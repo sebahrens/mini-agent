@@ -77,3 +77,49 @@ async fn list_dir_rejects_missing_directory_instead_of_reporting_empty() {
         .await;
     assert!(result.is_err(), "missing directory must fail: {result:?}");
 }
+
+// mini-agent-06im2: list_dir hides entries denied to `read` or `list_dir`.
+#[tokio::test]
+async fn list_dir_omits_denied_entries() {
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+    use std::sync::{Arc, Mutex};
+
+    let root = TestDirectory::new();
+    let workspace = root.0.canonicalize().unwrap();
+    std::fs::create_dir_all(workspace.join("config/secrets")).unwrap();
+    std::fs::write(workspace.join("config/.env"), "TOKEN=x").unwrap();
+    std::fs::write(workspace.join("config/app.toml"), "").unwrap();
+    std::fs::write(workspace.join("config/hidden.log"), "").unwrap();
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular(
+            [
+                ("config/.env".to_string(), Action::Deny),
+                ("config/secrets".to_string(), Action::Deny),
+            ]
+            .into(),
+        )),
+        list_dir: Some(ToolPerm::Granular(
+            [("**/*.log".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let permission = Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap(),
+    ));
+    let tool = ListDirTool::new(Some(permission), None, None).with_workspace(&workspace);
+    let absolute = workspace.join("config").to_string_lossy().into_owned();
+    for path in ["config".to_string(), absolute] {
+        let listing = tool.call(ListDirArgs { path: Some(path) }).await.unwrap();
+        assert!(listing.contains("app.toml"), "{listing}");
+        assert!(!listing.contains(".env"), "{listing}");
+        assert!(!listing.contains("secrets"), "{listing}");
+        assert!(!listing.contains("hidden.log"), "{listing}");
+    }
+}

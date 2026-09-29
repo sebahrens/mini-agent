@@ -102,7 +102,13 @@ impl Tool for ListDirTool {
         let (bound_directory, coaching) = if let Some(workspace) = bound_workspace {
             let logical = workspace.logical_relative_path(relative)?;
             let directory = workspace.open_relative_directory_file(relative)?;
-            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
+                crate::agent::tools::walk_deny_filter(
+                    &self.permission,
+                    "list_dir",
+                    Some(workspace.root()),
+                ),
+            );
             let coaching = check_perm_bound_path(
                 &self.permission,
                 &self.ask_tx,
@@ -117,7 +123,9 @@ impl Tool for ListDirTool {
             let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
             // Pin the exact authorized directory before an interactive
             // permission wait can race a pathname replacement.
-            let bound = BoundDirectory::open(&resolved, &checked_metadata)?;
+            let bound = BoundDirectory::open(&resolved, &checked_metadata)?.with_hidden_filter(
+                crate::agent::tools::walk_deny_filter(&self.permission, "list_dir", None),
+            );
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,

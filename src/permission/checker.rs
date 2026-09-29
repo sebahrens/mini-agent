@@ -1022,6 +1022,55 @@ impl PermissionChecker {
         false
     }
 
+    /// Non-prompting deny probe for one candidate path surfaced by a walking
+    /// tool. Only deny rules are evaluated (the tool's own, its aliases, and
+    /// the `read` rules for the read-class walkers `grep`, `find_files` and
+    /// `list_dir`, plus `external_directory` denies for paths outside the
+    /// workspace). It never asks, never consults allow rules or the session
+    /// allowlist, and never feeds doom-loop tracking. `path` is either
+    /// workspace-relative or absolute; both spellings are evaluated.
+    /// Walkers take a [`Self::path_deny_probe`] snapshot instead, so they
+    /// need not hold the checker lock for every entry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_path_denied(&self, tool: &str, path: &str) -> bool {
+        self.path_deny_probe(tool).is_denied(Path::new(path))
+    }
+
+    /// Lock-free snapshot of the deny rules [`Self::is_path_denied`] evaluates
+    /// for `tool`, so a blocking directory walk can filter every entry
+    /// without holding the checker lock.
+    pub(crate) fn path_deny_probe(&self, tool: &str) -> PathDenyProbe {
+        let canonical = canonical_permission_tool(tool);
+        let mut tools: SmallVec<[&str; 4]> = SmallVec::new();
+        tools.push(canonical);
+        tools.extend(permission_tool_aliases(canonical).iter().copied());
+        if matches!(canonical, "grep" | "find_files" | "list_dir") {
+            tools.push("read");
+        }
+        let mut rules = Vec::new();
+        for tool in tools {
+            let Some(entries) = self.rules.get(tool) else {
+                continue;
+            };
+            for (pattern, action) in entries {
+                if *action == Action::Deny {
+                    rules.push((pattern.clone(), is_path_tool_name(tool)));
+                }
+            }
+        }
+        let ext_dir_deny = self
+            .ext_dir_rules
+            .iter()
+            .filter(|(_, action)| *action == Action::Deny)
+            .map(|(pattern, _)| pattern.clone())
+            .collect();
+        PathDenyProbe {
+            working_dir: normalize_path(Path::new(&self.working_dir)),
+            rules,
+            ext_dir_deny,
+        }
+    }
+
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
             // Only path tools receive generated scope patterns. Every other
@@ -1375,6 +1424,88 @@ fn stricter_action(left: Action, right: Action) -> Action {
     } else {
         left
     }
+}
+
+/// Deny rules captured from a [`PermissionChecker`] for filtering the entries
+/// a walking tool (`grep`, `find_files`, `list_dir`) would surface.
+#[derive(Clone)]
+pub(crate) struct PathDenyProbe {
+    working_dir: PathBuf,
+    /// Deny patterns and whether they are path-tool patterns (matched with
+    /// the case-folding deny semantics).
+    rules: Vec<(Pattern, bool)>,
+    ext_dir_deny: Vec<Pattern>,
+}
+
+impl PathDenyProbe {
+    /// True when no rule could ever deny a path, so walkers can skip the probe.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.ext_dir_deny.is_empty()
+    }
+
+    /// Whether any captured deny rule matches `path`, which is either
+    /// workspace-relative or absolute. Both the absolute and, beneath the
+    /// workspace, the workspace-relative spelling are evaluated, mirroring
+    /// `check_path` and `check_bound_path`.
+    pub(crate) fn is_denied(&self, path: &Path) -> bool {
+        let (absolute, relative) = if path.is_absolute() {
+            let absolute = normalize_path(path);
+            let relative = absolute
+                .strip_prefix(&self.working_dir)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(Path::to_path_buf);
+            (absolute, relative)
+        } else {
+            let relative = normalize_path(path);
+            let absolute = normalize_path(&self.working_dir.join(&relative));
+            let relative = (!relative.as_os_str().is_empty() && relative != Path::new("."))
+                .then_some(relative);
+            (absolute, relative)
+        };
+        let absolute = absolute.to_string_lossy();
+        let relative = relative.as_ref().map(|relative| relative.to_string_lossy());
+        let mut inputs: SmallVec<[&str; 2]> = SmallVec::new();
+        inputs.push(&absolute);
+        if let Some(relative) = relative.as_deref() {
+            inputs.push(relative);
+        }
+        for (pattern, path_rule) in &self.rules {
+            let matched = inputs.iter().any(|input| {
+                if *path_rule {
+                    pattern.matches_path_for_deny(input)
+                } else {
+                    pattern.matches(input)
+                }
+            });
+            if matched {
+                return true;
+            }
+        }
+        let external = !Path::new(absolute.as_ref()).starts_with(&self.working_dir);
+        external
+            && self
+                .ext_dir_deny
+                .iter()
+                .any(|pattern| ext_dir_deny_matches(pattern, &absolute))
+    }
+}
+
+fn ext_dir_deny_matches(pattern: &Pattern, path: &str) -> bool {
+    if pattern.matches_path_for_deny(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let ordinary = crate::permission::pattern::normalize_policy_path(path);
+        if pattern.matches_path_for_deny(&ordinary) {
+            return true;
+        }
+        if let Some(verbatim) = windows_verbatim_policy_path(&ordinary) {
+            return pattern.matches_path_for_deny(&verbatim);
+        }
+    }
+    false
 }
 
 fn is_path_tool_name(tool: &str) -> bool {
@@ -2988,5 +3119,126 @@ mod yolo_destructive_tests {
         )));
         assert_eq!(checker.check("bash", "rm -rf target"), CheckResult::Allowed);
         assert_eq!(checker.check("bash", "rm -rf src"), CheckResult::Ask);
+    }
+}
+
+#[cfg(test)]
+mod path_deny_probe_tests {
+    use super::*;
+
+    fn checker(workspace: &Path, config: PermissionConfig) -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn is_path_denied_evaluates_only_deny_rules_for_the_walker_and_read() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_path_deny_probe_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let external = base.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("secrets/**".to_string(), Action::Deny),
+                    ("notes/**".to_string(), Action::Ask),
+                ]
+                .into(),
+            )),
+            grep: Some(ToolPerm::Granular(
+                [("vendor".to_string(), Action::Deny)].into(),
+            )),
+            edit: Some(ToolPerm::Granular(
+                [("src/**".to_string(), Action::Deny)].into(),
+            )),
+            external_directory: Some(
+                [(format!("{}/private/**", external.display()), Action::Deny)].into(),
+            ),
+            ..PermissionConfig::default()
+        };
+        let mut checker = checker(&workspace, config);
+        let absolute = |relative: &str| workspace.join(relative).to_string_lossy().into_owned();
+
+        for tool in ["read", "grep", "find_files", "list_dir"] {
+            assert!(checker.is_path_denied(tool, "secrets/key"), "{tool}");
+            assert!(
+                checker.is_path_denied(tool, &absolute("secrets/key")),
+                "{tool}"
+            );
+            // Ask and unmatched paths are not denials; the probe never asks.
+            assert!(!checker.is_path_denied(tool, "notes/todo"), "{tool}");
+            assert!(!checker.is_path_denied(tool, "README.md"), "{tool}");
+            // Another tool's deny rules do not apply.
+            assert!(!checker.is_path_denied(tool, "src/main.rs"), "{tool}");
+            // External-directory denies cover paths outside the workspace.
+            let private = external.join("private/key").to_string_lossy().into_owned();
+            assert!(checker.is_path_denied(tool, &private), "{tool}");
+            let public = external.join("public/key").to_string_lossy().into_owned();
+            assert!(!checker.is_path_denied(tool, &public), "{tool}");
+        }
+        // Tool-specific deny rules apply to that tool only.
+        assert!(checker.is_path_denied("grep", "vendor"));
+        assert!(checker.is_path_denied("grep", &absolute("vendor")));
+        assert!(!checker.is_path_denied("find_files", "vendor"));
+        assert!(!checker.is_path_denied("read", "vendor"));
+        // `read` aliases share its deny rules.
+        assert!(checker.is_path_denied("js/read_file", "secrets/key"));
+
+        // The probe feeds no doom-loop tracking: repeated probes of the same
+        // path leave the next real check unaffected.
+        for _ in 0..10 {
+            assert!(!checker.is_path_denied("read", "README.md"));
+        }
+        assert_eq!(
+            checker.check_path("read", "README.md"),
+            CheckResult::Allowed
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn is_path_denied_folds_case_on_case_insensitive_platforms() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_path_deny_case_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    (".env".to_string(), Action::Deny),
+                    ("secrets/**".to_string(), Action::Deny),
+                ]
+                .into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let checker = checker(&workspace, config);
+        let folded = cfg!(any(target_os = "macos", windows));
+        for spelling in [".ENV", ".Env", "Secrets/key", "SECRETS/KEY", "secrets/KEY"] {
+            let absolute = workspace.join(spelling).to_string_lossy().into_owned();
+            assert_eq!(
+                checker.is_path_denied("grep", spelling),
+                folded,
+                "relative {spelling}"
+            );
+            assert_eq!(
+                checker.is_path_denied("grep", &absolute),
+                folded,
+                "absolute {spelling}"
+            );
+        }
+        assert!(checker.is_path_denied("grep", ".env"));
+        assert!(checker.is_path_denied("list_dir", "secrets/key"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

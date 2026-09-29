@@ -544,9 +544,15 @@ pub(crate) struct BoundFile {
     pub(crate) metadata: std::fs::Metadata,
 }
 
+/// Predicate that hides a walked entry: called with the entry's approved
+/// path and whether it is a directory; `true` omits the entry (and prunes the
+/// whole subtree for a directory).
+pub(crate) type PathFilter = Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
+
 pub(crate) struct BoundDirectory {
     approved_root: PathBuf,
     root: File,
+    hidden: Option<PathFilter>,
 }
 
 #[derive(Clone, Default)]
@@ -622,11 +628,29 @@ impl BoundDirectory {
         Ok(Self {
             approved_root: approved_root.to_path_buf(),
             root,
+            hidden: None,
         })
     }
 
+    /// Hide every entry for which `filter` returns true from `walker` and
+    /// `list_entries`; hidden directories are not descended into.
+    pub(crate) fn with_hidden_filter(mut self, filter: Option<PathFilter>) -> Self {
+        self.hidden = filter;
+        self
+    }
+
+    fn is_hidden(&self, path: &Path, is_directory: bool) -> bool {
+        self.hidden
+            .as_ref()
+            .is_some_and(|hidden| hidden(path, is_directory))
+    }
+
     pub(crate) fn walker(&self) -> std::io::Result<BoundWalker> {
-        BoundWalker::new(self.root.try_clone()?, self.approved_root.clone())
+        BoundWalker::new(
+            self.root.try_clone()?,
+            self.approved_root.clone(),
+            self.hidden.clone(),
+        )
     }
 
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
@@ -664,7 +688,7 @@ impl BoundDirectory {
                 Ok(child) => child,
                 Err(_) if bound_platform::is_link(&self.root, &name) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&chain, &path, false) {
+                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
                         entries.push(BoundListEntry {
                             link_target: bound_platform::read_link(
                                 &self.root,
@@ -686,7 +710,7 @@ impl BoundDirectory {
             let metadata = match child.metadata() {
                 Ok(metadata) if bound_platform::is_link_metadata(&metadata) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&chain, &path, false) {
+                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
                         entries.push(BoundListEntry {
                             link_target: bound_platform::read_link(
                                 &self.root,
@@ -711,7 +735,7 @@ impl BoundDirectory {
             if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
                 continue;
             }
-            if is_ignored(&chain, &path, is_directory) {
+            if is_ignored(&chain, &path, is_directory) || self.is_hidden(&path, is_directory) {
                 continue;
             }
             let child_count = if is_directory {
@@ -840,10 +864,15 @@ impl DirectoryFrame {
 pub(crate) struct BoundWalker {
     approved_root: PathBuf,
     stack: Vec<DirectoryFrame>,
+    hidden: Option<PathFilter>,
 }
 
 impl BoundWalker {
-    fn new(root: File, approved_root: PathBuf) -> std::io::Result<Self> {
+    fn new(
+        root: File,
+        approved_root: PathBuf,
+        hidden: Option<PathFilter>,
+    ) -> std::io::Result<Self> {
         let mut matchers = IgnoreChain::default();
         let (global, _) = GitignoreBuilder::new(&approved_root).build_global();
         if !global.is_empty() {
@@ -863,6 +892,7 @@ impl BoundWalker {
         Ok(Self {
             approved_root,
             stack: vec![frame],
+            hidden,
         })
     }
 }
@@ -895,6 +925,13 @@ impl Iterator for BoundWalker {
                 continue;
             }
             if is_ignored(&frame.matchers, &approved_path, is_directory) {
+                continue;
+            }
+            if self
+                .hidden
+                .as_ref()
+                .is_some_and(|hidden| hidden(&approved_path, is_directory))
+            {
                 continue;
             }
             if is_directory {
@@ -1171,7 +1208,13 @@ impl Tool for FindFilesTool {
         {
             let logical = workspace.logical_relative_path(relative)?;
             let directory = workspace.open_relative_directory_file(relative)?;
-            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
+                crate::agent::tools::walk_deny_filter(
+                    &self.permission,
+                    "find_files",
+                    Some(workspace.root()),
+                ),
+            );
             let coaching = check_perm_bound_path(
                 &self.permission,
                 &self.ask_tx,
@@ -1184,7 +1227,10 @@ impl Tool for FindFilesTool {
         } else {
             let traversal_root = tokio::fs::canonicalize(&search_path).await?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-            let bound = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
+            let bound =
+                BoundDirectory::open(&traversal_root, &authorized_metadata)?.with_hidden_filter(
+                    crate::agent::tools::walk_deny_filter(&self.permission, "find_files", None),
+                );
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,
@@ -1860,5 +1906,78 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "keep.txt"));
         assert!(!names.iter().any(|name| name == "drop.txt"));
+    }
+
+    // mini-agent-06im2: names of paths denied to `read` or `find_files` are
+    // not enumerated, for workspace-bound, absolute and external roots.
+    #[tokio::test]
+    async fn find_files_omits_denied_paths() {
+        let container = TempDir::new("denied-paths");
+        let container_path = container.path().canonicalize().unwrap();
+        let workspace = container_path.join("workspace");
+        let external = container_path.join("external");
+        for root in [&workspace, &external] {
+            std::fs::create_dir_all(root.join("config/secrets")).unwrap();
+            std::fs::create_dir_all(root.join("private")).unwrap();
+            std::fs::write(root.join("config/secrets/key.txt"), "").unwrap();
+            std::fs::write(root.join("config/app.txt"), "").unwrap();
+            std::fs::write(root.join("private/plan.txt"), "").unwrap();
+        }
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("config/secrets/**".to_string(), Action::Deny),
+                    (
+                        format!("{}/config/secrets/**", external.display()),
+                        Action::Deny,
+                    ),
+                ]
+                .into(),
+            )),
+            find_files: Some(ToolPerm::Granular(
+                [
+                    ("private".to_string(), Action::Deny),
+                    (format!("{}/private", external.display()), Action::Deny),
+                ]
+                .into(),
+            )),
+            external_directory: Some(
+                [
+                    (external.display().to_string(), Action::Allow),
+                    (format!("{}/**", external.display()), Action::Allow),
+                ]
+                .into(),
+            ),
+            ..PermissionConfig::default()
+        };
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .expect("valid permission test configuration"),
+        ));
+        let tool = FindFilesTool::new(Some(permission), None, 50).with_workspace(&workspace);
+        let workspace_absolute = workspace.to_string_lossy().into_owned();
+        let external_absolute = external.to_string_lossy().into_owned();
+        for path in [
+            None,
+            Some(workspace_absolute.as_str()),
+            Some(external_absolute.as_str()),
+        ] {
+            let listing = tool
+                .call(FindFilesArgs {
+                    pattern: r"\.txt$".to_string(),
+                    path: path.map(str::to_string),
+                })
+                .await
+                .unwrap();
+            assert!(listing.contains("app.txt"), "{path:?}: {listing}");
+            assert!(listing.starts_with("1 files found"), "{path:?}: {listing}");
+            assert!(!listing.contains("key.txt"), "{path:?}: {listing}");
+            assert!(!listing.contains("plan.txt"), "{path:?}: {listing}");
+        }
     }
 }
