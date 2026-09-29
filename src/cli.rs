@@ -957,6 +957,19 @@ impl Cli {
             })
     }
 
+    /// The startup provider/model pair: `--provider`/`--model`/config
+    /// resolution, then `--quick-model` overriding both. Every surface that
+    /// starts a fresh conversation (interactive, headless, ACP) uses this.
+    pub fn resolve_provider_and_model(
+        &self,
+        cfg: &config::Config,
+    ) -> (CompactString, CompactString) {
+        if let Some(qm) = self.resolve_quick_model(cfg) {
+            return (qm.provider.clone(), qm.model.clone());
+        }
+        (self.resolve_provider(cfg), self.resolve_model(cfg))
+    }
+
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
         self.max_tokens.or(cfg.max_tokens).unwrap_or(16384)
     }

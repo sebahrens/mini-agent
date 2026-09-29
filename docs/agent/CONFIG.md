@@ -1742,6 +1742,14 @@ and runs the same process-wide lifecycle and tool hooks as other frontends.
 Permission prompts reuse the corresponding ACP tool-call ID, so clients can
 attach the decision to the call they already rendered.
 
+ACP turns select their provider and model exactly like interactive startup:
+`--provider`/`--model`/config resolution, then `--quick-model` overriding both.
+A custom provider's `model` is only the default when nothing else names a
+model. Provider clients honour `--api-key` first, and turns use the configured
+`[retry]` policy. The server also initialises the `task` tool's subagent
+configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
+startup, so delegated read-only agents work over ACP.
+
 Each new ACP session also owns an independent in-memory conversation history.
 Only completed turns are committed: the user prompt, correlated structured tool
 call/result messages, and the terminal assistant response are retained together.

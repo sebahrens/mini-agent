@@ -696,6 +696,71 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+// --- Provider resolution ---
+
+/// The provider/model an ACP turn runs with: the same `--provider`/`--model`
+/// resolution and `--quick-model` override as interactive startup. A custom
+/// provider's `model` is only a default, applied by `Cli::resolve_model` when
+/// nothing else selects a model; it never overrides an explicit `model`.
+fn acp_provider_and_model(
+    cli: &Cli,
+    cfg: &Config,
+) -> (compact_str::CompactString, compact_str::CompactString) {
+    cli.resolve_provider_and_model(cfg)
+}
+
+/// The ACP turn client, with the same credential precedence as startup
+/// (`--api-key` first).
+fn acp_client(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+) -> anyhow::Result<crate::provider::AnyClient> {
+    crate::provider::create_client(
+        provider,
+        cli.api_key.as_deref(),
+        &cfg.custom_providers_map(),
+        cfg.api_keys.as_ref(),
+    )
+}
+
+/// The subagent configuration an ACP server installs, or `None` when the
+/// `task` tool is disabled or the main provider has no usable client.
+#[cfg(feature = "subagents")]
+fn acp_subagent_config(
+    cli: &Cli,
+    cfg: &Config,
+) -> Option<crate::extras::subagents::SubagentConfig> {
+    if !cfg.task_enabled.unwrap_or(true) {
+        return None;
+    }
+    let (provider, model) = acp_provider_and_model(cli, cfg);
+    match acp_client(cli, cfg, &provider) {
+        Ok(client) => Some(crate::extras::subagents::resolve_config(
+            cfg,
+            cli.api_key.as_deref(),
+            &provider,
+            &model,
+            &client,
+        )),
+        Err(error) => {
+            tracing::warn!(
+                "ACP: subagent provider '{}' unavailable ({}); the task tool will fail until it is configured",
+                provider,
+                error
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "subagents")]
+fn init_acp_subagents(cli: &Cli, cfg: &Config) {
+    if let Some(config) = acp_subagent_config(cli, cfg) {
+        crate::extras::subagents::install(config);
+    }
+}
+
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
@@ -711,6 +776,12 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         "stdio"
     };
     tracing::info!("ACP server starting: transport={}", transport_mode);
+
+    // ACP returns before `Startup::init_features`, which is where the other
+    // surfaces install the subagent configuration. The `task` tool is still
+    // registered for every ACP turn, so install it here from the same resolver.
+    #[cfg(feature = "subagents")]
+    init_acp_subagents(&cli, &cfg);
 
     let state = Arc::new(AcpState {
         cli,
@@ -1026,8 +1097,7 @@ async fn apply_meta_goal(
             .goal_store
             .clone()
     };
-    let provider = state.cli.resolve_provider(&state.cfg);
-    let model = state.cli.resolve_model(&state.cfg);
+    let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
 
     let MetaGoal {
         objective,
@@ -1676,12 +1746,8 @@ async fn settle_acp_goal_round(
     // The same objective is gated the same way in an editor as in a terminal:
     // both tiers run here. A claim no command proved is labelled as such in
     // the line and in `_meta`, wherever it is settled.
-    let judge = crate::extras::goal::judge::resolve(
-        &goal.judge,
-        cfg,
-        &state.cli.resolve_provider(cfg),
-        &state.cli.resolve_model(cfg),
-    );
+    let (main_provider, main_model) = acp_provider_and_model(&state.cli, cfg);
+    let judge = crate::extras::goal::judge::resolve(&goal.judge, cfg, &main_provider, &main_model);
     let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
     let outcome = driver::settle_round(store, summary, |request| async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
@@ -1864,8 +1930,7 @@ async fn execute_prompt(
             blocked_ms,
         ));
     }
-    let provider_str = state.cli.resolve_provider(&state.cfg);
-    let mut model_str = state.cli.resolve_model(&state.cfg);
+    let (provider_str, model_str) = acp_provider_and_model(&state.cli, &state.cfg);
 
     tracing::debug!(
         "ACP run_prompt: provider={}, model={}, prompt_len={}",
@@ -1874,20 +1939,7 @@ async fn execute_prompt(
         prompt_text.len(),
     );
 
-    // Custom provider model override (if no explicit model set)
-    if (model_str.as_str() == "deepseek/deepseek-v4-pro" || state.cli.model.is_none())
-        && let Some(custom) = state.cfg.custom_providers_map().get(provider_str.as_str())
-        && let Some(ref custom_model) = custom.model
-    {
-        model_str = custom_model.clone();
-    }
-
-    let client = match crate::provider::create_client(
-        &provider_str,
-        None,
-        &state.cfg.custom_providers_map(),
-        state.cfg.api_keys.as_ref(),
-    ) {
+    let client = match acp_client(&state.cli, &state.cfg, &provider_str) {
         Ok(client) => client,
         Err(error) => {
             return Ok(PromptOutcome::failed(error.to_string()));
@@ -1994,7 +2046,7 @@ async fn execute_prompt(
         agent.spawn_runner_paused_in_scope(
             prompt_text.to_string(),
             prior_history,
-            crate::retry::RetryConfig::default(),
+            state.cfg.retry.clone(),
             #[cfg(feature = "hooks")]
             None, // ACP is not loop mode; global lifecycle hooks remain active.
             Arc::clone(&work_scope),
@@ -5602,6 +5654,86 @@ mod workspace_tests {
             .unwrap();
         assert_eq!(first_spawn, first.display().to_string());
         assert_eq!(second_spawn, second.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod provider_resolution_tests {
+    use super::*;
+
+    fn config(toml_text: &str) -> Config {
+        toml::from_str(toml_text).expect("test config parses")
+    }
+
+    const CUSTOM: &str = r#"
+provider = "acme"
+
+[custom_providers.acme]
+provider_type = "openai"
+base_url = "http://127.0.0.1:9/v1"
+model = "acme-default"
+
+[quick_models.fast]
+provider = "acme"
+model = "acme-fast"
+"#;
+
+    #[test]
+    fn acp_honours_quick_model_like_startup() {
+        let cli = Cli {
+            quick_model: Some("fast".into()),
+            ..Default::default()
+        };
+        let (provider, model) = acp_provider_and_model(&cli, &config(CUSTOM));
+        assert_eq!(provider, "acme");
+        assert_eq!(model, "acme-fast");
+    }
+
+    #[test]
+    fn custom_provider_model_is_only_a_default_under_acp() {
+        let cfg = config(CUSTOM);
+        let (_, model) = acp_provider_and_model(&Cli::default(), &cfg);
+        assert_eq!(model, "acme-default");
+
+        let explicit = config(&format!("model = \"explicit-model\"\n{CUSTOM}"));
+        let (provider, model) = acp_provider_and_model(&Cli::default(), &explicit);
+        assert_eq!(provider, "acme");
+        assert_eq!(
+            model, "explicit-model",
+            "cfg.model must win over the custom default"
+        );
+    }
+
+    #[test]
+    fn acp_client_uses_the_cli_api_key() {
+        let cfg = config(CUSTOM);
+        assert!(
+            acp_client(&Cli::default(), &cfg, "acme").is_err(),
+            "a custom provider without any key must not resolve"
+        );
+        let cli = Cli {
+            api_key: Some("cli-key".into()),
+            ..Default::default()
+        };
+        assert!(acp_client(&cli, &cfg, "acme").is_ok());
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn acp_installs_a_subagent_config_for_the_task_tool() {
+        let cli = Cli {
+            api_key: Some("cli-key".into()),
+            quick_model: Some("fast".into()),
+            ..Default::default()
+        };
+        let resolved = acp_subagent_config(&cli, &config(CUSTOM))
+            .expect("ACP must initialise the task tool's subagent config");
+        assert_eq!(resolved.provider_name, "acme");
+        assert_eq!(resolved.model_name, "acme-fast");
+        assert_eq!(resolved.api_key.as_deref(), Some("cli-key"));
+
+        let disabled = config(&format!("task_enabled = false\n{CUSTOM}"));
+        assert!(acp_subagent_config(&cli, &disabled).is_none());
     }
 }
 

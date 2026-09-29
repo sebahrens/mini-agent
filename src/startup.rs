@@ -640,14 +640,8 @@ impl Startup {
         let context =
             context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
 
-        let mut provider = cli.resolve_provider(&cfg);
-        let mut model = cli.resolve_model(&cfg);
-
         // --quick-model overrides provider + model
-        if let Some(qm) = cli.resolve_quick_model(&cfg) {
-            provider = qm.provider.clone();
-            model = qm.model.clone();
-        }
+        let (mut provider, mut model) = cli.resolve_provider_and_model(&cfg);
 
         let name = cli.name.as_deref().unwrap_or("");
         let qm_map = config::quick_models_map(&cfg);
@@ -873,65 +867,13 @@ impl Startup {
     /// permission checker, advisor.
     pub(crate) async fn init_features(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "subagents")]
-        {
-            let task_max_turns = self.cfg.task_max_turns.unwrap_or(20);
-            let qm = config::quick_models_map(&self.cfg);
-
-            // Resolve subagent model: subagent_model config > subagent_provider + model > main model
-            let (mut sub_provider, mut sub_model) = if let Some(sa_model) = &self.cfg.subagent_model
-            {
-                if let Some(q) = qm.get(sa_model.as_str()) {
-                    (q.provider.clone(), q.model.clone())
-                } else {
-                    let prov = self
-                        .cfg
-                        .subagent_provider
-                        .clone()
-                        .unwrap_or_else(|| self.provider.clone());
-                    (prov, sa_model.clone())
-                }
-            } else if let Some(sa_prov) = &self.cfg.subagent_provider {
-                (sa_prov.clone(), self.model.clone())
-            } else {
-                (self.provider.clone(), self.model.clone())
-            };
-
-            let sub_client = if sub_provider.as_str() == self.provider.as_str() {
-                self.client.clone()
-            } else {
-                match crate::provider::create_client(
-                    &sub_provider,
-                    self.cli.api_key.as_deref(),
-                    &self.cfg.custom_providers_map(),
-                    self.cfg.api_keys.as_ref(),
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not initialize subagent provider '{}' ({}); \
-                             falling back to main provider '{}'. \
-                             Set `subagent_provider`/`subagent_model` in config, or the \
-                             provider's API key, to silence this.",
-                            sub_provider,
-                            e,
-                            self.provider
-                        );
-                        sub_provider = self.provider.clone();
-                        sub_model = self.model.clone();
-                        self.client.clone()
-                    }
-                }
-            };
-
-            crate::extras::subagents::init(
-                sub_client,
-                sub_provider.to_string(),
-                sub_model.to_string(),
-                self.cli.api_key.clone(),
-                task_max_turns,
-                self.cfg.clone(),
-            );
-        }
+        crate::extras::subagents::install(crate::extras::subagents::resolve_config(
+            &self.cfg,
+            self.cli.api_key.as_deref(),
+            &self.provider,
+            &self.model,
+            &self.client,
+        ));
 
         // Sandbox, tools config, status signals, permission checker
         let (authority, sandbox) =
