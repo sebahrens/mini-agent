@@ -908,6 +908,18 @@ $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.ex
 cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
 ```
 
+This feasibility test is a manual research gate and is not run by any CI job. The runtime
+evidence CI relies on is the production containment probe `windows_js_worker_containment`
+described below, which runs on the `windows-worker-containment-gate` job. When the feasibility
+test was briefly wired into that job (mini-agent-6ap52) its first row failed on the hosted runner
+with `ERROR_ENVVAR_NOT_FOUND` (os error 203) from `CreateProcessW`: the matrix built its own child
+environment containing only `SystemRoot`, while the production launcher that passes on the same
+runner also supplies the AppContainer profile's `LOCALAPPDATA`, `TEMP` and `TMP`, which a custom
+environment block otherwise suppresses. Both launchers now build those loader and profile entries
+through one shared helper (mini-agent-6kdk2; a portable source-contract test pins the reuse). The
+fix has not yet been observed on a hosted runner, so the test stays ignored until a manual Windows
+run of the command above passes; only then may a CI job run it again.
+
 Construction of the production LPAC policy and attribute list is not runtime evidence: it cannot
 prove that Windows accepts the combined token, Job, mitigation, handle, console, and executable
 controls or that the resulting child observes them. Before advertising availability, the trusted
