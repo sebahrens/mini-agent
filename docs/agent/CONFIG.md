@@ -1894,8 +1894,17 @@ Servers can also be added per project via `.zerostack/config.toml` (see
 URL servers must use HTTP(S), must not embed user information, and must resolve
 exclusively to public IP addresses. `localhost`, loopback, private, link-local,
 metadata, multicast, documentation, reserved, and other non-public destinations
-are rejected before the connection is created. Use a stdio server for a local
-service; the OAuth redirect listener is a separate product-owned loopback flow.
+are rejected before the connection is created. The addresses that passed this
+check are pinned for the life of the connection: the HTTP transport (including
+every SSE reconnect) and the OAuth client connect only to them and never
+resolve the server's host again, so a DNS answer that changes to an internal
+address after validation (DNS rebinding) is not followed. Any other host the
+OAuth client reaches (an authorization server on another domain, a redirect
+target) is held to the same public-address rule on every lookup and hop, and
+`/mcp login` validates the server URL the same way. A configured HTTP(S)
+proxy resolves names itself, so this pinning does not apply to proxied
+requests. Use a stdio server for a local service; the OAuth redirect listener
+is a separate product-owned loopback flow.
 
 ### OAuth for URL servers
 
@@ -2036,6 +2045,13 @@ cannot relay a valid response, even to a client that does not verify the
 certificate chain; clients should still verify or pin the certificate. The
 session that follows is encrypted and integrity-protected. A TLS listener may
 bind a non-loopback `acp_host` without any opt-in.
+
+Plaintext and TLS listeners accept connections until one client
+authenticates. A failed accept of one incoming connection (the peer reset or
+aborted it, the call was interrupted, or the process briefly ran out of file
+descriptors or buffers, in which case accepting pauses for 100 ms) is logged
+and does not close the listener; only a failure of the listening socket itself
+ends it.
 
 Without TLS, a non-loopback `acp_host` is refused at startup unless the
 environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which case a

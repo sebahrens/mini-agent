@@ -1,6 +1,7 @@
 mod bounded_http;
 pub mod client;
 pub mod config;
+mod egress;
 pub mod oauth;
 pub mod tool;
 

@@ -2535,3 +2535,36 @@ async fn clearing_one_invocation_leaves_another_decision_intact() {
     .await;
     assert!(matches!(survivor, CheckResult::Allowed), "{survivor:?}");
 }
+
+// --- AllowAlways without a suggestion keeps glob characters literal ---
+
+#[test]
+fn allow_always_on_a_path_containing_a_glob_does_not_match_a_sibling() {
+    let mut checker = make_checker(SecurityMode::Restrictive);
+    let requested = workspace_path("target/**");
+    let scope = crate::permission::checker::exact_allow_scope_for_input("write", &requested)
+        .expect("write is a path tool");
+    checker.add_session_allowlist("write".into(), &scope);
+
+    assert_eq!(
+        checker.check_path("write", &requested),
+        CheckResult::Allowed
+    );
+    for sibling in ["target/sibling.txt", "target/nested/file.rs", "target/*"] {
+        assert_ne!(
+            checker.check_path("write", &workspace_path(sibling)),
+            CheckResult::Allowed,
+            "an exact AllowAlways for target/** must not approve {sibling}"
+        );
+    }
+    // The same grant installed as a glob (the previous ACP fallback) would
+    // have approved the whole tree.
+    let mut glob = make_checker(SecurityMode::Restrictive);
+    glob.add_session_allowlist("write".into(), &requested);
+    assert_eq!(
+        glob.check_path("write", &workspace_path("target/sibling.txt")),
+        CheckResult::Allowed
+    );
+    // Non-path tools keep their literal key and get no path scope.
+    assert!(crate::permission::checker::exact_allow_scope_for_input("shell", "rm *").is_none());
+}

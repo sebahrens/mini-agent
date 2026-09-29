@@ -1342,10 +1342,9 @@ pub(crate) async fn build_auth_client(
     url: &str,
     settings: &OAuthSettings,
     transport_client: super::bounded_http::BoundedHttpClient,
+    endpoint: Option<&super::egress::ValidatedEndpoint>,
 ) -> anyhow::Result<AuthClient<super::bounded_http::BoundedHttpClient>> {
-    let mut manager = AuthorizationManager::new(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))?;
+    let mut manager = authorization_manager(url, endpoint).await?;
     manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let restored = manager
@@ -1357,6 +1356,25 @@ pub(crate) async fn build_auth_client(
     }
 
     Ok(AuthClient::new(transport_client, manager))
+}
+
+/// The OAuth manager for `url`. With a validated endpoint every OAuth HTTP
+/// operation (metadata discovery, registration, token exchange and refresh)
+/// goes through [`super::egress::GuardedOAuthHttpClient`]: the server host is
+/// pinned to its validated addresses and any other host, lookup or redirect
+/// target must be publicly routable.
+async fn authorization_manager(
+    url: &str,
+    endpoint: Option<&super::egress::ValidatedEndpoint>,
+) -> anyhow::Result<AuthorizationManager> {
+    let manager = match endpoint {
+        Some(endpoint) => {
+            let client = super::egress::GuardedOAuthHttpClient::new(endpoint)?;
+            AuthorizationManager::new_with_oauth_http_client(url, std::sync::Arc::new(client)).await
+        }
+        None => AuthorizationManager::new(url).await,
+    };
+    manager.map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))
 }
 
 /// Result of starting an interactive login: the URL to open and the live session.
@@ -1375,9 +1393,10 @@ pub async fn begin_login(
     url: &str,
     settings: &OAuthSettings,
 ) -> anyhow::Result<LoginSession> {
-    let mut manager = AuthorizationManager::new(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))?;
+    // The login talks to the same server (and its authorization server) as
+    // the transport, so it is held to the same public-address policy.
+    let endpoint = super::client::validate_mcp_server_url(url).await?;
+    let mut manager = authorization_manager(url, Some(&endpoint)).await?;
     manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let metadata = manager

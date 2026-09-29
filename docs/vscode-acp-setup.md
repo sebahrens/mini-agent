@@ -63,7 +63,7 @@ The extension contributes exactly two settings, both machine-scoped:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `mini-agent.executablePath` | `""` | Path to the `mini-agent` executable. Leave empty to use the binary bundled in the VSIX. A custom path is accepted only from User/Remote machine settings; workspace settings cannot replace the executable. |
+| `mini-agent.executablePath` | `""` | Path to the `mini-agent` executable. Leave empty to use the binary bundled in the VSIX. A custom path is accepted only from User/Remote machine settings; workspace settings cannot replace the executable. An absolute path (or `~/...`) is used as given; a bare command name such as `mini-agent` is resolved once, when the session starts, to an absolute path by searching the absolute directories on the extension host's `PATH` (on Windows with the `.exe`/`.com` extensions from `PATHEXT`). The current directory and the workspace are never searched, and the version probe and the agent launch use that same resolved path. |
 | `mini-agent.logLevel` | `info` | Verbosity of the Mini Agent output channel (`error`, `warn`, `info`, `debug`, `trace`). |
 
 No API key is required: the bundled binary is started over stdio, and the model
@@ -178,7 +178,16 @@ turn; any completed tool progress remains in its history.
 
 ## Permission bridge
 
-When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow always / Deny) is forwarded back to the agent.
+When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow for this session / Deny) is forwarded back to the agent.
+
+The `allow_always` option ("Allow for this session") installs a rule for the
+current agent session only; nothing is written to configuration. Its `_meta`
+names that rule exactly: `suggestedPattern` is the human-readable rule (for
+example `exactly /repo/src/**` or `anything under /repo/`),
+`allowPatterns` lists the exact patterns the agent installs, and `scope` is
+`"session"`. When the tool supplies no narrower scope, a file tool's grant
+covers exactly the prompted path: `*`, `?` and `[` in that path stay literal,
+so approving a write to `/home/me/**` never approves the rest of the tree.
 
 Approvals with no existing tool-call identity appear as a separate `Permission:`
 entry. That entry finishes when the approval is granted, denied, cancelled, or
@@ -192,7 +201,9 @@ If no ACP client is connected, or if the session is non-interactive, tool calls 
 
 **Native extension cannot start the agent**: leave `mini-agent.executablePath`
 empty to use the bundled binary, or point it at an executable from User/Remote
-machine settings. The extension does not read `PATH`.
+machine settings. A bare command name is looked up only in the absolute
+directories on the extension host's `PATH`; if it is not found there, set an
+absolute path.
 
 **TCP connection refused**: confirm the agent is running (`mini-agent --acp-port <port>`) and the port matches.
 

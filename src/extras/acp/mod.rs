@@ -1,3 +1,4 @@
+mod accept;
 pub mod config;
 mod tls;
 
@@ -9,9 +10,11 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use agent_client_protocol::on_receive_request;
@@ -682,10 +685,13 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         }
 
         tracing::info!("ACP TCP listening on {}", local_addr);
+        let accept_error =
+            |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
+        let listener = accept::tokio_listener(listener).map_err(accept_error)?;
         let (stream, peer_addr) =
-            accept_authenticated_peer(listener, self.api_key).map_err(|e| {
-                agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
-            })?;
+            accept_authenticated_peer(listener, self.api_key, MAX_PENDING_AUTHENTICATIONS)
+                .await
+                .map_err(accept_error)?;
         tracing::info!("Authenticated ACP client connected from {}", peer_addr);
 
         let read_half = stream.try_clone().map_err(|e| {
@@ -701,75 +707,72 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
     }
 }
 
-enum AuthenticationAttempt {
-    Accepted(TcpStream, SocketAddr),
-    Rejected(SocketAddr),
-}
-
-fn accept_authenticated_peer(
-    listener: TcpListener,
+/// Accepts connections until one peer completes the challenge-response. Each
+/// peer authenticates on the blocking pool with bounded reads, so a slow or
+/// silent peer never blocks a valid one, and at most `max_pending` are in
+/// flight at once. A failed accept of one connection is logged and skipped
+/// (see [`accept`]); only a failure of the listener itself ends the loop.
+async fn accept_authenticated_peer<S: accept::AcceptSource>(
+    mut source: S,
     api_key: String,
+    max_pending: usize,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
-    listener.set_nonblocking(true)?;
     let api_key: Arc<str> = api_key.into();
-    let pending = Arc::new(AtomicUsize::new(0));
-    let (result_tx, result_rx) = mpsc::channel();
-
+    let mut pending: tokio::task::JoinSet<(Option<TcpStream>, SocketAddr)> =
+        tokio::task::JoinSet::new();
+    let mut backoff_until: Option<tokio::time::Instant> = None;
     loop {
-        while let Ok(attempt) = result_rx.try_recv() {
-            match attempt {
-                AuthenticationAttempt::Accepted(stream, peer_addr) => {
-                    return Ok((stream, peer_addr));
-                }
-                AuthenticationAttempt::Rejected(peer_addr) => {
-                    tracing::warn!("ACP TCP peer authentication rejected for {}", peer_addr);
-                }
-            }
-        }
-
-        match listener.accept() {
-            Ok((mut stream, peer_addr)) => {
-                // macOS inherits O_NONBLOCK from the listening socket. The
-                // authentication protocol uses bounded blocking reads in a
-                // dedicated worker, so restore blocking mode before the peer
-                // can race its response against the first read.
-                if let Err(error) = stream.set_nonblocking(false) {
-                    tracing::warn!(
-                        "ACP TCP peer rejected because blocking mode could not be restored: {error}"
-                    );
+        let (tcp, peer_addr) = tokio::select! {
+            accepted = source.accept(), if backoff_until.is_none() => match accepted {
+                Ok(connection) => connection,
+                Err(error) => {
+                    backoff_until = accept::after_accept_error("ACP TCP", error)?;
                     continue;
                 }
-                if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_AUTHENTICATIONS {
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                    tracing::warn!("ACP TCP peer rejected because authentication capacity is full");
-                    continue;
-                }
-
-                let api_key = api_key.clone();
-                let worker_pending = pending.clone();
-                let result_tx = result_tx.clone();
-                let spawn_result = std::thread::Builder::new()
-                    .name("acp-peer-auth".to_owned())
-                    .spawn(move || {
-                        let attempt = if authenticate_peer(&mut stream, &api_key).is_ok() {
-                            AuthenticationAttempt::Accepted(stream, peer_addr)
-                        } else {
-                            AuthenticationAttempt::Rejected(peer_addr)
-                        };
-                        worker_pending.fetch_sub(1, Ordering::AcqRel);
-                        let _ = result_tx.send(attempt);
-                    });
-
-                if spawn_result.is_err() {
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                    tracing::warn!("ACP TCP peer authentication worker could not start");
-                }
+            },
+            () = tokio::time::sleep_until(backoff_until.unwrap_or_else(tokio::time::Instant::now)),
+                if backoff_until.is_some() =>
+            {
+                backoff_until = None;
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+            Some(joined) = pending.join_next(), if !pending.is_empty() => {
+                match joined {
+                    Ok((Some(stream), peer_addr)) => return Ok((stream, peer_addr)),
+                    Ok((None, peer_addr)) => {
+                        tracing::warn!("ACP TCP peer authentication rejected for {}", peer_addr);
+                    }
+                    Err(error) => {
+                        tracing::warn!("ACP TCP peer authentication task failed: {error}");
+                    }
+                }
+                continue;
             }
-            Err(error) => return Err(error),
+        };
+        if pending.len() >= max_pending {
+            tracing::warn!("ACP TCP peer rejected because authentication capacity is full");
+            continue;
         }
+        // The challenge-response uses bounded blocking reads on the blocking
+        // pool, and the session afterwards is driven through a blocking
+        // adapter, so the peer leaves the reactor in blocking mode.
+        let mut stream = match tcp
+            .into_std()
+            .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(
+                    "ACP TCP peer rejected because blocking mode could not be restored: {error}"
+                );
+                continue;
+            }
+        };
+        let api_key = api_key.clone();
+        pending.spawn_blocking(move || {
+            let accepted = authenticate_peer(&mut stream, &api_key).is_ok();
+            (accepted.then_some(stream), peer_addr)
+        });
     }
 }
 
@@ -1772,6 +1775,45 @@ fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_
 
 // --- Permission Bridge ---
 
+/// The session AllowAlways grant one permission prompt installs, plus the
+/// `_meta` that tells the client exactly what it covers.
+///
+/// A caller-supplied suggestion wins. Without one, a path tool grants exactly
+/// the prompted path as a literal scope, so a model-chosen `/home/me/**`
+/// approved "for this session" never becomes a glob over the whole tree; any
+/// other tool grants its literal permission key. `_meta.suggestedPattern` is
+/// the human-readable rule (every installed scope, decoded) and
+/// `_meta.allowPatterns` lists the exact patterns handed to
+/// `add_session_allowlist`, primary first.
+fn allow_always_scope(
+    ask: &crate::permission::ask::AskRequest,
+) -> (String, serde_json::Map<String, serde_json::Value>) {
+    let pattern = match &ask.suggested_pattern {
+        Some(pattern) => pattern.clone(),
+        None => crate::permission::checker::exact_allow_scope_for_input(&ask.tool, &ask.input)
+            .unwrap_or_else(|| ask.input.clone()),
+    };
+    let installed: Vec<&String> = std::iter::once(&pattern)
+        .chain(&ask.additional_allow_patterns)
+        .collect();
+    let readable = installed
+        .iter()
+        .map(|pattern| crate::permission::pattern::describe_allow_pattern(pattern))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "suggestedPattern".to_owned(),
+        serde_json::Value::String(readable),
+    );
+    meta.insert("allowPatterns".to_owned(), serde_json::json!(installed));
+    meta.insert(
+        "scope".to_owned(),
+        serde_json::Value::String("session".to_owned()),
+    );
+    (pattern, meta)
+}
+
 async fn drive_permission_bridge(
     cx: ConnectionTo<Client>,
     session_id: SessionId,
@@ -1798,11 +1840,7 @@ async fn drive_permission_bridge(
             },
         };
 
-        let suggested = ask
-            .suggested_pattern
-            .as_deref()
-            .unwrap_or(&ask.input)
-            .to_string();
+        let (suggested, allow_always_meta) = allow_always_scope(&ask);
         let synthetic_tool_call_id = ask.tool_call_id.is_none();
         let title = if synthetic_tool_call_id {
             format!("Permission: {}", ask.tool)
@@ -1842,9 +1880,10 @@ async fn drive_permission_bridge(
             ),
             PermissionOption::new(
                 OPT_ALLOW_ALWAYS,
-                "Allow always",
+                "Allow for this session",
                 PermissionOptionKind::AllowAlways,
-            ),
+            )
+            .meta(allow_always_meta),
             PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
         ];
         let req = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
@@ -3695,6 +3734,139 @@ mod protocol_tests {
             },
             Message::assistant("tools-complete"),
         ]
+    }
+
+    #[tokio::test]
+    async fn allow_always_meta_names_the_exact_session_rule_it_installs() {
+        use crate::permission::ask::{AskRequest, UserDecision};
+
+        let requested = if cfg!(windows) {
+            r"C:\work\**"
+        } else {
+            "/work/**"
+        };
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
+        let control = Arc::new(TurnControl::new());
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async |_: InitializeRequest, responder, _cx| {
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                },
+                on_receive_request!(),
+            )
+            .with_spawned(move |cx| async move {
+                drive_permission_bridge(
+                    cx,
+                    SessionId::new("allow-always-meta"),
+                    ask_rx,
+                    control,
+                    #[cfg(feature = "goal")]
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )
+                .await;
+                Ok(())
+            });
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connection = Client
+            .builder()
+            .on_receive_request(
+                move |request: RequestPermissionRequest, responder, _cx| {
+                    let _ = request_tx.send((request, responder));
+                    async { Ok(()) }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(agent, async move |_cx| {
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                ask_tx
+                    .send(AskRequest {
+                        tool: "write".into(),
+                        input: requested.to_owned(),
+                        tool_call_id: Some("write-call".to_owned()),
+                        suggested_pattern: None,
+                        additional_allow_patterns: Vec::new(),
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+                let (request, responder) = request_rx.recv().await.unwrap();
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        "allow_always",
+                    )),
+                ))?;
+                Ok((request, receiver.await.unwrap()))
+            });
+        let (request, decision) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+                .await
+                .expect("the bridge must answer")
+                .unwrap();
+
+        let UserDecision::AllowAlways(installed) = decision else {
+            panic!("allow_always must install a session rule: {decision:?}");
+        };
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+            .expect("an allow-always option is offered");
+        assert_eq!(option.name, "Allow for this session");
+        let meta = option.meta.as_ref().expect("the option carries _meta");
+        assert_eq!(meta["allowPatterns"], serde_json::json!([installed]));
+        assert_eq!(meta["scope"], "session");
+        let readable = format!("exactly {}", requested.replace('\\', "/"));
+        assert_eq!(meta["suggestedPattern"], readable.as_str());
+
+        // What the checker receives is a literal path, not a glob over the
+        // tree the model named.
+        let matcher =
+            crate::permission::pattern::Pattern::new_generated_path_scope(&installed).unwrap();
+        assert!(matcher.matches_path(requested));
+        let sibling = if cfg!(windows) {
+            r"C:\work\sibling.txt"
+        } else {
+            "/work/sibling.txt"
+        };
+        assert!(!matcher.matches_path(sibling));
+    }
+
+    #[test]
+    fn allow_always_meta_lists_a_suggestion_and_its_additional_scopes() {
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        let (descendants, exact) = crate::permission::pattern::search_root_allow_scope("/repo");
+        let ask = crate::permission::ask::AskRequest {
+            tool: "grep".into(),
+            input: "/repo".to_owned(),
+            tool_call_id: None,
+            suggested_pattern: Some(descendants.clone()),
+            additional_allow_patterns: vec![exact.clone()],
+            reply,
+        };
+        let (pattern, meta) = allow_always_scope(&ask);
+        assert_eq!(pattern, descendants);
+        assert_eq!(
+            meta["allowPatterns"],
+            serde_json::json!([descendants, exact])
+        );
+        assert_eq!(
+            meta["suggestedPattern"],
+            "anything under /repo/ and exactly /repo"
+        );
+
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        let shell = crate::permission::ask::AskRequest {
+            tool: "shell".into(),
+            input: "rm -rf *".to_owned(),
+            tool_call_id: None,
+            suggested_pattern: None,
+            additional_allow_patterns: Vec::new(),
+            reply,
+        };
+        let (pattern, meta) = allow_always_scope(&shell);
+        assert_eq!(pattern, "rm -rf *");
+        assert_eq!(meta["suggestedPattern"], "rm -rf *");
     }
 
     #[tokio::test]
@@ -6977,31 +7149,67 @@ mod tcp_authentication_tests {
         }
     }
 
-    #[test]
-    fn racing_valid_peer_is_not_blocked_by_partial_peer() {
-        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let (server_tx, server_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = server_tx.send(accept_authenticated_peer(
-                listener,
-                "configured-key".to_owned(),
-            ));
-        });
+    /// Runs the plaintext accept loop over `source` and, on the blocking
+    /// pool, one partial peer followed by one valid peer; returns the address
+    /// the loop authenticated and the valid peer's own address.
+    async fn authenticate_after_partial_peer<S: accept::AcceptSource + 'static>(
+        source: S,
+        address: SocketAddr,
+    ) -> (SocketAddr, SocketAddr) {
+        let server = tokio::spawn(accept_authenticated_peer(
+            source,
+            "configured-key".to_owned(),
+            MAX_PENDING_AUTHENTICATIONS,
+        ));
+        let (partial, valid_address) = tokio::task::spawn_blocking(move || {
+            let mut partial = TcpStream::connect(address).unwrap();
+            let _ = read_challenge(&mut partial).unwrap();
 
-        let mut partial = TcpStream::connect(address).unwrap();
-        let _ = read_challenge(&mut partial).unwrap();
+            let mut valid = TcpStream::connect(address).unwrap();
+            let nonce = read_challenge(&mut valid).unwrap();
+            send_response(&mut valid, &nonce, "configured-key").unwrap();
+            (partial, valid.local_addr().unwrap())
+        })
+        .await
+        .unwrap();
 
-        let mut valid = TcpStream::connect(address).unwrap();
-        let nonce = read_challenge(&mut valid).unwrap();
-        send_response(&mut valid, &nonce, "configured-key").unwrap();
-        let valid_address = valid.local_addr().unwrap();
-
-        let (_, authenticated_address) = server_rx
-            .recv_timeout(Duration::from_secs(1))
+        let (_, authenticated_address) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
             .expect("a valid peer must not be blocked by a partial peer")
+            .unwrap()
             .unwrap();
-        assert_eq!(authenticated_address, valid_address);
+        drop(partial);
+        (authenticated_address, valid_address)
+    }
+
+    #[tokio::test]
+    async fn racing_valid_peer_is_not_blocked_by_partial_peer() {
+        let listener =
+            accept::tokio_listener(TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (authenticated, valid) = authenticate_after_partial_peer(listener, address).await;
+        assert_eq!(authenticated, valid);
+    }
+
+    #[tokio::test]
+    async fn aborted_accepts_do_not_stop_a_valid_peer_from_authenticating() {
+        let (source, address) = accept::test_support::FlakyListener::bind(
+            accept::test_support::per_connection_failures(),
+        );
+        let (authenticated, valid) = authenticate_after_partial_peer(source, address).await;
+        assert_eq!(authenticated, valid);
+    }
+
+    #[tokio::test]
+    async fn a_listener_failure_still_ends_the_plaintext_accept_loop() {
+        let (source, _) = accept::test_support::FlakyListener::bind(vec![std::io::Error::from(
+            std::io::ErrorKind::InvalidInput,
+        )]);
+        let error = accept_authenticated_peer(source, "configured-key".to_owned(), 4)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 

@@ -361,8 +361,11 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
         // Permission inputs for non-path tools are already canonical keys
         // (for example `mcp_tool:{server}:{tool}` or `git:commit`).  Grant
         // exactly that operation; a generated wildcard here would silently
-        // widen one approval to every operation in the tool family.
-        _ => input.to_string(),
+        // widen one approval to every operation in the tool family. The
+        // remaining path tools (`js/read_file`, `js/write_file`) grant exactly
+        // the prompted path, never a glob a `*` in that path would spell.
+        _ => crate::permission::checker::exact_allow_scope_for_input(tool, input)
+            .unwrap_or_else(|| input.to_string()),
     }
 }
 
@@ -462,6 +465,19 @@ mod tests {
         );
         assert_eq!(suggest_pattern("git", "git:commit"), "git:commit");
         assert_eq!(suggest_pattern("task", "task:review"), "task:review");
+    }
+
+    #[test]
+    fn js_path_suggestions_keep_glob_characters_literal() {
+        let pattern = suggest_pattern("js/write_file", "/workspace/**");
+        assert_eq!(
+            crate::permission::pattern::describe_allow_pattern(&pattern),
+            "exactly /workspace/**"
+        );
+        let matcher =
+            crate::permission::pattern::Pattern::new_generated_path_scope(&pattern).unwrap();
+        assert!(matcher.matches_path("/workspace/**"));
+        assert!(!matcher.matches_path("/workspace/sibling.txt"));
     }
 
     #[test]

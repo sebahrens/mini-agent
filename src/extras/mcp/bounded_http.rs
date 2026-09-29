@@ -659,6 +659,7 @@ mod tests {
             url,
             &HashMap::new(),
             None,
+            None,
             Duration::from_secs(10),
         )
         .await

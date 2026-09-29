@@ -1594,6 +1594,24 @@ fn is_git_execution_metadata(relative: &str) -> bool {
     }
 }
 
+/// The AllowAlways scope for a path-tool prompt that carries no
+/// caller-supplied suggestion: exactly the prompted path, encoded as a
+/// literal scope so a `*`, `?` or `[` in a model-chosen path never widens the
+/// grant into a glob (a prompt for `/home/me/**` must not approve the whole
+/// tree). The path is tilde-expanded and lexically normalized the same way
+/// [`PermissionChecker::check_path`] spells its inputs, so the grant matches
+/// the re-check. `None` for non-path tools, whose AllowAlways keys are
+/// already compared literally.
+pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<String> {
+    if !is_path_tool_name(canonical_permission_tool(tool)) {
+        return None;
+    }
+    let expanded = crate::fs::expand_tilde(input);
+    Some(crate::permission::pattern::exact_path_pattern(
+        &normalize_path(Path::new(&expanded)),
+    ))
+}
+
 fn is_path_tool_name(tool: &str) -> bool {
     matches!(
         tool,

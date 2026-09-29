@@ -113,6 +113,31 @@ describe('AgentSession --version probe', () => {
     session.dispose();
   });
 
+  it('probes and launches the same resolved executable', async () => {
+    const probe = new FakeProcess();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        probe.stdout.emit('data', Buffer.from('mini-agent 1.8.0\n'));
+        probe.exitCode = 0;
+        probe.emit('exit', 0, null);
+      });
+      return probe;
+    });
+    spawnMock.mockImplementationOnce(() => { throw new Error('launch stopped by test'); });
+    const session = makeSession('C:\\Tools\\mini-agent.exe');
+
+    await expect(session.start()).rejects.toThrow(/launch stopped by test/);
+
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    const [probeCall, launchCall] = spawnMock.mock.calls;
+    expect(probeCall?.[0]).toBe('C:\\Tools\\mini-agent.exe');
+    expect(probeCall?.[1]).toEqual(['--version']);
+    expect(launchCall?.[0]).toBe(probeCall?.[0]);
+    expect(launchCall?.[1]).toEqual(['--acp']);
+    expect(launchCall?.[2]).toMatchObject({ cwd: '/workspace', shell: false });
+    session.dispose();
+  });
+
   it('includes the executable path in spawn errors', async () => {
     const probe = new FakeProcess();
     spawnMock.mockImplementationOnce(() => {

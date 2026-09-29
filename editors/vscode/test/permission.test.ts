@@ -79,7 +79,8 @@ describe('buildPermissionDetail', () => {
   it('shows the command from the content text block, not only the tool name and id', () => {
     const detail = buildPermissionDetail(serverRequest('cargo test --workspace'));
     expect(detail).toContain('cargo test --workspace');
-    expect(detail).toContain('"Allow always" will persist a rule for this exact input.');
+    expect(detail).toContain('"Allow always" will allow this exact input for this session.');
+    expect(detail).not.toContain('persist');
     expect(detail).toContain('Tool call a1b2c3d4-0000-4000-8000-000000000000');
   });
 
@@ -90,12 +91,12 @@ describe('buildPermissionDetail', () => {
     expect(input?.endsWith('…')).toBe(true);
   });
 
-  it('names the persisted pattern when the server provides one', () => {
+  it('names the session rule when the server provides one', () => {
     const request = serverRequest('npm test');
     request.options = options.map(option => option.kind === 'allow_always'
       ? { ...option, _meta: { suggestedPattern: 'npm *' } }
       : option);
-    expect(buildPermissionDetail(request)).toContain('"Allow always" will persist this rule: npm *');
+    expect(buildPermissionDetail(request)).toContain('"Allow always" will allow this for this session: npm *');
   });
 
   it('falls back to a placeholder when there is no input', () => {
