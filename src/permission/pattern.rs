@@ -5,12 +5,21 @@ use regex::Regex;
 #[derive(Debug, Clone)]
 pub struct Pattern {
     regex: Regex,
+    /// Case-insensitive twin of `regex`, used only for deny decisions on
+    /// platforms whose default volumes are case-insensitive (macOS, Windows),
+    /// where `.ENV` opens the same file as `.env`.
+    #[cfg(any(target_os = "macos", windows))]
+    folded_regex: Regex,
     pub original: String,
     normalize_path_input: bool,
     /// Number of literal (non-wildcard) characters in the pattern. Rule
     /// resolution prefers the most specific matching pattern; see
     /// `docs/agent/CONFIG.md` ("Rule precedence").
     specificity: usize,
+    /// True when the pattern can only match absolute paths it names
+    /// explicitly (`/opt/**`, `~/src/**`, `^/opt/`), as opposed to a
+    /// relative or match-anything pattern such as `**/*.rs` or `src/**`.
+    absolute_anchored: bool,
 }
 
 impl Pattern {
@@ -20,7 +29,11 @@ impl Pattern {
         Pattern {
             regex: Regex::new(&glob_to_regex(&expanded))
                 .expect("glob conversion must always produce a valid regular expression"),
+            #[cfg(any(target_os = "macos", windows))]
+            folded_regex: Regex::new(&format!("(?i){}", glob_to_regex(&expanded)))
+                .expect("glob conversion must always produce a valid regular expression"),
             specificity: glob_specificity(&expanded),
+            absolute_anchored: is_absolute_path_text(&expanded),
             original,
             normalize_path_input: false,
         }
@@ -33,12 +46,27 @@ impl Pattern {
         // valid after the prefix.
         Ok(Pattern {
             regex: Regex::new(&format!("(?s){expanded}"))?,
+            #[cfg(any(target_os = "macos", windows))]
+            folded_regex: Regex::new(&format!("(?i)(?s){expanded}"))?,
             specificity: regex_specificity(&expanded),
+            absolute_anchored: expanded.strip_prefix('^').is_some_and(|rest| {
+                // A regex backslash starts an escape, so a UNC root is `\\\\` (two escaped backslashes).
+                rest.starts_with('/')
+                    || rest.starts_with(r"\\\\")
+                    || (!rest.starts_with('\\') && is_absolute_path_text(rest))
+            }),
             original: pattern.to_string(),
             // Regex syntax is caller-authored and raw: in particular, a
             // Windows deny regex may intentionally match `\\` separators.
             normalize_path_input: false,
         })
+    }
+
+    /// Whether this rule names an absolute location rather than matching
+    /// relative spellings or everything. Only anchored allow rules may grant
+    /// access outside the workspace without an `external_directory` allow.
+    pub fn is_absolute_anchored(&self) -> bool {
+        self.absolute_anchored
     }
 
     /// Literal-character count used for deterministic rule precedence.
@@ -75,11 +103,36 @@ impl Pattern {
             GeneratedScopeKind::Descendants => format!("^{escaped}/.+$"),
         };
         Some(Self {
+            #[cfg(any(target_os = "macos", windows))]
+            folded_regex: Regex::new(&format!("(?i){regex}")).ok()?,
             regex: Regex::new(&regex).ok()?,
             specificity: path.chars().count(),
+            absolute_anchored: true,
             original: encoded.to_string(),
             normalize_path_input: true,
         })
+    }
+
+    /// Path match used for deny rules: on macOS and Windows it also matches
+    /// any ASCII/Unicode case variant, because the default volumes there open
+    /// `Secrets/key` as the same file as `secrets/key`.
+    pub fn matches_path_for_deny(&self, input: &str) -> bool {
+        if self.matches_path(input) {
+            return true;
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            if self.normalize_path_input {
+                self.folded_regex
+                    .is_match(&normalize_path_separators(input))
+            } else {
+                self.folded_regex.is_match(input)
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            false
+        }
     }
 
     pub fn matches_path(&self, input: &str) -> bool {
@@ -169,6 +222,14 @@ fn decode_hex_path(encoded: &str) -> Option<String> {
         bytes.push(u8::from_str_radix(pair, 16).ok()?);
     }
     String::from_utf8(bytes).ok()
+}
+
+/// `/…`, `\\…`, or a Windows drive prefix such as `C:`.
+fn is_absolute_path_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.starts_with('/')
+        || text.starts_with('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 /// Count the literal characters of a glob: everything except `*` and `?`.

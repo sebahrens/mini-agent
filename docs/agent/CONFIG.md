@@ -679,7 +679,7 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
 | `async` | boolean | When `true`, the hook's `if` condition and handler run in the background and its decision is ignored. Agent-turn work owns the background task, so turn cancellation still terminates and reaps it before the turn settles. Default: `false`. |
@@ -800,8 +800,9 @@ control-sanitized block reason.
 Project-level hook handlers (`.zerostack/settings.json` — global and managed
 hooks are trusted automatically) require interactive confirmation the first
 time they'd run, keyed by a hash of the handler's definition (event +
-matcher + command/args/timeout/etc.); changing the definition changes the
-hash and requires re-confirmation. Confirmations persist to
+matcher + command/args/timeout/etc.) and of the content of every workspace
+file it executes; changing either changes the hash and requires
+re-confirmation. Confirmations persist to
 the state root at `hooks/trusted-hooks.json` (a user-level file, so child
 processes/orchestrated subagents sharing it inherit trust automatically). In
 headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped with
@@ -811,6 +812,32 @@ Project confirmation and subprocess authority are separate decisions. The
 confirmation hash includes `trust` and `env`, so either change requires new
 consent. Global and managed provenance does not silently select the trusted
 bypass: omitted `trust` still means `"sandboxed"` for every source.
+
+**Workspace hook files are content-bound.** A hook executable or script that
+lives inside the workspace (`./guard.sh`, `sh hooks/guard.sh`,
+`--config=hooks/policy.toml`, or a file named in an `if` condition such as
+`./check.sh`) is ordinary workspace content the model could otherwise rewrite
+to approve its own tool calls or escape the sandbox. When hooks load,
+zerostack records a SHA-256 digest of every such file: each argument, and each
+whitespace/shell-punctuation separated token of the arguments and condition,
+that resolves to an existing regular file inside the workspace (lexically or
+through a symlink) is bound, as is the resolved executable. Before every
+launch the same operands are re-resolved against the selected workspace; a
+changed file, a file that did not exist at load time, or a symlink retargeted
+elsewhere denies the launch (which blocks a `PreToolUse` call, fail-closed)
+until the session restarts. The `write`, `edit`, and JS `write_file` tools also
+refuse to modify a bound file in every security mode. For project hooks the
+digests are part of the confirmation hash and are shown in the prompt, so a
+rewritten script requires fresh confirmation on the next start; bindings that
+execute no workspace file keep their existing approval. Global and managed
+hooks are bound for the running session only, so point them at files outside
+the workspace. The binding is best-effort for shell text: variables expanded
+by a condition and files a script reads or sources on its own are not bound.
+
+Bare command names (`sh`, `python3`) resolve only through absolute `PATH`
+entries; empty, `.`, or other relative entries are ignored so a planted file in
+the workspace can never shadow a system executable. `if` conditions always run
+through `/bin/sh` on Unix.
 
 ### Global switches
 
@@ -1331,14 +1358,26 @@ permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, 
 `find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
 `git/show`, `git/stage`, `git/unstage`, `git/commit`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
-`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the default action,
+`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the
+default action applied when no rule for a tool matches. In `standard` mode an
+unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
+default (so `"*": ask` asks before workspace modifications), while unmatched
+workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
+external paths follow `external_directory`. Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
 `pwd`, `git status`, and `cargo test`) plus pattern-based deny rules.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
-inherited `read` access used by `lsp_diagnostics`.
+inherited `read` access used by `lsp_diagnostics`. When several
+`external_directory` rules match one path they follow the same
+order-independent precedence as tool rules (see Rule precedence): any `deny`
+wins, otherwise the most specific pattern, with `ask` beating `allow` on a tie.
+So `/tmp/**` allow plus `/**` ask allows `/tmp/x` and asks elsewhere, and a
+nested `~/.ssh/**` deny always beats a broader `~/**` allow. On Windows, where
+a path is also matched in its verbatim spelling, matching rules combine
+fail-closed instead (deny, then ask, then allow).
 
 `todo_write` replaces the structured task list stored with the current session;
 `todo_read` reads that same session-local list and performs no filesystem access.
@@ -1362,7 +1401,21 @@ redirects, substitutions, command lists, subshells, or background jobs that
 start with `echo`. Bash `ask` and `deny` entries remain pattern-based as
 best-effort workflow guardrails; shell syntax can reshape equivalent commands,
 so these patterns are not a containment boundary. An unmatched Bash script asks in `guarded` and
-`standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
+`standard`; `yolo` remains the explicit allow-all mode subject to deny rules,
+except that an unmatched script containing a recognizably destructive command
+still asks: `rm` with a recursive or force flag, `dd`, `mkfs`, `shred`,
+`wipefs`, `mkswap`, `fdisk`, `find … -delete`, recursive `chmod`/`chown`, and
+`git push --force`/`--delete`, `git reset --hard`, `git clean -f`, and
+`git branch -D`. Each command separated by a newline, `;`, `&`, or `|` is
+checked after leading `sudo`/`env`/`command`/`exec` wrappers. This check
+applies whether or not `bash` rules are configured, and a configured rule that
+matches the script (for example an exact `"rm -rf target": allow`) decides
+instead. Like other Bash patterns it is a best-effort guard rail, not a
+containment boundary, and in non-interactive runs the ask is refused. Note
+that configuring any `bash` rule replaces the built-in `bash` rule list
+(including its pattern-based denies such as `rm -rf /**` and `dd **`); only
+the built-in `^rm\s+.*\*` deny is always kept, so copy any built-in denies you
+still want into your own rules.
 
 `planwrite` is read-only except for the narrow built-in plan-file exception:
 `write`, `edit`, and `js/write_file` may modify `PLAN*.md` only when the
@@ -1436,7 +1489,9 @@ default action (`"*"`), the glob default takes precedence.
 When a rule resolves to `ask`, the TUI shows the request and these keys:
 
 - `y` allows this one call.
-- `a` allows the suggested scope (a path tree, or the exact shell script) for
+- `a` allows the suggested scope (a path tree for file tools; otherwise the
+  exact shell script, commit message, URL, or MCP operation, compared
+  literally so `*` or `?` inside it never widens the grant) for
   the rest of this session. It is recorded with the session for `--resume`
   but never written to the config.
 - `f` (only for `read`, `edit`, and `list_dir` requests) allows `read`,
@@ -1468,8 +1523,21 @@ characters) is more specific than `**` (none), while `README.md` falls through
 to the `**` ask rule. Path rules are matched against the absolute path, the
 path as the tool received it, and the workspace-relative spelling, so a
 relative rule such as `secrets/**` also applies when a tool passes the
-canonical absolute path. Bash scripts are checked as a whole and line by line
+canonical absolute path. On macOS and Windows, whose default volumes are
+case-insensitive, path `deny` rules (tool and `external_directory`) also match
+every case variant, so `read .ENV` or `read Secrets/key` cannot bypass a
+`.env` or `secrets/**` deny. Bash scripts are checked as a whole and line by line
 against deny rules: a deny that matches any line denies the entire script.
+
+Outside the working directory, a tool `allow` rule only counts when it names
+an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with
+`^/`). Relative or match-anything allows such as `**/*.rs`, `src/**`, or
+`read = "allow"` never grant an external path by themselves: the
+`external_directory` rules decide instead (asking when none match in
+`standard`). In the example above, writing `src/main.rs` is allowed, but writing
+another repository's `build.rs` or a file under `~/.cargo/registry` asks via
+the `/**` external rule. Tool `ask` and `deny` rules still apply to every
+spelling.
 
 As a TOML-friendly alternative to the nested `permission` object, you can use
 `permission-allow`, `permission-ask`, and `permission-deny` at the top level.

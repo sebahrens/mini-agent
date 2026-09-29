@@ -41,6 +41,9 @@ pub(crate) struct HookPolicy {
     sandbox: Sandbox,
     containment_supported: bool,
     env: std::collections::BTreeMap<String, String>,
+    /// Content digests of workspace-resident hook files, verified before
+    /// every launch. Dispatchers bound to a workspace always attach them.
+    content_pins: Option<Arc<super::pins::HookContentPins>>,
 }
 
 impl HookPolicy {
@@ -54,7 +57,17 @@ impl HookPolicy {
             sandbox: Sandbox::new(trust == HookTrust::Sandboxed, sandbox_backend),
             containment_supported: hook_containment_supported(sandbox_backend),
             env,
+            content_pins: None,
         }
+    }
+
+    /// Requires every launch under this policy to match `pins`.
+    pub(crate) fn with_content_pins(
+        mut self,
+        pins: Option<Arc<super::pins::HookContentPins>>,
+    ) -> Self {
+        self.content_pins = pins;
+        self
     }
 
     /// The sandbox policy as it applies to hooks: an available backend that
@@ -383,56 +396,39 @@ async fn run_hook_with_policy_and_limits(
         }
     };
     let project_dir_text = project_dir.to_string_lossy();
-    let program_path = std::path::Path::new(&program);
-    let program = if program_path.is_relative() && program_path.components().count() > 1 {
-        let resolved = match project_dir.join(program_path).canonicalize() {
-            Ok(path) if path.starts_with(&project_dir) => path,
-            Ok(_) => {
+    let search_path = policy
+        .env
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    let program =
+        match super::pins::resolve_hook_program(&program, search_path.as_deref(), &project_dir) {
+            Ok(path) => path,
+            Err(message) => {
                 return HookOutput {
                     started: false,
                     exit_code: None,
                     stdout: Vec::new(),
-                    stderr: b"relative hook executable escapes the project directory".to_vec(),
-                    status: HookStatus::PolicyDenied,
-                    diagnostics: policy.launch_denied_diagnostics(),
-                };
-            }
-            Err(error) => {
-                return HookOutput {
-                    started: false,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: format!("failed to resolve relative hook executable: {error}")
-                        .into_bytes(),
+                    stderr: message.into_bytes(),
                     status: HookStatus::PolicyDenied,
                     diagnostics: policy.launch_denied_diagnostics(),
                 };
             }
         };
-        resolved.to_string_lossy().into_owned()
-    } else if program_path.components().count() == 1 {
-        let search_path = policy
-            .env
-            .get("PATH")
-            .map(std::ffi::OsString::from)
-            .or_else(|| std::env::var_os("PATH"));
-        match which::which_in(&program, search_path.as_deref(), &project_dir) {
-            Ok(path) => path.to_string_lossy().into_owned(),
-            Err(error) => {
-                return HookOutput {
-                    started: false,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: format!("failed to resolve hook executable {program:?}: {error}")
-                        .into_bytes(),
-                    status: HookStatus::PolicyDenied,
-                    diagnostics: policy.launch_denied_diagnostics(),
-                };
-            }
-        }
-    } else {
-        program
-    };
+    if let Some(pins) = &policy.content_pins
+        && let Err(message) = pins.verify_launch(&project_dir, &program, &args)
+    {
+        tracing::warn!("hooks: {message}");
+        return HookOutput {
+            started: false,
+            exit_code: None,
+            stdout: Vec::new(),
+            stderr: message.into_bytes(),
+            status: HookStatus::PolicyDenied,
+            diagnostics: policy.launch_denied_diagnostics(),
+        };
+    }
+    let program = program.to_string_lossy().into_owned();
     let explicit_env = match policy.explicit_env(&project_dir_text) {
         Ok(env) => env,
         Err(message) => {
@@ -722,11 +718,7 @@ pub(crate) async fn run_shell_condition_at_root(
     policy: &HookPolicy,
     execution_root: &super::dispatcher::HookExecutionRootLease,
 ) -> HookOutput {
-    let (shell, flag) = if cfg!(windows) {
-        ("powershell", "-Command")
-    } else {
-        ("sh", "-c")
-    };
+    let (shell, flag) = super::pins::condition_shell();
     let args = vec![flag.to_string(), condition.to_string()];
     run_hook_with_policy_at_root(
         shell,
