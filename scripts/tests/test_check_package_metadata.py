@@ -1129,6 +1129,93 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
             self.assertTrue(any("checksums must match" in error for error in errors))
 
 
+class LinuxSandboxPrerequisiteValidationTests(unittest.TestCase):
+    def _copy_aur(self, root: Path) -> Path:
+        repository = SCRIPT.parents[1]
+        destination = root / "packaging/aur"
+        destination.mkdir(parents=True)
+        shutil.copy(repository / "packaging/aur/PKGBUILD", destination)
+        shutil.copy(repository / "packaging/aur/.SRCINFO", destination)
+        return destination
+
+    def test_checked_in_pkgbuild_declares_bubblewrap_optdepend(self) -> None:
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_linux_sandbox_prerequisites(
+                SCRIPT.parents[1]
+            ),
+        )
+        pkgbuild = (SCRIPT.parents[1] / "packaging/aur/PKGBUILD").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "optdepends=('bubblewrap: default sandbox and JS runtime')", pkgbuild
+        )
+
+    def test_missing_pkgbuild_optdepend_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self._copy_aur(Path(directory))
+            pkgbuild = destination / "PKGBUILD"
+            text = pkgbuild.read_text(encoding="utf-8")
+            pkgbuild.write_text(
+                "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not line.startswith("optdepends=")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_linux_sandbox_prerequisites(
+                Path(directory)
+            )
+
+            self.assertTrue(
+                any("must declare optdepends" in error for error in errors), errors
+            )
+
+    def test_srcinfo_optdepends_must_match_pkgbuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self._copy_aur(Path(directory))
+            srcinfo = destination / ".SRCINFO"
+            text = srcinfo.read_text(encoding="utf-8")
+            srcinfo.write_text(
+                "".join(
+                    line
+                    for line in text.splitlines(keepends=True)
+                    if "optdepends = " not in line
+                ),
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_linux_sandbox_prerequisites(
+                Path(directory)
+            )
+
+            self.assertIn(
+                "packaging/aur/.SRCINFO optdepends must match PKGBUILD", errors
+            )
+
+    def test_bubblewrap_as_hard_dependency_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self._copy_aur(Path(directory))
+            pkgbuild = destination / "PKGBUILD"
+            text = pkgbuild.read_text(encoding="utf-8")
+            pkgbuild.write_text(
+                text.replace("\ndepends=()\n", "\ndepends=('bubblewrap')\n", 1),
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_linux_sandbox_prerequisites(
+                Path(directory)
+            )
+
+            self.assertTrue(
+                any("keep bubblewrap optional" in error for error in errors), errors
+            )
+
+
 class ReleaseDigestValidationTests(unittest.TestCase):
     PREVIOUS_TAG = "v1.7.2"
     PREVIOUS_DIGEST = (

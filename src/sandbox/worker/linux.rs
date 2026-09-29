@@ -308,7 +308,7 @@ fn probe_containment() -> WorkerContainmentStatus {
         return unavailable("seccompiler does not support this Linux architecture");
     }
     let Some(bwrap) = trusted_bwrap() else {
-        return unavailable("trusted bubblewrap executable is unavailable");
+        return unavailable(super::super::BWRAP_MISSING_DIAGNOSTIC);
     };
     let Ok(executable) = worker_executable() else {
         return unavailable("current worker executable could not be resolved");
@@ -338,7 +338,8 @@ fn probe_containment() -> WorkerContainmentStatus {
                 };
             }
             Ok(Some(_)) => {
-                return unavailable("namespace, limit, or seccomp preflight failed");
+                let stderr = super::super::read_exited_probe_stderr(child.stderr.take());
+                return unavailable(failed_preflight_reason(&stderr));
             }
             Err(_) => {
                 cleanup_child(&mut child);
@@ -573,6 +574,20 @@ fn worker_executable() -> Result<PathBuf, WorkerLaunchError> {
             backend: BACKEND,
             source,
         })
+}
+
+/// Name a user-namespace restriction (for example Ubuntu's AppArmor userns policy) when the
+/// preflight stderr proves one; otherwise keep the generic closed reason. Stderr is only
+/// classified, never reported.
+fn failed_preflight_reason(stderr: &[u8]) -> &'static str {
+    let reason = super::super::classify_bwrap_preflight_stderr(stderr);
+    if reason == super::super::BWRAP_APPARMOR_USERNS_DIAGNOSTIC
+        || reason == super::super::BWRAP_USERNS_DISABLED_DIAGNOSTIC
+    {
+        reason
+    } else {
+        "namespace, limit, or seccomp preflight failed"
+    }
 }
 
 fn trusted_bwrap() -> Option<PathBuf> {
@@ -1580,5 +1595,25 @@ impl WorkerChild {
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
+    }
+}
+
+#[cfg(test)]
+mod preflight_reason_tests {
+    use super::failed_preflight_reason;
+
+    #[test]
+    fn apparmor_uid_map_denial_is_named_in_the_js_worker_reason() {
+        let reason = failed_preflight_reason(b"bwrap: setting up uid map: Permission denied\n");
+        assert!(reason.contains("AppArmor"), "{reason}");
+        assert!(reason.contains("kernel.apparmor_restrict_unprivileged_userns=0"));
+    }
+
+    #[test]
+    fn unclassified_worker_preflight_failures_keep_the_generic_reason() {
+        assert_eq!(
+            failed_preflight_reason(b"seccomp probe failed: secret-value\n"),
+            "namespace, limit, or seccomp preflight failed"
+        );
     }
 }

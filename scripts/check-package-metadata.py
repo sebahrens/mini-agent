@@ -1380,6 +1380,42 @@ def validate_aur_srcinfo_checksums(root: Path) -> list[str]:
     return errors
 
 
+AUR_BUBBLEWRAP_OPTDEPEND = "bubblewrap: default sandbox and JS runtime"
+
+
+def validate_linux_sandbox_prerequisites(root: Path) -> list[str]:
+    """Advertise bubblewrap, the default Linux sandbox and JS worker backend.
+
+    The binary still installs and runs without it (degraded or fail-closed), so
+    it is an optional dependency rather than a hard one.
+    """
+
+    pkgbuild_path = root / "packaging/aur/PKGBUILD"
+    srcinfo_path = root / "packaging/aur/.SRCINFO"
+    if not pkgbuild_path.is_file() or not srcinfo_path.is_file():
+        return ["AUR PKGBUILD and .SRCINFO are both required"]
+
+    pkgbuild = pkgbuild_path.read_text(encoding="utf-8")
+    srcinfo = srcinfo_path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    optdepends = re.search(r"^optdepends=\(([^)]*)\)$", pkgbuild, re.MULTILINE)
+    entries = re.findall(r"'([^']*)'", optdepends.group(1)) if optdepends else []
+    if AUR_BUBBLEWRAP_OPTDEPEND not in entries:
+        errors.append(
+            "packaging/aur/PKGBUILD must declare "
+            f"optdepends=('{AUR_BUBBLEWRAP_OPTDEPEND}')"
+        )
+    srcinfo_entries = re.findall(r"^\s*optdepends = (.+)$", srcinfo, re.MULTILINE)
+    if entries != srcinfo_entries:
+        errors.append("packaging/aur/.SRCINFO optdepends must match PKGBUILD")
+    if re.search(r"^depends=\([^)]*bubblewrap", pkgbuild, re.MULTILINE):
+        errors.append(
+            "packaging/aur/PKGBUILD must keep bubblewrap optional (optdepends), "
+            "not a hard depends"
+        )
+    return errors
+
+
 def indexed_files(root: Path) -> list[str]:
     """Return only files in Git's release index, excluding developer-local files."""
     result = subprocess.run(
@@ -1659,6 +1695,7 @@ def validate(
     errors.extend(validate_license_identity(root))
     errors.extend(validate_distribution_notice_installs(root))
     errors.extend(validate_aur_srcinfo_checksums(root))
+    errors.extend(validate_linux_sandbox_prerequisites(root))
     errors.extend(validate_stale_coordinates(root))
     errors.extend(validate_removed_nix_surface(root))
     errors.extend(validate_local_markdown_links(root))

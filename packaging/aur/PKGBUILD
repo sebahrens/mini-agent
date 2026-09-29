@@ -12,6 +12,7 @@ provides=('mini-agent')
 conflicts=('mini-agent')
 makedepends=()
 depends=()
+optdepends=('bubblewrap: default sandbox and JS runtime')
 
 source_x86_64=(
     "${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v${pkgver}/mini-agent-x86_64-unknown-linux-musl.tar.gz"

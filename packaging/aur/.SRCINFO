@@ -8,6 +8,7 @@ pkgbase = zerostack-bin
 	license = GPL-3.0-only
 	provides = mini-agent
 	conflicts = mini-agent
+	optdepends = bubblewrap: default sandbox and JS runtime
 	source_x86_64 = zerostack-bin-1.9.4-x86_64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v1.9.4/mini-agent-x86_64-unknown-linux-musl.tar.gz
 	source_x86_64 = LICENSE::https://raw.githubusercontent.com/sebahrens/mini-agent/v1.9.4/LICENSE
 	sha256sums_x86_64 = ab9feae6f7b7ffe3de03b8068847651c564671c3c74782ba5141f308d6653cd0
