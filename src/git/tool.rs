@@ -525,7 +525,7 @@ impl GitTool {
                     "log".into(),
                     format!("--max-count={count}"),
                     "--date=iso-strict".into(),
-                    "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x00".into(),
+                    LOG_FORMAT.into(),
                 ];
                 if let Some(revision) = args.revision {
                     command.push(revision);
@@ -533,30 +533,12 @@ impl GitTool {
                 command.push("--".into());
                 command.extend(paths);
                 let output = self.run("log", command, TEXT_LIMITS, true).await?;
-                let fields = output
-                    .stdout
-                    .split(|byte| *byte == 0)
-                    .filter(|field| !field.is_empty())
-                    .map(|field| String::from_utf8_lossy(field).trim_end().to_string())
-                    .collect::<Vec<_>>();
-                if fields.len() % 6 != 0 {
-                    return Err(ToolError::Msg(
-                        "git log output had unexpected field count".to_string(),
-                    ));
-                }
-                let commits = fields
-                    .chunks_exact(6)
-                    .map(|field| {
-                        serde_json::json!({
-                            "id": field[0], "parents": field[1], "author": field[2],
-                            "email": field[3], "authored_at": field[4], "subject": field[5],
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let truncated = matches!(output.status, CommandStatus::OutputLimitExceeded(_));
+                let commits = parse_log_records(&output.stdout, truncated)?;
                 Ok(serde_json::json!({
                     "operation": "log",
                     "commits": commits,
-                    "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
+                    "truncated": truncated,
                     "coaching": coaching,
                 }))
             }
@@ -594,6 +576,44 @@ impl GitTool {
             GitOperation::Commit => self.commit(args).await,
         }
     }
+}
+
+/// `git log` pretty format: NUL-separated fields, each record ended by an ASCII
+/// record separator. Git's tformat also appends a newline after every record,
+/// so parsing splits records first and then fields, keeping empty fields (a
+/// root commit has an empty `%P`).
+const LOG_FORMAT: &str = "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e";
+const LOG_FIELD_COUNT: usize = 6;
+
+fn parse_log_records(stdout: &[u8], truncated: bool) -> Result<Vec<serde_json::Value>, ToolError> {
+    let mut records = stdout.split(|byte| *byte == 0x1e).collect::<Vec<_>>();
+    // What follows the final terminator is only the trailing newline for
+    // complete output, or a partial record when the output limit cut it off.
+    let tail = records.pop().unwrap_or_default();
+    if !truncated && !tail.iter().all(u8::is_ascii_whitespace) {
+        return Err(ToolError::Msg(
+            "git log output had an unterminated record".to_string(),
+        ));
+    }
+    records
+        .into_iter()
+        .map(|record| {
+            let record = record.strip_prefix(b"\n").unwrap_or(record);
+            let fields = record
+                .split(|byte| *byte == 0)
+                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .collect::<Vec<_>>();
+            if fields.len() != LOG_FIELD_COUNT {
+                return Err(ToolError::Msg(
+                    "git log output had unexpected field count".to_string(),
+                ));
+            }
+            Ok(serde_json::json!({
+                "id": fields[0], "parents": fields[1], "author": fields[2],
+                "email": fields[3], "authored_at": fields[4], "subject": fields[5],
+            }))
+        })
+        .collect()
 }
 
 impl Tool for GitTool {
@@ -964,6 +984,76 @@ mod tests {
         assert_eq!(
             mutation_status(crate::sandbox::CommandStatus::Cancelled, None),
             "cancelled"
+        );
+    }
+
+    fn log_args(max_count: Option<u16>) -> GitArgs {
+        GitArgs {
+            max_count,
+            ..args(GitOperation::Log, &[], None)
+        }
+    }
+
+    #[tokio::test]
+    async fn log_reports_a_single_root_commit_with_empty_parents() {
+        let repo = TestRepo::new();
+        repo.write("root.txt", "root\n");
+        repo.git(["add", "root.txt"]);
+        repo.git(["commit", "--quiet", "-m", "root subject"]);
+        let head = repo.git(["rev-parse", "HEAD"]).trim().to_string();
+
+        let log = repo
+            .tool()
+            .call(log_args(Some(1)))
+            .await
+            .expect("log a single root commit");
+        let commits = log["commits"].as_array().expect("commits array");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["id"], head);
+        assert_eq!(commits[0]["parents"], "");
+        assert_eq!(commits[0]["author"], "Mini Agent Test");
+        assert_eq!(commits[0]["email"], "mini-agent@example.invalid");
+        assert_eq!(commits[0]["subject"], "root subject");
+        assert_eq!(log["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn log_keeps_fields_aligned_across_commits_reaching_the_root() {
+        let repo = TestRepo::new();
+        repo.write("file.txt", "one\n");
+        repo.git(["add", "file.txt"]);
+        repo.git(["commit", "--quiet", "-m", "first"]);
+        let first = repo.git(["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("file.txt", "two\n");
+        repo.git(["commit", "--quiet", "-am", "second"]);
+        let second = repo.git(["rev-parse", "HEAD"]).trim().to_string();
+
+        let log = repo.tool().call(log_args(None)).await.expect("log history");
+        let commits = log["commits"].as_array().expect("commits array");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["id"], second);
+        assert_eq!(commits[0]["parents"], first);
+        assert_eq!(commits[0]["subject"], "second");
+        assert_eq!(commits[1]["id"], first);
+        assert_eq!(commits[1]["parents"], "");
+        assert_eq!(commits[1]["subject"], "first");
+    }
+
+    #[test]
+    fn log_parser_drops_a_partial_record_only_when_output_was_truncated() {
+        let complete = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n\0e\0t\0s2\x1e\n";
+        let partial = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n";
+        let parsed = super::parse_log_records(complete, false).expect("complete output");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1]["id"], "b");
+        assert_eq!(parsed[1]["parents"], "a");
+        let parsed = super::parse_log_records(partial, true).expect("truncated output");
+        assert_eq!(parsed.len(), 1);
+        assert!(super::parse_log_records(partial, false).is_err());
+        assert!(
+            super::parse_log_records(b"", false)
+                .expect("empty history")
+                .is_empty()
         );
     }
 
