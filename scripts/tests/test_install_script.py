@@ -74,23 +74,74 @@ class InstallScriptTests(unittest.TestCase):
         stub_bin = root / "stub-bin"
         stub_bin.mkdir()
         curl = stub_bin / "curl"
+        # Anonymous requests are served from INSTALL_TEST_RELEASE. Requests to
+        # the GitHub REST API are served from INSTALL_TEST_AUTH_RELEASE and
+        # only when a header file carries "Bearer $INSTALL_TEST_TOKEN".
         curl.write_text(
             """#!/bin/bash
 set -euo pipefail
 output=""
+auth=""
 for ((index = 1; index <= $#; index++)); do
+    next=$((index + 1))
     if [[ "${!index}" == "-o" ]]; then
-        next=$((index + 1))
         output="${!next}"
+    elif [[ "${!index}" == "-H" && "${!next}" == @* ]]; then
+        header_file="${!next#@}"
+        auth="$(cat "$header_file")"
     fi
 done
 url="${!#}"
-filename="${url##*/}"
-cp "${INSTALL_TEST_RELEASE}/${filename}" "$output"
+printf '%s\\n' "$*" >> "${INSTALL_TEST_CURL_LOG:-/dev/null}"
+case "$url" in
+    https://api.github.com/*)
+        if [[ "$auth" != "Authorization: Bearer ${INSTALL_TEST_TOKEN:-}" ]]; then
+            exit 22
+        fi
+        case "$url" in
+            */releases/tags/v1.7.2|*/releases/latest)
+                cp "${INSTALL_TEST_AUTH_RELEASE}/release.json" "$output" ;;
+            */releases/assets/101)
+                cp "${INSTALL_TEST_AUTH_RELEASE}/mini-agent-aarch64-apple-darwin.tar.gz" "$output" ;;
+            */releases/assets/102)
+                cp "${INSTALL_TEST_AUTH_RELEASE}/SHA256SUMS" "$output" ;;
+            *) exit 22 ;;
+        esac
+        ;;
+    *)
+        filename="${url##*/}"
+        cp "${INSTALL_TEST_RELEASE}/${filename}" "$output"
+        ;;
+esac
 """,
             encoding="utf-8",
         )
         curl.chmod(0o755)
+        gh = stub_bin / "gh"
+        gh.write_text(
+            """#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "${INSTALL_TEST_GH_LOG:-/dev/null}"
+if [[ "$1 $2" == "auth status" ]]; then
+    exit "${INSTALL_TEST_GH_AUTH_STATUS:-0}"
+fi
+if [[ "$1 $2" == "release download" ]]; then
+    dir=""
+    for ((index = 1; index <= $#; index++)); do
+        next=$((index + 1))
+        if [[ "${!index}" == "--dir" ]]; then
+            dir="${!next}"
+        fi
+    done
+    cp "${INSTALL_TEST_AUTH_RELEASE}/mini-agent-aarch64-apple-darwin.tar.gz" "$dir/"
+    cp "${INSTALL_TEST_AUTH_RELEASE}/SHA256SUMS" "$dir/"
+    exit 0
+fi
+exit 2
+""",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
         uname = stub_bin / "uname"
         uname.write_text(
             """#!/bin/sh
@@ -114,8 +165,16 @@ fi
         install_dir: str | None = None,
         path_prefix: list[Path] | None = None,
         home: Path | None = None,
+        extra_env: dict[str, str] | None = None,
+        release_version: str | None = "1.7.2",
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        # A developer's real credentials and gh login must never reach the
+        # installer under test; authenticated tests opt back in explicitly.
+        for name in ("GITHUB_TOKEN", "GH_TOKEN", "MINI_AGENT_INSTALL_NO_TOKEN"):
+            env.pop(name, None)
+        env["MINI_AGENT_INSTALL_NO_GH"] = "1"
+        env.update(extra_env or {})
         # Keep any real mini-agent on the developer's PATH from influencing
         # the PATH-resolution checks.
         system_path = os.pathsep.join(
@@ -128,12 +187,12 @@ fi
         env["INSTALL_TEST_RELEASE"] = str(release)
         if home is not None:
             env["HOME"] = str(home)
+        release_args = ["--release", release_version] if release_version else []
         return subprocess.run(
             [
                 "bash",
                 str(INSTALLER),
-                "--release",
-                "1.7.2",
+                *release_args,
                 "--dir",
                 install_dir if install_dir is not None else str(root / "prefix" / "bin"),
             ],
@@ -365,6 +424,197 @@ fi
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertNotIn("is not in your PATH", result.stdout)
             self.assertNotIn("different binary", result.stdout)
+
+    # ---- authenticated fallbacks (GITHUB_TOKEN / gh) ----
+
+    TOKEN = "ghp_test_token_value"
+
+    def make_private_fixture(self, directory: str) -> tuple[Path, Path, dict[str, str]]:
+        """A release whose anonymous URLs serve a sign-in page while the
+        authenticated API and gh serve the real assets."""
+        root = Path(directory)
+        release, stub_bin = self.make_fixture(directory)
+        auth_release = root / "auth-release"
+        auth_release.mkdir()
+        for name in ("mini-agent-aarch64-apple-darwin.tar.gz", "SHA256SUMS"):
+            (auth_release / name).write_bytes((release / name).read_bytes())
+            (release / name).write_text("<!DOCTYPE html><html>Sign in</html>\n")
+        api = "https://api.github.com/repos/sebahrens/mini-agent/releases"
+        (auth_release / "release.json").write_text(
+            "{\n"
+            f'  "url": "{api}/9",\n'
+            '  "name": "v1.7.2",\n'
+            '  "assets": [\n'
+            # A foreign asset URL for the same name must never be used.
+            '    {"url": "https://evil.example/repos/x/releases/assets/7",'
+            ' "name": "decoy"},\n'
+            f'    {{"url": "{api}/assets/101", "id": 101,'
+            ' "name": "mini-agent-aarch64-apple-darwin.tar.gz",'
+            ' "uploader": {"url": "https://api.github.com/users/someone"}},\n'
+            f'    {{"url": "{api}/assets/102", "id": 102, "name": "SHA256SUMS"}}\n'
+            "  ]\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        env = {
+            "INSTALL_TEST_AUTH_RELEASE": str(auth_release),
+            "INSTALL_TEST_TOKEN": self.TOKEN,
+            "INSTALL_TEST_CURL_LOG": str(root / "curl.log"),
+            "INSTALL_TEST_GH_LOG": str(root / "gh.log"),
+        }
+        return release, stub_bin, env
+
+    def test_github_token_fallback_installs_private_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["GITHUB_TOKEN"] = self.TOKEN
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("retrying with GITHUB_TOKEN", result.stderr)
+            self.assertIn("Downloaded release assets with GITHUB_TOKEN", result.stdout)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            curl_log = (root / "curl.log").read_text()
+            # The token travels in a header file, never on the command line.
+            self.assertNotIn(self.TOKEN, curl_log)
+            self.assertIn("/releases/tags/v1.7.2", curl_log)
+            self.assertIn("/releases/assets/101", curl_log)
+            self.assertNotIn("evil.example", curl_log)
+            self.assertFalse((root / "gh.log").exists())
+
+    def test_github_token_fallback_still_verifies_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            archive = Path(env["INSTALL_TEST_AUTH_RELEASE"]) / (
+                "mini-agent-aarch64-apple-darwin.tar.gz"
+            )
+            archive.write_bytes(archive.read_bytes() + b"tampered")
+            env["GITHUB_TOKEN"] = self.TOKEN
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("checksum mismatch", result.stderr)
+            self.assertFalse((root / "prefix/bin/mini-agent").exists())
+
+    def test_rejected_github_token_reports_original_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["GITHUB_TOKEN"] = "wrong-token"
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not a release asset (received an HTML page)", result.stderr)
+            self.assertIn("Authenticated retries also failed: GITHUB_TOKEN", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    def test_no_token_switch_ignores_github_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["GITHUB_TOKEN"] = self.TOKEN
+            env["MINI_AGENT_INSTALL_NO_TOKEN"] = "1"
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertNotIn("api.github.com", (root / "curl.log").read_text())
+
+    def test_authenticated_gh_fallback_installs_private_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["MINI_AGENT_INSTALL_NO_GH"] = ""
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("Downloaded release assets with gh", result.stdout)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            gh_log = (root / "gh.log").read_text().splitlines()
+            self.assertEqual("auth status", gh_log[0])
+            self.assertEqual(
+                "release download v1.7.2 --repo sebahrens/mini-agent"
+                " --pattern mini-agent-aarch64-apple-darwin.tar.gz"
+                " --pattern SHA256SUMS --dir ",
+                gh_log[1][: gh_log[1].index("--dir ") + len("--dir ")],
+            )
+
+    def test_gh_fallback_for_latest_release_omits_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["MINI_AGENT_INSTALL_NO_GH"] = ""
+
+            result = self.run_installer(
+                root, release, stub_bin, extra_env=env, release_version=None
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            gh_log = (root / "gh.log").read_text().splitlines()
+            self.assertTrue(gh_log[1].startswith("release download --repo "), gh_log)
+
+    def test_gh_fallback_still_verifies_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            (Path(env["INSTALL_TEST_AUTH_RELEASE"]) / "SHA256SUMS").write_text(
+                "0" * 64 + "  mini-agent-aarch64-apple-darwin.tar.gz\n"
+            )
+            env["MINI_AGENT_INSTALL_NO_GH"] = ""
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("checksum mismatch", result.stderr)
+            self.assertFalse((root / "prefix/bin/mini-agent").exists())
+
+    def test_unauthenticated_gh_is_not_used(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env["MINI_AGENT_INSTALL_NO_GH"] = ""
+            env["INSTALL_TEST_GH_AUTH_STATUS"] = "1"
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("gh auth login", result.stderr)
+            self.assertEqual(["auth status"], (root / "gh.log").read_text().splitlines())
+            self.assertFalse((root / "prefix").exists())
+
+    def test_no_gh_switch_never_invokes_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertFalse((root / "gh.log").exists())
+
+    def test_successful_anonymous_download_never_uses_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            env = {
+                "GITHUB_TOKEN": self.TOKEN,
+                "MINI_AGENT_INSTALL_NO_GH": "",
+                "INSTALL_TEST_CURL_LOG": str(root / "curl.log"),
+                "INSTALL_TEST_GH_LOG": str(root / "gh.log"),
+            }
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("api.github.com", (root / "curl.log").read_text())
+            self.assertNotIn(" -H ", (root / "curl.log").read_text())
+            self.assertFalse((root / "gh.log").exists())
 
 
 if __name__ == "__main__":
