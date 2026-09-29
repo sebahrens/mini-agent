@@ -22,9 +22,9 @@ Build from a Windows checkout with the .NET 6 or newer SDK:
 dotnet build packaging/windows/installer.wixproj `
   --configuration Release `
   --output msi-output `
-  -p:ProductVersion=1.9.3 `
+  -p:ProductVersion=1.9.4 `
   -p:BinaryPath=C:\artifacts\mini-agent.exe `
-  -p:VsixPath=C:\artifacts\mini-agent-1.9.3-win32-x64.vsix
+  -p:VsixPath=C:\artifacts\mini-agent-1.9.4-win32-x64.vsix
 ```
 
 Silent per-user install (the default):

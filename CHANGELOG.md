@@ -6,9 +6,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
-## [1.9.3] - 2026-09-29
+## [1.9.4] - 2026-09-29
 
-Versions 1.9.0 to 1.9.2 were not published from this repository.
+Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but
+its release build was cancelled after CI found a Linux/Windows build break, so nothing was published
+as 1.9.3; all of its changes ship in 1.9.4.
 
 ### Security
 
@@ -297,6 +299,6 @@ Versions 1.9.0 to 1.9.2 were not published from this repository.
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.9.3...HEAD
-[1.9.3]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.3
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...HEAD
+[1.9.4]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.4
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0

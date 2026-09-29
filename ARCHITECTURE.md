@@ -1,4 +1,4 @@
-# Architecture Overview — mini-agent v1.9.3
+# Architecture Overview — mini-agent v1.9.4
 
 > **mini-agent** is a minimalistic coding agent with a built-in QuickJS engine, TUI, sandboxed workers, MCP/LSP integration, persistent skill learning, and autonomous loop/goal features. It is a single Rust binary using `rig-core` for LLM abstraction, `crossterm` for terminal UI, `tokio` for async I/O, and `rquickjs` for embedded JavaScript execution.
 

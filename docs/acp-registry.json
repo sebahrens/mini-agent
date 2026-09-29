@@ -2,7 +2,7 @@
   "schema_version": "1.0",
   "agent": {
     "name": "mini-agent",
-    "version": "1.9.3",
+    "version": "1.9.4",
     "description": "Minimalistic coding agent with built-in JS engine",
     "homepage": "https://github.com/sebahrens/mini-agent",
     "protocol": {
