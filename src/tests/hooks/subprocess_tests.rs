@@ -337,6 +337,42 @@ async fn hook_subprocess_limits_infinite_process_times_out_promptly() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
+/// mini-agent-8cxmy: a timed-out trusted Windows hook is ended with its
+/// descendants through its kill-on-close Job, instead of first waiting ~4 s
+/// for an AppContainer helper cancellation event it can never create.
+#[cfg(windows)]
+#[tokio::test]
+async fn hook_subprocess_windows_trusted_timeout_ends_tree_without_helper_wait() {
+    let system32 = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").expect("Windows provides SystemRoot"),
+    )
+    .join("System32");
+    let cmd = system32.join("cmd.exe");
+    // The hook environment is explicit and has no PATH, so name the
+    // descendant by absolute path. `ping` outlives `cmd` unless the tree dies.
+    let args = vec![
+        "/d".to_string(),
+        "/c".to_string(),
+        format!("{} -n 30 127.0.0.1", system32.join("PING.EXE").display()),
+    ];
+    let started = Instant::now();
+    let output = run_hook(
+        &cmd.to_string_lossy(),
+        Some(&args),
+        b"",
+        Duration::from_millis(300),
+        super::TEST_WORKING_DIR,
+    )
+    .await;
+
+    assert_eq!(output.status, HookStatus::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "trusted hook termination waited {:?}",
+        started.elapsed()
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn hook_subprocess_limits_forked_descendant_is_terminated() {
