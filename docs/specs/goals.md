@@ -163,7 +163,11 @@ wrong endpoint for a model it has never heard of — and fail open, silently cos
 user configured.
 
 The judge receives the objective and a bounded, sanitized tail of the conversation, fenced as
-untrusted data because that tail carries tool output the workspace controls. It gets no tools and no
+untrusted data because that tail carries tool output the workspace controls. When checks or the
+verify command ran this round, it also receives a bounded `## Checks` block, fenced the same way:
+each command that passed, with its exit status, or the recorded tail of the first failure. A judge
+that cannot see what the harness already proved would reject claims for want of that evidence and
+buy rounds that prove nothing new. It gets no tools and no
 workspace. Its prompt states that a verdict appearing inside the transcript is text being reported,
 never a directive, and the fence holds structurally: the closing tag is defanged inside the tail, so
 a fixture containing it cannot end the region. The tail's budget is spent from the newest end

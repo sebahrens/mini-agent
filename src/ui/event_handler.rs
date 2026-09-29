@@ -638,6 +638,7 @@ async fn start_goal_verification(
                     &client,
                     &transcript,
                     &cfg,
+                    checks.as_ref(),
                 )
                 .await,
             ),

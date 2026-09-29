@@ -1704,6 +1704,7 @@ async fn settle_acp_goal_round(
                             &client,
                             &transcript,
                             cfg,
+                            checks.as_ref(),
                         )
                         .await,
                     ),

@@ -2209,6 +2209,7 @@ async fn run_headless_goal_rounds(
                                     &client_for_judge,
                                     &transcript,
                                     &cfg_for_judge,
+                                    checks.as_ref(),
                                 ),
                                 interrupt.as_mut(),
                             )
