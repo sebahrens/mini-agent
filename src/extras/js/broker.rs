@@ -103,22 +103,55 @@ pub(crate) enum GrantPrincipal {
     },
 }
 
-/// Parent-owned record of learned-skill invocations that hit a capability-policy denial.
+/// Parent-owned record of learned-skill invocations whose brokered effects were denied by the
+/// skill's own capability authority, split by who caused the denial.
+///
+/// A *capability-policy fault* is attributable to the skill revision: it used an operation its
+/// grant does not hold, its manifest does not declare the capability at all, or a declared spawn
+/// program no longer resolves to the executable identity pinned at grant time. A *scope miss* is
+/// target-derived: the skill declared the capability, but the argument it forwarded (a path,
+/// origin, method, or program name that normally comes from the caller) is outside the declared
+/// prefixes, origins, or programs. Only faults feed the immediate `CapabilityDenied` quarantine
+/// path; scope misses become threw-class telemetry behind the behavioural threshold
+/// (docs/specs/phase-5-evidence-learning.md section 12a.1). Both are denied and audited alike.
 #[cfg(feature = "skills")]
 #[derive(Clone, Default)]
-pub(crate) struct CapabilityDenialTracker(Arc<Mutex<BTreeSet<String>>>);
+pub(crate) struct CapabilityDenialTracker(Arc<Mutex<SkillDenialSnapshot>>);
+
+/// Snapshot of [`CapabilityDenialTracker`], keyed by learned-skill invocation id.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkillDenialSnapshot {
+    pub(crate) capability_faults: BTreeSet<String>,
+    pub(crate) scope_misses: BTreeSet<String>,
+}
 
 #[cfg(feature = "skills")]
 impl CapabilityDenialTracker {
-    fn record(&self, invocation_id: String) {
+    fn record(&self, invocation_id: String, class: ManifestDenial) {
         if let Ok(mut denials) = self.0.lock() {
-            denials.insert(invocation_id);
+            match class {
+                ManifestDenial::PolicyFault => denials.capability_faults.insert(invocation_id),
+                ManifestDenial::ScopeMiss => denials.scope_misses.insert(invocation_id),
+            };
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Option<BTreeSet<String>> {
+    pub(crate) fn snapshot(&self) -> Option<SkillDenialSnapshot> {
         self.0.lock().ok().map(|denials| denials.clone())
     }
+}
+
+/// Why a learned-skill manifest check denied an effect. Both classes surface to the worker and
+/// the audit log as the same denial; the class only decides how parent telemetry attributes it.
+#[cfg(feature = "skills")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestDenial {
+    /// The declared capability exists, but the caller-derived target is outside its scope.
+    ScopeMiss,
+    /// The operation is outside the declared capability set, or the grant/manifest binding is
+    /// inconsistent. Attributable to the skill revision itself.
+    PolicyFault,
 }
 
 /// Immutable authority issued by the parent for exactly one invocation.
@@ -1021,6 +1054,10 @@ pub(crate) struct InvocationBroker<S> {
     issued_skill_grants: usize,
     #[cfg(feature = "skills")]
     capability_denials: CapabilityDenialTracker,
+    /// Class of the most recent manifest denial raised by `prepare_effect`, consumed by
+    /// `handle_effect` to attribute the denial to the right telemetry class.
+    #[cfg(feature = "skills")]
+    last_manifest_denial: Option<ManifestDenial>,
     #[cfg(test)]
     fail_completion_durability: Option<super::audit::AuditFailurePoint>,
 }
@@ -1055,6 +1092,8 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             issued_skill_grants: 0,
             #[cfg(feature = "skills")]
             capability_denials: CapabilityDenialTracker::default(),
+            #[cfg(feature = "skills")]
+            last_manifest_denial: None,
             #[cfg(test)]
             fail_completion_durability: None,
         })
@@ -1077,6 +1116,19 @@ impl<S: ParentEffectService> InvocationBroker<S> {
     #[cfg(feature = "skills")]
     pub(crate) fn capability_denial_tracker(&self) -> CapabilityDenialTracker {
         self.capability_denials.clone()
+    }
+
+    /// Map a classified manifest denial to the single wire/audit denial while remembering its
+    /// class for parent telemetry attribution.
+    #[cfg(feature = "skills")]
+    fn manifest_checked(
+        &mut self,
+        result: Result<(), ManifestDenial>,
+    ) -> Result<(), HostEffectError> {
+        result.map_err(|class| {
+            self.last_manifest_denial = Some(class);
+            HostEffectError::ManifestDenied
+        })
     }
 
     #[cfg(feature = "skills")]
@@ -1355,7 +1407,12 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         };
         self.service
             .validate_target(&authorized, &request.operation)?;
-        enforce_manifest_operation_scope(&grant, capability, &request.operation)?;
+        #[cfg(feature = "skills")]
+        self.manifest_checked(enforce_manifest_operation_scope(
+            &grant,
+            capability,
+            &request.operation,
+        ))?;
         if !self.session_allowed.contains(&capability) {
             return Err(HostEffectError::SessionDenied);
         }
@@ -1387,7 +1444,15 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                 result = &mut normalization => result?,
             }
         };
-        enforce_manifest_scope(&grant, capability, &normalized_target)?;
+        #[cfg(feature = "skills")]
+        self.manifest_checked(enforce_manifest_scope(
+            &grant,
+            capability,
+            &normalized_target,
+        ))?;
+        // Without learned skills the normalized target is only a normalization gate.
+        #[cfg(not(feature = "skills"))]
+        let _ = normalized_target;
 
         let audit_target = {
             let authorization =
@@ -1560,35 +1625,26 @@ fn enforce_manifest_operation_scope(
     grant: &InvocationGrant,
     capability: HostCapability,
     operation: &EffectOperation,
-) -> Result<(), HostEffectError> {
+) -> Result<(), ManifestDenial> {
     if matches!(grant.principal, GrantPrincipal::ModelAuthored { .. })
         || capability != HostCapability::Spawn
     {
         return Ok(());
     }
-    let manifest = grant
-        .manifest
-        .as_ref()
-        .ok_or(HostEffectError::ManifestDenied)?;
+    let manifest = grant.manifest.as_ref().ok_or(ManifestDenial::PolicyFault)?;
     let EffectOperation::Spawn { program, .. } = operation else {
-        return Err(HostEffectError::ManifestDenied);
+        return Err(ManifestDenial::PolicyFault);
     };
+    let Some(CapabilityScope::Spawn { programs }) = manifest.scope(SkillHostCapability::Spawn)
+    else {
+        return Err(ManifestDenial::PolicyFault);
+    };
+    // The program name is a caller-derived target: an undeclared name is a scope miss.
     let program = program.nfc().collect::<String>();
-    matches!(
-        manifest.scope(SkillHostCapability::Spawn),
-        Some(CapabilityScope::Spawn { programs }) if programs.contains(&program)
-    )
-    .then_some(())
-    .ok_or(HostEffectError::ManifestDenied)
-}
-
-#[cfg(not(feature = "skills"))]
-fn enforce_manifest_operation_scope(
-    _grant: &InvocationGrant,
-    _capability: HostCapability,
-    _operation: &EffectOperation,
-) -> Result<(), HostEffectError> {
-    Ok(())
+    programs
+        .contains(&program)
+        .then_some(())
+        .ok_or(ManifestDenial::ScopeMiss)
 }
 
 #[cfg(feature = "skills")]
@@ -1596,15 +1652,15 @@ fn enforce_manifest_scope(
     grant: &InvocationGrant,
     capability: HostCapability,
     target: &NormalizedTarget,
-) -> Result<(), HostEffectError> {
+) -> Result<(), ManifestDenial> {
     if matches!(grant.principal, GrantPrincipal::ModelAuthored { .. }) {
         return Ok(());
     }
-    let manifest = grant
-        .manifest
-        .as_ref()
-        .ok_or(HostEffectError::ManifestDenied)?;
-    let allowed = match (manifest.scope(skill_capability(capability)), target) {
+    let manifest = grant.manifest.as_ref().ok_or(ManifestDenial::PolicyFault)?;
+    // `None` means the target shape does not match a declared capability scope at all, which is
+    // a policy fault. `Some(false)` means the capability is declared but the caller-derived
+    // target lies outside its prefixes, origins, methods, or programs: a scope miss.
+    let within_scope = match (manifest.scope(skill_capability(capability)), target) {
         (
             Some(CapabilityScope::ReadFile { workspace_prefixes }),
             NormalizedTarget::ReadFile { workspace_relative },
@@ -1612,34 +1668,34 @@ fn enforce_manifest_scope(
         | (
             Some(CapabilityScope::WriteFile { workspace_prefixes }),
             NormalizedTarget::WriteFile { workspace_relative },
-        ) => workspace_prefixes.iter().any(|prefix| {
+        ) => Some(workspace_prefixes.iter().any(|prefix| {
             workspace_relative
                 .as_deref()
                 .is_some_and(|target| path_scope_contains(prefix, target))
-        }),
+        })),
         (
             Some(CapabilityScope::ReadFile { workspace_prefixes }),
             NormalizedTarget::ReadFiles { workspace_relative },
-        ) => workspace_relative.iter().all(|target| {
+        ) => Some(workspace_relative.iter().all(|target| {
             workspace_prefixes.iter().any(|prefix| {
                 target
                     .as_deref()
                     .is_some_and(|target| path_scope_contains(prefix, target))
             })
-        }),
+        })),
         #[cfg(any(test, feature = "sandbox"))]
         (
             Some(CapabilityScope::Fetch { origins, methods }),
             NormalizedTarget::Fetch { origin, method },
-        ) => {
+        ) => Some(
             origins.contains(origin)
                 && methods.iter().any(|allowed| {
                     matches!(
                         (allowed, method.as_str()),
                         (SkillHttpMethod::Get, "GET") | (SkillHttpMethod::Post, "POST")
                     )
-                })
-        }
+                }),
+        ),
         (
             Some(CapabilityScope::Spawn { programs }),
             NormalizedTarget::Spawn {
@@ -1647,21 +1703,23 @@ fn enforce_manifest_scope(
                 resolved_executable,
             },
         ) => {
-            programs.contains(program)
-                && grant.spawn_program_identities.get(program) == Some(resolved_executable)
+            if !programs.contains(program) {
+                Some(false)
+            } else if grant.spawn_program_identities.get(program) != Some(resolved_executable) {
+                // A declared program that no longer resolves to the executable identity pinned
+                // at grant time is not caller input; it stays a policy fault.
+                return Err(ManifestDenial::PolicyFault);
+            } else {
+                Some(true)
+            }
         }
-        _ => false,
+        _ => None,
     };
-    allowed.then_some(()).ok_or(HostEffectError::ManifestDenied)
-}
-
-#[cfg(not(feature = "skills"))]
-fn enforce_manifest_scope(
-    _grant: &InvocationGrant,
-    _capability: HostCapability,
-    _target: &NormalizedTarget,
-) -> Result<(), HostEffectError> {
-    Ok(())
+    match within_scope {
+        Some(true) => Ok(()),
+        Some(false) => Err(ManifestDenial::ScopeMiss),
+        None => Err(ManifestDenial::PolicyFault),
+    }
 }
 
 #[cfg(feature = "skills")]
@@ -2000,17 +2058,30 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
                 None
             }
         });
+        #[cfg(feature = "skills")]
+        {
+            self.last_manifest_denial = None;
+        }
         Box::pin(async move {
             match self.dispatch(request, cancellation).await {
                 Ok(result) => result,
                 Err(error) => {
                     #[cfg(feature = "skills")]
-                    if matches!(
-                        error,
-                        HostEffectError::CapabilityDenied | HostEffectError::ManifestDenied
-                    ) && let Some(invocation_id) = skill_invocation
                     {
-                        self.capability_denials.record(invocation_id);
+                        let manifest_denial = self.last_manifest_denial.take();
+                        // A missing grant capability is always a policy fault. A manifest
+                        // denial is a fault unless it was classified as a caller-derived
+                        // scope miss; an unclassified manifest denial stays a fault.
+                        let class = match error {
+                            HostEffectError::CapabilityDenied => Some(ManifestDenial::PolicyFault),
+                            HostEffectError::ManifestDenied => {
+                                Some(manifest_denial.unwrap_or(ManifestDenial::PolicyFault))
+                            }
+                            _ => None,
+                        };
+                        if let (Some(class), Some(invocation_id)) = (class, skill_invocation) {
+                            self.capability_denials.record(invocation_id, class);
+                        }
                     }
                     error.into_wire_result()
                 }

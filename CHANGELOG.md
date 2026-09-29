@@ -107,6 +107,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - CI now runs the `harness-regression` job (the bounded deterministic harness evaluation and the only
   Gym entrypoint smoke) on pushes as well as pull requests, and `ci-success` fails if it is skipped
   while code changed; it had been pull-request-only and so never ran for work landing on `main`.
+- A JS call that passes an out-of-scope path, origin, method or program into an active learned skill
+  no longer quarantines it immediately. The effect is still denied and audited, but the call is now
+  recorded as `threw` (`scope_miss`) telemetry behind the behavioural threshold; only an operation
+  outside the skill's declared capabilities is a capability-policy fault that quarantines at once.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

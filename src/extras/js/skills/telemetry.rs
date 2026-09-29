@@ -304,6 +304,10 @@ pub(crate) struct ParentSkillBinding {
     pub(crate) retrieval_rank: u32,
 }
 
+/// Canonical outcome token for a terminal whose effect was denied because a caller-derived target
+/// was outside a capability scope the skill declared.
+pub(crate) const SCOPE_MISS_OUTCOME: &str = "scope_miss";
+
 /// Immutable per-call telemetry authority retained only by the parent.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParentTelemetryContext {
@@ -314,7 +318,11 @@ pub(crate) struct ParentTelemetryContext {
     pub(crate) production: bool,
     pub(crate) step_outcome: StepOutcome,
     pub(crate) skills: Vec<ParentSkillBinding>,
+    /// Invocations whose effect hit a skill-attributable capability-policy fault.
     pub(crate) capability_denials: BTreeSet<String>,
+    /// Invocations whose effect was denied only because a caller-derived target fell outside a
+    /// declared capability scope. Recorded as threw-class telemetry, never as a policy fault.
+    pub(crate) scope_misses: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -368,6 +376,7 @@ pub(crate) fn bind_worker_events(
     let mut open_invocations = BTreeMap::<String, (String, String)>::new();
     let mut canonical_worker_events = Vec::with_capacity(worker_events.len());
     let mut capability_denials = context.capability_denials.clone();
+    let mut scope_misses = context.scope_misses.clone();
     let created_at = current_timestamp().map_err(|_| ParentBindingError::InvalidShape)?;
 
     for claim in worker_events {
@@ -456,13 +465,25 @@ pub(crate) fn bind_worker_events(
 
         let mut canonical = canonical_event(claim, binding, context, created_at, true);
         if claim.kind.is_terminal()
-            && claim
-                .invocation_id
-                .as_ref()
-                .is_some_and(|id| capability_denials.remove(id))
+            && let Some(id) = claim.invocation_id.as_ref()
         {
-            canonical.kind = SkillEventKind::CapabilityDenied;
-            canonical.outcome = Some("capability_policy".to_string());
+            // Consume both records so every parent-observed denial must bind to a terminal.
+            let policy_fault = capability_denials.remove(id);
+            let scope_miss = scope_misses.remove(id);
+            if policy_fault {
+                canonical.kind = SkillEventKind::CapabilityDenied;
+                canonical.outcome = Some("capability_policy".to_string());
+            } else if scope_miss
+                && matches!(claim.kind, SkillEventKind::Returned | SkillEventKind::Threw)
+            {
+                // A caller-derived target outside a declared scope is not evidence against the
+                // revision (phase-5 section 12a.1). It is threw-class: no positive evidence is
+                // credited for a call whose effect was denied, and it counts toward behavioural
+                // quarantine only with attributed negative feedback. Step-level timeout/OOM
+                // terminals keep their own severity.
+                canonical.kind = SkillEventKind::Threw;
+                canonical.outcome = Some(SCOPE_MISS_OUTCOME.to_string());
+            }
         }
         canonical_worker_events.push(canonical);
     }
@@ -472,6 +493,7 @@ pub(crate) fn bind_worker_events(
     if observed_injections != expected_injections
         || !open_invocations.is_empty()
         || !capability_denials.is_empty()
+        || !scope_misses.is_empty()
     {
         return Err(ParentBindingError::IncompleteEvidence);
     }

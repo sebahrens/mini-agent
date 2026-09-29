@@ -1369,14 +1369,18 @@ fn dispatch_skill_telemetry(
     step_outcome: &StepOutcome,
     worker_events: &[crate::extras::js::skills::telemetry::SkillEvent],
     _worker_claimed_evidence_complete: bool,
-    capability_denials: Option<std::collections::BTreeSet<String>>,
+    capability_denials: Option<crate::extras::js::broker::SkillDenialSnapshot>,
     production: bool,
 ) -> bool {
     use crate::extras::js::skills::telemetry::{
         ParentSkillBinding, ParentTelemetryContext, bind_worker_events, observability_lost_batch,
     };
 
-    let Some(capability_denials) = capability_denials else {
+    let Some(crate::extras::js::broker::SkillDenialSnapshot {
+        capability_faults: capability_denials,
+        scope_misses,
+    }) = capability_denials
+    else {
         turn_context.mark_evidence_lost();
         record_observability_lost(dispatcher, "capability_denial_binding_unavailable");
         return false;
@@ -1409,6 +1413,7 @@ fn dispatch_skill_telemetry(
         step_outcome: step_outcome.clone(),
         skills,
         capability_denials,
+        scope_misses,
     };
 
     let batch = match bind_worker_events(&context, worker_events) {

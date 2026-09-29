@@ -977,3 +977,267 @@ fn turn_context_replacement_does_not_mutate_existing_snapshots() {
     assert_eq!(frozen.skills[0].id, old.id);
     assert_eq!(turn_context.snapshot().skills[0].id, new.id);
 }
+
+/// Temporary app paths plus an active learned-skill revision and a live index coordinator.
+struct ActiveSkillFixture {
+    root: std::path::PathBuf,
+    paths: crate::paths::AppPaths,
+    coordinator: Arc<crate::extras::js::skills::coordinator::IndexCoordinator>,
+}
+
+impl ActiveSkillFixture {
+    fn new(selected: &SkillArtifact) -> Self {
+        use crate::extras::js::skills::coordinator::IndexCoordinator;
+        use crate::extras::js::skills::embed::Embedder;
+        use crate::extras::js::skills::store::SkillStore;
+        use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
+
+        let root = std::env::temp_dir().join(format!("scope-miss-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::resolve(&PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                PathPlatform::Windows
+            } else {
+                PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.clone()),
+            data_base: Some(root.clone()),
+            local_data_base: Some(root.clone()),
+            state_base: Some(root.clone()),
+            cache_base: Some(root.clone()),
+            workspace_root: None,
+            overrides: Default::default(),
+        })
+        .unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(selected).unwrap();
+        drop(store);
+        let coordinator =
+            Arc::new(IndexCoordinator::open(&paths, Arc::new(Embedder::new().unwrap())).unwrap());
+        coordinator.rebuild_and_publish().unwrap();
+        let fixture = Self {
+            root,
+            paths,
+            coordinator,
+        };
+        assert_eq!(fixture.status(&selected.id), "active");
+        fixture
+    }
+
+    /// Spawn the production telemetry worker outside any Tokio runtime, so dropping the last
+    /// handle joins it after it has drained, ingested, and applied automatic quarantine.
+    fn telemetry(&self) -> Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher> {
+        use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        Arc::new(
+            TelemetryDispatcher::spawn_session_scoped_with_coordinator(
+                &self.paths,
+                Arc::clone(&self.coordinator),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn status(&self, skill_id: &str) -> String {
+        crate::extras::js::skills::store::SkillStore::open_at(&self.paths)
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT status FROM skill_revisions WHERE id = ?",
+                [skill_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn terminal_events(&self, skill_id: &str) -> Vec<(String, Option<String>)> {
+        let store = crate::extras::js::skills::store::SkillStore::open_at(&self.paths).unwrap();
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT event_kind, outcome FROM skill_events
+                  WHERE skill_id = ?
+                    AND event_kind IN ('returned','threw','timed_out','oom','capability_denied')
+                  ORDER BY event_id",
+            )
+            .unwrap();
+        statement
+            .query_map([skill_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+}
+
+impl Drop for ActiveSkillFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// An active-eligible read-scoped skill. Its embedded test uses the pure branch so that store
+/// insertion can verify it (both mutation passes are detected) without a host read.
+fn read_scoped_docs_skill() -> SkillArtifact {
+    SkillArtifact::new(
+        "function doc_length(cap, path) { return path === '' ? 0 : cap.read_file(path).length; }"
+            .to_string(),
+        "read-scoped scope-miss test skill".to_string(),
+        vec!["test".to_string()],
+        vec![SkillExport {
+            name: "doc_length".to_string(),
+            signature: "doc_length(path)".to_string(),
+        }],
+        vec!["doc_length('') === 0".to_string()],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["docs".to_string()],
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Model code that passes an out-of-scope path into an active read-scoped skill is caller input,
+/// not a skill fault: the effect is denied, the revision stays active, and the call is recorded
+/// as non-severe threw-class telemetry (docs/specs/phase-5-evidence-learning.md section 12a.1).
+#[test]
+fn caller_out_of_scope_target_leaves_active_skill_active_with_non_severe_event() {
+    let selected = read_scoped_docs_skill();
+    let fixture = ActiveSkillFixture::new(&selected);
+    let telemetry = fixture.telemetry();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = runtime.block_on({
+        let telemetry = Arc::clone(&telemetry);
+        let selected = selected.clone();
+        async move {
+            let audit_dirs = super::TestTempDir::new("js-test-audits");
+            let tool = make_test_tool(&audit_dirs)
+                .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+                .with_skill_production(true)
+                .with_shared_telemetry(telemetry);
+            tool.call(JsArgs {
+                code: "let inScope = doc_length('docs/specs/00-index.md') > 0; \
+                       let outOfScope; \
+                       try { doc_length('README.md'); outOfScope = 'read'; } \
+                       catch (_) { outOfScope = 'denied'; } \
+                       JSON.stringify([inScope, outOfScope])"
+                    .to_string(),
+            })
+            .await
+            .unwrap()
+        }
+    });
+    drop(runtime);
+    assert_eq!(output, r#"[true,"denied"]"#);
+    // Last handle: joins the worker after ingestion and automatic quarantine evaluation.
+    drop(telemetry);
+
+    assert_eq!(
+        fixture.terminal_events(&selected.id),
+        vec![
+            ("returned".to_string(), Some("fulfilled".to_string())),
+            ("threw".to_string(), Some("scope_miss".to_string())),
+        ]
+    );
+    assert_eq!(
+        fixture.status(&selected.id),
+        "active",
+        "a caller-derived scope miss must not quarantine the revision"
+    );
+}
+
+/// A genuine capability-policy fault (an operation outside the skill's granted capability set,
+/// recorded by the broker as a policy fault) still quarantines an active revision at once.
+#[test]
+fn undeclared_capability_policy_fault_still_quarantines_active_skill_immediately() {
+    use crate::extras::js::protocol::StepOutcome;
+    use crate::extras::js::skills::telemetry::{
+        ParentSkillBinding, ParentTelemetryContext, SkillEvent, SkillEventKind, bind_worker_events,
+        stable_invocation_id,
+    };
+
+    let selected = read_scoped_docs_skill();
+    let fixture = ActiveSkillFixture::new(&selected);
+    let context = ParentTelemetryContext {
+        turn_id: "fault-turn".into(),
+        tool_call_id: "fault-turn:js:0".into(),
+        query_fingerprint: Some("fault".into()),
+        index_generation: 1,
+        production: true,
+        step_outcome: StepOutcome::Value("ok".into()),
+        skills: vec![ParentSkillBinding {
+            skill_id: selected.id.clone(),
+            exports: ["doc_length".to_string()].into_iter().collect(),
+            retrieval_score: 1.0,
+            retrieval_rank: 0,
+        }],
+        capability_denials: Default::default(),
+        scope_misses: Default::default(),
+    };
+    let invocation = stable_invocation_id(
+        &context.turn_id,
+        &context.tool_call_id,
+        &selected.id,
+        "doc_length",
+        0,
+    );
+    let claim = |kind: SkillEventKind| SkillEvent {
+        invocation_id: (kind != SkillEventKind::Injected).then(|| invocation.clone()),
+        skill_id: selected.id.clone(),
+        turn_id: context.turn_id.clone(),
+        tool_call_id: Some(context.tool_call_id.clone()),
+        kind,
+        export_name: (kind != SkillEventKind::Injected).then(|| "doc_length".into()),
+        outcome: kind.is_terminal().then(|| "exception".into()),
+        latency_us: kind.is_terminal().then_some(10),
+        retrieval_score: None,
+        retrieval_rank: None,
+        query_fingerprint: None,
+        index_generation: 0,
+        evidence_complete: true,
+        production: true,
+        argument_shape: (kind == SkillEventKind::Invoked)
+            .then(|| r#"{"argc":1,"types":["string"]}"#.into()),
+        created_at: 1,
+    };
+    let claims = [
+        claim(SkillEventKind::Injected),
+        claim(SkillEventKind::Invoked),
+        claim(SkillEventKind::Threw),
+    ];
+
+    // The same invocation classified as a caller scope miss is not severe ...
+    let mut miss_context = context.clone();
+    miss_context.scope_misses.insert(invocation.clone());
+    let miss = bind_worker_events(&miss_context, &claims).unwrap();
+    assert!(
+        miss.events()
+            .iter()
+            .all(|event| event.kind != SkillEventKind::CapabilityDenied)
+    );
+
+    // ... but the broker's capability-policy fault record quarantines immediately, without the
+    // behavioural threshold.
+    let mut fault_context = context;
+    fault_context.capability_denials.insert(invocation);
+    let fault = bind_worker_events(&fault_context, &claims).unwrap();
+    let telemetry = fixture.telemetry();
+    telemetry.try_dispatch(fault).unwrap();
+    drop(telemetry);
+
+    assert_eq!(
+        fixture.terminal_events(&selected.id),
+        vec![(
+            "capability_denied".to_string(),
+            Some("capability_policy".to_string())
+        )]
+    );
+    assert_eq!(fixture.status(&selected.id), "quarantined");
+}

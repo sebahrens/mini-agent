@@ -153,7 +153,9 @@ attribution mechanism with parent-created invocation/grant bindings and identity
 scopes. A brokered host call is allowed only when the normal session permission policy, target
 narrowing, and the skill's immutable structured capability manifest all allow it.
 Ambient session permission never upgrades a skill. Undeclared capability use is a directly
-attributed policy fault and causes immediate quarantine.
+attributed policy fault and causes immediate quarantine. A target outside the prefixes, origins,
+methods, or programs of a capability the skill *did* declare is denied and audited the same way,
+but it is a caller-derived scope miss, not a policy fault (section 12a.1).
 
 The delivered identity-v1 manifest contained both tier and an exact flat allow-list of host
 operations. Phase 6 identity v2 replaces that list with exact structured scopes. Tier still
@@ -174,7 +176,8 @@ Each declared export is wrapped after skill source evaluation. The wrapper recor
 - start/end monotonic timestamps;
 - synchronous return or exception;
 - asynchronous fulfillment or rejection when the export returns a Promise;
-- timeout, OOM, and capability-policy faults;
+- timeout, OOM, and capability-policy faults (a denial caused only by a caller-supplied target
+  outside a declared scope is recorded as threw-class telemetry instead; see section 12a.1);
 - whether the containing model-authored JS step eventually succeeded.
 
 Each wrapper call gets a stable `invocation_id` derived from the durable turn ID, tool-call ID,
@@ -425,7 +428,9 @@ Quarantine is immediate for:
 
 - identity version 1 when Phase 6 migration/eligibility is active;
 - canonical identity or stored-content mismatch;
-- undeclared capability use;
+- undeclared capability use (an operation outside the declared capability set, a grant that does
+  not hold the capability, or a declared spawn program whose executable identity no longer matches
+  the one pinned at grant time) — not a caller-supplied target outside a declared scope;
 - sandbox or permission-policy violation;
 - held-out regression discovered after admission;
 - any timeout/OOM during canary;
@@ -660,6 +665,24 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    feedback targets that exact invocation; an uncorroborated exception caused by caller input is
    telemetry, not evidence against the revision. (Widened on 2026-09-07 — see section 12c — so a
    `returned` event with the same attributed feedback also counts.)
+
+   **Scope misses are caller input** (mini-agent-z712s, delivered). The parent broker classifies
+   every manifest denial it raises for a learned-skill grant. A *capability-policy fault* — an
+   operation outside the declared capability set, a grant that does not hold the capability, a
+   missing manifest, a target shape that matches no declared scope, or a declared spawn program
+   that resolves to an executable other than the one pinned at grant time — is recorded as
+   `capability_denied` with outcome `capability_policy` and quarantines immediately. A *scope miss*
+   — a caller-derived path, origin, HTTP method, or program name outside the declared prefixes,
+   origins, methods, or programs of a capability the skill did declare — is recorded on that
+   invocation's terminal event as `threw` with outcome `scope_miss`, whether the skill propagated
+   or caught the denied effect. It therefore earns no positive evidence and counts toward the
+   behavioural window only with attributed negative or severe feedback, like any other `threw`.
+   A policy fault on the same invocation outranks a scope miss; step-level `timed_out`/`oom`
+   terminals keep their own kind. Both classes are denied before permission or execution, reach
+   the worker as the same `capability_denied` effect error, and append the same terminal denial
+   audit record; only telemetry attribution differs. Every recorded denial of either class must
+   bind to a worker-observed terminal, or the batch is incomplete evidence. One model call passing
+   an out-of-scope argument into an active skill can no longer quarantine it.
 2. **Canary ordering** (mini-agent-840z, delivered). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
 3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy

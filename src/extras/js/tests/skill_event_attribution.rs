@@ -202,6 +202,7 @@ fn parent_context(artifact: &SkillArtifact) -> ParentTelemetryContext {
             retrieval_rank: 2,
         }],
         capability_denials: Default::default(),
+        scope_misses: Default::default(),
     }
 }
 
@@ -305,6 +306,104 @@ fn parent_binding_promotes_authoritative_broker_denial_to_policy_event() {
         .find(|event| event.kind == SkillEventKind::CapabilityDenied)
         .expect("authoritative denial must become durable telemetry");
     assert_eq!(denial.outcome.as_deref(), Some("capability_policy"));
+}
+
+#[test]
+fn parent_binding_records_caller_scope_miss_as_threw_class_telemetry() {
+    let (_root, mut store, artifact) = store();
+    let mut context = parent_context(&artifact);
+    let invocation = stable_invocation_id(
+        &context.turn_id,
+        &context.tool_call_id,
+        &artifact.id,
+        "run",
+        0,
+    );
+    context.scope_misses.insert(invocation.clone());
+    // Whether the skill propagated or caught the denied effect, the call is threw-class: it
+    // earns no positive evidence and is not a capability-policy fault.
+    for terminal in [SkillEventKind::Threw, SkillEventKind::Returned] {
+        let events = vec![
+            worker_claim(&context, &artifact, SkillEventKind::Injected),
+            worker_claim(&context, &artifact, SkillEventKind::Invoked),
+            worker_claim(&context, &artifact, terminal),
+        ];
+        let batch = bind_worker_events(&context, &events).expect("scope miss is attributable");
+        assert!(
+            batch
+                .events()
+                .iter()
+                .all(|event| event.kind != SkillEventKind::CapabilityDenied),
+            "a caller-derived scope miss must not become a policy fault"
+        );
+        let terminal_event = batch
+            .events()
+            .iter()
+            .find(|event| event.kind.is_terminal())
+            .expect("terminal event");
+        assert_eq!(terminal_event.kind, SkillEventKind::Threw);
+        assert_eq!(terminal_event.outcome.as_deref(), Some("scope_miss"));
+        assert_eq!(
+            terminal_event.invocation_id.as_deref(),
+            Some(invocation.as_str())
+        );
+        if terminal == SkillEventKind::Threw {
+            TelemetryIngestor::new(&mut store).ingest(&batch).unwrap();
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(
+        behavioral_window_counts_for_test(&store, &artifact.id, now + 1).unwrap(),
+        (1, 0),
+        "an uncorroborated scope miss is telemetry, not a behavioural fault"
+    );
+}
+
+#[test]
+fn parent_binding_policy_fault_outranks_a_scope_miss_on_the_same_invocation() {
+    let (_root, _store, artifact) = store();
+    let mut context = parent_context(&artifact);
+    let invocation = stable_invocation_id(
+        &context.turn_id,
+        &context.tool_call_id,
+        &artifact.id,
+        "run",
+        0,
+    );
+    context.scope_misses.insert(invocation.clone());
+    context.capability_denials.insert(invocation);
+    let events = vec![
+        worker_claim(&context, &artifact, SkillEventKind::Injected),
+        worker_claim(&context, &artifact, SkillEventKind::Invoked),
+        worker_claim(&context, &artifact, SkillEventKind::Returned),
+    ];
+    let batch = bind_worker_events(&context, &events).expect("both denials bind");
+    let terminal = batch
+        .events()
+        .iter()
+        .find(|event| event.kind.is_terminal())
+        .unwrap();
+    assert_eq!(terminal.kind, SkillEventKind::CapabilityDenied);
+    assert_eq!(terminal.outcome.as_deref(), Some("capability_policy"));
+}
+
+#[test]
+fn parent_binding_requires_every_scope_miss_to_bind_to_a_terminal() {
+    let (_root, _store, artifact) = store();
+    let mut context = parent_context(&artifact);
+    context.scope_misses.insert("f".repeat(64));
+    let events = vec![
+        worker_claim(&context, &artifact, SkillEventKind::Injected),
+        worker_claim(&context, &artifact, SkillEventKind::Invoked),
+        worker_claim(&context, &artifact, SkillEventKind::Returned),
+    ];
+    assert_eq!(
+        bind_worker_events(&context, &events).unwrap_err(),
+        ParentBindingError::IncompleteEvidence
+    );
 }
 
 #[test]
