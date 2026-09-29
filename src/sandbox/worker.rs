@@ -816,6 +816,65 @@ mod tests {
         assert!(specification.contains("They do not prove the resulting token"));
     }
 
+    /// Regression for mini-agent-6kdk2: the feasibility matrix built its own environment block
+    /// with only `SystemRoot` (read from the caller's environment), and AppContainer
+    /// `CreateProcessW` rejected it on the hosted runner with ERROR_ENVVAR_NOT_FOUND (203) while
+    /// the production launcher, which also supplies the profile's LOCALAPPDATA/TEMP/TMP, passed.
+    /// Both LPAC launchers must build those entries through the one shared helper.
+    #[test]
+    fn windows_lpac_launchers_share_the_appcontainer_environment_builder() {
+        let source = include_str!("worker/windows.rs").replace("\r\n", "\n");
+        let body_of = |start: &str| {
+            let tail = source
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing `{start}` in the Windows worker source"));
+            tail.split("\n    }\n")
+                .next()
+                .expect("function body")
+                .to_string()
+        };
+
+        let shared = body_of("fn appcontainer_environment_entries(");
+        for required in [
+            "system_windows_directory()",
+            "appcontainer_local_data_path(appcontainer_sid)",
+            "(\"LOCALAPPDATA\", local_data.as_path())",
+            "(\"TEMP\", temp.as_path())",
+            "(\"TMP\", temp.as_path())",
+        ] {
+            assert!(
+                shared.contains(required),
+                "shared AppContainer environment builder lost `{required}`"
+            );
+        }
+
+        let encode = body_of("fn encode_environment_block(");
+        assert!(encode.contains("block.push(0);\n        }\n        block.push(0);"));
+
+        for launcher in [
+            "fn environment_block(\n",
+            "fn production_environment_block(\n",
+        ] {
+            let body = body_of(launcher);
+            assert!(
+                body.contains("appcontainer_environment_entries(\n            appcontainer_sid,"),
+                "`{}` must reuse the shared AppContainer environment entries",
+                launcher.trim()
+            );
+            assert!(body.contains("Ok(encode_environment_block(entries))"));
+            assert!(
+                !body.contains("var_os(\"SystemRoot\")"),
+                "`{}` must not take SystemRoot from the caller's environment",
+                launcher.trim()
+            );
+        }
+        assert!(
+            source.contains("environment_block(&sentinel.0, canary_read.raw(), appcontainer_sid)?"),
+            "the feasibility launch must pass its profile SID to the environment builder"
+        );
+    }
+
     #[test]
     fn windows_production_launcher_source_keeps_creation_time_authority_closed() {
         // Hosted Windows checkouts use CRLF. Normalize before asserting a

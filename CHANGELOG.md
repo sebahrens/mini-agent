@@ -137,6 +137,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The manual Windows LPAC image-loading feasibility test now builds its child environment with the
+  same helper as the production worker launcher, adding the AppContainer profile's `LOCALAPPDATA`,
+  `TEMP` and `TMP`; without them `CreateProcessW` failed on the hosted runner with os error 203. The
+  test stays ignored and out of CI until a manual Windows run confirms the fix.
 - "Always allow" for `grep` and `find_files` now grants the approved search root and its literal
   subtree instead of a `first-word*` prefix glob, so approving `/a/other` no longer covers
   `/a/other-secrets` and a root containing a space is no longer cut at the space.

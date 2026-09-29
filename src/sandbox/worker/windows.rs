@@ -2430,7 +2430,11 @@ mod feasibility {
         Ok(wide_string(&format!("\"{display}\" {arguments}")))
     }
 
-    fn environment_block(sentinel: &Path, omitted_handle: HANDLE) -> Result<Vec<u16>, GateError> {
+    fn environment_block(
+        sentinel: &Path,
+        omitted_handle: HANDLE,
+        appcontainer_sid: PSID,
+    ) -> Result<Vec<u16>, GateError> {
         let sentinel = sentinel.as_os_str().to_string_lossy();
         if sentinel.contains('\0') || sentinel.contains('=') {
             return Err(GateError(
@@ -2441,17 +2445,15 @@ mod feasibility {
             format!("{SENTINEL_ENV}={sentinel}"),
             format!("{CANARY_HANDLE_ENV}={}", omitted_handle as usize),
         ];
-        if let Some(system_root) = std::env::var_os("SystemRoot") {
-            entries.push(format!("SystemRoot={}", system_root.to_string_lossy()));
-        }
-        entries.sort_by_key(|entry| entry.to_ascii_lowercase());
-        let mut block = Vec::new();
-        for entry in entries {
-            block.extend(OsStr::new(&entry).encode_wide());
-            block.push(0);
-        }
-        block.push(0);
-        Ok(block)
+        // Reuse the production launcher's loader and AppContainer-profile entries. This block
+        // previously carried only SystemRoot (from the caller's environment), and AppContainer
+        // CreateProcessW rejected it with ERROR_ENVVAR_NOT_FOUND (203) on the hosted runner while
+        // the production launcher, which supplies LOCALAPPDATA/TEMP/TMP, passed.
+        entries.extend(appcontainer_environment_entries(
+            appcontainer_sid,
+            "LPAC feasibility probe",
+        )?);
+        Ok(encode_environment_block(entries))
     }
 
     struct Sentinel(PathBuf);
@@ -2939,13 +2941,30 @@ mod feasibility {
                 entries.push(format!("{name}={value}"));
             }
         }
+        entries.extend(appcontainer_environment_entries(
+            appcontainer_sid,
+            "production worker",
+        )?);
+        Ok(encode_environment_block(entries))
+    }
+
+    /// Loader and AppContainer-profile entries that every custom LPAC environment block carries.
+    ///
+    /// Shared by the production launcher and the `cfg(test)` feasibility matrix so both build the
+    /// child environment from the same source. `purpose` only names the launcher in errors.
+    fn appcontainer_environment_entries(
+        appcontainer_sid: PSID,
+        purpose: &str,
+    ) -> Result<Vec<String>, GateError> {
         // SystemRoot is non-secret loader configuration required by Windows system DLL
         // resolution. No PATH, profile, credential, workspace, or application variable crosses.
         let system_root = system_windows_directory()?;
-        entries.push(format!("SystemRoot={}", system_root.to_string_lossy()));
+        let mut entries = vec![format!("SystemRoot={}", system_root.to_string_lossy())];
         // A custom environment block suppresses Windows' inherited profile
         // environment. Restore only the three AppContainer-local paths that
         // Windows assigns to a profile; do not inherit user/profile variables.
+        // The feasibility matrix's block without them failed AppContainer
+        // CreateProcessW with ERROR_ENVVAR_NOT_FOUND (203) on the hosted runner.
         let local_data = appcontainer_local_data_path(appcontainer_sid)?;
         let temp = local_data.join("Temp");
         std::fs::create_dir_all(&temp)
@@ -2958,11 +2977,17 @@ mod feasibility {
             let value = value.to_string_lossy();
             if value.contains('\0') || value.contains('=') {
                 return Err(GateError(format!(
-                    "{name} cannot enter the production worker environment"
+                    "{name} cannot enter the {purpose} environment"
                 )));
             }
             entries.push(format!("{name}={value}"));
         }
+        Ok(entries)
+    }
+
+    /// Encodes `NAME=value` entries as a sorted, double-NUL-terminated UTF-16 block for
+    /// `CREATE_UNICODE_ENVIRONMENT`.
+    fn encode_environment_block(mut entries: Vec<String>) -> Vec<u16> {
         entries.sort_by_key(|entry| entry.to_ascii_lowercase());
         let mut block = Vec::new();
         for entry in entries {
@@ -2970,7 +2995,7 @@ mod feasibility {
             block.push(0);
         }
         block.push(0);
-        Ok(block)
+        block
     }
 
     fn production_executable(_hooks: &ProductionLaunchHooks) -> Result<PathBuf, GateError> {
@@ -4602,7 +4627,7 @@ mod feasibility {
             .ok_or_else(|| GateError("executable has no launch directory".to_string()))?;
         let child_directory_wide = wide_null(child_directory.as_os_str())?;
         let mut command_line = command_line(executable, probe)?;
-        let environment = environment_block(&sentinel.0, canary_read.raw())?;
+        let environment = environment_block(&sentinel.0, canary_read.raw(), appcontainer_sid)?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -5483,7 +5508,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a real Windows AppContainer backend"]
+    #[ignore = "manual Windows LPAC research gate, not run in CI: needs a real AppContainer \
+                backend and MINI_AGENT_LPAC_CARGO_INSTALL_EXE; see 'Windows image-loading \
+                feasibility gate' in docs/specs/phase-6-brokered-js-runtime.md"]
     fn windows_lpac_can_load_current_exe_with_only_protocol_handles() {
         let _production_test_guard = production_test_guard();
         super::run_lpac_image_loading_gate()
