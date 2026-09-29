@@ -3376,8 +3376,10 @@ mod path_deny_probe_tests {
             ..PermissionConfig::default()
         };
         let checker = checker(&workspace, config);
+        // Spellings whose case differs in a literal part of the rule are denied
+        // only where paths fold case (macOS and Windows).
         let folded = cfg!(any(target_os = "macos", windows));
-        for spelling in [".ENV", ".Env", "Secrets/key", "SECRETS/KEY", "secrets/KEY"] {
+        for spelling in [".ENV", ".Env", "Secrets/key", "SECRETS/KEY"] {
             let absolute = workspace.join(spelling).to_string_lossy().into_owned();
             assert_eq!(
                 checker.is_path_denied("grep", spelling),
@@ -3387,6 +3389,18 @@ mod path_deny_probe_tests {
             assert_eq!(
                 checker.is_path_denied("grep", &absolute),
                 folded,
+                "absolute {spelling}"
+            );
+        }
+        // A case change inside the `**` wildcard is matched on every platform.
+        for spelling in ["secrets/KEY", "secrets/Nested/KEY"] {
+            let absolute = workspace.join(spelling).to_string_lossy().into_owned();
+            assert!(
+                checker.is_path_denied("grep", spelling),
+                "relative {spelling}"
+            );
+            assert!(
+                checker.is_path_denied("grep", &absolute),
                 "absolute {spelling}"
             );
         }
