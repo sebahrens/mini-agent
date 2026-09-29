@@ -333,8 +333,12 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 tool_name,
                 args,
                 outcome,
+                internal_call_id,
                 ..
             } => {
+                if outcome.is_error() || outcome.is_denied() {
+                    record_tool_failure(internal_call_id);
+                }
                 let fingerprint = tool_call_fingerprint(tool_name, args);
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
                     state.record_result(tool_name, fingerprint, outcome)
@@ -687,6 +691,9 @@ pub(crate) struct AgentWorkScope {
     advisor_uses: Arc<AtomicUsize>,
     #[cfg(feature = "advisor")]
     advisor_messages: std::sync::Mutex<Vec<crate::session::SessionMessage>>,
+    /// Internal call ids whose tool outcome was an error or denial, recorded by
+    /// `ToolLoopGuard` and consumed when the matching `ToolResult` is emitted.
+    failed_tool_calls: std::sync::Mutex<std::collections::HashSet<String>>,
     cancellation: Notify,
     idle: Notify,
     #[cfg(test)]
@@ -702,6 +709,7 @@ impl AgentWorkScope {
             advisor_uses: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "advisor")]
             advisor_messages: std::sync::Mutex::new(Vec::new()),
+            failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
             cancellation: Notify::new(),
             idle: Notify::new(),
             #[cfg(test)]
@@ -729,6 +737,7 @@ impl AgentWorkScope {
                 advisor_uses: Arc::new(AtomicUsize::new(0)),
                 #[cfg(feature = "advisor")]
                 advisor_messages: std::sync::Mutex::new(Vec::new()),
+                failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
                 blocking_gate: Some(gate),
@@ -968,6 +977,30 @@ pub(crate) fn with_advisor_messages<R>(
             f(&mut messages)
         })
         .ok()
+}
+
+fn record_tool_failure(internal_call_id: &str) {
+    let _ = AGENT_WORK_SCOPE.try_with(|scope| {
+        scope
+            .failed_tool_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(internal_call_id.to_owned());
+    });
+}
+
+/// Whether the tool call with this internal id failed or was denied. Consumes
+/// the record; outside a work scope every result reads as successful.
+pub(crate) fn take_tool_failure(internal_call_id: &str) -> bool {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .failed_tool_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(internal_call_id)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "mcp")]
@@ -1322,6 +1355,7 @@ async fn finalize_interactive_tool_calls(
                 id: CompactString::from(call.internal_call_id),
                 name: CompactString::from(call.name),
                 output: CompactString::from(UNKNOWN_TOOL_OUTCOME),
+                is_error: true,
             })
             .await;
     }
@@ -2834,11 +2868,13 @@ where
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
                         goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
                         let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
+                        let is_error = take_tool_failure(&internal_call_id);
                         let _ = event_tx
                             .send(AgentEvent::ToolResult {
                                 id: CompactString::from(internal_call_id),
                                 name: tool_name.clone(),
                                 output: CompactString::from(output),
+                                is_error,
                             })
                             .await;
                         if let Some(message) = loop_notice {
@@ -4880,6 +4916,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_events_flag_failed_tool_calls() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("fails", AlwaysFailTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("works", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(AlwaysFailTool(Arc::new(AtomicUsize::new(0))))
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "use both tools".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut results = Vec::new();
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::ToolResult { name, is_error, .. } => {
+                    results.push((name.to_string(), is_error))
+                }
+                crate::event::AgentEvent::Done { .. } => break,
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            results,
+            vec![
+                (AlwaysFailTool::NAME.to_string(), true),
+                (CountingTool::NAME.to_string(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn third_identical_failure_is_corrected_and_later_call_is_not_executed() {
         let args = serde_json::json!({"path": "missing.rs"});
         let model = MockCompletionModel::from_stream_turns(vec![
@@ -6842,7 +6931,9 @@ mod tests {
                         assert_eq!(name, CountingTool::NAME);
                         call_id = Some(id.to_string());
                     }
-                    crate::event::AgentEvent::ToolResult { id, name, output } => {
+                    crate::event::AgentEvent::ToolResult {
+                        id, name, output, ..
+                    } => {
                         assert_eq!(name, CountingTool::NAME);
                         assert_eq!(output, UNKNOWN_TOOL_OUTCOME);
                         synthetic = Some(id.to_string());
@@ -6954,7 +7045,9 @@ mod tests {
         let interactive_error = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
                 crate::event::AgentEvent::ToolCall { id, .. } => call_id = Some(id.to_string()),
-                crate::event::AgentEvent::ToolResult { id, name, output } => {
+                crate::event::AgentEvent::ToolResult {
+                    id, name, output, ..
+                } => {
                     assert_eq!(name, CountingTool::NAME);
                     assert_eq!(output, UNKNOWN_TOOL_OUTCOME);
                     result_id = Some(id.to_string());
@@ -7240,7 +7333,9 @@ mod tests {
                     }
                     session.add_tool_call_with_id(&id, &name, &args);
                 }
-                crate::event::AgentEvent::ToolResult { id, name, output } => {
+                crate::event::AgentEvent::ToolResult {
+                    id, name, output, ..
+                } => {
                     session.add_tool_result_with_id(&id, &name, &output);
                 }
                 crate::event::AgentEvent::Done { response, .. } => {

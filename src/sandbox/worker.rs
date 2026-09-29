@@ -860,7 +860,7 @@ mod tests {
         assert!(creation_source.contains("static PROCESS_CREATION_LOCK: Mutex<()>"));
         assert!(creation_source.contains("trait StdCommandCreationExt"));
         assert!(creation_source.contains("trait TokioCommandCreationExt"));
-        assert!(creation_source.contains("trait RmcpCommandCreationExt"));
+        assert!(creation_source.contains("trait CommandWrapCreationExt"));
         assert!(source.contains("static STATUS: OnceLock<WorkerContainmentStatus>"));
         assert!(source.contains("cached_containment_status(&STATUS, probe_containment)"));
         assert!(source.contains("cache.get_or_init(probe).clone()"));

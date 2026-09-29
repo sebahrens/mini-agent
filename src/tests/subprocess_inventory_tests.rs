@@ -1150,7 +1150,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-LSP-SERVICE",
     ),
-    ("src/extras/mcp/client.rs", ".spawn()", 1, "TC-MCP-STDIO"),
+    (
+        "src/extras/mcp/client.rs",
+        "let mut child = command.spawn()?;",
+        1,
+        "TC-MCP-STDIO",
+    ),
+    (
+        "src/extras/mcp/client.rs",
+        "Option<tokio::process::ChildStderr>,",
+        1,
+        "TC-MCP-STDIO",
+    ),
     (
         "src/extras/mcp/client.rs",
         "assert_eq!(response.status(), reqwest::StatusCode::FOUND);",
@@ -1165,7 +1176,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/mcp/client.rs",
-        "use tokio::process::Command;",
+        "use tokio::process::{ChildStdin, ChildStdout, Command};",
         1,
         "TC-MCP-STDIO",
     ),
@@ -2879,7 +2890,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/acp/mod.rs",
         &[
             (
-                "e846245f9ae3ad3f1ebad98ee1a10be06733d8d3439a1f77f12daf9e800112db",
+                "9106b09f8b4839d779e3f835488b1de3b17df2dabdf109f16d5088cd13f1140f",
                 1,
             ),
             (
@@ -4357,11 +4368,6 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
         ("spawn_guarded|TokioCommand::spawn(self)".to_string(), 1),
         (
             "spawn_guarded|process_wrap::tokio::CommandWrap::spawn(self)".to_string(),
-            1,
-        ),
-        (
-            "spawn_guarded|rmcp::transport::child_process::TokioChildProcessBuilder::spawn(self)"
-                .to_string(),
             1,
         ),
         (

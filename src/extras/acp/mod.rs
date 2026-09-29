@@ -265,6 +265,10 @@ struct SessionState {
     js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")]
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+    /// MCP servers the client supplied in `session/new`, connected for each
+    /// tool-enabled prompt alongside the configured servers.
+    #[cfg(feature = "mcp")]
+    client_mcp_servers: Arc<ClientMcpServers>,
 }
 
 struct PromptSessionSnapshot {
@@ -282,6 +286,7 @@ struct PromptSessionSnapshot {
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     control: Arc<TurnControl>,
     registration: TurnRegistration,
+    hook_lease: Option<HookRootLease>,
 }
 
 const TURN_ACTIVE: u8 = 0;
@@ -463,6 +468,67 @@ impl Drop for TurnRegistration {
     }
 }
 
+/// The workspace root that every active ACP turn shares while hooks are
+/// configured.
+///
+/// Hook dispatch (the `HookedTool` context and the dispatcher's execution
+/// root) is process-wide: each prompt rebinds it to that session's workspace.
+/// Two concurrent turns in different workspaces would therefore run each
+/// other's hooks against the wrong repository. Until hook execution carries a
+/// per-turn root, a turn whose workspace differs from the one active turns
+/// already hold is refused instead.
+#[derive(Default)]
+struct HookRootClaims {
+    active: StdMutex<Option<(std::path::PathBuf, usize)>>,
+}
+
+/// One active turn's hold on the shared hook root; released on drop.
+struct HookRootLease {
+    claims: Arc<HookRootClaims>,
+}
+
+impl HookRootClaims {
+    fn try_acquire(self: &Arc<Self>, root: &Path) -> Result<HookRootLease, String> {
+        let mut active = lock_unpoisoned(&self.active);
+        match active.as_mut() {
+            Some((held, count)) if held.as_path() == root => *count += 1,
+            Some((held, _)) => {
+                return Err(format!(
+                    "hooks are configured and another ACP session is running a prompt in '{}'; \
+                     hooks run against one workspace at a time, so this prompt in '{}' was refused \
+                     (retry when that prompt finishes)",
+                    held.display(),
+                    root.display()
+                ));
+            }
+            None => *active = Some((root.to_path_buf(), 1)),
+        }
+        Ok(HookRootLease {
+            claims: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for HookRootLease {
+    fn drop(&mut self) {
+        let mut active = lock_unpoisoned(&self.claims.active);
+        if let Some((_, count)) = active.as_mut() {
+            *count -= 1;
+            if *count == 0 {
+                *active = None;
+            }
+        }
+    }
+}
+
+fn acp_hook_root_claims() -> Option<Arc<HookRootClaims>> {
+    #[cfg(feature = "hooks")]
+    if crate::extras::hooks::get_dispatcher().is_some_and(|dispatcher| !dispatcher.is_empty()) {
+        return Some(Arc::default());
+    }
+    None
+}
+
 struct AcpState {
     cli: Cli,
     cfg: Config,
@@ -470,6 +536,14 @@ struct AcpState {
     sessions: Mutex<HashMap<SessionId, SessionState>>,
     cancel_routes: StdMutex<HashMap<SessionId, Arc<StdMutex<SessionTurns>>>>,
     shell_search_path: Option<std::ffi::OsString>,
+    /// Present only when hooks are configured. Hook dispatch uses one
+    /// process-wide execution root, so concurrent turns must agree on it.
+    hook_roots: Option<Arc<HookRootClaims>>,
+    /// Client-supplied stdio MCP servers launch local processes, so they are
+    /// accepted only from the editor that spawned this server over stdio,
+    /// never from a network peer.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    accepts_client_mcp: bool,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -628,15 +702,23 @@ struct TcpServerSettings {
     api_key: String,
 }
 
+/// Opt-in for a non-loopback ACP TCP bind. The TCP transport authenticates
+/// only the connection handshake: the session afterwards is plaintext and the
+/// client never authenticates the server, so anyone on the network path can
+/// read or inject into a tool-executing session.
+const ACP_ALLOW_REMOTE_ENV: &str = "MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE";
+
 fn resolve_tcp_settings(cli: &Cli, cfg: &Config) -> anyhow::Result<Option<TcpServerSettings>> {
     let environment_key = std::env::var("MINI_AGENT_ACP_API_KEY").ok();
-    resolve_tcp_settings_with_key(cli, cfg, environment_key)
+    let allow_remote = std::env::var(ACP_ALLOW_REMOTE_ENV).is_ok_and(|value| value == "1");
+    resolve_tcp_settings_with_key(cli, cfg, environment_key, allow_remote)
 }
 
 fn resolve_tcp_settings_with_key(
     cli: &Cli,
     cfg: &Config,
     environment_key: Option<String>,
+    allow_remote: bool,
 ) -> anyhow::Result<Option<TcpServerSettings>> {
     let configured_host = cli.acp_host.clone().or_else(|| cfg.acp_host.clone());
     let configured_port = cli.acp_port.or(cfg.acp_port);
@@ -656,10 +738,22 @@ fn resolve_tcp_settings_with_key(
         })?;
 
     if !is_loopback_host(&host) {
-        tracing::warn!(
-            "ACP TCP remote bind explicitly enabled for {}; authentication is required",
-            host
+        if !allow_remote {
+            anyhow::bail!(
+                "refusing ACP TCP bind on non-loopback host '{host}': the TCP transport \
+                 authenticates only the handshake, then carries the session in plaintext \
+                 without authenticating the server, so an on-path attacker could read or \
+                 inject into a tool-executing session. Bind to 127.0.0.1 and tunnel (for \
+                 example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 to accept that risk"
+            );
+        }
+        let warning = format!(
+            "WARNING: ACP TCP is listening on non-loopback host {host} because \
+             {ACP_ALLOW_REMOTE_ENV}=1. The session is unencrypted and the server is not \
+             authenticated to clients; use only on a trusted network."
         );
+        tracing::warn!("{warning}");
+        eprintln!("{warning}");
     }
 
     Ok(Some(TcpServerSettings {
@@ -696,6 +790,71 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+// --- Provider resolution ---
+
+/// The provider/model an ACP turn runs with: the same `--provider`/`--model`
+/// resolution and `--quick-model` override as interactive startup. A custom
+/// provider's `model` is only a default, applied by `Cli::resolve_model` when
+/// nothing else selects a model; it never overrides an explicit `model`.
+fn acp_provider_and_model(
+    cli: &Cli,
+    cfg: &Config,
+) -> (compact_str::CompactString, compact_str::CompactString) {
+    cli.resolve_provider_and_model(cfg)
+}
+
+/// The ACP turn client, with the same credential precedence as startup
+/// (`--api-key` first).
+fn acp_client(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+) -> anyhow::Result<crate::provider::AnyClient> {
+    crate::provider::create_client(
+        provider,
+        cli.api_key.as_deref(),
+        &cfg.custom_providers_map(),
+        cfg.api_keys.as_ref(),
+    )
+}
+
+/// The subagent configuration an ACP server installs, or `None` when the
+/// `task` tool is disabled or the main provider has no usable client.
+#[cfg(feature = "subagents")]
+fn acp_subagent_config(
+    cli: &Cli,
+    cfg: &Config,
+) -> Option<crate::extras::subagents::SubagentConfig> {
+    if !cfg.task_enabled.unwrap_or(true) {
+        return None;
+    }
+    let (provider, model) = acp_provider_and_model(cli, cfg);
+    match acp_client(cli, cfg, &provider) {
+        Ok(client) => Some(crate::extras::subagents::resolve_config(
+            cfg,
+            cli.api_key.as_deref(),
+            &provider,
+            &model,
+            &client,
+        )),
+        Err(error) => {
+            tracing::warn!(
+                "ACP: subagent provider '{}' unavailable ({}); the task tool will fail until it is configured",
+                provider,
+                error
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "subagents")]
+fn init_acp_subagents(cli: &Cli, cfg: &Config) {
+    if let Some(config) = acp_subagent_config(cli, cfg) {
+        crate::extras::subagents::install(config);
+    }
+}
+
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
@@ -705,12 +864,19 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
     crate::permission::build_noninteractive_permission(&cfg, authority)?;
 
     let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
+    let is_tcp = tcp_settings.is_some();
     let transport_mode = if tcp_settings.is_some() {
         "tcp"
     } else {
         "stdio"
     };
     tracing::info!("ACP server starting: transport={}", transport_mode);
+
+    // ACP returns before `Startup::init_features`, which is where the other
+    // surfaces install the subagent configuration. The `task` tool is still
+    // registered for every ACP turn, so install it here from the same resolver.
+    #[cfg(feature = "subagents")]
+    init_acp_subagents(&cli, &cfg);
 
     let state = Arc::new(AcpState {
         cli,
@@ -719,6 +885,8 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
+        hook_roots: acp_hook_root_claims(),
+        accepts_client_mcp: !is_tcp,
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -884,6 +1052,10 @@ async fn handle_new_session(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
+    #[cfg(feature = "mcp")]
+    let client_mcp_servers = client_mcp_servers(state, &req.mcp_servers)?;
+    #[cfg(not(feature = "mcp"))]
+    client_mcp_servers(state, &req.mcp_servers)?;
     let workspace_root = workspace.root();
     let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -931,6 +1103,8 @@ async fn handle_new_session(
             js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            client_mcp_servers: Arc::new(client_mcp_servers),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
@@ -938,6 +1112,118 @@ async fn handle_new_session(
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
+}
+
+#[cfg(feature = "mcp")]
+type ClientMcpServers = HashMap<String, crate::extras::mcp::config::McpServerConfig>;
+#[cfg(not(feature = "mcp"))]
+type ClientMcpServers = ();
+
+/// Validate the MCP servers a client supplied in `session/new`.
+///
+/// ACP requires every agent to accept stdio servers. They are launched like a
+/// configured `mcp_servers` command entry (no sandbox, working directory = the
+/// session root) with the client's `env` plus the server process's `PATH` and
+/// `HOME`. Anything this server cannot honour is refused explicitly rather
+/// than silently ignored: HTTP/SSE servers (not advertised), servers from a
+/// TCP peer (a network client must not launch local processes), and servers
+/// when MCP is disabled or not compiled in.
+fn client_mcp_servers(
+    state: &AcpState,
+    servers: &[McpServer],
+) -> Result<ClientMcpServers, agent_client_protocol::Error> {
+    let refuse = |message: String| Err(agent_client_protocol::Error::new(-32602, message));
+    if servers.is_empty() {
+        #[cfg(feature = "mcp")]
+        return Ok(ClientMcpServers::new());
+        #[cfg(not(feature = "mcp"))]
+        return Ok(());
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = state;
+        refuse(
+            "client-supplied MCP servers are not supported: this build has no MCP support".into(),
+        )
+    }
+    #[cfg(feature = "mcp")]
+    {
+        use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+        if !state.accepts_client_mcp {
+            return refuse(
+                "client-supplied MCP servers are refused over ACP TCP; configure them in \
+                 `mcp_servers` on the agent host instead"
+                    .into(),
+            );
+        }
+        if !state.cli.mcp_is_eligible(&state.cfg) {
+            return refuse(
+                "client-supplied MCP servers were sent but MCP is disabled for this agent".into(),
+            );
+        }
+        let mut accepted = ClientMcpServers::new();
+        for server in servers {
+            let McpServer::Stdio(stdio) = server else {
+                return refuse(
+                    "only stdio MCP servers are supported; HTTP and SSE servers are not \
+                     advertised by this agent"
+                        .into(),
+                );
+            };
+            if !stdio.command.is_absolute() {
+                return refuse(format!(
+                    "MCP server '{}' command must be an absolute path",
+                    stdio.name
+                ));
+            }
+            if accepted.contains_key(&stdio.name) {
+                return refuse(format!("duplicate MCP server name '{}'", stdio.name));
+            }
+            accepted.insert(
+                stdio.name.clone(),
+                McpServerConfig::Command {
+                    command: stdio.command.to_string_lossy().into_owned(),
+                    args: stdio.args.clone(),
+                    cwd: None,
+                    env: stdio
+                        .env
+                        .iter()
+                        .map(|variable| (variable.name.clone(), variable.value.clone()))
+                        .collect(),
+                    inherit_env: vec!["PATH".to_string(), "HOME".to_string()],
+                    sandbox: None,
+                    network: McpStdioNetwork::Inherit,
+                },
+            );
+        }
+        Ok(accepted)
+    }
+}
+
+/// The configuration a prompt connects MCP with: the configured servers plus
+/// the session's client-supplied ones. A configured server keeps its name;
+/// a client server with the same name is skipped.
+#[cfg(feature = "mcp")]
+fn with_client_mcp_servers<'a>(
+    cfg: &'a Config,
+    client: &ClientMcpServers,
+) -> std::borrow::Cow<'a, Config> {
+    if client.is_empty() {
+        return std::borrow::Cow::Borrowed(cfg);
+    }
+    let mut merged = cfg.clone();
+    let servers = merged.mcp_servers.get_or_insert_with(HashMap::new);
+    for (name, server) in client {
+        if servers.contains_key(name) {
+            tracing::warn!(
+                "ACP: client MCP server '{}' shadows a configured server; using the configured one",
+                name
+            );
+            continue;
+        }
+        servers.insert(name.clone(), server.clone());
+    }
+    std::borrow::Cow::Owned(merged)
 }
 
 async fn handle_close_session(
@@ -1010,24 +1296,15 @@ fn acp_session_sandbox(
 /// reason `/goal` refuses it: the rounds and verdicts on it are the record of
 /// the work done so far.
 #[cfg(feature = "goal")]
-async fn apply_meta_goal(
-    state: &Arc<AcpState>,
-    session_id: &SessionId,
+fn apply_meta_goal(
+    state: &AcpState,
+    store: &crate::extras::goal::GoalStore,
     meta: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
     let Some(spec) = meta.get("goal") else {
         return Ok(());
     };
-    let store = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(session_id)
-            .ok_or_else(|| "unknown ACP session".to_string())?
-            .goal_store
-            .clone()
-    };
-    let provider = state.cli.resolve_provider(&state.cfg);
-    let model = state.cli.resolve_model(&state.cfg);
+    let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
 
     let MetaGoal {
         objective,
@@ -1125,23 +1402,13 @@ async fn handle_prompt(
 
     let prompt_text = render_prompt_blocks(&req.prompt)?;
 
-    // A client sets or clears the session's goal through the request's `_meta`
-    // rather than through prompt text: the objective is a long-lived
-    // instruction channel, and a text directive would let anything that reaches
-    // the prompt install one.
-    #[cfg(feature = "goal")]
-    if let Some(meta) = req.meta.as_ref()
-        && let Err(error) = apply_meta_goal(&state, &session_id, meta).await
-    {
-        return Err(agent_client_protocol::Error::new(-32602, error));
-    }
-
     let snapshot = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
         let control = Arc::new(TurnControl::new());
+        let hook_lease;
         let generation = {
             let mut turns = lock_unpoisoned(&sess.turns);
             if !turns.queue.is_empty() {
@@ -1150,6 +1417,12 @@ async fn handle_prompt(
                     "ACP session already has an active prompt",
                 ));
             }
+            hook_lease = state
+                .hook_roots
+                .as_ref()
+                .map(|claims| claims.try_acquire(sess.workspace.root()))
+                .transpose()
+                .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
             let generation = turns.next_generation;
             turns.next_generation = turns.next_generation.wrapping_add(1);
             turns.queue.push_back(RegisteredTurn {
@@ -1177,6 +1450,7 @@ async fn handle_prompt(
                 turns: sess.turns.clone(),
                 control: control.clone(),
             },
+            hook_lease,
         }
     };
     let PromptSessionSnapshot {
@@ -1194,7 +1468,22 @@ async fn handle_prompt(
         skill_services,
         control,
         registration,
+        hook_lease,
     } = snapshot;
+
+    // A client sets or clears the session's goal through the request's `_meta`
+    // rather than through prompt text: the objective is a long-lived
+    // instruction channel, and a text directive would let anything that reaches
+    // the prompt install one. It is applied only once this prompt has been
+    // admitted, so a prompt rejected because another turn is active cannot
+    // clear or replace the goal that turn is being judged against. A refused
+    // goal drops `registration`, which settles the just-admitted generation.
+    #[cfg(feature = "goal")]
+    if let Some(meta) = req.meta.as_ref()
+        && let Err(error) = apply_meta_goal(&state, &goal_store, meta)
+    {
+        return Err(agent_client_protocol::Error::new(-32602, error));
+    }
 
     control.attach_sandbox(sandbox.clone());
 
@@ -1215,6 +1504,8 @@ async fn handle_prompt(
             // kill/reap hooks and finish tracked blocking work.
             let _cancel_on_connection_drop = CancelTurnOnDrop(teardown_control);
             tokio::spawn(async move {
+                // Held until the turn, its hooks and its tracked work settle.
+                let _hook_lease = hook_lease;
                 let registration = registration;
                 let _request_cancellation_bridge = request_cancellation_bridge;
                 if control.is_cancelled() {
@@ -1476,6 +1767,15 @@ fn respond_terminal(
     responder.respond(PromptResponse::new(reason))
 }
 
+fn respond_terminal_error(
+    registration: &TurnRegistration,
+    responder: Responder<PromptResponse>,
+    error: String,
+) -> Result<(), agent_client_protocol::Error> {
+    registration.settle();
+    responder.respond_with_error(agent_client_protocol::Error::new(-32603, error))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -1547,6 +1847,7 @@ async fn run_prompt(
     let mut outcome = result?;
     if !registration.complete_and_settle() {
         outcome.reason = StopReason::Cancelled;
+        outcome.error = None;
     }
     // Settle the goal round this prompt turn was, before the transcript is
     // committed, so the gate sees the round's own record.
@@ -1554,6 +1855,7 @@ async fn run_prompt(
     let goal_line = settle_acp_goal_round(
         &goal_store_for_gate,
         outcome.reason,
+        outcome.error.as_deref(),
         outcome.progress.as_deref().unwrap_or(&[]),
         &todo_snapshot,
         state,
@@ -1612,18 +1914,14 @@ async fn run_prompt(
         notification.meta = Some(meta);
         let _ = cx.send_notification(notification);
     }
-    if outcome.reason == StopReason::Refusal
-        && let Some(error) = outcome.error
-    {
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
-            "[error: {error}]"
-        ))));
-        let _ = cx.send_notification(SessionNotification::new(
-            session_id,
-            SessionUpdate::AgentMessageChunk(chunk),
-        ));
+    // An internal failure (provider, runner, workspace or configuration) is
+    // not a model refusal: it is answered as a JSON-RPC error so a client can
+    // tell the two apart. Progress the turn made is still committed above.
+    if let Some(error) = outcome.error {
+        let _ = respond_terminal_error(registration, responder, error);
+    } else {
+        let _ = respond_terminal(registration, responder, outcome.reason);
     }
-    let _ = respond_terminal(registration, responder, outcome.reason);
     Ok(())
 }
 
@@ -1637,9 +1935,11 @@ async fn run_prompt(
 ///
 /// Returns the line to report and the goal it describes.
 #[cfg(feature = "goal")]
+#[allow(clippy::too_many_arguments)]
 async fn settle_acp_goal_round(
     store: &crate::extras::goal::GoalStore,
     reason: StopReason,
+    error: Option<&str>,
     interactions: &[Message],
     todos: &[crate::agent::tools::todo::TodoItem],
     state: &AcpState,
@@ -1667,21 +1967,18 @@ async fn settle_acp_goal_round(
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty()),
     );
-    summary.end = match reason {
-        StopReason::EndTurn => RoundEnd::Done,
-        StopReason::Cancelled => RoundEnd::Cancelled,
-        other => RoundEnd::Failed(format!("{other:?}")),
+    summary.end = match (error, reason) {
+        (Some(error), _) => RoundEnd::Failed(error.to_string()),
+        (None, StopReason::EndTurn) => RoundEnd::Done,
+        (None, StopReason::Cancelled) => RoundEnd::Cancelled,
+        (None, other) => RoundEnd::Failed(format!("{other:?}")),
     };
 
     // The same objective is gated the same way in an editor as in a terminal:
     // both tiers run here. A claim no command proved is labelled as such in
     // the line and in `_meta`, wherever it is settled.
-    let judge = crate::extras::goal::judge::resolve(
-        &goal.judge,
-        cfg,
-        &state.cli.resolve_provider(cfg),
-        &state.cli.resolve_model(cfg),
-    );
+    let (main_provider, main_model) = acp_provider_and_model(&state.cli, cfg);
+    let judge = crate::extras::goal::judge::resolve(&goal.judge, cfg, &main_provider, &main_model);
     let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
     let outcome = driver::settle_round(store, summary, |request| async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
@@ -1736,8 +2033,11 @@ async fn settle_acp_goal_round(
 }
 
 struct PromptOutcome {
+    /// Ignored when `error` is set: a failed turn is answered with a JSON-RPC
+    /// error, never with a stop reason.
     reason: StopReason,
     progress: Option<Vec<Message>>,
+    /// An internal failure; the prompt request fails with this message.
     error: Option<String>,
     /// Tokens this turn spent. A goal's token bound is enforced from here, so
     /// leaving it at zero would make the bound configurable and inert.
@@ -1869,8 +2169,7 @@ async fn execute_prompt(
             blocked_ms,
         ));
     }
-    let provider_str = state.cli.resolve_provider(&state.cfg);
-    let mut model_str = state.cli.resolve_model(&state.cfg);
+    let (provider_str, model_str) = acp_provider_and_model(&state.cli, &state.cfg);
 
     tracing::debug!(
         "ACP run_prompt: provider={}, model={}, prompt_len={}",
@@ -1879,20 +2178,7 @@ async fn execute_prompt(
         prompt_text.len(),
     );
 
-    // Custom provider model override (if no explicit model set)
-    if (model_str.as_str() == "deepseek/deepseek-v4-pro" || state.cli.model.is_none())
-        && let Some(custom) = state.cfg.custom_providers_map().get(provider_str.as_str())
-        && let Some(ref custom_model) = custom.model
-    {
-        model_str = custom_model.clone();
-    }
-
-    let client = match crate::provider::create_client(
-        &provider_str,
-        None,
-        &state.cfg.custom_providers_map(),
-        state.cfg.api_keys.as_ref(),
-    ) {
+    let client = match acp_client(&state.cli, &state.cfg, &provider_str) {
         Ok(client) => client,
         Err(error) => {
             return Ok(PromptOutcome::failed(error.to_string()));
@@ -1948,8 +2234,16 @@ async fn execute_prompt(
     #[cfg(feature = "mcp")]
     {
         *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
+            let client_servers = state
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|session| session.client_mcp_servers.clone())
+                .unwrap_or_default();
+            let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
             let Some(manager) =
-                connect_prompt_mcp(&state.cfg, &workspace, &work_scope, control.cancelled()).await
+                connect_prompt_mcp(&mcp_cfg, &workspace, &work_scope, control.cancelled()).await
             else {
                 return Ok(PromptOutcome::cancelled(None));
             };
@@ -1999,7 +2293,7 @@ async fn execute_prompt(
         agent.spawn_runner_paused_in_scope(
             prompt_text.to_string(),
             prior_history,
-            crate::retry::RetryConfig::default(),
+            state.cfg.retry.clone(),
             #[cfg(feature = "hooks")]
             None, // ACP is not loop mode; global lifecycle hooks remain active.
             Arc::clone(&work_scope),
@@ -2094,7 +2388,7 @@ async fn relay_prompt_events(
                 progress: None,
                 #[cfg(feature = "goal")]
                 usage: rig::completion::Usage::default(),
-                error: None,
+                error: Some("agent runner stopped without a terminal event".to_string()),
             };
         };
         match event {
@@ -2145,13 +2439,21 @@ async fn relay_prompt_events(
                 // Display-only provenance; the outer task call remains the
                 // canonical ACP tool lifecycle.
             }
-            AgentEvent::ToolResult { id, output, .. } => {
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                ..
+            } => {
                 let id = id.to_string();
-                let fields = ToolCallUpdateFields::new()
+                let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
                         TextContent::new(output.to_string()),
                     ))]);
+                if is_error {
+                    fields.status = Some(ToolCallStatus::Failed);
+                }
                 let update = ToolCallUpdate::new(ToolCallId::new(id), fields);
                 let notif = SessionNotification::new(
                     session_id.clone(),
@@ -2882,6 +3184,8 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -2898,6 +3202,8 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -2917,6 +3223,8 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -2952,6 +3260,8 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
+            hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3294,11 +3604,13 @@ mod protocol_tests {
                                 id: "lifecycle-b".into(),
                                 name: "read".into(),
                                 output: "b-result".into(),
+                                is_error: true,
                             },
                             AgentEvent::ToolResult {
                                 id: "lifecycle-a".into(),
                                 name: "read".into(),
                                 output: "a-result".into(),
+                                is_error: false,
                             },
                             done("tools-complete", canonical_tool_turn()),
                         ]);
@@ -3388,8 +3700,11 @@ mod protocol_tests {
                 let failed = cx
                     .send_request(prompt(first.clone(), "fail"))
                     .block_task()
-                    .await?;
-                assert_eq!(failed.stop_reason, StopReason::Refusal);
+                    .await;
+                assert!(
+                    failed.is_err(),
+                    "an internal failure is a JSON-RPC error, not a refusal: {failed:?}"
+                );
                 cx.send_request(prompt(first.clone(), "after-failure"))
                     .block_task()
                     .await?;
@@ -3439,6 +3754,23 @@ mod protocol_tests {
             .collect::<Vec<_>>();
         assert_eq!(call_ids, vec!["lifecycle-a", "lifecycle-b"]);
         assert_eq!(result_ids, vec!["lifecycle-b", "lifecycle-a"]);
+        let statuses = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => {
+                    Some((update.tool_call_id.to_string(), update.fields.status))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("lifecycle-b".to_string(), Some(ToolCallStatus::Failed)),
+                ("lifecycle-a".to_string(), Some(ToolCallStatus::Completed)),
+            ],
+            "a failed tool result must be reported as failed"
+        );
     }
 
     #[tokio::test]
@@ -3539,6 +3871,305 @@ mod protocol_tests {
             })
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn rejected_prompt_does_not_touch_the_active_turns_goal() {
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let blocked_started = blocked_started.clone();
+            Arc::new(move |prompt, _history| {
+                let blocked_started = blocked_started.clone();
+                Box::pin(async move {
+                    if prompt == "blocked" {
+                        blocked_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let with_goal = |session: SessionId, text: &str, goal: serde_json::Value| {
+            let mut request = prompt(session, text);
+            let mut meta = serde_json::Map::new();
+            meta.insert("goal".to_string(), goal);
+            request.meta = Some(meta);
+            request
+        };
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let first_cx = cx.clone();
+                let first = with_goal(
+                    session.clone(),
+                    "blocked",
+                    serde_json::json!({"objective": "keep this objective"}),
+                );
+                let blocked =
+                    tokio::spawn(async move { first_cx.send_request(first).block_task().await });
+                tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+                    .await
+                    .expect("the first turn should start");
+
+                for goal in [
+                    serde_json::json!({"clear": true}),
+                    serde_json::json!({"objective": "hijack", "replace": true}),
+                ] {
+                    assert!(
+                        cx.send_request(with_goal(session.clone(), "concurrent", goal))
+                            .block_task()
+                            .await
+                            .is_err(),
+                        "a concurrent prompt must be rejected"
+                    );
+                    let objective = observed
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session)
+                        .and_then(|s| s.goal_store.snapshot())
+                        .map(|goal| goal.objective.clone());
+                    assert_eq!(
+                        objective.as_deref(),
+                        Some("keep this objective"),
+                        "a rejected prompt must not change the active turn's goal"
+                    );
+                }
+
+                cx.send_notification(CancelNotification::new(session))?;
+                let blocked = tokio::time::timeout(Duration::from_secs(5), blocked)
+                    .await
+                    .expect("cancellation must release the active turn")
+                    .unwrap()?;
+                assert_eq!(blocked.stop_reason, StopReason::Cancelled);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooked_server_refuses_concurrent_turns_in_different_workspaces() {
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let blocked_started = blocked_started.clone();
+            Arc::new(move |prompt, _history| {
+                let blocked_started = blocked_started.clone();
+                Box::pin(async move {
+                    if prompt == "blocked" {
+                        blocked_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().hook_roots = Some(Arc::default());
+        let repo_a = ProtocolTempDir::new();
+        let repo_b = ProtocolTempDir::new();
+        let (cwd_a, cwd_b) = (repo_a.path().to_path_buf(), repo_b.path().to_path_buf());
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let a = cx
+                    .send_request(NewSessionRequest::new(cwd_a.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let a_again = cx
+                    .send_request(NewSessionRequest::new(cwd_a))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let b = cx
+                    .send_request(NewSessionRequest::new(cwd_b))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let blocked_cx = cx.clone();
+                let blocked_id = a.clone();
+                let blocked = tokio::spawn(async move {
+                    blocked_cx
+                        .send_request(prompt(blocked_id, "blocked"))
+                        .block_task()
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+                    .await
+                    .expect("the first turn should start");
+
+                let refused = cx
+                    .send_request(prompt(b.clone(), "other-repo"))
+                    .block_task()
+                    .await
+                    .expect_err("hooks would run against the wrong workspace");
+                assert!(refused.to_string().contains("hooks"), "{refused}");
+                let same_repo = cx
+                    .send_request(prompt(a_again, "same-repo"))
+                    .block_task()
+                    .await?;
+                assert_eq!(same_repo.stop_reason, StopReason::EndTurn);
+
+                cx.send_notification(CancelNotification::new(a))?;
+                tokio::time::timeout(Duration::from_secs(5), blocked)
+                    .await
+                    .expect("cancellation must release the active turn")
+                    .unwrap()?;
+                let after = cx
+                    .send_request(prompt(b, "other-repo"))
+                    .block_task()
+                    .await?;
+                assert_eq!(after.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn client_stdio_mcp_servers_become_session_command_servers() {
+        use crate::extras::mcp::config::McpServerConfig;
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let command = std::env::temp_dir().join("client-mcp-server");
+        let servers = vec![McpServer::Stdio(
+            McpServerStdio::new("editor-tools", command.clone())
+                .args(vec!["--stdio".to_string()])
+                .env(vec![EnvVariable::new("TOKEN", "from-editor")]),
+        )];
+
+        let accepted = client_mcp_servers(&state, &servers).unwrap();
+        let Some(McpServerConfig::Command {
+            command: launched,
+            args,
+            env,
+            inherit_env,
+            sandbox,
+            cwd,
+            ..
+        }) = accepted.get("editor-tools")
+        else {
+            panic!("a client stdio server must become a command server: {accepted:?}");
+        };
+        assert_eq!(launched, &command.display().to_string());
+        assert_eq!(args, &vec!["--stdio".to_string()]);
+        assert_eq!(env.get("TOKEN").map(String::as_str), Some("from-editor"));
+        assert_eq!(inherit_env, &vec!["PATH".to_string(), "HOME".to_string()]);
+        assert!(sandbox.is_none() && cwd.is_none());
+
+        let configured = Config {
+            mcp_servers: Some(HashMap::from([(
+                "editor-tools".to_string(),
+                McpServerConfig::Url {
+                    url: "https://configured.example/mcp".to_string(),
+                    headers: HashMap::new(),
+                    oauth: None,
+                },
+            )])),
+            ..Config::default()
+        };
+        let merged = with_client_mcp_servers(&configured, &accepted);
+        assert!(
+            matches!(
+                merged.mcp_servers.as_ref().unwrap().get("editor-tools"),
+                Some(McpServerConfig::Url { .. })
+            ),
+            "a configured server keeps its name"
+        );
+        let unconfigured = Config::default();
+        let merged = with_client_mcp_servers(&unconfigured, &accepted);
+        assert!(matches!(
+            merged.mcp_servers.as_ref().unwrap().get("editor-tools"),
+            Some(McpServerConfig::Command { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_client_mcp_servers_are_refused_not_ignored() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let absolute = std::env::temp_dir().join("client-mcp-server");
+        let refused = |state: &AcpState, server: McpServer| {
+            client_mcp_servers(state, &[server])
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        assert!(
+            refused(
+                &state,
+                McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp"))
+            )
+            .is_some(),
+            "HTTP servers are not advertised"
+        );
+        #[cfg(feature = "mcp")]
+        {
+            assert!(
+                refused(
+                    &state,
+                    McpServer::Stdio(McpServerStdio::new("relative", "bin/server"))
+                )
+                .is_some()
+            );
+            let duplicate = McpServer::Stdio(McpServerStdio::new("same", absolute.clone()));
+            assert!(client_mcp_servers(&state, &[duplicate.clone(), duplicate]).is_err());
+
+            let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+            let mut tcp = fixture_state(fixture);
+            Arc::get_mut(&mut tcp).unwrap().accepts_client_mcp = false;
+            let error = refused(
+                &tcp,
+                McpServer::Stdio(McpServerStdio::new("local", absolute.clone())),
+            )
+            .expect("a TCP peer must not launch local processes");
+            assert!(error.contains("TCP"), "{error}");
+        }
+        #[cfg(not(feature = "mcp"))]
+        assert!(
+            refused(
+                &state,
+                McpServer::Stdio(McpServerStdio::new("local", absolute))
+            )
+            .is_some()
+        );
+        assert!(client_mcp_servers(&state, &[]).is_ok());
     }
 
     #[tokio::test]
@@ -4531,13 +5162,17 @@ mod protocol_tests {
                     let response = tokio::time::timeout(Duration::from_secs(2), response)
                         .await
                         .unwrap()
-                        .unwrap()?;
-                    let expected = match case {
-                        "prepare-cancel" | "cleanup-cancel" | "compaction" => StopReason::Cancelled,
-                        "done" => StopReason::EndTurn,
-                        _ => StopReason::Refusal,
-                    };
-                    assert_eq!(response.stop_reason, expected, "{case}");
+                        .unwrap();
+                    match case {
+                        "prepare-cancel" | "cleanup-cancel" | "compaction" => {
+                            assert_eq!(response?.stop_reason, StopReason::Cancelled, "{case}")
+                        }
+                        "done" => assert_eq!(response?.stop_reason, StopReason::EndTurn, "{case}"),
+                        _ => assert!(
+                            response.is_err(),
+                            "{case}: internal failures are JSON-RPC errors"
+                        ),
+                    }
                     assert!(
                         !process_is_alive(pid),
                         "{case}: child outlived terminal response"
@@ -5611,6 +6246,122 @@ mod workspace_tests {
 }
 
 #[cfg(test)]
+mod provider_resolution_tests {
+    use super::*;
+
+    fn config(toml_text: &str) -> Config {
+        toml::from_str(toml_text).expect("test config parses")
+    }
+
+    const CUSTOM: &str = r#"
+provider = "acme"
+
+[custom_providers.acme]
+provider_type = "openai"
+base_url = "http://127.0.0.1:9/v1"
+model = "acme-default"
+
+[quick_models.fast]
+provider = "acme"
+model = "acme-fast"
+"#;
+
+    #[test]
+    fn acp_honours_quick_model_like_startup() {
+        let cli = Cli {
+            quick_model: Some("fast".into()),
+            ..Default::default()
+        };
+        let (provider, model) = acp_provider_and_model(&cli, &config(CUSTOM));
+        assert_eq!(provider, "acme");
+        assert_eq!(model, "acme-fast");
+    }
+
+    #[test]
+    fn custom_provider_model_is_only_a_default_under_acp() {
+        let cfg = config(CUSTOM);
+        let (_, model) = acp_provider_and_model(&Cli::default(), &cfg);
+        assert_eq!(model, "acme-default");
+
+        let explicit = config(&format!("model = \"explicit-model\"\n{CUSTOM}"));
+        let (provider, model) = acp_provider_and_model(&Cli::default(), &explicit);
+        assert_eq!(provider, "acme");
+        assert_eq!(
+            model, "explicit-model",
+            "cfg.model must win over the custom default"
+        );
+    }
+
+    #[test]
+    fn acp_client_uses_the_cli_api_key() {
+        let cfg = config(CUSTOM);
+        assert!(
+            acp_client(&Cli::default(), &cfg, "acme").is_err(),
+            "a custom provider without any key must not resolve"
+        );
+        let cli = Cli {
+            api_key: Some("cli-key".into()),
+            ..Default::default()
+        };
+        assert!(acp_client(&cli, &cfg, "acme").is_ok());
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn acp_installs_a_subagent_config_for_the_task_tool() {
+        let cli = Cli {
+            api_key: Some("cli-key".into()),
+            quick_model: Some("fast".into()),
+            ..Default::default()
+        };
+        let resolved = acp_subagent_config(&cli, &config(CUSTOM))
+            .expect("ACP must initialise the task tool's subagent config");
+        assert_eq!(resolved.provider_name, "acme");
+        assert_eq!(resolved.model_name, "acme-fast");
+        assert_eq!(resolved.api_key.as_deref(), Some("cli-key"));
+
+        let disabled = config(&format!("task_enabled = false\n{CUSTOM}"));
+        assert!(acp_subagent_config(&cli, &disabled).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hook_root_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_turns_must_share_the_hook_root() {
+        let claims = Arc::new(HookRootClaims::default());
+        let repo_a = Path::new("/workspace/a");
+        let repo_b = Path::new("/workspace/b");
+
+        let first = claims
+            .try_acquire(repo_a)
+            .expect("first turn claims its root");
+        let same = claims
+            .try_acquire(repo_a)
+            .expect("a second session in the same workspace may run concurrently");
+        let refused = claims
+            .try_acquire(repo_b)
+            .err()
+            .expect("a turn in another workspace would run hooks against the wrong repo");
+        assert!(refused.contains("/workspace/a"), "{refused}");
+
+        drop(first);
+        assert!(
+            claims.try_acquire(repo_b).is_err(),
+            "the root stays held while any turn in it is active"
+        );
+        drop(same);
+        let other = claims
+            .try_acquire(repo_b)
+            .expect("once every turn settles another workspace may claim the root");
+        drop(other);
+        assert!(lock_unpoisoned(&claims.active).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tcp_authentication_tests {
     use super::*;
     use crate::acp_auth::{read_challenge, send_response};
@@ -5633,7 +6384,8 @@ mod tcp_authentication_tests {
     #[test]
     fn stdio_remains_default_without_tcp_endpoint() {
         let settings =
-            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None).unwrap();
+            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false)
+                .unwrap();
         assert!(settings.is_none());
     }
 
@@ -5645,7 +6397,7 @@ mod tcp_authentication_tests {
         };
         let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None)
+        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false)
             .unwrap()
             .unwrap();
         assert_eq!(settings.host, DEFAULT_TCP_HOST);
@@ -5660,10 +6412,42 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
 
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None)
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false)
             .err()
             .expect("TCP without authentication must fail");
         assert!(error.to_string().contains("requires authentication"));
+    }
+
+    #[test]
+    fn non_loopback_tcp_bind_requires_an_explicit_insecure_opt_in() {
+        let cli = Cli {
+            acp_host: Some("0.0.0.0".to_owned()),
+            ..Default::default()
+        };
+        let key = Some("secret".to_owned());
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+            .err()
+            .expect("a remote bind must be refused by default");
+        assert!(error.to_string().contains(ACP_ALLOW_REMOTE_ENV), "{error}");
+        assert!(!error.to_string().contains("secret"));
+
+        let settings = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.host, "0.0.0.0");
+
+        for loopback in ["127.0.0.1", "::1", "localhost"] {
+            let cli = Cli {
+                acp_host: Some(loopback.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+                    .unwrap()
+                    .is_some(),
+                "{loopback} needs no opt-in"
+            );
+        }
     }
 
     #[test]

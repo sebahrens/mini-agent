@@ -1637,9 +1637,16 @@ or oversized schemas are omitted. Startup notices report each applied bound.
 A server that exceeds the time or page budget is skipped without delaying the
 others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 (default 120); on expiry zerostack cancels the request and returns a tool error
-the model can act on instead of stalling the turn. Malformed JSON arguments are
-rejected rather than silently converted to an argument-less call. Text, image,
-and embedded resource data from one result share the same model-facing bound as
+the model can act on instead of stalling the turn. A stdio server's protocol
+messages are newline-delimited; one line may be at most 16 MiB, and a server
+that writes more without a newline is disconnected and its process tree
+killed rather than buffered without bound. Malformed JSON arguments are
+rejected rather than silently converted to an argument-less call. Content
+blocks are joined with newlines; images and binary resources are shown as
+`[image: <mime>, <N> bytes]` / `[resource: <uri>, <mime>, <N> bytes]`
+placeholders rather than inlined base64, and host permission notes appear
+outside the `[mcp output begins]` fence that marks server text. Text and
+embedded resource text from one result share the same model-facing bound as
 ordinary tool output: results over 12,000 characters are stored in the private
 tool-output directory and replaced with a 2,000-character head, an omission
 notice with the spill-file path, and an 8,000-character tail. If private
@@ -1730,7 +1737,9 @@ distinguishes a confirmed clipboard write from an unacknowledged OSC 52
 terminal request. Open the URL in a browser, approve access, and the redirect
 is caught on the loopback port. The browser wait runs in the background, so the
 TUI stays responsive (you can keep working or select the URL with the mouse to
-copy it). The token is saved to
+copy it). If you deny access, the redirect carrying `error=` for the active
+login ends the wait immediately with that error instead of waiting for the
+timeout; error redirects for another login are ignored. The token is saved to
 `<credentials_dir>/mcp-oauth/<opaque-server-identity>.json`; server display
 names never become filenames. `credentials_dir` defaults to
 `<local_data_dir>/credentials` (including `%LOCALAPPDATA%\zerostack\credentials`
@@ -1812,8 +1821,13 @@ ACP server configs (in `acp_servers`) support two transport types:
 When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
 (the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
 `acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
-host defaults to `127.0.0.1`. A non-loopback `acp_host` is an explicit remote
-exposure choice and emits a startup warning.
+host defaults to `127.0.0.1`. A non-loopback `acp_host` is refused at startup
+unless the environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which
+case a prominent warning is printed. The TCP handshake authenticates the
+client, but the session that follows is plaintext and the server is never
+authenticated to the client, so an on-path attacker could read or inject into
+a tool-executing session. Prefer a loopback bind behind an SSH tunnel or
+another encrypted, mutually authenticated channel.
 
 Every `session/new` request must provide an existing directory as `cwd`.
 zerostack canonicalizes that directory before creating the session and binds
@@ -1831,6 +1845,33 @@ ACP advertises protocol V1, connects MCP services for each tool-enabled prompt,
 and runs the same process-wide lifecycle and tool hooks as other frontends.
 Permission prompts reuse the corresponding ACP tool-call ID, so clients can
 attach the decision to the call they already rendered.
+
+ACP turns select their provider and model exactly like interactive startup:
+`--provider`/`--model`/config resolution, then `--quick-model` overriding both.
+A custom provider's `model` is only the default when nothing else names a
+model. Provider clients honour `--api-key` first, and turns use the configured
+`[retry]` policy. The server also initialises the `task` tool's subagent
+configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
+startup, so delegated read-only agents work over ACP.
+
+`session/new` accepts the client's `mcpServers` list. Each stdio entry is
+connected for every tool-enabled prompt in that session alongside the
+configured `mcp_servers`, launched like a configured command server (absolute
+`command`, no sandbox, working directory = the session root, the client's
+`env` plus this process's `PATH` and `HOME`). A configured server keeps its
+name if a client server uses the same one. The request is refused with an
+explicit error instead of being silently ignored when it lists an HTTP or SSE
+server (not advertised), a relative command or duplicate name, when MCP is
+disabled or not compiled in, or when it arrives over ACP TCP: a network peer
+must not launch local processes, so TCP deployments configure MCP on the
+agent host.
+
+A turn that fails internally (provider or runner error, unusable workspace,
+missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
+carrying the failure message, rather than a `refusal` stop reason; any tool
+work the turn completed is still committed to the session history. Tool calls
+that fail, are denied, or whose outcome is unknown are reported with tool-call
+status `failed` instead of `completed`.
 
 Each new ACP session also owns an independent in-memory conversation history.
 Only completed turns are committed: the user prompt, correlated structured tool
@@ -1878,7 +1919,12 @@ directory-handle authority.
 
 Permission containment, LSP services, and delegated read-only agents use the
 same binding. Concurrent ACP sessions may therefore use different roots
-without changing or inheriting the server process working directory. Missing
+without changing or inheriting the server process working directory.
+Hooks are the exception: hook execution uses one process-wide workspace root,
+so when any hook is configured, a prompt is refused (JSON-RPC error `-32000`)
+while another session's prompt is active in a different workspace. Sessions in
+the same workspace still run concurrently, and the refused prompt can be
+retried once the other turn finishes. Missing
 paths and non-directories are rejected before an agent is built. LSP file
 requests are strictly contained; other absolute, `..`, symlink, and reparse-point
 escapes are rejected.
@@ -2254,13 +2300,22 @@ messages and completed tool results from the current request. It sees the same
 bounded tool output as the main model. Concurrent requests keep separate
 transcripts; each model call refreshes its snapshot from the current history.
 Images, audio, video, and documents appear as placeholders, and provider
-reasoning blocks are excluded from this text transcript.
+reasoning blocks are excluded from this text transcript. The context limit is
+split between the oldest and newest messages; if the oldest or the newest
+message alone exceeds its half, it is kept with its start and end and a marker
+for the omitted middle rather than dropped.
 
 Advisor model names use the same quick-model aliases at startup and in
 `/advisor model <name>`. An alias selects its configured provider and model;
 a bare model ID selects the current main provider. That selection remains bound
 to its provider when the main agent changes models, providers, or prompts.
 An invalid provider selection leaves the current advisor model unchanged.
+
+Advisor requests carry the same provider parameters as the main agent for the
+advisor's model: the resolved `extra_body` (quick-model or global),
+`[reasoning]` settings including `store = false`, the Responses
+`prompt_cache_key`, and OpenRouter provider routing. They use the configured
+`[retry]` policy.
 
 ### Human handoff mode
 
@@ -2329,8 +2384,12 @@ already-authorized file handle. Oversized or invalid UTF-8 documents are omitted
 without advancing the document version, and workspace-relative reads use the
 asynchronous file reader too.
 Each server tracks at most 128 synchronized documents, retaining the identity
-of the authorized read handle for each. Further new documents are omitted until
-the server restarts; updates to tracked documents continue at the limit. A reply
+of the authorized read handle for each. At the limit, a new document evicts
+the least recently synchronized one: the server receives `textDocument/didClose`
+for it before the new `didOpen`, and its cached diagnostics are dropped. A later
+change to an evicted file reopens it. Requests a server sends to the client are
+answered with their exact id (number or string): `workspace/configuration`
+receives one `null` per requested item, every other request `null`. A reply
 is rejected if the source has been replaced since synchronization, including
 when its protocol version matches. Accepted cache entries share the synchronized
 identity, so a replacement racing cache insertion also invalidates the result.

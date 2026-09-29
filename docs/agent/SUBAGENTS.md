@@ -148,6 +148,10 @@ data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
+In the `task` tool schema every specialist is labelled a read-only
+investigation subagent: a persona changes the child's focus, never its write
+access or tools beyond the read-only set.
+
 A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
 same-named definition, this file replaces nothing: the host appends it under a
 `## Project notes` boundary to every resolved persona after overrides have
@@ -268,7 +272,12 @@ Every successful child response is required to use this host-owned structure:
 ```
 
 The host checks the section order, confidence label, and both coverage entries.
-If a model returns unstructured text, mini-agent retains it under `Raw child
+If a model returns unstructured text, the host first gives the same child one
+bounded repair turn (a single model reply, no tools, charged to the task
+budget) asking it to restate its own previous response in the required
+sections; a negative result such as "no such capability exists" is a finding.
+The restatement is used only if it passes validation. Otherwise mini-agent
+retains the original text under `Raw child
 response` but wraps it in a machine-checkable partial report with low
 confidence. This keeps malformed output useful without letting it masquerade as
 a complete specialist report.
@@ -513,6 +522,14 @@ retained, but it cannot cause queued work to start at or after the deadline.
 Exhausting `task_max_turns` is not a child failure. The child returns all text
 accumulated so far followed by `[partial: turn budget exhausted]`; its queued
 and in-flight siblings continue normally (mini-agent-ddno).
+
+Output accounting charges each response in its returned (quoted and fenced)
+form: a response is cut so that form fits the remaining budget, and the cut is
+marked inside that response. Output exhaustion makes the call partial only when
+it abandons work that has not run; if every task completed, no partial header
+is added. The partial header is reserved when the report is assembled, and a
+final aggregate cut inside a quoted child output still closes its
+`[subagent output ends]` fence.
 
 Partial returns begin with a summary containing the stop reason and aggregate
 started/completed/cost accounting. Cost includes usage already observed from

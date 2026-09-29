@@ -241,6 +241,10 @@ pub(crate) struct SyncedDocument {
     pub(crate) allow_versionless: bool,
     pub(crate) identity: crate::fs::CheckedMetadata,
     pub(crate) content: crate::fs::ContentDigest,
+    /// URI the server knows this document by, for `didClose` on eviction.
+    pub(crate) wire_uri: String,
+    /// Recency stamp; the least recently synced document is evicted first.
+    pub(crate) last_used: u64,
 }
 
 impl SyncedDocument {
@@ -480,23 +484,24 @@ impl LspClient {
                     };
                     let method = msg.get("method").and_then(Value::as_str);
                     let id = msg.get("id").and_then(Value::as_i64);
-                    match (method, id) {
-                        // Server→client request: reply null, we declare no
-                        // capabilities that would legitimately trigger one.
-                        (Some(_), Some(id)) => {
-                            let reply = json!({"jsonrpc": "2.0", "id": id, "result": Value::Null});
-                            let body = serde_json::to_vec(&reply).unwrap_or_default();
-                            if !write_owned_frame_with_deadline(
-                                &stdin,
-                                &transport,
-                                &body,
-                                transport.write_timeout(),
-                            )
-                            .await
-                            {
-                                break;
-                            }
+                    if let Some(reply) = server_request_reply(&msg) {
+                        // Server→client request (numeric or string id).
+                        let body = serde_json::to_vec(&reply).unwrap_or_default();
+                        if !write_owned_frame_with_deadline(
+                            &stdin,
+                            &transport,
+                            &body,
+                            transport.write_timeout(),
+                        )
+                        .await
+                        {
+                            break;
                         }
+                        continue;
+                    }
+                    match (method, id) {
+                        // Requests were answered above.
+                        (Some(_), Some(_)) => {}
                         // Server→client notification.
                         (Some(m), None) => {
                             if m == "textDocument/publishDiagnostics"
@@ -851,19 +856,34 @@ impl LspClient {
                 Open,
                 Change(i64),
             }
-            let (action, baseline) = {
+            let (action, baseline, evicted) = {
                 let mut open = self.open.lock().unwrap();
                 // Match the diagnostic cache ceiling and bound retained source
-                // handles. Existing documents can still advance at capacity.
-                if !open.contains_key(&uri) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
-                    return Ok(None);
-                }
+                // handles. At capacity a new document evicts the least
+                // recently synced one, which is closed on the server, so
+                // syncing never silently stops.
+                let evicted =
+                    if !open.contains_key(&uri) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
+                        open.iter()
+                            .min_by_key(|(_, document)| document.last_used)
+                            .map(|(evicted, _)| evicted.clone())
+                            .and_then(|evicted| open.remove_entry(&evicted))
+                    } else {
+                        None
+                    };
+                let last_used = open
+                    .values()
+                    .map(|document| document.last_used)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
                 let action = match open.get_mut(&uri) {
                     Some(document) => {
                         document.version += 1;
                         document.allow_versionless = false;
                         document.identity = identity;
                         document.content = content;
+                        document.last_used = last_used;
                         Sync::Change(document.version)
                     }
                     None => {
@@ -874,6 +894,8 @@ impl LspClient {
                                 allow_versionless: true,
                                 identity,
                                 content,
+                                wire_uri: wire_uri.clone(),
+                                last_used,
                             },
                         );
                         Sync::Open
@@ -881,13 +903,22 @@ impl LspClient {
                 };
                 // Match the reader's open-then-diags lock order; a publication
                 // from the previous epoch cannot satisfy this sync's wait.
-                let baseline = self
-                    .diags
-                    .lock()
-                    .unwrap()
-                    .get(&uri)
-                    .map_or(0, |diagnostics| diagnostics.version);
-                (action, baseline)
+                let mut diags = self.diags.lock().unwrap();
+                // A closed document's diagnostics are no longer maintained by
+                // the server; drop them so they cannot be reported as current.
+                if let Some((evicted_uri, _)) = &evicted
+                    && diags
+                        .get(evicted_uri)
+                        .is_some_and(|entry| entry.server == self.name)
+                {
+                    diags.remove(evicted_uri);
+                }
+                let baseline = diags.get(&uri).map_or(0, |diagnostics| diagnostics.version);
+                (
+                    action,
+                    baseline,
+                    evicted.map(|(_, document)| document.wire_uri),
+                )
             }; // State locks are released before writing; stdin stays locked.
             #[cfg(test)]
             if let Some((advanced, release)) = probe {
@@ -918,6 +949,15 @@ impl LspClient {
             .map_err(std::io::Error::other)?;
             if self.transport.is_closing() {
                 return Ok(None);
+            }
+            if let Some(evicted) = evicted {
+                let close = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didClose",
+                    "params": { "textDocument": { "uri": evicted } },
+                }))
+                .map_err(std::io::Error::other)?;
+                rpc::write_frame(write.writer(), &close).await?;
             }
             rpc::write_frame(write.writer(), &body).await?;
             Ok::<_, std::io::Error>(Some(baseline))
@@ -964,6 +1004,35 @@ fn take_pipe<T>(pipe: &mut Option<T>, kind: &str, name: &str) -> Option<T> {
         tracing::debug!("lsp[{name}]: child did not provide piped {kind}");
         None
     })
+}
+
+/// Most `workspace/configuration` items answered in one reply.
+const MAX_CONFIGURATION_ITEMS: usize = 1024;
+
+/// The reply to a server→client request, or `None` when `msg` is not one.
+///
+/// The id is echoed exactly as sent (JSON-RPC allows numbers and strings).
+/// `workspace/configuration` must answer with one entry per requested item;
+/// every other request gets `null`, since this client declares no
+/// capabilities that would legitimately trigger one.
+fn server_request_reply(msg: &Value) -> Option<Value> {
+    let method = msg.get("method")?.as_str()?;
+    let id = msg.get("id")?;
+    if !(id.is_number() || id.is_string()) {
+        return None;
+    }
+    let result = if method == "workspace/configuration" {
+        let items = msg
+            .get("params")
+            .and_then(|params| params.get("items"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .min(MAX_CONFIGURATION_ITEMS);
+        Value::Array(vec![Value::Null; items])
+    } else {
+        Value::Null
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 struct PendingRequest {
@@ -1579,6 +1648,30 @@ fn language_id(path: &Path) -> &'static str {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn server_requests_are_answered_with_their_exact_id() {
+        let string_id = server_request_reply(&json!({
+            "jsonrpc": "2.0", "id": "req-7", "method": "window/workDoneProgress/create",
+            "params": {"token": "t"}
+        }))
+        .expect("a string-id request must be answered");
+        assert_eq!(string_id["id"], "req-7");
+        assert_eq!(string_id["result"], Value::Null);
+
+        let configuration = server_request_reply(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "workspace/configuration",
+            "params": {"items": [{"section": "a"}, {"section": "b"}, {}]}
+        }))
+        .unwrap();
+        assert_eq!(configuration["id"], 3);
+        assert_eq!(configuration["result"], json!([null, null, null]));
+
+        // Notifications and responses are not requests.
+        assert!(server_request_reply(&json!({"method": "window/logMessage"})).is_none());
+        assert!(server_request_reply(&json!({"id": 1, "result": {}})).is_none());
+        assert!(server_request_reply(&json!({"id": null, "method": "x"})).is_none());
+    }
 
     #[tokio::test]
     async fn document_reads_stop_at_the_sync_limit_before_allocating_the_full_input() {

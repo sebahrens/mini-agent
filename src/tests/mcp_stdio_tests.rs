@@ -161,6 +161,18 @@ fn main() {
         }
         if compact.contains("\"method\":\"initialize\"") {
             let id = request_id(&compact);
+            if mode == "unbounded-line" {
+                let chunk = vec![b'x'; 1024 * 1024];
+                for _ in 0..32 {
+                    if stdout.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+                let _ = stdout.flush();
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }
             if mode == "large-error" {
                 let message = format!("{}MCP_LARGE_ERROR_TAIL", "x".repeat(2 * 1024 * 1024));
                 write_response(
@@ -2086,5 +2098,32 @@ async fn delayed_prebuild_preserves_configuration_and_services_across_interrupti
     }
     server.abort();
     let _ = server.await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn stdio_server_line_without_newline_is_capped_and_the_server_killed() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("unbounded-line");
+    let config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "unbounded-line",
+        &lease,
+    );
+    let error = McpClientHandle::connect_with_timeout(
+        CompactString::new("unbounded-line"),
+        &config,
+        Duration::from_secs(30),
+    )
+    .await
+    .err()
+    .expect("a server that never ends its line must not initialize");
+    let message = error.to_string();
+    assert!(
+        message.contains("initialization failed"),
+        "the line cap, not the timeout, must end the connection: {message}"
+    );
+    assert_process_reaped(wait_for_pid(&lease).await).await;
     fixture.cleanup();
 }

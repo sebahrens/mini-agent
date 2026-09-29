@@ -696,6 +696,8 @@ impl LspManager {
                 content: crate::fs::ContentDigest::of(
                     &std::fs::read(client::file_path(uri).unwrap()).unwrap(),
                 ),
+                wire_uri: uri.to_string(),
+                last_used: 0,
             },
         );
     }

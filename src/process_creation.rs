@@ -13,9 +13,6 @@ use std::process::{Child, ExitStatus, Output};
 use std::time::{Duration, Instant};
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
-#[cfg(feature = "mcp")]
-use tokio::process::ChildStderr as TokioChildStderr;
-
 #[cfg(windows)]
 use std::sync::{Mutex, MutexGuard};
 
@@ -123,39 +120,16 @@ impl TokioCommandCreationExt for TokioCommand {
     }
 }
 
-#[cfg(feature = "lsp")]
+#[cfg(any(feature = "lsp", feature = "mcp"))]
 pub(crate) trait CommandWrapCreationExt {
     fn spawn_guarded(&mut self) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>>;
 }
 
-#[cfg(feature = "lsp")]
+#[cfg(any(feature = "lsp", feature = "mcp"))]
 impl CommandWrapCreationExt for process_wrap::tokio::CommandWrap {
     fn spawn_guarded(&mut self) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
         let _guard = creation_guard()?;
         process_wrap::tokio::CommandWrap::spawn(self)
-    }
-}
-
-#[cfg(feature = "mcp")]
-pub(crate) trait RmcpCommandCreationExt {
-    fn spawn_guarded(
-        self,
-    ) -> io::Result<(
-        rmcp::transport::child_process::TokioChildProcess,
-        Option<TokioChildStderr>,
-    )>;
-}
-
-#[cfg(feature = "mcp")]
-impl RmcpCommandCreationExt for rmcp::transport::child_process::TokioChildProcessBuilder {
-    fn spawn_guarded(
-        self,
-    ) -> io::Result<(
-        rmcp::transport::child_process::TokioChildProcess,
-        Option<TokioChildStderr>,
-    )> {
-        let _guard = creation_guard()?;
-        rmcp::transport::child_process::TokioChildProcessBuilder::spawn(self)
     }
 }
 

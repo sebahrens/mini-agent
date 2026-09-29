@@ -273,62 +273,102 @@ impl ToolDyn for McpTool {
                 ))));
             }
 
-            let mut content = String::new();
-            let mut unsupported = 0_usize;
-            for item in result.content {
-                match item {
-                    ContentBlock::Text(t) => content.push_str(&t.text),
-                    ContentBlock::Image(img) => {
-                        content.push_str("data:");
-                        content.push_str(&img.mime_type);
-                        content.push_str(";base64,");
-                        content.push_str(&img.data);
-                    }
-                    ContentBlock::Resource(r) => match &r.resource {
-                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            content.push_str(text);
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
-                            content.push_str(blob);
-                        }
-                        _ => unsupported += 1,
-                    },
-                    _ => unsupported += 1,
-                }
-            }
-            // A successful result may carry its whole payload in
-            // structuredContent with an empty `content` array. Dropping it
-            // leaves the model with empty delimiters, so it may repeat a
-            // side-effecting call or invent an answer. Render it whenever it
-            // is not already the text the server also sent, so a server that
-            // duplicates its payload does not double the output.
-            if let Some(structured) = &result.structured_content
-                && let Some(rendered) = render_structured_content(structured)
-                && content.trim() != rendered.trim()
-            {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&rendered);
-            }
-            if unsupported > 0 {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&format!(
-                    "[{unsupported} content block(s) of a kind this client cannot render were omitted]"
-                ));
-            }
-            if let Some(msg) = coaching {
-                content = format!("{}\n\n{}", msg, content);
-            }
-            Ok(bounded_mcp_output(
+            let content =
+                render_success_content(result.content, result.structured_content.as_ref());
+            let bounded = bounded_mcp_output(
                 &content,
                 &spill_scope,
                 &format!("mcp:{server_name}:{tool_name}"),
-            ))
+            );
+            // Host coaching is trusted host text: it stays outside the fence
+            // that marks untrusted server output.
+            Ok(match coaching {
+                Some(msg) => format!("{msg}\n\n{bounded}"),
+                None => bounded,
+            })
         })
     }
+}
+
+/// Render a successful result's content blocks for the model.
+///
+/// Blocks are separated by newlines so adjacent text blocks never run
+/// together. Binary payloads (images, blob resources) are described by a
+/// placeholder instead of being inlined as base64, which the model cannot use
+/// and which would otherwise dominate the bounded output.
+fn render_success_content(
+    blocks: Vec<ContentBlock>,
+    structured: Option<&serde_json::Value>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut unsupported = 0_usize;
+    for item in blocks {
+        match item {
+            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::Image(img) => parts.push(format!(
+                "[image: {}, {} bytes]",
+                img.mime_type,
+                base64_decoded_len(&img.data)
+            )),
+            ContentBlock::Resource(r) => match &r.resource {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                    parts.push(text.clone());
+                }
+                rmcp::model::ResourceContents::BlobResourceContents {
+                    uri,
+                    mime_type,
+                    blob,
+                    ..
+                } => parts.push(format!(
+                    "[resource: {uri}, {}, {} bytes]",
+                    mime_type.as_deref().unwrap_or("application/octet-stream"),
+                    base64_decoded_len(blob)
+                )),
+                _ => unsupported += 1,
+            },
+            _ => unsupported += 1,
+        }
+    }
+    let mut content = parts.join("\n");
+    // A successful result may carry its whole payload in
+    // structuredContent with an empty `content` array. Dropping it
+    // leaves the model with empty delimiters, so it may repeat a
+    // side-effecting call or invent an answer. Render it whenever it
+    // is not already the text the server also sent, so a server that
+    // duplicates its payload does not double the output.
+    if let Some(structured) = structured
+        && let Some(rendered) = render_structured_content(structured)
+        && content.trim() != rendered.trim()
+    {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&rendered);
+    }
+    if unsupported > 0 {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&format!(
+            "[{unsupported} content block(s) of a kind this client cannot render were omitted]"
+        ));
+    }
+    content
+}
+
+/// Decoded size of a base64 payload, without decoding it.
+fn base64_decoded_len(data: &str) -> usize {
+    let significant = data
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    let padding = data
+        .trim_end()
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    (significant / 4 * 3 + (significant % 4).saturating_sub(1)).saturating_sub(padding.min(2))
 }
 
 /// Render a successful result's `structuredContent` for the model.
@@ -390,6 +430,39 @@ mod tests {
             McpTool::bounded_model_metadata(&definition),
             Err("input schema exceeds 16 KiB")
         );
+    }
+
+    #[test]
+    fn success_content_separates_blocks_and_describes_binary_payloads() {
+        let blocks: Vec<ContentBlock> = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            {"type": "resource", "resource": {
+                "uri": "file:///report.pdf",
+                "mimeType": "application/pdf",
+                "blob": "AAECAwQF"
+            }}
+        ]))
+        .unwrap();
+
+        let rendered = render_success_content(blocks, None);
+
+        assert_eq!(
+            rendered,
+            "first\nsecond\n[image: image/png, 5 bytes]\n[resource: file:///report.pdf, application/pdf, 6 bytes]"
+        );
+        assert!(!rendered.contains("base64"));
+        assert!(!rendered.contains("aGVsbG8"));
+    }
+
+    #[test]
+    fn base64_decoded_len_handles_padding() {
+        assert_eq!(base64_decoded_len(""), 0);
+        assert_eq!(base64_decoded_len("aA=="), 1);
+        assert_eq!(base64_decoded_len("aGk="), 2);
+        assert_eq!(base64_decoded_len("aGVs"), 3);
+        assert_eq!(base64_decoded_len("aGVsbG8"), 5);
     }
 
     #[test]

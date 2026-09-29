@@ -1486,6 +1486,21 @@ fn listen_on_callback_listener(
                     .ok();
                 let captured = read_request_line(&mut stream)
                     .and_then(|request_line| matching_callback(&request_line, expected_state));
+                if let Err(error) = &captured
+                    && let Some(denied) = error.downcast_ref::<AuthorizationDenied>()
+                {
+                    // The user (or server) refused the active login: stop
+                    // waiting now instead of running out the whole timeout.
+                    let body = authorization_denied_body();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    anyhow::bail!("OAuth authorization was denied: {}", denied.0);
+                }
                 let Ok(captured) = captured else {
                     let body = "Invalid or unrelated OAuth callback; waiting for authorization.";
                     let response = format!(
@@ -1515,12 +1530,66 @@ fn listen_on_callback_listener(
     }
 }
 
+/// The authorization server redirected the active login (matching `state`)
+/// with an `error`, e.g. `access_denied` after the user clicked Deny.
+#[derive(Debug)]
+struct AuthorizationDenied(String);
+
+impl std::fmt::Display for AuthorizationDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AuthorizationDenied {}
+
+fn authorization_denied_body() -> String {
+    format!(
+        "<html><body><h3>{}: authorization was denied.</h3>You can close this tab and return to the terminal.</body></html>",
+        crate::product::PUBLIC_NAME
+    )
+}
+
 fn matching_callback(request_line: &str, expected_state: &str) -> anyhow::Result<CapturedCode> {
+    if let Some(denied) = denied_callback(request_line, expected_state) {
+        return Err(anyhow::Error::new(denied));
+    }
     let (code, state) = parse_callback(request_line)?;
     if state != expected_state {
         anyhow::bail!("OAuth callback state does not match the active login");
     }
     Ok(CapturedCode { code, state })
+}
+
+/// An `error=` redirect whose `state` belongs to the active login. A stray
+/// error redirect with another state stays an unrelated callback.
+fn denied_callback(request_line: &str, expected_state: &str) -> Option<AuthorizationDenied> {
+    let target = request_line.split_whitespace().nth(1)?;
+    let query = target.split_once('?').map(|(_, q)| q)?;
+    let mut state = None;
+    let mut error = None;
+    let mut description = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            "state" => state = Some(percent_decode(value)),
+            "error" => error = Some(percent_decode(value)),
+            "error_description" => description = Some(percent_decode(value)),
+            _ => {}
+        }
+    }
+    if state.as_deref() != Some(expected_state) {
+        return None;
+    }
+    let error = error?;
+    let mut message: String = error.chars().take(128).collect();
+    if let Some(description) = description {
+        message.push_str(": ");
+        message.extend(description.chars().take(256));
+    }
+    Some(AuthorizationDenied(message))
 }
 
 fn read_request_line(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
@@ -1638,6 +1707,46 @@ mod product_identity_tests {
         .unwrap();
         assert_eq!(captured.code, "right");
         assert_eq!(captured.state, "expected");
+    }
+
+    #[test]
+    fn callback_listener_returns_immediately_when_the_active_login_is_denied() {
+        let callback_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = callback_listener.local_addr().unwrap().port();
+        let started = std::time::Instant::now();
+
+        let listener = std::thread::spawn(move || {
+            super::listen_on_callback_listener(
+                callback_listener,
+                Duration::from_secs(30),
+                "expected",
+            )
+        });
+        // A stray error redirect for another login is ignored.
+        send_request(
+            port,
+            "GET /callback?error=access_denied&state=stray HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        send_request(
+            port,
+            "GET /callback?error=access_denied&error_description=User+clicked+Deny&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+
+        let error = listener
+            .join()
+            .unwrap()
+            .err()
+            .expect("denial ends the wait");
+        let message = error.to_string();
+        assert!(message.contains("denied"), "{message}");
+        assert!(
+            message.contains("access_denied: User clicked Deny"),
+            "{message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a denial must not wait for the timeout"
+        );
     }
 
     #[test]
