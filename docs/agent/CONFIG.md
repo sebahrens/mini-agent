@@ -1750,6 +1750,18 @@ model. Provider clients honour `--api-key` first, and turns use the configured
 configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
 startup, so delegated read-only agents work over ACP.
 
+`session/new` accepts the client's `mcpServers` list. Each stdio entry is
+connected for every tool-enabled prompt in that session alongside the
+configured `mcp_servers`, launched like a configured command server (absolute
+`command`, no sandbox, working directory = the session root, the client's
+`env` plus this process's `PATH` and `HOME`). A configured server keeps its
+name if a client server uses the same one. The request is refused with an
+explicit error instead of being silently ignored when it lists an HTTP or SSE
+server (not advertised), a relative command or duplicate name, when MCP is
+disabled or not compiled in, or when it arrives over ACP TCP: a network peer
+must not launch local processes, so TCP deployments configure MCP on the
+agent host.
+
 A turn that fails internally (provider or runner error, unusable workspace,
 missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
 carrying the failure message, rather than a `refusal` stop reason; any tool

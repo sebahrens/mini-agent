@@ -265,6 +265,10 @@ struct SessionState {
     js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")]
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+    /// MCP servers the client supplied in `session/new`, connected for each
+    /// tool-enabled prompt alongside the configured servers.
+    #[cfg(feature = "mcp")]
+    client_mcp_servers: Arc<ClientMcpServers>,
 }
 
 struct PromptSessionSnapshot {
@@ -535,6 +539,10 @@ struct AcpState {
     /// Present only when hooks are configured. Hook dispatch uses one
     /// process-wide execution root, so concurrent turns must agree on it.
     hook_roots: Option<Arc<HookRootClaims>>,
+    /// Client-supplied stdio MCP servers launch local processes, so they are
+    /// accepted only from the editor that spawned this server over stdio,
+    /// never from a network peer.
+    accepts_client_mcp: bool,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -835,6 +843,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
     crate::permission::build_noninteractive_permission(&cfg, authority)?;
 
     let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
+    let is_tcp = tcp_settings.is_some();
     let transport_mode = if tcp_settings.is_some() {
         "tcp"
     } else {
@@ -856,6 +865,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
         hook_roots: acp_hook_root_claims(),
+        accepts_client_mcp: !is_tcp,
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -1021,6 +1031,8 @@ async fn handle_new_session(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
+    #[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+    let client_mcp_servers = client_mcp_servers(state, &req.mcp_servers)?;
     let workspace_root = workspace.root();
     let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -1068,6 +1080,8 @@ async fn handle_new_session(
             js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            client_mcp_servers: Arc::new(client_mcp_servers),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
@@ -1075,6 +1089,115 @@ async fn handle_new_session(
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
+}
+
+#[cfg(feature = "mcp")]
+type ClientMcpServers = HashMap<String, crate::extras::mcp::config::McpServerConfig>;
+#[cfg(not(feature = "mcp"))]
+type ClientMcpServers = ();
+
+/// Validate the MCP servers a client supplied in `session/new`.
+///
+/// ACP requires every agent to accept stdio servers. They are launched like a
+/// configured `mcp_servers` command entry (no sandbox, working directory = the
+/// session root) with the client's `env` plus the server process's `PATH` and
+/// `HOME`. Anything this server cannot honour is refused explicitly rather
+/// than silently ignored: HTTP/SSE servers (not advertised), servers from a
+/// TCP peer (a network client must not launch local processes), and servers
+/// when MCP is disabled or not compiled in.
+fn client_mcp_servers(
+    state: &AcpState,
+    servers: &[McpServer],
+) -> Result<ClientMcpServers, agent_client_protocol::Error> {
+    let refuse = |message: String| Err(agent_client_protocol::Error::new(-32602, message));
+    if servers.is_empty() {
+        return Ok(Default::default());
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = state;
+        refuse(
+            "client-supplied MCP servers are not supported: this build has no MCP support".into(),
+        )
+    }
+    #[cfg(feature = "mcp")]
+    {
+        use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+        if !state.accepts_client_mcp {
+            return refuse(
+                "client-supplied MCP servers are refused over ACP TCP; configure them in \
+                 `mcp_servers` on the agent host instead"
+                    .into(),
+            );
+        }
+        if !state.cli.mcp_is_eligible(&state.cfg) {
+            return refuse(
+                "client-supplied MCP servers were sent but MCP is disabled for this agent".into(),
+            );
+        }
+        let mut accepted = ClientMcpServers::new();
+        for server in servers {
+            let McpServer::Stdio(stdio) = server else {
+                return refuse(
+                    "only stdio MCP servers are supported; HTTP and SSE servers are not \
+                     advertised by this agent"
+                        .into(),
+                );
+            };
+            if !stdio.command.is_absolute() {
+                return refuse(format!(
+                    "MCP server '{}' command must be an absolute path",
+                    stdio.name
+                ));
+            }
+            if accepted.contains_key(&stdio.name) {
+                return refuse(format!("duplicate MCP server name '{}'", stdio.name));
+            }
+            accepted.insert(
+                stdio.name.clone(),
+                McpServerConfig::Command {
+                    command: stdio.command.to_string_lossy().into_owned(),
+                    args: stdio.args.clone(),
+                    cwd: None,
+                    env: stdio
+                        .env
+                        .iter()
+                        .map(|variable| (variable.name.clone(), variable.value.clone()))
+                        .collect(),
+                    inherit_env: vec!["PATH".to_string(), "HOME".to_string()],
+                    sandbox: None,
+                    network: McpStdioNetwork::Inherit,
+                },
+            );
+        }
+        Ok(accepted)
+    }
+}
+
+/// The configuration a prompt connects MCP with: the configured servers plus
+/// the session's client-supplied ones. A configured server keeps its name;
+/// a client server with the same name is skipped.
+#[cfg(feature = "mcp")]
+fn with_client_mcp_servers<'a>(
+    cfg: &'a Config,
+    client: &ClientMcpServers,
+) -> std::borrow::Cow<'a, Config> {
+    if client.is_empty() {
+        return std::borrow::Cow::Borrowed(cfg);
+    }
+    let mut merged = cfg.clone();
+    let servers = merged.mcp_servers.get_or_insert_with(HashMap::new);
+    for (name, server) in client {
+        if servers.contains_key(name) {
+            tracing::warn!(
+                "ACP: client MCP server '{}' shadows a configured server; using the configured one",
+                name
+            );
+            continue;
+        }
+        servers.insert(name.clone(), server.clone());
+    }
+    std::borrow::Cow::Owned(merged)
 }
 
 async fn handle_close_session(
@@ -2079,8 +2202,16 @@ async fn execute_prompt(
     #[cfg(feature = "mcp")]
     {
         *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
+            let client_servers = state
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|session| session.client_mcp_servers.clone())
+                .unwrap_or_default();
+            let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
             let Some(manager) =
-                connect_prompt_mcp(&state.cfg, &workspace, &work_scope, control.cancelled()).await
+                connect_prompt_mcp(&mcp_cfg, &workspace, &work_scope, control.cancelled()).await
             else {
                 return Ok(PromptOutcome::cancelled(None));
             };
@@ -3022,6 +3153,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3039,6 +3171,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -3059,6 +3192,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3095,6 +3229,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
             hook_roots: None,
+            accepts_client_mcp: true,
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3893,6 +4028,117 @@ mod protocol_tests {
             })
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn client_stdio_mcp_servers_become_session_command_servers() {
+        use crate::extras::mcp::config::McpServerConfig;
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let command = std::env::temp_dir().join("client-mcp-server");
+        let servers = vec![McpServer::Stdio(
+            McpServerStdio::new("editor-tools", command.clone())
+                .args(vec!["--stdio".to_string()])
+                .env(vec![EnvVariable::new("TOKEN", "from-editor")]),
+        )];
+
+        let accepted = client_mcp_servers(&state, &servers).unwrap();
+        let Some(McpServerConfig::Command {
+            command: launched,
+            args,
+            env,
+            inherit_env,
+            sandbox,
+            cwd,
+            ..
+        }) = accepted.get("editor-tools")
+        else {
+            panic!("a client stdio server must become a command server: {accepted:?}");
+        };
+        assert_eq!(launched, &command.display().to_string());
+        assert_eq!(args, &vec!["--stdio".to_string()]);
+        assert_eq!(env.get("TOKEN").map(String::as_str), Some("from-editor"));
+        assert_eq!(inherit_env, &vec!["PATH".to_string(), "HOME".to_string()]);
+        assert!(sandbox.is_none() && cwd.is_none());
+
+        let configured = Config {
+            mcp_servers: Some(HashMap::from([(
+                "editor-tools".to_string(),
+                McpServerConfig::Url {
+                    url: "https://configured.example/mcp".to_string(),
+                    headers: HashMap::new(),
+                    oauth: None,
+                },
+            )])),
+            ..Config::default()
+        };
+        let merged = with_client_mcp_servers(&configured, &accepted);
+        assert!(
+            matches!(
+                merged.mcp_servers.as_ref().unwrap().get("editor-tools"),
+                Some(McpServerConfig::Url { .. })
+            ),
+            "a configured server keeps its name"
+        );
+        let unconfigured = Config::default();
+        let merged = with_client_mcp_servers(&unconfigured, &accepted);
+        assert!(matches!(
+            merged.mcp_servers.as_ref().unwrap().get("editor-tools"),
+            Some(McpServerConfig::Command { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_client_mcp_servers_are_refused_not_ignored() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let absolute = std::env::temp_dir().join("client-mcp-server");
+        let refused = |state: &AcpState, server: McpServer| {
+            client_mcp_servers(state, &[server])
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        assert!(
+            refused(
+                &state,
+                McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp"))
+            )
+            .is_some(),
+            "HTTP servers are not advertised"
+        );
+        #[cfg(feature = "mcp")]
+        {
+            assert!(
+                refused(
+                    &state,
+                    McpServer::Stdio(McpServerStdio::new("relative", "bin/server"))
+                )
+                .is_some()
+            );
+            let duplicate = McpServer::Stdio(McpServerStdio::new("same", absolute.clone()));
+            assert!(client_mcp_servers(&state, &[duplicate.clone(), duplicate]).is_err());
+
+            let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+            let mut tcp = fixture_state(fixture);
+            Arc::get_mut(&mut tcp).unwrap().accepts_client_mcp = false;
+            let error = refused(
+                &tcp,
+                McpServer::Stdio(McpServerStdio::new("local", absolute.clone())),
+            )
+            .expect("a TCP peer must not launch local processes");
+            assert!(error.contains("TCP"), "{error}");
+        }
+        #[cfg(not(feature = "mcp"))]
+        assert!(
+            refused(
+                &state,
+                McpServer::Stdio(McpServerStdio::new("local", absolute))
+            )
+            .is_some()
+        );
+        assert!(client_mcp_servers(&state, &[]).is_ok());
     }
 
     #[tokio::test]
