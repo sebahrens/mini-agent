@@ -391,20 +391,57 @@ mod tests {
         }
     }
 
-    async fn wait_for_pid(path: &Path) -> u32 {
+    /// Polls `condition` until it holds (`true`) or `POLL_BUDGET` expires.
+    async fn poll_within_budget(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + POLL_BUDGET;
         loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(pid) = contents.trim().parse()
-            {
-                return pid;
+            if condition() {
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for validator descendant pid file"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    fn read_pid(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// The pid a fixture published at `path`, or `None` if none appeared
+    /// within `POLL_BUDGET`.
+    async fn published_pid(path: &Path) -> Option<u32> {
+        let mut pid = None;
+        poll_within_budget(|| {
+            pid = read_pid(path);
+            pid.is_some()
+        })
+        .await;
+        pid
+    }
+
+    async fn wait_for_pid(path: &Path) -> u32 {
+        published_pid(path)
+            .await
+            .expect("timed out waiting for validator descendant pid file")
+    }
+
+    /// Fails a readiness wait with what the validator itself reports: cancel
+    /// it and render its result, whose captured stderr carries the shell's
+    /// own diagnostics (for example a fork that kept failing).
+    async fn fail_with_validation_outcome(
+        failure: &str,
+        cancellation: &ValidationCancellation,
+        task: &mut tokio::task::JoinHandle<ValidationResult>,
+    ) -> ! {
+        cancellation.cancel();
+        let outcome = match tokio::time::timeout(POLL_BUDGET, task).await {
+            Ok(Ok(result)) => result.render(),
+            Ok(Err(error)) => format!("validation task failed: {error}"),
+            Err(_) => "validation stayed blocked after cancellation".to_string(),
+        };
+        panic!("{failure}; validation outcome: {outcome}");
     }
 
     async fn assert_process_gone(pid: u32) {
@@ -729,12 +766,46 @@ mod tests {
             "(while :; do sleep 1; done) & child=$!; printf '%s' \"$child\" > {}; wait",
             shell_quote(&pid_file)
         );
-        let task = tokio::spawn({
-            let sandbox = sandbox.clone();
-            async move { run_with_limits(&sandbox, &command, limits(SETTLE)).await }
-        });
+        let operation = start_with_limits(&sandbox, &command, limits(SETTLE));
+        let cancellation = operation.cancellation();
+        let mut task = tokio::spawn(operation.wait());
 
-        let pid = wait_for_pid(&pid_file).await;
+        // Two readiness conditions, each with its own budget. The validator is
+        // spawned synchronously on this test's single-threaded runtime, so a
+        // slow spawn stalls these polls too; one budget covering both would
+        // report a shell that had no chance to run as one that never wrote.
+        // An early end or an expired budget reports the validator's own result.
+        let registered = tokio::select! {
+            registered = poll_within_budget(|| sandbox.active_group_count() == 1) => registered,
+            result = &mut task => panic!(
+                "validation ended before publishing its descendant pid: {}",
+                result.expect("validation task panicked").render()
+            ),
+        };
+        if !registered {
+            fail_with_validation_outcome(
+                "validator process group was never registered",
+                &cancellation,
+                &mut task,
+            )
+            .await;
+        }
+        let published = tokio::select! {
+            pid = published_pid(&pid_file) => pid,
+            result = &mut task => panic!(
+                "validation ended before publishing its descendant pid: {}",
+                result.expect("validation task panicked").render()
+            ),
+        };
+        let Some(pid) = published else {
+            let _ = std::fs::remove_file(&pid_file);
+            fail_with_validation_outcome(
+                "timed out waiting for validator descendant pid file",
+                &cancellation,
+                &mut task,
+            )
+            .await
+        };
         task.abort();
         let _ = task.await;
         wait_until(
