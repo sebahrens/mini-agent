@@ -158,6 +158,16 @@ Notable changes to mini-agent are documented in this file. The format follows
   Conda, MSI and VSIX install it, and `NOTICE` now credits QuickJS and rquickjs with their MIT texts.
   Releases before 1.9.5 predate the inventory: `install.sh` and the package recipes still install
   them, and the installer warns that the inventory is absent.
+- CI: every job now has a timeout (no job can hold a runner for GitHub's 6-hour default), the
+  dependency-policy job's condition is parenthesised so it no longer runs on documentation-only
+  changes by operator precedence, the weekly scheduled run also re-runs the parallel test smoke and
+  the Phase 6 containment gates for runner-image drift, the `--all-features` build (including
+  `skills-embed`) is linted with `-D warnings`, and the Windows LPAC image-loading feasibility gate
+  now runs in the Windows containment job instead of never. The macOS worker code-identity check now
+  names the CDHash of every slice of a universal binary, so its real-signature tests run again
+  instead of being ignored. Dead code hidden behind `#[allow(dead_code)]` (the pre-goal validation
+  registry, the unused startup path field, test-only path helpers) was removed or compiled only
+  where it is used, and `/loop` start/stop/usage gained slash-command tests.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

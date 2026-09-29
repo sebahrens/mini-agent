@@ -32,10 +32,6 @@ fn resolved_paths() -> anyhow::Result<crate::paths::AppPaths> {
     crate::paths::process_paths().map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-fn oauth_dir(paths: &crate::paths::AppPaths) -> PathBuf {
-    paths.credentials_dir.join("mcp-oauth")
-}
-
 /// Build the opaque credential filename for an exact MCP server identity.
 ///
 /// The configured map key is display metadata only. Its exact bytes, normalized
@@ -63,7 +59,7 @@ pub(crate) fn token_path(
     url: &str,
     settings: &OAuthSettings,
 ) -> anyhow::Result<PathBuf> {
-    Ok(oauth_dir(paths).join(token_filename(
+    Ok(paths.mcp_oauth_dir().join(token_filename(
         server_name,
         url,
         settings.client_id.as_deref(),

@@ -207,8 +207,10 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
         todo_tools_enabled: false,
     };
     let mut chain = ChainState::default();
-    let mut run = AgentRunState::default();
-    run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
+    let mut run = AgentRunState {
+        goal_round: Some(crate::extras::goal::driver::RoundCollector::new()),
+        ..AgentRunState::default()
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
     handle_agent_event(
@@ -392,8 +394,10 @@ async fn a_goal_paused_during_verification_is_not_overwritten_by_its_result() {
         todo_tools_enabled: false,
     };
     let mut chain = ChainState::default();
-    let mut run = AgentRunState::default();
-    run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
+    let mut run = AgentRunState {
+        goal_round: Some(crate::extras::goal::driver::RoundCollector::new()),
+        ..AgentRunState::default()
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
     handle_agent_event(
@@ -534,8 +538,10 @@ async fn goal_pause_cancels_the_running_verification() {
         todo_tools_enabled: false,
     };
     let mut chain = ChainState::default();
-    let mut run = AgentRunState::default();
-    run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
+    let mut run = AgentRunState {
+        goal_round: Some(crate::extras::goal::driver::RoundCollector::new()),
+        ..AgentRunState::default()
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
     handle_agent_event(

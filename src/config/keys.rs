@@ -178,17 +178,22 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
 
 /// Whether the running build compiled in `feature`.
 pub(crate) fn feature_enabled(feature: &str) -> bool {
-    match feature {
-        "goal" => cfg!(feature = "goal"),
-        "subagents" => cfg!(feature = "subagents"),
-        "js" => cfg!(feature = "js"),
-        "mcp" => cfg!(feature = "mcp"),
-        "acp" => cfg!(feature = "acp"),
-        "git-worktree" => cfg!(feature = "git-worktree"),
-        "lsp" => cfg!(feature = "lsp"),
-        "advisor" => cfg!(feature = "advisor"),
-        _ => false,
-    }
+    // A table rather than a `match`: with every feature on (`--all-features`)
+    // each arm is `true` and Clippy's `match_like_matches_macro` fires, while
+    // any other build needs the per-feature values.
+    const COMPILED: [(&str, bool); 8] = [
+        ("goal", cfg!(feature = "goal")),
+        ("subagents", cfg!(feature = "subagents")),
+        ("js", cfg!(feature = "js")),
+        ("mcp", cfg!(feature = "mcp")),
+        ("acp", cfg!(feature = "acp")),
+        ("git-worktree", cfg!(feature = "git-worktree")),
+        ("lsp", cfg!(feature = "lsp")),
+        ("advisor", cfg!(feature = "advisor")),
+    ];
+    COMPILED
+        .iter()
+        .any(|(name, enabled)| *enabled && *name == feature)
 }
 
 /// The catalogue entry whose name or alias is exactly `spelling`.
@@ -350,6 +355,19 @@ fn redact_quoted(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_enabled_reports_exactly_this_builds_features() {
+        assert_eq!(feature_enabled("goal"), cfg!(feature = "goal"));
+        assert_eq!(feature_enabled("js"), cfg!(feature = "js"));
+        assert_eq!(feature_enabled("lsp"), cfg!(feature = "lsp"));
+        assert_eq!(
+            feature_enabled("git-worktree"),
+            cfg!(feature = "git-worktree")
+        );
+        assert!(!feature_enabled("no-such-feature"));
+        assert!(!feature_enabled(""));
+    }
 
     #[test]
     fn edit_distance_counts_single_edits() {

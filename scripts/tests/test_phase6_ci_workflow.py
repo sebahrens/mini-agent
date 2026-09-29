@@ -30,6 +30,71 @@ def job_body(workflow: str, name: str) -> str:
     return match.group("body")
 
 
+def workflow_jobs(workflow: str) -> list[str]:
+    return re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):$", workflow.split("jobs:\n", 1)[1])
+
+
+def top_level_split(expression: str, operator: str) -> list[str]:
+    """Split a GitHub Actions expression on `operator` outside parentheses and quotes.
+
+    Operands are stripped. A term that is one fully parenthesised group keeps its
+    parentheses, so `a && (b || c)` splits on `&&` into `a` and `(b || c)`.
+    """
+
+    terms: list[str] = []
+    depth = 0
+    quoted = False
+    start = 0
+    index = 0
+    while index < len(expression):
+        character = expression[index]
+        if character == "'":
+            quoted = not quoted
+        elif not quoted and character == "(":
+            depth += 1
+        elif not quoted and character == ")":
+            depth -= 1
+            if depth < 0:
+                raise AssertionError(f"unbalanced parentheses in {expression!r}")
+        elif not quoted and depth == 0 and expression.startswith(operator, index):
+            terms.append(expression[start:index].strip())
+            index += len(operator)
+            start = index
+            continue
+        index += 1
+    if depth != 0 or quoted:
+        raise AssertionError(f"unbalanced expression {expression!r}")
+    terms.append(expression[start:].strip())
+    return terms
+
+
+class ConditionParserTests(unittest.TestCase):
+    def test_precedence_bug_is_visible_at_top_level(self) -> None:
+        buggy = (
+            "needs.changes.outputs.code == 'true' && github.event_name != "
+            "'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'"
+        )
+        self.assertEqual(2, len(top_level_split(buggy, "||")))
+        fixed = (
+            "needs.changes.outputs.code == 'true' && (github.event_name != "
+            "'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')"
+        )
+        self.assertEqual([fixed], top_level_split(fixed, "||"))
+        self.assertEqual(
+            [
+                "needs.changes.outputs.code == 'true'",
+                "(github.event_name != 'workflow_dispatch' || "
+                "inputs.scope != 'windows-general-sandbox')",
+            ],
+            top_level_split(fixed, "&&"),
+        )
+
+    def test_quoted_operators_and_parentheses_are_ignored(self) -> None:
+        self.assertEqual(
+            ["a == '(x || y'", "b"], top_level_split("a == '(x || y' && b", "&&")
+        )
+
+
 class Phase6CiWorkflowTests(unittest.TestCase):
     SHARED_ADVERSARIAL_FILTERS = (
         "extras::js::tests::worker_protocol::",
@@ -64,11 +129,16 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("scope:", dispatch_header)
         self.assertIn("windows-general-sandbox", dispatch_header)
 
-        jobs = re.findall(
-            r"(?m)^  ([a-zA-Z0-9_-]+):$",
-            self.workflow.split("jobs:\n", 1)[1],
-        )
+        jobs = workflow_jobs(self.workflow)
         self.assertIn("windows-general-sandbox-policy", jobs)
+        skip_probe_scope = (
+            "(github.event_name != 'workflow_dispatch' || "
+            "inputs.scope != 'windows-general-sandbox')"
+        )
+        probe_scope = (
+            "(github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || "
+            "inputs.scope == 'windows-general-sandbox')"
+        )
         for job in jobs:
             condition = job_body(self.workflow, job).splitlines()[0].strip()
             with self.subTest(job=job):
@@ -79,10 +149,22 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     # take the probe down with it, so it runs unconditionally
                     # and reports code=true for every dispatch.
                     self.assertNotIn("inputs.scope", condition)
-                elif job == "windows-general-sandbox-policy":
-                    self.assertIn("inputs.scope == 'windows-general-sandbox'", condition)
-                else:
-                    self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
+                    continue
+                # Parse the expression rather than substring-match it:
+                # `a && b || c` contains the right words but means
+                # `(a && b) || c` (mini-agent-6ap52, dependency-policy).
+                self.assertTrue(condition.startswith("if: "), condition)
+                conjuncts = top_level_split(condition[len("if: "):], "&&")
+                for term in conjuncts:
+                    self.assertEqual(
+                        [term],
+                        top_level_split(term, "||"),
+                        f"an unparenthesised `||` leaks out of {condition!r}",
+                    )
+                expected = probe_scope if job == "windows-general-sandbox-policy" else skip_probe_scope
+                self.assertIn(expected, conjuncts, condition)
+                if "needs.changes.outputs.code" in condition:
+                    self.assertIn("needs.changes.outputs.code == 'true'", conjuncts)
 
         windows_job = job_body(self.workflow, "windows-general-sandbox-policy")
         source_step = windows_job.split(
@@ -595,6 +677,102 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertGreater(len(test_rows), 5)
         missing = [row for row in test_rows if row not in clippy_rows]
         self.assertEqual([], missing, "test rows without a strict Clippy row")
+
+        # The complete feature union (including `skills-embed`, which no matrix
+        # row enables) is tested by the all-features job, so that job lints it
+        # strictly too, before its tests run (mini-agent-6ap52).
+        all_features = job_body(self.workflow, "all-features")
+        self.assertIn("runs-on: ubuntu-latest", all_features)
+        lint = "run: cargo clippy --locked --all-targets --all-features -- -D warnings\n"
+        self.assertIn(lint, all_features)
+        self.assertIn("cargo test --locked --all-features", all_features)
+        self.assertLess(
+            all_features.index(lint),
+            all_features.index("cargo test --locked --all-features"),
+        )
+        lint_step = all_features.split(lint, 1)[0].rsplit("- name:", 1)[1]
+        self.assertNotIn("continue-on-error", lint_step)
+        self.assertNotIn("if:", lint_step)
+
+    def test_every_job_declares_a_bounded_timeout(self) -> None:
+        # Without a job-level timeout a hung job holds a runner for GitHub's
+        # 360-minute default (mini-agent-6ap52).
+        for job in workflow_jobs(self.workflow):
+            with self.subTest(job=job):
+                header = job_body(self.workflow, job).split("    steps:\n", 1)[0]
+                timeouts = re.findall(r"(?m)^    timeout-minutes: (\d+)$", header)
+                self.assertEqual(1, len(timeouts), f"{job} must declare one job-level timeout")
+                minutes = int(timeouts[0])
+                self.assertGreater(minutes, 0)
+                self.assertLessEqual(minutes, 120)
+        for job in (
+            "windows-general-sandbox-policy",
+            "windows-worker-containment-gate",
+            "macos-worker-containment-gate",
+        ):
+            with self.subTest(gate=job):
+                header = job_body(self.workflow, job).split("    steps:\n", 1)[0]
+                self.assertIn("    timeout-minutes: 90\n", header)
+
+    def test_schedule_runs_only_the_drift_detection_jobs(self) -> None:
+        # The weekly run re-checks what can drift without a commit: advisories,
+        # the hosted runner images and toolchain (mini-agent-6ap52).
+        drift_jobs = {
+            "changes",
+            "dependency-policy",
+            "harness-regression",
+            "parallel-test-smoke",
+            "linux-sandbox-policy",
+            "macos-worker-containment-gate",
+            "windows-general-sandbox-policy",
+            "windows-worker-containment-gate",
+            "phase6-cross-platform-gate",
+        }
+        header = self.workflow.split("jobs:\n", 1)[0]
+        self.assertIn("  schedule:\n    - cron: '23 3 * * 1'\n", header)
+        self.assertIn("drift detection", header)
+        jobs = workflow_jobs(self.workflow)
+        self.assertLessEqual(drift_jobs, set(jobs))
+        for job in jobs:
+            condition = job_body(self.workflow, job).splitlines()[0].strip()
+            with self.subTest(job=job):
+                if job in drift_jobs:
+                    self.assertNotIn("'schedule'", condition)
+                else:
+                    self.assertTrue(condition.startswith("if: "), condition)
+                    self.assertIn(
+                        "github.event_name != 'schedule'",
+                        top_level_split(condition[len("if: "):], "&&"),
+                    )
+
+    def test_windows_gate_runs_the_lpac_image_loading_feasibility_gate(self) -> None:
+        # The ignored real-backend test documented as the Windows image-loading
+        # gate must actually run, exactly once, in the Windows gate.
+        body = job_body(self.workflow, "windows-worker-containment-gate")
+        step = body.split(
+            "name: Validate LPAC image loading from every supported install location", 1
+        )[1].split("- name:", 1)[0]
+        test = (
+            "sandbox::worker::platform::tests::"
+            "windows_lpac_can_load_current_exe_with_only_protocol_handles"
+        )
+        self.assertIn(f"$test = '{test}'", step)
+        self.assertIn(
+            "cargo test --locked --no-default-features --features js $test -- --exact --ignored --list",
+            step,
+        )
+        self.assertIn(".Count -ne 1", step)
+        self.assertIn(
+            "cargo test --locked --no-default-features --features js $test "
+            "-- --exact --ignored --nocapture --test-threads=1",
+            step,
+        )
+        self.assertNotIn("continue-on-error", step)
+        # It needs the installed binary exported by the install step.
+        self.assertLess(
+            body.index("MINI_AGENT_LPAC_CARGO_INSTALL_EXE=$installed"),
+            body.index("name: Validate LPAC image loading from every supported install location"),
+        )
 
     def test_linux_sandbox_policy_proves_hooks_have_no_controlling_terminal(
         self,
