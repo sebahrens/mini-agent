@@ -176,6 +176,15 @@ in the model's original call order, mutations remain serialized, and reads do
 not observe a concurrent mutation. Tool hooks are inside the same lane so a
 guard-rail command cannot race another tool operation.
 
+File tools (`read`, `write`, `edit`, `list_dir`, `grep`, `find_files`) resolve their path
+argument once through `resolve_tool_target` in `src/agent/tools/mod.rs`. Home expansion (`~/`,
+`$HOME/`) happens first, and the bound-versus-ambient decision is made from the expanded path: a
+path that expands to an absolute path takes the ambient permission path and is reported as that
+absolute path, while a path that is still relative is opened through the captured workspace
+capability and reported as its logical location inside the workspace. A `$`-prefixed component
+that does not expand (for example `$FOO/x`, or `$HOME/x` without a home directory) is a literal
+workspace-relative name and is reported as such.
+
 `find_files` preserves filename-regex matching for valid regular expressions.
 If the supplied pattern is not valid regex, it is parsed as a workspace-relative
 path glob, so common forms such as `**/*.rs` search recursively. Capped output

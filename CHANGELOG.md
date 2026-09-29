@@ -31,6 +31,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
+  `~/...`: it resolves to the home directory through the ambient permission check instead of being
+  created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.
+  Reported paths are the paths actually touched on disk.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

@@ -1745,7 +1745,42 @@ pub fn process_paths() -> Result<AppPaths, AppPathError> {
 }
 
 pub fn process_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME_OVERRIDE.with(|home| home.borrow().clone()) {
+        return Some(home);
+    }
     dirs::home_dir()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only home directory override for the current thread. Unlike changing
+/// `HOME` process-wide, it cannot race tests on other threads that expand `~`.
+/// It is visible to `~`/`$HOME` expansion performed on this thread, which
+/// covers a current-thread `#[tokio::test]` driving a tool call.
+#[cfg(all(test, unix))]
+pub(crate) struct ScopedTestHome {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(all(test, unix))]
+impl ScopedTestHome {
+    pub(crate) fn set(home: &Path) -> Self {
+        let previous = TEST_HOME_OVERRIDE.with(|slot| slot.replace(Some(home.to_path_buf())));
+        Self { previous }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for ScopedTestHome {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
+    }
 }
 
 pub fn prepare_storage_roots(paths: &AppPaths) -> io::Result<()> {

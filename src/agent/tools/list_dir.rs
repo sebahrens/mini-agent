@@ -84,20 +84,15 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
-        let workspace_root =
-            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
-        let requested = crate::agent::tools::resolve_tool_path(
-            workspace_root.as_deref(),
+        crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let target = crate::agent::tools::resolve_tool_target(
+            self.workspace.as_ref(),
             args.path.as_deref().unwrap_or("."),
         );
+        let requested = target.requested;
         let path = requested.to_string_lossy().into_owned();
-        let raw = args.path.as_deref().unwrap_or(".");
-        let relative = Path::new(raw);
-        let bound_workspace = if !relative.is_absolute() && !raw.starts_with('~') {
-            self.workspace.as_ref()
-        } else {
-            None
-        };
+        let relative = target.bound_relative.as_deref().unwrap_or(Path::new(""));
+        let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         tracing::debug!("tool list_dir start: path={}", path);
         let (bound_directory, coaching) = if let Some(workspace) = bound_workspace {
             let logical = workspace.logical_relative_path(relative)?;

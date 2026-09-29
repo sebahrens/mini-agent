@@ -4,6 +4,8 @@ pub(crate) mod crc;
 pub(crate) mod edit;
 pub(crate) mod find_files;
 pub(crate) mod grep;
+#[cfg(all(test, unix))]
+mod home_path_tests;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
 pub(crate) mod lsp;
@@ -54,17 +56,51 @@ pub(crate) fn edit_system() -> EditSystem {
     TEST_EDIT_SYSTEM.get()
 }
 
+/// A model-supplied tool path resolved exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolPath {
+    /// The path reported to the model. For an ambient target it is also the
+    /// path the tool resolves; for a bound target it is the logical on-disk
+    /// location inside the workspace.
+    pub(crate) requested: PathBuf,
+    /// Present when the captured workspace capability must resolve the path.
+    /// It is the expanded, still-relative path handed to the binding.
+    pub(crate) bound_relative: Option<PathBuf>,
+}
+
 /// Resolve a tool path against the immutable workspace selected when the
-/// agent was built. Absolute and home-relative paths retain their historical
-/// meaning; only relative paths are workspace-bound.
-pub(crate) fn resolve_tool_path(workspace_root: Option<&Path>, path: &str) -> PathBuf {
+/// agent was built.
+///
+/// Home expansion (`~/`, `$HOME/`) happens first and the bound-vs-ambient
+/// decision is taken from the *expanded* path: anything that expands to an
+/// absolute path goes through the ambient permission path and is reported as
+/// that absolute path. Only a path that is still relative after expansion is
+/// workspace-bound. A `$`- or `~`-prefixed first component that did not
+/// expand (for example `$HOME/x` without a home directory, or `$FOO/x`) stays
+/// a literal workspace-relative path and is reported as the on-disk location
+/// inside the workspace, never as a home path.
+pub(crate) fn resolve_tool_target(
+    workspace: Option<&Arc<crate::paths::WorkspaceBinding>>,
+    path: &str,
+) -> ToolPath {
     let expanded = PathBuf::from(crate::fs::expand_tilde(path));
     if expanded.is_absolute() {
-        expanded
-    } else if let Some(root) = workspace_root {
-        root.join(expanded)
-    } else {
-        expanded
+        return ToolPath {
+            requested: expanded,
+            bound_relative: None,
+        };
+    }
+    match workspace {
+        Some(workspace) => ToolPath {
+            requested: workspace
+                .logical_relative_path(&expanded)
+                .unwrap_or_else(|_| workspace.root().join(&expanded)),
+            bound_relative: Some(expanded),
+        },
+        None => ToolPath {
+            requested: expanded,
+            bound_relative: None,
+        },
     }
 }
 

@@ -1160,13 +1160,12 @@ impl Tool for FindFilesTool {
         if requested_path.is_empty() {
             return Err(ToolError::Msg("Search path cannot be empty".to_string()));
         }
-        let workspace_root =
-            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
-        let search_path =
-            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), requested_path);
-        let relative = Path::new(requested_path);
-        let (bound_directory, path_coaching) = if !relative.is_absolute()
-            && !requested_path.starts_with('~')
+        crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let target =
+            crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), requested_path);
+        let search_path = target.requested;
+        let (bound_directory, path_coaching) = if let Some(relative) =
+            target.bound_relative.as_deref()
             && let Some(workspace) = &self.workspace
         {
             let logical = workspace.logical_relative_path(relative)?;
