@@ -2340,11 +2340,12 @@ mod tests {
     async fn completed_task_whose_quoted_output_is_cut_is_not_partial_and_keeps_its_fence() {
         let counters = Arc::new(FakeCounters::default());
         // 300 raw bytes fit a 512-byte limit, but quoting doubles them.
-        let steps = vec![FakeStep {
+        let step = FakeStep {
             delay: Duration::ZERO,
             output: Ok("x\n".repeat(150)),
             cost_units: 1,
-        }];
+        };
+        let steps = Vec::from([step]);
         let limits = TaskLimits {
             max_concurrency: 1,
             max_output_bytes: 512,
