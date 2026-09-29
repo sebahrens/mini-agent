@@ -116,6 +116,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   parallel runner: its readiness wait is split into bounded stages (tool announced, shell pid, child
   pid) that each report which one stalled, and CI now runs the unserialised default suite on macOS
   as well as Linux.
+- The goal round-clock test that proves time waiting on a permission prompt does not count against a
+  goal's time budget no longer flakes on loaded macOS CI runners: it now injects the instants instead
+  of bounding real sleeps from above.
 
 ## [1.9.4] - 2026-09-29
 

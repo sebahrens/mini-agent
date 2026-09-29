@@ -14,7 +14,7 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Round model).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::gate::{GateDecision, KEEP_WORKING_INSTRUCTION, RoundEnd, RoundSummary};
 use super::{ContinuationMode, Goal, GoalStatus, ReportStatus};
@@ -39,14 +39,22 @@ pub struct RoundCollector {
     /// waiting on a permission prompt. A user at lunch must not consume a
     /// goal's time budget.
     active: Duration,
-    running_since: Option<std::time::Instant>,
-    blocked_since: Option<std::time::Instant>,
+    running_since: Option<Instant>,
+    blocked_since: Option<Instant>,
 }
 
 impl RoundCollector {
     pub fn new() -> Self {
+        Self::started_at(Instant::now())
+    }
+
+    /// A collector whose round began at `now`. Each clock method below has an
+    /// `_at` form taking the instant explicitly, so the active-time arithmetic
+    /// is exact under test instead of depending on how long a loaded machine
+    /// really slept; the public forms read `Instant::now()`.
+    fn started_at(now: Instant) -> Self {
         Self {
-            running_since: Some(std::time::Instant::now()),
+            running_since: Some(now),
             ..Self::default()
         }
     }
@@ -85,28 +93,46 @@ impl RoundCollector {
 
     /// The agent is blocked on a permission prompt; stop the clock.
     pub fn pause_clock(&mut self) {
+        self.pause_clock_at(Instant::now());
+    }
+
+    fn pause_clock_at(&mut self, now: Instant) {
         if self.blocked_since.is_none() {
-            self.accrue();
-            self.blocked_since = Some(std::time::Instant::now());
+            self.accrue(now);
+            self.blocked_since = Some(now);
         }
     }
 
     /// The prompt was answered; restart the clock.
     pub fn resume_clock(&mut self) {
+        self.resume_clock_at(Instant::now());
+    }
+
+    fn resume_clock_at(&mut self, now: Instant) {
         if self.blocked_since.take().is_some() {
-            self.running_since = Some(std::time::Instant::now());
+            self.running_since = Some(now);
         }
     }
 
-    fn accrue(&mut self) {
+    fn accrue(&mut self, now: Instant) {
         if let Some(started) = self.running_since.take() {
-            self.active += started.elapsed();
+            self.active += now.saturating_duration_since(started);
         }
     }
 
     /// Close the round and produce what the gate reads.
-    pub fn finish(mut self, goal: &Goal, end: RoundEnd, open_todos: usize) -> RoundSummary {
-        self.accrue();
+    pub fn finish(self, goal: &Goal, end: RoundEnd, open_todos: usize) -> RoundSummary {
+        self.finish_at(Instant::now(), goal, end, open_todos)
+    }
+
+    fn finish_at(
+        mut self,
+        now: Instant,
+        goal: &Goal,
+        end: RoundEnd,
+        open_todos: usize,
+    ) -> RoundSummary {
+        self.accrue(now);
         let round = goal.progress.current_round();
         // Only a report filed during this round speaks for it.
         let report = goal
@@ -507,28 +533,87 @@ mod tests {
 
     /// A goal's time budget measures how long the agent worked, not how long
     /// the user took to answer. A person at lunch must not exhaust it.
+    ///
+    /// The instants are injected, so the arithmetic is exact. An earlier
+    /// version slept for real and bounded `active` from above, and a loaded
+    /// macOS runner that overslept the work crossed that bound.
     #[test]
     fn time_spent_waiting_on_the_user_does_not_count_against_the_budget() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut collector = RoundCollector::started_at(start);
+        collector.pause_clock_at(at(20));
+        // An hour at lunch, then ten more milliseconds of work.
+        collector.resume_clock_at(at(20 + 3_600_000));
+        let summary = collector.finish_at(at(3_600_030), &goal(), RoundEnd::Done, 0);
+
+        assert_eq!(
+            summary.active,
+            Duration::from_millis(30),
+            "the work either side of the prompt counts; the wait for the user does not"
+        );
+    }
+
+    /// Several prompts in one round each stop the clock, and a repeated pause
+    /// or a resume without a pause changes nothing.
+    #[test]
+    fn every_wait_on_the_user_is_excluded_and_redundant_clock_calls_are_ignored() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut collector = RoundCollector::started_at(start);
+        collector.resume_clock_at(at(5)); // not paused: no effect
+        collector.pause_clock_at(at(10));
+        collector.pause_clock_at(at(50)); // already paused: the wait began at 10
+        collector.resume_clock_at(at(100));
+        collector.pause_clock_at(at(125));
+        collector.resume_clock_at(at(1_000));
+        collector.resume_clock_at(at(1_020)); // already running since 1000
+        let summary = collector.finish_at(at(1_040), &goal(), RoundEnd::Done, 0);
+
+        assert_eq!(summary.active, Duration::from_millis(10 + 25 + 40));
+    }
+
+    /// A round that ends while still blocked on a prompt counts nothing after
+    /// the prompt opened.
+    #[test]
+    fn a_round_that_ends_mid_prompt_stops_counting_at_the_prompt() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut collector = RoundCollector::started_at(start);
+        collector.pause_clock_at(at(70));
+        let summary = collector.finish_at(at(90_000), &goal(), RoundEnd::Cancelled, 0);
+
+        assert_eq!(summary.active, Duration::from_millis(70));
+    }
+
+    /// The public forms read the real clock. Only bounds that hold however
+    /// long the machine really slept are asserted: the work is at least what
+    /// was slept, and `active` plus a span measured inside the wait cannot
+    /// exceed the wall time measured around the whole round.
+    #[test]
+    fn the_real_clock_excludes_the_wait_whatever_the_scheduler_does() {
+        let outer = Instant::now();
         let mut collector = RoundCollector::new();
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
         collector.pause_clock();
-        // The wait dwarfs the work: counting it would put `active` above 420 ms,
-        // while a loaded runner that oversleeps the 20 ms of work stays far below
-        // the ceiling. A 120 ms wait against a 100 ms ceiling failed on CI when
-        // the work sleep alone overran to 105 ms.
-        std::thread::sleep(Duration::from_millis(400));
+        let wait = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
+        let waited = wait.elapsed();
         collector.resume_clock();
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
+        let wall = outer.elapsed();
 
         assert!(
-            summary.active >= Duration::from_millis(15),
+            summary.active >= Duration::from_millis(5),
             "the work before the prompt is still work: {:?}",
             summary.active
         );
         assert!(
-            summary.active < Duration::from_millis(250),
-            "but the wait for the user is not: {:?}",
-            summary.active
+            summary.active + waited <= wall,
+            "the wait for the user is not work: active {:?} + waited {:?} > wall {:?}",
+            summary.active,
+            waited,
+            wall
         );
     }
 
