@@ -150,6 +150,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     id: "lifecycle-1".into(),
                     name: "read".into(),
                     output: "fn main() {}".into(),
+                    is_error: false,
                 },
                 #[cfg(feature = "subagents")]
                 AgentEvent::SubagentToolCall {

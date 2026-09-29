@@ -35,6 +35,9 @@ pub enum AgentEvent {
         id: CompactString,
         name: CompactString,
         output: CompactString,
+        /// The tool failed, was denied, or its outcome is unknown. Clients that
+        /// report tool status (ACP) mark such calls failed.
+        is_error: bool,
     },
     /// The runner has honored a UI compaction request only after every
     /// in-flight tool result is correlated into this structured transcript.

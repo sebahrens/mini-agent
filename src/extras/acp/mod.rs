@@ -1618,6 +1618,15 @@ fn respond_terminal(
     responder.respond(PromptResponse::new(reason))
 }
 
+fn respond_terminal_error(
+    registration: &TurnRegistration,
+    responder: Responder<PromptResponse>,
+    error: String,
+) -> Result<(), agent_client_protocol::Error> {
+    registration.settle();
+    responder.respond_with_error(agent_client_protocol::Error::new(-32603, error))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -1689,6 +1698,7 @@ async fn run_prompt(
     let mut outcome = result?;
     if !registration.complete_and_settle() {
         outcome.reason = StopReason::Cancelled;
+        outcome.error = None;
     }
     // Settle the goal round this prompt turn was, before the transcript is
     // committed, so the gate sees the round's own record.
@@ -1696,6 +1706,7 @@ async fn run_prompt(
     let goal_line = settle_acp_goal_round(
         &goal_store_for_gate,
         outcome.reason,
+        outcome.error.as_deref(),
         outcome.progress.as_deref().unwrap_or(&[]),
         &todo_snapshot,
         state,
@@ -1754,18 +1765,14 @@ async fn run_prompt(
         notification.meta = Some(meta);
         let _ = cx.send_notification(notification);
     }
-    if outcome.reason == StopReason::Refusal
-        && let Some(error) = outcome.error
-    {
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
-            "[error: {error}]"
-        ))));
-        let _ = cx.send_notification(SessionNotification::new(
-            session_id,
-            SessionUpdate::AgentMessageChunk(chunk),
-        ));
+    // An internal failure (provider, runner, workspace or configuration) is
+    // not a model refusal: it is answered as a JSON-RPC error so a client can
+    // tell the two apart. Progress the turn made is still committed above.
+    if let Some(error) = outcome.error {
+        let _ = respond_terminal_error(registration, responder, error);
+    } else {
+        let _ = respond_terminal(registration, responder, outcome.reason);
     }
-    let _ = respond_terminal(registration, responder, outcome.reason);
     Ok(())
 }
 
@@ -1782,6 +1789,7 @@ async fn run_prompt(
 async fn settle_acp_goal_round(
     store: &crate::extras::goal::GoalStore,
     reason: StopReason,
+    error: Option<&str>,
     interactions: &[Message],
     todos: &[crate::agent::tools::todo::TodoItem],
     state: &AcpState,
@@ -1809,10 +1817,11 @@ async fn settle_acp_goal_round(
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty()),
     );
-    summary.end = match reason {
-        StopReason::EndTurn => RoundEnd::Done,
-        StopReason::Cancelled => RoundEnd::Cancelled,
-        other => RoundEnd::Failed(format!("{other:?}")),
+    summary.end = match (error, reason) {
+        (Some(error), _) => RoundEnd::Failed(error.to_string()),
+        (None, StopReason::EndTurn) => RoundEnd::Done,
+        (None, StopReason::Cancelled) => RoundEnd::Cancelled,
+        (None, other) => RoundEnd::Failed(format!("{other:?}")),
     };
 
     // The same objective is gated the same way in an editor as in a terminal:
@@ -1869,8 +1878,11 @@ async fn settle_acp_goal_round(
 }
 
 struct PromptOutcome {
+    /// Ignored when `error` is set: a failed turn is answered with a JSON-RPC
+    /// error, never with a stop reason.
     reason: StopReason,
     progress: Option<Vec<Message>>,
+    /// An internal failure; the prompt request fails with this message.
     error: Option<String>,
     /// Tokens this turn spent. A goal's token bound is enforced from here, so
     /// leaving it at zero would make the bound configurable and inert.
@@ -2213,7 +2225,7 @@ async fn relay_prompt_events(
                 progress: None,
                 #[cfg(feature = "goal")]
                 usage: rig::completion::Usage::default(),
-                error: None,
+                error: Some("agent runner stopped without a terminal event".to_string()),
             };
         };
         match event {
@@ -2264,13 +2276,21 @@ async fn relay_prompt_events(
                 // Display-only provenance; the outer task call remains the
                 // canonical ACP tool lifecycle.
             }
-            AgentEvent::ToolResult { id, output, .. } => {
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                ..
+            } => {
                 let id = id.to_string();
-                let fields = ToolCallUpdateFields::new()
+                let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
                         TextContent::new(output.to_string()),
                     ))]);
+                if is_error {
+                    fields.status = Some(ToolCallStatus::Failed);
+                }
                 let update = ToolCallUpdate::new(ToolCallId::new(id), fields);
                 let notif = SessionNotification::new(
                     session_id.clone(),
@@ -3417,11 +3437,13 @@ mod protocol_tests {
                                 id: "lifecycle-b".into(),
                                 name: "read".into(),
                                 output: "b-result".into(),
+                                is_error: true,
                             },
                             AgentEvent::ToolResult {
                                 id: "lifecycle-a".into(),
                                 name: "read".into(),
                                 output: "a-result".into(),
+                                is_error: false,
                             },
                             done("tools-complete", canonical_tool_turn()),
                         ]);
@@ -3511,8 +3533,11 @@ mod protocol_tests {
                 let failed = cx
                     .send_request(prompt(first.clone(), "fail"))
                     .block_task()
-                    .await?;
-                assert_eq!(failed.stop_reason, StopReason::Refusal);
+                    .await;
+                assert!(
+                    failed.is_err(),
+                    "an internal failure is a JSON-RPC error, not a refusal: {failed:?}"
+                );
                 cx.send_request(prompt(first.clone(), "after-failure"))
                     .block_task()
                     .await?;
@@ -3562,6 +3587,23 @@ mod protocol_tests {
             .collect::<Vec<_>>();
         assert_eq!(call_ids, vec!["lifecycle-a", "lifecycle-b"]);
         assert_eq!(result_ids, vec!["lifecycle-b", "lifecycle-a"]);
+        let statuses = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => {
+                    Some((update.tool_call_id.to_string(), update.fields.status))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("lifecycle-b".to_string(), Some(ToolCallStatus::Failed)),
+                ("lifecycle-a".to_string(), Some(ToolCallStatus::Completed)),
+            ],
+            "a failed tool result must be reported as failed"
+        );
     }
 
     #[tokio::test]
@@ -4843,13 +4885,17 @@ mod protocol_tests {
                     let response = tokio::time::timeout(Duration::from_secs(2), response)
                         .await
                         .unwrap()
-                        .unwrap()?;
-                    let expected = match case {
-                        "prepare-cancel" | "cleanup-cancel" | "compaction" => StopReason::Cancelled,
-                        "done" => StopReason::EndTurn,
-                        _ => StopReason::Refusal,
-                    };
-                    assert_eq!(response.stop_reason, expected, "{case}");
+                        .unwrap();
+                    match case {
+                        "prepare-cancel" | "cleanup-cancel" | "compaction" => {
+                            assert_eq!(response?.stop_reason, StopReason::Cancelled, "{case}")
+                        }
+                        "done" => assert_eq!(response?.stop_reason, StopReason::EndTurn, "{case}"),
+                        _ => assert!(
+                            response.is_err(),
+                            "{case}: internal failures are JSON-RPC errors"
+                        ),
+                    }
                     assert!(
                         !process_is_alive(pid),
                         "{case}: child outlived terminal response"

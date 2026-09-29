@@ -1750,6 +1750,13 @@ model. Provider clients honour `--api-key` first, and turns use the configured
 configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
 startup, so delegated read-only agents work over ACP.
 
+A turn that fails internally (provider or runner error, unusable workspace,
+missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
+carrying the failure message, rather than a `refusal` stop reason; any tool
+work the turn completed is still committed to the session history. Tool calls
+that fail, are denied, or whose outcome is unknown are reported with tool-call
+status `failed` instead of `completed`.
+
 Each new ACP session also owns an independent in-memory conversation history.
 Only completed turns are committed: the user prompt, correlated structured tool
 call/result messages, and the terminal assistant response are retained together.

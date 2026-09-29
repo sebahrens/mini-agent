@@ -175,7 +175,9 @@ pub async fn handle_agent_event(
                 C_TOOL,
             )?;
         }
-        AgentEvent::ToolResult { id, name, output } => {
+        AgentEvent::ToolResult {
+            id, name, output, ..
+        } => {
             let (_, artifact) = ui
                 .session
                 .add_tool_result_with_id_and_artifact(&id, &name, &output);
