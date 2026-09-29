@@ -643,19 +643,22 @@ async fn start_goal_verification(
     // An operator who interrupts must not wait for a check, and the check must
     // actually stop: cancellation terminates the command's process group and
     // reaps it, which dropping this task's future would not.
-    let (cancel, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        let (checks, mut interrupted) = crate::extras::goal::checks::run_with_interrupt(
-            &goal,
-            &request,
-            &sandbox,
-            &cfg,
-            async {
-                let _ = (&mut cancelled).await;
-                Ok(())
-            },
-        )
-        .await;
+        // Shared, so the checks and then the judge can each wait on the same
+        // cancellation, and a signal that already fired stays fired.
+        let cancelled = futures::FutureExt::shared(async move {
+            let _ = cancelled.await;
+        });
+        let (checks, mut interrupted) =
+            crate::extras::goal::checks::run_with_interrupt(&goal, &request, &sandbox, &cfg, {
+                let cancelled = cancelled.clone();
+                async move {
+                    cancelled.await;
+                    Ok(())
+                }
+            })
+            .await;
         // A failing check already decides the claim, and the gate returns
         // before it looks at the judge: asking anyway spends a model call on
         // an answer nobody reads.
@@ -677,8 +680,8 @@ async fn start_goal_verification(
                         &cfg,
                         checks.as_ref(),
                     ),
-                    async {
-                        let _ = (&mut cancelled).await;
+                    async move {
+                        cancelled.await;
                         Ok(())
                     },
                 )
