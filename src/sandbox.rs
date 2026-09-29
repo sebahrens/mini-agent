@@ -731,12 +731,12 @@ fn bwrap_path() -> Option<&'static Path> {
 }
 
 #[cfg(target_os = "macos")]
-fn seatbelt_exists() -> bool {
+pub(crate) fn seatbelt_exists() -> bool {
     cached_backend_availability(&SEATBELT_AVAILABLE, probe_seatbelt)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn seatbelt_exists() -> bool {
+pub(crate) fn seatbelt_exists() -> bool {
     false
 }
 
@@ -3735,7 +3735,7 @@ fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
 
 /// Render the Seatbelt shell profile from already-escaped path literals.
 /// `private_read_denies` is the body produced by [`seatbelt_private_read_denies`].
-fn seatbelt_shell_profile(
+pub(crate) fn seatbelt_shell_profile(
     workspace_str: &str,
     cache_str: &str,
     private_read_denies: &str,
@@ -3786,7 +3786,7 @@ fn seatbelt_resolved_spelling(path: &Path) -> Option<PathBuf> {
 /// Build the `(subpath ...)` list for private application directories that
 /// sandboxed commands must not read. Each directory is denied under both its
 /// configured spelling and its resolved spelling.
-fn seatbelt_private_read_denies(paths: &[(&Path, &str)]) -> Result<String, String> {
+pub(crate) fn seatbelt_private_read_denies(paths: &[(&Path, &str)]) -> Result<String, String> {
     let mut spellings: Vec<String> = Vec::new();
     for (path, label) in paths {
         let mut candidates = vec![path.to_path_buf()];
@@ -3811,7 +3811,7 @@ fn seatbelt_private_read_denies(paths: &[(&Path, &str)]) -> Result<String, Strin
         .collect())
 }
 
-fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
+pub(crate) fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
     let value = path.to_str().ok_or_else(|| {
         format!(
             "sandbox: {label} {} is not valid UTF-8 for the Seatbelt profile",
@@ -5802,54 +5802,6 @@ printf {pass_token}
         assert!(error.contains("filesystem root"), "{error}");
     }
 
-    /// Regression for mini-agent-v54o6: a credential directory reached through
-    /// a symlink (here `/tmp` -> `/private/tmp` style aliasing via an explicit
-    /// link) must be unreadable by a real Seatbelt child under both spellings.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_seatbelt_denies_symlinked_credential_reads() {
-        if !seatbelt_exists() {
-            eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
-            return;
-        }
-        let root = ScratchDir::new();
-        let real_home = root.path().join("real-home");
-        let credentials = real_home.join("credentials");
-        std::fs::create_dir_all(&credentials).unwrap();
-        std::fs::write(credentials.join("key"), "secret").unwrap();
-        let linked_home = root.path().join("linked-home");
-        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
-        let canonical_secret = std::fs::canonicalize(credentials.join("key")).unwrap();
-
-        let denies = seatbelt_private_read_denies(&[(
-            linked_home.join("credentials").as_path(),
-            "credential directory",
-        )])
-        .unwrap();
-        let workspace = std::fs::canonicalize(root.path()).unwrap();
-        let workspace_str = seatbelt_string_literal(&workspace, "working directory").unwrap();
-        let profile = seatbelt_shell_profile(&workspace_str, &workspace_str, &denies, true);
-
-        for target in [
-            canonical_secret.clone(),
-            linked_home.join("credentials").join("key"),
-        ] {
-            let output = std::process::Command::new("/usr/bin/sandbox-exec")
-                .arg("-p")
-                .arg(profile.as_str())
-                .arg("/bin/cat")
-                .arg(&target)
-                .output()
-                .unwrap();
-            assert!(
-                !output.status.success() && output.stdout.is_empty(),
-                "credential read through {} escaped Seatbelt: {:?}",
-                target.display(),
-                output
-            );
-        }
-    }
-
     /// Regression for mini-agent-0j5vz: the zerobox model-action arm must not
     /// inherit the parent environment (provider API keys).
     #[cfg(unix)]
@@ -5879,73 +5831,5 @@ printf {pass_token}
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn terminate_process_group_async_kills_the_whole_group() {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; /bin/sleep 60 & wait"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        terminate_process_group(pid).await;
-        for _ in 0..200 {
-            if child.try_wait().unwrap().is_some() {
-                await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("async process-group termination did not terminate group {pid}");
-    }
-
-    /// Regression for mini-agent-2tdv3: Windows termination waits up to ~5 s
-    /// for a cooperative helper exit and must not stall the executor meanwhile.
-    #[cfg(windows)]
-    #[test]
-    fn terminate_process_group_does_not_block_current_thread_executor() {
-        let mut child = std::process::Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let observed = runtime.block_on({
-            let ticks = ticks.clone();
-            async move {
-                let ticker = tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                });
-                // A non-helper process never opens the cancellation event, so
-                // termination spends its full cooperative window (~4 s) here.
-                terminate_process_group(pid).await;
-                let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
-                ticker.abort();
-                observed
-            }
-        });
-        let status = child.wait().unwrap();
-        assert!(
-            observed > 0,
-            "the executor made no progress while Windows termination was in flight"
-        );
-        assert!(
-            !status.success(),
-            "terminated process must not exit cleanly"
-        );
     }
 }
