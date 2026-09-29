@@ -49,8 +49,11 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
 /// Every line `/help` prints, in order; `true` marks a section heading.
 pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "commands:");
-    emit(false, "  /add [path]            add file(s) to context");
-    emit(false, "  /drop <path>           remove file from context");
+    emit(false, "  /add [path...]         add file(s) to context");
+    emit(
+        false,
+        "  /drop <path...>        remove file(s) from context",
+    );
     emit(
         false,
         "  /drop-all              remove all added files from context",
@@ -96,7 +99,7 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     }
     emit(
         false,
-        "  /reasoning             toggle LLM reasoning ability",
+        "  /reasoning [on|off]    set or toggle LLM reasoning",
     );
     emit(false, "  /thinking              alias for /reasoning");
     emit(

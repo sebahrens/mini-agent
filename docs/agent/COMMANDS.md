@@ -24,7 +24,7 @@ All slash commands are available from the TUI input prompt.
 | `/sessions delete <id-or-name>` | Delete a session by its ID prefix or name. |
 | `/rename <name>` | Rename the current session. |
 | `/history` | Show global chat history (last 10 entries across sessions). |
-| `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Requires the `export` feature (default-on). |
+| `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Quote a file name that contains spaces. Requires the `export` feature (default-on). |
 | `/import <file>` | Import a session from a versioned zerostack JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
 | `/share` | Upload the HTML export as a secret GitHub gist and print the URL. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). |
@@ -59,8 +59,8 @@ fields remain importable and replay their tool records as labeled transcript tex
 | Command | Description |
 | ------- | ----------- |
 | `/add` | List files currently added to context (with sizes). |
-| `/add <path>` | Add a file to the agent's context (absolute or relative path). |
-| `/drop <path>` | Remove a file from the agent's context. |
+| `/add <path>...` | Add one or more files to the agent's context (absolute or relative paths). Quote a path that contains spaces (`/add "my notes.md" src/lib.rs`). |
+| `/drop <path>...` | Remove one or more files (or pending media indexes) from the agent's context. |
 | `/drop-all` | Remove all added files from the agent's context. |
 
 Files added with `/add` are included alongside the conversation in each request,
@@ -152,7 +152,7 @@ You are in read-only mode. Only read files and explore.
 | `/editsys similarity` | Use SEARCH/REPLACE with fuzzy matching for edits (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |
 | `/btw <message>` | Ask a quick side question in parallel, without touching the main conversation. It forks the current context (including the main agent's in-flight turn, if any), answers using read-only tools (read/grep/find_files/list_dir, no writes or shell), and prints the answer inline. Works even while the main agent is running. Nothing is written to history; its token cost is shown separately as `btw:$…`. Ctrl-C cancels an in-flight `/btw` without disturbing the main agent. |
-| `/reasoning` | Toggle LLM reasoning on/off (requires model support). |
+| `/reasoning [on\|off]` | Turn LLM reasoning on or off, or toggle it without an argument (requires model support). |
 | `/thinking` | Alias for `/reasoning`. |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
