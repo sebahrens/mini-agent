@@ -491,8 +491,9 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Home / End` | Move to the start/end of the current input line. With an empty input (or while a picker is open) they jump to the top/bottom of chat history instead. |
 | `Ctrl+Home / Ctrl+End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
-| Mouse drag | Select transcript lines and copy them on release. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's native selection. |
+| Mouse drag | Select transcript text from the press point to the release point (partial first and last lines) and copy it on release; the result is shown briefly on the status line rather than added to the transcript. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's (or multiplexer's) native selection. |
 | Mouse scroll | Scroll chat history. |
+| Permission prompt | While a `[permission]` prompt waits, the mouse wheel, `Up`/`Down`, `PageUp`/`PageDown` and `Home`/`End` scroll the transcript so the request's context can be reviewed; the answer keys (`y`, `a`, `f`, `n`, `Esc`) are unchanged. A long path wraps (a path too long for the prompt area is shortened in the middle, keeping the file name); a multi-line command shows its first lines and a count of the rest, and its full text is in the transcript above. Transcript tool-call lines show only the first line of a multi-line script, followed by `(+N lines, M chars)`. |
 
 Learned-skill feedback can be inspected and corrected by the authenticated local
 OS-account owner (requires `skills`):

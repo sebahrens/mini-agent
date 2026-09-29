@@ -1453,7 +1453,6 @@ fn seatbelt_profile(image: &Path) -> io::Result<String> {
 (allow process-exec (literal "{image}"))
 (allow file-read* (literal "{image}") (subpath "/System/Library") (subpath "/usr/lib"))
 (allow file-read-data (literal "/"))
-(allow file-read-data file-write-data (vnode-type FIFO))
 (allow sysctl-read)
 (allow signal (target self))
 (allow process-info* (target self))"#
@@ -4543,6 +4542,109 @@ mod tests {
         assert!(profile.contains("(allow file-read-data (literal \"/\"))"));
         assert!(!profile.contains("(subpath \"/\")"));
         assert!(!profile.contains("allow network"));
+        // Protocol streams are inherited anonymous pipes; no vnode-type rule
+        // may grant opening arbitrary named FIFOs (mini-agent-vvzsy).
+        assert!(!profile.contains("vnode-type"));
+    }
+
+    /// Regression for mini-agent-vvzsy: under the worker profile, inherited
+    /// anonymous pipes keep working while opening a named FIFO is denied.
+    #[test]
+    fn seatbelt_profile_denies_named_fifos_but_keeps_inherited_pipes() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let sandbox_exec = Path::new("/usr/bin/sandbox-exec");
+        let image = Path::new("/bin/cat");
+        if !sandbox_exec.exists() || !image.exists() {
+            eprintln!("skipping: sandbox-exec or /bin/cat is unavailable");
+            return;
+        }
+        let profile = seatbelt_profile(image).unwrap();
+
+        // Inherited anonymous pipes (the protocol transport) still work.
+        let mut piped = Command::new(sandbox_exec)
+            .arg("-p")
+            .arg(&profile)
+            .arg(image)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        piped.stdin.take().unwrap().write_all(b"protocol").unwrap();
+        let output = piped.wait_with_output().unwrap();
+        if !output.status.success() {
+            eprintln!("skipping: Seatbelt is not usable on this host");
+            return;
+        }
+        assert_eq!(output.stdout, b"protocol");
+
+        let directory =
+            std::env::temp_dir().join(format!("mini-agent-worker-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // Canonical path: a `/var` -> `/private/var` hop would be denied for
+        // unrelated reasons and hide the FIFO rule under test.
+        let fifo = std::fs::canonicalize(&directory)
+            .unwrap()
+            .join("named.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        #[allow(unsafe_code)]
+        // SAFETY: `fifo_c` is a valid NUL-terminated path for this synchronous call.
+        let created = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "mkfifo failed: {}", io::Error::last_os_error());
+
+        let mut child = Command::new(sandbox_exec)
+            .arg("-p")
+            .arg(&profile)
+            .arg(image)
+            .arg(&fifo)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // If the open were permitted, feed the reader so the child completes.
+        let writer_fifo = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&writer_fifo)
+                {
+                    let _ = file.write_all(b"named");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        writer.join().unwrap();
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            !status.success() && stdout.is_empty(),
+            "worker profile allowed opening a named FIFO: status {status:?}, stdout {stdout:?}"
+        );
     }
 
     #[test]
