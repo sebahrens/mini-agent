@@ -257,7 +257,7 @@ The heading is tagged `[compaction <ref>]`, where `<ref>` is `session::compactio
 
 ### `Mem::context_block_excluding(ref)`
 
-The injected memory block without the daily-log entry tagged `ref`. The session already replays its active compaction summary as a recap, so the interactive turn refresh and a resumed startup pass `Session::active_compaction_ref()` and the model sees that summary once. The entry itself stays in the log and in `memory_search`. Compactions saved before the tag existed exclude nothing.
+The injected memory block without the daily-log entry tagged `ref`. The session already replays its active compaction summary as a recap, so the interactive turn refresh and a resumed startup pass `Session::active_compaction_ref()` and the model sees that summary once. An ACP prompt turn refreshes the block after its history compaction and passes the `compaction_ref` of the recap its history replays (none for the emergency recap); ACP does not write its own summaries to the daily log, so this only matters when that text is already there, but the rule is the same on every surface. The entry itself stays in the log and in `memory_search`. Compactions saved before the tag existed exclude nothing.
 
 ### `effective_reserve(base, memory_block)`
 

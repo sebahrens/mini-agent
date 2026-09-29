@@ -49,6 +49,12 @@ struct SessionHistory {
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
     summary: Option<String>,
+    /// [`crate::session::compaction_ref`] of the summarizer text behind
+    /// `summary`, so a daily-memory copy of the recap this history already
+    /// replays is left out of the turn's memory block (mini-agent-p9oyv).
+    /// `None` for the emergency recap, which is never written to memory.
+    #[cfg(feature = "memory")]
+    summary_ref: Option<String>,
 }
 
 impl SessionHistory {
@@ -216,6 +222,10 @@ impl SessionHistory {
                         self.serialized_bytes.saturating_sub(turn.serialized_bytes);
                 }
             }
+            #[cfg(feature = "memory")]
+            {
+                self.summary_ref = Some(crate::session::compaction_ref(&summary));
+            }
             // A summarizer may drop anything in the turns it replaces, so the
             // objective is restated from the record rather than hoped for.
             #[cfg(feature = "goal")]
@@ -229,8 +239,20 @@ impl SessionHistory {
         Some(())
     }
 
+    /// The reference of the recap this history replays, which the turn's
+    /// memory block must not repeat.
+    #[cfg(feature = "memory")]
+    fn active_compaction_ref(&self) -> Option<String> {
+        self.summary.as_ref()?;
+        self.summary_ref.clone()
+    }
+
     fn emergency_compact(&mut self) {
         self.summary = Some(Self::EMERGENCY_RECAP.to_string());
+        #[cfg(feature = "memory")]
+        {
+            self.summary_ref = None;
+        }
         while self.needs_compaction() {
             let Some(turn) = self.turns.pop_front() else {
                 break;
@@ -2097,12 +2119,6 @@ async fn execute_prompt(
     }
     #[cfg(feature = "hooks")]
     crate::extras::hooks::set_active_workspace(workspace.root());
-    #[cfg(feature = "memory")]
-    let context = {
-        let mut refreshed = (*context).clone();
-        refreshed.refresh_memory_if_changed(None).await;
-        Arc::new(refreshed)
-    };
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
@@ -2243,6 +2259,16 @@ async fn execute_prompt(
             return Ok(PromptOutcome::cancelled(None));
         }
     }
+    // Refreshed after compaction, so the recap this turn replays is the one
+    // whose daily-memory copy is left out of the block.
+    #[cfg(feature = "memory")]
+    let context = {
+        let mut refreshed = (*context).clone();
+        refreshed
+            .refresh_memory_if_changed(history.active_compaction_ref())
+            .await;
+        Arc::new(refreshed)
+    };
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
 
@@ -3124,6 +3150,66 @@ mod history_tests {
                 ))]
             );
         }
+    }
+
+    /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
+    /// of the recap the ACP history already replays, like the terminal does.
+    #[cfg(feature = "memory")]
+    #[tokio::test]
+    async fn acp_memory_block_excludes_the_recap_history_replays() {
+        let summary = "ACP recap: renamed the parser module";
+        let mut history = SessionHistory::default();
+        assert_eq!(history.active_compaction_ref(), None);
+        history.commit_completed_turn(
+            &"u".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("old answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok((summary.to_string(), messages.len())) },
+            )
+            .await
+            .unwrap();
+        let reference = history.active_compaction_ref().expect("recap reference");
+        assert_eq!(reference, crate::session::compaction_ref(summary));
+
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-acp-p9oyv-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mem = crate::extras::memory::Mem {
+            root: root.clone(),
+            project: "proj".into(),
+            today: "2026-05-25".into(),
+        };
+        crate::extras::memory::flush_compaction_summary(&mem, summary, Some(2));
+        crate::extras::memory::flush_compaction_summary(&mem, "an unrelated summary", None);
+        let block = mem.context_block_excluding(Some(&reference)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!block.contains(summary), "{block}");
+        assert!(block.contains("an unrelated summary"), "{block}");
+
+        // The emergency recap was never written to memory, so nothing is
+        // excluded on its behalf.
+        history.commit_completed_turn(
+            &"v".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("newer answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async move { anyhow::bail!("summarizer unavailable") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.active_compaction_ref(), None);
     }
 }
 
