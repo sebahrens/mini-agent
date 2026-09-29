@@ -141,22 +141,6 @@ fn active_agent_message(
     }
 }
 
-#[cfg(test)]
-mod active_agent_message_tests {
-    use super::active_agent_message;
-
-    #[test]
-    fn persona_confirmation_states_capabilities_are_unchanged() {
-        assert_eq!(
-            active_agent_message("rust-maintainer", "global", Some("standard"), false),
-            "active agent: rust-maintainer (global); persona prompt only; tools and security mode unchanged (mode: standard)"
-        );
-        let applied = active_agent_message("reviewer", "project", Some("plan"), true);
-        assert!(applied.contains("security mode from its prompt (mode: plan)"));
-        assert!(applied.ends_with("tools unchanged"));
-    }
-}
-
 async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let mut sorted: Vec<&String> = ctx.context.prompts.keys().collect();
     sorted.sort();
@@ -337,4 +321,20 @@ async fn handle_regen_themes(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod active_agent_message_tests {
+    use super::active_agent_message;
+
+    #[test]
+    fn persona_confirmation_states_capabilities_are_unchanged() {
+        assert_eq!(
+            active_agent_message("rust-maintainer", "global", Some("standard"), false),
+            "active agent: rust-maintainer (global); persona prompt only; tools and security mode unchanged (mode: standard)"
+        );
+        let applied = active_agent_message("reviewer", "project", Some("plan"), true);
+        assert!(applied.contains("security mode from its prompt (mode: plan)"));
+        assert!(applied.ends_with("tools unchanged"));
+    }
 }

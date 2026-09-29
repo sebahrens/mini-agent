@@ -1929,6 +1929,7 @@ async fn run_prompt(
 ///
 /// Returns the line to report and the goal it describes.
 #[cfg(feature = "goal")]
+#[allow(clippy::too_many_arguments)]
 async fn settle_acp_goal_round(
     store: &crate::extras::goal::GoalStore,
     reason: StopReason,
@@ -4025,8 +4026,7 @@ mod protocol_tests {
                     .send_request(prompt(b.clone(), "other-repo"))
                     .block_task()
                     .await
-                    .err()
-                    .expect("hooks would run against the wrong workspace");
+                    .expect_err("hooks would run against the wrong workspace");
                 assert!(refused.to_string().contains("hooks"), "{refused}");
                 let same_repo = cx
                     .send_request(prompt(a_again, "same-repo"))
