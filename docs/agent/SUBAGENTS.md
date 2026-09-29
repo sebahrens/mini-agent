@@ -514,6 +514,14 @@ Exhausting `task_max_turns` is not a child failure. The child returns all text
 accumulated so far followed by `[partial: turn budget exhausted]`; its queued
 and in-flight siblings continue normally (mini-agent-ddno).
 
+Output accounting charges each response in its returned (quoted and fenced)
+form: a response is cut so that form fits the remaining budget, and the cut is
+marked inside that response. Output exhaustion makes the call partial only when
+it abandons work that has not run; if every task completed, no partial header
+is added. The partial header is reserved when the report is assembled, and a
+final aggregate cut inside a quoted child output still closes its
+`[subagent output ends]` fence.
+
 Partial returns begin with a summary containing the stop reason and aggregate
 started/completed/cost accounting. Cost includes usage already observed from
 started siblings before they were cancelled, so partial work cannot bypass the

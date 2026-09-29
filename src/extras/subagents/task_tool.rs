@@ -912,7 +912,7 @@ impl TaskOutcome {
     fn render(&self) -> String {
         match self {
             Self::Success(response) => format!(
-                "[subagent output begins]\n{}[subagent output ends]\n",
+                "{SUBAGENT_OUTPUT_BEGINS}{}{SUBAGENT_OUTPUT_ENDS}",
                 quote_untrusted_output(response)
             ),
             Self::Failed(error) => format!("[failed: {error}]\n"),
@@ -963,13 +963,13 @@ struct TaskReport {
 
 impl TaskReport {
     fn render(&self) -> String {
-        let mut rendered = String::new();
+        let mut preamble = String::new();
         if let Some(notice) = &self.notice {
-            rendered.push_str(notice);
-            rendered.push('\n');
+            preamble.push_str(notice);
+            preamble.push('\n');
         }
         if let Some(reason) = &self.stop_reason {
-            rendered.push_str(&format!(
+            preamble.push_str(&format!(
                 "[partial: {}; started={}; completed={}; cost_units={}/{}]\n",
                 reason.description(self.limits),
                 self.started,
@@ -978,21 +978,89 @@ impl TaskReport {
                 self.limits.max_cost_units
             ));
         }
+        if preamble.len() >= self.limits.max_output_bytes {
+            return truncate_total_bytes(
+                &preamble,
+                self.limits.max_output_bytes,
+                "\n…[task output truncated at aggregate limit]",
+            );
+        }
 
+        let mut sections = String::new();
         for (index, outcome) in self.outcomes.iter().enumerate() {
-            rendered.push_str(&task_heading(
+            sections.push_str(&task_heading(
                 index,
                 &self.prompts[index],
                 self.outcomes.len(),
             ));
-            rendered.push_str(&outcome.render());
+            sections.push_str(&outcome.render());
         }
 
-        truncate_total_bytes(
-            &rendered,
-            self.limits.max_output_bytes,
-            "\n…[task output truncated at aggregate limit]",
-        )
+        // The header is not known while children run, so it is reserved here:
+        // the sections are cut to what remains after it, and a cut inside a
+        // quoted child output still closes that output's fence.
+        let budget = self.limits.max_output_bytes - preamble.len();
+        preamble.push_str(&truncate_sections(&sections, budget));
+        preamble
+    }
+}
+
+const SUBAGENT_OUTPUT_BEGINS: &str = "[subagent output begins]\n";
+const SUBAGENT_OUTPUT_ENDS: &str = "[subagent output ends]\n";
+
+/// Cut rendered task sections to `budget` bytes. When the cut falls inside a
+/// quoted child output, the closing fence is restored so host text after the
+/// cut can never be read as child output (or vice versa).
+fn truncate_sections(sections: &str, budget: usize) -> String {
+    if sections.len() <= budget {
+        return sections.to_string();
+    }
+    const MARKER: &str = "\n…[task output truncated at aggregate limit]\n";
+    let fenced_marker = format!("{MARKER}{SUBAGENT_OUTPUT_ENDS}");
+    if fenced_marker.len() > budget {
+        return truncate_total_bytes(sections, budget, MARKER.trim_end());
+    }
+    let mut end = budget - fenced_marker.len();
+    while !sections.is_char_boundary(end) {
+        end -= 1;
+    }
+    let kept = &sections[..end];
+    // Fence markers are host lines; child text is always `> `-quoted, so it
+    // cannot contain a line that equals either marker.
+    let inside_fence = kept
+        .rfind(SUBAGENT_OUTPUT_BEGINS)
+        .is_some_and(|begins| !kept[begins..].contains(SUBAGENT_OUTPUT_ENDS));
+    let mut truncated = kept.to_string();
+    if inside_fence {
+        truncated.push_str(&fenced_marker);
+    } else {
+        truncated.push_str(MARKER);
+    }
+    truncated
+}
+
+/// Fit a successful response so its *rendered* (quoted and fenced) form is
+/// at most `budget` bytes. Returns the outcome and whether it was cut.
+fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
+    const MARKER: &str = "\n…[response stopped at aggregate output limit]";
+    let full = TaskOutcome::Success(response);
+    if full.render().len() <= budget {
+        return (full, false);
+    }
+    let TaskOutcome::Success(response) = full else {
+        unreachable!("constructed as a success above");
+    };
+    // Quoting adds `> ` per line plus the fences; shrink the raw budget by
+    // the observed excess until the rendered form fits.
+    let mut raw_budget = budget;
+    loop {
+        let candidate = truncate_total_bytes(&response, raw_budget, MARKER);
+        let outcome = TaskOutcome::Success(candidate);
+        let rendered = outcome.render().len();
+        if rendered <= budget || raw_budget == 0 {
+            return (outcome, true);
+        }
+        raw_budget = raw_budget.saturating_sub((rendered - budget).max(1));
     }
 }
 
@@ -1077,13 +1145,8 @@ async fn execute_tasks(
                         MAX_SUBAGENT_RESPONSE_BYTES
                     ),
                 );
-                let output_exhausted = response.len() > remaining_output;
-                let response = truncate_total_bytes(
-                    &response,
-                    remaining_output,
-                    "\n…[response stopped at aggregate output limit]",
-                );
-                (TaskOutcome::Success(response), false, output_exhausted)
+                let (outcome, output_exhausted) = fit_success(response, remaining_output);
+                (outcome, false, output_exhausted)
             }
             Err(error) => {
                 let output_exhausted = error.len() > remaining_output;
@@ -1105,9 +1168,11 @@ async fn execute_tasks(
             .saturating_add(body_len);
 
         let work_remains = next_index < task_count || !in_flight.is_empty();
+        // A cut response is marked in its own body; the report is partial
+        // only when work that has not finished is being abandoned.
         if child_failed {
             stop_reason = Some(StopReason::ChildFailure(index));
-        } else if output_exhausted || (output_bytes >= limits.max_output_bytes && work_remains) {
+        } else if work_remains && (output_exhausted || output_bytes >= limits.max_output_bytes) {
             stop_reason = Some(StopReason::OutputLimit);
         } else if cost_units > limits.max_cost_units
             || (cost_units == limits.max_cost_units && work_remains)
@@ -2161,6 +2226,76 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn completed_task_whose_quoted_output_is_cut_is_not_partial_and_keeps_its_fence() {
+        let counters = Arc::new(FakeCounters::default());
+        // 300 raw bytes fit a 512-byte limit, but quoting doubles them.
+        let steps = vec![FakeStep {
+            delay: Duration::ZERO,
+            output: Ok("x\n".repeat(150)),
+            cost_units: 1,
+        }];
+        let limits = TaskLimits {
+            max_concurrency: 1,
+            max_output_bytes: 512,
+            ..limits()
+        };
+        let report = execute_tasks(
+            prompts(1),
+            limits,
+            fake_executor(steps, Arc::clone(&counters)),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(
+            report.stop_reason.is_none(),
+            "every task completed: {:?}",
+            report.stop_reason
+        );
+        assert!(
+            rendered.len() <= limits.max_output_bytes,
+            "{}",
+            rendered.len()
+        );
+        assert!(rendered.ends_with("[subagent output ends]\n"), "{rendered}");
+        assert!(rendered.contains("response stopped at aggregate output limit"));
+    }
+
+    #[test]
+    fn partial_header_is_reserved_and_the_fence_survives_the_aggregate_cut() {
+        let limits = TaskLimits {
+            max_output_bytes: 400,
+            ..limits()
+        };
+        let report = TaskReport {
+            prompts: vec!["prompt 0".into(), "prompt 1".into()],
+            outcomes: vec![
+                TaskOutcome::Success("y\n".repeat(200)),
+                TaskOutcome::NotStarted("aggregate output limit".into()),
+            ],
+            started: 1,
+            completed: 1,
+            cost_units: 1,
+            stop_reason: Some(StopReason::OutputLimit),
+            limits,
+            notice: None,
+        };
+        let rendered = report.render();
+        assert!(
+            rendered.len() <= limits.max_output_bytes,
+            "{}",
+            rendered.len()
+        );
+        assert!(rendered.starts_with("[partial: aggregate output limit"));
+        assert_eq!(
+            rendered.matches("[subagent output begins]").count(),
+            rendered.matches("[subagent output ends]").count(),
+            "{rendered}"
+        );
+        assert!(rendered.contains("task output truncated at aggregate limit"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn quoted_output_exhaustion_prevents_queued_children_from_starting() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![
@@ -2232,7 +2367,14 @@ mod tests {
             .await;
             assert_eq!(report.started, expected_started, "limit={max_output_bytes}");
             assert_eq!(counters.started.load(Ordering::SeqCst), expected_started);
-            assert!(matches!(report.stop_reason, Some(StopReason::OutputLimit)));
+            if expected_started < 2 {
+                assert!(matches!(report.stop_reason, Some(StopReason::OutputLimit)));
+            } else {
+                // Every task ran to completion; a cut final body is marked in
+                // place and does not make the report partial.
+                assert_eq!(report.completed, 2);
+                assert!(report.stop_reason.is_none(), "limit={max_output_bytes}");
+            }
             assert!(report.render().len() <= max_output_bytes);
         }
     }
