@@ -30,6 +30,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   Decision: Linux keeps starting in this degraded state rather than failing closed like Windows,
   because stock Ubuntu 24.04 blocks `bwrap` by default; use `--sandbox` to fail closed or
   `--no-sandbox` to opt out deliberately (mini-agent-cfib7).
+- Releases are gated on CI: a new `ci-success` check aggregates every CI job, and the release
+  workflow builds and publishes nothing until the tagged commit is on `main` and its tag CI run
+  reports `ci-success`; publication runs in the `release` environment, and `just release` /
+  `just add-tag` run `cargo test --locked` before tagging.
 
 ### Added
 

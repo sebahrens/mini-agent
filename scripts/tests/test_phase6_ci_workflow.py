@@ -678,6 +678,132 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("if-no-files-found: error", body)
 
 
+class CiSuccessAggregateTests(unittest.TestCase):
+    """`ci-success` is the one required check; it must cover every CI job."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.jobs = re.findall(
+            r"(?m)^  ([a-zA-Z0-9_-]+):$", cls.workflow.split("jobs:\n", 1)[1]
+        )
+        cls.body = job_body(cls.workflow, "ci-success")
+
+    def needs(self) -> list[str]:
+        block = self.body.split("    needs:\n", 1)[1].split("    runs-on:", 1)[0]
+        return re.findall(r"(?m)^      - ([a-zA-Z0-9_-]+)$", block)
+
+    def test_ci_success_needs_every_other_job(self) -> None:
+        self.assertIn("ci-success", self.jobs)
+        needs = self.needs()
+        self.assertEqual(len(needs), len(set(needs)))
+        self.assertEqual(set(self.jobs) - {"ci-success"}, set(needs))
+
+    def test_ci_success_always_runs_on_push_and_pull_request(self) -> None:
+        condition = self.body.splitlines()[0].strip()
+        self.assertTrue(condition.startswith("if: always() && "), condition)
+        self.assertNotIn("needs.changes.outputs.code", condition)
+        self.assertNotIn("github.event_name == ", condition)
+        self.assertNotIn("'push'", condition)
+        self.assertNotIn("'pull_request'", condition)
+
+    def test_ci_success_delegates_to_the_tested_result_policy(self) -> None:
+        self.assertIn("CI_NEEDS_JSON: ${{ toJSON(needs) }}", self.body)
+        self.assertIn('python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME"', self.body)
+        self.assertNotIn("continue-on-error", self.body)
+
+
+class CiSuccessPolicyTests(unittest.TestCase):
+    def needs(self, code: str, **results: str) -> dict[str, object]:
+        jobs = {
+            "changes": {"result": "success", "outputs": {"code": code}},
+            "fmt": {"result": "success", "outputs": {}},
+        }
+        default = "success" if code == "true" else "skipped"
+        for job in ("test", "clippy", "windows-msi", "harness-regression"):
+            jobs[job] = {"result": default, "outputs": {}}
+        if code == "true":
+            jobs["harness-regression"]["result"] = "skipped"
+        for job, result in results.items():
+            jobs.setdefault(job.replace("_", "-"), {"outputs": {}})["result"] = result
+        return jobs
+
+    def evaluate(self, needs: dict[str, object], event: str = "push") -> list[str]:
+        from scripts import ci_success
+
+        return ci_success.evaluate(needs, event)
+
+    def test_full_matrix_success_passes(self) -> None:
+        self.assertEqual([], self.evaluate(self.needs("true")))
+        self.assertEqual(
+            [],
+            self.evaluate(self.needs("true", harness_regression="success"), "pull_request"),
+        )
+
+    def test_documentation_only_change_accepts_skipped_matrix(self) -> None:
+        self.assertEqual([], self.evaluate(self.needs("false")))
+        self.assertEqual([], self.evaluate(self.needs("false"), "pull_request"))
+
+    def test_skipped_job_with_code_changes_fails(self) -> None:
+        errors = self.evaluate(self.needs("true", test="skipped"))
+        self.assertEqual(["test finished with 'skipped'"], errors)
+
+    def test_pull_request_only_job_must_run_on_pull_requests(self) -> None:
+        errors = self.evaluate(self.needs("true"), "pull_request")
+        self.assertEqual(["harness-regression finished with 'skipped'"], errors)
+
+    def test_failed_or_cancelled_jobs_fail_even_for_documentation(self) -> None:
+        for result in ("failure", "cancelled"):
+            for code in ("true", "false"):
+                with self.subTest(result=result, code=code):
+                    errors = self.evaluate(self.needs(code, windows_msi=result))
+                    self.assertEqual([f"windows-msi finished with {result!r}"], errors)
+
+    def test_change_detector_and_fmt_must_succeed(self) -> None:
+        errors = self.evaluate(self.needs("false", fmt="skipped"))
+        self.assertIn("fmt finished with 'skipped'", errors)
+
+        needs = self.needs("false")
+        needs["changes"] = {"result": "failure", "outputs": {}}
+        errors = self.evaluate(needs)
+        self.assertIn("changes finished with 'failure'", errors)
+        # Without a trusted docs-only verdict every skipped job is a failure.
+        self.assertIn("test finished with 'skipped'", errors)
+
+    def test_invalid_change_detector_output_fails_closed(self) -> None:
+        needs = self.needs("true")
+        needs["changes"]["outputs"]["code"] = ""
+        errors = self.evaluate(needs)
+        self.assertTrue(any("invalid code output" in error for error in errors))
+
+    def test_missing_required_dependencies_are_rejected(self) -> None:
+        self.assertEqual(["ci-success received no job results"], self.evaluate({}))
+        needs = self.needs("true")
+        del needs["fmt"]
+        self.assertIn("ci-success must depend on fmt", self.evaluate(needs))
+
+    def test_command_line_reads_needs_from_the_environment(self) -> None:
+        script = REPOSITORY_ROOT / "scripts" / "ci_success.py"
+        for needs, expected in ((self.needs("true"), 0), (self.needs("true", test="failure"), 1)):
+            with self.subTest(expected=expected):
+                result = subprocess.run(
+                    [sys.executable, str(script), "--event", "push"],
+                    env={**os.environ, "CI_NEEDS_JSON": json.dumps(needs)},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(expected, result.returncode, result.stderr)
+        result = subprocess.run(
+            [sys.executable, str(script), "--event", "push"],
+            env={key: value for key, value in os.environ.items() if key != "CI_NEEDS_JSON"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(2, result.returncode)
+
+
 class BubblewrapInstallerTests(unittest.TestCase):
     def test_isolated_sources_and_failures_preserve_the_install_gate(self) -> None:
         for failure in ["none", "update", "install", "probe", "missing"]:

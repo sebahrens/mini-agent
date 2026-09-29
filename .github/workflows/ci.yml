@@ -161,7 +161,8 @@ jobs:
             scripts.tests.test_check_package_metadata \
             scripts.tests.test_extract_changelog \
             scripts.tests.test_release_artifacts \
-            scripts.tests.test_smoke_package_compliance
+            scripts.tests.test_smoke_package_compliance \
+            scripts.tests.test_verify_release_ci
 
       - name: Test Windows MSI policy
         run: |
@@ -2309,3 +2310,49 @@ jobs:
 
       - name: Reject lockfile changes made by policy tooling
         run: git diff --exit-code -- Cargo.lock
+
+  # The one required status check. Branch protection on main and the release
+  # workflow's verify-ci job both key on this job name, so it needs every other
+  # job in this workflow and runs even when one of them failed. It passes only
+  # when each dependency succeeded or was skipped by design (a
+  # documentation-only change, or a pull-request-only job on another event);
+  # scripts/ci_success.py owns that decision and its tests. Adding a job to this
+  # workflow without adding it here fails scripts.tests.test_phase6_ci_workflow.
+  ci-success:
+    if: always() && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs:
+      - changes
+      - fmt
+      - harness-regression
+      - package-compliance-smoke
+      - vscode
+      - clippy
+      - test
+      - all-features
+      - parallel-test-smoke
+      - windows-default-compile
+      - windows-hooks-compile
+      - linux-sandbox-policy
+      - macos-worker-containment-gate
+      - windows-worker-launcher-unit
+      - macos-gym-ownership
+      - windows-general-sandbox-policy
+      - windows-worker-containment-gate
+      - phase6-cross-platform-gate
+      - platform-paths
+      - platform-path-negative-controls
+      - platform-path-install-smoke
+      - mcp-stdio
+      - lsp-lifecycle
+      - install
+      - windows-msi
+      - package
+      - dependency-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require every gating job to succeed or be skipped by design
+        env:
+          CI_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME"

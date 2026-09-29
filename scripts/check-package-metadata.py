@@ -533,7 +533,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             f"CHANGELOG section; missing={missing_release_notes}"
         )
     publication_fragments = (
-        "needs: [package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]",
+        "needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]",
         "python3 scripts/release_artifacts.py validate-set \\",
         "python3 scripts/release_artifacts.py verify \\",
         "--manifest private-publish/checksums/SHA256SUMS",
@@ -593,7 +593,119 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 f"noncanonical binary path {fragment!r}"
             )
     errors.extend(validate_release_archive_gates(text))
+    errors.extend(validate_release_ci_gate(text))
     errors.extend(validate_release_action_pins(text))
+    return errors
+
+
+RELEASE_CI_GATE_JOB = "verify-ci"
+RELEASE_CI_GATE_FRAGMENTS = (
+    "python3 scripts/verify_release_ci.py",
+    "GH_TOKEN: ${{ github.token }}",
+    "fetch-depth: 0",
+    "+refs/heads/main:refs/remotes/origin/main",
+    'merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+)
+RELEASE_CI_GATE_PERMISSIONS = {"actions": "read", "checks": "read", "contents": "read"}
+RELEASE_PUBLISH_ENVIRONMENT = "release"
+
+
+def _job_needs(job: Any) -> list[str]:
+    needs = job.get("needs", []) if isinstance(job, dict) else []
+    if isinstance(needs, str):
+        return [needs]
+    if isinstance(needs, list):
+        return [need for need in needs if isinstance(need, str)]
+    return []
+
+
+def validate_release_ci_gate(text: str) -> list[str]:
+    """Require CI verification before every release job and a gated publisher.
+
+    `verify-ci` must be the first, dependency-free job; it proves the tagged
+    commit is on main and that the tag's own CI run reported a successful
+    `ci-success`. Every other job must depend on it, directly or transitively,
+    and none may bypass a failed gate with `always()`. The publishing job must
+    need it directly and run in the protected `release` environment.
+    """
+
+    try:
+        document = parse_yaml_document(text)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return [f"release workflow cannot be validated: {error}"]
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return [".github/workflows/release.yml must define jobs"]
+
+    gate = jobs.get(RELEASE_CI_GATE_JOB)
+    if not isinstance(gate, dict):
+        return [
+            ".github/workflows/release.yml must start with a verify-ci job that "
+            "requires a successful ci-success check for the tagged commit"
+        ]
+    errors: list[str] = []
+    if next(iter(jobs)) != RELEASE_CI_GATE_JOB:
+        errors.append(".github/workflows/release.yml verify-ci must be the first job")
+    if _job_needs(gate) or "if" in gate:
+        errors.append(
+            ".github/workflows/release.yml verify-ci must run unconditionally "
+            "with no dependencies"
+        )
+    if gate.get("permissions") != RELEASE_CI_GATE_PERMISSIONS:
+        errors.append(
+            ".github/workflows/release.yml verify-ci permissions must be exactly "
+            f"{RELEASE_CI_GATE_PERMISSIONS}"
+        )
+    if type(gate.get("timeout-minutes")) is not int:
+        errors.append(".github/workflows/release.yml verify-ci must bound its wait")
+    gate_text = _workflow_job(text, RELEASE_CI_GATE_JOB)
+    missing = [
+        fragment for fragment in RELEASE_CI_GATE_FRAGMENTS if fragment not in gate_text
+    ]
+    if missing:
+        errors.append(
+            ".github/workflows/release.yml verify-ci must check CI and main "
+            f"ancestry; missing={missing}"
+        )
+
+    def reaches_gate(name: str, seen: frozenset[str]) -> bool:
+        if name in seen:
+            return False
+        needs = _job_needs(jobs.get(name))
+        return RELEASE_CI_GATE_JOB in needs or any(
+            reaches_gate(need, seen | {name}) for need in needs
+        )
+
+    for name, job in jobs.items():
+        if name == RELEASE_CI_GATE_JOB:
+            continue
+        if not reaches_gate(name, frozenset()):
+            errors.append(
+                f".github/workflows/release.yml job {name} must depend on verify-ci"
+            )
+        condition = job.get("if") if isinstance(job, dict) else None
+        if condition is not None and re.search(r"\b(always|failure|cancelled)\(", str(condition)):
+            errors.append(
+                f".github/workflows/release.yml job {name} must not run after a "
+                "failed verify-ci"
+            )
+
+    publish = jobs.get("publish-release")
+    if not isinstance(publish, dict):
+        errors.append(".github/workflows/release.yml must define publish-release")
+        return errors
+    if RELEASE_CI_GATE_JOB not in _job_needs(publish):
+        errors.append(
+            ".github/workflows/release.yml publish-release must directly need verify-ci"
+        )
+    environment = publish.get("environment")
+    if isinstance(environment, dict):
+        environment = environment.get("name")
+    if environment != RELEASE_PUBLISH_ENVIRONMENT:
+        errors.append(
+            ".github/workflows/release.yml publish-release must run in the "
+            f"{RELEASE_PUBLISH_ENVIRONMENT!r} environment"
+        )
     return errors
 
 
@@ -974,6 +1086,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             '--release-tag "v${VERSION}"',
             '--release-tag "v${NEW_VERSION}"',
             "--require-clean",
+            "cargo test --locked",
             "cargo metadata --format-version 1 --no-deps >/dev/null",
             "cargo install --path . --debug",
         ),

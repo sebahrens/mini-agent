@@ -18,7 +18,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Nothing is built or published unless CI passed for the exact tagged commit
+  # and that commit is already on main. The tag push starts CI and this
+  # workflow in parallel, so this job waits (bounded) for the tag's own CI run
+  # to report the `ci-success` aggregate; every later job needs it.
+  verify-ci:
+    name: Verify CI passed for the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "ERROR: tag $GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+
+      - name: Wait for a successful ci-success check on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify_release_ci.py --timeout-seconds 9000 --interval-seconds 30
+
   package-metadata:
+    needs: verify-ci
     runs-on: ubuntu-latest
     outputs:
       # The single source of the VSIX and SBOM version for every later job.
@@ -57,7 +88,7 @@ jobs:
 
   build:
     name: ${{ matrix.target }}
-    needs: package-metadata
+    needs: [verify-ci, package-metadata]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -123,7 +154,7 @@ jobs:
 
   build-static:
     name: ${{ matrix.target }}-static
-    needs: package-metadata
+    needs: [verify-ci, package-metadata]
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +237,7 @@ jobs:
 
   build-windows:
     name: ${{ matrix.target }}
-    needs: package-metadata
+    needs: [verify-ci, package-metadata]
     runs-on: windows-latest
     defaults:
       run:
@@ -268,7 +299,7 @@ jobs:
 
   corresponding-source:
     name: Corresponding Source
-    needs: package-metadata
+    needs: [verify-ci, package-metadata]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -643,7 +674,10 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: [package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
+    needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
+    # Deployment protection rules on this environment (required reviewers,
+    # tag-only deployment) are the last human gate before publication.
+    environment: release
     runs-on: ubuntu-latest
     permissions:
       artifact-metadata: write

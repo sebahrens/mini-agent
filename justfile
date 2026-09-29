@@ -52,6 +52,9 @@ add-tag:
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+    # Never tag an untested tree. The release workflow independently waits for
+    # CI's ci-success check on the tagged commit before it builds anything.
+    cargo test --locked
     python3 scripts/check-package-metadata.py \
         --require-clean \
         --ref-type tag \
@@ -150,6 +153,8 @@ release BUMP:
     python3 scripts/check-package-metadata.py \
         --ref-type tag \
         --release-tag "v${NEW_VERSION}"
+    # Test the exact tree that is about to be committed and tagged.
+    cargo test --locked
 
     git commit -am "bump to v${NEW_VERSION}"
     python3 scripts/check-package-metadata.py \
