@@ -799,6 +799,22 @@ fn advisor_context_limit_entry(kilobytes: u32) -> (&'static str, String) {
     )
 }
 
+/// Repeat the warnings startup printed while loading the config (unknown
+/// keys, clamped values, ...) so `--print-config` shows everything that was
+/// not applied as written.
+fn append_config_warnings(report: &mut String, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    report.push_str("Warnings:\n");
+    for warning in warnings {
+        report.push_str("  ");
+        report.push_str(warning);
+        report.push('\n');
+    }
+    report.push('\n');
+}
+
 fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) {
     writeln!(output, "{}:", title).expect("writing configuration output to a String cannot fail");
     let width = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -1082,6 +1098,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         );
     }
 
+    append_config_warnings(&mut output, &cfg.load_warnings);
+
     write_output(io::stdout().lock(), &output)
 }
 
@@ -1094,10 +1112,21 @@ mod tests {
     use rig::message::AssistantContent;
 
     use super::{
-        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        emit_headless, installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
-        render_headless_json, write_output,
+        CHAT_HISTORY_FILE_LABEL, append_config_warnings, chat_history_limit_entry,
+        chat_history_path_policy_entry, emit_headless, installed_build_entry,
+        javascript_worker_compiled_entry, parse_git_status, render_headless_json, write_output,
     };
+
+    #[test]
+    fn print_config_repeats_load_warnings_and_omits_an_empty_section() {
+        let mut report = String::new();
+        append_config_warnings(&mut report, &[]);
+        assert!(report.is_empty());
+
+        let warning = "global config c.toml: unknown config key `sandbx` is ignored (did you mean `sandbox`?)";
+        append_config_warnings(&mut report, &[warning.to_string()]);
+        assert_eq!(report, format!("Warnings:\n  {warning}\n\n"));
+    }
 
     /// Every way a goal can stop has its own exit code, so an unattended
     /// caller can tell "resume me" from "stop retrying" without parsing prose.

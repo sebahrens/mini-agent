@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use std::io::{self, Read};
 
+use crate::config::keys;
 use crate::config::{
     Config, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine, StatusLineSegment,
 };
@@ -282,13 +283,25 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => toml::from_str(content)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "config is not valid TOML")),
-        _ => serde_yaml_ng::from_str(content).map_err(|_| {
+        Some("toml") => toml::from_str(content).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "config is not valid YAML or JSON",
+                format!(
+                    "config is not valid TOML ({})",
+                    keys::describe_toml_error(content, &error)
+                ),
             )
+        }),
+        _ => serde_yaml_ng::from_str(content).map_err(|error| {
+            let message = match error.location() {
+                Some(location) => format!(
+                    "config is not valid YAML or JSON (line {}, column {})",
+                    location.line(),
+                    location.column()
+                ),
+                None => "config is not valid YAML or JSON".to_string(),
+            };
+            io::Error::new(io::ErrorKind::InvalidData, message)
         }),
     }
 }
@@ -720,9 +733,26 @@ fn load_from_path(
         cfg.custom_providers.as_ref().map(|m| m.len()).unwrap_or(0),
     );
 
+    let mut warnings = Vec::new();
+    emit_config_warnings(
+        &mut warnings,
+        keys::unknown_key_warnings(
+            &format!("global config {}", path.display()),
+            cfg.preserved.keys(),
+        ),
+    );
     let clamped = cfg.retry.clamp_to_limits();
-    warn_clamped_retry(&cfg, clamped, "global config", &path);
+    emit_config_warnings(
+        &mut warnings,
+        clamped_retry_warnings(&cfg, clamped, "global config", &path),
+    );
     if let Some(local_config_path) = local_config_path {
+        if local_config_path.exists() {
+            emit_config_warnings(
+                &mut warnings,
+                project_config_unknown_key_warnings(local_config_path),
+            );
+        }
         let user_retry = cfg.retry.clone();
         apply_local_override(
             &mut cfg,
@@ -733,11 +763,14 @@ fn load_from_path(
         );
         // A repository may only tighten the user's retry policy.
         let clamped = cfg.retry.cap_at(&user_retry);
-        warn_clamped_retry(
-            &cfg,
-            clamped,
-            "project config (may only tighten the global retry policy)",
-            local_config_path,
+        emit_config_warnings(
+            &mut warnings,
+            clamped_retry_warnings(
+                &cfg,
+                clamped,
+                "project config (may only tighten the global retry policy)",
+                local_config_path,
+            ),
         );
     }
 
@@ -745,12 +778,7 @@ fn load_from_path(
     inject_mcp_defaults(&mut cfg);
 
     match validate_extra_body(&mut cfg) {
-        Ok(warnings) => {
-            for warning in warnings {
-                tracing::warn!("config: {warning}");
-                eprintln!("warning: {warning}");
-            }
-        }
+        Ok(body_warnings) => emit_config_warnings(&mut warnings, body_warnings),
         Err(error) => fatal_config_load(format!(
             "error: {} configures an unusable OpenAI Responses request body: {}\n\
              Fix the value or remove it.",
@@ -759,25 +787,43 @@ fn load_from_path(
         )),
     }
 
+    cfg.load_warnings = warnings;
+
     (cfg, is_first_startup)
 }
 
-/// Report each `[retry]` field that load-time bounding changed, naming the
-/// file it came from and the value now in effect.
-fn warn_clamped_retry(cfg: &Config, fields: Vec<&'static str>, source: &str, path: &Path) {
-    for field in fields {
-        let value = match field {
-            "max_attempts" => cfg.retry.max_attempts as u64,
-            "initial_backoff_ms" => cfg.retry.initial_backoff_ms,
-            _ => cfg.retry.max_backoff_ms,
-        };
-        let warning = format!(
-            "{source} {}: retry.{field} is outside the allowed range and was clamped to {value}",
-            path.display()
-        );
+/// Print each new load warning to stderr and the log, and keep it for
+/// `--print-config`.
+fn emit_config_warnings(warnings: &mut Vec<String>, new: Vec<String>) {
+    for warning in new {
         tracing::warn!("config: {warning}");
         eprintln!("warning: {warning}");
+        warnings.push(warning);
     }
+}
+
+/// Describe each `[retry]` field that load-time bounding changed, naming the
+/// file it came from and the value now in effect.
+fn clamped_retry_warnings(
+    cfg: &Config,
+    fields: Vec<&'static str>,
+    source: &str,
+    path: &Path,
+) -> Vec<String> {
+    fields
+        .into_iter()
+        .map(|field| {
+            let value = match field {
+                "max_attempts" => cfg.retry.max_attempts as u64,
+                "initial_backoff_ms" => cfg.retry.initial_backoff_ms,
+                _ => cfg.retry.max_backoff_ms,
+            };
+            format!(
+                "{source} {}: retry.{field} is outside the allowed range and was clamped to {value}",
+                path.display()
+            )
+        })
+        .collect()
 }
 
 fn confirm_project_config_trust(description: &str) -> bool {
@@ -878,8 +924,7 @@ fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
 fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
-    let local: toml::Value =
-        toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
+    let local = parse_project_toml(local_toml)?;
     let table = local
         .as_table()
         .ok_or_else(|| "project config must contain a TOML table".to_string())?;
@@ -1135,9 +1180,42 @@ fn apply_local_override(
 /// key, scalars and arrays replace, and absent keys keep the base value.
 #[cfg(test)]
 pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, String> {
-    let local: toml::Value =
-        toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
-    merge_config_value(base, local)
+    merge_config_value(base, parse_project_toml(local_toml)?)
+}
+
+/// Parse a project-local TOML config with its top-level keys rewritten to
+/// their canonical spellings, so trust classification and merging see
+/// `permission_deny` exactly as they see `permission-deny`.
+fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
+    let mut local: toml::Value = toml::from_str(local_toml).map_err(|error| {
+        format!(
+            "project config is not valid TOML ({})",
+            keys::describe_toml_error(local_toml, &error)
+        )
+    })?;
+    if let Some(table) = local.as_table_mut() {
+        keys::canonicalize_top_level_keys(table)?;
+    }
+    Ok(local)
+}
+
+/// Unknown-key warnings for the project-local config at `path`. Unreadable or
+/// invalid files yield none: loading them reports its own error.
+fn project_config_unknown_key_warnings(path: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(local) = parse_project_toml(&content) else {
+        return Vec::new();
+    };
+    let source = format!("project config {}", path.display());
+    match local.clone().try_into::<Config>() {
+        Ok(cfg) => keys::unknown_key_warnings(&source, cfg.preserved.keys()),
+        Err(_) => local
+            .as_table()
+            .map(|table| keys::unknown_key_warnings(&source, table.keys().map(String::as_str)))
+            .unwrap_or_default(),
+    }
 }
 
 /// Deep-merge `over` into `base`: objects merge recursively per key, any
@@ -1436,7 +1514,14 @@ fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> 
         // Reject a concurrently corrupted config rather than publishing a
         // syntactically valid delta over values the application cannot load.
         parse_config_content(path, &content)?;
-        toml::from_str(&content).map_err(io::Error::other)?
+        let mut global: toml::Value = toml::from_str(&content).map_err(io::Error::other)?;
+        // Rewrite alias spellings (`permission_deny`) to the canonical key the
+        // delta below is expressed in, so a change never leaves both.
+        if let Some(table) = global.as_table_mut() {
+            keys::canonicalize_top_level_keys(table)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
+        global
     } else {
         toml::Value::Table(toml::map::Map::new())
     };
@@ -2242,5 +2327,240 @@ mod preservation_check_tests {
 
         std::fs::remove_file(stale_path).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod config_key_tests {
+    use super::{
+        load_from_path, merge_config_override, parse_config_content, save_config_changes_at,
+        split_project_override,
+    };
+    use crate::config::Config;
+    use std::path::Path;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "mini-agent-config-keys-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn parse_toml(content: &str) -> Config {
+        parse_config_content(Path::new("config.toml"), content).unwrap()
+    }
+
+    /// Map equality is order-insensitive, unlike serialized text of the
+    /// `HashMap`-backed permission tables.
+    fn normalized(cfg: &Config) -> serde_json::Value {
+        serde_json::to_value(cfg).unwrap()
+    }
+
+    /// The snake_case spelling of each kebab-case key (and the kebab spelling
+    /// of the snake-case permission keys next to them) configures exactly
+    /// what the canonical spelling does, in TOML and YAML alike.
+    #[test]
+    fn snake_and_kebab_spellings_deserialize_identically() {
+        let mut pairs = vec![
+            (
+                "sandbox-backend = \"seatbelt\"",
+                "sandbox_backend = \"seatbelt\"",
+            ),
+            (
+                "permission-deny = { bash = [\"rm **\"], write = [\"/etc/**\"] }",
+                "permission_deny = { bash = [\"rm **\"], write = [\"/etc/**\"] }",
+            ),
+            (
+                "permission-modes = [\"guarded\"]",
+                "permission_modes = [\"guarded\"]",
+            ),
+            (
+                "permission-allow = { read = [\"src/**\"] }",
+                "permission_allow = { read = [\"src/**\"] }",
+            ),
+            (
+                "default_permission_mode = \"readonly\"",
+                "default-permission-mode = \"readonly\"",
+            ),
+            ("allow_all_mcp_calls = false", "allow-all-mcp-calls = false"),
+        ];
+        let js_pair = (
+            "js-fetch-origins = [\"https://docs.rs\"]",
+            "js_fetch_origins = [\"https://docs.rs\"]",
+        );
+        if cfg!(feature = "js") {
+            pairs.push(js_pair);
+        }
+        for (canonical, alias) in pairs {
+            let expected = parse_toml(canonical);
+            let actual = parse_toml(alias);
+            assert!(
+                actual.preserved.keys().next().is_none(),
+                "`{alias}` must be owned, not preserved"
+            );
+            assert_eq!(normalized(&actual), normalized(&expected), "{alias}");
+        }
+
+        let restricted = parse_toml("sandbox_backend = \"seatbelt\"\npermission_modes = []");
+        assert_eq!(restricted.sandbox_backend.as_deref(), Some("seatbelt"));
+        assert_eq!(restricted.permission_modes, Some(Vec::new()));
+        #[cfg(feature = "js")]
+        assert_eq!(
+            parse_toml(js_pair.1).js_fetch_origins,
+            Some(vec!["https://docs.rs".to_string()])
+        );
+        // A build without `js` keeps either spelling without owning it and
+        // without calling it unknown.
+        #[cfg(not(feature = "js"))]
+        for spelling in [js_pair.0, js_pair.1] {
+            let cfg = parse_toml(spelling);
+            let keys: Vec<&str> = cfg.preserved.keys().collect();
+            assert!(
+                crate::config::keys::unknown_key_warnings("test", keys).is_empty(),
+                "{spelling}"
+            );
+        }
+
+        let yaml = parse_config_content(
+            Path::new("config.yaml"),
+            "permission_deny:\n  bash: [\"rm **\"]\nsandbox_backend: seatbelt\n",
+        )
+        .unwrap();
+        assert_eq!(
+            normalized(&yaml),
+            normalized(&parse_toml(
+                "permission-deny = { bash = [\"rm **\"] }\nsandbox-backend = \"seatbelt\""
+            ))
+        );
+    }
+
+    #[test]
+    fn both_spellings_of_one_key_are_rejected_not_silently_merged() {
+        let error = parse_config_content(
+            Path::new("config.toml"),
+            "permission-deny = { bash = [\"rm **\"] }\npermission_deny = {}\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("line"), "{error}");
+        assert!(
+            merge_config_override(
+                &Config::default(),
+                "sandbox-backend = \"bwrap\"\nsandbox_backend = \"seatbelt\""
+            )
+            .is_err()
+        );
+    }
+
+    /// Unknown keys warn with the nearest known key; a key owned only by
+    /// builds with other Cargo features (here `mcp_servers`, `acp_host` and
+    /// the JS keys) never warns, whichever feature row runs this test.
+    #[test]
+    fn load_warns_about_unknown_keys_only() {
+        let root = scratch("unknown");
+        let global = root.join("global/config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "model = \"m\"\n\
+             sandbx = true\n\
+             acp_host = \"127.0.0.1\"\n\
+             js_fetch_origins = [\"https://docs.rs\"]\n\
+             enable-exa-mcp = false\n\
+             [mcp_servers.audit]\n\
+             command = \"printf\"\n",
+        )
+        .unwrap();
+        let project = root.join("project/.zerostack/config.toml");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            "chat_left_margin = 2\npermision_deny = { bash = [\"rm **\"] }\n",
+        )
+        .unwrap();
+        let trust = root.join("state/trust.json");
+
+        let (cfg, _) = load_from_path(global.clone(), Some(&project), &trust, false);
+
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        let global_warning = &cfg.load_warnings[0];
+        assert!(global_warning.contains("`sandbx`"), "{global_warning}");
+        assert!(global_warning.contains("`sandbox`"), "{global_warning}");
+        assert!(global_warning.contains(&global.display().to_string()));
+        let project_warning = &cfg.load_warnings[1];
+        assert!(
+            project_warning.contains("`permision_deny`"),
+            "{project_warning}"
+        );
+        assert!(
+            project_warning.contains("`permission-deny`"),
+            "{project_warning}"
+        );
+        for warning in &cfg.load_warnings {
+            for other_build_key in ["mcp_servers", "acp_host", "js_fetch_origins", "enable-exa"] {
+                assert!(!warning.contains(other_build_key), "{warning}");
+            }
+        }
+        assert_eq!(cfg.chat_left_margin, Some(2));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toml_parse_errors_name_line_and_column_without_echoing_values() {
+        let error =
+            parse_config_content(Path::new("config.toml"), "model = \"m\"\nmax_tokens = \n")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("line 2, column"), "{error}");
+
+        let error = parse_config_content(
+            Path::new("config.toml"),
+            "model = \"m\"\n\nmax_tokens = \"sk-secret-value\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line 3, column 14"), "{error}");
+        assert!(!error.contains("sk-secret-value"), "{error}");
+
+        let error = split_project_override("a = 1\nb = [\n").unwrap_err();
+        assert!(error.contains("line 2"), "{error}");
+    }
+
+    /// Project-local configs are classified and merged by canonical key, so a
+    /// snake spelling is exactly as sensitive as the kebab one and merges
+    /// into the base value instead of colliding with it.
+    #[test]
+    fn project_aliases_are_classified_and_merged_canonically() {
+        let (_, _, sensitive) =
+            split_project_override("permission_deny = { bash = [\"rm **\"] }\n").unwrap();
+        assert!(sensitive.contains("permission-deny"), "{sensitive:?}");
+
+        let base = parse_toml("permission-deny = { write = [\"/etc/**\"] }");
+        let merged =
+            merge_config_override(&base, "permission_deny = { bash = [\"rm **\"] }").unwrap();
+        let deny = merged.permission_deny.unwrap();
+        assert_eq!(deny["bash"], vec!["rm **".to_string()]);
+        assert_eq!(deny["write"], vec!["/etc/**".to_string()]);
+    }
+
+    #[test]
+    fn saving_rewrites_alias_spellings_to_the_canonical_key() {
+        let root = scratch("save");
+        let path = root.join("config.toml");
+        std::fs::write(&path, "sandbox_backend = \"bwrap\"\nmax_tokens = 1\n").unwrap();
+        let before = parse_toml(&std::fs::read_to_string(&path).unwrap());
+        let after = Config {
+            sandbox_backend: Some("seatbelt".to_string()),
+            ..before.clone()
+        };
+
+        save_config_changes_at(&path, &before, &after).unwrap();
+
+        let raw: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["sandbox-backend"].as_str(), Some("seatbelt"));
+        assert!(raw.get("sandbox_backend").is_none());
+        assert_eq!(raw["max_tokens"].as_integer(), Some(1));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,3 +1,4 @@
+pub(crate) mod keys;
 pub mod load;
 pub mod types;
 
@@ -27,6 +28,13 @@ use crate::extras::acp::config::AcpServerConfig;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PreservedConfig(BTreeMap<String, toml::Value>);
+
+impl PreservedConfig {
+    /// The top-level keys this build did not own when the config was read.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+}
 
 /// Default `max_bash_output_lines` when the config does not set one. Output
 /// beyond this many lines keeps its head and tail with an omitted-count marker.
@@ -167,10 +175,15 @@ pub struct Config {
     pub always_show_welcome: Option<bool>,
     #[serde(
         skip_serializing_if = "Option::is_none",
-        rename = "auto-update-prompts"
+        rename = "auto-update-prompts",
+        alias = "auto_update_prompts"
     )]
     pub auto_update_prompts: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "auto-update-themes")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "auto-update-themes",
+        alias = "auto_update_themes"
+    )]
     pub auto_update_themes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
@@ -185,13 +198,29 @@ pub struct Config {
     pub enable_skill_proposals: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-regex")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-regex",
+        alias = "permission_regex"
+    )]
     pub permission_regex: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-allow")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-allow",
+        alias = "permission_allow"
+    )]
     pub permission_allow: Option<HashMap<String, Vec<String>>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-ask")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-ask",
+        alias = "permission_ask"
+    )]
     pub permission_ask: Option<HashMap<String, Vec<String>>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-deny")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-deny",
+        alias = "permission_deny"
+    )]
     pub permission_deny: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restrictive: Option<bool>,
@@ -201,71 +230,112 @@ pub struct Config {
     pub yolo: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "sandbox-backend")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-backend",
+        alias = "sandbox_backend"
+    )]
     pub sandbox_backend: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        rename = "windows-appcontainer-read-roots"
+        rename = "windows-appcontainer-read-roots",
+        alias = "windows_appcontainer_read_roots"
     )]
     pub windows_appcontainer_read_roots: Vec<std::path::PathBuf>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        rename = "windows-appcontainer-write-roots"
+        rename = "windows-appcontainer-write-roots",
+        alias = "windows_appcontainer_write_roots"
     )]
     pub windows_appcontainer_write_roots: Vec<std::path::PathBuf>,
     #[cfg(feature = "js")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "js-file-base-dir")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-file-base-dir",
+        alias = "js_file_base_dir"
+    )]
     pub js_file_base_dir: Option<String>,
     #[cfg(feature = "js")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "js-read-roots")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-read-roots",
+        alias = "js_read_roots"
+    )]
     pub js_read_roots: Option<Vec<String>>,
     #[cfg(feature = "js")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "js-write-roots")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-write-roots",
+        alias = "js_write_roots"
+    )]
     pub js_write_roots: Option<Vec<String>>,
     #[cfg(feature = "js")]
     #[serde(
         skip_serializing_if = "Option::is_none",
-        rename = "js-read-unrestricted"
+        rename = "js-read-unrestricted",
+        alias = "js_read_unrestricted"
     )]
     pub js_read_unrestricted: Option<bool>,
     #[cfg(feature = "js")]
     #[serde(
         skip_serializing_if = "Option::is_none",
-        rename = "js-write-unrestricted"
+        rename = "js-write-unrestricted",
+        alias = "js_write_unrestricted"
     )]
     pub js_write_unrestricted: Option<bool>,
     #[cfg(feature = "js")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "js-fetch-origins")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-fetch-origins",
+        alias = "js_fetch_origins"
+    )]
     pub js_fetch_origins: Option<Vec<String>>,
     #[cfg(feature = "js")]
     #[serde(
         skip_serializing_if = "Option::is_none",
-        rename = "js-fetch-allow-http"
+        rename = "js-fetch-allow-http",
+        alias = "js_fetch_allow_http"
     )]
     pub js_fetch_allow_http: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "allow-all-mcp-calls")]
     pub allow_all_mcp_calls: Option<bool>,
     /// Bound on one MCP `tools/call` round trip, in seconds. Default: 120.
     #[cfg(feature = "mcp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_tool_timeout_secs: Option<u64>,
     #[cfg(feature = "mcp")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "enable-exa-mcp")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "enable-exa-mcp",
+        alias = "enable_exa_mcp"
+    )]
     pub enable_exa_mcp: Option<bool>,
     #[cfg(feature = "mcp")]
     #[serde(
         skip_serializing_if = "Option::is_none",
-        rename = "enable-context7-mcp"
+        rename = "enable-context7-mcp",
+        alias = "enable_context7_mcp"
     )]
     pub enable_context7_mcp: Option<bool>,
     #[cfg(feature = "mcp")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "enable-grepapp-mcp")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "enable-grepapp-mcp",
+        alias = "enable_grepapp_mcp"
+    )]
     pub enable_grepapp_mcp: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "default-permission-mode"
+    )]
     pub default_permission_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-modes")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-modes",
+        alias = "permission_modes"
+    )]
     pub permission_modes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_details: Option<ShowToolDetails>,
@@ -301,10 +371,18 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "wt-auto-merge")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "wt-auto-merge",
+        alias = "wt_auto_merge"
+    )]
     pub wt_auto_merge: Option<bool>,
     #[cfg(feature = "git-worktree")]
-    #[serde(skip_serializing_if = "Option::is_none", rename = "wt-base-dir")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "wt-base-dir",
+        alias = "wt_base_dir"
+    )]
     pub wt_base_dir: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -387,6 +465,11 @@ pub struct Config {
     #[serde(flatten)]
     #[doc(hidden)]
     pub preserved: PreservedConfig,
+    /// Warnings raised while loading (unknown keys, clamped values, ...),
+    /// kept so `--print-config` can repeat what startup printed. Never read
+    /// from or written to a config file.
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
 }
 
 impl Config {
