@@ -1256,6 +1256,35 @@ mod slash_picker_contract {
         assert_eq!(display_safe("日本\u{9b}x"), "日本\u{fffd}x");
     }
 
+    /// mini-agent-2o379: a file or model name cannot reorder or hide part of
+    /// itself with bidi or zero-width format characters.
+    #[test]
+    fn picker_entries_are_drawn_without_bidi_or_zero_width_format_characters() {
+        use crate::ui::pickers::display_safe;
+        assert_eq!(
+            display_safe("invoice\u{202E}fdp.exe"),
+            "invoice\u{fffd}fdp.exe"
+        );
+        assert_eq!(
+            display_safe(
+                "a\u{2066}b\u{2069}c\u{200E}d\u{061C}e\u{2029}f\u{FEFF}g\u{2060}h\u{200B}i"
+            ),
+            "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e\u{fffd}f\u{fffd}g\u{fffd}h\u{fffd}i"
+        );
+        // Right-to-left scripts and ZWJ/ZWNJ sequences are legitimate.
+        for name in [
+            "שלום.txt",
+            "مرحبا.md",
+            "👨\u{200D}👩\u{200D}👧",
+            "می\u{200C}خواهم",
+        ] {
+            assert!(
+                matches!(display_safe(name), std::borrow::Cow::Borrowed(_)),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn picker_window_ends_above_the_floor_and_follows_the_selection() {
         let window = |top_row, start, end| PickerWindow {

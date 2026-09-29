@@ -767,9 +767,11 @@ fn terminal_safe(text: String) -> String {
 }
 
 /// Whether `text` holds a control character (ESC, a C1 introducer, BEL,
-/// `\r`, a tab, ...) that [`sanitize_output`] would remove or rewrite.
+/// `\r`, a tab, ...) or a bidi/zero-width format character that
+/// [`sanitize_output`] would remove or rewrite.
 fn has_terminal_control(text: &str) -> bool {
-    text.chars().any(|c| c != '\n' && c.is_control())
+    text.chars()
+        .any(|c| c != '\n' && super::events::needs_terminal_sanitizing(c))
 }
 
 fn compact_oversized_block(text: &mut String) -> bool {

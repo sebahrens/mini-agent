@@ -286,9 +286,47 @@ fn replayed_tool_call(content: &str) -> String {
 /// tab stop, which desynchronises the renderer's width accounting.
 const TAB_SPACES: &str = "    ";
 
+/// Whether `c` is an invisible Unicode format character that can make text
+/// display differently from what it is: the bidi embedding, override and
+/// isolate controls (U+202A..U+202E, U+2066..U+2069), the LRM/RLM/ALM marks
+/// (U+200E, U+200F, U+061C), the line and paragraph separators
+/// (U+2028, U+2029), and the zero-width space, word joiner and BOM
+/// (U+200B, U+2060, U+FEFF). A right-to-left override lets a prompt-injected
+/// command render reversed ("Trojan Source") in the approval prompt.
+///
+/// ZWNJ (U+200C) and ZWJ (U+200D) are deliberately kept: Persian, Indic
+/// scripts and emoji sequences need them, and they cannot reorder text.
+pub fn is_deceptive_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// Whether [`sanitize_output`] would remove or rewrite `c`: a control
+/// character (ESC, a C1 introducer, BEL, `\r`, a tab, `\n`, ...) or a
+/// [deceptive format character](is_deceptive_format_char). Fast paths that
+/// skip sanitising clean text must use this predicate so they never pass a
+/// character the sanitiser would have stripped.
+pub fn needs_terminal_sanitizing(c: char) -> bool {
+    c.is_control() || is_deceptive_format_char(c)
+}
+
 /// Make untrusted text safe to paint: remove every terminal control sequence
 /// and control character so model or tool output can never move the cursor,
-/// retitle the window, emit hyperlinks or queries, or hide text.
+/// retitle the window, emit hyperlinks or queries, or hide text. Bidi
+/// controls and the other [deceptive format
+/// characters](is_deceptive_format_char) are removed too, so text can never
+/// display reordered.
 ///
 /// Parsing follows ECMA-48: CSI sequences run to their final byte, OSC/DCS/
 /// SOS/PM/APC strings run to BEL or ST (and, for display robustness, to the
@@ -298,6 +336,19 @@ const TAB_SPACES: &str = "    ";
 /// hiding) what preceded it; a `\r` ending the chunk is dropped because a
 /// streamed CRLF may be split across chunks. Tabs expand to spaces.
 pub fn sanitize_output(text: &str) -> CompactString {
+    sanitize(text, false)
+}
+
+/// [`sanitize_output`] for text a person must review before approving it,
+/// such as a permission prompt's command: every [deceptive format
+/// character](is_deceptive_format_char) is shown as a visible `<U+XXXX>`
+/// marker instead of being dropped, so the reviewer sees that the request
+/// carried one while the text still displays in its logical order.
+pub fn sanitize_for_review(text: &str) -> CompactString {
+    sanitize(text, true)
+}
+
+fn sanitize(text: &str, mark_format_chars: bool) -> CompactString {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -315,6 +366,12 @@ pub fn sanitize_output(text: &str) -> CompactString {
             }
             // C0 controls, DEL and the remaining C1 controls.
             c if c.is_control() => {}
+            c if is_deceptive_format_char(c) => {
+                if mark_format_chars {
+                    use std::fmt::Write as _;
+                    let _ = write!(result, "<U+{:04X}>", u32::from(c));
+                }
+            }
             c => result.push(c),
         }
     }
@@ -401,7 +458,7 @@ fn skip_control_string(chars: &mut Chars<'_>) {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::sanitize_output;
+    use super::{needs_terminal_sanitizing, sanitize_for_review, sanitize_output};
 
     #[test]
     fn csi_sequences_are_removed_through_their_final_byte() {
@@ -446,6 +503,60 @@ mod sanitize_tests {
         assert_eq!(sanitize_output("rm -rf /\rsafe"), "rm -rf /\nsafe");
         assert_eq!(sanitize_output("split\r"), "split");
         assert_eq!(sanitize_output("a\tb"), "a    b");
+    }
+
+    /// mini-agent-2o379: bidi embedding/override/isolate controls, LRM/RLM/
+    /// ALM, line/paragraph separators and zero-width format characters could
+    /// make displayed text differ from what it is ("Trojan Source").
+    #[test]
+    fn bidi_and_zero_width_format_characters_are_removed() {
+        let out = sanitize_output("a\u{202E}b\u{2066}c\u{2028}d\u{200B}e");
+        assert_eq!(out, "abcde");
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{2028}', '\u{2029}',
+            '\u{200B}', '\u{2060}', '\u{FEFF}',
+        ] {
+            let text = format!("x{c}y");
+            assert_eq!(sanitize_output(&text), "xy", "U+{:04X}", u32::from(c));
+            assert!(needs_terminal_sanitizing(c));
+        }
+    }
+
+    #[test]
+    fn review_sanitizing_marks_format_characters_visibly() {
+        assert_eq!(
+            sanitize_for_review("echo ok #\u{202E} ;x\u{2069}\x1b[2J"),
+            "echo ok #<U+202E> ;x<U+2069>"
+        );
+        assert_eq!(sanitize_for_review("\u{61C}\u{FEFF}"), "<U+061C><U+FEFF>");
+        // Idempotent: the markers are plain ASCII.
+        let once = sanitize_for_review("a\u{202D}b");
+        assert_eq!(sanitize_for_review(&once), once);
+    }
+
+    #[test]
+    fn right_to_left_scripts_and_joiner_sequences_are_untouched() {
+        use crate::ui::utils::display_width;
+        for text in [
+            "שלום עולם",
+            "مرحبا بالعالم",
+            "می\u{200C}خواهم",
+            "👨\u{200D}👩\u{200D}👧\u{200D}👦 family",
+            "🏳\u{FE0F}\u{200D}🌈",
+        ] {
+            assert_eq!(sanitize_output(text), text);
+            assert_eq!(sanitize_for_review(text), text);
+            assert!(!text.chars().any(needs_terminal_sanitizing), "{text}");
+            assert_eq!(
+                display_width(&sanitize_output(text)),
+                display_width(text),
+                "{text}"
+            );
+        }
+        // Removing a format character leaves the width of what remains.
+        assert_eq!(display_width(&sanitize_output("ab\u{202E}cd")), 4);
+        assert_eq!(display_width(&sanitize_for_review("ab\u{202E}cd")), 12);
     }
 
     #[test]

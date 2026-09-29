@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- The permission prompt can no longer show a different command than the one that runs: bidi
+  override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
+  characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed
+  from chat output and replaced with `�` in picker entries. ZWJ/ZWNJ and right-to-left text are kept.
 - Replayed sessions (`--continue`/`--resume`, double-Esc rewind, session or worktree switch, `/memory`,
   `/init`) no longer paint stored escape sequences: user, assistant and system messages and the
   welcome line's directory name are sanitised, and the chat feed and painter now strip control

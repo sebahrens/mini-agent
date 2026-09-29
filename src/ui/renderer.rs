@@ -61,7 +61,7 @@ pub(crate) fn paint_row_text(
 }
 
 fn paint_text(text: &str) -> String {
-    if text.chars().any(char::is_control) {
+    if text.chars().any(super::events::needs_terminal_sanitizing) {
         wrap_urls_osc8(&sanitize_output(text))
     } else {
         wrap_urls_osc8(text)
@@ -397,7 +397,7 @@ pub(crate) fn permission_prompt_rows(
 fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[String]) -> bool {
     use crate::ui::utils::wrap_to_width;
     let width = width.max(1);
-    let header = crate::ui::events::sanitize_output(header);
+    let header = crate::ui::events::sanitize_for_review(header);
     let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
     let option_rows = wrap_to_width(&options, width).len().min(rows.len());
     let full: Vec<String> = header
@@ -424,7 +424,7 @@ pub(crate) fn prompt_block_rows(
 
     let width = width.max(1);
     let max_rows = max_rows.max(2);
-    let header = crate::ui::events::sanitize_output(header);
+    let header = crate::ui::events::sanitize_for_review(header);
     let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
     let mut option_rows = wrap_to_width(&options, width);
     option_rows.truncate(max_rows - 1);
