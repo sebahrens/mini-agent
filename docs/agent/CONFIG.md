@@ -1327,6 +1327,7 @@ Available items:
 | `cost`                | Session cost (hidden at `$0.0000` unless `show_cost_always` is set). |
 | `prompt`              | Active prompt (`prompt:<name>`). |
 | `mode`                | Security mode when not `standard` (`mode:<name>`). |
+| `sandbox`             | Red `sandbox:off` while shell commands run unsandboxed because the default sandbox backend was unavailable (hidden otherwise, including under an explicit `--no-sandbox`). In the default layout; a custom layout that omits it still gets it appended to the first line while degraded. |
 | `loop`                | Active loop label. |
 | `goal`                | Active goal: its round and status, in brackets. Hidden when there is no goal or it has finished. |
 | `chain`               | Chain-of-prompts label. |
@@ -1424,7 +1425,13 @@ follows a stricter `"*": deny`). Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
-`pwd`, `git status`, and `cargo test`) plus pattern-based deny rules.
+`pwd`, `git status`, and `cargo test`) plus pattern-based deny rules. When the
+default sandbox backend is unavailable and the session fell back to running
+unsandboxed (shown as `sandbox:off` in the status bar), the built-in allows for
+commands that run workspace code (`git status`, `cargo check`/`build`/`test`/
+`fmt`/`clippy`, `pip list`) are withheld and those commands ask first; only
+`pwd` and the deny rules remain. Add an explicit `bash` rule if you want to
+allow them anyway.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
 inherited `read` access used by `lsp_diagnostics`. When several

@@ -6,6 +6,17 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- When the default sandbox backend is unavailable on Linux or macOS and the session falls back to
+  running unsandboxed, the built-in auto-allows for commands that run workspace code (`cargo
+  build`/`test`/`check`/`clippy`/`fmt`, `pip list`, `git status`) are withheld and ask first. The
+  fallback is now always visible: a stderr notice in every mode (even with `RUST_LOG=off`), a chat
+  notice before the first TUI turn, and a persistent red `sandbox:off` status-bar segment.
+  Decision: Linux keeps starting in this degraded state rather than failing closed like Windows,
+  because stock Ubuntu 24.04 blocks `bwrap` by default; use `--sandbox` to fail closed or
+  `--no-sandbox` to opt out deliberately (mini-agent-cfib7).
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

@@ -46,6 +46,23 @@ pub struct StatusContext<'a> {
     pub btw_cost: f64,
     pub btw_in: u64,
     pub btw_out: u64,
+    /// `Some("sandbox:off")` while shell commands run unsandboxed because the
+    /// implicitly selected default backend was unavailable. This security
+    /// indicator is shown even when a custom `[statusline]` omits `sandbox`.
+    pub sandbox_label: Option<&'a str>,
+}
+
+/// Status segment text for a degraded (unavailable-default) sandbox.
+pub const SANDBOX_OFF_LABEL: &str = "sandbox:off";
+
+/// The persistent sandbox indicator for `sandbox`, or `None` when the session
+/// is contained or the operator disabled sandboxing deliberately.
+pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'static str> {
+    matches!(
+        sandbox.explicit_shell_boundary(),
+        crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { .. }
+    )
+    .then_some(SANDBOX_OFF_LABEL)
 }
 
 static SPEC: OnceLock<StatusLineConfig> = OnceLock::new();
@@ -131,6 +148,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.btw_cost.to_bits().hash(&mut state);
     ctx.btw_in.hash(&mut state);
     ctx.btw_out.hash(&mut state);
+    ctx.sandbox_label.hash(&mut state);
 
     let uses = |item: &str| {
         spec()
@@ -160,10 +178,37 @@ pub fn build_lines(
     session: &Session,
     ctx: &StatusContext,
 ) -> Vec<Vec<StatusSpan>> {
-    spec.lines
+    let mut lines: Vec<Vec<StatusSpan>> = spec
+        .lines
         .iter()
         .map(|line| build_line(line, session, ctx))
-        .collect()
+        .collect();
+    // A degraded sandbox is a security state, not a cosmetic item: when a
+    // custom layout does not place `sandbox` itself, append it to the first
+    // line so the indicator can never be configured away by omission.
+    let places_sandbox = spec
+        .lines
+        .iter()
+        .flat_map(|line| &line.segments)
+        .any(|segment| segment.item == "sandbox");
+    if !places_sandbox
+        && let Some(label) = ctx.sandbox_label
+        && let Some(first) = lines.first_mut()
+    {
+        if !first.is_empty() {
+            first.push(StatusSpan::Text {
+                text: " ".to_string(),
+                fg: None,
+                bg: None,
+            });
+        }
+        first.push(StatusSpan::Text {
+            text: single_line_safe(label),
+            fg: Some(Color::Red),
+            bg: None,
+        });
+    }
+    lines
 }
 
 /// Item values can come from outside the process (a session name set by
@@ -280,6 +325,9 @@ fn context_percentage(session: &Session) -> Option<u64> {
 /// approaches full, red once it crosses the window, so an over-budget reading is
 /// visibly intentional. Returns `None` to keep the segment's configured color.
 fn dynamic_item_color(item: &str, session: &Session) -> Option<Color> {
+    if item == "sandbox" {
+        return Some(Color::Red);
+    }
     if item != "context_percentage" {
         return None;
     }
@@ -367,6 +415,7 @@ fn resolve_item(
             .perm_mode
             .filter(|m| *m != "standard")
             .map(|m| format!("mode:{m}")),
+        "sandbox" => ctx.sandbox_label.map(str::to_string),
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
         "goal" => ctx.goal_label.map(|s| format!("[{s}]")),
         "chain" => ctx.chain_label.map(|s| s.to_string()),
@@ -649,6 +698,8 @@ pub fn default_spec() -> StatusLineConfig {
             item: "flex_separator".into(),
             ..Default::default()
         },
+        seg("sandbox", Some("red")),
+        sep(" "),
         seg("loop", Some("dark_grey")),
         sep(" "),
         seg("mode", Some("dark_grey")),

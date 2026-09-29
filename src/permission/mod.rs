@@ -221,9 +221,7 @@ pub(crate) fn resolve_configured_execution_authority(
     };
     let authority = resolve_execution_authority(cli, cfg, policy, &backend)?;
     let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
-        tracing::warn!(
-            "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
-        );
+        report_degraded_sandbox_once(&backend);
         crate::sandbox::Sandbox::new(false, &backend).with_unavailable_default_fallback()
     } else {
         configured
@@ -308,11 +306,12 @@ fn build_permission_checker_at(
     // Parse and compile the complete policy before honoring flags that disable
     // tools or checks. Invalid configuration must fail closed in every mode.
     let configs = cfg.build_permission_config()?;
-    let checker = checker::PermissionChecker::new(
+    let checker = checker::PermissionChecker::new_for_sandbox(
         &configs,
         authority.mode,
         working_dir,
         cfg.permission_modes.clone(),
+        authority.sandbox,
     )?;
 
     if !authority.tools_enabled || !authority.permission_checks_enabled {
@@ -510,6 +509,86 @@ pub(crate) fn is_destructive_shell_script(script: &str) -> bool {
 
 pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &'static str)> {
     vec![("bash", r"^rm\s+.*\*")]
+}
+
+/// Operator-facing notice for a session whose implicitly selected default
+/// sandbox backend was unavailable. Every frontend shows the same text: the
+/// TUI as a first-turn chat notice (plus the persistent `sandbox:off` status
+/// segment), headless runs on stderr regardless of `RUST_LOG`.
+pub(crate) fn degraded_sandbox_notice(backend: &str) -> String {
+    let remedy = if backend == "bwrap" {
+        "install bubblewrap (and allow unprivileged user namespaces), "
+    } else {
+        ""
+    };
+    format!(
+        "warning: sandbox backend '{backend}' is unavailable — shell commands run UNSANDBOXED with your full user privileges. \
+         Built-in auto-allows for build/test commands (cargo, pip, git status) are withheld and ask first. \
+         To fix: {remedy}pass --sandbox (or set `sandbox = true`) to refuse to start instead, or pass --no-sandbox to run unsandboxed deliberately."
+    )
+}
+
+/// The degraded-sandbox notice for a materialized session sandbox, or `None`
+/// when it is contained or was disabled deliberately (`--no-sandbox`).
+pub(crate) fn degraded_sandbox_notice_for(sandbox: &crate::sandbox::Sandbox) -> Option<String> {
+    match sandbox.explicit_shell_boundary() {
+        crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { backend } => {
+            Some(degraded_sandbox_notice(&backend))
+        }
+        _ => None,
+    }
+}
+
+/// Write the degraded-sandbox notice directly to `out`. This deliberately
+/// bypasses `tracing`, so `RUST_LOG=off` or `--log-level off` cannot hide it.
+pub(crate) fn write_degraded_sandbox_notice(
+    out: &mut dyn std::io::Write,
+    backend: &str,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", degraded_sandbox_notice(backend))?;
+    out.flush()
+}
+
+/// Report an unavailable-default fallback once per process on stderr (and at
+/// `info` to the log file). Headless print, loop and ACP runs have no other
+/// surface; the TUI additionally shows a chat notice and a status segment.
+fn report_degraded_sandbox_once(backend: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    tracing::info!(backend, "default sandbox unavailable; running unsandboxed");
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = write_degraded_sandbox_notice(&mut std::io::stderr().lock(), backend);
+    }
+}
+
+/// Built-in `bash` allows that execute workspace-controlled code or
+/// configuration: `cargo` runs `build.rs`, proc-macros, test binaries and
+/// toolchain overrides (`rust-toolchain.toml`, `.cargo/config.toml`), `pip`
+/// imports site `.pth` hooks, and `git status` honours `core.fsmonitor` from
+/// a repository config the model can write. With the sandbox enforced they
+/// run contained; after an unavailable-default fallback they would run with
+/// full user privileges, so they are withheld and resolve like any other
+/// unmatched script (`ask` in `standard` and `guarded`).
+pub(crate) const UNSANDBOXED_EXEC_DEFAULT_ALLOWS: &[&str] = &[
+    "git status",
+    "cargo check",
+    "cargo build",
+    "cargo test",
+    "cargo fmt",
+    "cargo clippy",
+    "pip list",
+];
+
+/// Built-in `bash` rules for a session with the given sandbox resolution.
+/// Deny rules are never dropped; only exec-capable allows are withheld when
+/// the default sandbox silently degraded to unsandboxed execution.
+pub(crate) fn default_bash_rules_for(sandbox: SandboxResolution) -> Vec<(&'static str, Action)> {
+    let mut rules = default_bash_rules();
+    if sandbox == SandboxResolution::DegradedUnavailable {
+        rules.retain(|(pattern, action)| {
+            *action != Action::Allow || !UNSANDBOXED_EXEC_DEFAULT_ALLOWS.contains(pattern)
+        });
+    }
+    rules
 }
 
 pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
@@ -1009,6 +1088,147 @@ mod execution_authority_tests {
 
         drop((sandbox, workspace));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn default_bash_decision(
+        cli: Cli,
+        policy: SandboxPolicy,
+        script: &str,
+    ) -> (SandboxResolution, super::checker::CheckResult) {
+        let cfg = Config::default();
+        let authority = resolve_execution_authority(&cli, &cfg, policy, "missing").unwrap();
+        let (permission, _) = build_noninteractive_permission(&cfg, authority).unwrap();
+        let permission = permission.expect("tools and checks are enabled");
+        let decision = permission.lock().unwrap().check("bash", script);
+        (authority.sandbox, decision)
+    }
+
+    /// cfib7: a silently degraded default sandbox must not keep auto-allowing
+    /// scripts that execute workspace-controlled code with full privileges.
+    #[test]
+    fn exec_capable_default_allows_ask_only_when_the_default_sandbox_degraded() {
+        use super::checker::CheckResult;
+
+        for script in super::UNSANDBOXED_EXEC_DEFAULT_ALLOWS {
+            let (resolution, enforced) =
+                default_bash_decision(Cli::default(), SandboxPolicy::RequiredAndAvailable, script);
+            assert_eq!(resolution, SandboxResolution::Enforced);
+            assert_eq!(enforced, CheckResult::Allowed, "{script} under Enforced");
+
+            let (resolution, degraded) = default_bash_decision(
+                Cli::default(),
+                SandboxPolicy::RequiredButUnavailable,
+                script,
+            );
+            assert_eq!(resolution, SandboxResolution::DegradedUnavailable);
+            assert_eq!(
+                degraded,
+                CheckResult::Ask,
+                "{script} under DegradedUnavailable"
+            );
+        }
+
+        // The headline case, spelled out: `cargo test` asks when degraded.
+        assert_eq!(
+            default_bash_decision(
+                Cli::default(),
+                SandboxPolicy::RequiredButUnavailable,
+                "cargo test"
+            )
+            .1,
+            CheckResult::Ask
+        );
+        // Guarded mode asks too; nothing silently falls back to allow.
+        assert_eq!(
+            default_bash_decision(
+                Cli {
+                    guarded: true,
+                    ..Cli::default()
+                },
+                SandboxPolicy::RequiredButUnavailable,
+                "cargo build --workspace"
+            )
+            .1,
+            CheckResult::Ask
+        );
+        // An explicit `--no-sandbox` is the operator's deliberate choice and
+        // keeps the historical built-in allows.
+        let (resolution, disabled) =
+            default_bash_decision(Cli::default(), SandboxPolicy::Disabled, "cargo test");
+        assert_eq!(resolution, SandboxResolution::Disabled);
+        assert_eq!(disabled, CheckResult::Allowed);
+        // Harmless allows and every built-in deny survive degradation.
+        assert_eq!(
+            default_bash_decision(Cli::default(), SandboxPolicy::RequiredButUnavailable, "pwd").1,
+            CheckResult::Allowed
+        );
+        assert!(matches!(
+            default_bash_decision(
+                Cli::default(),
+                SandboxPolicy::RequiredButUnavailable,
+                "mkfs /dev/sda"
+            )
+            .1,
+            CheckResult::Denied(_)
+        ));
+    }
+
+    /// Every built-in allow is either inert or classified as exec-capable, so
+    /// a new default allow cannot silently bypass the degraded-sandbox rule.
+    #[test]
+    fn every_builtin_bash_allow_is_classified_for_unsandboxed_sessions() {
+        const INERT: &[&str] = &["pwd"];
+        for (pattern, action) in super::default_bash_rules() {
+            if action == super::Action::Allow {
+                assert!(
+                    INERT.contains(&pattern)
+                        || super::UNSANDBOXED_EXEC_DEFAULT_ALLOWS.contains(&pattern),
+                    "unclassified built-in allow `{pattern}`"
+                );
+            }
+        }
+        let degraded = super::default_bash_rules_for(SandboxResolution::DegradedUnavailable);
+        let deny_count = |rules: &[(&str, super::Action)]| {
+            rules
+                .iter()
+                .filter(|(_, action)| *action == super::Action::Deny)
+                .count()
+        };
+        assert_eq!(
+            deny_count(&degraded),
+            deny_count(&super::default_bash_rules())
+        );
+    }
+
+    #[test]
+    fn degraded_notice_is_actionable() {
+        let notice = super::degraded_sandbox_notice("bwrap");
+        assert!(notice.contains("UNSANDBOXED"), "{notice}");
+        assert!(notice.contains("install bubblewrap"), "{notice}");
+        assert!(notice.contains("--sandbox"), "{notice}");
+        assert!(notice.contains("--no-sandbox"), "{notice}");
+        assert!(!notice.contains('\n'), "{notice}");
+        assert!(!super::degraded_sandbox_notice("seatbelt").contains("bubblewrap"));
+    }
+
+    /// Headless runs report the fallback on stderr through a direct write,
+    /// not through `tracing`, so no log filter can suppress it; and the
+    /// notice is derived from the materialized session sandbox.
+    #[test]
+    fn headless_degraded_notice_is_written_directly_and_only_when_degraded() {
+        use crate::sandbox::Sandbox;
+
+        let degraded = Sandbox::new(false, "bwrap").with_unavailable_default_fallback();
+        let notice = super::degraded_sandbox_notice_for(&degraded).expect("degraded");
+        assert_eq!(notice, super::degraded_sandbox_notice("bwrap"));
+        assert_eq!(
+            super::degraded_sandbox_notice_for(&Sandbox::new(false, "bwrap")),
+            None
+        );
+
+        let mut stderr = Vec::new();
+        super::write_degraded_sandbox_notice(&mut stderr, "bwrap").unwrap();
+        assert_eq!(String::from_utf8(stderr).unwrap(), format!("{notice}\n"));
     }
 }
 
