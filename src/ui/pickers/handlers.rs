@@ -328,11 +328,11 @@ pub fn handle_command_key(
         // completion and let the editor insert the space.
         KeyCode::Char(' ') if typed_command(buffer, *cursor, picker).is_some() => {
             let command = typed_command(buffer, *cursor, picker).unwrap_or_default();
-            if opens_sub_picker(&command, ctx) {
-                if let Some(index) = picker.matches.iter().position(|m| *m == command) {
-                    picker.selected = index;
-                    return accept_command(buffer, cursor, ctx, picker);
-                }
+            if opens_sub_picker(&command, ctx)
+                && let Some(index) = picker.matches.iter().position(|m| *m == command)
+            {
+                picker.selected = index;
+                return accept_command(buffer, cursor, ctx, picker);
             }
             picker.deactivate();
             (false, None)
