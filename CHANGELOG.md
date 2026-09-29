@@ -6,6 +6,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Hooks and workspace services (MCP stdio and LSP servers, contained Git) now start in their own
+  session with no controlling terminal, as sandboxed model commands already did, so they can no
+  longer inject keystrokes into the TUI (`TIOCSTI`) or write escape sequences to your terminal.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

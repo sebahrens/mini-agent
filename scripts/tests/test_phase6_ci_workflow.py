@@ -529,6 +529,24 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         missing = [row for row in test_rows if row not in clippy_rows]
         self.assertEqual([], missing, "test rows without a strict Clippy row")
 
+    def test_linux_sandbox_policy_proves_hooks_have_no_controlling_terminal(
+        self,
+    ) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        # The ignored real-bwrap probe is only meaningful when the test process
+        # owns a controlling terminal, which script(1) provides on the runner.
+        self.assertIn(
+            'script -qec "cargo test --locked --no-default-features '
+            "--features hooks,js,subagents,skills,sandbox "
+            "sandbox::sandbox_tests::bwrap_hook_has_no_controlling_terminal "
+            '-- --exact --ignored --nocapture" /dev/null',
+            linux,
+        )
+        self.assertLess(
+            linux.index("bash scripts/install-ci-bubblewrap.sh"),
+            linux.index("bwrap_hook_has_no_controlling_terminal"),
+        )
+
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("bash scripts/install-ci-bubblewrap.sh", linux)
