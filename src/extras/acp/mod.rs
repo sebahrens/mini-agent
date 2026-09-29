@@ -4639,6 +4639,52 @@ mod protocol_tests {
             .unwrap();
     }
 
+    /// Budget for each readiness stage of the production Bash cancellation
+    /// fixture. Each stage is timed from the end of the previous one, so load
+    /// that delays one stage is never charged against the next.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const PROCESS_TREE_STAGE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// How one readiness stage of the Bash cancellation fixture ended.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    enum ProcessTreeStage<T, E> {
+        Ready(T),
+        PromptEnded(E),
+        Stalled,
+    }
+
+    /// Waits for `ready` within [`PROCESS_TREE_STAGE_BUDGET`], unless the
+    /// prompt ends first. A stage that is ready when the prompt also ends wins.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn process_tree_stage<T, E>(
+        ready: impl Future<Output = T>,
+        prompt: &mut tokio::task::JoinHandle<E>,
+    ) -> ProcessTreeStage<T, Result<E, tokio::task::JoinError>> {
+        tokio::select! {
+            biased;
+            value = ready => ProcessTreeStage::Ready(value),
+            ended = prompt => ProcessTreeStage::PromptEnded(ended),
+            _ = tokio::time::sleep(PROCESS_TREE_STAGE_BUDGET) => ProcessTreeStage::Stalled,
+        }
+    }
+
+    /// Polls `path` until it holds a complete, non-zero pid. A file can exist
+    /// before its contents are flushed, so this waits for a parsable pid
+    /// rather than for the path to appear.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn published_process_tree_pid(path: &Path) -> u32 {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.ends_with('\n')
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid != 0
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn exercise_cancellation_process_tree(fail_after_readiness: bool) {
         use crate::tests::process_gate::ProcessGate;
@@ -4698,14 +4744,27 @@ mod protocol_tests {
         let state = runner_fixture_state(fixture);
         let workspace = ProtocolTempDir::new();
         let cwd = workspace.path().to_path_buf();
+        // The agent announces the Bash call before the tool runs. Readiness is
+        // staged on that announcement so model and agent latency under a loaded
+        // parallel runner is not counted against the shell's own budget.
+        let (announced_tx, announced_rx) = tokio::sync::watch::channel(false);
 
         Client
             .builder()
             .on_receive_notification(
-                async |_notification: SessionNotification, _cx| Ok(()),
+                async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::ToolCall(call) = &notification.update
+                        && call.title
+                            == <crate::agent::tools::bash::BashTool as rig::tool::Tool>::NAME
+                    {
+                        announced_tx.send_replace(true);
+                    }
+                    Ok(())
+                },
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(InMemoryAgent(state), async move |cx| {
+                let mut announced_rx = announced_rx;
                 cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
@@ -4724,26 +4783,46 @@ mod protocol_tests {
                 }));
                 let mut observed_tree = None;
                 let result = std::panic::AssertUnwindSafe(async {
-                    // A file can exist before its contents are flushed, so wait for
-                    // a parsable pid rather than for the path to appear.
-                    let read_pid = |path: std::path::PathBuf| async move {
-                        tokio::time::timeout(Duration::from_secs(15), async {
-                            loop {
-                                if let Ok(text) = std::fs::read_to_string(&path)
-                                    && text.ends_with('\n')
-                                    && let Ok(pid) = text.trim().parse::<u32>()
-                                    && pid != 0
-                                {
-                                    return pid;
+                    // Readiness has three stages, each with its own budget and
+                    // its own failure: the agent announces the Bash call, the
+                    // spawned shell publishes its pid, and the shell's child
+                    // publishes its pid. A prompt that ends early reports its
+                    // own response instead of an anonymous timeout.
+                    macro_rules! stage {
+                        ($name:expr, $ready:expr) => {
+                            match process_tree_stage($ready, blocked.as_mut().unwrap()).await {
+                                ProcessTreeStage::Ready(value) => value,
+                                ProcessTreeStage::PromptEnded(ended) => {
+                                    // The handle has completed; drop it so
+                                    // cleanup does not poll it again.
+                                    blocked.take();
+                                    panic!("the prompt ended before {}: {ended:?}", $name);
                                 }
-                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                ProcessTreeStage::Stalled => panic!(
+                                    "production BashTool stalled: {} did not happen within \
+                                     {:?} (shell pid file present: {}, descendant pid file \
+                                     present: {})",
+                                    $name,
+                                    PROCESS_TREE_STAGE_BUDGET,
+                                    shell_pid_file.exists(),
+                                    descendant_pid_file.exists(),
+                                ),
                             }
-                        })
-                        .await
-                        .expect("production BashTool should publish its process tree")
-                    };
-                    let shell_pid = read_pid(shell_pid_file.clone()).await;
-                    let descendant_pid = read_pid(descendant_pid_file.clone()).await;
+                        };
+                    }
+                    stage!(
+                        "the agent announced the Bash tool call",
+                        announced_rx.wait_for(|announced| *announced)
+                    )
+                    .expect("the notification sender outlives the client");
+                    let shell_pid = stage!(
+                        "the Bash shell published its pid",
+                        published_process_tree_pid(&shell_pid_file)
+                    );
+                    let descendant_pid = stage!(
+                        "the Bash descendant published its pid",
+                        published_process_tree_pid(&descendant_pid_file)
+                    );
 
                     let shell = ProcessIdentity::capture(shell_pid).unwrap();
                     let descendant = ProcessIdentity::capture(descendant_pid).unwrap();

@@ -514,6 +514,29 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("-- --list", run_step)
         self.assertIn('-lt 1', run_step)
 
+    def test_parallel_smoke_runs_the_default_suite_unserialised_on_linux_and_macos(
+        self,
+    ) -> None:
+        # mini-agent-o55tm: every `test` row passes --test-threads=1, so a
+        # readiness race that only appears under the parallel runner on macOS
+        # was invisible to CI while local `cargo test` hit it.
+        body = job_body(self.workflow, "parallel-test-smoke")
+        header = body.split("    steps:\n", 1)[0]
+        self.assertIn("fail-fast: false", header)
+        self.assertIn("os: [ubuntu-latest, macos-latest]", header)
+        self.assertIn("runs-on: ${{ matrix.os }}", header)
+        self.assertNotIn("continue-on-error", header)
+        step = body.split(
+            "name: Test the default suite with the standard parallel runner", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("run: cargo test --locked\n", step)
+        self.assertNotIn("--test-threads", step)
+        self.assertNotIn("--skip", step)
+        self.assertLess(
+            body.index("name: Use the durable macOS temporary root"),
+            body.index("name: Test the default suite with the standard parallel runner"),
+        )
+
     def test_every_test_row_has_a_strict_linux_clippy_row(self) -> None:
         # A test row compiles with warnings allowed, so a cfg-gated item that is
         # dead on Linux under that exact feature set only fails under Clippy.
@@ -542,6 +565,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("TMPDIR: /private/tmp", macos)
         for job in (
             "test",
+            "parallel-test-smoke",
             "platform-paths",
             "platform-path-install-smoke",
             "mcp-stdio",
