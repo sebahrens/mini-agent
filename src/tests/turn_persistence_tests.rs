@@ -372,7 +372,7 @@ fn headless_text_before_a_tool_call_is_its_own_record() {
         unreachable!()
     };
     let mut items = vec![AssistantContent::text("I'll read the file.")];
-    items.extend(content.into_iter());
+    items.extend(content);
     let interactions = vec![
         Message::Assistant {
             id: None,
