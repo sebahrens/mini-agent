@@ -895,6 +895,25 @@ mod slash_picker_contract {
         assert!(!command_picker_open(&input));
     }
 
+    /// mini-agent-lqq0c: aliases are not suggested but still run in one Enter.
+    #[test]
+    fn hidden_aliases_are_not_suggested_but_run_when_typed_in_full() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/comp");
+        let Some(Picker::Command(picker)) = input.picker.as_ref() else {
+            panic!("command picker open");
+        };
+        assert_eq!(picker.matches, ["/compress"]);
+        for alias in ["/exit", "/compact", "/thinking", "/tutorial"] {
+            let mut input = InputEditor::new();
+            typed(&mut input, alias);
+            assert_eq!(
+                press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+                Some(alias)
+            );
+        }
+    }
+
     #[test]
     fn backspace_after_an_inserted_command_reopens_completion() {
         let mut input = InputEditor::new();

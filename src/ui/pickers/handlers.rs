@@ -344,6 +344,10 @@ pub fn handle_command_key(
                     && buffer.as_str() == cmd
                     && !opens_sub_picker(cmd, ctx)
             });
+            // A hidden alias typed in full runs as typed, too.
+            let alias_in_full = buffer.strip_prefix('/') == Some(picker.query.as_str())
+                && super::list::is_command_alias(buffer.as_str());
+            let typed_in_full = typed_in_full || alias_in_full;
             if typed_in_full {
                 picker.deactivate();
                 return (false, None);
