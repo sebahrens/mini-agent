@@ -27,6 +27,8 @@ mod import;
 pub mod index;
 #[cfg(feature = "skills")]
 pub mod loader;
+#[cfg(feature = "skills")]
+mod retention;
 // `manifest` parses the whole documented frontmatter surface, including the
 // `license` and `compatibility` fields no consumer reads yet. The allow is
 // scoped to that one module instead of covering all of `extras::skills`; the

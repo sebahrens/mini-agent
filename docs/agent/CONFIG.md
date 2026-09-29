@@ -167,7 +167,21 @@ digest for a package installed without `ACTIVE`, the import first pins the
 existing digest, so an import killed mid-way leaves the old version active.
 Each import also removes working trees older than one hour that killed imports
 left behind (`<cache-dir>/import-staging/agent-skill-*` and
-`<data-dir>/agent-skills/<name>/.import-*`). Superseded digests are kept.
+`<data-dir>/agent-skills/<name>/.import-*`).
+
+Superseded digests stay on disk because running sessions may still read them.
+Each import prunes old ones, deleting a superseded digest only when all of these
+hold: its package has a valid `ACTIVE` pointer (packages installed without one
+are never pruned) that has not changed for 7 days; it is not one of the two most
+recently installed superseded digests of that package; it was installed more
+than 7 days ago; and no running session leases it. Every TUI or ACP session that
+has loaded Agent Skills holds a lease in `<data-dir>/agent-skill-leases/`: an
+exclusively locked `<id>.lock` file plus an `<id>.digests` list of the digests
+its current and previous catalog generations read. A lease whose lock can be
+taken belonged to an exited process and is removed; if the leases cannot be
+read, nothing is pruned. A pruned digest is first renamed to a hidden
+`.import-pruned-*` tree (removed by the same stale sweep if deletion is
+interrupted), and is restored if an import re-activated it meanwhile.
 
 `SKILL.md` is capped at 48 KiB at import — one whole turn's instruction budget.
 A larger file is refused by the import command instead of installing, ranking

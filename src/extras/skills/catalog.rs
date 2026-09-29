@@ -12,6 +12,7 @@ use crate::paths::{AppPaths, portable};
 
 use super::index::{AgentSkillIndex, AgentSkillRecord};
 use super::manifest::parse_skill_markdown;
+use super::retention::SessionLease;
 
 // A tree whose SKILL.md is larger than one turn's instruction budget can never
 // be surfaced, so it is omitted from the generation rather than ranked first
@@ -58,6 +59,10 @@ pub struct AgentSkillCatalog {
     root: PathBuf,
     generation: u64,
     signature: Option<CatalogSignature>,
+    lease_root: PathBuf,
+    // Protects the digests this catalog's generations read from pruning while
+    // the owning session runs; acquired with the first non-empty generation.
+    lease: Option<SessionLease>,
 }
 
 // A signature is only ever compared as a whole. The derived `PartialEq` reads
@@ -86,6 +91,8 @@ impl AgentSkillCatalog {
             root: paths.data_dir.join("agent-skills"),
             generation: 0,
             signature: None,
+            lease_root: super::retention::lease_root(&paths.data_dir),
+            lease: None,
         }
     }
 
@@ -149,6 +156,7 @@ impl AgentSkillCatalog {
                 }
             }
         }
+        self.record_lease(&records);
         let documents = records
             .iter()
             .map(AgentSkillRecord::embedding_document)
@@ -166,6 +174,32 @@ impl AgentSkillCatalog {
             AgentSkillIndex::build(self.generation, embedder.model_metadata().clone(), records)?;
         self.signature = Some(signature);
         Ok(index)
+    }
+
+    /// Lease the digests of a generation before any reader can load from it.
+    /// Best effort: without a lease the retention window alone protects them.
+    fn record_lease(&mut self, records: &[AgentSkillRecord]) {
+        if self.lease.is_none() {
+            if records.is_empty() {
+                return;
+            }
+            match SessionLease::acquire(&self.lease_root) {
+                Ok(lease) => self.lease = Some(lease),
+                Err(error) => {
+                    tracing::debug!("could not create Agent Skill session lease: {error}");
+                    return;
+                }
+            }
+        }
+        if let Some(lease) = self.lease.as_mut()
+            && let Err(error) = lease.record(
+                records
+                    .iter()
+                    .map(|record| (record.name.as_str(), record.digest.as_str())),
+            )
+        {
+            tracing::debug!("could not record Agent Skill session lease: {error}");
+        }
     }
 
     /// Rebuild only after an import or ACTIVE-pointer change is visible.
