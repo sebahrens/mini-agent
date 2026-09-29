@@ -87,7 +87,7 @@ built-in prompts, or create a custom `code.md` prompt).
 | Command | Description |
 | ------- | ----------- |
 | `/mode` | Pick a security mode. In the TUI, accepting `/mode` from completion (Tab, or Enter on the full name) opens a picker listing every mode with a one-line description, the current mode highlighted and marked `(current)`; choosing one inserts `/mode <name>` for Enter to apply. Submitting a bare `/mode` (or running without a permission system) prints the current mode and the same described list as text. |
-| `/mode standard` | Allow path tools within CWD, ask for external paths. Config rules apply. |
+| `/mode standard` | Allow path tools within CWD, ask for external paths and for writes to `.git/config` or `.git/hooks`. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
 | `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. |
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |

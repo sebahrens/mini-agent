@@ -232,7 +232,7 @@ default `bwrap` backend, the following matrix is normative:
 | Capability | Enforced policy |
 |------------|-----------------|
 | Filesystem reads | The canonical current workspace, mini-agent's canonical application cache, explicit read-only runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/nix` when present), `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
-| Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp`; the remaining sandbox root and runtime mounts are read-only |
+| Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp`, except the workspace Git metadata below, which stays read-only; the remaining sandbox root and runtime mounts are read-only |
 | Process namespace | Separate user, PID, IPC, UTS, and cgroup namespaces |
 | Devices | A synthetic minimal `/dev`; host device trees are not mounted |
 | Environment | `--clearenv`, followed only by `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, and `NO_COLOR`; `TMPDIR` is fixed to `/tmp` |
@@ -256,6 +256,47 @@ or child setup error fail closed. No command is retried outside the backend. Cap
 must distinguish disabled, requested-and-available, and requested-but-unavailable states and must
 list the actual bwrap flags/mount policy above.
 
+### Workspace Git metadata stays read-only
+
+Every workspace sandbox profile (model commands and brokered JS `spawn`, sandboxed hooks, and
+workspace services such as the structured Git tool, MCP stdio, and LSP servers) keeps the Git
+metadata that decides which code Git runs outside the sandbox read-only, while the rest of `.git`
+(index, objects, refs, logs, `HEAD`) stays writable so `git add` and `git commit` keep working
+inside the sandbox. For a workspace whose top level holds `.git`:
+
+- The protected paths are `<common-dir>/config`, `<common-dir>/hooks`, `<common-dir>/info`,
+  `<common-dir>/modules`, `<git-dir>/config.worktree`, and `<git-dir>/commondir` (a planted
+  `commondir` would redirect Git to a model-written common directory). For a plain repository both
+  directories are `.git`. For a linked worktree, the `.git` gitfile is itself protected, its
+  `gitdir:` line names the Git directory, and that directory's `commondir` file names the common
+  directory. A repository above the workspace is outside every writable root already and is not
+  consulted.
+- **bubblewrap:** each protected path that exists, is a regular file or directory, and lies inside
+  the workspace is opened beneath the canonical workspace one component at a time without
+  following symlinks, and is bound read-only with `--ro-bind-fd` after the writable workspace bind;
+  bubblewrap binds exactly that inode and closes the descriptor before the sandboxed program
+  starts. The `.git` directory is first bound onto itself (`--bind-fd`, still writable), so it is a
+  mount point that cannot be renamed away, edited under another name, and renamed back. Missing
+  paths (commonly `modules`, `config.worktree`, and `commondir`) are skipped because bubblewrap
+  cannot bind a path that does not exist without creating it on the host; **remaining gap:** under
+  bubblewrap a sandboxed process can therefore create a protected path that was absent at launch
+  (for example a `.git/commondir` pointing at a model-written directory, or `.git/hooks` in a
+  repository that has none). A linked worktree's common directory lies outside the workspace and is
+  not visible inside the sandbox at all. Writes fail with `EROFS`, and replacing a protected file or directory
+  (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options need
+  bubblewrap 0.8.0 or later; an older bubblewrap (probed once by parsing `--ro-bind-fd`) logs a
+  warning and launches without this defence rather than binding a model-writable path by name,
+  which could be swapped for a symlink to a host file.
+- **Seatbelt:** the profile ends with `(deny file-write* ...)` after the workspace write grant (of
+  two filtered rules, Seatbelt applies the later one): a `subpath` filter for every protected path
+  whether or not it exists yet, and a `literal` filter for the `.git` directory itself, each in both
+  its configured and its resolved spelling. Writes fail with `EPERM`.
+
+This rule is defence in depth for the host-side Git hardening (`GitRunner`), which still treats
+repository configuration as untrusted. Paths created while no repository exists (a `git init`
+inside the sandbox) are not protected until the next launch, and `zerobox` and Windows
+AppContainer do not apply this rule.
+
 General-subprocess networking and Phase 2's historically in-process `fetch()` global are separate
 capabilities. Phase 6 supersedes that placement by keeping `fetch()` in the parent capability
 broker. The bwrap general-subprocess policy always denies networking. A permission-approved
@@ -268,7 +309,9 @@ Supported macOS hosts default to the system-provided Seatbelt backend at the fix
 `/usr/bin/sandbox-exec` path. The executable and every parent directory must be root-owned and not
 group/world-writable. The generated profile denies by
 default, allows child processes, allows host-readable files, permits writes only below the
-canonical workspace, canonical application cache, `/private/tmp`, and `/dev/null`, and denies all
+canonical workspace, canonical application cache, `/private/tmp`, and `/dev/null`, keeps the
+workspace Git metadata read-only as described in
+[Workspace Git metadata stays read-only](#workspace-git-metadata-stays-read-only), and denies all
 Seatbelt network operations. The child starts through `/usr/bin/env -i`; only the same
 non-credential environment allow-list as Linux is restored and `TMPDIR` is fixed to
 `/private/tmp`.

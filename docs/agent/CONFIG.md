@@ -1514,7 +1514,10 @@ MCP-backed calls use `mcp_tool` as the tool key and
 `mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the
 default action applied when no rule for a tool matches. In `standard` mode an
 unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
-default (so `"*": ask` asks before workspace modifications), while unmatched
+default (so `"*": ask` asks before workspace modifications), except that an
+unmatched write or edit of the workspace's `.git/config` or anything under
+`.git/hooks` always asks (Git runs that configuration and those hooks outside
+the sandbox; a matching rule still decides), while unmatched
 workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
 external paths follow `external_directory`. A matching `external_directory`
 rule is combined with what the same call would get inside the workspace, and

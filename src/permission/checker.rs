@@ -478,6 +478,28 @@ impl PermissionChecker {
         }
     }
 
+    /// Standard mode asks before a file tool rewrites the workspace's Git
+    /// configuration or hooks, which later run outside the sandbox, when no
+    /// configured rule decided the call. Other modes and rules are unchanged.
+    fn ask_before_git_execution_metadata_write(
+        &self,
+        tool: &str,
+        relative: Option<&str>,
+        rule_matched: bool,
+        action: Action,
+    ) -> Action {
+        if self.mode == SecurityMode::Standard
+            && !rule_matched
+            && action == Action::Allow
+            && matches!(tool, "write" | "edit" | "js/write_file")
+            && relative.is_some_and(is_git_execution_metadata)
+        {
+            Action::Ask
+        } else {
+            action
+        }
+    }
+
     fn apply_rules(&self) -> bool {
         self.permission_modes.contains(&self.mode) || self.mode == SecurityMode::Yolo
     }
@@ -929,6 +951,12 @@ impl PermissionChecker {
 
         let action =
             self.resolve_path_action(tool, &matched, abs_path, external, external_action, false);
+        let action = self.ask_before_git_execution_metadata_write(
+            tool,
+            relative.as_deref(),
+            !matched.is_empty(),
+            action,
+        );
         let result = self.doom_loop_check(tool, expanded, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]
@@ -1016,6 +1044,12 @@ impl PermissionChecker {
         }
 
         let action = self.resolve_path_action(tool, &matched, &logical, false, None, true);
+        let action = self.ask_before_git_execution_metadata_write(
+            tool,
+            Some(&relative),
+            !matched.is_empty(),
+            action,
+        );
         let result = self.doom_loop_check(tool, &logical, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]
@@ -1530,6 +1564,26 @@ fn ext_dir_deny_matches(pattern: &Pattern, path: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a workspace-relative path is `.git/config` or under `.git/hooks`
+/// (ASCII case-insensitively, for case-insensitive filesystems).
+fn is_git_execution_metadata(relative: &str) -> bool {
+    let relative = relative.replace('\\', "/");
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    match parts.as_slice() {
+        [git, entry] => {
+            git.eq_ignore_ascii_case(".git")
+                && (entry.eq_ignore_ascii_case("config") || entry.eq_ignore_ascii_case("hooks"))
+        }
+        [git, hooks, _, ..] => {
+            git.eq_ignore_ascii_case(".git") && hooks.eq_ignore_ascii_case("hooks")
+        }
+        _ => false,
+    }
 }
 
 fn is_path_tool_name(tool: &str) -> bool {
@@ -3034,6 +3088,36 @@ mod case_insensitive_deny_tests {
             CheckResult::Allowed
         );
         let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod git_execution_metadata_tests {
+    use super::is_git_execution_metadata;
+
+    #[test]
+    fn matches_config_and_hooks_in_any_spelling() {
+        for relative in [
+            ".git/config",
+            ".git/hooks",
+            ".git/hooks/post-checkout",
+            "./.git//hooks/nested/x",
+            ".GIT/Hooks/pre-commit",
+            ".git\\config",
+        ] {
+            assert!(is_git_execution_metadata(relative), "{relative}");
+        }
+        for relative in [
+            ".git",
+            ".git/info/exclude",
+            ".git/config.lock",
+            ".git/configx",
+            "sub/.git/config",
+            "hooks/x",
+            "config",
+        ] {
+            assert!(!is_git_execution_metadata(relative), "{relative}");
+        }
     }
 }
 

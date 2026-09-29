@@ -1213,12 +1213,29 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MODEL-ACTION",
     ),
+    // The preflight and the option-parsing `--ro-bind-fd` support probe
+    // (mini-agent-4jsau), which exits at `--version` before any namespace.
     (
         "src/sandbox.rs",
         "let mut command = std::process::Command::new(bwrap);",
-        1,
+        2,
         "TC-INTERNAL-VERIFICATION",
     ),
+    // Host `git` fixture and log check for the real-backend workspace Git
+    // metadata tests (mini-agent-4jsau).
+    (
+        "src/sandbox.rs",
+        "let output = std::process::Command::new(\"git\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let log = std::process::Command::new(\"git\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox.rs", ".output()", 2, "TEST-ONLY"),
     (
         "src/sandbox.rs",
         "let mut command = std::process::Command::new(seatbelt);",
@@ -3472,9 +3489,22 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox.rs",
         "let mut command = std::process::Command::new(bwrap);",
-        1,
+        2,
         "TC-INTERNAL-VERIFICATION",
     ),
+    (
+        "src/sandbox.rs",
+        "let output = std::process::Command::new(\"git\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let log = std::process::Command::new(\"git\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox.rs", ".output()", 2, "TEST-ONLY"),
     (
         "src/sandbox.rs",
         "let mut command = std::process::Command::new(seatbelt);",
