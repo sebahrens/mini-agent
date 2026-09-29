@@ -288,6 +288,52 @@ fn alt_y_after_yanking_multibyte_text_mid_buffer() {
     assert_eq!(editor.cursor, "[🦀🦀".len());
 }
 
+// --- word motion on Alt/Ctrl+arrows and Alt+Backspace (mini-agent-rmcpm) ---
+
+fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}
+
+#[test]
+fn alt_and_ctrl_arrows_move_by_word() {
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+        let mut editor = InputEditor::new();
+        type_str(&mut editor, "héllo wörld  end");
+        editor.handle_key(with(KeyCode::Left, modifiers));
+        assert_eq!(editor.cursor, "héllo wörld  ".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Left, modifiers));
+        assert_eq!(editor.cursor, "héllo ".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Right, modifiers));
+        assert_eq!(editor.cursor, "héllo wörld".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Right, modifiers));
+        assert_eq!(editor.cursor, editor.buffer.len(), "{modifiers:?}");
+    }
+}
+
+#[test]
+fn alt_backspace_deletes_the_previous_word_onto_the_kill_ring() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "keep this");
+    editor.handle_key(with(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(editor.buffer.as_str(), "keep ");
+    editor.handle_key(ctrl('y'));
+    assert_eq!(editor.buffer.as_str(), "keep this");
+}
+
+#[test]
+fn word_commands_treat_newlines_and_tabs_as_separators() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "foo bar");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "baz");
+    editor.handle_key(ctrl('w'));
+    assert_eq!(editor.buffer.as_str(), "foo bar\n");
+    editor.handle_key(alt('b'));
+    assert_eq!(editor.cursor, "foo ".len());
+    editor.handle_key(alt('f'));
+    assert_eq!(editor.cursor, "foo bar".len());
+}
+
 // --- line-edge keys, history recall, unbound chords, @ triggers ---
 
 fn shift_enter() -> KeyEvent {

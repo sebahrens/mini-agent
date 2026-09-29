@@ -769,15 +769,42 @@ impl InputEditor {
             }
         }
 
-        if alt {
+        // Word motion also on Ctrl+Left/Right, the common non-Emacs binding.
+        if ctrl && !alt {
             match key.code {
-                KeyCode::Char('b') => {
+                KeyCode::Left => {
                     self.cursor = self.prev_word_start();
                     self.yank_pos = None;
                     return None;
                 }
-                KeyCode::Char('f') => {
+                KeyCode::Right => {
                     self.cursor = self.next_word_end();
+                    self.yank_pos = None;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        if alt {
+            match key.code {
+                // Terminals send Option/Alt+arrows either as `ESC b`/`ESC f`
+                // or as CSI `1;3D`/`1;3C`; both move by word.
+                KeyCode::Char('b') | KeyCode::Left => {
+                    self.cursor = self.prev_word_start();
+                    self.yank_pos = None;
+                    return None;
+                }
+                KeyCode::Char('f') | KeyCode::Right => {
+                    self.cursor = self.next_word_end();
+                    self.yank_pos = None;
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    let deleted = self.delete_prev_word();
+                    if !deleted.is_empty() {
+                        self.push_kill(deleted);
+                    }
                     self.yank_pos = None;
                     return None;
                 }
@@ -1121,10 +1148,10 @@ impl InputEditor {
             .position(|&(bi, _)| bi >= self.cursor)
             .unwrap_or(pairs.len());
         let mut pos = char_idx;
-        while pos > 0 && pairs[pos - 1].1 == ' ' {
+        while pos > 0 && pairs[pos - 1].1.is_whitespace() {
             pos -= 1;
         }
-        while pos > 0 && pairs[pos - 1].1 != ' ' {
+        while pos > 0 && !pairs[pos - 1].1.is_whitespace() {
             pos -= 1;
         }
         if pos < pairs.len() {
@@ -1145,10 +1172,10 @@ impl InputEditor {
             .position(|&(bi, _)| bi >= self.cursor)
             .unwrap_or(len);
         let mut pos = char_idx;
-        while pos < len && pairs[pos].1 == ' ' {
+        while pos < len && pairs[pos].1.is_whitespace() {
             pos += 1;
         }
-        while pos < len && pairs[pos].1 != ' ' {
+        while pos < len && !pairs[pos].1.is_whitespace() {
             pos += 1;
         }
         if pos < len {

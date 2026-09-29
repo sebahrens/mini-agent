@@ -476,8 +476,9 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+K` | Delete everything after the cursor. |
 | `Ctrl+A` / `Ctrl+E` | Move to the start/end of the current input line; pressing again at the edge stays put. |
 | `Ctrl+B` / `Ctrl+F` | Move one character left/right. |
-| `Alt+B` / `Alt+F` | Move one word left/right. |
+| `Alt+B` / `Alt+F`, `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right` | Move one word left/right. Words are separated by any whitespace, including newlines. |
 | `Alt+D` | Delete the next word. |
+| `Alt+Backspace` | Delete the previous word (like `Ctrl+W`). |
 | Other `Ctrl`/`Alt` letters | Ignored in the input and pickers; they never type the plain letter. With macOS Option-as-Meta enabled, Option-layer characters such as `@` on a German layout arrive as `Alt`+letter, so disable Option-as-Meta (or use the right Option key without it) to type them. |
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |

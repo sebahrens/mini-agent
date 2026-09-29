@@ -324,6 +324,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(false, "  Ctrl+A/E/B/F           move line edge/character");
     emit(false, "  Alt+B/F/D              move word/delete next word");
+    emit(
+        false,
+        "  Alt/Ctrl+Left/Right    move word; Alt+Backspace deletes word",
+    );
     emit(false, "  Ctrl+Y / Alt+Y         yank/rotate kill ring");
     emit(
         false,
