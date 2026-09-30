@@ -1751,6 +1751,18 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/sandbox.rs",
+        "assert!(output.exit_status.is_some_and(|status| status.success()));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.stdout, b\"DECLARED_EXECUTABLE\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/setup/mod.rs",
         ".is_some_and(|status| status.contains(\"never saved\"))",
         1,
@@ -2393,10 +2405,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         2,
         "NON-PROCESS",
     ),
+    // Captured Sandbox command-result fields in native boundary tests; the
+    // added Seatbelt assertions are data inspection, not process terminals.
     (
         "src/sandbox.rs",
         "String::from_utf8_lossy(&output.stderr)",
-        8,
+        9,
         "NON-PROCESS",
     ),
     (
@@ -2420,7 +2434,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox.rs",
         "output.exit_status.is_some_and(|status| status.success()),",
-        4,
+        5,
         "NON-PROCESS",
     ),
     ("src/sandbox.rs", "output.status,", 4, "NON-PROCESS"),
@@ -3231,6 +3245,19 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/sandbox.rs",
         &[
+            // Exact macro contexts for the two new native Seatbelt tests.
+            (
+                "05e3b16e731da032d3b458cb2ffa859da145b5a7adefa4806895742048a416b2",
+                1,
+            ),
+            (
+                "4dd1797249dccadd720d5239ab4cc1b711e50d34a29958f2a2f2b49b9b55cb3e",
+                1,
+            ),
+            (
+                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                1,
+            ),
             (
                 "627b473d9f5eeeebcc106c10f05b0efd5737d4306d9842f566d3b999afe0b605",
                 1,
