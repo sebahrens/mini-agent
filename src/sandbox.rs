@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
+#[cfg(any(
+    target_os = "macos",
+    feature = "mcp",
+    feature = "lsp",
+    feature = "git-worktree",
+    test
+))]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
