@@ -2479,7 +2479,7 @@ async fn resolve_skill_services(
 ///
 /// The JavaScript worker containment preflight already computes a specific
 /// reason for every refusal, but that reason used to die in a `tracing::warn!`
-/// that the raw-mode TUI never renders. Keeping it in a value lets the operator
+/// that the operator may never see. Keeping it in a value lets the operator
 /// surface print it verbatim.
 // Which variants a given build constructs depends on the feature combination
 // (`NotCompiled` only without `js`/`skills`, `Available` only with them), so on
@@ -2503,20 +2503,25 @@ pub struct JsRuntimeReport {
     pub learned_skills: RuntimeAvailability,
 }
 
+/// Placeholder used before any agent build has performed the worker probe.
+/// It is an unknown state, not a containment refusal.
+pub(crate) const JS_RUNTIME_PROBE_PENDING_REASON: &str =
+    "startup containment probe has not run yet";
+
 impl JsRuntimeReport {
     /// The report to show before any agent build has recorded one. A compiled-in
     /// subsystem is reported as not-yet-probed rather than as available, so the
     /// surface never claims more than has been verified.
-    fn unreported() -> Self {
+    pub(crate) fn unreported() -> Self {
         #[cfg(feature = "js")]
         let javascript = RuntimeAvailability::Unavailable {
-            reason: "startup containment probe has not run yet".to_string(),
+            reason: JS_RUNTIME_PROBE_PENDING_REASON.to_string(),
         };
         #[cfg(not(feature = "js"))]
         let javascript = RuntimeAvailability::NotCompiled;
         #[cfg(feature = "skills")]
         let learned_skills = RuntimeAvailability::Unavailable {
-            reason: "startup containment probe has not run yet".to_string(),
+            reason: JS_RUNTIME_PROBE_PENDING_REASON.to_string(),
         };
         #[cfg(not(feature = "skills"))]
         let learned_skills = RuntimeAvailability::NotCompiled;

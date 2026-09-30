@@ -1868,25 +1868,36 @@ fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Optio
 /// The gate can remove the `js` tool and the entire learned-skill subsystem
 /// with no other visible sign — the tool is simply absent — so the banner is
 /// the only surface an operator who never runs `/toggle` or `--print-config`
-/// sees. Only [`provider::RuntimeAvailability::Unavailable`] produces a line:
-/// a live subsystem and a build that never compiled the owning Cargo feature
-/// both add nothing, so the banner stays silent when there is nothing to say.
+/// sees. A pending initial report adds no line because no preflight decision
+/// has been made yet. A real refusal remains visible even if the other
+/// subsystem is pending, available, or not compiled.
 ///
 /// Kept pure and out of the renderer so the reason-propagation contract is
 /// unit-testable without a terminal.
 pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec<String> {
     use provider::RuntimeAvailability::Unavailable;
-    match (&report.javascript, &report.learned_skills) {
+    fn actual_refusal(availability: &provider::RuntimeAvailability) -> Option<&str> {
+        match availability {
+            Unavailable { reason } if reason != provider::JS_RUNTIME_PROBE_PENDING_REASON => {
+                Some(reason.as_str())
+            }
+            _ => None,
+        }
+    }
+    match (
+        actual_refusal(&report.javascript),
+        actual_refusal(&report.learned_skills),
+    ) {
         // The learned-skill refusal is derived from the JavaScript one
         // (`requires the contained JavaScript worker: <reason>`), so one line
         // names both subsystems and repeats the single underlying reason.
-        (Unavailable { reason }, Unavailable { .. }) => vec![format!(
+        (Some(reason), Some(_)) => vec![format!(
             "[!] JavaScript runtime and learned skills unavailable: {reason}"
         )],
-        (Unavailable { reason }, _) => {
+        (Some(reason), _) => {
             vec![format!("[!] JavaScript runtime unavailable: {reason}")]
         }
-        (_, Unavailable { reason }) => vec![format!("[!] learned skills unavailable: {reason}")],
+        (_, Some(reason)) => vec![format!("[!] learned skills unavailable: {reason}")],
         _ => Vec::new(),
     }
 }
@@ -2411,9 +2422,16 @@ mod tests {
     /// reason intact, and a healthy (or not-compiled) runtime must add nothing.
     #[test]
     fn js_runtime_banner_names_the_verbatim_containment_reason() {
-        use crate::provider::{JsRuntimeReport, RuntimeAvailability};
+        use crate::provider::{
+            JS_RUNTIME_PROBE_PENDING_REASON, JsRuntimeReport, RuntimeAvailability,
+        };
         const REASON: &str =
             "MACOS_CONTAINMENT_UNSUPPORTED_VERSION: macOS 15 is not a validated major";
+
+        assert!(
+            js_runtime_banner_lines(&JsRuntimeReport::unreported()).is_empty(),
+            "the pending startup probe must not be called unavailable"
+        );
 
         for report in [
             JsRuntimeReport {
@@ -2469,6 +2487,31 @@ mod tests {
                 "[!] learned skills unavailable: learned-skill services did not initialize"
                     .to_string()
             ]
+        );
+
+        assert_eq!(
+            js_runtime_banner_lines(&JsRuntimeReport {
+                javascript: RuntimeAvailability::Unavailable {
+                    reason: JS_RUNTIME_PROBE_PENDING_REASON.to_string(),
+                },
+                learned_skills: RuntimeAvailability::Unavailable {
+                    reason: REASON.to_string(),
+                },
+            }),
+            vec![format!("[!] learned skills unavailable: {REASON}")],
+            "a pending JS probe cannot mask a real skills failure"
+        );
+        assert_eq!(
+            js_runtime_banner_lines(&JsRuntimeReport {
+                javascript: RuntimeAvailability::Unavailable {
+                    reason: REASON.to_string(),
+                },
+                learned_skills: RuntimeAvailability::Unavailable {
+                    reason: JS_RUNTIME_PROBE_PENDING_REASON.to_string(),
+                },
+            }),
+            vec![format!("[!] JavaScript runtime unavailable: {REASON}")],
+            "a pending skills probe cannot be labeled as a refusal"
         );
     }
 

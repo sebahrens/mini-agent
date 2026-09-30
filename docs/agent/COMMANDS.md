@@ -164,6 +164,11 @@ You are in read-only mode. Only read files and explore.
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
 | `/toggle todo [on\|off]` | Enable or disable todo-list tools. |
 
+The startup banner reports JavaScript or learned-skill unavailability only after
+the containment probe has made a refusal decision. While the initial agent is
+still being built, the pending probe adds no warning; `/toggle` shows the
+current runtime report once it is available.
+
 ## Memory (feature-gated)
 
 Requires the `memory` feature, which is included in the default build.
