@@ -1,11 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(any(
-    target_os = "macos",
-    feature = "mcp",
-    feature = "lsp",
-    feature = "git-worktree",
-    test
-))]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -1810,6 +1803,9 @@ impl Sandbox {
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         let sandbox_cache = paths.cache_dir.join("sandbox-runtime");
+        #[cfg(target_os = "macos")]
+        let sandbox_cache =
+            select_macos_runtime_cache(sandbox_cache, &paths, dirs::cache_dir().as_deref())?;
         crate::fs::ensure_private_directory(&sandbox_cache).map_err(|error| {
             format!(
                 "sandbox: failed to create dedicated sandbox cache {}: {error}",
@@ -1823,6 +1819,8 @@ impl Sandbox {
             &sandbox_cache,
             "dedicated sandbox cache",
         )?);
+        #[cfg(target_os = "macos")]
+        validate_macos_runtime_cache(&cache_dir, &paths)?;
         *cached = Some(cache_dir.clone());
         Ok(cache_dir)
     }
@@ -4364,6 +4362,58 @@ pub(crate) fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String
         ));
     }
     Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A legacy application home places cache beneath the private configuration
+/// root. Seatbelt must continue denying that root, including read/write opens,
+/// so command scratch storage needs a separate location instead of a read
+/// exception that could expose credentials or configuration.
+#[cfg(any(target_os = "macos", test))]
+fn select_macos_runtime_cache(
+    configured: PathBuf,
+    paths: &crate::paths::AppPaths,
+    system_cache: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if !configured.is_absolute() || configured.parent().is_none() {
+        return Err("sandbox: command cache must be an absolute non-root directory".into());
+    }
+    seatbelt_string_literal(&configured, "dedicated sandbox cache")?;
+    if validate_macos_runtime_cache(&configured, paths).is_ok() {
+        return Ok(configured);
+    }
+    let fallback = system_cache
+        .ok_or_else(|| "sandbox: system cache is unavailable; set ZS_CACHE_DIR outside private application directories".to_string())?
+        .join(crate::product::LEGACY_APP_COMPONENT)
+        .join("sandbox-runtime");
+    validate_macos_runtime_cache(&fallback, paths)?;
+    Ok(fallback)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_runtime_cache(
+    cache: &Path,
+    paths: &crate::paths::AppPaths,
+) -> Result<(), String> {
+    if !cache.is_absolute() || cache.parent().is_none() {
+        return Err("sandbox: command cache must be an absolute non-root directory".into());
+    }
+    seatbelt_string_literal(cache, "dedicated sandbox cache")?;
+    let cache_resolved = seatbelt_resolved_spelling(cache);
+    for private in [&paths.config_dir, &paths.credentials_dir] {
+        let private_resolved = seatbelt_resolved_spelling(private);
+        for cache_spelling in std::iter::once(cache).chain(cache_resolved.as_deref()) {
+            for private_spelling in
+                std::iter::once(private.as_path()).chain(private_resolved.as_deref())
+            {
+                if cache_spelling.starts_with(private_spelling)
+                    || private_spelling.starts_with(cache_spelling)
+                {
+                    return Err("sandbox: command cache overlaps private application directories; set ZS_CACHE_DIR outside configuration and credentials directories".into());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6944,7 +6994,36 @@ printf {pass_token}
     async fn seatbelt_children_use_private_temp_and_cannot_overwrite_shared_temp() {
         assert!(seatbelt_exists(), "Seatbelt is unavailable");
         let scratch = ScratchDir::new();
-        let workspace = std::fs::canonicalize(scratch.path()).unwrap();
+        let home = scratch.path().join("system-home");
+        let app_home = scratch.path().join("app-home");
+        let workspace = scratch.path().join("workspace");
+        for path in [&home, &app_home, &workspace] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let home = std::fs::canonicalize(home).unwrap();
+        let app_home = std::fs::canonicalize(app_home).unwrap();
+        // The legacy application home co-locates configuration and cache.
+        // Exercise that real layout rather than depending on the developer's
+        // disjoint path overrides, which hid the private-temp regression.
+        let _env = crate::tests::ScopedProcessEnv::set(&[
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("MINI_AGENT_HOME", Some(app_home.as_os_str().to_owned())),
+            ("ZS_CONFIG_DIR", None),
+            ("ZS_DATA_DIR", None),
+            ("ZS_LOCAL_DATA_DIR", None),
+            ("ZS_STATE_DIR", None),
+            ("ZS_CACHE_DIR", None),
+            ("ZS_CREDENTIALS_DIR", None),
+        ]);
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let config_secret = app_home.join("config.toml");
+        let credentials = app_home.join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let credential_secret = credentials.join("sentinel");
+        std::fs::write(&config_secret, "private config sentinel").unwrap();
+        std::fs::write(&credential_secret, "private credential sentinel").unwrap();
+        let config_alias = workspace.join("config-alias");
+        std::os::unix::fs::symlink(&config_secret, &config_alias).unwrap();
         let shared = Path::new("/private/tmp")
             .join(format!("mini-agent-shared-temp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&shared).unwrap();
@@ -6952,15 +7031,27 @@ printf {pass_token}
         let sentinel = shared.path().join("host-sentinel");
         std::fs::write(&sentinel, "host sentinel\n").unwrap();
         let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        let cache = sandbox.get_cached_cache_dir().unwrap();
+        assert!(
+            cache.starts_with(&home),
+            "fixture must own fallback storage"
+        );
+        assert!(!cache.starts_with(&app_home));
         let script = format!(
             r#"if printf overwritten > '{}'; then echo SHARED_TMP_WRITABLE; fi
 test "$TMPDIR" = "$TMP" && test "$TMPDIR" = "$TEMP" || exit 20
 file=$(mktemp) || exit 21
 case "$file" in "$TMPDIR"/*) ;; *) exit 22;; esac
 printf private > "$file" && test "$(cat "$file")" = private && rm "$file" || exit 23
+for secret in '{}' '{}' '{}'; do
+    if cat "$secret"; then echo PRIVATE_ROOT_READABLE; exit 24; fi
+done
 printf workspace > workspace-proof
 echo PRIVATE_TEMP_PASS"#,
-            sentinel.display()
+            sentinel.display(),
+            config_secret.display(),
+            credential_secret.display(),
+            config_alias.display()
         );
         let mut commands = vec![sandbox.wrap_command(&script).unwrap()];
         commands.push(
@@ -7049,7 +7140,87 @@ echo PRIVATE_TEMP_PASS"#,
     }
 
     #[test]
+    fn macos_runtime_cache_selection_preserves_disjoint_overrides_and_moves_private_overlaps() {
+        let scratch = ScratchDir::new();
+        let root = std::fs::canonicalize(scratch.path()).unwrap();
+        let paths = crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            credentials_dir: root.join("credentials"),
+            cache_dir: root.join("cache"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            project_dir: None,
+        };
+        let configured = paths.cache_dir.join("sandbox-runtime");
+        assert_eq!(
+            select_macos_runtime_cache(configured.clone(), &paths, None).unwrap(),
+            configured
+        );
+        let system = root.join("system-cache");
+        let fallback = system
+            .join(crate::product::LEGACY_APP_COMPONENT)
+            .join("sandbox-runtime");
+        for private in [&paths.config_dir, &paths.credentials_dir] {
+            let overlapping = private.join("cache/sandbox-runtime");
+            assert!(select_macos_runtime_cache(overlapping.clone(), &paths, None).is_err());
+            assert_eq!(
+                select_macos_runtime_cache(overlapping, &paths, Some(&system)).unwrap(),
+                fallback
+            );
+        }
+        for invalid in [Path::new("relative"), Path::new("/")] {
+            assert!(select_macos_runtime_cache(invalid.into(), &paths, Some(&system)).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_runtime_cache_refuses_private_ancestors_descendants_and_aliases() {
+        let scratch = ScratchDir::new();
+        let root = std::fs::canonicalize(scratch.path()).unwrap();
+        let private = root.join("private");
+        std::fs::create_dir(&private).unwrap();
+        let paths = crate::paths::AppPaths {
+            config_dir: private.join("config"),
+            credentials_dir: private.join("credentials"),
+            cache_dir: private.join("cache"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            project_dir: None,
+        };
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&private, &alias).unwrap();
+        for candidate in [&private, &alias] {
+            assert!(validate_macos_runtime_cache(candidate, &paths).is_err());
+            assert!(validate_macos_runtime_cache(&candidate.join("config/cache"), &paths).is_err());
+            assert!(
+                validate_macos_runtime_cache(&candidate.join("credentials/cache"), &paths).is_err()
+            );
+        }
+        // A broad configured private root makes the fallback unsafe too.
+        let overlapping = paths.config_dir.join("cache");
+        let mut broad = paths.clone();
+        broad.config_dir = root.clone();
+        assert!(select_macos_runtime_cache(overlapping, &broad, Some(&root)).is_err());
+        // Recheck after publication catches a previously separate spelling
+        // whose ancestor was retargeted into private storage.
+        let separate = root.join("separate");
+        std::fs::create_dir(&separate).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&separate, &alias).unwrap();
+        let candidate = alias.join("config/runtime");
+        validate_macos_runtime_cache(&candidate, &paths).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&private, &alias).unwrap();
+        assert!(validate_macos_runtime_cache(&candidate, &paths).is_err());
+    }
+
+    #[test]
     fn seatbelt_profile_cache_is_byte_identical_to_uncached_build() {
+        // Keep application path inputs stable across cached and manual builds.
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
         let workspace = std::env::temp_dir().join(format!("test-ws-{}", uuid::Uuid::new_v4()));
         let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
@@ -7144,6 +7315,8 @@ echo PRIVATE_TEMP_PASS"#,
 
     #[test]
     fn seatbelt_profile_cache_key_varies_correctly() {
+        // Other tests temporarily replace process-wide application roots.
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
         let workspace_a = std::env::temp_dir().join(format!("test-ws-a-{}", uuid::Uuid::new_v4()));
         let workspace_b = std::env::temp_dir().join(format!("test-ws-b-{}", uuid::Uuid::new_v4()));
