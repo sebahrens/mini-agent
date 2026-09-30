@@ -679,7 +679,8 @@ not a failing baseline.
 projection: identity-stable, but carrying no semantic meaning. Its vectors are barred from dense
 retrieval, so on a default build the dense candidate limit is set to zero and every learned-JS
 result comes from the FTS5 BM25 channel alone. The startup diagnostic
-`semantic_retrieval_unavailable:deterministic_embedding_backend` records this.
+`semantic_retrieval_unavailable:deterministic_embedding_backend` records this as
+a debug diagnostic; normal lexical-only retrieval does not produce a warning.
 
 That lexical channel builds its query by tokenizing the prompt on non-alphanumeric boundaries,
 lower-casing, dropping a small stop-word list, ranking the surviving distinct terms by IDF over the

@@ -1100,7 +1100,11 @@ fn log_skill_diagnostics(diagnostics: &[String]) {
         let kind = diagnostic
             .split_once(':')
             .map_or(diagnostic.as_str(), |(kind, _)| kind);
-        if kind.ends_with("_unavailable") {
+        if diagnostic == "semantic_retrieval_unavailable:deterministic_embedding_backend" {
+            // The default backend intentionally uses healthy lexical-only
+            // retrieval; retain the diagnostic without alarming TUI users.
+            tracing::debug!(diagnostic = %diagnostic, "skill discovery diagnostic");
+        } else if kind.ends_with("_unavailable") {
             tracing::warn!(diagnostic = %diagnostic, "skill discovery diagnostic");
         } else {
             tracing::debug!(diagnostic = %diagnostic, "skill discovery diagnostic");
@@ -1330,6 +1334,80 @@ mod tests {
     use super::*;
     use crate::extras::js::skills::CapabilityManifest;
     use crate::extras::js::skills::router::RouteKind;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn expected_lexical_only_diagnostic_is_debug_and_real_failures_warn() {
+        #[derive(Default)]
+        struct DiagnosticVisitor(Option<String>);
+
+        impl tracing::field::Visit for DiagnosticVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "diagnostic" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "diagnostic" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = DiagnosticVisitor::default();
+                event.record(&mut visitor);
+                if let Some(diagnostic) = visitor.0 {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((*event.metadata().level(), diagnostic));
+                }
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&observed)));
+        tracing::subscriber::with_default(subscriber, || {
+            log_skill_diagnostics(&[
+                "semantic_retrieval_unavailable:deterministic_embedding_backend".to_string(),
+                "learned_js_store_unavailable:database_error".to_string(),
+                "semantic_retrieval_unavailable:unexpected_backend_failure".to_string(),
+                "retrieval_truncated:budget".to_string(),
+            ]);
+        });
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                (
+                    tracing::Level::DEBUG,
+                    "semantic_retrieval_unavailable:deterministic_embedding_backend".to_string(),
+                ),
+                (
+                    tracing::Level::WARN,
+                    "learned_js_store_unavailable:database_error".to_string(),
+                ),
+                (
+                    tracing::Level::WARN,
+                    "semantic_retrieval_unavailable:unexpected_backend_failure".to_string(),
+                ),
+                (
+                    tracing::Level::DEBUG,
+                    "retrieval_truncated:budget".to_string(),
+                ),
+            ]
+        );
+    }
 
     fn attribution_skill(id: &str) -> ResolvedSkill {
         ResolvedSkill {
