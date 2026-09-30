@@ -8,9 +8,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
-- Linux sandbox launches refuse existing symlink and hardlink aliases of protected Git metadata,
-  including a symlinked `.git`, and entries that cannot be pinned safely. Metadata first created
-  after launch and aliases introduced concurrently remain tracked limitations.
+- Linux and macOS sandbox launches refuse existing symlink and hardlink aliases of protected Git
+  metadata, including bounded inspection of protected-directory descendants and external linked
+  worktree metadata. In-workspace gitfile target directories are pinned against rename while
+  ordinary Git add and commit remain available. Metadata first created after launch and aliases
+  introduced concurrently remain tracked limitations.
+- Executable Git configuration from multiply linked global files is treated as untrusted,
+  preserving ordinary single-link global helpers.
 - macOS commands with a shared application home select a separate private runtime cache when the
   configured cache overlaps configuration or credentials, preserving those read denials while
   allowing temporary-file workflows.

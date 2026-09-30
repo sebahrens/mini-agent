@@ -1,7 +1,7 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.8.2
+- **Specification version**: 1.8.3
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-30
@@ -17,11 +17,13 @@ The 2026-09-30 general-process hardening is owned by [phase-2-sandbox.md](phase-
 and [subprocess-trust.md](subprocess-trust.md): private macOS temporary storage, option-safe
 workspace service environments, and mandatory Linux descriptor-backed Git metadata binds.
 The follow-up selects disjoint macOS runtime storage for shared application homes and rejects
-existing Linux metadata symlink/hardlink aliases; absent, later, and concurrent metadata changes
+existing Linux/macOS metadata aliases, including protected-directory descendants and external
+linked-worktree entries, and pins in-workspace gitfile target directories; absent, later, and concurrent metadata changes
 remain tracked rather than claimed as protected.
 These changes do not alter the canonical Phase 6 worker containment checklist.
 The subprocess contract also records bounded, network-denied ACP client MCP servers and
-executable Git configuration origin checks, including the selected macOS cache fallback;
+executable Git configuration origin checks, including the selected macOS cache fallback and
+multiply linked global configuration files;
 it explicitly retains the separate Git
 probe-to-launch race and additional writable-root limitations.
 

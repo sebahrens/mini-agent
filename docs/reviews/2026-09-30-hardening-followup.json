@@ -1,0 +1,556 @@
+{
+  "date": "2026-09-30",
+  "scope": "Follow-up to compiled TUI, ACP, IDE, and defensive application hardening. Historical 54-command slash coverage and native IDE proofs remain in the linked reports.",
+  "prior_reports": [
+    "2026-09-30-native-hardening-audit.json",
+    "2026-09-30-native-ux-acp-audit.json"
+  ],
+  "implementation_commits": [
+    "02eb3e8",
+    "80d6fb8",
+    "a8d8a98",
+    "10e5236",
+    "781d71b",
+    "072f3b4",
+    "6d51863"
+  ],
+  "prior_ci": {
+    "head": "21750d1984565c1cdf2edd2d2d1a18d81da6cd79",
+    "run": "https://github.com/sebahrens/mini-agent/actions/runs/36698205385",
+    "conclusion": "failure",
+    "causes": [
+      "Generic Seatbelt command construction referenced OsString, but its import was macOS/feature/test-gated: production Linux and Windows compilation failed. Import is now unconditional.",
+      "With a shared application home, private config read denial also covered sandbox-runtime/tmp: mktemp failed on macOS. Select a disjoint private system-cache fallback without weakening private-root read denials."
+    ],
+    "failed_jobs_classified": {
+      "OsString import": 27,
+      "macOS private-temp test": 15,
+      "aggregate/prerequisite gate": 2
+    },
+    "classification_evidence": "/private/tmp/mini-agent-continued-prior-ci-summary.json"
+  },
+  "fixed": [
+    {
+      "issue": "mini-agent-ala40.14",
+      "change": "Cross-platform OsString import and macOS default-layout runtime-cache selection; selection checks both ancestry directions, lexical and resolved spellings before creation and after canonicalization.",
+      "negative_evidence": "/private/tmp/mini-agent-continued-private-tmp-before.log",
+      "positive_evidence": "/private/tmp/mini-agent-continued-private-tmp-after.log",
+      "private_read_controls": [
+        "config file",
+        "credential file",
+        "workspace symlink to config"
+      ]
+    },
+    {
+      "issue": "mini-agent-ala40.15",
+      "change": "Refuse preexisting Linux protected metadata symlinks, hardlinked regular files, unsupported entries, and entries that cannot be pinned; normal index/object/ref writes remain usable.",
+      "linux_evidence": {
+        "issue": "mini-agent-ala40.15",
+        "commit": "7099d5a6365504e88783c807163d8de4ea34be87",
+        "platform": "Docker LinuxKit 6.12.76 aarch64 on macOS host; rust:1.95-bookworm base image, repository rust-toolchain.toml pinned Rust 1.96.0",
+        "boundary_setup": "Disposable outer Docker container used --privileged because ordinary Docker disallowed bubblewrap's proc mount; test executable ran as unprivileged nobody. Bubblewrap 0.8.0+ installed in container. The privilege claim is for the outer test harness only, not the sandboxed command.",
+        "build_command": "docker run --rm --privileged -v /private/tmp/mini-agent-linux-metadata:/work:ro -v /private/tmp/mini-agent-linux-target:/target -w /work -e CARGO_TARGET_DIR=/target rust:1.95-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq bubblewrap pkg-config libssl-dev >/dev/null && cargo test --locked -j 2 bwrap_workspace_git_metadata --no-run >/tmp/compile.log 2>&1 && runuser -u nobody -- env HOME=/tmp /target/debug/deps/mini_agent-7e7b2093155867d5 bwrap_workspace_git_metadata --ignored --nocapture'",
+        "final_run_command": "docker run --rm --privileged -v /private/tmp/mini-agent-linux-target:/target rust:1.95-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq bubblewrap pkg-config libssl-dev >/dev/null && runuser -u nobody -- env HOME=/tmp /target/debug/deps/mini_agent-7e7b2093155867d5 bwrap_workspace_git_metadata --ignored --nocapture'",
+        "final_run_log": "/private/tmp/mini-agent-linux-metadata-native.log",
+        "results": [
+          "bwrap_workspace_git_metadata_rejects_existing_aliases: PASS (production Sandbox output wrapper refuses hardlinked config and symlinked .git)",
+          "bwrap_workspace_git_metadata_is_read_only: PASS (read-only metadata plus ordinary git add/commit and workspace service control)",
+          "2 passed, 0 failed, 0 ignored, 2861 filtered out; 0.08 s",
+          "macOS cargo test sandbox::git_metadata::tests::: 9 passed",
+          "cargo fmt and git diff --check: pass",
+          "cargo install --path . --debug --offline: pass in isolated install root"
+        ],
+        "negative_controls": [
+          "Before patch, unprivileged bwrap allowed a child to replace preexisting .git symlink with a symlink to a new model-written directory even while the canonical target Git directory and config were descriptor-bound.",
+          "Landlock ABI 6 with only a pinned dynamic ELF failed to execute it until the ELF interpreter was allowed; after allowing the interpreter, direct ld-linux-aarch64.so.1 /bin/sh -c echo LOADER_BYPASS succeeded. Landlock EXECUTE allowlisting Git plus its dynamic linker is therefore insufficient."
+        ],
+        "limits": [
+          "The patch rejects unsafe aliases present at the launch check. It does not enforce names created after launch, later nested repositories, or a concurrent writer between metadata inspection and bind setup; mini-agent-ala40.8 remains open.",
+          "FUSE /dev/fuse was absent from the local unprivileged image and no FUSE policy filesystem was implemented or validated.",
+          "A broad macOS sandbox:: test run had 123 pass and 10 environment-dependent failures from unavailable Seatbelt, private cache permissions, and code-signature checks; focused metadata tests and native Linux controls passed."
+        ]
+      }
+    },
+    {
+      "issue": "mini-agent-ala40.16",
+      "change": "Serialize both existing cache-key tests against process-global AppPaths overrides using the existing ScopedProcessEnv lock, preserving cache assertions.",
+      "agent_commit": "661a3a5",
+      "integrated_commit": "02eb3e8"
+    },
+    {
+      "issue": "mini-agent-ew67q.6",
+      "change": "Classify selected macOS fallback runtime cache and the configured cache as untrusted executable Git configuration origins using shared side-effect-free cache selection.",
+      "commit": "10e5236",
+      "native_negative_control": "Owned real-Git fixture executes a touch marker from fallback global include under old configured-only classifier. The shared-selection classifier overrides the filter, Git add succeeds with changed payload, and no marker exists; outside trusted helper remains in overrides.",
+      "test": "git::runner::tests::global_include_from_selected_seatbelt_cache_cannot_supply_executable_config"
+    },
+    {
+      "issue": "mini-agent-ew67q.7",
+      "change": "Executable global Git configuration requires a regular single-link retained origin handle; Unix and Windows link-count checks reject multiply linked files.",
+      "commit": "072f3b4",
+      "controls": [
+        "Owned real-Git old-classifier filter marker versus suppressed new-classifier marker and successful add",
+        "Ordinary single-link trusted helper retained",
+        "Hardlink removal restores single-link origin classification"
+      ],
+      "focused_evidence": "/private/tmp/mini-agent-continued-hardlink-git.log"
+    },
+    {
+      "issues": [
+        "mini-agent-ala40.17",
+        "mini-agent-ala40.18",
+        "mini-agent-gpjll"
+      ],
+      "change": "Bounded descriptor-relative nofollow inspection of existing protected directories and external linked-worktree metadata; validate macOS aliases before every profile lookup; pin in-workspace gitfile target directory.",
+      "commit": "6d51863",
+      "agent_commit": "4020303",
+      "native_evidence": {
+        "commit": "4020303",
+        "worktree": "/private/tmp/mini-agent-linux-dir-aliases",
+        "scope": "Static, preexisting Git metadata aliases; bounded nofollow traversal of protected directory trees; external linked-worktree metadata inspection; in-workspace gitfile target directory pinning; macOS validation before Seatbelt profile cache lookup",
+        "native_linux": {
+          "container_image": "rust:1.95-bookworm (project rust-toolchain selects Rust 1.96)",
+          "runtime": "Docker --privileged outer container for proc mount, actual bubblewrap execution as unprivileged nobody",
+          "command": "docker run --rm --privileged -v /private/tmp/mini-agent-linux-dir-aliases:/work:ro -v /private/tmp/mini-agent-linux-target:/target -w /work -e CARGO_TARGET_DIR=/target rust:1.95-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq bubblewrap pkg-config libssl-dev >/dev/null && cargo test --locked -j 2 bwrap_workspace_git_metadata --no-run > /target/compile-final.log 2>&1 && runuser -u nobody -- env HOME=/tmp /target/debug/deps/mini_agent-7e7b2093155867d5 bwrap_workspace_git_metadata --ignored --nocapture && runuser -u nobody -- env HOME=/tmp /target/debug/deps/mini_agent-7e7b2093155867d5 workspace_gitfile_target_directory_cannot_be_renamed --ignored --nocapture'",
+          "log": "/private/tmp/mini-agent-linux-dir-native-final.log",
+          "result": "3 metadata integration tests and 1 alternate gitfile target test passed; ordinary git add/commit remains available"
+        },
+        "native_macos": {
+          "real_seatbelt_alias_test": "/private/tmp/mini-agent-linux-dir-mac-native-final.log",
+          "real_seatbelt_gitfile_test": "/private/tmp/mini-agent-linux-dir-gitfile-mac.log",
+          "default_parallel_sandbox_suite": "/private/tmp/mini-agent-linux-dir-sandbox-parallel-final.log",
+          "result": "145 sandbox tests passed at default parallelism; real Seatbelt alias refusal and alternate gitdir rename refusal passed with ordinary Git commit"
+        },
+        "other_checks": {
+          "subprocess_inventory": "/private/tmp/mini-agent-linux-dir-inventory-final.log (27 passed)",
+          "debug_install": "/private/tmp/mini-agent-linux-dir-install-final.log (cargo install --path . --debug --offline passed)",
+          "fmt": "cargo fmt passed",
+          "diff_check": "git diff --check passed"
+        },
+        "limits": "Does not close mini-agent-ala40.8: missing or later-created metadata, aliases introduced concurrently with launch, and writable cache/mount aliases outside inspected Git metadata remain. Outer Docker privilege is setup only; bubblewrap tests run as nobody. macOS and Linux controls validate ordinary Git index/ref/worktree writes."
+      },
+      "compiled_acp_negative_control": "/private/tmp/mini-agent-alternate-gitdir-acp-before.log",
+      "test_fixture_race": "Lock process-global application-path inputs for both profile tests and new native Seatbelt tests. Earlier parallel ENOENT occurred during temporary HOME mutation; locks preserve assertions.",
+      "compiled_acp_positive_control": "/private/tmp/mini-agent-continued-delivery-gitdir-acp.log",
+      "compiled_acp_result": "Rename denied, original configuration unchanged, no moved directory or proof marker; close exit 0."
+    }
+  ],
+  "compiled_acp": {
+    "binary": "/Users/seb/.cargo/bin/mini-agent",
+    "evidence": "/private/tmp/mini-agent-continued-delivery-native-acp.log",
+    "result": "pass",
+    "controls": [
+      "initialize, bounded client MCP list, session/new and session/close",
+      "default shared application home selects owned 0700 disjoint runtime tmp",
+      "approved workspace write and actual mktemp/write/read/remove",
+      "outside-workspace and shared-host-temp writes denied without effects",
+      "permission denial without effect",
+      "both shell and sleep verified live before cancellation, absent afterward, no late write, exit 0"
+    ],
+    "observation": "Native parent emitted EPERM signal warnings, while owned process-state checks proved both children absent before close; warning text is not the process-lifetime verdict.",
+    "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2"
+  },
+  "acp_readiness": {
+    "issue": "mini-agent-ala40.12",
+    "status": "open",
+    "observation": "Original early return lacks captured actual tool result. Twenty native repeats and both cancellation-tree tests passed; no justified ACP code fix.",
+    "evidence": [
+      "/private/tmp/mini-agent-acp-readiness-repeats.log",
+      "/private/tmp/mini-agent-acp-readiness-both.log"
+    ]
+  },
+  "quality_gates": [
+    {
+      "name": "native macOS default cargo test",
+      "result": "pass",
+      "counts": [
+        {
+          "passed": 2918,
+          "ignored": 7
+        },
+        {
+          "passed": 15,
+          "ignored": 0
+        },
+        {
+          "passed": 2,
+          "ignored": 0
+        },
+        {
+          "passed": 7,
+          "ignored": 0
+        }
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-combined-default.log"
+    },
+    {
+      "name": "default strict all-targets Clippy",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-combined-default-clippy.log"
+    },
+    {
+      "name": "native macOS rich cargo test",
+      "result": "pass",
+      "counts": [
+        {
+          "passed": 3770,
+          "ignored": 12
+        },
+        {
+          "passed": 16,
+          "ignored": 0
+        },
+        {
+          "passed": 2,
+          "ignored": 0
+        },
+        {
+          "passed": 7,
+          "ignored": 0
+        }
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-combined-rich.log"
+    },
+    {
+      "name": "rich strict all-targets Clippy",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-combined-rich-clippy.log"
+    },
+    {
+      "name": "native macOS minimal cargo test",
+      "result": "pass",
+      "counts": [
+        {
+          "passed": 1798,
+          "ignored": 0
+        },
+        {
+          "passed": 8,
+          "ignored": 0
+        },
+        {
+          "passed": 0,
+          "ignored": 0
+        },
+        {
+          "passed": 0,
+          "ignored": 0
+        }
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-combined-minimal.log"
+    },
+    {
+      "name": "minimal strict all-targets Clippy",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-combined-minimal-clippy.log"
+    },
+    {
+      "name": "debug rich cargo install --path . --debug",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-combined-install.log"
+    },
+    {
+      "name": "subprocess inventory",
+      "result": "pass",
+      "passed": 27,
+      "evidence": "/private/tmp/mini-agent-continued-inventory.log"
+    },
+    {
+      "name": "release metadata policy",
+      "result": "pass",
+      "passed": 157,
+      "evidence": "/private/tmp/mini-agent-continued-metadata.log"
+    },
+    {
+      "name": "Phase6/VSCode/docs CI policy",
+      "result": "pass",
+      "passed": 47,
+      "evidence": "/private/tmp/mini-agent-continued-workflow.log"
+    },
+    {
+      "name": "compiled real-terminal TUI",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-tui.log"
+    },
+    {
+      "name": "final native macOS default suite",
+      "source_head": "781d71b",
+      "result": "pass",
+      "passed": 2919,
+      "ignored": 7,
+      "headless": 15,
+      "preflight": 2,
+      "worker_bootstrap": 7,
+      "evidence": "/private/tmp/mini-agent-continued-final-default.log"
+    },
+    {
+      "name": "final rich Git regression suite",
+      "source_head": "781d71b",
+      "result": "pass",
+      "passed": 19,
+      "evidence": "/private/tmp/mini-agent-continued-final-rich-git.log"
+    },
+    {
+      "name": "final minimal Git regression suite",
+      "source_head": "781d71b",
+      "result": "pass",
+      "passed": 19,
+      "evidence": "/private/tmp/mini-agent-continued-final-minimal-git.log"
+    },
+    {
+      "name": "final default strict all-targets Clippy",
+      "result": "pass",
+      "source_head": "781d71b",
+      "evidence": "/private/tmp/mini-agent-continued-final-default-clippy.log"
+    },
+    {
+      "name": "final rich strict all-targets Clippy",
+      "result": "pass",
+      "source_head": "781d71b",
+      "evidence": "/private/tmp/mini-agent-continued-final-rich-clippy.log"
+    },
+    {
+      "name": "final minimal strict all-targets Clippy",
+      "result": "pass",
+      "source_head": "781d71b",
+      "evidence": "/private/tmp/mini-agent-continued-final-minimal-clippy.log"
+    },
+    {
+      "name": "final debug rich cargo install --path . --debug",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-final-install.log"
+    },
+    {
+      "name": "delivery native macOS default full suite",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "passed": 2929,
+      "ignored": 7,
+      "integration_results": [
+        [
+          15,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          7,
+          0
+        ]
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-delivery-default.log",
+      "real_sandbox_required": true
+    },
+    {
+      "name": "delivery native macOS rich full suite",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "passed": 3781,
+      "ignored": 12,
+      "integration_results": [
+        [
+          16,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          7,
+          0
+        ]
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-delivery-rich.log",
+      "real_sandbox_required": true
+    },
+    {
+      "name": "delivery native macOS minimal full suite",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "passed": 1809,
+      "ignored": 0,
+      "integration_results": [
+        [
+          8,
+          0
+        ]
+      ],
+      "evidence": "/private/tmp/mini-agent-continued-delivery-minimal.log",
+      "real_sandbox_required": true
+    },
+    {
+      "name": "delivery default-clippy",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-default-clippy.log"
+    },
+    {
+      "name": "delivery rich-clippy",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-rich-clippy.log"
+    },
+    {
+      "name": "delivery minimal-clippy",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-minimal-clippy.log"
+    },
+    {
+      "name": "delivery install",
+      "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-install.log"
+    },
+    {
+      "name": "delivery release metadata policy",
+      "passed": 178,
+      "skipped": 1,
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-metadata.log"
+    },
+    {
+      "name": "delivery Phase6/VSCode/docs CI policy",
+      "passed": 47,
+      "result": "pass",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-workflow.log"
+    },
+    {
+      "name": "delivery live OpenRouter connectivity",
+      "result": "pass",
+      "final_reply": "Hello",
+      "evidence": "/private/tmp/mini-agent-continued-delivery-connectivity.log",
+      "observation": "Provider reasoning also streamed; final reply was Hello."
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "adversarial-reviewer",
+      "findings": [],
+      "residual_risks": [
+        "mini-agent-ew67q.4: host Git configuration probe and launch remain separate; newly introduced filters or nested gitlinks can change authority between them.",
+        "mini-agent-ala40.8: absent or later nested Git metadata, concurrent aliases, and a gitfile targeting another writable mount remain unresolved."
+      ],
+      "testing_gaps": [
+        "Exact final Windows/macOS/Linux hosted CI evidence pending."
+      ]
+    },
+    {
+      "reviewer": "reliability-reviewer",
+      "findings": [],
+      "residual_risks": [
+        "No total sandbox confidentiality or per-child cache isolation claim; general process policy remains distinct from Phase 6 worker containment."
+      ],
+      "testing_gaps": [
+        "ACP historical early-return incident was not reproduced."
+      ]
+    },
+    {
+      "reviewer": "testing-reviewer",
+      "findings": [],
+      "residual_risks": [],
+      "testing_gaps": [
+        "Hosted-platform outcomes must be recorded separately from local native evidence."
+      ]
+    },
+    {
+      "reviewer": "independent adversarial+testing (Sol6)",
+      "findings": [],
+      "residual_risks": [
+        "Known dynamic Linux metadata and host Git launch races remain open; preexisting protected-directory aliases and in-workspace alternate gitdir rename counterexamples have targeted fixes and native controls."
+      ],
+      "testing_gaps": []
+    },
+    {
+      "reviewer": "independent static metadata review (Sol6)",
+      "findings": [],
+      "residual_risks": [
+        "mini-agent-ala40.8: absent/later metadata, concurrent alias changes, and writable cache/mount aliases outside inspected Git metadata."
+      ],
+      "testing_gaps": [
+        "Native Windows hosted result not yet observed."
+      ],
+      "controls": [
+        "Pinned descriptor fstat and nofollow bounded traversal",
+        "External linked-worktree relative gitfile remains usable",
+        "Real macOS/Linux alternate gitdir rename denied while ordinary Git add/commit works",
+        "Validate Seatbelt aliases before cached profiles"
+      ]
+    }
+  ],
+  "design_negative_controls": [
+    {
+      "approach": "macOS blanket process-fork denial for host Git",
+      "result": "Blocks optional filter subprocess but breaks ordinary populated-submodule status/add; optional filter failure can return success with raw bytes. Not delivered as a fix.",
+      "evidence": [
+        "/private/tmp/mini-agent-git-boundary-probe.py",
+        "/private/tmp/mini-agent-gitlink-fork-probe.py"
+      ]
+    },
+    {
+      "approach": "Landlock pinned Git executable and dynamic linker",
+      "result": "Native direct linker invocation executed /bin/sh; insufficient to enforce Git-only execution. No such guarantee delivered.",
+      "source": "https://docs.kernel.org/userspace-api/landlock.html"
+    },
+    {
+      "approach": "FUSE policy filesystem",
+      "result": "No /dev/fuse in local image; no implemented or validated new backend.",
+      "source": "https://docs.kernel.org/filesystems/fuse/fuse.html"
+    }
+  ],
+  "remaining": [
+    "mini-agent-ew67q.4",
+    "mini-agent-ala40.8",
+    "mini-agent-ala40.12",
+    "mini-agent-ew67q.1",
+    "mini-agent-ew67q.2",
+    "mini-agent-mxtlv"
+  ],
+  "fresh_ci": {
+    "status": "not observed at local validation time",
+    "prior_failed_run": "https://github.com/sebahrens/mini-agent/actions/runs/36698205385",
+    "note": "The earlier exact-head failure is recorded above. Native evidence is separate from hosted CI; check the latest pushed-head workflow outcome."
+  },
+  "cleanup": {
+    "status": "completed for all current task-owned worktrees and fixture helpers",
+    "removed_clean_task_worktrees": [
+      "/private/tmp/mini-agent-acp-readiness",
+      "/private/tmp/mini-agent-linux-metadata",
+      "/private/tmp/mini-agent-git-fallback-origin",
+      "/private/tmp/mini-agent-git-hardlink-origin",
+      "/private/tmp/mini-agent-linux-dir-aliases"
+    ],
+    "helpers": "Owned TUI loopback provider reaped; owned tmux socket closed; ACP owned agent and mock provider exited.",
+    "preserved": "User worktrees and branches preserved. Task-owned fallback stash was restored and dropped after integration; no root stash."
+  },
+  "compiled_tui": {
+    "binary": "/Users/seb/.cargo/bin/mini-agent",
+    "source_head": "6d5186309bd3149f992772f6ee50d79252a7dac2",
+    "result": "pass",
+    "evidence": "/private/tmp/mini-agent-continued-final-tui.log",
+    "screens": "/private/tmp/mini-agent-ux-fpyoj/evidence/hardening-*.screen.txt",
+    "controls": [
+      "first Enter applies /model",
+      "readonly and standard mode transitions",
+      "actual streamed provider reply",
+      "/hooks feedback",
+      "72x20 resize and restore",
+      "/quit closes real terminal session",
+      "healthy lexical-only diagnostic absent from warning output"
+    ],
+    "prior_all_slash_coverage": "2026-09-30-native-ux-acp-audit.json: 54 commands and aliases",
+    "driver_result": "/private/tmp/mini-agent-continued-delivery-tui-wrapper.log"
+  },
+  "implementation_head": "6d51863",
+  "remaining_descriptions": {
+    "mini-agent-ew67q.4": "Host Git configuration probe-to-launch race; no total freeze across concurrent writers.",
+    "mini-agent-ala40.8": "Missing/later/nested metadata and concurrent or additional writable-root aliases.",
+    "mini-agent-ala40.12": "Historical ACP early return lacks a captured actual result; twenty repeats passed.",
+    "mini-agent-ew67q.1": "Required CI gate still lacks a non-owner negative control.",
+    "mini-agent-ew67q.2": "Release tag gate still lacks branch/tag deployment negative controls.",
+    "mini-agent-mxtlv": "Native VS Code Chat view registry blocks that specific UX proof; native VSIX installation and session export were verified."
+  }
+}

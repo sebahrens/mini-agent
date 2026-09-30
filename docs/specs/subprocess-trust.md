@@ -1,7 +1,7 @@
 # Subprocess Trust Classes and Launch Contracts
 
 - **Document role**: normative cross-cutting specification
-- **Specification version**: 1.2.2
+- **Specification version**: 1.2.3
 - **Delivery status**: contract delivered; hardening gaps remain tracked separately
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-30
@@ -48,8 +48,8 @@ Every workspace profile (`TC-MODEL-ACTION` commands and brokered JS `spawn`, san
 `TC-PROJECT-AUTOMATION` hooks, and workspace services) keeps the workspace's Git `config`, `hooks`,
 `info`, `modules`, `config.worktree`, `commondir`, and a linked worktree's gitfile read-only, and
 pins `.git` against renaming, and Linux/macOS refuse existing symlink/hardlink metadata aliases
-that path rules cannot safely protect, including descendants of protected directories under a bounded descriptor
-walk, so a prompt-injected command cannot plant `core.fsmonitor`, hooks, or filter
+that path rules cannot safely protect, including descendants of protected directories under a
+bounded descriptor walk, so a prompt-injected command cannot plant `core.fsmonitor`, hooks, or filter
 drivers that later run outside the sandbox. `git add` and `git commit` still work inside the
 sandbox. Under bubblewrap an entry absent at launch can still be created (a named remaining
 gap). The concrete bubblewrap (`--ro-bind-fd`, bubblewrap 0.8.0+) and Seatbelt
