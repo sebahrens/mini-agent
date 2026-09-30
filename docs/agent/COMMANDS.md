@@ -245,6 +245,8 @@ During a merge, a dirty worktree requires an explicit `c` to commit all changes;
 a conflict offers `l` to leave it for manual resolution. Uppercase action keys
 also work. `a`, Enter, Escape, Ctrl-C, or Ctrl-D selects abort. Closing the input
 channel also aborts. Background events are queued for processing after the prompt.
+The target branch is pulled before the merge when it has upstream configuration.
+For a local-only target branch, the merge uses its local tip without requiring a remote.
 
 ## Loop (feature-gated)
 

@@ -359,6 +359,28 @@ async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
     Ok(Some(branch))
 }
 
+/// A local-only target has nothing to pull. If either half of Git's upstream
+/// configuration is present, let `git pull` validate it and report failures.
+async fn target_has_pull_configuration(repo_path: &Path, target: &str) -> Result<bool, String> {
+    for suffix in ["remote", "merge"] {
+        let key = format!("branch.{target}.{suffix}");
+        let output = worktree_runner()
+            .run_allow_exit(
+                repo_path,
+                "target-upstream",
+                ["config", "--get", key.as_str()],
+                QUERY_LIMITS,
+            )
+            .await?;
+        match output.exit_status.and_then(|status| status.code()) {
+            Some(0) => return Ok(true),
+            Some(1) => {}
+            _ => return Err(command_failure("target-upstream", &output)),
+        }
+    }
+    Ok(false)
+}
+
 async fn validate_branch_name(repo_path: &Path, branch: &str) -> Result<(), String> {
     if branch.is_empty() {
         return Err("Git branch name must not be empty".to_string());
@@ -1263,33 +1285,49 @@ async fn try_merge_transaction(
         }
         Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
     };
-    state.index_mutation_attempted = true;
-    match await_merge_step(
+    let pull_configured = match await_merge_step(
         response_tx,
-        run_network(
-            &main_repo_path,
-            "pull",
-            ["pull", "--no-edit", "--no-rebase"],
-        ),
+        target_has_pull_configuration(&main_repo_path, target),
     )
     .await
     {
-        Ok(_) => {}
+        Ok(configured) => configured,
         Err(MergeStepError::Command(error)) => {
-            let mut rollback_errors = Vec::new();
-            if let Err(reset_error) = rollback_merge_index(&state).await {
-                rollback_errors.push(reset_error);
-            }
             return SupervisedMerge::Deliver(
-                early_merge_error_after_branch_change(
-                    &mut state,
-                    format!("pull failed: {error}"),
-                    rollback_errors,
-                )
-                .await,
+                early_merge_error_after_branch_change(&mut state, error, Vec::new()).await,
             );
         }
         Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+    };
+    state.index_mutation_attempted = true;
+    if pull_configured {
+        match await_merge_step(
+            response_tx,
+            run_network(
+                &main_repo_path,
+                "pull",
+                ["pull", "--no-edit", "--no-rebase"],
+            ),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(MergeStepError::Command(error)) => {
+                let mut rollback_errors = Vec::new();
+                if let Err(reset_error) = rollback_merge_index(&state).await {
+                    rollback_errors.push(reset_error);
+                }
+                return SupervisedMerge::Deliver(
+                    early_merge_error_after_branch_change(
+                        &mut state,
+                        format!("pull failed: {error}"),
+                        rollback_errors,
+                    )
+                    .await,
+                );
+            }
+            Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+        }
     }
 
     match await_merge_step(response_tx, direct_ref_oid(&main_repo_path, &target_ref)).await {

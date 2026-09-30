@@ -1032,6 +1032,79 @@ mod tests {
         assert_eq!(worktree_has_uncommitted(repo.path()).await, Ok(false));
     }
 
+    #[tokio::test]
+    async fn local_only_clean_worktree_merges_without_an_upstream() {
+        let repo = TempRepo::new("local-only merge");
+        let worktree = repo.path().parent().unwrap().join("linked worktree");
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("feature"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        std::fs::write(worktree.join("feature.txt"), "local feature\n").unwrap();
+        git(&worktree, ["add", "feature.txt"]);
+        git(&worktree, ["commit", "-m", "feature"]);
+        assert_eq!(worktree_has_uncommitted(&worktree).await, Ok(false));
+
+        let info = WorktreeInfo {
+            branch: "feature".into(),
+            worktree_path: worktree.clone(),
+            main_repo_path: repo.path().to_path_buf(),
+        };
+        let (mut state, outcome) = try_merge(&info, "main").await;
+        assert_eq!(outcome, MergeOutcome::Success);
+        complete_merge(&mut state).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("feature.txt")).unwrap(),
+            "local feature\n"
+        );
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn configured_but_incomplete_upstream_still_fails_pull() {
+        for (key, value) in [
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ] {
+            let repo = TempRepo::new("incomplete upstream");
+            let worktree = repo.path().parent().unwrap().join("linked worktree");
+            git(repo.path(), ["config", key, value]);
+            git(
+                repo.path(),
+                vec![
+                    OsString::from("worktree"),
+                    OsString::from("add"),
+                    OsString::from("-b"),
+                    OsString::from("feature"),
+                    worktree.as_os_str().to_os_string(),
+                ],
+            );
+            std::fs::write(worktree.join("feature.txt"), "local feature\n").unwrap();
+            git(&worktree, ["add", "feature.txt"]);
+            git(&worktree, ["commit", "-m", "feature"]);
+            let info = WorktreeInfo {
+                branch: "feature".into(),
+                worktree_path: worktree.clone(),
+                main_repo_path: repo.path().to_path_buf(),
+            };
+
+            let (_state, outcome) = try_merge(&info, "main").await;
+            assert!(
+                matches!(outcome, MergeOutcome::Error(error) if error.contains("pull failed")),
+                "incomplete {key} configuration must not be treated as local-only"
+            );
+            assert!(!repo.path().join("feature.txt").exists());
+            assert_eq!(worktree_has_uncommitted(&worktree).await, Ok(false));
+        }
+    }
+
     /// mini-agent-93gx4: the model can write `.git/hooks` and `.git/config`
     /// from inside the sandbox, so the host-side auto-commit must not run
     /// repository hooks or repository-configured filters.
