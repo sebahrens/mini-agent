@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as acp from '@agentclientprotocol/sdk';
 
@@ -18,6 +19,7 @@ const logMock = vi.hoisted(() => ({
 }));
 const spawnMock = vi.hoisted(() => vi.fn());
 const trust = vi.hoisted(() => ({ isTrusted: true }));
+const protocol = vi.hoisted(() => ({ connect: vi.fn() }));
 
 vi.mock('vscode', () => ({
   StatusBarAlignment: { Right: 2 },
@@ -33,6 +35,14 @@ vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
   return { ...actual, spawn: spawnMock };
 });
+vi.mock('@agentclientprotocol/sdk', async () => {
+  const actual = await vi.importActual<typeof import('@agentclientprotocol/sdk')>('@agentclientprotocol/sdk');
+  return {
+    ...actual,
+    client: vi.fn(() => ({ onRequest: () => ({ connect: protocol.connect }) })),
+    ndJsonStream: vi.fn(() => ({})),
+  };
+});
 
 import { AgentSession } from '../src/session';
 
@@ -41,6 +51,36 @@ class FakeProcess extends EventEmitter {
   readonly stderr = new EventEmitter();
   exitCode: number | null = null;
   kill = vi.fn();
+}
+
+class FakeProtocolProcess extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  exitCode: number | null = null;
+  readonly kill = vi.fn(() => {
+    this.exitCode = 0;
+    queueMicrotask(() => this.emit('exit', 0, 'SIGTERM'));
+    return true;
+  });
+}
+
+function held<T>() {
+  let release!: (value: T) => void;
+  const promise = new Promise<T>(resolve => { release = resolve; });
+  return { promise, release };
+}
+
+function successfulProbe(): void {
+  const probe = new FakeProcess();
+  spawnMock.mockImplementationOnce(() => {
+    queueMicrotask(() => {
+      probe.stdout.emit('data', Buffer.from('mini-agent 1.8.0\n'));
+      probe.exitCode = 0;
+      probe.emit('exit', 0, null);
+    });
+    return probe;
+  });
 }
 
 function makeSession(executable = '/usr/bin/mini-agent'): AgentSession {
@@ -206,6 +246,65 @@ describe('AgentSession --version probe', () => {
     const message = ui.showErrorMessage.mock.calls[0]?.[0] as string;
     expect(message).toContain('"/missing/mini-agent"');
     expect(message).toContain('spawn ENOENT');
+    session.dispose();
+  });
+});
+
+describe('AgentSession ACP trust transitions', () => {
+  it('reaps the owned child when trust is revoked during ACP initialize', async () => {
+    successfulProbe();
+    const child = new FakeProtocolProcess();
+    spawnMock.mockReturnValueOnce(child);
+    const initialize = held<{ protocolVersion: number }>();
+    const agent = { request: vi.fn(() => initialize.promise), buildSession: vi.fn() };
+    const connection = { agent, close: vi.fn() };
+    protocol.connect.mockReturnValue(connection);
+    const session = makeSession();
+
+    const starting = session.start();
+    await vi.waitFor(() => expect(agent.request).toHaveBeenCalledOnce());
+    trust.isTrusted = false;
+    initialize.release({ protocolVersion: 1 });
+
+    await expect(starting).rejects.toThrow(/trusted workspace/);
+    expect(connection.close).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(agent.buildSession).not.toHaveBeenCalled();
+    await session.stop();
+    expect(child.exitCode).toBe(0);
+    expect(statusBar.hide).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('disposes an in-flight ACP session and stops its child before any prompt', async () => {
+    successfulProbe();
+    const child = new FakeProtocolProcess();
+    spawnMock.mockReturnValueOnce(child);
+    const newSession = held<{ sessionId: string; dispose: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn> }>();
+    const active = { sessionId: 'held-session', dispose: vi.fn(), prompt: vi.fn() };
+    const startSession = vi.fn(() => newSession.promise);
+    const agent = {
+      request: vi.fn(async () => ({ protocolVersion: 1 })),
+      buildSession: vi.fn(() => ({ start: startSession })),
+    };
+    const connection = { agent, close: vi.fn() };
+    protocol.connect.mockReturnValue(connection);
+    const session = makeSession();
+    await session.start();
+
+    const prompting = session.prompt('should not dispatch', vi.fn(), new AbortController().signal);
+    await vi.waitFor(() => expect(startSession).toHaveBeenCalledOnce());
+    trust.isTrusted = false;
+    newSession.release(active);
+
+    await expect(prompting).rejects.toThrow(/trusted workspace/);
+    expect(active.dispose).toHaveBeenCalledOnce();
+    expect(active.prompt).not.toHaveBeenCalled();
+    expect(connection.close).toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalled();
+    await session.stop();
+    expect(child.exitCode).toBe(0);
+    expect(statusBar.hide).toHaveBeenCalled();
     session.dispose();
   });
 });
