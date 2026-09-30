@@ -54,21 +54,24 @@ class FakeProcess extends EventEmitter {
 }
 
 class FakeProtocolProcess extends EventEmitter {
+  constructor(private readonly ignoreSigterm = false) { super(); }
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   exitCode: number | null = null;
-  readonly kill = vi.fn(() => {
+  readonly kill = vi.fn((signal: NodeJS.Signals = 'SIGTERM') => {
+    if (this.ignoreSigterm && signal === 'SIGTERM') { return true; }
     this.exitCode = 0;
-    queueMicrotask(() => this.emit('exit', 0, 'SIGTERM'));
+    queueMicrotask(() => this.emit('exit', 0, signal));
     return true;
   });
 }
 
 function held<T>() {
   let release!: (value: T) => void;
-  const promise = new Promise<T>(resolve => { release = resolve; });
-  return { promise, release };
+  let fail!: (reason: Error) => void;
+  const promise = new Promise<T>((resolve, reject) => { release = resolve; fail = reject; });
+  return { promise, release, fail };
 }
 
 function successfulProbe(): void {
@@ -275,6 +278,57 @@ describe('AgentSession ACP trust transitions', () => {
     expect(statusBar.hide).toHaveBeenCalled();
     session.dispose();
   });
+
+  it.each(['initialize failure', 'trust loss'] as const)(
+    'waits for forced child exit after %s before settling startup', async scenario => {
+      successfulProbe();
+      const child = new FakeProtocolProcess(true);
+      spawnMock.mockReturnValueOnce(child);
+      const initialize = held<{ protocolVersion: number }>();
+      const agent = { request: vi.fn(() => initialize.promise), buildSession: vi.fn() };
+      const connection = { agent, close: vi.fn() };
+      protocol.connect.mockReturnValue(connection);
+      const session = makeSession();
+      const starting = session.start();
+      await vi.waitFor(() => expect(agent.request).toHaveBeenCalledOnce());
+      const queued = scenario === 'trust loss' ? session.start() : undefined;
+      const queuedRejected = queued ? expect(queued).rejects.toThrow(/trusted workspace/) : undefined;
+      let settled = false;
+      void starting.then(() => { settled = true; }, () => { settled = true; });
+
+      vi.useFakeTimers();
+      try {
+        if (scenario === 'trust loss') {
+          trust.isTrusted = false;
+          initialize.release({ protocolVersion: 1 });
+        } else {
+          initialize.fail(new Error('fixture initialize failed'));
+        }
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM');
+        expect(child.exitCode).toBeNull();
+        expect(settled).toBe(false);
+        expect(statusBar.hide).not.toHaveBeenCalled();
+        expect(spawnMock).toHaveBeenCalledTimes(2);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
+        await expect(starting).rejects.toThrow(
+          scenario === 'trust loss' ? /trusted workspace/ : /fixture initialize failed/,
+        );
+        if (queuedRejected) { await queuedRejected; }
+        expect(connection.close).toHaveBeenCalledOnce();
+        expect(child.exitCode).toBe(0);
+        expect(statusBar.hide).toHaveBeenCalled();
+        expect(agent.buildSession).not.toHaveBeenCalled();
+        expect(spawnMock).toHaveBeenCalledTimes(2);
+        await session.stop();
+        session.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it('disposes an in-flight ACP session and stops its child before any prompt', async () => {
     successfulProbe();

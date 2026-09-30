@@ -246,10 +246,11 @@ export class AgentSession {
       this.setState('running');
     } catch (error) {
       connection.close(error);
-      if (proc.exitCode === null) { proc.kill(); }
-      this.proc = undefined;
       this.connection = undefined;
       this.client = undefined;
+      this.setState('stopping');
+      if (proc.exitCode === null) { await terminate(proc); }
+      this.proc = undefined;
       this.setState('stopped');
       const recent = stderr.lines();
       log.error(`ACP initialize failed for ${this.executablePath}: ${errorMessage(error)}\n${formatStderrBlock(recent)}`);
