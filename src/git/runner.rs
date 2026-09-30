@@ -93,6 +93,8 @@ pub(crate) struct GitRunner {
     /// configuration of repositories nested in the work tree (see
     /// [`GitRunner::probing_nested_repositories`]).
     nested_repositories: bool,
+    #[cfg(test)]
+    home_override: Option<Arc<PathBuf>>,
 }
 
 impl Default for GitRunner {
@@ -133,6 +135,8 @@ impl GitRunner {
             program: Arc::new(program),
             identity: Arc::new(identity),
             nested_repositories: false,
+            #[cfg(test)]
+            home_override: None,
         })
     }
 
@@ -144,6 +148,8 @@ impl GitRunner {
             program: Arc::new(PathBuf::new()),
             identity: Arc::new(identity),
             nested_repositories: false,
+            #[cfg(test)]
+            home_override: None,
         })
     }
 
@@ -156,6 +162,12 @@ impl GitRunner {
     /// skip the extra `ls-files` per command.
     pub(crate) fn probing_nested_repositories(mut self) -> Self {
         self.nested_repositories = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_home_for_test(mut self, home: &Path) -> Self {
+        self.home_override = Some(Arc::new(home.to_path_buf()));
         self
     }
 
@@ -206,9 +218,9 @@ impl GitRunner {
     ///   cache, hooks, signing, external diff, submodule recursion, and the
     ///   `ext::` transport (and, outside network operations, credential
     ///   helpers, `core.sshCommand`, and `core.askPass`);
-    /// * every command-executing key that repository-scoped configuration
-    ///   (`local`/`worktree`, including anything it includes) sets is
-    ///   overridden with the user's global value or a non-executing default,
+    /// * every command-executing key from repository-controlled configuration
+    ///   (`local`/`worktree` and global includes sourced from writable roots)
+    ///   is overridden with a trusted global value or non-executing default,
     ///   so repository filter, diff, and merge drivers, credential helpers,
     ///   and `core.sshCommand` never run. Keys Git resolves first-value-wins
     ///   (`remote.*.uploadpack`/`receivepack`, `core.gitProxy`) cannot be
@@ -266,6 +278,12 @@ impl GitRunner {
         command.envs(internal_git_environment(profile, |name| {
             std::env::var_os(name)
         }));
+        #[cfg(test)]
+        if let Some(home) = self.home_override.as_ref() {
+            command.env("HOME", home.as_path());
+            // The fixture's HOME must not mix with the developer's XDG config.
+            command.env("XDG_CONFIG_HOME", home.join(".config"));
+        }
         command.env("GIT_CONFIG_COUNT", config.len().to_string());
         for (index, (key, value)) in config.iter().enumerate() {
             command
@@ -299,7 +317,13 @@ impl GitRunner {
     ) -> Result<Vec<ScopedConfigEntry>, String> {
         let command = self.build_internal_command(
             repo_path,
-            ["config", "--show-scope", "--null", "--list"],
+            [
+                "config",
+                "--show-scope",
+                "--show-origin",
+                "--null",
+                "--list",
+            ],
             InternalProfile::Local,
             &[],
         );
@@ -311,10 +335,104 @@ impl GitRunner {
             return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
         }
         match output.exit_status.and_then(|status| status.code()) {
-            Some(0) => parse_scoped_config(&output.stdout)
-                .map_err(|error| format!("refusing git {operation}: {error}")),
+            Some(0) => {
+                let mut entries = parse_scoped_config(&output.stdout)
+                    .map_err(|error| format!("refusing git {operation}: {error}"))?;
+                let roots = self.untrusted_config_roots(repo_path, operation).await?;
+                for entry in &mut entries {
+                    entry.trusted_origin =
+                        origin_is_outside_untrusted_roots(&entry.origin, repo_path, &roots);
+                }
+                Ok(entries)
+            }
             _ => Err(command_failure(operation, &output)),
         }
+    }
+
+    /// Repositories can be linked outside their work trees, and callers may
+    /// point at a subdirectory. Resolve all three places a model can author
+    /// Git metadata before trusting a nominally global included file.
+    async fn untrusted_config_roots(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let command = self.build_internal_command(
+            repo_path,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--is-bare-repository",
+            ],
+            InternalProfile::Local,
+            &hardened_config(InternalProfile::Local, false),
+        );
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, QUERY_LIMITS)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))?;
+        let output = command_result(operation, QUERY_LIMITS, output)?;
+        let lines = output
+            .stdout
+            .strip_suffix(b"\n")
+            .ok_or_else(|| format!("refusing git {operation}: Git repository roots are malformed"))?
+            .split(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        if lines.len() != 3
+            || lines[..2].iter().any(|line| line.is_empty())
+            || !matches!(lines[2], b"true" | b"false")
+        {
+            return Err(format!(
+                "refusing git {operation}: Git repository roots are malformed"
+            ));
+        }
+        let bare = lines[2] == b"true";
+        let mut roots = std::iter::once(repo_path.to_path_buf())
+            .chain(lines[..2].iter().copied().map(output_path_bytes))
+            .map(|path| {
+                path.canonicalize().map_err(|_| {
+                    format!("refusing git {operation}: Git repository roots cannot be resolved")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !bare {
+            let command = self.build_internal_command(
+                repo_path,
+                ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                InternalProfile::Local,
+                &hardened_config(InternalProfile::Local, false),
+            );
+            let output = Sandbox::new(false, "git")
+                .output_built_command_with_limits(command, QUERY_LIMITS)
+                .await
+                .map_err(|_| format!("git {operation} runner failed"))?;
+            let output = command_result(operation, QUERY_LIMITS, output)?;
+            let top = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
+                format!("refusing git {operation}: Git repository roots are malformed")
+            })?;
+            if top.is_empty() || top.contains(&b'\n') {
+                return Err(format!(
+                    "refusing git {operation}: Git repository roots are malformed"
+                ));
+            }
+            roots.push(output_path_bytes(top).canonicalize().map_err(|_| {
+                format!("refusing git {operation}: Git repository roots cannot be resolved")
+            })?);
+        }
+        let paths = crate::paths::process_paths()
+            .map_err(|_| format!("refusing git {operation}: application paths are unavailable"))?;
+        let cache_parent = paths
+            .cache_dir
+            .canonicalize()
+            .unwrap_or(paths.cache_dir.clone());
+        let sandbox_cache = cache_parent.join("sandbox-runtime");
+        roots.push(sandbox_cache.clone());
+        if let Ok(resolved) = sandbox_cache.canonicalize() {
+            roots.push(resolved);
+        }
+        Ok(roots)
     }
 
     /// Overrides for repositories nested in the work tree.
@@ -613,6 +731,29 @@ impl GitRunner {
     {
         self.run_profiled(repo_path, operation, args, limits, InternalProfile::Network)
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_network_with_input_for_test<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &'static str,
+        args: I,
+        input: Vec<u8>,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self
+            .internal_command(repo_path, operation, args, InternalProfile::Network)
+            .await?;
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_input_and_limits(command, input, limits)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))?;
+        command_result(operation, limits, output)
     }
 
     async fn run_profiled<I, S>(
@@ -1145,13 +1286,15 @@ fn nested_override_applies(key: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 struct ScopedConfigEntry {
     scope: String,
+    origin: String,
     key: String,
     value: Option<String>,
+    trusted_origin: bool,
 }
 
-/// Selects executable keys from `git config --list --show-scope --null` output:
-/// `scope NUL key LF value NUL` per entry, with no `LF value` for a value-less
-/// boolean key.
+/// Selects executable keys from `git config --show-scope --show-origin --null
+/// --list` output: `scope NUL origin NUL key LF value NUL` per entry, with no
+/// `LF value` for a value-less boolean key.
 fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -1161,6 +1304,7 @@ fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
     let mut fields = records.split(|byte| *byte == 0);
     let mut entries = Vec::new();
     while let Some(scope) = fields.next() {
+        let origin = fields.next().ok_or_else(invalid)?;
         let pair = fields.next().ok_or_else(invalid)?;
         // A replacement character would name a different driver from the one
         // Git reads. Refuse the operation instead of emitting a lossy override.
@@ -1170,24 +1314,60 @@ fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
             .split(|byte| *byte == b'\n')
             .next()
             .ok_or_else(invalid)?;
-        if scope.is_empty() || key.is_empty() {
+        if scope.is_empty() || origin.is_empty() || key.is_empty() {
             return Err(invalid());
         }
         if !executable_config_key(key) {
             continue;
         }
         let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+        let origin = std::str::from_utf8(origin).map_err(|_| invalid())?;
         let (key, value) = match pair.split_once('\n') {
             Some((key, value)) => (key, Some(value.to_string())),
             None => (pair, None),
         };
         entries.push(ScopedConfigEntry {
             scope: scope.to_string(),
+            origin: origin.to_string(),
             key: key.to_string(),
             value,
+            trusted_origin: false,
         });
     }
     Ok(entries)
+}
+
+/// Git reports an included file with the including file's `global` scope.
+/// Scope alone is therefore insufficient: a global include can point into a
+/// model-writable work tree or its Git administration directory. Check both
+/// the path Git named and its resolved target so a symlink under an untrusted
+/// root cannot confer global authority. An unknown or vanished origin is not
+/// trusted. This classifies the probed config; it does not freeze later edits.
+fn origin_is_outside_untrusted_roots(origin: &str, repo_path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(file) = origin.strip_prefix("file:") else {
+        return false;
+    };
+    let path = Path::new(file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_path.join(path)
+    };
+    // Check every ancestor before resolving the complete path. A symlink
+    // *inside* the work tree can point to an outside file, while /tmp itself
+    // may be a symlink to /private/tmp. Either spelling must remain untrusted.
+    for ancestor in path.ancestors() {
+        if roots.iter().any(|root| ancestor.starts_with(root)) {
+            return false;
+        }
+        let Ok(resolved) = ancestor.canonicalize() else {
+            return false;
+        };
+        if roots.iter().any(|root| resolved.starts_with(root)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Overrides for every executable key that repository-scoped configuration
@@ -1198,7 +1378,9 @@ fn untrusted_config_overrides(
     entries: &[ScopedConfigEntry],
     profile: InternalProfile,
 ) -> Result<Vec<(String, String)>, String> {
-    let trusted = |entry: &ScopedConfigEntry| matches!(entry.scope.as_str(), "global" | "system");
+    let trusted = |entry: &ScopedConfigEntry| {
+        entry.trusted_origin && matches!(entry.scope.as_str(), "global" | "system")
+    };
     let mut keys: Vec<&str> = Vec::new();
     for entry in entries.iter().filter(|entry| !trusted(entry)) {
         if !keys.contains(&entry.key.as_str()) {
@@ -1607,25 +1789,31 @@ mod tests {
     #[test]
     fn scoped_config_output_parses_values_and_valueless_keys() {
         let entries = parse_scoped_config(
-            b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0filter.x.required\0local\0core.sshcommand\nevil\nline\0",
+            b"global\0file:/home/user/.gitconfig\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0file:.git/config\0filter.x.required\0local\0file:.git/config\0core.sshcommand\nevil\nline\0",
         ).unwrap();
         assert_eq!(
             entries,
             vec![
                 ScopedConfigEntry {
                     scope: "global".into(),
+                    origin: "file:/home/user/.gitconfig".into(),
                     key: "filter.lfs.clean".into(),
                     value: Some("git-lfs clean -- %f".into()),
+                    trusted_origin: false,
                 },
                 ScopedConfigEntry {
                     scope: "local".into(),
+                    origin: "file:.git/config".into(),
                     key: "filter.x.required".into(),
                     value: None,
+                    trusted_origin: false,
                 },
                 ScopedConfigEntry {
                     scope: "local".into(),
+                    origin: "file:.git/config".into(),
                     key: "core.sshcommand".into(),
                     value: Some("evil\nline".into()),
+                    trusted_origin: false,
                 },
             ]
         );
@@ -1652,11 +1840,13 @@ mod tests {
             "gpg.program",
             "gpg.ssh.program",
         ];
-        let mut records = b"local\0remote.origin.url\nfile:///local/repo\0".to_vec();
+        let mut records =
+            b"local\0file:.git/config\0remote.origin.url\nfile:///local/repo\0".to_vec();
         for key in keys {
-            records.extend_from_slice(format!("local\0{key}\nvalue\0").as_bytes());
+            records
+                .extend_from_slice(format!("local\0file:.git/config\0{key}\nvalue\0").as_bytes());
         }
-        records.extend_from_slice(b"local\0filter.x.description\ntext\xff\0");
+        records.extend_from_slice(b"local\0file:.git/config\0filter.x.description\ntext\xff\0");
         let entries = parse_scoped_config(&records).unwrap();
         assert_eq!(
             entries
@@ -1671,33 +1861,102 @@ mod tests {
     fn scoped_config_rejects_lossy_or_incomplete_records() {
         assert_eq!(parse_scoped_config(b""), Ok(Vec::new()));
         assert_eq!(
-            parse_scoped_config(b"local\0user.name\nname\xff\0"),
+            parse_scoped_config(b"local\0file:.git/config\0user.name\nname\xff\0"),
             Ok(Vec::new())
         );
         for bytes in [
-            &b"local\0filter.x\xff.clean\nevil\0"[..],
-            &b"loc\xffal\0filter.x.clean\nevil\0"[..],
-            &b"global\0filter.x.clean\nevil\xff\0"[..],
-            &b"local\0filter.x.clean\nevil"[..],
+            &b"local\0file:.git/config\0filter.x\xff.clean\nevil\0"[..],
+            &b"loc\xffal\0file:.git/config\0filter.x.clean\nevil\0"[..],
+            &b"global\0file:/home/user/.gitconfig\0filter.x.clean\nevil\xff\0"[..],
+            &b"global\0file:/home/user/config\xff\0filter.x.clean\nevil\0"[..],
+            &b"local\0file:.git/config\0filter.x.clean\nevil"[..],
             &b"local\0"[..],
-            &b"\0filter.x.clean\nevil\0"[..],
-            &b"local\0\0"[..],
-            &b"local\0filter.x.clean\nevil\0worktree\0"[..],
+            &b"\0file:.git/config\0filter.x.clean\nevil\0"[..],
+            &b"local\0\0filter.x.clean\nevil\0"[..],
+            &b"local\0file:.git/config\0filter.x.clean\nevil\0worktree\0"[..],
         ] {
             assert!(parse_scoped_config(bytes).is_err(), "accepted {bytes:?}");
         }
         // Literal replacement characters are valid UTF-8 and must stay intact.
-        let entries = parse_scoped_config("local\0filter.\u{fffd}.clean\n\0".as_bytes()).unwrap();
+        let entries =
+            parse_scoped_config("local\0file:.git/config\0filter.\u{fffd}.clean\n\0".as_bytes())
+                .unwrap();
         assert_eq!(entries[0].key, "filter.\u{fffd}.clean");
         assert_eq!(entries[0].value.as_deref(), Some(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_origin_under_workspace_or_cache_is_not_trusted() {
+        use std::os::unix::fs::symlink;
+
+        let owned =
+            std::env::temp_dir().join(format!("mini-agent-origin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&owned).unwrap();
+        let repo = owned.join("repo");
+        let cache = owned.join("sandbox-runtime");
+        let trusted = owned.join("trusted");
+        for directory in [&repo, &cache, &trusted] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let trusted_file = trusted.join("config");
+        let cache_file = cache.join("config");
+        std::fs::write(&trusted_file, "").unwrap();
+        std::fs::write(&cache_file, "").unwrap();
+        let repo_file = repo.join("config");
+        std::fs::write(&repo_file, "").unwrap();
+        let alias = repo.join("alias");
+        symlink(&trusted_file, &alias).unwrap();
+        let outside_alias = trusted.join("alias-to-repo");
+        symlink(&repo_file, &outside_alias).unwrap();
+        let roots = vec![repo.canonicalize().unwrap(), cache.canonicalize().unwrap()];
+        let origin = |path: &Path| format!("file:{}", path.display());
+
+        assert!(origin_is_outside_untrusted_roots(
+            &origin(&trusted_file),
+            &repo,
+            &roots
+        ));
+        assert!(!origin_is_outside_untrusted_roots(
+            &origin(&cache_file),
+            &repo,
+            &roots
+        ));
+        assert!(!origin_is_outside_untrusted_roots(
+            &origin(&alias),
+            &repo,
+            &roots
+        ));
+        assert!(!origin_is_outside_untrusted_roots(
+            &origin(&outside_alias),
+            &repo,
+            &roots
+        ));
+        assert!(!origin_is_outside_untrusted_roots(
+            "command line:",
+            &repo,
+            &roots
+        ));
+        assert!(!origin_is_outside_untrusted_roots(
+            &origin(&repo.join("vanished")),
+            &repo,
+            &roots
+        ));
+        std::fs::remove_dir_all(owned).unwrap();
     }
 
     #[test]
     fn repository_scoped_executables_are_overridden_and_global_ones_kept() {
         let entry = |scope: &str, key: &str, value: &str| ScopedConfigEntry {
             scope: scope.into(),
+            origin: if scope == "global" {
+                "file:/home/user/.gitconfig".into()
+            } else {
+                "file:.git/config".into()
+            },
             key: key.into(),
             value: Some(value.into()),
+            trusted_origin: scope == "global",
         };
         let entries = vec![
             entry("global", "filter.lfs.clean", "git-lfs clean -- %f"),

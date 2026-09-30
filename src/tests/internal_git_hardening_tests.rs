@@ -163,6 +163,173 @@ async fn internal_git_status_does_not_run_clean_filters() {
     );
 }
 
+/// Git reports files reached through ~/.gitconfig as global even when the
+/// included file is model-writable. The runner must classify the file origin.
+#[tokio::test]
+async fn global_include_inside_repository_does_not_authorize_clean_filter() {
+    let fixture = Fixture::new("global-include-filter");
+    let home = fixture.root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let included = fixture.repo.join("model-config");
+    let (clean, marker) = fixture.marker_script("global-include-clean");
+    std::fs::write(
+        &included,
+        format!("[filter \"included\"]\n\tclean = {}\n", clean.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!("[include]\n\tpath = {}\n", included.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.repo.join(".gitattributes"),
+        "tracked.txt filter=included\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.repo.join("tracked.txt"), "changed\n").unwrap();
+
+    let runner = GitRunner::discover().unwrap().with_home_for_test(&home);
+    runner
+        .run(
+            &fixture.repo,
+            "add",
+            ["add", "tracked.txt"],
+            LOCAL_MUTATION_LIMITS,
+        )
+        .await
+        .expect("repository-sourced global include is neutralized");
+    assert_not_run(std::slice::from_ref(&marker));
+
+    // The same Git installation really executes the configured filter when
+    // it is not behind the runner; the marker is not an inert fixture.
+    std::fs::write(fixture.repo.join("tracked.txt"), "changed again\n").unwrap();
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["add", "tracked.txt"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists(), "the unguarded included filter did not run");
+}
+
+#[tokio::test]
+async fn global_include_inside_linked_git_dir_is_not_trusted() {
+    let fixture = Fixture::new("linked-global-include");
+    let linked = fixture.root.join("linked");
+    git(
+        &fixture.repo,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    );
+    let git_dir = StdCommand::new("git")
+        .arg("-C")
+        .arg(&linked)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .unwrap();
+    assert!(git_dir.status.success());
+    let git_dir = PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim());
+    let home = fixture.root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let included = git_dir.join("model-global-config");
+    let (clean, marker) = fixture.marker_script("linked-global-clean");
+    std::fs::write(
+        &included,
+        format!("[filter \"included\"]\n\tclean = {}\n", clean.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!("[include]\n\tpath = {}\n", included.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        linked.join(".gitattributes"),
+        "tracked.txt filter=included\n",
+    )
+    .unwrap();
+    std::fs::write(linked.join("tracked.txt"), "changed in linked worktree\n").unwrap();
+
+    GitRunner::discover()
+        .unwrap()
+        .with_home_for_test(&home)
+        .run(
+            &linked,
+            "add",
+            ["add", "tracked.txt"],
+            LOCAL_MUTATION_LIMITS,
+        )
+        .await
+        .expect("linked Git-dir include is neutralized");
+    assert_not_run(std::slice::from_ref(&marker));
+}
+
+#[tokio::test]
+async fn external_global_credential_helper_remains_authorized_for_network_profile() {
+    let fixture = Fixture::new("global-credential-helper");
+    let home = fixture.root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let marker = fixture.root.join("credential.marker");
+    let helper = fixture.root.join("credential-helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n: > '{}'\nprintf 'username=fixture\\npassword=fixture-secret\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!("[credential]\n\thelper = {}\n", helper.display()),
+    )
+    .unwrap();
+
+    let output = GitRunner::discover()
+        .unwrap()
+        .with_home_for_test(&home)
+        .run_network_with_input_for_test(
+            &fixture.repo,
+            "credential-fill",
+            ["credential", "fill"],
+            b"protocol=https\nhost=example.invalid\n\n".to_vec(),
+            QUERY_LIMITS,
+        )
+        .await
+        .expect("outside-workspace global helper stays authorized");
+    assert!(marker.exists(), "global credential helper did not run");
+    assert!(output.stdout.starts_with(b"protocol=https\n"));
+}
+
+#[tokio::test]
+async fn bare_repository_remains_usable_by_internal_runner() {
+    let fixture = Fixture::new("bare-origin-roots");
+    let bare = fixture.root.join("remote.git");
+    std::fs::create_dir(&bare).unwrap();
+    git(&bare, &["init", "--quiet", "--bare"]);
+
+    let output = GitRunner::discover()
+        .unwrap()
+        .run(
+            &bare,
+            "bare-repository-query",
+            ["rev-parse", "--is-bare-repository"],
+            QUERY_LIMITS,
+        )
+        .await
+        .expect("bare repository config origin probe must not need a work tree");
+    assert_eq!(output.stdout, b"true\n");
+}
+
 #[tokio::test]
 async fn undo_stash_uses_hardened_runner() {
     let fixture = Fixture::new("undo-stash");
