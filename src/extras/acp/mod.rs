@@ -1272,7 +1272,9 @@ fn client_mcp_policy(is_tcp: bool, trusted_by_operator: bool) -> ClientMcpPolicy
 /// workspace settings file), which is not the human-trusted `mcp_servers`
 /// path, so by default they are launched in the dedicated workspace-service
 /// sandbox of the resolved sandbox backend (working directory = the session
-/// root, the client's `env` plus the server process's `PATH` and `HOME`).
+/// root, the client's `env` plus the server process's `PATH` and `HOME`, with
+/// network access denied). A backend that cannot enforce network denial is
+/// refused at session creation rather than after a prompt begins.
 /// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` launches them unsandboxed instead.
 /// Anything this server cannot honour is refused explicitly rather than
 /// silently ignored: HTTP/SSE servers (not advertised), servers from a TCP
@@ -1300,7 +1302,7 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
-        let sandbox = match state.client_mcp {
+        let (sandbox, network) = match state.client_mcp {
             ClientMcpPolicy::Refused => {
                 return refuse(
                     "client-supplied MCP servers are refused over ACP TCP; configure them in \
@@ -1308,9 +1310,16 @@ fn client_mcp_servers(
                         .into(),
                 );
             }
-            ClientMcpPolicy::Trusted => None,
+            ClientMcpPolicy::Trusted => (None, McpStdioNetwork::Inherit),
             ClientMcpPolicy::Sandboxed => {
                 let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+                if backend == "zerobox" {
+                    return refuse(
+                        "client-supplied MCP servers require network denial, which the 'zerobox' \
+                         workspace-service sandbox cannot enforce"
+                            .into(),
+                    );
+                }
                 if !matches!(
                     crate::sandbox::Sandbox::new(true, &backend).policy(),
                     crate::sandbox::SandboxPolicy::RequiredAndAvailable
@@ -1321,7 +1330,7 @@ fn client_mcp_servers(
                          {ACP_TRUST_CLIENT_MCP_ENV}=1 to launch them unsandboxed"
                     ));
                 }
-                Some(backend)
+                (Some(backend), McpStdioNetwork::Deny)
             }
         };
         if !state.cli.mcp_is_eligible(&state.cfg) {
@@ -1360,7 +1369,7 @@ fn client_mcp_servers(
                         .collect(),
                     inherit_env: vec!["PATH".to_string(), "HOME".to_string()],
                     sandbox: sandbox.clone(),
-                    network: McpStdioNetwork::Inherit,
+                    network,
                 },
             );
         }
@@ -4616,7 +4625,7 @@ mod protocol_tests {
     #[cfg(feature = "mcp")]
     #[test]
     fn client_stdio_mcp_servers_become_session_command_servers() {
-        use crate::extras::mcp::config::McpServerConfig;
+        use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
         let mut state = fixture_state(fixture);
         Arc::get_mut(&mut state).unwrap().client_mcp = ClientMcpPolicy::Trusted;
@@ -4634,6 +4643,7 @@ mod protocol_tests {
             env,
             inherit_env,
             sandbox,
+            network,
             cwd,
             ..
         }) = accepted.get("editor-tools")
@@ -4645,6 +4655,7 @@ mod protocol_tests {
         assert_eq!(env.get("TOKEN").map(String::as_str), Some("from-editor"));
         assert_eq!(inherit_env, &vec!["PATH".to_string(), "HOME".to_string()]);
         assert!(sandbox.is_none() && cwd.is_none());
+        assert_eq!(*network, McpStdioNetwork::Inherit);
 
         let configured = Config {
             mcp_servers: Some(HashMap::from([(
@@ -4679,7 +4690,7 @@ mod protocol_tests {
     #[cfg(feature = "mcp")]
     #[test]
     fn client_stdio_mcp_servers_are_sandboxed_by_default() {
-        use crate::extras::mcp::config::McpServerConfig;
+        use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
         assert!(matches!(
             client_mcp_policy(false, false),
             ClientMcpPolicy::Sandboxed
@@ -4707,11 +4718,14 @@ mod protocol_tests {
         match client_mcp_servers(&state, &servers) {
             Ok(accepted) => {
                 assert!(available, "accepted without an available sandbox");
-                let Some(McpServerConfig::Command { sandbox, .. }) = accepted.get("editor-tools")
+                let Some(McpServerConfig::Command {
+                    sandbox, network, ..
+                }) = accepted.get("editor-tools")
                 else {
                     panic!("expected a command server: {accepted:?}");
                 };
                 assert_eq!(sandbox.as_deref(), Some(backend.as_str()));
+                assert_eq!(*network, McpStdioNetwork::Deny);
             }
             Err(error) => {
                 assert!(!available, "refused although the sandbox is available");
@@ -4732,6 +4746,18 @@ mod protocol_tests {
             error.to_string().contains(ACP_TRUST_CLIENT_MCP_ENV),
             "{error}"
         );
+
+        // A selected backend with no workspace-service network-denial arm is
+        // refused during session/new, before a tool-enabled prompt can start.
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut no_network_gate = fixture_state(fixture);
+        Arc::get_mut(&mut no_network_gate)
+            .unwrap()
+            .cfg
+            .sandbox_backend = Some("zerobox".to_string());
+        let error = client_mcp_servers(&no_network_gate, &servers)
+            .expect_err("zerobox cannot enforce client MCP network denial");
+        assert!(error.to_string().contains("cannot enforce"), "{error}");
     }
 
     #[test]
