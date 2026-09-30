@@ -752,8 +752,8 @@ jobs:
   publish-release:
     name: Publish GitHub release
     needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
-    # Deployment protection rules on this environment (required reviewers,
-    # tag-only deployment) are the last human gate before publication.
+    # The release environment admits only selected v* tags. Repository
+    # administrators may add required reviewers as a separate human gate.
     environment: release
     runs-on: ubuntu-latest
     permissions:

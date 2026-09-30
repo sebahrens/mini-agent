@@ -256,14 +256,15 @@ A release is built and published only from a commit CI has passed:
 If `verify-ci` fails because CI failed, fix the cause (or re-run the flaky CI jobs on the tag's CI
 run), wait for `ci-success` to pass, and then use **Re-run failed jobs** on the tag's release run.
 
-### Repository settings (manual, owner only)
+### Repository settings (live)
 
-Two protections live in repository settings rather than in the workflow files. An administrator
-applies them once; automated agents are not permitted to change repository rules.
+Two protections live in repository settings rather than in the workflow files. They were applied
+and checked through the GitHub API on 2026-09-30. Change them only with repository-admin authority
+and explicit authorization; keep the owner release bypass and the existing all-branch ruleset.
 
-1. **Require `ci-success` on `main`.** Settings → Rules → Rulesets → New branch ruleset: name
-   `Require CI`, enforcement *Active*, target *Default branch*, enable *Require status checks to
-   pass* and add the check `ci-success` from the *GitHub Actions* app. Equivalently:
+1. **Require `ci-success` on `main`.** The active `Require CI` ruleset (id `24233900`) targets the
+   default branch and requires the `ci-success` check from the GitHub Actions app. To recreate it
+   only if missing, use Settings → Rules → Rulesets → New branch ruleset with those settings, or:
 
    ```bash
    gh api -X POST repos/sebahrens/mini-agent/rulesets --input - <<'EOF'
@@ -290,13 +291,16 @@ applies them once; automated agents are not permitted to change repository rules
    the check then binds pull requests from everyone else, and the release workflow's `verify-ci`
    job still refuses to publish an admin-pushed commit that CI has not passed. Remove the bypass
    actor only when every change, including the release bump, lands through a pull request.
-   Confirm with `gh api repos/sebahrens/mini-agent/rules/branches/main`, which must list a
-   `required_status_checks` rule naming `ci-success`. The existing `Blocking` ruleset (id
-   20623676) applies to every branch, so do not add the check there.
-2. **Protect the `release` environment.** Settings → Environments → `release` (GitHub creates it
-   on the first release run if it does not exist): under *Deployment branches and tags* choose
-   *Selected branches and tags* and add the tag rule `v*`; optionally add *Required reviewers* to
-   approve each publication. Equivalently:
+   `gh api repos/sebahrens/mini-agent/rules/branches/main` lists the effective
+   `required_status_checks` rule naming `ci-success` and GitHub Actions integration id `15368`.
+   The existing `Blocking` ruleset (id `20623676`) still applies to every branch with its original
+   deletion, non-fast-forward, update, and creation rules, so do not add the check there. The
+   administrator bypass remains active on both rulesets. A disposable non-owner pull-request
+   negative control has not yet been run.
+2. **Protect the `release` environment.** The live `release` environment has
+   `protected_branches=false`, `custom_branch_policies=true`, and exactly one selected tag rule,
+   `v*`. It has no required reviewers. To recreate it only if missing, choose *Selected branches
+   and tags* under Settings → Environments → `release` and add the tag rule `v*`, or:
 
    ```bash
    gh api -X PUT repos/sebahrens/mini-agent/environments/release \
@@ -305,6 +309,10 @@ applies them once; automated agents are not permitted to change repository rules
    gh api -X POST repos/sebahrens/mini-agent/environments/release/deployment-branch-policies \
      -f name='v*' -f type=tag
    ```
+
+   The environment API confirms the policy shape. No real branch deployment was attempted to
+   demonstrate rejection, and no tag deployment was created solely for this check. A required
+   reviewer can be added later if each publication needs a separate human approval.
 
 The release workflow accepts only pushed `v*` tags. After `verify-ci`, its `package-metadata` job rejects a non-tag ref,
 a malformed tag, or a tag whose version differs from the root Cargo package version before any
