@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Internal Git commands now refuse malformed or non-UTF8 executable configuration. The probe
+  reads all configuration records instead of a locale-sensitive regex query, so a filter name
+  containing invalid UTF-8 cannot escape the command overrides and execute on the host.
+
 - URL MCP servers are pinned to the addresses that passed the public-address check: the HTTP
   transport, its SSE reconnects and the OAuth client no longer resolve the host again, and every
   other OAuth host, lookup and redirect must also be public, so DNS rebinding to `127.0.0.1` or

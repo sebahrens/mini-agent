@@ -299,13 +299,7 @@ impl GitRunner {
     ) -> Result<Vec<ScopedConfigEntry>, String> {
         let command = self.build_internal_command(
             repo_path,
-            [
-                "config",
-                "--show-scope",
-                "--null",
-                "--get-regexp",
-                EXECUTABLE_CONFIG_PATTERN,
-            ],
+            ["config", "--show-scope", "--null", "--list"],
             InternalProfile::Local,
             &[],
         );
@@ -317,9 +311,8 @@ impl GitRunner {
             return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
         }
         match output.exit_status.and_then(|status| status.code()) {
-            Some(0) => Ok(parse_scoped_config(&output.stdout)),
-            // `git config --get-regexp` exits 1 when no key matches.
-            Some(1) => Ok(Vec::new()),
+            Some(0) => parse_scoped_config(&output.stdout)
+                .map_err(|error| format!("refusing git {operation}: {error}")),
             _ => Err(command_failure(operation, &output)),
         }
     }
@@ -1081,17 +1074,25 @@ fn hardened_config(profile: InternalProfile, repository_execution: bool) -> Vec<
     config
 }
 
-/// Canonical (lower-case section and variable) names of configuration keys
-/// whose value Git executes. Hooks, fsmonitor, external diff, the editor,
-/// and the pager are covered by [`hardened_config`] and the policy
-/// environment instead.
-const EXECUTABLE_CONFIG_PATTERN: &str = "^(core\\.(sshcommand|askpass|gitproxy|alternaterefscommand)\
-|credential\\.(.*\\.)?helper\
-|remote\\..*\\.(uploadpack|receivepack)\
-|filter\\..*\\.(clean|smudge|process|required)\
-|diff\\..*\\.(command|textconv)\
-|merge\\..*\\.driver\
-|gpg\\.(.*\\.)?program)$";
+/// Classifies Git's canonical (lower-case section and variable) key bytes.
+/// Do not ask Git to filter with a regex: locale-aware matching can skip a
+/// subsection containing non-UTF8 bytes even though Git executes that driver.
+fn executable_config_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"core.sshcommand" | b"core.askpass" | b"core.gitproxy" | b"core.alternaterefscommand"
+    ) || (key.starts_with(b"credential.") && key.ends_with(b".helper"))
+        || (key.starts_with(b"remote.")
+            && (key.ends_with(b".uploadpack") || key.ends_with(b".receivepack")))
+        || (key.starts_with(b"filter.")
+            && [b".clean".as_slice(), b".smudge", b".process", b".required"]
+                .iter()
+                .any(|suffix| key.ends_with(suffix)))
+        || (key.starts_with(b"diff.")
+            && (key.ends_with(b".command") || key.ends_with(b".textconv")))
+        || (key.starts_with(b"merge.") && key.ends_with(b".driver"))
+        || (key.starts_with(b"gpg.") && key.ends_with(b".program"))
+}
 
 /// Bounds for the nested-repository probe: nested repositories beyond these
 /// refuse the operation rather than run unprobed.
@@ -1148,27 +1149,45 @@ struct ScopedConfigEntry {
     value: Option<String>,
 }
 
-/// Parses `git config --show-scope --null` output: `scope NUL key LF value
-/// NUL` per entry, with no `LF value` for a value-less boolean key.
-fn parse_scoped_config(bytes: &[u8]) -> Vec<ScopedConfigEntry> {
-    let mut fields = bytes.split(|byte| *byte == 0);
+/// Selects executable keys from `git config --list --show-scope --null` output:
+/// `scope NUL key LF value NUL` per entry, with no `LF value` for a value-less
+/// boolean key.
+fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let invalid = || "executable Git configuration is malformed or not UTF-8".to_string();
+    let records = bytes.strip_suffix(b"\0").ok_or_else(invalid)?;
+    let mut fields = records.split(|byte| *byte == 0);
     let mut entries = Vec::new();
-    while let (Some(scope), Some(pair)) = (fields.next(), fields.next()) {
-        if scope.is_empty() && pair.is_empty() {
-            break;
+    while let Some(scope) = fields.next() {
+        let pair = fields.next().ok_or_else(invalid)?;
+        // A replacement character would name a different driver from the one
+        // Git reads. Refuse the operation instead of emitting a lossy override.
+        // Values must also survive exactly when restoring a trusted command.
+        let scope = std::str::from_utf8(scope).map_err(|_| invalid())?;
+        let key = pair
+            .split(|byte| *byte == b'\n')
+            .next()
+            .ok_or_else(invalid)?;
+        if scope.is_empty() || key.is_empty() {
+            return Err(invalid());
         }
-        let pair = String::from_utf8_lossy(pair);
+        if !executable_config_key(key) {
+            continue;
+        }
+        let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
         let (key, value) = match pair.split_once('\n') {
-            Some((key, value)) => (key.to_string(), Some(value.to_string())),
-            None => (pair.into_owned(), None),
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (pair, None),
         };
         entries.push(ScopedConfigEntry {
-            scope: String::from_utf8_lossy(scope).into_owned(),
-            key,
+            scope: scope.to_string(),
+            key: key.to_string(),
             value,
         });
     }
-    entries
+    Ok(entries)
 }
 
 /// Overrides for every executable key that repository-scoped configuration
@@ -1589,7 +1608,7 @@ mod tests {
     fn scoped_config_output_parses_values_and_valueless_keys() {
         let entries = parse_scoped_config(
             b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0filter.x.required\0local\0core.sshcommand\nevil\nline\0",
-        );
+        ).unwrap();
         assert_eq!(
             entries,
             vec![
@@ -1610,6 +1629,67 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn scoped_config_selects_every_executable_key() {
+        let keys = [
+            "core.sshcommand",
+            "core.askpass",
+            "core.gitproxy",
+            "core.alternaterefscommand",
+            "credential.helper",
+            "credential.https://example.com.helper",
+            "remote.origin.uploadpack",
+            "remote.origin.receivepack",
+            "filter.a=b.clean",
+            "filter.x.smudge",
+            "filter.x.process",
+            "filter.x.required",
+            "diff.x.command",
+            "diff.x.textconv",
+            "merge.x.driver",
+            "gpg.program",
+            "gpg.ssh.program",
+        ];
+        let mut records = b"local\0remote.origin.url\nfile:///local/repo\0".to_vec();
+        for key in keys {
+            records.extend_from_slice(format!("local\0{key}\nvalue\0").as_bytes());
+        }
+        records.extend_from_slice(b"local\0filter.x.description\ntext\xff\0");
+        let entries = parse_scoped_config(&records).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            keys
+        );
+    }
+
+    #[test]
+    fn scoped_config_rejects_lossy_or_incomplete_records() {
+        assert_eq!(parse_scoped_config(b""), Ok(Vec::new()));
+        assert_eq!(
+            parse_scoped_config(b"local\0user.name\nname\xff\0"),
+            Ok(Vec::new())
+        );
+        for bytes in [
+            &b"local\0filter.x\xff.clean\nevil\0"[..],
+            &b"loc\xffal\0filter.x.clean\nevil\0"[..],
+            &b"global\0filter.x.clean\nevil\xff\0"[..],
+            &b"local\0filter.x.clean\nevil"[..],
+            &b"local\0"[..],
+            &b"\0filter.x.clean\nevil\0"[..],
+            &b"local\0\0"[..],
+            &b"local\0filter.x.clean\nevil\0worktree\0"[..],
+        ] {
+            assert!(parse_scoped_config(bytes).is_err(), "accepted {bytes:?}");
+        }
+        // Literal replacement characters are valid UTF-8 and must stay intact.
+        let entries = parse_scoped_config("local\0filter.\u{fffd}.clean\n\0".as_bytes()).unwrap();
+        assert_eq!(entries[0].key, "filter.\u{fffd}.clean");
+        assert_eq!(entries[0].value.as_deref(), Some(""));
     }
 
     #[test]
@@ -1766,6 +1846,86 @@ mod tests {
         assert!(
             std::ptr::eq(env, git_environment()),
             "the cached environment must reuse its allocation"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod configuration_encoding_tests {
+    use super::*;
+    struct Fixture {
+        root: PathBuf,
+        repo: PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    impl Fixture {
+        async fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("mini-agent-git-encoding-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let fixture = Self {
+                repo: root.join("repo"),
+                root,
+            };
+            std::fs::create_dir(&fixture.repo).unwrap();
+            GitRunner::discover()
+                .unwrap()
+                .run(&fixture.repo, "init", ["init", "-q"], LOCAL_MUTATION_LIMITS)
+                .await
+                .unwrap();
+            std::fs::write(fixture.repo.join("file.txt"), "payload\n").unwrap();
+            fixture
+        }
+        fn arm(&self) -> PathBuf {
+            let marker = self.root.join("host-executed");
+            let mut name = b"review".to_vec();
+            name.push(0xff);
+            let mut config = std::fs::read(self.repo.join(".git/config")).unwrap();
+            config.extend_from_slice(b"\n[filter \"");
+            config.extend_from_slice(&name);
+            config.extend_from_slice(
+                b"\"]\n\tclean = \"sh -c 'printf EXECUTED > ../host-executed; cat'\"\n",
+            );
+            std::fs::write(self.repo.join(".git/config"), config).unwrap();
+            let mut attributes = b"* filter=".to_vec();
+            attributes.extend_from_slice(&name);
+            attributes.push(b'\n');
+            std::fs::write(self.repo.join(".gitattributes"), attributes).unwrap();
+            marker
+        }
+    }
+    #[tokio::test]
+    async fn non_utf8_git_filter_is_rejected_before_host_mutation() {
+        let fixture = Fixture::new().await;
+        let marker = fixture.arm();
+        let runner = GitRunner::discover().unwrap();
+        let result = runner
+            .run(
+                &fixture.repo,
+                "add",
+                ["add", "file.txt"],
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await;
+        let error = result
+            .err()
+            .expect("undecodable filter configuration must refuse add");
+        assert!(error.contains("executable Git configuration"), "{error}");
+        assert!(!marker.exists(), "non-UTF8 filter ran outside containment");
+        let index = runner
+            .run(&fixture.repo, "ls-files", ["ls-files"], QUERY_LIMITS)
+            .await;
+        assert!(
+            index.is_err(),
+            "queries must use the same fail-closed probe"
+        );
+        assert!(
+            !fixture.repo.join(".git/index").exists(),
+            "refused add mutated the index"
         );
     }
 }
