@@ -1,7 +1,7 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.2
+- **Specification version**: 1.3.3
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-30
@@ -292,7 +292,10 @@ inside the sandbox. For a workspace whose top level holds `.git`:
   bubblewrap a sandboxed process can therefore create a protected path that was absent at launch
   (for example a `.git/commondir` pointing at a model-written directory, or `.git/hooks` in a
   repository that has none). A linked worktree's common directory lies outside the workspace and is
-  not visible inside the sandbox at all. Writes fail with `EROFS`, and replacing a protected file or directory
+  not visible inside the sandbox at all. Existing protected symlinks, a symlinked `.git`,
+  hardlinked protected regular files, and existing entries that cannot be pinned safely refuse
+  launch: binding their target inode would leave a writable alias. This does not protect metadata
+  first created after launch or aliases introduced concurrently with launch. Writes fail with `EROFS`, and replacing a protected file or directory
   (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options require
   bubblewrap 0.8.0 or later. A backend without `--ro-bind-fd` is rejected before constructing
   any model-action, hook, workspace-service, or executable-snapshot launch; there is no launch

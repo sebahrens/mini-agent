@@ -47,7 +47,8 @@ The ignored `bwrap_hook_has_no_controlling_terminal` test runs under `script(1)`
 Every workspace profile (`TC-MODEL-ACTION` commands and brokered JS `spawn`, sandboxed
 `TC-PROJECT-AUTOMATION` hooks, and workspace services) keeps the workspace's Git `config`, `hooks`,
 `info`, `modules`, `config.worktree`, `commondir`, and a linked worktree's gitfile read-only, and
-pins `.git` against renaming, so a prompt-injected command cannot plant `core.fsmonitor`, hooks, or filter
+pins `.git` against renaming, and Linux refuses existing symlink/hardlink metadata aliases it
+cannot pin safely, so a prompt-injected command cannot plant `core.fsmonitor`, hooks, or filter
 drivers that later run outside the sandbox. `git add` and `git commit` still work inside the
 sandbox. Under bubblewrap an entry absent at launch can still be created (a named remaining
 gap). The concrete bubblewrap (`--ro-bind-fd`, bubblewrap 0.8.0+) and Seatbelt

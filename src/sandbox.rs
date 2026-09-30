@@ -772,7 +772,7 @@ fn bwrap_git_metadata_binds_with_capability(
                 .to_string(),
         );
     }
-    Ok(git_metadata::BwrapGitMetadataBinds::open(workspace_root))
+    git_metadata::BwrapGitMetadataBinds::open(workspace_root)
 }
 
 /// Closed diagnostic recorded when the cached bubblewrap preflight fails. It is set at most once,
@@ -5982,7 +5982,7 @@ mod sandbox_tests {
             "printf sandboxed",
             &workspace,
             Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::open(&workspace),
+            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
         );
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
@@ -6002,7 +6002,8 @@ mod sandbox_tests {
             Path::new("/cache/mini-agent"),
             git_metadata::BwrapGitMetadataBinds::open(
                 &sandbox.canonical_workspace_root(&workspace).unwrap(),
-            ),
+            )
+            .unwrap(),
         );
         assert_git_metadata_bound_after_workspace(
             &command_argv(&command),
@@ -6022,7 +6023,7 @@ mod sandbox_tests {
             "printf sandboxed",
             &worktree,
             Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::open(&worktree),
+            git_metadata::BwrapGitMetadataBinds::open(&worktree).unwrap(),
         );
         assert_eq!(
             descriptor_binds(&command_argv(&command)),
@@ -6047,7 +6048,7 @@ mod sandbox_tests {
             &workspace,
             Path::new("/cache/mini-agent"),
             &std::collections::BTreeMap::new(),
-            git_metadata::BwrapGitMetadataBinds::open(&workspace),
+            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
         );
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
@@ -6065,7 +6066,7 @@ mod sandbox_tests {
             Path::new("/cache/mini-agent"),
             &[],
             true,
-            git_metadata::BwrapGitMetadataBinds::open(&workspace),
+            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
         );
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
@@ -6290,6 +6291,46 @@ echo COMMITTED"#;
             .await
             .unwrap();
         assert_git_metadata_probe_contained(&workspace, &output, "service\nsandboxed\ninitial\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
+    async fn bwrap_workspace_git_metadata_rejects_existing_aliases() {
+        assert!(bwrap_exists(), "bubblewrap is unavailable");
+        let scratch = ScratchDir::new();
+        let workspace = host_git_repository(scratch.path());
+        let sandbox = Sandbox::new(true, "bwrap").with_working_dir(&workspace);
+
+        std::fs::hard_link(
+            workspace.join(".git/config"),
+            workspace.join("config-alias"),
+        )
+        .unwrap();
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Failed);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("hardlink"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_file(workspace.join("config-alias")).unwrap();
+
+        std::fs::rename(workspace.join(".git"), workspace.join("gitdir")).unwrap();
+        std::os::unix::fs::symlink("gitdir", workspace.join(".git")).unwrap();
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Failed);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(".git symlink"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "macos")]
