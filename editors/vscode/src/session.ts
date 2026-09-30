@@ -24,6 +24,14 @@ export type PermissionHandler = (
   signal: AbortSignal,
 ) => Promise<acp.RequestPermissionResponse>;
 
+function trustedWorkspaceError(): Error {
+  return new Error('Mini Agent requires a trusted workspace.');
+}
+
+function requireTrustedWorkspace(): void {
+  if (!vscode.workspace.isTrusted) { throw trustedWorkspaceError(); }
+}
+
 class AcpProtocolSession implements ConversationSession {
   private prompting = false;
 
@@ -38,6 +46,7 @@ class AcpProtocolSession implements ConversationSession {
     signal: AbortSignal,
   ): Promise<acp.StopReason> {
     if (signal.aborted) { return 'cancelled'; }
+    requireTrustedWorkspace();
     this.prompting = true;
     let cancellationSent = false;
     const cancel = (): void => {
@@ -119,6 +128,10 @@ export class AgentSession {
 
   async start(): Promise<void> {
     return this.transitions.run(async () => {
+      if (!vscode.workspace.isTrusted) {
+        await this.doStop();
+        throw trustedWorkspaceError();
+      }
       if (this.state !== 'running') { await this.doStart(); }
     });
   }
@@ -129,8 +142,16 @@ export class AgentSession {
     signal: AbortSignal,
   ): Promise<acp.StopReason> {
     await this.start();
+    if (!vscode.workspace.isTrusted) {
+      await this.stop();
+      throw trustedWorkspaceError();
+    }
     if (this.state !== 'running') { throw new Error('Mini Agent failed to start.'); }
-    return this.conversation.prompt(text, onUpdate, signal);
+    try {
+      return await this.conversation.prompt(text, onUpdate, signal);
+    } finally {
+      if (!vscode.workspace.isTrusted) { await this.stop(); }
+    }
   }
 
   async stop(): Promise<void> {
@@ -164,13 +185,26 @@ export class AgentSession {
 
   private async doStart(): Promise<void> {
     if (this.state === 'starting') { return; }
+    requireTrustedWorkspace();
     this.setState('starting');
-    if (!await this.verify()) {
+    let verified: boolean;
+    try {
+      verified = await this.verify();
+      requireTrustedWorkspace();
+    } catch (error) {
+      this.setState('stopped');
+      throw error;
+    }
+    if (!verified) {
       this.setState('stopped');
       throw new Error('The configured Mini Agent executable is not runnable.');
     }
 
     const cwd = this.folder.uri.fsPath;
+    if (!vscode.workspace.isTrusted) {
+      this.setState('stopped');
+      throw trustedWorkspaceError();
+    }
     log.info(`Spawning mini-agent: ${this.executablePath} --acp (cwd: ${cwd})`);
     const proc = cp.spawn(this.executablePath, ['--acp'], {
       shell: false,
@@ -208,6 +242,7 @@ export class AgentSession {
         clientInfo: { name: 'mini-agent-vscode', version: extensionVersion(this.context) },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
+      requireTrustedWorkspace();
       this.setState('running');
     } catch (error) {
       connection.close(error);
@@ -225,9 +260,18 @@ export class AgentSession {
   private async createProtocolSession(): Promise<ConversationSession> {
     const client = this.client;
     if (!client || this.state !== 'running') { throw new Error('ACP connection is not running.'); }
+    if (!vscode.workspace.isTrusted) {
+      await this.stop();
+      throw trustedWorkspaceError();
+    }
     const session = await client.buildSession(this.folder.uri.fsPath).start({
       cancellationSignal: AbortSignal.timeout(10_000),
     });
+    if (!vscode.workspace.isTrusted) {
+      session.dispose();
+      await this.stop();
+      throw trustedWorkspaceError();
+    }
     log.info(`ACP session created: ${session.sessionId}`);
     return new AcpProtocolSession(session, client);
   }
@@ -270,6 +314,7 @@ export class AgentSession {
 
   private async verify(): Promise<boolean> {
     return new Promise(resolve => {
+      requireTrustedWorkspace();
       const probe = cp.spawn(this.executablePath, ['--version'], {
         shell: false,
         timeout: 5000,

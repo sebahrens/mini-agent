@@ -17,9 +17,11 @@ const logMock = vi.hoisted(() => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
 }));
 const spawnMock = vi.hoisted(() => vi.fn());
+const trust = vi.hoisted(() => ({ isTrusted: true }));
 
 vi.mock('vscode', () => ({
   StatusBarAlignment: { Right: 2 },
+  workspace: { get isTrusted() { return trust.isTrusted; } },
   window: {
     createStatusBarItem: vi.fn(() => statusBar),
     showErrorMessage: ui.showErrorMessage,
@@ -57,6 +59,7 @@ function makeSession(executable = '/usr/bin/mini-agent'): AgentSession {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  trust.isTrusted = true;
 });
 
 describe('AgentSession resource ownership', () => {
@@ -87,6 +90,59 @@ describe('AgentSession resource ownership', () => {
 });
 
 describe('AgentSession --version probe', () => {
+  it('does not probe an executable when trust is already revoked', async () => {
+    trust.isTrusted = false;
+    const session = makeSession();
+
+    await expect(session.start()).rejects.toThrow(/trusted workspace/);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('rechecks trust immediately before the version probe', async () => {
+    statusBar.show.mockImplementationOnce(() => { trust.isTrusted = false; });
+    const session = makeSession();
+
+    await expect(session.start()).rejects.toThrow(/trusted workspace/);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(statusBar.hide).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('refuses ACP launch and a queued start when trust changes during version verification', async () => {
+    const probe = new FakeProcess();
+    spawnMock.mockReturnValueOnce(probe);
+    const session = makeSession();
+    const first = session.start();
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledOnce());
+    const queued = session.start();
+
+    trust.isTrusted = false;
+    probe.stdout.emit('data', Buffer.from('mini-agent 1.8.0\n'));
+    probe.exitCode = 0;
+    probe.emit('exit', 0, null);
+
+    await expect(first).rejects.toThrow(/trusted workspace/);
+    await expect(queued).rejects.toThrow(/trusted workspace/);
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual(['--version']);
+    expect(statusBar.hide).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('rechecks trust after start resolves and before creating a prompt', async () => {
+    const session = makeSession();
+    vi.spyOn(session, 'start').mockImplementation(async () => { trust.isTrusted = false; });
+
+    await expect(session.prompt('hello', vi.fn(), new AbortController().signal))
+      .rejects.toThrow(/trusted workspace/);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
   it('surfaces the probe stderr and executable path when the binary fails to start', async () => {
     const probe = new FakeProcess();
     spawnMock.mockImplementationOnce(() => {
