@@ -42,6 +42,8 @@ const MAX_PENDING_AUTHENTICATIONS: usize = 16;
 const MAX_ACP_HISTORY_TURNS: usize = 128;
 const MAX_ACP_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACP_SESSIONS: usize = 64;
+#[cfg(feature = "mcp")]
+const MAX_ACP_CLIENT_MCP_SERVERS: usize = 8;
 
 struct CommittedTurn {
     messages: Vec<Message>,
@@ -1302,6 +1304,11 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+        if servers.len() > MAX_ACP_CLIENT_MCP_SERVERS {
+            return refuse(format!(
+                "ACP session accepts at most {MAX_ACP_CLIENT_MCP_SERVERS} client-supplied MCP servers"
+            ));
+        }
         let (sandbox, network) = match state.client_mcp {
             ClientMcpPolicy::Refused => {
                 return refuse(
@@ -4682,6 +4689,29 @@ mod protocol_tests {
             merged.mcp_servers.as_ref().unwrap().get("editor-tools"),
             Some(McpServerConfig::Command { .. })
         ));
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn client_stdio_mcp_server_count_is_bounded_before_prompt_connection() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().client_mcp = ClientMcpPolicy::Trusted;
+        let servers = (0..=MAX_ACP_CLIENT_MCP_SERVERS)
+            .map(|index| {
+                McpServer::Stdio(McpServerStdio::new(
+                    format!("editor-{index}"),
+                    std::env::temp_dir().join("client-mcp-server"),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let accepted = client_mcp_servers(&state, &servers[..MAX_ACP_CLIENT_MCP_SERVERS])
+            .expect("eight client servers fit the admission bound");
+        assert_eq!(accepted.len(), MAX_ACP_CLIENT_MCP_SERVERS);
+        let error = client_mcp_servers(&state, &servers)
+            .expect_err("the ninth editor-supplied process must be refused");
+        assert!(error.to_string().contains("at most 8"), "{error}");
     }
 
     /// Client-supplied servers may come from repository-controlled editor

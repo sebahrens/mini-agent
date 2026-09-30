@@ -2090,12 +2090,13 @@ model. Provider clients honour `--api-key` first, and turns use the configured
 configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
 startup, so delegated read-only agents work over ACP.
 
-`session/new` accepts the client's `mcpServers` list. Each stdio entry is
-connected for every tool-enabled prompt in that session alongside the
-configured `mcp_servers` (absolute `command`, working directory = the session
-root, the client's `env` plus this process's `PATH` and `HOME`). Because the
-list can come from repository-controlled editor settings rather than the
-human-trusted `mcp_servers` configuration, client servers run in the
+`session/new` accepts up to eight entries from the client's `mcpServers` list.
+Each stdio entry is connected for every tool-enabled prompt in that session
+alongside the configured `mcp_servers`. It uses an absolute `command`, the
+session root as its working directory, and the client's `env` plus this
+process's `PATH` and `HOME`. The list can come from repository-controlled
+editor settings rather than the human-trusted `mcp_servers` configuration.
+Client servers run in the
 dedicated workspace-service sandbox of the resolved sandbox backend
 (`--sandbox-backend`/`sandbox-backend`, else the platform default), exactly as
 a configured server with `sandbox` set, but with network access denied. When
@@ -2106,8 +2107,7 @@ set `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` in the agent's environment to launch
 them like a configured command server without a sandbox and with inherited
 network access (a warning is logged). A configured server keeps its name if a
 client server uses the same one. The request is refused with an explicit error
-instead of being silently
-ignored when it lists an HTTP or SSE server (not advertised), a relative
+when it lists an HTTP or SSE server (not advertised), a relative
 command or duplicate name, when MCP is disabled or not compiled in, or when it
 arrives over ACP TCP: a network peer must not launch local processes, so TCP
 deployments configure MCP on the agent host.
