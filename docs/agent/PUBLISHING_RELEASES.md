@@ -111,10 +111,15 @@ available.
 The VSIX requires VS Code 1.91 or later: the Chat Participant API first became available in
 Stable there. The release matrix installs each candidate into clean VS Code 1.91.1, then starts
 the extension in a real extension host and exercises ACP process startup, restart and stop,
-and Open Config. The host smoke uses a private config root and dummy provider key and sends no
-model prompt; the extension's unit tests cover permission cancellation. Linux runs the host smoke
-under Xvfb. The separate `smoke-acp.mjs` check sends a prompt only to cancel it before provider
-work. Neither check substitutes for platform-specific sandbox tests.
+and Open Config. The host smoke uses a private config root and a loopback scripted provider: an
+installed VSIX sends a prompt through its production ACP session and bundled compiled binary,
+checks streamed reply updates, then exercises the real VS Code permission picker with allow,
+deny, and cancellation decisions. Its dummy key cannot reach a paid API. The clean offline VS Code
+profile cannot fetch the signed-in Chat participant registry, so this test invokes the installed
+extension's session export directly; it does not prove Chat view registration or message rendering
+in that view. Linux runs the host smoke under Xvfb. The separate `smoke-acp.mjs` check sends a
+prompt only to cancel it before provider work. Neither check substitutes for platform-specific
+sandbox tests.
 
 ## Product identity matrix
 
