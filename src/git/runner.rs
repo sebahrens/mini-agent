@@ -93,7 +93,7 @@ pub(crate) struct GitRunner {
     /// configuration of repositories nested in the work tree (see
     /// [`GitRunner::probing_nested_repositories`]).
     nested_repositories: bool,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     home_override: Option<Arc<PathBuf>>,
 }
 
@@ -135,7 +135,7 @@ impl GitRunner {
             program: Arc::new(program),
             identity: Arc::new(identity),
             nested_repositories: false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             home_override: None,
         })
     }
@@ -148,7 +148,7 @@ impl GitRunner {
             program: Arc::new(PathBuf::new()),
             identity: Arc::new(identity),
             nested_repositories: false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             home_override: None,
         })
     }
@@ -165,7 +165,7 @@ impl GitRunner {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_home_for_test(mut self, home: &Path) -> Self {
         self.home_override = Some(Arc::new(home.to_path_buf()));
         self
@@ -278,7 +278,7 @@ impl GitRunner {
         command.envs(internal_git_environment(profile, |name| {
             std::env::var_os(name)
         }));
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(home) = self.home_override.as_ref() {
             command.env("HOME", home.as_path());
             // The fixture's HOME must not mix with the developer's XDG config.
@@ -733,7 +733,7 @@ impl GitRunner {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn run_network_with_input_for_test<I, S>(
         &self,
         repo_path: &Path,
