@@ -293,8 +293,8 @@ and rolls the transcript back.
 | Command | Description |
 | ------- | ----------- |
 | `/loop [prompt]` | Start the iterative coding loop (bounded to 100 iterations). |
-| `/loop stop` | Stop the active loop. |
-| `/loop status` | Show current loop status. |
+| `/loop stop` | Stop future rounds of the active loop, even during a round. The current agent run finishes; an in-flight verification is cancelled. |
+| `/loop status` | Show current loop status, including during an active round. |
 
 ## Goal (feature-gated)
 

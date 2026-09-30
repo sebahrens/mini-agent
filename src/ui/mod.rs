@@ -644,7 +644,7 @@ pub(crate) enum SubmitAction {
 /// don't spawn or mutate the main run — the single "bypass" whitelist. Add
 /// future parallel-safe commands here. Currently: `/queue` (queue management),
 /// `/btw` (isolated, tool-less side question on its own event stream), and the
-/// two read-or-park `/goal` verbs.
+/// read-or-park `/goal` verbs and `/loop` status/stop controls.
 ///
 /// A goal relaunches back to back, so a run is active almost continuously for
 /// as long as the goal lasts. Without these, asking what the goal is doing or
@@ -659,6 +659,22 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
         || t == "/btw"
         || t.starts_with("/btw ")
         || goal_control_while_running(t)
+        || loop_control_while_running(t)
+}
+
+/// A running loop can be inspected or stopped, but a new loop cannot replace
+/// the active agent's work until the current run settles.
+#[cfg(feature = "loop")]
+fn loop_control_while_running(text: &str) -> bool {
+    matches!(
+        text.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["/loop"] | ["/loop", "status"] | ["/loop", "stop"]
+    )
+}
+
+#[cfg(not(feature = "loop"))]
+fn loop_control_while_running(_text: &str) -> bool {
+    false
 }
 
 /// `/goal status` and `/goal pause`, and only those two.

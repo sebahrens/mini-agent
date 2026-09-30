@@ -63,7 +63,16 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             Some(_) => {
                 store.clear();
                 write_ok(ctx.renderer, "loop stopped");
-                ctx.rebuild_agent().await;
+                if *ctx.is_running {
+                    // The current runner owns its own agent clone. Invalidate
+                    // the cached agent so the next turn builds without the
+                    // cleared loop, without rebuilding during this run.
+                    ctx.prebuild_invalidated
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    *ctx.agent = None;
+                } else {
+                    ctx.rebuild_agent().await;
+                }
             }
             None => write_ok(ctx.renderer, "no active loop"),
         }

@@ -775,7 +775,17 @@ pub async fn handle_slash(
         // `/memory write <target> <content>` and `/memory read daily <date>`
         // need more than the three fields the generic split above yields.
         "/memory" => memory::handle(&memory::split_command(text), &mut ctx).await,
-        "/compress" | "/compact" | "/loop" | "/worktree" | "/wt-merge" | "/wt-exit" => {
+        "/loop" => {
+            features::handle(&parts, &mut ctx).await?;
+            #[cfg(feature = "loop")]
+            if parts.get(1) == Some(&"stop")
+                && crate::ui::event_handler::retire_goal_verification_after_control(run, ui.session)
+            {
+                write_result(renderer, "loop: verification stopped");
+            }
+            Ok(())
+        }
+        "/compress" | "/compact" | "/worktree" | "/wt-merge" | "/wt-exit" => {
             features::handle(&parts, &mut ctx).await
         }
         #[cfg(feature = "hooks")]

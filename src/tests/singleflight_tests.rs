@@ -69,6 +69,37 @@ fn whitelisted_commands_pass_through_while_running() {
     assert_eq!(classify_submission(true, "/queue clear"), SubmitAction::Run);
 }
 
+#[cfg(feature = "loop")]
+#[test]
+fn running_loop_controls_pass_but_new_starts_remain_blocked() {
+    for command in ["/loop", "/loop status", "  /loop stop  "] {
+        assert_eq!(classify_submission(true, command), SubmitAction::Run);
+    }
+    for command in [
+        "/loop fix the parser",
+        "/loop resume",
+        "/loop stop then restart",
+        "/loop status extra",
+    ] {
+        assert_eq!(
+            classify_submission(true, command),
+            SubmitAction::RejectWhileRunning,
+            "{command}"
+        );
+    }
+}
+
+#[cfg(not(feature = "loop"))]
+#[test]
+fn disabled_loop_controls_remain_blocked_during_a_run() {
+    for command in ["/loop", "/loop status", "/loop stop"] {
+        assert_eq!(
+            classify_submission(true, command),
+            SubmitAction::RejectWhileRunning
+        );
+    }
+}
+
 #[test]
 fn running_empty_is_ignored() {
     assert_eq!(classify_submission(true, ""), SubmitAction::Ignore);

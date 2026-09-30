@@ -77,6 +77,18 @@ async fn run_loop_parts(
     context: &mut ContextFiles,
     workspace: &Arc<crate::paths::WorkspaceBinding>,
 ) -> Vec<String> {
+    run_loop_parts_with_state(parts, session, context, workspace, false)
+        .await
+        .0
+}
+
+async fn run_loop_parts_with_state(
+    parts: &[&str],
+    session: &mut Session,
+    context: &mut ContextFiles,
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
+    running: bool,
+) -> (Vec<String>, bool, bool, bool) {
     let cli = Cli::parse_from([
         "mini-agent",
         "--no-session",
@@ -100,7 +112,7 @@ async fn run_loop_parts(
     let invalidated = std::sync::atomic::AtomicBool::new(false);
     let mut show_reasoning = false;
     let mut reasoning_enabled = false;
-    let mut is_running = false;
+    let mut is_running = running;
     let mut todo_tools_enabled = true;
     #[cfg(feature = "skills")]
     let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
@@ -130,9 +142,15 @@ async fn run_loop_parts(
     };
     features::handle(parts, &mut ctx).await.unwrap();
     let feed = renderer.feed();
-    (0..feed.block_count())
+    let lines = (0..feed.block_count())
         .map(|index| feed.block_text(index).unwrap().to_string())
-        .collect()
+        .collect();
+    (
+        lines,
+        is_running,
+        invalidated.load(std::sync::atomic::Ordering::Relaxed),
+        agent.is_some(),
+    )
 }
 
 /// After `/worktree` rebinds the workspace, the plan a new loop re-reads each
@@ -220,6 +238,50 @@ async fn loop_stop_clears_only_a_loop_goal() {
     );
     let lines = run_loop_command("/loop stop", &mut session, &mut context, &workspace).await;
     assert_eq!(lines, ["loop stopped"]);
+    assert!(session.goal_store.snapshot().is_none());
+}
+
+#[tokio::test]
+async fn loop_stop_during_a_run_clears_future_rounds_without_rebuilding_current_runner() {
+    let root = fixture_root("loop-active-stop");
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+    let mut context = context_for(workspace.root());
+    let mut session = Session::new("openrouter", "loop-model", 128_000, "loop-active-stop");
+    run_loop_command(
+        "/loop refactor the parser",
+        &mut session,
+        &mut context,
+        &workspace,
+    )
+    .await;
+
+    let (status, running, invalidated, _) = run_loop_parts_with_state(
+        &["/loop", "status"],
+        &mut session,
+        &mut context,
+        &workspace,
+        true,
+    )
+    .await;
+    assert!(status.iter().any(|line| line.starts_with("loop active:")));
+    assert!(running);
+    assert!(!invalidated);
+
+    let (stopped, running, invalidated, rebuilt) = run_loop_parts_with_state(
+        &["/loop", "stop"],
+        &mut session,
+        &mut context,
+        &workspace,
+        true,
+    )
+    .await;
+    assert_eq!(stopped, ["loop stopped"]);
+    assert!(running, "the current round remains owned by its runner");
+    assert!(
+        invalidated,
+        "the next turn must rebuild without loop context"
+    );
+    assert!(!rebuilt, "stopping cannot rebuild the active runner");
     assert!(session.goal_store.snapshot().is_none());
 }
 
