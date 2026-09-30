@@ -5076,6 +5076,11 @@ mod protocol_tests {
         use crate::tests::process_gate::ProcessGate;
         use crate::tests::process_state::{ProcessIdentity, ProcessState};
         use futures::FutureExt;
+        // The production runner consults the process-global Stop dispatcher
+        // after a model turn. Another test must not install a blocking hook
+        // while this fixture is assessing Bash process-tree cancellation.
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
         let files = ProtocolTempDir::new();
         let shell_pid_file = files.path().join("shell.pid");
         let descendant_pid_file = files.path().join("descendant.pid");
@@ -5134,6 +5139,8 @@ mod protocol_tests {
         // staged on that announcement so model and agent latency under a loaded
         // parallel runner is not counted against the shell's own budget.
         let (announced_tx, announced_rx) = tokio::sync::watch::channel(false);
+        let tool_updates = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let reported_updates = Arc::clone(&tool_updates);
 
         Client
             .builder()
@@ -5144,6 +5151,9 @@ mod protocol_tests {
                             == <crate::agent::tools::bash::BashTool as rig::tool::Tool>::NAME
                     {
                         announced_tx.send_replace(true);
+                    }
+                    if let SessionUpdate::ToolCallUpdate(update) = &notification.update {
+                        reported_updates.lock().unwrap().push(format!("{update:?}"));
                     }
                     Ok(())
                 },
@@ -5182,7 +5192,11 @@ mod protocol_tests {
                                     // The handle has completed; drop it so
                                     // cleanup does not poll it again.
                                     blocked.take();
-                                    panic!("the prompt ended before {}: {ended:?}", $name);
+                                    panic!(
+                                        "the prompt ended before {}: {ended:?}; tool updates: {:?}",
+                                        $name,
+                                        tool_updates.lock().unwrap()
+                                    );
                                 }
                                 ProcessTreeStage::Stalled => panic!(
                                     "production BashTool stalled: {} did not happen within \
