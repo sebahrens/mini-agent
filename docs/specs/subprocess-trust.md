@@ -1,7 +1,7 @@
 # Subprocess Trust Classes and Launch Contracts
 
 - **Document role**: normative cross-cutting specification
-- **Specification version**: 1.2.1
+- **Specification version**: 1.2.2
 - **Delivery status**: contract delivered; hardening gaps remain tracked separately
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-30
@@ -418,7 +418,9 @@ without moving or dropping it. New, duplicate, removed, or unguarded raw termina
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
 as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. Native Git metadata alias-refusal assertions inspect captured
 `CommandOutput` status and stderr; their exact macro contexts and occurrence counts are
-`NON-PROCESS`, without exempting any launch or terminal. An
+`NON-PROCESS`, without exempting any launch or terminal. The owned real-Git fallback-cache
+fixture uses exact `TEST-ONLY` fingerprints for initialization, config probing, and Git add in
+both the checked inventory and class-validation rules; production Git retains `TC-INTERNAL-GIT`. An
 explicit current-class allow-list permits `TC-BROKER-JS-WORKER` only at the reviewed Linux worker
 fingerprints. Every disposition and every site
 in a file with multiple production classes has an exact fingerprint-and-occurrence ownership rule;

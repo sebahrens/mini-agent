@@ -14,6 +14,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - macOS commands with a shared application home select a separate private runtime cache when the
   configured cache overlaps configuration or credentials, preserving those read denials while
   allowing temporary-file workflows.
+  Git also treats executable configuration included from that selected cache as untrusted.
 - Editor-supplied ACP MCP servers deny network by default and are capped at eight per session;
   operator-trusted servers retain their explicit bypass. VS Code rechecks workspace trust after
   permission and folder selection and across executable verification, ACP launch, and prompt

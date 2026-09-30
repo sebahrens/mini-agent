@@ -3561,6 +3561,32 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // Owned real-Git fixture: config probe, old-authority marker, and hardened add.
+    (
+        "src/git/runner.rs",
+        "let init = std::process::Command::new(git.program.as_path())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "let probe = std::process::Command::new(git.program.as_path())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "let mut command = std::process::Command::new(git.program.as_path());",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/git/runner.rs", ".output()", 2, "TEST-ONLY"),
+    (
+        "src/git/runner.rs",
+        "command.output().unwrap()",
+        1,
+        "TEST-ONLY",
+    ),
     (
         "src/extras/js/skills/coordinator.rs",
         "let holder = HeldTestLock::spawn(move |wait| {",
