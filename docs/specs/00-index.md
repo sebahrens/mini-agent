@@ -17,6 +17,9 @@ The 2026-09-30 general-process hardening is owned by [phase-2-sandbox.md](phase-
 and [subprocess-trust.md](subprocess-trust.md): private macOS temporary storage, option-safe
 workspace service environments, and mandatory Linux descriptor-backed Git metadata binds.
 These changes do not alter the canonical Phase 6 worker containment checklist.
+The subprocess contract also records bounded, network-denied ACP client MCP servers and
+executable Git configuration origin checks; it explicitly retains the separate Git
+probe-to-launch race and additional writable-root limitations.
 
 Apply normative text in this order:
 

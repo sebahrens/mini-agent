@@ -8,6 +8,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Editor-supplied ACP MCP servers deny network by default and are capped at eight per session;
+  operator-trusted servers retain their explicit bypass. VS Code rechecks workspace trust after
+  permission and folder selection and across executable verification, ACP launch, and prompt
+  dispatch. Audited VS Code tooling dependencies are patched.
+- Internal Git commands classify executable configuration by its file origin as well as scope:
+  a global include from a writable repository, linked Git directory, or sandbox cache cannot
+  acquire user authority. The separate configuration probe-to-launch race remains tracked.
+
 - macOS sandboxed commands, hooks, and workspace services use private temporary storage instead
   of granting writes throughout `/private/tmp`. Workspace service environment names cannot
   replace the declared executable through `env` options. Linux launches now fail closed when
@@ -149,6 +157,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The supported lexical-only skill backend logs its diagnostic at Debug; genuine retrieval
+  failures still warn. VS Code waits for bounded child termination after ACP startup fails.
 - `/wt-merge` works with local-only target branches without requiring an upstream.
   Branches with upstream configuration still pull before merging.
 - `/loop stop` and loop status are available during an active round; stopping prevents

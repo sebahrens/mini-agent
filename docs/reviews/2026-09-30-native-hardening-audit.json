@@ -1,0 +1,307 @@
+{
+  "date": "2026-09-30",
+  "scope": "Application hardening authorized by the user; supersedes the earlier cyber exclusion in the native UX/ACP audit. No claim of complete containment.",
+  "implementation_head": "5a9ff27",
+  "prior_ux_evidence": "docs/reviews/2026-09-30-native-ux-acp-audit.json",
+  "fixed": [
+    {
+      "beads": [
+        "mini-agent-ala40.1"
+      ],
+      "result": "General Linux launches refuse bubblewrap without descriptor-backed metadata binds; no silent unprotected fallback."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.2"
+      ],
+      "result": "macOS model commands, hooks and workspace services use owned private temporary storage; shared /private/tmp write grant removed. Before/after native sentinel test demonstrates correction."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.5"
+      ],
+      "result": "Workspace service env wrapper places -- before assignments; hostile env option names cannot replace the declared executable. Native hostile-option and ordinary-executable controls pass."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.6"
+      ],
+      "result": "Standard file tools ask before nested Git execution metadata, gitfiles and linked-worktree administration writes; explicit operator policies retained."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.4",
+        "mini-agent-ala40.9"
+      ],
+      "result": "Executable Git configuration authority accounts for lexical and canonical file origins, including writable repository/linked Git/cache origins. Trusted external global credentials, bare repositories and fresh Git init retained. Separate probe-to-launch race remains open."
+    },
+    {
+      "beads": [
+        "mini-agent-rmofx",
+        "mini-agent-lxpee"
+      ],
+      "result": "ACP client-supplied stdio MCP servers deny network by default and are bounded at eight per session; explicit operator bypass retained; ACP-over-TCP client MCP remains refused. Native launched-helper loopback positive/denied controls pass."
+    },
+    {
+      "beads": [
+        "mini-agent-o6bh3",
+        "mini-agent-54k5s",
+        "mini-agent-ala40.7",
+        "mini-agent-ala40.10"
+      ],
+      "result": "VS Code rechecks workspace trust after permission/folder pickers and across queued start, executable verification, process launch, protocol initialization/session creation and prompt dispatch. Failed initialization awaits bounded termination before releasing process ownership. Held-await and ignored-SIGTERM regression controls pass."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.3"
+      ],
+      "result": "VS Code tooling dependencies patched: brace-expansion 1.1.21/2.1.7/5.0.12 and fast-uri override 3.1.8."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.11"
+      ],
+      "result": "Expected deterministic lexical-only skill diagnostic logs at Debug; genuine unavailable failures remain Warn; diagnostic payload and retrieval behavior unchanged."
+    },
+    {
+      "beads": [
+        "mini-agent-w12by"
+      ],
+      "result": "Subprocess inventory annotations updated with precise non-process counts and hashes; production authority inventory remains enforced."
+    },
+    {
+      "beads": [
+        "mini-agent-ala40.13"
+      ],
+      "result": "Rich harness run_print fixtures hold the shared process-global hook dispatcher guard. A causal blocking Stop-hook control exhausts the original one-turn model; the identical model completes with the dispatcher reset. Real-store, tool-use, oracle and turn-budget assertions retained."
+    }
+  ],
+  "quality_gates": {
+    "platform": "Native macOS; Rust production builds use cargo install --path . --debug. No cargo build/check/release.",
+    "rich": {
+      "status": "pass",
+      "unit_passed": 3765,
+      "unit_ignored": 12,
+      "headless_passed": 16,
+      "sandbox_preflight_passed": 2,
+      "worker_passed": 7,
+      "features": "skills,hooks,advisor,lsp,multimodal,pdf plus default",
+      "evidence": "/private/tmp/mini-agent-hardening-final-rich-combined-tests.log",
+      "strict_all_targets_clippy": "pass",
+      "lint_evidence": "/private/tmp/mini-agent-hardening-final-rich-combined-clippy.log"
+    },
+    "default": {
+      "unit_passed": 2913,
+      "unit_ignored": 7,
+      "headless_passed": 15,
+      "sandbox_preflight_passed": 2,
+      "worker_passed": 7,
+      "strict_all_targets_clippy": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-final-default-tests.log"
+    },
+    "minimal": {
+      "unit_passed": 1793,
+      "unit_ignored": 0,
+      "headless_passed": 8,
+      "strict_all_targets_clippy": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-final-minimal-tests.log"
+    },
+    "vscode": {
+      "tests_passed": 71,
+      "files_passed": 9,
+      "typecheck": "pass",
+      "lint": "pass",
+      "build": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-final-vscode-tests.log"
+    },
+    "python_policy_tests": {
+      "run": 439,
+      "skipped": 9,
+      "status": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-python-native-tests.log"
+    },
+    "release_metadata_tests": {
+      "run": 122,
+      "status": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-final-metadata.log"
+    },
+    "subprocess_inventory": {
+      "tests_passed": 27
+    },
+    "debug_install": {
+      "status": "pass",
+      "binary": "/private/tmp/mini-agent-hardened-install/bin/mini-agent",
+      "evidence": "/private/tmp/mini-agent-hardening-final-install.log",
+      "source_limit": "All final production changes are included. Subsequent d7a8918/5a9ff27 change only cfg(test) fixtures."
+    }
+  },
+  "native_binary": {
+    "installed_path": "/private/tmp/mini-agent-hardened-install/bin/mini-agent",
+    "openrouter_smoke": {
+      "result": "Hello; exit 0",
+      "evidence": "/private/tmp/mini-agent-hardening-final-openrouter-smoke.log"
+    },
+    "acp": {
+      "status": "pass",
+      "evidence": "/private/tmp/mini-agent-hardening-final-native-acp-pids.log",
+      "observed": [
+        "Initialize, session/new and session/close; exit 0",
+        "Nine client MCP servers rejected before launch",
+        "Approved exact workspace write succeeds",
+        "Approved sibling-directory write refused; no effect",
+        "Approved shared-temp overwrite refused; owned host sentinel unchanged",
+        "Denied tool call produces no file",
+        "Shell and sleep child both observed live before cancellation, both absent after prompt settles and before session close; no late write"
+      ],
+      "pid_evidence": {
+        "before": "10437 (Bash Ss), 10438 (sleep S)",
+        "after": "No rows for either captured PID"
+      }
+    },
+    "tui": {
+      "status": "pass",
+      "prior_all_commands_and_aliases_exercised": 54,
+      "driver": "Owned native tmux terminal, rendered screen captures, one-Enter literal input, application-feedback assertions, scripted loopback provider, isolated workspace/data/cache. Canonical JS publication guard retained.",
+      "evidence": "/private/tmp/mini-agent-hardening-final-native-tui.log",
+      "screens": "/private/tmp/mini-agent-ux-fpyoj/evidence/hardening-*.screen.txt",
+      "observed": [
+        "/model with one Enter changes model",
+        "readonly and standard mode feedback",
+        "Streamed fixture response",
+        "Hooks command feedback",
+        "72x20 resize and recovery",
+        "Quit exits owned tmux session",
+        "No expected deterministic semantic warning in captured screens"
+      ]
+    },
+    "ide_limit": "Latest async trust and termination changes tested through production AgentSession with held awaits/fake time. Earlier installed native macOS VSIX session evidence is in the prior UX audit. Native host trust revocation and Chat view were not replayed."
+  },
+  "dependency_audits": {
+    "npm": {
+      "known_vulnerabilities": 0,
+      "all_severities_zero": true,
+      "evidence": "/private/tmp/mini-agent-hardening-final-npm-audit.json"
+    },
+    "rust": {
+      "known_vulnerabilities": 0,
+      "lockfile_dependencies": 627,
+      "advisory_database_commit": "9b3a3b73a7f42606494c943e95f8196e9994df46",
+      "evidence": "/private/tmp/mini-agent-cargo-audit-2026-09-30.json",
+      "informational_unmaintained": [
+        "bincode 1.3.3 via optional hnsw_rs",
+        "paste 1.0.15 via optional fastembed"
+      ],
+      "limits": "Neither informational dependency has a patched version; both absent from default dependency tree. Audit policy was not weakened."
+    }
+  },
+  "live_github_controls": {
+    "main": {
+      "active_ruleset_id": 24233900,
+      "required_context": "ci-success",
+      "integration_id": 15368,
+      "strict": false,
+      "creation_check_exemption": false,
+      "existing_all_branch_ruleset_preserved": 20623676,
+      "owner_bypass": "RepositoryRole actor_id 5 always, retained in both rulesets",
+      "evidence": "/private/tmp/mini-agent-hardening-live-main-rules.json"
+    },
+    "release": {
+      "environment_id": 23091533580,
+      "custom_branch_policies": true,
+      "protected_branches": false,
+      "sole_policy": {
+        "id": 61499924,
+        "name": "v*",
+        "type": "tag"
+      },
+      "required_reviewers": false,
+      "evidence": "/private/tmp/mini-agent-hardening-live-release-policies.json"
+    },
+    "limits": "API readback verified. Disposable non-owner PR merge rejection and real branch/version-tag deployment controls were not exercised; acceptance issues remain open."
+  },
+  "reviews": [
+    {
+      "reviewer": "adversarial",
+      "findings": [],
+      "residual_risks": [
+        "mini-agent-ew67q.4: mutable executable Git configuration between probe and launch, including nested repositories. Immutable outer-only shadow was rejected after actual nested filter execution.",
+        "mini-agent-ala40.8: Linux descriptor binds protect existing metadata only; later metadata creation requires an enforced boundary.",
+        "General process sandbox is not the workspace-invisible Phase 6 JS worker. Private temp is application-private, not per-child confidential.",
+        "Additional writable-root limitations and explicit trusted MCP bypass remain documented."
+      ],
+      "testing_gaps": [
+        "Native Linux old/new bubblewrap and dynamic-path controls not run on this macOS host.",
+        "No native Windows IDE/sandbox verification in this session."
+      ]
+    },
+    {
+      "reviewer": "reliability",
+      "findings": [],
+      "residual_risks": [
+        "IDE child termination retains the existing bounded SIGTERM/SIGKILL helper; no guarantee if the OS cannot reap after force termination.",
+        "Bounded Git config probing refuses oversized configuration rather than silently dropping records."
+      ],
+      "testing_gaps": [
+        "Live negative controls for branch and release policies remain open."
+      ]
+    },
+    {
+      "reviewer": "testing",
+      "findings": [],
+      "residual_risks": [
+        "Ignored tests and optional unmaintained dependencies are explicitly retained."
+      ],
+      "testing_gaps": [
+        "Original intermittent ACP early Bash return remains unexplained (mini-agent-ala40.12); future recurrence now includes tool result. Harness Stop-hook collision is reproduced and isolated.",
+        "mini-agent-mxtlv: signed-in native Chat view and cross-extension picker lifecycle remain unproven.",
+        "mini-agent-gesi4.3: prior transient worktree clean/dirty display had no stable reproduction."
+      ]
+    }
+  ],
+  "remaining": [
+    {
+      "bead": "mini-agent-ew67q.4",
+      "status": "in_progress",
+      "risk": "Executable Git configuration probe-to-launch race; complete nested/index/config enforced boundary required."
+    },
+    {
+      "bead": "mini-agent-ala40.8",
+      "status": "open",
+      "risk": "Linux Git metadata introduced after sandbox launch is not protected by existing-path binds."
+    },
+    {
+      "bead": "mini-agent-ew67q.1",
+      "status": "in_progress",
+      "risk": "Live main required check installed; non-owner merge rejection negative control not exercised."
+    },
+    {
+      "bead": "mini-agent-ew67q.2",
+      "status": "in_progress",
+      "risk": "Live release tag policy installed; real branch/tag deployment controls not exercised."
+    },
+    {
+      "bead": "mini-agent-mxtlv",
+      "status": "open",
+      "risk": "Native signed-in IDE Chat view coverage requires registry connectivity."
+    },
+    {
+      "bead": "mini-agent-ala40.12",
+      "status": "open",
+      "risk": "One rich run ended the ACP fixture before shell PID publication. Individual and subsequent full runs passed; exact early Bash failure remains unproven. Fixture now isolates global hooks and records early tool updates without extra scripted turns or weakened process checks."
+    }
+  ],
+  "verification_history": {
+    "first_final_rich_run": "3762 unit passed, 2 failed, 12 ignored: ACP early Bash return and real-store harness extra-turn exhaustion. Evidence /private/tmp/mini-agent-hardening-final-rich-tests.log.",
+    "independent_targeted_reruns": "Both passed without source changes; logs /private/tmp/mini-agent-hardening-final-acp-flake.log and final-eval-flake.log.",
+    "diagnostic_full_rich_rerun": "3764 unit passed, 12 ignored; 16 headless, 2 macOS preflight and 7 worker passed. /private/tmp/mini-agent-hardening-final-rich-diagnostic-tests.log.",
+    "fixture_correction": "Harness Stop-hook interference causally reproduced with a blocking hook negative control. Harness and ACP fixtures now acquire the shared dispatcher guard; ACP additionally records early ToolCallUpdate data. Original ACP early return not classified as fixed.",
+    "final_combined_rich": "3765 unit passed, 12 ignored; 16 headless, 2 macOS preflight, 7 worker passed; strict all-targets Clippy passes. Both fixture isolation commits included. /private/tmp/mini-agent-hardening-final-rich-combined-tests.log."
+  },
+  "cleanup": {
+    "owned_loopback_server": "Stopped verified fixture PID 7108 after final probes.",
+    "owned_tmux_socket": "mini-agent-hardening-20260930 stopped by driver finally block.",
+    "worktrees": "Clean integrated implementation worktrees removed; user worktrees/branches/stashes preserved.",
+    "native_acp_children": "Captured live shell/child PIDs absent before close; owned binary exits 0.",
+    "canonical_phase6": "Unchanged; test storage was corrected to satisfy existing worker publication guard."
+  }
+}
