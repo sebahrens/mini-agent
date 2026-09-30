@@ -331,6 +331,71 @@ async fn bare_repository_remains_usable_by_internal_runner() {
 }
 
 #[tokio::test]
+async fn init_without_repository_accepts_global_helper_and_untrusted_include() {
+    let fixture = Fixture::new("unborn-global-config");
+    let unborn = fixture.root.join("unborn");
+    let home = fixture.root.join("home");
+    std::fs::create_dir(&unborn).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    let included = unborn.join("model-config");
+    let (clean, marker) = fixture.marker_script("unborn-global-clean");
+    std::fs::write(
+        &included,
+        format!("[filter \"included\"]\n\tclean = {}\n", clean.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!(
+            "[credential]\n\thelper = /usr/bin/true\n[include]\n\tpath = {}\n",
+            included.display()
+        ),
+    )
+    .unwrap();
+    let runner = GitRunner::discover().unwrap().with_home_for_test(&home);
+    runner
+        .run(&unborn, "init", ["init", "--quiet"], LOCAL_MUTATION_LIMITS)
+        .await
+        .expect("fresh init accepts global config before Git roots exist");
+    std::fs::write(
+        unborn.join(".gitattributes"),
+        "tracked.txt filter=included\n",
+    )
+    .unwrap();
+    std::fs::write(unborn.join("tracked.txt"), "content\n").unwrap();
+    runner
+        .run(
+            &unborn,
+            "add",
+            ["add", "tracked.txt"],
+            LOCAL_MUTATION_LIMITS,
+        )
+        .await
+        .expect("workspace global include remains neutralized after init");
+    assert_not_run(std::slice::from_ref(&marker));
+}
+
+#[tokio::test]
+async fn init_does_not_treat_broken_git_metadata_as_unborn() {
+    let fixture = Fixture::new("broken-init-metadata");
+    let unborn = fixture.root.join("broken");
+    std::fs::create_dir(&unborn).unwrap();
+    std::fs::write(unborn.join(".git"), "gitdir: missing-git-dir\n").unwrap();
+
+    let error = GitRunner::discover()
+        .unwrap()
+        .run(&unborn, "init", ["init", "--quiet"], LOCAL_MUTATION_LIMITS)
+        .await
+        .err()
+        .expect("a broken existing .git entry must fail closed");
+    assert!(error.contains("git init"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(unborn.join(".git")).unwrap(),
+        "gitdir: missing-git-dir\n"
+    );
+}
+
+#[tokio::test]
 async fn undo_stash_uses_hardened_runner() {
     let fixture = Fixture::new("undo-stash");
     let markers = fixture.arm_fsmonitor_and_filters();

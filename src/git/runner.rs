@@ -241,6 +241,15 @@ impl GitRunner {
         S: AsRef<OsStr>,
     {
         self.validate()?;
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        // `git init` must also work before there is a repository to ask for
+        // its administration paths. Select this narrow case from the actual
+        // argv, never from the caller's diagnostic operation label.
+        let initializing =
+            profile == InternalProfile::Local && args.first().is_some_and(|arg| arg == "init");
         #[cfg(test)]
         let repository_execution = repository_execution_allowed_for_test(repo_path);
         #[cfg(not(test))]
@@ -248,7 +257,7 @@ impl GitRunner {
         let mut config = hardened_config(profile, repository_execution);
         if !repository_execution {
             config.extend(
-                self.repository_config_overrides(repo_path, operation, profile)
+                self.repository_config_overrides(repo_path, operation, profile, initializing)
                     .await?,
             );
             if self.nested_repositories {
@@ -303,8 +312,11 @@ impl GitRunner {
         repo_path: &Path,
         operation: &str,
         profile: InternalProfile,
+        initializing: bool,
     ) -> Result<Vec<(String, String)>, String> {
-        let entries = self.executable_config_entries(repo_path, operation).await?;
+        let entries = self
+            .executable_config_entries(repo_path, operation, initializing)
+            .await?;
         untrusted_config_overrides(&entries, profile)
     }
 
@@ -314,6 +326,7 @@ impl GitRunner {
         &self,
         repo_path: &Path,
         operation: &str,
+        initializing: bool,
     ) -> Result<Vec<ScopedConfigEntry>, String> {
         let command = self.build_internal_command(
             repo_path,
@@ -338,7 +351,9 @@ impl GitRunner {
             Some(0) => {
                 let mut entries = parse_scoped_config(&output.stdout)
                     .map_err(|error| format!("refusing git {operation}: {error}"))?;
-                let roots = self.untrusted_config_roots(repo_path, operation).await?;
+                let roots = self
+                    .untrusted_config_roots(repo_path, operation, initializing)
+                    .await?;
                 for entry in &mut entries {
                     entry.trusted_origin =
                         origin_is_outside_untrusted_roots(&entry.origin, repo_path, &roots);
@@ -356,6 +371,7 @@ impl GitRunner {
         &self,
         repo_path: &Path,
         operation: &str,
+        initializing: bool,
     ) -> Result<Vec<PathBuf>, String> {
         let command = self.build_internal_command(
             repo_path,
@@ -373,6 +389,16 @@ impl GitRunner {
             .output_built_command_with_limits(command, QUERY_LIMITS)
             .await
             .map_err(|_| format!("git {operation} runner failed"))?;
+        let unborn = initializing
+            && output.status == CommandStatus::Completed
+            && output.exit_status.and_then(|status| status.code()) != Some(0)
+            && matches!(
+                repo_path.join(".git").symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+        if unborn {
+            return self.pre_init_untrusted_roots(repo_path, operation);
+        }
         let output = command_result(operation, QUERY_LIMITS, output)?;
         let lines = output
             .stdout
@@ -421,17 +447,24 @@ impl GitRunner {
                 format!("refusing git {operation}: Git repository roots cannot be resolved")
             })?);
         }
-        let paths = crate::paths::process_paths()
-            .map_err(|_| format!("refusing git {operation}: application paths are unavailable"))?;
-        let cache_parent = paths
-            .cache_dir
-            .canonicalize()
-            .unwrap_or(paths.cache_dir.clone());
-        let sandbox_cache = cache_parent.join("sandbox-runtime");
-        roots.push(sandbox_cache.clone());
-        if let Ok(resolved) = sandbox_cache.canonicalize() {
-            roots.push(resolved);
-        }
+        add_sandbox_cache_root(&mut roots, operation)?;
+        Ok(roots)
+    }
+
+    /// `git init` in a fresh directory has no Git administration paths yet.
+    /// The directory itself covers any global include the model can already
+    /// author there, including a future `.git` path. An existing `.git` entry
+    /// never enters this path: malformed or unreadable repositories fail closed.
+    fn pre_init_untrusted_roots(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let root = repo_path.canonicalize().map_err(|_| {
+            format!("refusing git {operation}: Git repository roots cannot be resolved")
+        })?;
+        let mut roots = vec![root];
+        add_sandbox_cache_root(&mut roots, operation)?;
         Ok(roots)
     }
 
@@ -489,7 +522,7 @@ impl GitRunner {
             }
             visited.push(canonical);
             let entries = self
-                .executable_config_entries(&nested, operation)
+                .executable_config_entries(&nested, operation, false)
                 .await
                 .map_err(|error| refuse(&format!("has unreadable configuration ({error})")))?;
             // Transport and credential keys are never consulted by a dirty
@@ -1275,6 +1308,21 @@ fn output_path_bytes(bytes: &[u8]) -> PathBuf {
     {
         PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
     }
+}
+
+fn add_sandbox_cache_root(roots: &mut Vec<PathBuf>, operation: &str) -> Result<(), String> {
+    let paths = crate::paths::process_paths()
+        .map_err(|_| format!("refusing git {operation}: application paths are unavailable"))?;
+    let cache_parent = paths
+        .cache_dir
+        .canonicalize()
+        .unwrap_or(paths.cache_dir.clone());
+    let sandbox_cache = cache_parent.join("sandbox-runtime");
+    roots.push(sandbox_cache.clone());
+    if let Ok(resolved) = sandbox_cache.canonicalize() {
+        roots.push(resolved);
+    }
+    Ok(())
 }
 
 /// Nested repositories contribute only the keys a dirty check inside them

@@ -129,7 +129,10 @@ its Git administration directories, and the dedicated writable
 `cache_dir/sandbox-runtime` root. This covers global includes that point back
 into model-writable storage; outside-workspace global credential helpers remain
 available for explicit network operations. An undecodable executable origin
-refuses the operation. This origin check does not make the source immutable:
+refuses the operation. For `git init` in a fresh directory, the selected
+directory is the untrusted root until Git has administration paths; an existing
+malformed `.git` entry still refuses initialization. This origin check does not
+make the source immutable:
 the separate probe-to-launch race in mini-agent-ew67q.4 remains. Additional
 user-configured writable roots, including Windows AppContainer extra roots, may
 extend model authority beyond this origin classifier and require their own
