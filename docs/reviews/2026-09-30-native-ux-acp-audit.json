@@ -1,0 +1,120 @@
+{
+  "date": "2026-09-30",
+  "scope": "Non-cyber UX and integration fixes; cyber findings deferred at user request.",
+  "tui": {
+    "binary": "Debug binary installed with cargo install --path . --debug, with skills,hooks,advisor,lsp,multimodal,pdf plus default features.",
+    "driver": "Owned native tmux terminal, rendered pane captures, readiness markers, loopback scripted provider, isolated config/data/workspace.",
+    "commands_and_aliases_exercised": 54,
+    "coverage": "/private/tmp/mini-agent-ux-fpyoj/evidence/coverage.json",
+    "observed_behaviors": [
+      "Explicit argument submission with one Enter",
+      "Streaming and side questions",
+      "Queue listing/pop/clear and interruption",
+      "Active loop status/stop and no later round",
+      "Undo/redo, rewind dismissal, retry and review prompt restoration",
+      "Populated JSONL import/export and actual compression",
+      "File paths with spaces, models/providers, prompts/themes, modes, tools and memory",
+      "Init confirmation, pager recovery, scrolling, small-terminal resize and quit/exit"
+    ],
+    "share_scope": "Preview only; no external upload performed.",
+    "local_only_merge_evidence": "/private/tmp/mini-agent-ux-fpyoj/evidence/final-local-worktree-merge-success.screen.txt; root rebuilt75af8fc, native /worktree then external commit then /wt-merge observed exact target bytes, removed source path, and empty target Git status."
+  },
+  "fixed": [
+    {
+      "bead": "mini-agent-u4ond",
+      "result": "Fully typed slash-command arguments submit on the first Enter."
+    },
+    {
+      "bead": "mini-agent-kqk9c",
+      "result": "Interactive diagnostics enter a bounded sanitized TUI feed and preserve the draft input."
+    },
+    {
+      "bead": "mini-agent-4kfxc",
+      "result": "Active loop status/stop commands work while a round is running; stop prevents another round."
+    },
+    {
+      "bead": "mini-agent-2pshv",
+      "result": "Pending JS containment probes no longer cause a false startup unavailability warning; actual refusal reasons remain visible."
+    },
+    {
+      "bead": "mini-agent-gesi4.1",
+      "result": "Expected ACP permission responses no longer produce false unhandled-dispatch warnings."
+    },
+    {
+      "bead": "mini-agent-gesi4.2",
+      "result": "Parallel worktree hook fixture matches only its unique probe tool."
+    },
+    {
+      "bead": "mini-agent-wzppj",
+      "result": "VSIX minimum VS Code version is 1.91 and host tests exercise the installed artifact."
+    },
+    {
+      "bead": "mini-agent-gesi4.4",
+      "result": "Local-only target branches merge without requiring an upstream; remote-only or merge-only configuration still surfaces pull failure, and configured upstream behavior is preserved."
+    }
+  ],
+  "acp": {
+    "native_wire_probe": "/private/tmp/mini-agent-gesi4-native.log",
+    "observed": [
+      "Initialize/new session and streamed turn",
+      "Approved tool effect inside workspace",
+      "Permission denial prevents effect",
+      "Cancellation after a started marker prevents late effect",
+      "Session close and process exit"
+    ],
+    "sandbox": "Native macOS approved shell wrote inside its workspace; an approved sibling-directory write failed with Operation not permitted and created no file. No production sandbox policy was changed."
+  },
+  "vscode": {
+    "host": "Native macOS VS Code 1.91.1, isolated profile and installed VSIX with bundled compiled binary.",
+    "observed": [
+      "Activation/start/restart/stop and Open Config",
+      "Streamed offline ACP response through installed production session export",
+      "Real Quick Pick allow and deny, with explicit denial result",
+      "Cancelled ACP turn with no provider tool result"
+    ],
+    "evidence": "Agent tool output after commits 63328ed and fb41ce4 contains IDE_ACP_TURN_PASS, IDE_PERMISSION_ALLOW_PASS, IDE_PERMISSION_DENY_PASS, IDE_PERMISSION_CANCEL_PASS, IDE_HOST_SMOKE_PASS and host exit 0; no final file log was saved.",
+    "limits": "Production session export bypasses the Chat view. Offline profile could not fetch signed-in participant registry; Chat view registration/rendering and cross-extension Quick Pick lifecycle were not proven. Native Linux/Windows hosts were not run.",
+    "followup": "mini-agent-mxtlv"
+  },
+  "quality_gates": {
+    "default_native": {
+      "unit_passed": 2896,
+      "unit_ignored": 7,
+      "headless_passed": 15,
+      "macos_preflight_passed": 2,
+      "worker_bootstrap_passed": 7
+    },
+    "rich_features_native": {
+      "unit_passed": 3746,
+      "unit_ignored": 12,
+      "headless_passed": 16,
+      "macos_preflight_passed": 2,
+      "worker_bootstrap_passed": 7
+    },
+    "other": [
+      "Strict Clippy default/minimal/rich feature rows",
+      "Subprocess inventory:27 passed",
+      "VS Code npm:61 passed plus typecheck/lint",
+      "Package metadata:112 passed; workflow policy:4 passed",
+      "Debug installs, cargo fmt and diff checks"
+    ],
+    "logs": "/private/tmp/mini-agent-ux-fpyoj/evidence",
+    "source_for_full_suites": "Root commit79466de; final local-only merge change75af8fc is validated separately by its owning Git worktree suite, strict Clippy, and rebuilt native TUI.",
+    "final_local_only_merge": [
+      "Owning worktree suite with git-worktree feature:95 passed including configured-upstream success and conflict recovery",
+      "Strict all-targets Clippy with git-worktree feature passed",
+      "Debug install and native compiled local-only merge passed",
+      "Integrated rich-feature owning worktree suite passed; log /private/tmp/mini-agent-ux-fpyoj/evidence/local-merge-final-tests.log",
+      "Integrated rich-feature worktree suite:96 passed",
+      "Integrated subprocess inventory:27 passed",
+      "Integrated strict all-targets rich-feature Clippy passed"
+    ]
+  },
+  "remaining": [
+    {
+      "bead": "mini-agent-gesi4.3",
+      "status": "open P2",
+      "result": "Initial clean/dirty worktree report did not reproduce in three settled native reruns. No speculative workaround delivered."
+    }
+  ]
+}

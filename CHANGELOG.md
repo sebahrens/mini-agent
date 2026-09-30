@@ -141,6 +141,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `/wt-merge` works with local-only target branches without requiring an upstream.
+  Branches with upstream configuration still pull before merging.
 - `/loop stop` and loop status are available during an active round; stopping prevents
   further rounds without rebuilding the running agent.
 - Pending JavaScript startup checks no longer appear as false runtime-unavailability warnings.
