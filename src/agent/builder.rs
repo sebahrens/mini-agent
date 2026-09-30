@@ -529,8 +529,8 @@ fn register_js_tool_with_status(
     } = containment_status
     {
         // The reason is also recorded by `crate::provider::build_agent_in_workspace`
-        // into the session runtime report, which is what `/toggle` renders; the
-        // the TUI renders tracing records while attached. Interpolate the reason
+        // into the session runtime report, which is what `/toggle` renders. The
+        // TUI also renders tracing records while attached. Interpolate the reason
         // into the message too so log sinks that drop structured fields still
         // carry it.
         tracing::warn!(

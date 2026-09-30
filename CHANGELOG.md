@@ -141,6 +141,16 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `/loop stop` and loop status are available during an active round; stopping prevents
+  further rounds without rebuilding the running agent.
+- Pending JavaScript startup checks no longer appear as false runtime-unavailability warnings.
+- The VS Code extension now requires Stable 1.91, where chat participants became available,
+  and release checks activate the installed VSIX against its bundled ACP binary.
+
+- Background diagnostics now appear in the TUI chat feed without overwriting unsent input.
+  Headless and ACP diagnostics continue to use stderr.
+- Expected ACP permission responses no longer emit false unhandled-dispatch warnings.
+
 - Fully typed slash-command arguments such as `/model org/model`, `/prompt default`, and
   `/models refresh` now submit on the first Enter. Partial arguments still complete the
   highlighted choice, and Tab keeps its existing completion behavior.

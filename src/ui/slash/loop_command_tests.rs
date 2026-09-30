@@ -255,7 +255,7 @@ async fn loop_stop_during_a_run_clears_future_rounds_without_rebuilding_current_
     )
     .await;
 
-    let (status, running, invalidated, _) = run_loop_parts_with_state(
+    let (status_lines, running, invalidated, _) = run_loop_parts_with_state(
         &["/loop", "status"],
         &mut session,
         &mut context,
@@ -263,7 +263,11 @@ async fn loop_stop_during_a_run_clears_future_rounds_without_rebuilding_current_
         true,
     )
     .await;
-    assert!(status.iter().any(|line| line.starts_with("loop active:")));
+    assert!(
+        status_lines
+            .iter()
+            .any(|line| line.starts_with("loop active:"))
+    );
     assert!(running);
     assert!(!invalidated);
 
