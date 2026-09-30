@@ -893,6 +893,32 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-INTERNAL-GIT",
     ),
+    // Owned real-Git fixture: config probe, old-authority marker, and hardened add.
+    (
+        "src/git/runner.rs",
+        "let init = std::process::Command::new(git.program.as_path())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "let probe = std::process::Command::new(git.program.as_path())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "let mut command = std::process::Command::new(git.program.as_path());",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/git/runner.rs", ".output()", 2, "TEST-ONLY"),
+    (
+        "src/git/runner.rs",
+        "command.output().unwrap()",
+        1,
+        "TEST-ONLY",
+    ),
     (
         "src/git/runner.rs",
         "use tokio::process::Command;",

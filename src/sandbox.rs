@@ -4369,7 +4369,7 @@ pub(crate) fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String
 /// so command scratch storage needs a separate location instead of a read
 /// exception that could expose credentials or configuration.
 #[cfg(any(target_os = "macos", test))]
-fn select_macos_runtime_cache(
+pub(crate) fn select_macos_runtime_cache(
     configured: PathBuf,
     paths: &crate::paths::AppPaths,
     system_cache: Option<&Path>,

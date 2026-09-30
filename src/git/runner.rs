@@ -1313,16 +1313,47 @@ fn output_path_bytes(bytes: &[u8]) -> PathBuf {
 fn add_sandbox_cache_root(roots: &mut Vec<PathBuf>, operation: &str) -> Result<(), String> {
     let paths = crate::paths::process_paths()
         .map_err(|_| format!("refusing git {operation}: application paths are unavailable"))?;
+    roots.extend(sandbox_cache_roots(
+        &paths,
+        dirs::cache_dir().as_deref(),
+        operation,
+    )?);
+    Ok(())
+}
+
+fn sandbox_cache_roots(
+    paths: &crate::paths::AppPaths,
+    system_cache: Option<&Path>,
+    operation: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
     let cache_parent = paths
         .cache_dir
         .canonicalize()
         .unwrap_or(paths.cache_dir.clone());
-    let sandbox_cache = cache_parent.join("sandbox-runtime");
-    roots.push(sandbox_cache.clone());
-    if let Ok(resolved) = sandbox_cache.canonicalize() {
+    let configured = cache_parent.join("sandbox-runtime");
+    // The configured cache remains model-writable even when Seatbelt chooses
+    // its disjoint system-cache fallback for command scratch storage.
+    roots.push(configured.clone());
+    if let Ok(resolved) = configured.canonicalize() {
         roots.push(resolved);
     }
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let selected = crate::sandbox::select_macos_runtime_cache(
+            paths.cache_dir.join("sandbox-runtime"),
+            paths,
+            system_cache,
+        )
+        .map_err(|error| format!("refusing git {operation}: {error}"))?;
+        roots.push(selected.clone());
+        if let Ok(resolved) = selected.canonicalize() {
+            roots.push(resolved);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (system_cache, operation);
+    Ok(roots)
 }
 
 /// Nested repositories contribute only the keys a dirty check inside them
@@ -1991,6 +2022,171 @@ mod tests {
             &roots
         ));
         std::fs::remove_dir_all(owned).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn global_include_from_selected_seatbelt_cache_cannot_supply_executable_config() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let owned = Owned(std::env::temp_dir().join(format!(
+            "mini-agent-seatbelt-global-include-{}",
+            uuid::Uuid::new_v4()
+        )));
+        let repo = owned.0.join("repo");
+        let home = owned.0.join("home");
+        let system_cache = owned.0.join("system-cache");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = crate::paths::AppPaths {
+            config_dir: owned.0.join("private"),
+            credentials_dir: owned.0.join("credentials"),
+            cache_dir: owned.0.join("private/cache"),
+            data_dir: owned.0.join("data"),
+            local_data_dir: owned.0.join("local"),
+            state_dir: owned.0.join("state"),
+            project_dir: None,
+        };
+        let fallback = crate::sandbox::select_macos_runtime_cache(
+            paths.cache_dir.join("sandbox-runtime"),
+            &paths,
+            Some(&system_cache),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let included = fallback.join("included-config");
+        let marker = owned.0.join("filter-ran");
+        std::fs::write(
+            &included,
+            format!(
+                "[filter \"late\"]\n\tclean = /usr/bin/touch {}\n[credential]\n\thelper = attacker-helper\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[credential]\n\thelper = trusted-helper\n[include]\n\tpath = {}\n",
+                included.display()
+            ),
+        )
+        .unwrap();
+        let git = GitRunner::discover().unwrap();
+        let init = std::process::Command::new(git.program.as_path())
+            .args(["init", "-q"])
+            .arg(&repo)
+            .env_clear()
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        std::fs::write(repo.join("payload"), "content\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "payload filter=late\n").unwrap();
+        let probe = std::process::Command::new(git.program.as_path())
+            .args([
+                "config",
+                "--show-scope",
+                "--show-origin",
+                "--null",
+                "--list",
+            ])
+            .current_dir(&repo)
+            .env_clear()
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let roots = sandbox_cache_roots(&paths, Some(&system_cache), "probe").unwrap();
+        assert!(roots.iter().any(|root| fallback.starts_with(root)));
+        assert!(
+            roots
+                .iter()
+                .any(|root| paths.cache_dir.join("sandbox-runtime").starts_with(root))
+        );
+        let mut entries = parse_scoped_config(&probe.stdout).unwrap();
+        let configured_only = vec![repo.clone(), paths.cache_dir.join("sandbox-runtime")];
+        let mut old_entries = parse_scoped_config(&probe.stdout).unwrap();
+        for entry in &mut old_entries {
+            entry.trusted_origin =
+                origin_is_outside_untrusted_roots(&entry.origin, &repo, &configured_only);
+        }
+        assert!(
+            old_entries
+                .iter()
+                .any(|entry| entry.key == "filter.late.clean" && entry.trusted_origin)
+        );
+        let old_overrides =
+            untrusted_config_overrides(&old_entries, InternalProfile::Network).unwrap();
+        assert!(
+            !old_overrides
+                .iter()
+                .any(|(key, _)| key == "filter.late.clean")
+        );
+        let git_add = |overrides: &[(String, String)]| {
+            let mut command = std::process::Command::new(git.program.as_path());
+            command.current_dir(&repo);
+            command
+                .env_clear()
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for (key, value) in overrides {
+                command.arg("-c").arg(format!("{key}={value}"));
+            }
+            command.args(["add", "--", "payload"]);
+            command.output().unwrap()
+        };
+        let old_add = git_add(&old_overrides);
+        assert!(
+            old_add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&old_add.stderr)
+        );
+        assert!(
+            marker.exists(),
+            "the old classifier must permit the clean driver"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(repo.join("payload"), "changed\n").unwrap();
+        for entry in &mut entries {
+            entry.trusted_origin = origin_is_outside_untrusted_roots(&entry.origin, &repo, &roots);
+        }
+        assert!(entries.iter().any(|entry| {
+            entry.scope == "global" && entry.key == "filter.late.clean" && !entry.trusted_origin
+        }));
+        let overrides = untrusted_config_overrides(&entries, InternalProfile::Network).unwrap();
+        assert!(overrides.contains(&("filter.late.clean".into(), String::new())));
+        assert!(overrides.contains(&("credential.helper".into(), "trusted-helper".into())));
+        assert!(
+            !overrides
+                .iter()
+                .any(|(_, value)| value == "attacker-helper")
+        );
+        let guarded_add = git_add(&overrides);
+        assert!(
+            guarded_add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&guarded_add.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "selected-cache origin must be neutralized"
+        );
     }
 
     #[test]

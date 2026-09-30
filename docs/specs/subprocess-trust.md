@@ -127,7 +127,11 @@ The internal Git config probe uses `--show-scope --show-origin --null --list` an
 classifies executable keys by raw bytes. A nominally global value is trusted
 only when its source file resolves outside the selected repository work tree,
 its Git administration directories, and the dedicated writable
-`cache_dir/sandbox-runtime` root. This covers global includes that point back
+configured `cache_dir/sandbox-runtime` root and, on macOS, the actual writable
+Seatbelt cache selected when the configured cache overlaps private application
+directories. Git uses the same side-effect-free selection as the sandbox and
+keeps the configured root untrusted even when Seatbelt selects a fallback.
+This covers global includes that point back
 into model-writable storage; outside-workspace global credential helpers remain
 available for explicit network operations. An undecodable executable origin
 refuses the operation. For `git init` in a fresh directory, the selected
