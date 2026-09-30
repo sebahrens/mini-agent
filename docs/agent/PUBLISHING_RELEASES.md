@@ -108,6 +108,14 @@ when its bytes match the lockfile integrity, so the result is byte-identical to 
 release workflow does not use that cache. Never delete a source asset while any matching binary asset remains
 available.
 
+The VSIX requires VS Code 1.91 or later: the Chat Participant API first became available in
+Stable there. The release matrix installs each candidate into clean VS Code 1.91.1, then starts
+the extension in a real extension host and exercises ACP process startup, restart and stop,
+and Open Config. The host smoke uses a private config root and dummy provider key and sends no
+model prompt; the extension's unit tests cover permission cancellation. Linux runs the host smoke
+under Xvfb. The separate `smoke-acp.mjs` check sends a prompt only to cancel it before provider
+work. Neither check substitutes for platform-specific sandbox tests.
+
 ## Product identity matrix
 
 | Category | Canonical value | Compatibility policy |

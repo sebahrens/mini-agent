@@ -602,9 +602,15 @@ jobs:
         env:
           VSCODE_TARGET: ${{ matrix.vscode-target }}
         run: |
-          node scripts/run-integration-tests.mjs \
-            "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.vsix" \
-            "$VSCODE_TARGET"
+          if [[ "$VSCODE_TARGET" == linux-* ]]; then
+            xvfb-run -a node scripts/run-integration-tests.mjs \
+              "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.vsix" \
+              "$VSCODE_TARGET"
+          else
+            node scripts/run-integration-tests.mjs \
+              "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.vsix" \
+              "$VSCODE_TARGET"
+          fi
 
       - name: Upload native candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
