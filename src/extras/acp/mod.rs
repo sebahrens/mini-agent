@@ -4790,6 +4790,64 @@ mod protocol_tests {
         assert!(error.to_string().contains("cannot enforce"), "{error}");
     }
 
+    /// Exercise the complete editor server configuration -> MCP launch path.
+    /// The same helper connects to an owned loopback listener when explicitly
+    /// trusted and is blocked by the default workspace-service sandbox.
+    #[cfg(all(feature = "mcp", target_os = "macos"))]
+    #[tokio::test]
+    async fn client_stdio_mcp_network_denial_survives_native_launch() {
+        const PORT: &str = "MINI_AGENT_ACP_MCP_NETWORK_PORT";
+        const MARKER: &str = "MINI_AGENT_ACP_MCP_NETWORK_MARKER";
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture.clone());
+        let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+        if !matches!(
+            crate::sandbox::Sandbox::new(true, &backend).policy(),
+            crate::sandbox::SandboxPolicy::RequiredAndAvailable
+        ) || backend == "zerobox"
+        {
+            return; // Platform has no enforceable workspace-service backend.
+        }
+
+        let workspace = ProtocolTempDir::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = "if /usr/bin/nc -z -w 1 127.0.0.1 \"$MINI_AGENT_ACP_MCP_NETWORK_PORT\"; \
+            then printf connected > \"$MINI_AGENT_ACP_MCP_NETWORK_MARKER\"; \
+            else printf blocked > \"$MINI_AGENT_ACP_MCP_NETWORK_MARKER\"; fi";
+        for (policy, expected) in [
+            (ClientMcpPolicy::Trusted, "connected"),
+            (ClientMcpPolicy::Sandboxed, "blocked"),
+        ] {
+            let marker = workspace.path().join(format!("{expected}.txt"));
+            let mut policy_state = fixture_state(fixture.clone());
+            Arc::get_mut(&mut policy_state).unwrap().client_mcp = policy;
+            let server = McpServer::Stdio(
+                McpServerStdio::new("network-probe", std::path::PathBuf::from("/bin/sh"))
+                    .args(vec!["-c".to_string(), script.to_string()])
+                    .env(vec![
+                        EnvVariable::new(PORT, port.to_string()),
+                        EnvVariable::new(MARKER, marker.display().to_string()),
+                    ]),
+            );
+            let accepted = client_mcp_servers(&policy_state, &[server]).unwrap();
+            let config = accepted.get("network-probe").unwrap();
+            let launch = crate::extras::mcp::client::McpClientHandle::connect_with_timeout_in(
+                compact_str::CompactString::new("network-probe"),
+                config,
+                Duration::from_secs(5),
+                workspace.path(),
+            )
+            .await;
+            let launch_error = launch.err().map(|error| error.to_string());
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap_or_default(),
+                expected,
+                "ACP {policy:?} helper must report {expected} through {backend}; launch: {launch_error:?}"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_client_mcp_servers_are_refused_not_ignored() {
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
