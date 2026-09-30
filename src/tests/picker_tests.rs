@@ -937,6 +937,57 @@ mod slash_picker_contract {
         ));
     }
 
+    #[test]
+    fn fully_typed_arguments_submit_without_a_second_enter() {
+        for command in [
+            "/model org/a",
+            "/models fast",
+            "/models refresh",
+            "/model raw/new-model",
+            "/prompt café",
+            "/prompt missing",
+            "/theme dark",
+            "/provider local",
+            "/provider unavailable",
+            "/queue clear",
+        ] {
+            let mut input = InputEditor::new();
+            input.set_quick_model_names(vec!["fast".into()]);
+            input.set_live_model_names(vec!["org/a".into()]);
+            input.set_prompt_names(vec!["café".into()]);
+            input.set_theme_names(vec!["dark".into()]);
+            input.set_provider_names(vec!["local".into()]);
+            typed(&mut input, command);
+            assert!(
+                input.picker.as_ref().is_some_and(Picker::active),
+                "{command}"
+            );
+            assert_eq!(
+                press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+                Some(command),
+                "{command}"
+            );
+            assert!(input.buffer.is_empty(), "{command}");
+            assert!(
+                !input.picker.as_ref().is_some_and(Picker::active),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_tab_completion_still_waits_for_enter_to_submit() {
+        let mut input = InputEditor::new();
+        input.set_prompt_names(vec!["café".into()]);
+        typed(&mut input, "/prompt caf");
+        assert_eq!(press(&mut input, KeyCode::Tab, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/prompt café");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("/prompt café")
+        );
+    }
+
     /// mini-agent-lqq0c: aliases are not suggested but still run in one Enter.
     #[test]
     fn hidden_aliases_are_not_suggested_but_run_when_typed_in_full() {

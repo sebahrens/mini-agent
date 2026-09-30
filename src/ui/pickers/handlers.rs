@@ -403,6 +403,22 @@ pub fn handle_command_key(
     }
 }
 
+/// A complete, explicitly typed argument should reach the slash handler on
+/// Enter. An unmatched argument may be a raw model ID or a handler subcommand
+/// (e.g. `/models refresh`); the handler owns its validation.
+fn typed_argument(
+    buffer: &str,
+    cursor: usize,
+    prefix: &str,
+    query: &str,
+    selected: Option<&str>,
+) -> bool {
+    !query.is_empty()
+        && cursor == buffer.len()
+        && buffer.strip_prefix(prefix) == Some(query)
+        && selected.is_none_or(|name| name == query)
+}
+
 pub fn handle_prefixed_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -412,6 +428,19 @@ pub fn handle_prefixed_key(
 ) -> bool {
     let prefix_len = prefix.len();
     match key.code {
+        KeyCode::Enter
+            if typed_argument(
+                buffer,
+                *cursor,
+                prefix,
+                &picker.query,
+                picker.selected_name(),
+            ) =>
+        {
+            picker.deactivate();
+            false
+        }
+
         KeyCode::Char(c)
             if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
         {
@@ -538,6 +567,19 @@ pub fn handle_models_key(
     let prefix = picker.prefix;
     let prefix_len = prefix.len();
     match key.code {
+        KeyCode::Enter
+            if typed_argument(
+                buffer,
+                *cursor,
+                prefix,
+                &picker.query,
+                picker.selected_name(),
+            ) =>
+        {
+            picker.deactivate();
+            false
+        }
+
         KeyCode::Char(c)
             if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
         {

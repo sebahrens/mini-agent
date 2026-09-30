@@ -240,7 +240,7 @@ Here is some keybindings to speed up your coding experience:
 | `Home` / `End` | Start/end of the input line (empty input: jump to top/bottom) |
 | `Ctrl+Home` / `Ctrl+End` | Jump to top/bottom of chat |
 | `Shift+Enter` / `Alt+Enter` | Insert a newline |
-| `/` | Open the command picker; Tab inserts the highlight, Enter runs a command typed in full |
+| `/` | Open the command picker; Tab inserts the highlight, Enter runs a command or argument typed in full |
 | `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path, a space closes it |
 | `Tab` | Insert two spaces when no picker is active |
 

@@ -141,6 +141,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Fully typed slash-command arguments such as `/model org/model`, `/prompt default`, and
+  `/models refresh` now submit on the first Enter. Partial arguments still complete the
+  highlighted choice, and Tab keeps its existing completion behavior.
+
 - The manual Windows LPAC image-loading feasibility test now builds its child environment with the
   same helper as the production worker launcher, adding the AppContainer profile's `LOCALAPPDATA`,
   `TEMP` and `TMP`; without them `CreateProcessW` failed on the hosted runner with os error 203. The
