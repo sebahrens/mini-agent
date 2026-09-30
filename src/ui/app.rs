@@ -622,6 +622,7 @@ pub(crate) struct App<'a> {
 
     user_tx: mpsc::Sender<UserEvent>,
     user_rx: mpsc::Receiver<UserEvent>,
+    tui_log_rx: Option<mpsc::Receiver<String>>,
     deferred_user_events: std::collections::VecDeque<UserEvent>,
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
@@ -1017,6 +1018,7 @@ impl<'a> App<'a> {
             btw_total_out: 0,
             user_tx,
             user_rx,
+            tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
             running,
             event_handle,
@@ -1057,6 +1059,7 @@ impl<'a> App<'a> {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
+            self.drain_tui_diagnostics()?;
             // Every adoption/rebuild path returns here, including a prompt that
             // awaited prebuild and deferred events that immediately continue.
             #[cfg(feature = "mcp")]
@@ -1080,6 +1083,12 @@ impl<'a> App<'a> {
             }
 
             tokio::select! {
+                Some(message) = async { self.tui_log_rx.as_mut()?.recv().await } => {
+                    for line in message.lines() {
+                        self.renderer.write_line(&sanitize_output(line), C_ERROR)?;
+                    }
+                    self.drain_tui_diagnostics()?;
+                }
                 Some(refresh) = self.git_status_rx.recv() => {
                     self.git_status_in_flight = false;
                     if apply_git_status_refresh(self.ui.session, self.ui.workspace.root(), refresh) {
@@ -1185,6 +1194,29 @@ impl<'a> App<'a> {
         }
 
         self.handle_worktree_auto_merge().await?;
+        Ok(())
+    }
+
+    fn drain_tui_diagnostics(&mut self) -> io::Result<()> {
+        // A trace burst cannot monopolize input or agent progress. The next
+        // event-loop iteration drains the remaining records.
+        if let Some(receiver) = self.tui_log_rx.as_mut() {
+            for _ in 0..16 {
+                let Ok(message) = receiver.try_recv() else {
+                    break;
+                };
+                for line in message.lines() {
+                    self.renderer.write_line(&sanitize_output(line), C_ERROR)?;
+                }
+            }
+        }
+        let dropped = crate::logging::take_dropped_tui_diagnostics();
+        if dropped > 0 {
+            self.renderer.write_line(
+                &format!("warning: {dropped} additional diagnostic records omitted"),
+                C_ERROR,
+            )?;
+        }
         Ok(())
     }
 

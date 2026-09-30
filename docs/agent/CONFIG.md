@@ -2795,6 +2795,12 @@ Behavior notes:
 zerostack uses the `tracing` framework for structured logging. By default, only
 warnings and errors are printed to stderr at the `warn` level (with the `rig`
 crate silenced). Full debug and trace output is available via CLI flags.
+In the interactive TUI, diagnostics emitted while the alternate screen is active
+appear in the chat feed, so they do not overwrite the input prompt. The feed
+holds up to 256 pending records of at most 4 KiB each and reports how many
+additional records were omitted during a burst. Startup and suspended editor
+or pager output continues to use stderr. Headless and ACP output also uses
+stderr. File logging remains independent of these display limits.
 
 ### Verbose mode (`-v` / `--verbose`)
 
@@ -2807,8 +2813,8 @@ root's `logs/` directory (`ZS_STATE_DIR` overrides the state root). The log
 file is named `zerostack-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
 per instance — previous runs are never overwritten.
 
-With `-v`, stderr output stays at the default `warn` level so the TUI remains
-clean. The log file captures everything at `trace` level for all zerostack
+With `-v`, visible diagnostic output stays at the default `warn` level. The
+log file captures everything at `trace` level for all zerostack
 modules.
 
 ### Custom log file (`--log-file`)
@@ -2827,7 +2833,7 @@ effect on the path, since `--log-file` takes precedence).
 mini-agent --log-level debug
 ```
 
-Sets the minimum level for stderr output. Accepted values: `trace`, `debug`,
+Sets the minimum level for visible diagnostic output. Accepted values: `trace`, `debug`,
 `info`, `warn`, `error`. This overrides the `RUST_LOG` environment variable.
 
 ### Environment variable (`RUST_LOG`)

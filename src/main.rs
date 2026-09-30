@@ -224,7 +224,7 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
 
     paths::converge_legacy_artifacts(&app_paths, is_interactive)?;
     logging::install_panic_hook();
-    logging::init(&cli);
+    logging::init(&cli, is_interactive);
 
     let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths, is_interactive);
 

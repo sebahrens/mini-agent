@@ -15,6 +15,10 @@ const DROP_RESTORE_ATTEMPTS: usize = 3;
 const DROP_RESTORE_BACKOFF: Duration = Duration::from_millis(10);
 static SYSTEM_TERMINAL_ATTACHED: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn is_attached() -> bool {
+    SYSTEM_TERMINAL_ATTACHED.load(Ordering::Acquire)
+}
+
 #[derive(Debug)]
 pub struct TerminalLifecycleError {
     operation: &'static str,
