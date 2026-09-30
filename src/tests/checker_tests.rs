@@ -600,6 +600,7 @@ fn standard_asks_before_file_tools_rewrite_git_config_or_hooks() {
             ".git/config",
             ".git/hooks/post-checkout",
             ".git/hooks/nested/x",
+            ".git/info/exclude",
         ] {
             assert_eq!(
                 checker.check_path(tool, &path(relative)),
@@ -613,12 +614,7 @@ fn standard_asks_before_file_tools_rewrite_git_config_or_hooks() {
         checker.check_path("read", &path(".git/config")),
         CheckResult::Allowed
     );
-    for relative in [
-        ".git/info/exclude",
-        ".git/COMMIT_EDITMSG",
-        "src/config",
-        "hooks/x",
-    ] {
+    for relative in [".git/COMMIT_EDITMSG", "src/config", "hooks/x"] {
         assert_eq!(
             checker.check_path("write", &path(relative)),
             CheckResult::Allowed,

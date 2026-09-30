@@ -598,9 +598,21 @@ mod tests {
     }
 
     async fn assert_scoped_cancellation_preserves_unrelated_command(sandbox: Sandbox, label: &str) {
-        let validator_pid_file = temp_path(&format!("{label}-validator-pid"));
-        let unrelated_pid_file = temp_path(&format!("{label}-unrelated-pid"));
-        let unrelated_stop_file = temp_path(&format!("{label}-unrelated-stop"));
+        struct Workspace(PathBuf);
+        impl Drop for Workspace {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        // Readiness and release files belong to this command's authorized
+        // workspace; sibling shared-temporary writes are intentionally denied.
+        let path = temp_path(&format!("{label}-workspace"));
+        std::fs::create_dir(&path).unwrap();
+        let workspace = Workspace(path);
+        let sandbox = sandbox.with_working_dir(&workspace.0);
+        let validator_pid_file = workspace.0.join("validator-pid");
+        let unrelated_pid_file = workspace.0.join("unrelated-pid");
+        let unrelated_stop_file = workspace.0.join("unrelated-stop");
         let unrelated_command = format!(
             "printf '%s' \"$$\" > {}; while [ ! -f {} ]; do :; done",
             shell_quote(&unrelated_pid_file),
