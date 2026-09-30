@@ -1,10 +1,10 @@
 # Subprocess Trust Classes and Launch Contracts
 
 - **Document role**: normative cross-cutting specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.2.1
 - **Delivery status**: contract delivered; hardening gaps remain tracked separately
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-30
 
 The corpus authority and conflict rules are defined in [`00-index.md`](00-index.md). This document
 controls how mini-agent selects a subprocess boundary and records the authority crossing that
@@ -16,7 +16,10 @@ Seatbelt capability matrices for model-generated actions.
 The `TC-MODEL-ACTION` row includes the delivered general-profile hardening: captured commands use
 null stdin, Unix creates a fresh session, Linux `bwrap` closes the workspace-authority descriptor
 inside the namespace before model exec, and only `cache_dir/sandbox-runtime` is mounted as cache.
-The macOS profile denies the resolved mini-agent configuration and credential directories. Backend
+The macOS profile denies the resolved mini-agent configuration and credential directories and
+limits temporary writes to the private dedicated sandbox cache instead of shared `/private/tmp`.
+Every general bubblewrap launch requires descriptor-bind support; unsupported backends refuse
+launch rather than omit the Git metadata protections. Backend
 readiness is a bounded real probe. Sandboxed hook executables, including an `if` condition's fixed
 shell, are resolved before the same readiness check. These rules apply whether the launch began in
 the shell tool, a brokered JS `spawn`, or a hook; none grants worker-containment authority.
@@ -88,6 +91,10 @@ shell is resolved once from the canonical workspace and the invocation's capture
 Bash/sh (`-c`) and, on Windows, PowerShell/pwsh (`-Command`) are supported. The canonical executable
 identity is held and revalidated at launch; missing, replaced, or unsupported shells are not
 registered or described to the model and never fall back to an unchecked name.
+
+Seatbelt workspace services pass delegated environment assignments through
+`/usr/bin/env -i --` before the resolved executable and argv. The option separator is mandatory:
+an environment name beginning with `-S` remains data and cannot substitute another executable.
 
 ## Trust classes and normative contracts
 

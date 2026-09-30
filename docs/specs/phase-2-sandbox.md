@@ -1,10 +1,10 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.1
+- **Specification version**: 1.3.2
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-30
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -293,10 +293,10 @@ inside the sandbox. For a workspace whose top level holds `.git`:
   (for example a `.git/commondir` pointing at a model-written directory, or `.git/hooks` in a
   repository that has none). A linked worktree's common directory lies outside the workspace and is
   not visible inside the sandbox at all. Writes fail with `EROFS`, and replacing a protected file or directory
-  (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options need
-  bubblewrap 0.8.0 or later; an older bubblewrap (probed once by parsing `--ro-bind-fd`) logs a
-  warning and launches without this defence rather than binding a model-writable path by name,
-  which could be swapped for a symlink to a host file.
+  (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options require
+  bubblewrap 0.8.0 or later. A backend without `--ro-bind-fd` is rejected before constructing
+  any model-action, hook, workspace-service, or executable-snapshot launch; there is no launch
+  with a reduced Git metadata policy or a path-based bind fallback.
 - **Seatbelt:** the profile ends with `(deny file-write* ...)` after the workspace write grant (of
   two filtered rules, Seatbelt applies the later one): a `subpath` filter for every protected path
   whether or not it exists yet, and a `literal` filter for the `.git` directory itself, each in both
@@ -319,16 +319,21 @@ Supported macOS hosts default to the system-provided Seatbelt backend at the fix
 `/usr/bin/sandbox-exec` path. The executable and every parent directory must be root-owned and not
 group/world-writable. The generated profile denies by
 default, allows child processes, allows host-readable files, permits writes only below the
-canonical workspace, canonical application cache, `/private/tmp`, and `/dev/null`, keeps the
+canonical workspace, dedicated sandbox cache (including its private `tmp` directory), and
+`/dev/null`, keeps the
 workspace Git metadata read-only as described in
 [Workspace Git metadata stays read-only](#workspace-git-metadata-stays-read-only), and denies all
 Seatbelt network operations. The child starts through `/usr/bin/env -i`; only the same
-non-credential environment allow-list as Linux is restored and `TMPDIR` is fixed to
-`/private/tmp`.
+non-credential environment allow-list as Linux is restored. `TMPDIR`, `TMP`, and `TEMP` are fixed
+to the private `sandbox-runtime/tmp` directory under the dedicated sandbox cache, overriding
+ambient or explicitly supplied temporary-directory variables. These directories are created as
+owned private application state. The profile grants no write authority to shared `/private/tmp`.
+Hooks and workspace services use the same temporary-directory policy.
 
 Seatbelt does not provide a filesystem or process namespace. Accordingly, Phase 2 does not claim
-read confidentiality, device isolation, a private temporary directory, or process-namespace
-isolation on macOS. It does enforce the stated write and network boundaries, and all descendants
+read confidentiality, device isolation, per-child temporary-directory isolation, or
+process-namespace isolation on macOS. The private application temporary directory is shared
+by its sandboxed children; it is not a separate filesystem namespace. It does enforce the stated write and network boundaries, and all descendants
 inherit the profile. Backend absence, profile application failure, or child setup failure starts
 no requested child and is never retried unsandboxed.
 

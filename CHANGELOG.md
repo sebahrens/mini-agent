@@ -8,6 +8,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- macOS sandboxed commands, hooks, and workspace services use private temporary storage instead
+  of granting writes throughout `/private/tmp`. Workspace service environment names cannot
+  replace the declared executable through `env` options. Linux launches now fail closed when
+  bubblewrap lacks descriptor-backed Git metadata protection (requires 0.8.0 or later).
+- Standard-mode file tools ask before changing nested Git execution metadata, gitfiles, and
+  linked-worktree administration, while preserving explicitly configured permission rules.
+
 - Internal Git commands now refuse malformed or non-UTF8 executable configuration. The probe
   reads all configuration records instead of a locale-sensitive regex query, so a filter name
   containing invalid UTF-8 cannot escape the command overrides and execute on the host.
@@ -63,8 +70,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   workspace's `.git/config`, `hooks`, `info`, `modules`, `config.worktree`, `commondir`, or a
   linked worktree's gitfile (so they cannot plant `core.fsmonitor`, hooks, or filter drivers), nor
   rename `.git`; `git add`/`git commit` inside the sandbox still work. On Linux this needs
-  bubblewrap 0.8.0 or later (older versions log a warning) and covers entries that exist at launch. In `standard` mode the write/edit tools now also ask before
-  changing `.git/config` or anything under `.git/hooks` unless a configured rule decides.
+  bubblewrap 0.8.0 or later (older versions refuse launch) and covers entries that exist at launch.
+  In `standard` mode file tools also ask before changing Git execution metadata, including nested
+  repositories, unless a configured rule decides.
 - The permission prompt can no longer show a different command than the one that runs: bidi
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed

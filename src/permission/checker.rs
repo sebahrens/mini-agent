@@ -479,7 +479,7 @@ impl PermissionChecker {
     }
 
     /// Standard mode asks before a file tool rewrites the workspace's Git
-    /// configuration or hooks, which later run outside the sandbox, when no
+    /// execution metadata, including nested repositories and gitfiles, when no
     /// configured rule decided the call. Other modes and rules are unchanged.
     fn ask_before_git_execution_metadata_write(
         &self,
@@ -1574,24 +1574,34 @@ fn ext_dir_deny_matches(pattern: &Pattern, path: &str) -> bool {
     false
 }
 
-/// Whether a workspace-relative path is `.git/config` or under `.git/hooks`
-/// (ASCII case-insensitively, for case-insensitive filesystems).
+/// Whether a workspace-relative path selects Git execution metadata or
+/// administration that can redirect it, at any repository depth.
+/// ASCII case folding also covers case-insensitive filesystems.
 fn is_git_execution_metadata(relative: &str) -> bool {
     let relative = relative.replace('\\', "/");
     let parts: Vec<&str> = relative
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect();
-    match parts.as_slice() {
-        [git, entry] => {
-            git.eq_ignore_ascii_case(".git")
-                && (entry.eq_ignore_ascii_case("config") || entry.eq_ignore_ascii_case("hooks"))
+    parts.iter().enumerate().any(|(index, part)| {
+        if !part.eq_ignore_ascii_case(".git") {
+            return false;
         }
-        [git, hooks, _, ..] => {
-            git.eq_ignore_ascii_case(".git") && hooks.eq_ignore_ascii_case("hooks")
+        match &parts[index + 1..] {
+            // A linked worktree's gitfile can redirect Git to another directory.
+            [] => true,
+            [entry]
+                if ["config", "config.worktree", "commondir"]
+                    .iter()
+                    .any(|name| entry.eq_ignore_ascii_case(name)) =>
+            {
+                true
+            }
+            [entry, ..] => ["hooks", "info", "modules", "worktrees"]
+                .iter()
+                .any(|name| entry.eq_ignore_ascii_case(name)),
         }
-        _ => false,
-    }
+    })
 }
 
 /// The AllowAlways scope for a path-tool prompt that carries no
@@ -3119,7 +3129,120 @@ mod case_insensitive_deny_tests {
 
 #[cfg(test)]
 mod git_execution_metadata_tests {
-    use super::is_git_execution_metadata;
+    use super::*;
+
+    struct Workspace(PathBuf);
+
+    impl Workspace {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("mini-agent-git-metadata-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn standard_file_tools_ask_before_nested_git_metadata_writes() {
+        let workspace = Workspace::new();
+        for tool in ["write", "edit", "js/write_file"] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(workspace.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            for path in [
+                ".git",
+                ".git/config.worktree",
+                ".git/commondir",
+                ".git/info/attributes",
+                ".git/modules/sub/config",
+                ".git/worktrees/sub/config.worktree",
+                "sub/.git/config",
+                "sub/.git/hooks/pre-commit",
+                "sub/.git/commondir",
+                "sub/.git/objects/../config",
+            ] {
+                assert_eq!(
+                    checker.check_path(tool, path),
+                    CheckResult::Ask,
+                    "{tool} {path}"
+                );
+                if !path.contains("..") {
+                    assert_eq!(
+                        checker
+                            .check_bound_path(tool, &workspace.path().join(path).to_string_lossy()),
+                        CheckResult::Ask,
+                        "bound {tool} {path}"
+                    );
+                }
+            }
+            for path in [
+                "src/lib.rs",
+                ".git/index",
+                ".git/objects/object",
+                ".git/refs/heads/main",
+            ] {
+                assert_eq!(
+                    checker.check_path(tool, path),
+                    CheckResult::Allowed,
+                    "{tool} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_git_metadata_permission_rules_keep_their_authority() {
+        let workspace = Workspace::new();
+        for action in [Action::Allow, Action::Deny, Action::Ask] {
+            let config = PermissionConfigs::from(crate::permission::PermissionConfig {
+                write: Some(crate::permission::ToolPerm::Simple(action)),
+                edit: Some(crate::permission::ToolPerm::Simple(action)),
+                ..Default::default()
+            });
+            let mut checker = PermissionChecker::new(
+                &config,
+                SecurityMode::Standard,
+                Some(workspace.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            for tool in ["write", "edit", "js/write_file"] {
+                let decision = checker.check_path(tool, "sub/.git/config.worktree");
+                match action {
+                    Action::Allow => assert_eq!(decision, CheckResult::Allowed),
+                    Action::Ask => assert_eq!(decision, CheckResult::Ask),
+                    Action::Deny => assert!(matches!(decision, CheckResult::Denied(_))),
+                }
+            }
+        }
+        let mut yolo = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Yolo,
+            Some(workspace.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            yolo.check_path("write", "sub/.git/config"),
+            CheckResult::Allowed
+        );
+    }
 
     #[test]
     fn matches_config_and_hooks_in_any_spelling() {
@@ -3130,15 +3253,26 @@ mod git_execution_metadata_tests {
             "./.git//hooks/nested/x",
             ".GIT/Hooks/pre-commit",
             ".git\\config",
+            ".git",
+            ".git/config.worktree",
+            ".git/commondir",
+            ".git/info/attributes",
+            ".git/info/exclude",
+            ".git/modules/sub/config",
+            ".git/worktrees/sub/commondir",
+            "sub/.git/config",
+            "sub/.git/hooks/pre-commit",
+            "nested\\.GIT\\CONFIG.WORKTREE",
         ] {
             assert!(is_git_execution_metadata(relative), "{relative}");
         }
         for relative in [
-            ".git",
-            ".git/info/exclude",
             ".git/config.lock",
             ".git/configx",
-            "sub/.git/config",
+            ".git/index",
+            ".git/objects/object",
+            ".git/refs/heads/main",
+            "sub/.git/index",
             "hooks/x",
             "config",
         ] {

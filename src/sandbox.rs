@@ -745,13 +745,7 @@ fn bwrap_supports_bind_fd(bwrap: &Path) -> bool {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let supported = bounded_backend_probe(command).is_ok();
-        if !supported {
-            tracing::warn!(
-                "bubblewrap lacks --ro-bind-fd (needs 0.8.0 or later); workspace Git metadata stays writable inside the sandbox"
-            );
-        }
-        supported
+        bounded_backend_probe(command).is_ok()
     })
 }
 
@@ -761,16 +755,25 @@ fn bwrap_supports_bind_fd(_bwrap: &Path) -> bool {
 }
 
 /// The workspace Git metadata binds for a bubblewrap launch rooted at the
-/// canonical `workspace_root`; empty when bubblewrap cannot bind descriptors.
+/// canonical `workspace_root`; unsupported descriptor binding denies launch.
 fn bwrap_git_metadata_binds(
     bwrap: &Path,
     workspace_root: &Path,
-) -> git_metadata::BwrapGitMetadataBinds {
-    if bwrap_supports_bind_fd(bwrap) {
-        git_metadata::BwrapGitMetadataBinds::open(workspace_root)
-    } else {
-        git_metadata::BwrapGitMetadataBinds::none()
+) -> Result<git_metadata::BwrapGitMetadataBinds, String> {
+    bwrap_git_metadata_binds_with_capability(workspace_root, bwrap_supports_bind_fd(bwrap))
+}
+
+fn bwrap_git_metadata_binds_with_capability(
+    workspace_root: &Path,
+    supported: bool,
+) -> Result<git_metadata::BwrapGitMetadataBinds, String> {
+    if !supported {
+        return Err(
+            "bubblewrap must support --ro-bind-fd (0.8.0 or later); refusing launch without Git metadata protection"
+                .to_string(),
+        );
     }
+    Ok(git_metadata::BwrapGitMetadataBinds::open(workspace_root))
 }
 
 /// Closed diagnostic recorded when the cached bubblewrap preflight fails. It is set at most once,
@@ -1525,7 +1528,7 @@ impl Sandbox {
                     backend: self.backend.clone(),
                     status: "required-and-available",
                     filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
-                    filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache, shared temporary directory, and /dev/null only",
+                    filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache including private temporary storage, and /dev/null only",
                     process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
                     devices: "host-readable devices remain readable; writes are limited to /dev/null",
                     environment: "cleared, then populated from a non-credential allow-list",
@@ -1801,11 +1804,14 @@ impl Sandbox {
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         let sandbox_cache = paths.cache_dir.join("sandbox-runtime");
-        std::fs::create_dir_all(&sandbox_cache).map_err(|error| {
+        crate::fs::ensure_private_directory(&sandbox_cache).map_err(|error| {
             format!(
                 "sandbox: failed to create dedicated sandbox cache {}: {error}",
                 sandbox_cache.display()
             )
+        })?;
+        crate::fs::ensure_private_directory(&sandbox_cache.join("tmp")).map_err(|error| {
+            format!("sandbox: failed to create private temporary directory: {error}")
         })?;
         let cache_dir = Arc::new(canonical_non_root(
             &sandbox_cache,
@@ -1893,7 +1899,7 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root);
+        let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root)?;
         Ok(self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata))
     }
 
@@ -2011,7 +2017,7 @@ impl Sandbox {
                 .to_string()
         })?;
         let git_metadata =
-            bwrap_git_metadata_binds(bwrap, &self.canonical_workspace_root(&requested_cwd)?);
+            bwrap_git_metadata_binds(bwrap, &self.canonical_workspace_root(&requested_cwd)?)?;
         let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata);
         self.bind_workspace_cwd(&mut command)?;
         Ok(command)
@@ -2131,7 +2137,10 @@ impl Sandbox {
             for (key, value) in self.get_essential_env() {
                 cmd.env(key, value);
             }
-            cmd.envs(explicit_env).env("TMPDIR", "/private/tmp");
+            cmd.envs(explicit_env);
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                cmd.env(key, cache_dir.join("tmp"));
+            }
             configure_new_session_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
@@ -2141,7 +2150,7 @@ impl Sandbox {
                 .to_string()
         })?;
         let readiness_shell = hook_readiness_shell()?;
-        let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd);
+        let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
         Ok(self.build_hook_bwrap_command(
             bwrap,
             &readiness_shell,
@@ -2281,7 +2290,8 @@ impl Sandbox {
             cmd.arg("-p")
                 .arg(profile.as_ref())
                 .arg("/usr/bin/env")
-                .arg("-i");
+                .arg("-i")
+                .arg("--");
             for (key, value) in env {
                 let key = key.to_str().ok_or_else(|| {
                     "workspace-service environment name is not valid UTF-8 for Seatbelt".to_string()
@@ -2294,6 +2304,11 @@ impl Sandbox {
                 let mut assignment = OsString::from(key);
                 assignment.push("=");
                 assignment.push(value);
+                cmd.arg(assignment);
+            }
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                let mut assignment = OsString::from(format!("{key}="));
+                assignment.push(cache_dir.join("tmp"));
                 cmd.arg(assignment);
             }
             cmd.arg(program).args(args).current_dir(&cwd);
@@ -2329,7 +2344,7 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing workspace-service launch"
                 .to_string()
         })?;
-        let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd);
+        let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
         Ok(Self::build_workspace_service_bwrap_command(
             bwrap,
             program,
@@ -2489,7 +2504,11 @@ impl Sandbox {
         for (key, value) in self.get_essential_env() {
             cmd.arg(format!("{key}={value}"));
         }
-        cmd.arg("TMPDIR=/private/tmp");
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            let mut assignment = OsString::from(format!("{key}="));
+            assignment.push(cache_dir.join("tmp"));
+            cmd.arg(assignment);
+        }
         cmd.arg(&self.shell)
             .arg(&self.shell_command_arg)
             .arg(command);
@@ -4271,7 +4290,6 @@ pub(crate) fn seatbelt_shell_profile(
 (allow file-write*
     (subpath "{workspace_str}")
     (subpath "{cache_str}")
-    (subpath "/private/tmp")
     (literal "/dev/null"))
 {git_rule}{network_rule}"#
     )
@@ -5872,6 +5890,33 @@ mod sandbox_tests {
 
     #[cfg(unix)]
     #[test]
+    fn bwrap_unsupported_descriptor_binds_refuse_launch_even_without_a_repository() {
+        let (_scratch, root) = canonical_scratch();
+        let error = bwrap_git_metadata_binds_with_capability(&root, false)
+            .expect_err("unsupported policy must not produce an empty bind set");
+        assert!(error.contains("--ro-bind-fd"), "{error}");
+        assert!(error.contains("refusing launch"), "{error}");
+        assert!(bwrap_git_metadata_binds_with_capability(&root, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_supported_descriptor_binds_preserve_git_metadata_protection() {
+        let (_scratch, root) = canonical_scratch();
+        let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
+        let binds = bwrap_git_metadata_binds_with_capability(&workspace, true).unwrap();
+        let command = Sandbox::new(true, "bwrap").build_bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            "printf sandboxed",
+            &workspace,
+            Path::new("/cache/mini-agent"),
+            binds,
+        );
+        assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bwrap_model_command_binds_git_metadata_read_only_after_workspace() {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
@@ -6486,7 +6531,7 @@ echo COMMITTED"#;
             backend: "seatbelt".to_string(),
             status: "required-and-available",
             filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
-            filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache, shared temporary directory, and /dev/null only",
+            filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache including private temporary storage, and /dev/null only",
             process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
             devices: "host-readable devices remain readable; writes are limited to /dev/null",
             environment: "cleared, then populated from a non-credential allow-list",
@@ -6862,6 +6907,109 @@ printf {pass_token}
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(output.stdout, b"MACOS_SEATBELT_SERVICE_WORKSPACE_PASS");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_workspace_service_environment_names_cannot_replace_the_program() {
+        assert!(seatbelt_exists(), "Seatbelt is unavailable");
+        let scratch = ScratchDir::new();
+        let workspace = std::fs::canonicalize(scratch.path()).unwrap();
+        let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        let command = sandbox
+            .wrap_workspace_service(
+                Path::new("/bin/echo"),
+                &["DECLARED_EXECUTABLE".into()],
+                &workspace,
+                &[("-S/bin/echo EXECUTABLE_SUBSTITUTED".into(), "value".into())],
+                true,
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert!(output.exit_status.is_some_and(|status| status.success()));
+        assert_eq!(output.stdout, b"DECLARED_EXECUTABLE\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_children_use_private_temp_and_cannot_overwrite_shared_temp() {
+        assert!(seatbelt_exists(), "Seatbelt is unavailable");
+        let scratch = ScratchDir::new();
+        let workspace = std::fs::canonicalize(scratch.path()).unwrap();
+        let shared = Path::new("/private/tmp")
+            .join(format!("mini-agent-shared-temp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&shared).unwrap();
+        let shared = ScratchDir(shared);
+        let sentinel = shared.path().join("host-sentinel");
+        std::fs::write(&sentinel, "host sentinel\n").unwrap();
+        let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        let script = format!(
+            r#"if printf overwritten > '{}'; then echo SHARED_TMP_WRITABLE; fi
+test "$TMPDIR" = "$TMP" && test "$TMPDIR" = "$TEMP" || exit 20
+file=$(mktemp) || exit 21
+case "$file" in "$TMPDIR"/*) ;; *) exit 22;; esac
+printf private > "$file" && test "$(cat "$file")" = private && rm "$file" || exit 23
+printf workspace > workspace-proof
+echo PRIVATE_TEMP_PASS"#,
+            sentinel.display()
+        );
+        let mut commands = vec![sandbox.wrap_command(&script).unwrap()];
+        commands.push(
+            sandbox
+                .wrap_workspace_service(
+                    Path::new("/bin/sh"),
+                    &["-c".into(), script.clone()],
+                    &workspace,
+                    &[
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        ("TMPDIR".into(), "/private/tmp".into()),
+                        ("TMP".into(), "/private/tmp".into()),
+                        ("TEMP".into(), "/private/tmp".into()),
+                    ],
+                    true,
+                )
+                .unwrap(),
+        );
+        #[cfg(feature = "hooks")]
+        commands.push(
+            sandbox
+                .wrap_hook_command(
+                    "/bin/sh",
+                    &["-c".into(), script],
+                    &workspace,
+                    &std::collections::BTreeMap::from([
+                        ("TMPDIR".into(), "/private/tmp".into()),
+                        ("TMP".into(), "/private/tmp".into()),
+                        ("TEMP".into(), "/private/tmp".into()),
+                    ]),
+                )
+                .unwrap(),
+        );
+        for command in commands {
+            let output = sandbox
+                .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).unwrap(),
+                "host sentinel\n"
+            );
+            assert!(!stdout.contains("SHARED_TMP_WRITABLE"), "{stdout}");
+            assert!(
+                output.exit_status.is_some_and(|status| status.success()),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("PRIVATE_TEMP_PASS"), "{stdout}");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("workspace-proof")).unwrap(),
+                "workspace"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

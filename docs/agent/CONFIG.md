@@ -1515,9 +1515,12 @@ MCP-backed calls use `mcp_tool` as the tool key and
 default action applied when no rule for a tool matches. In `standard` mode an
 unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
 default (so `"*": ask` asks before workspace modifications), except that an
-unmatched write or edit of the workspace's `.git/config` or anything under
-`.git/hooks` always asks (Git runs that configuration and those hooks outside
-the sandbox; a matching rule still decides), while unmatched
+unmatched write or edit of Git execution metadata always asks, including nested
+repositories: `.git` gitfiles, `config`, `config.worktree`, `commondir`, and entries
+under `.git/hooks`, `.git/info`, `.git/modules`, or `.git/worktrees`. These paths
+can select code or redirect later Git operations outside the sandbox. A matching
+rule still decides; ordinary `.git/index`, object and ref writes keep their prior
+policy. Meanwhile unmatched
 workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
 external paths follow `external_directory`. A matching `external_directory`
 rule is combined with what the same call would get inside the workspace, and

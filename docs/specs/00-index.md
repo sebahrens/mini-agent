@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.8.0
+- **Specification version**: 1.8.1
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-11
+- **Last reconciled**: 2026-09-30
 
 ## Authority and conflict resolution
 
@@ -12,6 +12,11 @@ The documents indexed below are the only normative design corpus. `ARCHITECTURE.
 architecture overview and `SPEC.md` is an implementation overview; they explain the normative
 corpus but cannot add, remove, or override requirements. Dated blueprints are superseded research
 artifacts and must not be used for implementation.
+
+The 2026-09-30 general-process hardening is owned by [phase-2-sandbox.md](phase-2-sandbox.md)
+and [subprocess-trust.md](subprocess-trust.md): private macOS temporary storage, option-safe
+workspace service environments, and mandatory Linux descriptor-backed Git metadata binds.
+These changes do not alter the canonical Phase 6 worker containment checklist.
 
 Apply normative text in this order:
 
