@@ -918,10 +918,14 @@ mod tests {
             env: Default::default(),
         };
         let mut config = HashMap::new();
+        // The dispatcher is process-global. Match only this fixture's probe
+        // so a concurrent test using an ordinary tool cannot recreate the
+        // observed file after this test removes it for worktree cleanup.
+        let probe_tool = "hook_workspace_rebind_probe";
         config.insert(
             "PreToolUse".to_string(),
             vec![HookGroup {
-                matcher: None,
+                matcher: Some(probe_tool.to_string()),
                 hooks: vec![handler],
             }],
         );
@@ -951,7 +955,7 @@ mod tests {
         let ctx = crate::extras::hooks::best_effort_ctx();
         let dispatcher = crate::extras::hooks::get_dispatcher().expect("production dispatcher");
         let _ = dispatcher
-            .dispatch_pre_tool_use(&ctx, "bash", serde_json::json!({"command": "true"}))
+            .dispatch_pre_tool_use(&ctx, probe_tool, serde_json::json!({"command": "true"}))
             .await;
 
         let captured = std::fs::read_to_string(&observed).expect("hook observation");
@@ -969,7 +973,14 @@ mod tests {
         assert_eq!(ctx.cwd, expected);
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
 
-        std::fs::remove_file(observed).unwrap();
+        std::fs::remove_file(&observed).unwrap();
+        let _ = dispatcher
+            .dispatch_pre_tool_use(&ctx, "bash", serde_json::json!({"command": "true"}))
+            .await;
+        assert!(
+            !observed.exists(),
+            "ordinary parallel tool dispatch must not recreate this fixture's output"
+        );
         crate::ui::rebind_worktree_workspace(
             &mut session,
             &mut context,
