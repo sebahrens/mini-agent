@@ -412,7 +412,9 @@ and RMCP terminal and requires the first statement in its owning helper to retai
 without moving or dropping it. New, duplicate, removed, or unguarded raw terminals fail.
 
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
-as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. An
+as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. Native Git metadata alias-refusal assertions inspect captured
+`CommandOutput` status and stderr; their exact macro contexts and occurrence counts are
+`NON-PROCESS`, without exempting any launch or terminal. An
 explicit current-class allow-list permits `TC-BROKER-JS-WORKER` only at the reviewed Linux worker
 fingerprints. Every disposition and every site
 in a file with multiple production classes has an exact fingerprint-and-occurrence ownership rule;

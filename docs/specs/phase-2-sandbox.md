@@ -295,7 +295,8 @@ inside the sandbox. For a workspace whose top level holds `.git`:
   not visible inside the sandbox at all. Existing protected symlinks, a symlinked `.git`,
   hardlinked protected regular files, and existing entries that cannot be pinned safely refuse
   launch: binding their target inode would leave a writable alias. This does not protect metadata
-  first created after launch or aliases introduced concurrently with launch. Writes fail with `EROFS`, and replacing a protected file or directory
+  first created after launch or aliases introduced concurrently with launch. Writes fail with
+  `EROFS`, and replacing a protected file or directory
   (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options require
   bubblewrap 0.8.0 or later. A backend without `--ro-bind-fd` is rejected before constructing
   any model-action, hook, workspace-service, or executable-snapshot launch; there is no launch
@@ -332,6 +333,15 @@ to the private `sandbox-runtime/tmp` directory under the dedicated sandbox cache
 ambient or explicitly supplied temporary-directory variables. These directories are created as
 owned private application state. The profile grants no write authority to shared `/private/tmp`.
 Hooks and workspace services use the same temporary-directory policy.
+
+The configured application cache is used only when it is disjoint from both the configuration
+and credential directories. If a shared application home places that cache inside a private root,
+macOS selects its per-user system cache at `zerostack/sandbox-runtime` instead. Both configured and
+resolved spellings must be disjoint in either ancestry direction before directory creation and
+again after canonicalization; an unsafe or unavailable fallback refuses launch with guidance to
+move `ZS_CACHE_DIR`. This preserves private configuration and credential read denials rather than
+adding an exception for temporary files. The runtime root and its `tmp` child remain owned,
+non-symlink directories with mode `0700`.
 
 Seatbelt does not provide a filesystem or process namespace. Accordingly, Phase 2 does not claim
 read confidentiality, device isolation, per-child temporary-directory isolation, or

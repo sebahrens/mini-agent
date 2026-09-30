@@ -2405,18 +2405,30 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         2,
         "NON-PROCESS",
     ),
+    (
+        "src/sandbox.rs",
+        "String::from_utf8_lossy(&output.stderr).contains(\"hardlink\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "String::from_utf8_lossy(&output.stderr).contains(\".git symlink\"),",
+        1,
+        "NON-PROCESS",
+    ),
     // Captured Sandbox command-result fields in native boundary tests; the
     // added Seatbelt assertions are data inspection, not process terminals.
     (
         "src/sandbox.rs",
         "String::from_utf8_lossy(&output.stderr)",
-        9,
+        11,
         "NON-PROCESS",
     ),
     (
         "src/sandbox.rs",
         "assert_eq!(output.status, CommandStatus::Failed);",
-        1,
+        3,
         "NON-PROCESS",
     ),
     (
@@ -3246,6 +3258,15 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/sandbox.rs",
         &[
             // Exact macro contexts for the two new native Seatbelt tests.
+            // Native bwrap alias-refusal stderr predicates read CommandOutput data.
+            (
+                "180fa7b0696bd7ffa684772d8ce48c7481f258456b1aeadc03868a8f69e12c48",
+                1,
+            ),
+            (
+                "45c86e553982badc8ac01b7c4004735ebe00a3561fd23f3bcdbf1e3c2058f64e",
+                1,
+            ),
             (
                 "05e3b16e731da032d3b458cb2ffa859da145b5a7adefa4806895742048a416b2",
                 1,
@@ -3296,7 +3317,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "4e84ceaa1caa195958b88ed22d26b6d1e789ca8417fe59629074614a4e7100b8",
-                1,
+                3,
             ),
             (
                 "5940f63c8bdc3c394d8e54c7b6deba8e8529d0a5b921c897cf45a23f4d94f94b",
