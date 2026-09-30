@@ -909,13 +909,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/git/runner.rs",
         "let mut command = std::process::Command::new(git.program.as_path());",
-        1,
+        2,
         "TEST-ONLY",
     ),
     ("src/git/runner.rs", ".output()", 2, "TEST-ONLY"),
     (
         "src/git/runner.rs",
         "command.output().unwrap()",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "command.args(args).output().unwrap()",
         1,
         "TEST-ONLY",
     ),
@@ -3577,13 +3583,19 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/git/runner.rs",
         "let mut command = std::process::Command::new(git.program.as_path());",
-        1,
+        2,
         "TEST-ONLY",
     ),
     ("src/git/runner.rs", ".output()", 2, "TEST-ONLY"),
     (
         "src/git/runner.rs",
         "command.output().unwrap()",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/runner.rs",
+        "command.args(args).output().unwrap()",
         1,
         "TEST-ONLY",
     ),

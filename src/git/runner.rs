@@ -1420,8 +1420,10 @@ fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
 /// Scope alone is therefore insufficient: a global include can point into a
 /// model-writable work tree or its Git administration directory. Check both
 /// the path Git named and its resolved target so a symlink under an untrusted
-/// root cannot confer global authority. An unknown or vanished origin is not
-/// trusted. This classifies the probed config; it does not freeze later edits.
+/// root cannot confer global authority. A multiply linked regular file may
+/// have a writable workspace alias despite its outside path, so it is not
+/// trusted either. An unknown or vanished origin is not trusted. This
+/// classifies the probed config; it does not freeze later edits.
 fn origin_is_outside_untrusted_roots(origin: &str, repo_path: &Path, roots: &[PathBuf]) -> bool {
     let Some(file) = origin.strip_prefix("file:") else {
         return false;
@@ -1446,7 +1448,28 @@ fn origin_is_outside_untrusted_roots(origin: &str, repo_path: &Path, roots: &[Pa
             return false;
         }
     }
-    true
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(metadata) = crate::fs::checked_path_metadata(&canonical) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        crate::fs::windows_file_link_count(metadata.handle()).is_ok_and(|count| count == 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 /// Overrides for every executable key that repository-scoped configuration
@@ -2022,6 +2045,151 @@ mod tests {
             &roots
         ));
         std::fs::remove_dir_all(owned).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn multiply_linked_global_origin_is_not_trusted() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let owned = Owned(std::env::temp_dir().join(format!(
+            "mini-agent-global-hardlink-origin-{}",
+            uuid::Uuid::new_v4()
+        )));
+        let repo = owned.0.join("repo");
+        let home = owned.0.join("home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let global = home.join("extra-config");
+        std::fs::write(&global, "[filter \"linked\"]\n\tclean = command\n").unwrap();
+        let origin = format!("file:{}", global.display());
+        let roots = vec![repo.canonicalize().unwrap()];
+        assert!(origin_is_outside_untrusted_roots(&origin, &repo, &roots));
+        let alias = repo.join("config-alias");
+        std::fs::hard_link(&global, &alias).unwrap();
+        assert!(!origin_is_outside_untrusted_roots(&origin, &repo, &roots));
+        std::fs::remove_file(alias).unwrap();
+        assert!(origin_is_outside_untrusted_roots(&origin, &repo, &roots));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_global_include_cannot_run_filter_but_normal_global_helper_survives() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let owned = Owned(std::env::temp_dir().join(format!(
+            "mini-agent-global-hardlink-git-{}",
+            uuid::Uuid::new_v4()
+        )));
+        let repo = owned.0.join("repo");
+        let home = owned.0.join("home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let included = home.join("included-config");
+        let alias = repo.join("included-config-alias");
+        let marker = owned.0.join("filter-ran");
+        std::fs::write(&included, "").unwrap();
+        std::fs::hard_link(&included, &alias).unwrap();
+        std::fs::write(
+            &alias,
+            format!(
+                "[filter \"linked\"]\n\tclean = /usr/bin/touch {}\n[credential]\n\thelper = attacker-helper\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[credential]\n\thelper = trusted-helper\n[include]\n\tpath = {}\n",
+                included.display()
+            ),
+        )
+        .unwrap();
+        let git = GitRunner::discover().unwrap();
+        let run_git = |args: &[&str], overrides: &[(String, String)]| {
+            let mut command = std::process::Command::new(git.program.as_path());
+            command
+                .current_dir(&repo)
+                .env_clear()
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for (key, value) in overrides {
+                command.arg("-c").arg(format!("{key}={value}"));
+            }
+            command.args(args).output().unwrap()
+        };
+        let init = run_git(&["init", "-q"], &[]);
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        std::fs::write(repo.join("payload"), "content\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "payload filter=linked\n").unwrap();
+        let probe = run_git(
+            &[
+                "config",
+                "--show-scope",
+                "--show-origin",
+                "--null",
+                "--list",
+            ],
+            &[],
+        );
+        assert!(
+            probe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let mut entries = parse_scoped_config(&probe.stdout).unwrap();
+        let roots = vec![repo.canonicalize().unwrap()];
+        assert!(entries.iter().any(|entry| {
+            entry.scope == "global"
+                && entry.key == "filter.linked.clean"
+                && entry.origin == format!("file:{}", included.display())
+        }));
+        let old_add = run_git(&["add", "--", "payload"], &[]);
+        assert!(
+            old_add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&old_add.stderr)
+        );
+        assert!(
+            marker.exists(),
+            "the old path-only classifier permits the filter"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(repo.join("payload"), "changed\n").unwrap();
+        for entry in &mut entries {
+            entry.trusted_origin = origin_is_outside_untrusted_roots(&entry.origin, &repo, &roots);
+        }
+        let overrides = untrusted_config_overrides(&entries, InternalProfile::Network).unwrap();
+        assert!(overrides.contains(&("filter.linked.clean".into(), String::new())));
+        assert!(overrides.contains(&("credential.helper".into(), "trusted-helper".into())));
+        assert!(
+            !overrides
+                .iter()
+                .any(|(_, value)| value == "attacker-helper")
+        );
+        let guarded_add = run_git(&["add", "--", "payload"], &overrides);
+        assert!(
+            guarded_add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&guarded_add.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "multiply linked config must be neutralized"
+        );
     }
 
     #[cfg(target_os = "macos")]

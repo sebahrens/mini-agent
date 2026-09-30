@@ -131,8 +131,10 @@ configured `cache_dir/sandbox-runtime` root and, on macOS, the actual writable
 Seatbelt cache selected when the configured cache overlaps private application
 directories. Git uses the same side-effect-free selection as the sandbox and
 keeps the configured root untrusted even when Seatbelt selects a fallback.
-This covers global includes that point back
-into model-writable storage; outside-workspace global credential helpers remain
+An outside source must also be a regular file with exactly one link, checked
+through an opened file handle: a multiply linked global file may have an alias
+inside a model-writable repository or cache. Executable values from such a file
+are neutralized, while ordinary single-link global credential helpers remain
 available for explicit network operations. An undecodable executable origin
 refuses the operation. For `git init` in a fresh directory, the selected
 directory is the untrusted root until Git has administration paths; an existing
