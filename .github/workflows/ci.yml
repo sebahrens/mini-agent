@@ -706,6 +706,12 @@ jobs:
           cargo test --locked \
             sandbox::sandbox_tests::bwrap_workspace_git_metadata_rejects_existing_aliases \
             -- --exact --ignored --nocapture
+          cargo test --locked \
+            sandbox::sandbox_tests::bwrap_workspace_git_metadata_rejects_nested_aliases \
+            -- --exact --ignored --nocapture
+          cargo test --locked \
+            sandbox::sandbox_tests::workspace_gitfile_target_directory_cannot_be_renamed \
+            -- --exact --ignored --nocapture
           # Hooks are not a default feature. script(1) gives the test process a
           # controlling terminal, so the hook's failing /dev/tty open is a real
           # proof that sandboxed hooks and workspace services start detached.
@@ -968,6 +974,8 @@ jobs:
         run: |
           guarded_tests=(
             'sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend'
+            'sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases'
+            'sandbox::sandbox_tests::seatbelt_workspace_gitfile_target_directory_cannot_be_renamed'
             'tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads'
             'extras::js::host::tests::spawn_uses_real_macos_seatbelt_write_boundary'
           )

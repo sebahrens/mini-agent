@@ -25,8 +25,6 @@
 //!   alias could still retarget or change the protected metadata.
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
@@ -43,8 +41,8 @@ const POINTER_FILE_LIMIT: u64 = 4096;
 /// The Git metadata layout of one workspace, in configured spellings.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct GitMetadataLayout {
-    /// The `<workspace>/.git` directory (or the directory a `.git` symlink
-    /// names), pinned so it cannot be renamed away and back.
+    /// The Git directory, including an in-workspace gitfile target, pinned
+    /// so it cannot be renamed away and back.
     pub(super) pinned_dir: Option<PathBuf>,
     /// Paths that must stay read-only; they may not exist.
     pub(super) read_only: Vec<PathBuf>,
@@ -68,7 +66,11 @@ pub(super) fn discover(workspace: &Path) -> GitMetadataLayout {
         // The gitfile decides which Git directory the host resolves.
         layout.read_only.push(dot_git.clone());
         match read_pointer(&dot_git, Some("gitdir:")) {
-            Some(target) => workspace.join(target),
+            Some(target) => {
+                let git_dir = workspace.join(target);
+                layout.pinned_dir = Some(git_dir.clone());
+                git_dir
+            }
             None => return layout,
         }
     } else if metadata.file_type().is_symlink() {
@@ -192,6 +194,12 @@ struct BwrapGitBind {
 /// the workspace authority's fd 197).
 #[cfg(unix)]
 const BIND_FD_FLOOR: i32 = 256;
+/// Refuse unusually large/deep protected trees rather than inspecting them
+/// without a finite launch budget.
+#[cfg(unix)]
+const MAX_PROTECTED_DIR_ENTRIES: usize = 4096;
+#[cfg(unix)]
+const MAX_PROTECTED_DIR_DEPTH: usize = 16;
 
 impl BwrapGitMetadataBinds {
     /// No Git metadata binds for test builders and non-Unix platforms.
@@ -231,8 +239,12 @@ impl BwrapGitMetadataBinds {
             .chain(layout.read_only.iter().map(|path| (path, true)));
         for (path, read_only) in planned {
             // A linked worktree may point to a Git directory outside its
-            // workspace. Only the gitfile is visible there and must be bound.
+            // workspace. It needs no bind, but a hardlink back into the
+            // writable workspace could still alter external config or hooks.
             if !path.starts_with(&root) {
+                if read_only {
+                    inspect_external_protected_entry(&root, path)?;
+                }
                 continue;
             }
             if symlink_component_beneath(&root, path)? {
@@ -252,15 +264,26 @@ impl BwrapGitMetadataBinds {
             let canonical = std::fs::canonicalize(path)
                 .map_err(|_| "cannot resolve workspace Git metadata".to_string())?;
             let Some(relative) = relative_beneath(&root, &canonical) else {
-                return Err("workspace Git metadata resolves outside workspace".to_string());
+                if read_only {
+                    inspect_external_protected_entry(&root, path)?;
+                    continue;
+                }
+                continue;
             };
             if entries.iter().any(|entry| entry.relative == relative) {
                 continue;
             }
             let fd = open_beneath(&root_fd, &relative, !read_only)
                 .ok_or_else(|| "cannot pin workspace Git metadata".to_string())?;
-            if read_only && metadata.is_file() && metadata.nlink() > 1 {
+            let (pinned_kind, pinned_single_link) = pinned_entry_shape(&fd)?;
+            if (pinned_kind == libc::S_IFDIR) != metadata.is_dir() {
+                return Err("workspace Git metadata changed while pinning".to_string());
+            }
+            if read_only && pinned_kind == libc::S_IFREG && !pinned_single_link {
                 return Err("workspace Git metadata has a writable hardlink alias".to_string());
+            }
+            if read_only && pinned_kind == libc::S_IFDIR {
+                scan_protected_directory(&fd)?;
             }
             entries.push(BwrapGitBind {
                 relative,
@@ -321,6 +344,196 @@ impl BwrapGitMetadataBinds {
     pub(super) fn apply(self, _command: &mut super::Command, _sandbox_root: &Path) {}
 }
 
+/// Check the same open inode later handed to bubblewrap. A pathname `stat`
+/// before `openat` would miss a replacement between those operations.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn pinned_entry_shape(fd: &std::os::fd::OwnedFd) -> Result<(libc::mode_t, bool), String> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fstat fills the initialized stat buffer for this owned fd.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err("cannot inspect pinned workspace Git metadata".to_string());
+    }
+    Ok((stat.st_mode & libc::S_IFMT, stat.st_nlink == 1))
+}
+
+/// An external linked-worktree Git directory is not mounted into the
+/// sandbox, but its inode may still have a writable hardlink in the workspace.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn inspect_external_protected_entry(root: &Path, path: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid external Git metadata path".to_string())?;
+    let canonical_parent = match std::fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("cannot resolve external Git metadata parent".to_string()),
+    };
+    if canonical_parent.starts_with(root) {
+        return Err("external Git metadata resolves inside workspace".to_string());
+    }
+    let parent_fd = open_directory(&canonical_parent)
+        .ok_or_else(|| "cannot open external Git metadata parent".to_string())?;
+    let name = std::ffi::CString::new(
+        path.file_name()
+            .ok_or_else(|| "invalid external Git metadata entry".to_string())?
+            .as_bytes(),
+    )
+    .map_err(|_| "invalid external Git metadata entry".to_string())?;
+    // SAFETY: `parent_fd` pins the resolved parent and `name` is one
+    // NUL-terminated component. The protected leaf is never followed.
+    let raw = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            path_flags() | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return match std::io::Error::last_os_error() {
+            error if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            error if error.raw_os_error() == Some(libc::ELOOP) => {
+                Err("external Git metadata symlink cannot be pinned safely".to_string())
+            }
+            _ => Err("cannot pin external Git metadata entry".to_string()),
+        };
+    }
+    // SAFETY: openat returned an owned nonnegative fd.
+    let opened = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let (kind, single_link) = pinned_entry_shape(&opened)?;
+    match kind {
+        libc::S_IFDIR => scan_protected_directory(&opened),
+        libc::S_IFREG if single_link => Ok(()),
+        libc::S_IFREG => Err("external Git metadata has a writable hardlink alias".to_string()),
+        libc::S_IFLNK => Err("external Git metadata symlink cannot be pinned safely".to_string()),
+        _ => Err("external Git metadata has an unsupported file type".to_string()),
+    }
+}
+
+/// Seatbelt path denies do not stop writes through another hardlink to the
+/// same vnode. Apply the same static alias validation before every profile
+/// lookup, including cache hits; descriptors are not passed to Seatbelt.
+#[cfg(target_os = "macos")]
+pub(super) fn validate_workspace_aliases(workspace: &Path) -> Result<(), String> {
+    BwrapGitMetadataBinds::open(workspace).map(|_| ())
+}
+
+/// Inspect the inode actually supplied to bubblewrap, not a second pathname
+/// lookup. Every child is opened relative to its pinned directory descriptor
+/// without following symlinks before its kind and link count are inspected.
+#[cfg(unix)]
+fn scan_protected_directory(root: &std::os::fd::OwnedFd) -> Result<(), String> {
+    let mut remaining = MAX_PROTECTED_DIR_ENTRIES;
+    scan_protected_directory_inner(root, 0, &mut remaining)
+}
+
+#[cfg(unix)]
+struct DirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: fdopendir owns this directory stream until one closedir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn scan_protected_directory_inner(
+    directory: &std::os::fd::OwnedFd,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    if depth > MAX_PROTECTED_DIR_DEPTH {
+        return Err("workspace Git metadata directory is too deep".to_string());
+    }
+    let dot = c".";
+    // SAFETY: `directory` is a pinned directory; opening its own `.` yields a
+    // readable fd for fdopendir without looking up any model-controlled path.
+    let raw = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err("cannot inspect workspace Git metadata directory".to_string());
+    }
+    // SAFETY: fdopendir consumes a valid directory fd on success. On failure,
+    // the fd remains ours and is closed below.
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not consume `raw` on failure.
+        unsafe { libc::close(raw) };
+        return Err("cannot inspect workspace Git metadata directory".to_string());
+    }
+    let stream = DirectoryStream(stream);
+    loop {
+        nix::errno::Errno::clear();
+        // SAFETY: stream is valid until its Drop; readdir returns a pointer
+        // valid until the next call on this stream.
+        let child = unsafe { libc::readdir(stream.0) };
+        if child.is_null() {
+            if nix::errno::Errno::last_raw() != 0 {
+                return Err("cannot enumerate workspace Git metadata".to_string());
+            }
+            break;
+        }
+        // SAFETY: POSIX guarantees a NUL-terminated d_name for this entry.
+        let name = unsafe { std::ffi::CStr::from_ptr((*child).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| "workspace Git metadata directory is too large".to_string())?;
+        // SAFETY: `directory` is a pinned directory descriptor, `name` is a
+        // NUL-terminated single component, and the returned fd is owned below.
+        let raw = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                path_flags() | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP) {
+                return Err("workspace Git metadata symlink cannot be pinned safely".to_string());
+            }
+            return Err("cannot pin workspace Git metadata entry".to_string());
+        }
+        // SAFETY: `raw` is a nonnegative owned descriptor from openat.
+        let opened = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: fstat fills the initialized stat buffer for this pinned fd.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(opened.as_raw_fd(), &mut stat) } != 0 {
+            return Err("cannot inspect workspace Git metadata entry".to_string());
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => scan_protected_directory_inner(&opened, depth + 1, remaining)?,
+            libc::S_IFREG if stat.st_nlink == 1 => {}
+            libc::S_IFREG => {
+                return Err("workspace Git metadata has a writable hardlink alias".to_string());
+            }
+            libc::S_IFLNK => {
+                return Err("workspace Git metadata symlink cannot be pinned safely".to_string());
+            }
+            _ => return Err("workspace Git metadata has an unsupported file type".to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// A protected path can have a mutable symlink in an intermediate component,
 /// including a gitfile's in-workspace target. Check every existing component,
 /// not only the final entry passed to `--ro-bind-fd`.
@@ -334,10 +547,13 @@ fn symlink_component_beneath(root: &Path, path: &Path) -> Result<bool, String> {
         match component {
             Component::Normal(name) => current.push(name),
             Component::ParentDir => {
-                if current == root {
-                    return Err("workspace Git metadata escapes workspace".to_string());
+                // Gitfiles in linked worktrees routinely name a sibling
+                // repository with `../main/.git`. Keep checking components
+                // after leaving the workspace; the caller will inspect the
+                // resulting external entry without mounting it.
+                if !current.pop() {
+                    return Err("workspace Git metadata has an invalid path".to_string());
                 }
-                current.pop();
                 continue;
             }
             Component::CurDir => continue,
@@ -560,7 +776,11 @@ mod tests {
 
         let layout = discover(&worktree);
 
-        assert_eq!(layout.pinned_dir, None, "a gitfile is not a directory");
+        assert_eq!(
+            layout.pinned_dir,
+            Some(main.join(".git/worktrees/wt")),
+            "a gitfile's target directory must be anchored",
+        );
         let worktree_git_dir = main.join(".git/worktrees/wt");
         let common_dir = worktree_git_dir.join("../..");
         assert_eq!(
@@ -683,6 +903,54 @@ mod tests {
     }
 
     #[test]
+    fn bwrap_refuses_aliases_inside_protected_directories() {
+        let scratch = Scratch::new();
+        let workspace = fixtures::plain_repository(&scratch.0, "repo");
+        let hook = workspace.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::hard_link(&hook, workspace.join("writable-hook-alias")).unwrap();
+        let error = BwrapGitMetadataBinds::open(&workspace).unwrap_err();
+        assert!(error.contains("hardlink"), "{error}");
+
+        std::fs::remove_file(workspace.join("writable-hook-alias")).unwrap();
+        std::fs::remove_file(&hook).unwrap();
+        std::os::unix::fs::symlink(
+            "../../writable-attributes",
+            workspace.join(".git/info/attributes"),
+        )
+        .unwrap();
+        let error = BwrapGitMetadataBinds::open(&workspace).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn bwrap_refuses_protected_directory_past_depth_bound() {
+        let scratch = Scratch::new();
+        let workspace = fixtures::plain_repository(&scratch.0, "repo");
+        let mut nested = workspace.join(".git/modules");
+        for _ in 0..=MAX_PROTECTED_DIR_DEPTH {
+            nested.push("a");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let error = BwrapGitMetadataBinds::open(&workspace).unwrap_err();
+        assert!(error.contains("too deep"), "{error}");
+    }
+
+    #[test]
+    fn bwrap_refuses_protected_directory_past_entry_bound() {
+        let scratch = Scratch::new();
+        let workspace = fixtures::plain_repository(&scratch.0, "repo");
+        let hooks = workspace.join(".git/hooks");
+        for index in 0..=MAX_PROTECTED_DIR_ENTRIES {
+            std::fs::write(hooks.join(format!("entry-{index}")), "").unwrap();
+        }
+
+        let error = BwrapGitMetadataBinds::open(&workspace).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
     fn bwrap_binds_of_a_linked_worktree_cover_only_its_gitfile() {
         let scratch = Scratch::new();
         let (_main, worktree) = fixtures::linked_worktree(&scratch.0, &scratch.0);
@@ -692,5 +960,71 @@ mod tests {
         let planned = BwrapGitMetadataBinds::open(&worktree).unwrap().planned();
 
         assert_eq!(planned, vec![(true, PathBuf::from(".git"))]);
+    }
+
+    #[test]
+    fn linked_worktree_relative_external_metadata_is_checked_for_aliases() {
+        let scratch = Scratch::new();
+        let (main, worktree) = fixtures::linked_worktree(&scratch.0, &scratch.0);
+        std::fs::write(worktree.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+
+        assert_eq!(
+            BwrapGitMetadataBinds::open(&worktree).unwrap().planned(),
+            vec![(true, PathBuf::from(".git"))],
+        );
+
+        std::fs::hard_link(main.join(".git/config"), worktree.join("config-alias")).unwrap();
+        let error = BwrapGitMetadataBinds::open(&worktree).unwrap_err();
+        assert!(error.contains("hardlink"), "{error}");
+
+        std::fs::remove_file(worktree.join("config-alias")).unwrap();
+        let hook = main.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::hard_link(&hook, worktree.join("hook-alias")).unwrap();
+        let error = BwrapGitMetadataBinds::open(&worktree).unwrap_err();
+        assert!(error.contains("hardlink"), "{error}");
+    }
+
+    #[test]
+    fn external_spelling_resolving_to_workspace_metadata_is_refused() {
+        let scratch = Scratch::new();
+        let workspace = fixtures::plain_repository(&scratch.0, "repo");
+        std::fs::rename(workspace.join(".git"), workspace.join("gitdir")).unwrap();
+        let external_alias = scratch.0.join("external-alias");
+        std::os::unix::fs::symlink(&workspace, &external_alias).unwrap();
+        std::fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", external_alias.join("gitdir").display()),
+        )
+        .unwrap();
+
+        let error = BwrapGitMetadataBinds::open(&workspace).unwrap_err();
+        assert!(error.contains("resolves inside workspace"), "{error}");
+    }
+
+    #[test]
+    fn in_workspace_gitfile_target_directory_is_pinned() {
+        let scratch = Scratch::new();
+        let workspace = fixtures::plain_repository(&scratch.0, "repo");
+        std::fs::rename(workspace.join(".git"), workspace.join("gitdir")).unwrap();
+        std::fs::write(workspace.join(".git"), "gitdir: gitdir\n").unwrap();
+
+        let planned = BwrapGitMetadataBinds::open(&workspace).unwrap().planned();
+        assert!(
+            planned.contains(&(false, PathBuf::from("gitdir"))),
+            "{planned:?}"
+        );
+        assert!(
+            planned.contains(&(true, PathBuf::from(".git"))),
+            "{planned:?}"
+        );
+        let denies = seatbelt_write_denies(&workspace);
+        assert!(
+            denies.contains(&format!(
+                "(literal \"{}\")",
+                workspace.join("gitdir").display()
+            )),
+            "{denies}",
+        );
     }
 }

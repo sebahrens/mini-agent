@@ -1,7 +1,7 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.3
+- **Specification version**: 1.3.4
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-30
@@ -292,9 +292,17 @@ inside the sandbox. For a workspace whose top level holds `.git`:
   bubblewrap a sandboxed process can therefore create a protected path that was absent at launch
   (for example a `.git/commondir` pointing at a model-written directory, or `.git/hooks` in a
   repository that has none). A linked worktree's common directory lies outside the workspace and is
-  not visible inside the sandbox at all. Existing protected symlinks, a symlinked `.git`,
+  not visible inside the sandbox at all; existing external protected entries are still inspected
+  for hardlinks back into the writable workspace. A gitfile target inside the workspace is itself
+  pinned against rename, and an external spelling that resolves back inside is refused.
+  Existing protected symlinks, a symlinked `.git`,
   hardlinked protected regular files, and existing entries that cannot be pinned safely refuse
-  launch: binding their target inode would leave a writable alias. This does not protect metadata
+  launch: binding their target inode would leave a writable alias. Unix also inspects each
+  existing protected directory through its pinned descriptor, opens descendants without following
+  symlinks, and refuses symlinks, hardlinked regular files, unsupported entries, or unreadable
+  descendants. Each protected directory walk refuses trees deeper than 16 directories or
+  containing more than 4,096 entries; it never silently drops protection when that budget is
+  exceeded. This does not protect metadata
   first created after launch or aliases introduced concurrently with launch. Writes fail with
   `EROFS`, and replacing a protected file or directory
   (including `git config`'s lock-file rename) fails with `EBUSY`. The descriptor options require
@@ -304,7 +312,9 @@ inside the sandbox. For a workspace whose top level holds `.git`:
 - **Seatbelt:** the profile ends with `(deny file-write* ...)` after the workspace write grant (of
   two filtered rules, Seatbelt applies the later one): a `subpath` filter for every protected path
   whether or not it exists yet, and a `literal` filter for the `.git` directory itself, each in both
-  its configured and its resolved spelling. Writes fail with `EPERM`.
+  its configured and its resolved spelling. Before each profile lookup, including a cache hit,
+  macOS applies the same bounded descriptor-based inspection to existing metadata and refuses
+  preexisting hardlink and symlink aliases that a path deny could miss. Writes fail with `EPERM`.
 
 This rule is defence in depth for the host-side Git hardening (`GitRunner`), which still treats
 repository configuration as untrusted. Paths created while no repository exists (a `git init`

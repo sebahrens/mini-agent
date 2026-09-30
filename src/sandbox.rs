@@ -1834,6 +1834,8 @@ impl Sandbox {
         cache: &Path,
         deny_network: bool,
     ) -> Result<Arc<str>, String> {
+        #[cfg(target_os = "macos")]
+        git_metadata::validate_workspace_aliases(workspace)?;
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
         let app_paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
@@ -6074,6 +6076,7 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn seatbelt_profiles_deny_git_metadata_writes_after_the_workspace_grant() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "seatbelt");
@@ -6127,6 +6130,7 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn seatbelt_linked_worktree_profile_denies_gitfile_and_common_dir_writes() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let (main, worktree) = git_metadata::fixtures::linked_worktree(&root, &root);
         let sandbox = Sandbox::new(true, "seatbelt");
@@ -6232,6 +6236,17 @@ echo COMMITTED"#;
         assert_eq!(String::from_utf8_lossy(&log.stdout), expected_log);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_git_metadata_alias_denied(output: &CommandOutput, marker: &str) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status != CommandStatus::Failed {
+            panic!("metadata alias launch unexpectedly ran: {stderr}");
+        }
+        if !stderr.contains(marker) {
+            panic!("metadata alias denial omitted {marker}: {stderr}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
@@ -6333,6 +6348,78 @@ echo COMMITTED"#;
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
+    async fn bwrap_workspace_git_metadata_rejects_nested_aliases() {
+        assert!(bwrap_exists(), "bubblewrap is unavailable");
+        let scratch = ScratchDir::new();
+        let workspace = host_git_repository(scratch.path());
+        let sandbox = Sandbox::new(true, "bwrap").with_working_dir(&workspace);
+        let hook = workspace.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::hard_link(&hook, workspace.join("writable-hook-alias")).unwrap();
+
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_git_metadata_alias_denied(&output, "hardlink");
+        std::fs::remove_file(workspace.join("writable-hook-alias")).unwrap();
+        std::fs::remove_file(&hook).unwrap();
+
+        std::os::unix::fs::symlink("../../writable", workspace.join(".git/info/attributes"))
+            .unwrap();
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_git_metadata_alias_denied(&output, "symlink");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
+    async fn workspace_gitfile_target_directory_cannot_be_renamed() {
+        assert!(bwrap_exists(), "bubblewrap is unavailable");
+        assert_gitfile_target_directory_cannot_be_renamed("bwrap").await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_workspace_gitfile_target_directory_cannot_be_renamed() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !seatbelt_exists() {
+            skip_unusable_real_sandbox_test("Seatbelt is unusable on this host");
+            return;
+        }
+        assert_gitfile_target_directory_cannot_be_renamed("seatbelt").await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn assert_gitfile_target_directory_cannot_be_renamed(backend: &str) {
+        let scratch = ScratchDir::new();
+        let workspace = host_git_repository(scratch.path());
+        std::fs::rename(workspace.join(".git"), workspace.join("gitdir")).unwrap();
+        std::fs::write(workspace.join(".git"), "gitdir: gitdir\n").unwrap();
+        let sandbox = Sandbox::new(true, backend).with_working_dir(&workspace);
+        let output = sandbox
+            .output_command_with_limits(
+                "mv gitdir moved && echo MOVED; printf 'two\\n' >> file && git add file && git -c user.name=sandbox -c user.email=sandbox@example.invalid commit -qm sandboxed && echo COMMITTED",
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let command_status = output.status;
+        assert_eq!(command_status, CommandStatus::Completed, "{stderr}");
+        assert!(!stdout.contains("MOVED"), "{stdout}\n{stderr}");
+        assert!(stdout.contains("COMMITTED"), "{stdout}\n{stderr}");
+        assert!(workspace.join("gitdir").is_dir());
+        assert!(!workspace.join("moved").exists());
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_workspace_git_metadata_is_read_only() {
@@ -6382,6 +6469,55 @@ echo COMMITTED"#;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(!stdout.contains("COMMONDIR_WRITTEN"), "{stdout}");
         assert!(!workspace.join(".git/commondir").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_workspace_git_metadata_rejects_cached_aliases() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !seatbelt_exists() {
+            skip_unusable_real_sandbox_test("Seatbelt is unusable on this host");
+            return;
+        }
+        let scratch = ScratchDir::new();
+        let workspace = host_git_repository(scratch.path());
+        let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+
+        // The cached profile must not bypass validation on later launches.
+        let initial = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        if initial.status != CommandStatus::Completed {
+            panic!("initial Seatbelt launch failed");
+        }
+
+        let config_alias = workspace.join("writable-config-alias");
+        std::fs::hard_link(workspace.join(".git/config"), &config_alias).unwrap();
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_git_metadata_alias_denied(&output, "hardlink");
+        std::fs::remove_file(config_alias).unwrap();
+
+        let hook = workspace.join(".git/hooks/pre-commit");
+        let hook_alias = workspace.join("writable-hook-alias");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::hard_link(&hook, &hook_alias).unwrap();
+        let output = sandbox
+            .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_git_metadata_alias_denied(&output, "hardlink");
+        std::fs::remove_file(hook_alias).unwrap();
+        std::fs::remove_file(hook).unwrap();
+
+        let output = sandbox
+            .output_command_with_limits(GIT_METADATA_PROBE, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_git_metadata_probe_contained(&workspace, &output, "sandboxed\ninitial\n");
     }
 
     /// Asserts that `pid` leads its own session and process group, i.e. it
@@ -6580,12 +6716,16 @@ echo COMMITTED"#;
 
     #[test]
     fn macos_seatbelt_policy_command_matches_capability_matrix() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        let scratch = ScratchDir::new();
+        let workspace = scratch.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
         let sandbox = Sandbox::new(true, "seatbelt");
         let command = sandbox
             .build_seatbelt_command(
                 Path::new("/usr/bin/sandbox-exec"),
                 "printf sandboxed",
-                Path::new("/workspace"),
+                &workspace,
                 Path::new("/cache/mini-agent"),
             )
             .unwrap();
@@ -6601,7 +6741,7 @@ echo COMMITTED"#;
 
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(deny network*)"));
-        assert!(profile.contains(r#"(subpath "/workspace")"#));
+        assert!(profile.contains(&format!("(subpath \"{}\")", workspace.display())));
         assert!(profile.contains(r#"(subpath "/cache/mini-agent")"#));
         assert!(!profile.contains("(allow network"));
         assert!(
@@ -7263,7 +7403,9 @@ echo PRIVATE_TEMP_PASS"#,
         // Keep application path inputs stable across cached and manual builds.
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
-        let workspace = std::env::temp_dir().join(format!("test-ws-{}", uuid::Uuid::new_v4()));
+        let scratch = ScratchDir::new();
+        let workspace = scratch.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
         let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
 
         // Build profile through cache
@@ -7359,8 +7501,11 @@ echo PRIVATE_TEMP_PASS"#,
         // Other tests temporarily replace process-wide application roots.
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
-        let workspace_a = std::env::temp_dir().join(format!("test-ws-a-{}", uuid::Uuid::new_v4()));
-        let workspace_b = std::env::temp_dir().join(format!("test-ws-b-{}", uuid::Uuid::new_v4()));
+        let scratch = ScratchDir::new();
+        let workspace_a = scratch.path().join("workspace-a");
+        let workspace_b = scratch.path().join("workspace-b");
+        std::fs::create_dir(&workspace_a).unwrap();
+        std::fs::create_dir(&workspace_b).unwrap();
         let cache_a = std::env::temp_dir().join(format!("test-cache-a-{}", uuid::Uuid::new_v4()));
         let cache_b = std::env::temp_dir().join(format!("test-cache-b-{}", uuid::Uuid::new_v4()));
 
