@@ -1098,11 +1098,15 @@ async fn connect_agent(
         .on_receive_dispatch(
             |dispatch: Dispatch<AgentRequest, AgentNotification>, _cx: ConnectionTo<Client>| {
                 async move {
-                    tracing::warn!("ACP unhandled dispatch message");
                     match dispatch {
-                        Dispatch::Request(_, responder) => responder
-                            .respond_with_error(agent_client_protocol::Error::method_not_found()),
-                        Dispatch::Notification(_) => Ok(()),
+                        Dispatch::Request(_, responder) => {
+                            tracing::warn!("ACP received an unhandled request");
+                            responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                        }
+                        Dispatch::Notification(_) => {
+                            tracing::warn!("ACP received an unhandled notification");
+                            Ok(())
+                        }
                         Dispatch::Response(response, router) => {
                             router.route_with_result(response)
                         }

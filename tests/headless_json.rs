@@ -1,5 +1,191 @@
 use std::process::Command;
 
+#[cfg(feature = "acp")]
+#[test]
+fn acp_permission_reply_is_routed_without_unhandled_dispatch_warning() {
+    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::process::{Child, ExitStatus, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct AcpFixture {
+        child: Child,
+        stdout_reader: Option<std::thread::JoinHandle<()>>,
+        stderr_reader: Option<std::thread::JoinHandle<io::Result<String>>>,
+        provider: Option<std::thread::JoinHandle<io::Result<()>>>,
+    }
+    impl AcpFixture {
+        fn settle(&mut self, deadline: Instant) -> Result<(ExitStatus, String), String> {
+            let status = loop {
+                match self.child.try_wait().map_err(|error| error.to_string())? {
+                    Some(status) => break status,
+                    None if Instant::now() >= deadline => {
+                        self.child.kill().map_err(|error| error.to_string())?;
+                        return Err("ACP child exceeded its exit deadline".into());
+                    }
+                    None => std::thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            let stdout = self.stdout_reader.take().map(|reader| reader.join());
+            let stderr = self.stderr_reader.take().map(|reader| reader.join());
+            let provider = self.provider.take().map(|provider| provider.join());
+            stdout
+                .transpose()
+                .map_err(|_| "ACP stdout reader panicked".to_string())?;
+            let stderr = stderr
+                .transpose()
+                .map_err(|_| "ACP stderr reader panicked".to_string())?
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            provider
+                .transpose()
+                .map_err(|_| "mock provider panicked".to_string())?
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Ok((status, stderr))
+        }
+    }
+    impl Drop for AcpFixture {
+        fn drop(&mut self) {
+            if self.stdout_reader.is_some()
+                || self.stderr_reader.is_some()
+                || self.provider.is_some()
+            {
+                let _ = self.child.kill();
+                // A failed assertion must close the child and its pipes before
+                // joining the mock provider. Both server waits are bounded.
+                let _ = self.settle(Instant::now() + Duration::from_secs(5));
+            }
+        }
+    }
+
+    let root = TempRoot::new();
+    let server = root.local_provider("partial_wait");
+    let mut child = root
+        .command()
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--acp",
+            "--guarded",
+            "--no-context-files",
+            "--tools",
+            "write",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start ACP binary");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr_pipe = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read ACP response");
+            if tx
+                .send(serde_json::from_str::<serde_json::Value>(&line).expect("ACP JSON line"))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = String::new();
+        BufReader::new(stderr_pipe).read_to_string(&mut stderr)?;
+        Ok(stderr)
+    });
+    let mut fixture = AcpFixture {
+        child,
+        stdout_reader: Some(reader),
+        stderr_reader: Some(stderr_reader),
+        provider: Some(server),
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let next_message = || {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("ACP exchange deadline")
+    };
+    let send = |stdin: &mut std::process::ChildStdin, message: serde_json::Value| {
+        writeln!(stdin, "{message}").expect("write ACP request");
+        stdin.flush().expect("flush ACP request");
+    };
+    let response = |id: i64| loop {
+        let message = next_message();
+        if message["id"] == id {
+            break message;
+        }
+    };
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}),
+    );
+    assert_eq!(response(1)["result"]["protocolVersion"], 1);
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":root.0,"mcpServers":[]}}),
+    );
+    let session = response(2)["result"]["sessionId"]
+        .as_str()
+        .expect("ACP session id")
+        .to_owned();
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"write effect.txt"}]}}),
+    );
+    loop {
+        let message = next_message();
+        if message["method"] == "session/request_permission" {
+            let id = &message["id"];
+            send(
+                &mut stdin,
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}),
+            );
+            break;
+        }
+    }
+    while !root.0.join("provider.waiting").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        root.0.join("provider.waiting").exists(),
+        "provider continuation did not start"
+    );
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}),
+    );
+    assert_eq!(response(3)["result"]["stopReason"], "cancelled");
+    send(
+        &mut stdin,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":session}}),
+    );
+    assert!(response(4)["result"].is_object());
+    drop(stdin);
+    let (status, stderr) = fixture
+        .settle(deadline)
+        .expect("ACP child and mock provider settle");
+    assert!(status.success(), "ACP child failed: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+        "written\n"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.contains("WARN") && line.contains("unhandled")),
+        "an expected permission response was logged as unhandled: {stderr}"
+    );
+}
+
 struct TempRoot(std::path::PathBuf);
 
 impl TempRoot {
