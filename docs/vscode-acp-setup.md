@@ -179,6 +179,8 @@ turn; any completed tool progress remains in its history.
 ## Permission bridge
 
 When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow for this session / Deny) is forwarded back to the agent.
+The VS Code extension cancels the decision if workspace trust is revoked while
+the dialog is open, even if an Allow option was selected.
 
 The `allow_always` option ("Allow for this session") installs a rule for the
 current agent session only; nothing is written to configuration. Its `_meta`

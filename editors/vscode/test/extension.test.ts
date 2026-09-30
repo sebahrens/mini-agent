@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
+  isTrusted: true,
   gatedFolderPick: vi.fn(),
   showQuickPick: vi.fn(),
   instances: [] as Array<{
@@ -13,7 +14,7 @@ const state = vi.hoisted(() => ({
 
 vi.mock('vscode', () => ({
   workspace: {
-    isTrusted: true,
+    get isTrusted() { return state.isTrusted; },
     getConfiguration: vi.fn(() => ({
       get: vi.fn((_name: string, fallback: unknown) => fallback),
       inspect: vi.fn(() => ({ globalValue: '/usr/bin/mini-agent' })),
@@ -112,6 +113,7 @@ const folder = {
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  state.isTrusted = true;
   state.instances.length = 0;
 });
 
@@ -181,5 +183,17 @@ describe('permission cancellation', () => {
     expect(state.showQuickPick).toHaveBeenCalledOnce();
     const token = state.showQuickPick.mock.calls[0]?.[2];
     expect(token?.isCancellationRequested).toBe(true);
+  });
+
+  it('rejects an approval selected after workspace trust is revoked', async () => {
+    const pick = deferred<{ optionIndex: number }>();
+    state.showQuickPick.mockReturnValueOnce(pick.promise);
+    const extension = await import('../src/extension');
+    const result = extension.requestPermission(request, new AbortController().signal);
+
+    state.isTrusted = false;
+    pick.resolve({ optionIndex: 0 });
+
+    await expect(result).resolves.toEqual({ outcome: { outcome: 'cancelled' } });
   });
 });

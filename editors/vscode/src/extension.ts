@@ -249,7 +249,11 @@ export async function requestPermission(
     signal.removeEventListener('abort', onAbort);
     cancellation.dispose();
   }
-  if (!selected || signal.aborted) { return { outcome: { outcome: 'cancelled' } }; }
+  // Trust can be revoked while the picker is open. Decide against the current
+  // workspace state, not the state captured before awaiting the user.
+  if (!selected || signal.aborted || !vscode.workspace.isTrusted) {
+    return { outcome: { outcome: 'cancelled' } };
+  }
   const option = request.options[selected.optionIndex];
   if (!option) { return { outcome: { outcome: 'cancelled' } }; }
   return { outcome: { outcome: 'selected', optionId: option.optionId } };
