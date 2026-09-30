@@ -204,7 +204,7 @@ async function createSession(
   generation: number,
 ): Promise<AgentSession | undefined> {
   const folder = await gatedFolderPick();
-  if (!folder || generation !== sessionGeneration) { return undefined; }
+  if (!folder || generation !== sessionGeneration || !vscode.workspace.isTrusted) { return undefined; }
   const executablePath = resolveExecutable(context);
   if (!executablePath || generation !== sessionGeneration) { return undefined; }
   const created = new AgentSession(executablePath, folder, context, requestPermission);

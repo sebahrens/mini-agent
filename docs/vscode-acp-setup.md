@@ -35,7 +35,9 @@ permission requests as modal editor choices, and forwards Chat cancellation to
 `session/cancel`. Stopping the extension, closing the session, revoking its
 workspace context, or deactivating VS Code reaps the child process.
 
-The extension fails closed in Restricted Mode and virtual workspaces. In a
+The extension rechecks workspace trust after a folder picker returns, so a
+folder selected after trust was revoked cannot start an ACP session. It fails
+closed in Restricted Mode and virtual workspaces. In a
 Remote Development window, install it on the remote/workspace side so the ACP
 process and selected `file:` workspace share the same authority.
 

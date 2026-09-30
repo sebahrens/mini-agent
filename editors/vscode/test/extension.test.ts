@@ -149,6 +149,19 @@ describe('extension session creation', () => {
     expect(state.instances).toHaveLength(0);
   });
 
+  it('rejects a folder pick that resolves after workspace trust is revoked', async () => {
+    const pick = deferred<typeof folder>();
+    state.gatedFolderPick.mockReturnValueOnce(pick.promise);
+    const extension = await import('../src/extension');
+
+    const creation = extension.ensureSession(context);
+    state.isTrusted = false;
+    pick.resolve(folder);
+
+    await expect(creation).resolves.toBeUndefined();
+    expect(state.instances).toHaveLength(0);
+  });
+
   it('disposes the session even when stopping it fails', async () => {
     state.gatedFolderPick.mockResolvedValueOnce(folder);
     const extension = await import('../src/extension');
