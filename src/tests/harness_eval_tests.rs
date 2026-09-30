@@ -249,6 +249,74 @@ fn done_turn() -> Vec<MockStreamEvent> {
     ]
 }
 
+/// A process-global Stop hook can demand one more provider turn even when the
+/// mock already supplied a terminal answer. This is why every harness test
+/// that drives `run_print` must hold the dispatcher guard for its full run.
+#[cfg(all(unix, feature = "hooks"))]
+#[tokio::test]
+async fn blocking_global_stop_hook_exhausts_one_turn_mock_without_isolation() {
+    use crate::extras::hooks::dispatcher::HookDispatcher;
+    use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let handler = HookHandler {
+        kind: "command".into(),
+        command: Some("sh".into()),
+        args: Some(vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"decision\":\"block\",\"reason\":\"continue\"}'".into(),
+        ]),
+        timeout: Some(5),
+        is_async: false,
+        condition: None,
+        once: false,
+        trust: HookTrust::Trusted,
+        env: Default::default(),
+    };
+    let mut config = HooksConfig::new();
+    config.insert(
+        "Stop".into(),
+        vec![HookGroup {
+            matcher: None,
+            hooks: vec![handler],
+        }],
+    );
+    crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
+    let model = MockCompletionModel::from_stream_turns(vec![done_turn()]);
+    let agent = AgentBuilder::new(model).default_max_turns(1).build();
+    let error = run_print(
+        &agent,
+        "finish",
+        false,
+        &RetryConfig::default(),
+        None,
+        Vec::<Message>::new(),
+        None,
+    )
+    .await
+    .expect_err("blocking Stop hook must require another provider turn");
+    assert!(
+        error.to_string().contains("maximum turn budget (1)"),
+        "{error:#}"
+    );
+
+    crate::extras::hooks::reset_dispatcher();
+    let model = MockCompletionModel::from_stream_turns(vec![done_turn()]);
+    let agent = AgentBuilder::new(model).default_max_turns(1).build();
+    let (response, _, _) = run_print(
+        &agent,
+        "finish",
+        false,
+        &RetryConfig::default(),
+        None,
+        Vec::<Message>::new(),
+        None,
+    )
+    .await
+    .expect("same mock completes when the global dispatcher is absent");
+    assert_eq!(response, "done");
+}
+
 fn structured_subagent_report(finding: &str, covered: &str) -> String {
     format!(
         "## Findings\n- [confidence: high] {finding}\n\n\
@@ -806,6 +874,12 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     use crate::extras::js::skills::turn::{SkillRuntime, SkillTurnContext, TurnSkillBundle};
     use crate::extras::skills::index::AgentSkillSearchPolicy;
 
+    // `run_print` consults the process-global Stop-hook dispatcher. Other
+    // rich-feature tests install a blocking Stop hook, so keep all scripted
+    // provider runs in this evaluation outside their dispatcher lifetime.
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+
     let specification: GymTaskFile = serde_json::from_str(GYM_TASKS).unwrap();
     assert_eq!(specification.tasks.len(), 20);
 
@@ -1272,6 +1346,9 @@ async fn completion_verification_gate_records_both_task_outcome_source_kinds() {
     use crate::extras::js::skills::turn::{SkillTurnContext, TurnSkillBundle};
     use sha2::Digest;
 
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+
     // No leading or trailing whitespace: `from_config` trims before hashing, so
     // the hash below has to be taken over the same bytes the gate hashes.
     const VERIFY_COMMAND: &str = "printf 'gate ran'";
@@ -1424,6 +1501,9 @@ async fn completion_verification_gate_records_both_task_outcome_source_kinds() {
 #[tokio::test]
 #[ignore = "deterministic task-level harness regression eval; run by scheduled CI"]
 async fn harness_regression_eval() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+
     let mut all_metrics = Vec::new();
     for fixture in parse_fixtures() {
         let directory = EvalDirectory::new();
