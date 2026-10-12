@@ -151,9 +151,29 @@ def configured_projections(
     return audit_ids, licenses, sources
 
 
+def validate_patched_sdk_workspace(cargo: dict[str, Any]) -> None:
+    """Keep the maintained SDK pinned and accounted for as a third-party dependency."""
+    sdk_path = "patched-deps/rig-core"
+    for section in ("dependencies", "dev-dependencies"):
+        rig = cargo.get(section, {}).get("rig", {})
+        require(
+            rig.get("package") == "rig-core"
+            and rig.get("version") == "=0.40.0"
+            and rig.get("path") == sdk_path,
+            f"{section}.rig must use the pinned maintained SDK path",
+        )
+    workspace = cargo.get("workspace", {})
+    require(
+        workspace.get("members") == [] and sdk_path in workspace.get("exclude", []),
+        "patched Rig must remain outside workspace membership; explicit root membership "
+        "overrides nested exclusions (Cargo #6745) and drops its license inventory",
+    )
+
+
 def validate_policy(root: Path, *, today: dt.date | None = None) -> None:
     today = today or dt.date.today()
     cargo = load_toml(root / "Cargo.toml")
+    validate_patched_sdk_workspace(cargo)
     audit = load_toml(root / ".cargo" / "audit.toml")
     deny = load_toml(root / "deny.toml")
     ledger = load_toml(root / "dependency-exceptions.toml")

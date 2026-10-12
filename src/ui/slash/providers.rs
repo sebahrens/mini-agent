@@ -877,6 +877,7 @@ mod model_cache_tests {
     fn fixtures() -> (AnyClient, Cli, Config) {
         let client = AnyClient::OpenRouter(
             rig::providers::openrouter::Client::builder()
+                .http_client(crate::provider_http::ProviderHttpClient::default())
                 .api_key("unused-test-key")
                 .build()
                 .unwrap(),
@@ -1035,6 +1036,7 @@ mod model_pricing_tests {
         };
         let mut client = AnyClient::Anthropic(
             rig::providers::anthropic::Client::builder()
+                .http_client(crate::provider_http::ProviderHttpClient::default())
                 .api_key("unused-test-key")
                 .build()
                 .unwrap(),

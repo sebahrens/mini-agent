@@ -418,6 +418,12 @@ has a dedicated exact multiset inventory. That audit enumerates every raw standa
 and RMCP terminal and requires the first statement in its owning helper to retain the crate guard
 without moving or dropping it. New, duplicate, removed, or unguarded raw terminals fail.
 
+The provider HTTP adapter in `src/provider_http.rs` introduces no process launches. Its exact
+response-status reads and HTTP response-builder status methods are `NON-PROCESS`; local HTTP
+fixtures run futures in one bounded scope without detached task or subprocess creation. The
+maintained dependency snapshot in `patched-deps/rig-core` remains third-party SDK source, outside
+the application launch inventory; its patch only inspects typed error sources.
+
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
 as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. Native Git metadata alias-refusal assertions inspect captured
 `CommandOutput` status and stderr; their exact macro contexts and occurrence counts are

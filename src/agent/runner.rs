@@ -1181,7 +1181,7 @@ impl CompletionRetryState {
             return None;
         }
 
-        let delay = retry::retry_delay(self.backoff, self.max_backoff);
+        let delay = retry::retry_delay_for_error(self.backoff, self.max_backoff, error);
         self.backoff = (self.backoff * 2).min(self.max_backoff);
         Some((self.failures, delay))
     }
@@ -4461,6 +4461,24 @@ mod tests {
         assert!(headless_error.contains("/compress"));
         assert!(headless_error.contains("compact_enabled = true"));
         assert_eq!(headless_model.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_completion_retry_uses_the_request_header_within_the_ceiling() {
+        for code in [429, 529] {
+            let error = crate::provider_http::tests::streaming_error(code, Some("20")).await;
+            let config = crate::retry::RetryConfig {
+                max_attempts: 2,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 50,
+            };
+            let mut state = super::CompletionRetryState::new(&config);
+            assert_eq!(
+                state.retry_delay(&config, &error),
+                Some((1, std::time::Duration::from_millis(50)))
+            );
+            assert_eq!(state.retry_delay(&config, &error), None);
+        }
     }
 
     #[test]

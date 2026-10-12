@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import sys
 import unittest
@@ -26,6 +27,28 @@ class DependencyPolicyTests(unittest.TestCase):
             REPOSITORY_ROOT,
             today=dt.date(2026, 11, 24),
         )
+
+    def test_patched_sdk_cannot_become_a_workspace_member(self) -> None:
+        cargo = policy.load_toml(REPOSITORY_ROOT / "Cargo.toml")
+        policy.validate_patched_sdk_workspace(cargo)
+        for mutate in (
+            lambda manifest: manifest["workspace"].update(members=["."]),
+            lambda manifest: manifest["workspace"].update(members=["patched-deps/rig-core"]),
+            lambda manifest: manifest["workspace"].update(exclude=["spike"]),
+        ):
+            altered = copy.deepcopy(cargo)
+            mutate(altered)
+            with self.assertRaisesRegex(policy.PolicyError, "outside workspace membership"):
+                policy.validate_patched_sdk_workspace(altered)
+
+    def test_unpatched_or_unpinned_sdk_resolution_is_rejected(self) -> None:
+        cargo = policy.load_toml(REPOSITORY_ROOT / "Cargo.toml")
+        for section in ("dependencies", "dev-dependencies"):
+            for field, value in (("path", "registry-sdk"), ("version", "0.40")):
+                altered = copy.deepcopy(cargo)
+                altered[section]["rig"][field] = value
+                with self.assertRaisesRegex(policy.PolicyError, "pinned maintained SDK path"):
+                    policy.validate_patched_sdk_workspace(altered)
 
     def test_fake_denied_license_fails(self) -> None:
         self.assertTrue(

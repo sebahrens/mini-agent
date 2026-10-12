@@ -1,6 +1,8 @@
 [workspace]
-members = ["."]
-exclude = ["spike"]
+# Root package is an implicit member; explicit "." overrides nested exclusions.
+members = []
+# The licensed SDK snapshot is a dependency, not another production target.
+exclude = ["spike", "patched-deps/rig-core"]
 resolver = "2"
 
 [workspace.metadata.dependency-policy]
@@ -65,7 +67,7 @@ skills-embed = ["skills", "dep:fastembed", "dep:ort"]
 skills-embed-dynamic = ["skills-embed", "ort/load-dynamic"]
 
 [dependencies]
-rig = { package = "rig-core", version = "0.40", default-features = false, features = [
+rig = { package = "rig-core", version = "=0.40.0", path = "patched-deps/rig-core", default-features = false, features = [
     "reqwest",
     "derive",
     "native-tls",
@@ -127,6 +129,8 @@ globset = "0.4"
 pulldown-cmark = "0.13"
 include_dir = "0.7"
 http = "1"
+httpdate = "1"
+bytes = "1"
 agent-client-protocol = { version = "2.0.0", optional = true }
 blocking = { version = "1", optional = true }
 # ACP TCP TLS reuses the native-tls stack reqwest already links.
@@ -192,7 +196,7 @@ security-framework-sys = "2.17"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
+rig = { package = "rig-core", version = "=0.40.0", path = "patched-deps/rig-core", features = ["test-utils"] }
 syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]

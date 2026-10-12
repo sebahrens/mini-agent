@@ -28,6 +28,7 @@ use crate::extras::hooks::LoopInfo;
 use crate::extras::mcp::McpClientManager;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
+use crate::provider_http::ProviderHttpClient;
 use crate::retry::{self, RetryConfig};
 use crate::sandbox::Sandbox;
 use crate::session::SessionMessage;
@@ -226,8 +227,8 @@ fn resolve_base_url(config: &ProviderConfig) -> Option<String> {
 /// `ApiStyle` decide which one to build.
 #[derive(Clone)]
 pub enum OpenAiClient {
-    Responses(openai::Client),
-    Completions(openai::CompletionsClient),
+    Responses(openai::Client<ProviderHttpClient>),
+    Completions(openai::CompletionsClient<ProviderHttpClient>),
 }
 
 impl OpenAiClient {
@@ -240,23 +241,23 @@ impl OpenAiClient {
 }
 
 pub enum OpenAiModel {
-    Responses(openai::responses_api::ResponsesCompletionModel),
-    Completions(openai::completion::CompletionModel),
+    Responses(openai::responses_api::ResponsesCompletionModel<ProviderHttpClient>),
+    Completions(openai::completion::CompletionModel<ProviderHttpClient>),
 }
 
 #[derive(Clone)]
 pub enum OpenAiAgent {
-    Responses(Agent<openai::responses_api::ResponsesCompletionModel>),
-    Completions(Agent<openai::completion::CompletionModel>),
+    Responses(Agent<openai::responses_api::ResponsesCompletionModel<ProviderHttpClient>>),
+    Completions(Agent<openai::completion::CompletionModel<ProviderHttpClient>>),
 }
 
 #[derive(Clone)]
 pub enum AnyClient {
-    OpenRouter(openrouter::Client),
+    OpenRouter(openrouter::Client<ProviderHttpClient>),
     OpenAI(OpenAiClient),
-    Anthropic(anthropic::Client),
-    Gemini(gemini::Client),
-    Ollama(ollama::Client),
+    Anthropic(anthropic::Client<ProviderHttpClient>),
+    Gemini(gemini::Client<ProviderHttpClient>),
+    Ollama(ollama::Client<ProviderHttpClient>),
 }
 
 /// Extra OpenRouter request body params that pin a Claude model to the
@@ -1277,22 +1278,22 @@ pub enum AnyModel {
     /// breakpoints (Bedrock/Vertex silently drop them). `None` for every other
     /// OpenRouter model, which caches automatically and needs no routing.
     OpenRouter(
-        openrouter::completion::CompletionModel,
+        openrouter::completion::CompletionModel<ProviderHttpClient>,
         Option<serde_json::Value>,
     ),
     OpenAI(OpenAiModel),
-    Anthropic(anthropic::completion::CompletionModel),
-    Gemini(gemini::completion::CompletionModel),
-    Ollama(ollama::CompletionModel),
+    Anthropic(anthropic::completion::CompletionModel<ProviderHttpClient>),
+    Gemini(gemini::completion::CompletionModel<ProviderHttpClient>),
+    Ollama(ollama::CompletionModel<ProviderHttpClient>),
 }
 
 #[derive(Clone)]
 pub enum AnyAgentInner {
-    OpenRouter(Agent<openrouter::completion::CompletionModel>),
+    OpenRouter(Agent<openrouter::completion::CompletionModel<ProviderHttpClient>>),
     OpenAI(OpenAiAgent),
-    Anthropic(Agent<anthropic::completion::CompletionModel>),
-    Gemini(Agent<gemini::completion::CompletionModel>),
-    Ollama(Agent<ollama::CompletionModel>),
+    Anthropic(Agent<anthropic::completion::CompletionModel<ProviderHttpClient>>),
+    Gemini(Agent<gemini::completion::CompletionModel<ProviderHttpClient>>),
+    Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
 #[derive(Clone)]
@@ -1998,11 +1999,11 @@ fn build_openai_client(
                 Some(u) => openai::Client::builder()
                     .api_key(key)
                     .base_url(u)
-                    .http_client(http_client)
+                    .http_client(ProviderHttpClient::new(http_client))
                     .build()?,
                 None => openai::Client::builder()
                     .api_key(key)
-                    .http_client(http_client)
+                    .http_client(ProviderHttpClient::new(http_client))
                     .build()?,
             };
             Ok(OpenAiClient::Responses(client))
@@ -2012,11 +2013,11 @@ fn build_openai_client(
                 Some(u) => openai::CompletionsClient::builder()
                     .api_key(key)
                     .base_url(u)
-                    .http_client(http_client)
+                    .http_client(ProviderHttpClient::new(http_client))
                     .build()?,
                 None => openai::CompletionsClient::builder()
                     .api_key(key)
-                    .http_client(http_client)
+                    .http_client(ProviderHttpClient::new(http_client))
                     .build()?,
             };
             Ok(OpenAiClient::Completions(client))
@@ -2071,8 +2072,10 @@ macro_rules! build_provider_client {
             Some(u) => <$client_ty>::builder()
                 .api_key(key)
                 .base_url(u)
-                .http_client($http),
-            None => <$client_ty>::builder().api_key(key).http_client($http),
+                .http_client(ProviderHttpClient::new($http)),
+            None => <$client_ty>::builder()
+                .api_key(key)
+                .http_client(ProviderHttpClient::new($http)),
         };
         Ok(AnyClient::$variant(builder.build()?))
     }};
@@ -2121,8 +2124,10 @@ fn build_openrouter_client(
         Some(u) => openrouter::Client::builder()
             .api_key(key)
             .base_url(u)
-            .http_client(http),
-        None => openrouter::Client::builder().api_key(key).http_client(http),
+            .http_client(ProviderHttpClient::new(http)),
+        None => openrouter::Client::builder()
+            .api_key(key)
+            .http_client(ProviderHttpClient::new(http)),
     };
     let builder = builder
         .with_app_identity(crate::product::PUBLIC_NAME, crate::product::REPOSITORY_URL)

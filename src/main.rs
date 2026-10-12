@@ -21,6 +21,7 @@ mod print;
 mod process_creation;
 mod product;
 mod provider;
+mod provider_http;
 mod retry;
 mod sandbox;
 mod session;

@@ -254,6 +254,7 @@ async fn exercise_replacement(provider_changed: bool) {
     };
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .api_key("unused-test-key")
             .base_url(format!("http://{}", listener.local_addr().unwrap()))
             .build()
@@ -509,6 +510,7 @@ async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent(
     };
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .api_key("unused-test-key")
             .build()
             .unwrap(),
@@ -611,6 +613,7 @@ async fn share_requires_confirmation_before_uploading() {
     };
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .api_key("unused-test-key")
             .build()
             .unwrap(),

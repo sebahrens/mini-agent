@@ -121,7 +121,11 @@ async fn discard(payload: PrebuildPayload) {
 pub(crate) fn test_agent() -> crate::provider::AnyAgent {
     use rig::client::CompletionClient;
 
-    let client = rig::providers::openrouter::Client::new("unused-test-key").unwrap();
+    let client = rig::providers::openrouter::Client::builder()
+        .api_key("unused-test-key")
+        .http_client(crate::provider_http::ProviderHttpClient::default())
+        .build()
+        .unwrap();
     crate::provider::AnyAgent::without_skills(crate::provider::AnyAgentInner::OpenRouter(
         client.agent("test-model").build(),
     ))

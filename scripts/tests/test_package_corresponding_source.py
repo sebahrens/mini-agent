@@ -496,6 +496,22 @@ class WorkflowNodePolicyTests(unittest.TestCase):
             raise AssertionError(f"{workflow} job {name!r} is missing")
         return match.group("body")
 
+    def test_repository_source_gate_preserves_the_patched_sdk(self) -> None:
+        body = self.job("ci.yml", "package")
+        self.assertNotIn("cargo package", body)
+        self.assertIn('git archive --format=tar HEAD | tar xf - -C "$tmpdir/source"', body)
+        self.assertIn('cd "$tmpdir/source"', body)
+        self.assertIn("test -f patched-deps/rig-core/LICENSE", body)
+        self.assertIn("test -f patched-deps/rig-core/PATCH.md", body)
+        self.assertIn("real_http_stream_retry_waits_for_the_capped_header_delay_and_recovers", body)
+        self.assertIn('cargo install --locked --path . --debug', body)
+        self.assertIn('"$tmpdir/install/bin/mini-agent" --js-runtime-check', body)
+        # Corresponding Source retains offline dependency verification too.
+        script = (REPOSITORY_ROOT / "scripts/package-corresponding-source.sh").read_text()
+        self.assertIn("git archive", script)
+        self.assertIn("cargo vendor --locked", script)
+        self.assertIn("--locked --offline", script)
+
     def test_packaging_jobs_install_pinned_node_before_the_packager(self) -> None:
         setup = "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0"
         verify = "test \"npm@$(npm --version)\" = \"$(node --print \"require('./package.json').packageManager\")\""
@@ -559,6 +575,22 @@ class WorkflowNodePolicyTests(unittest.TestCase):
 )
 class AssembledArchiveTests(unittest.TestCase):
     """Checks a real archive produced by package-corresponding-source.sh."""
+
+    def test_patched_sdk_and_license_survive_source_assembly(self) -> None:
+        archive_path = Path(os.environ["MINI_AGENT_SOURCE_ARCHIVE"])
+        root = archive_path.name.removesuffix(".tar.gz")
+        with tarfile.open(archive_path) as archive:
+            manifest = archive.extractfile(f"{root}/Cargo.toml").read().decode()
+            if 'path = "patched-deps/rig-core"' not in manifest:
+                return  # Historical releases predate this maintained backport.
+            for relative in ("Cargo.toml", "Cargo.toml.orig", "LICENSE", ".cargo_vcs_info.json", "PATCH.md"):
+                member = archive.getmember(f"{root}/patched-deps/rig-core/{relative}")
+                self.assertTrue(member.isfile(), relative)
+                self.assertGreater(member.size, 0, relative)
+            sdk = archive.extractfile(f"{root}/patched-deps/rig-core/src/http_client/mod.rs").read()
+            app = archive.extractfile(f"{root}/src/provider_http.rs").read()
+            self.assertIn(b"pub const MINI_AGENT_HTTP_RESPONSE_SOURCE_CHAIN: bool = true", sdk)
+            self.assertIn(b"assert!(rig::http_client::MINI_AGENT_HTTP_RESPONSE_SOURCE_CHAIN)", app)
 
     def test_npm_sources_are_present_and_match_the_archived_lockfile(self) -> None:
         archive_path = Path(os.environ["MINI_AGENT_SOURCE_ARCHIVE"])

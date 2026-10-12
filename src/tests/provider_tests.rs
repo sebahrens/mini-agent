@@ -1224,6 +1224,7 @@ fn provider_timeouts_fall_back_to_documented_defaults() {
 
 #[tokio::test]
 async fn provider_redirects_preserve_origin_headers_and_hop_limit() {
+    use rig::http_client::HttpClientExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn request_headers(stream: &mut tokio::net::TcpStream) -> String {
@@ -1266,9 +1267,15 @@ async fn provider_redirects_preserve_origin_headers_and_hop_limit() {
             Some(&format!("http://{address}")),
         )
         .unwrap();
-        let request = client
-            .get(format!("http://{address}/start"))
-            .bearer_auth("redirect-bearer-sentinel");
+        let client = crate::provider_http::ProviderHttpClient::new(client);
+        let request = http::Request::builder()
+            .uri(format!("http://{address}/start"))
+            .header(
+                http::header::AUTHORIZATION,
+                "Bearer redirect-bearer-sentinel",
+            )
+            .body(Vec::<u8>::new())
+            .unwrap();
 
         // Keep all network futures inside this bounded scope: assertion failures
         // and timeouts drop their listeners/streams without detached tasks.
@@ -1303,15 +1310,16 @@ async fn provider_redirects_preserve_origin_headers_and_hop_limit() {
                     headers = unexpected_destination => {
                         panic!("{scenario}: redirect reached another origin: {headers}");
                     }
-                    result = request.send() => result,
+                    result = client.send::<_, bytes::Bytes>(request) => result,
                 };
                 if scenario == "same-origin" {
                     let response = result.unwrap();
                     assert_eq!(response.status(), reqwest::StatusCode::OK);
-                    assert_eq!(response.text().await.unwrap(), "ok");
+                    assert_eq!(response.into_body().await.unwrap(), "ok");
                 } else {
-                    let error = result.expect_err("provider followed an unsafe or unbounded redirect");
-                    assert!(error.is_redirect(), "{scenario}: expected redirect refusal, got {error}");
+                    let error = result.err().expect("provider followed an unsafe or unbounded redirect");
+                    let rig::http_client::Error::Instance(source) = &error else { panic!("{scenario}: expected transport redirect refusal, got {error}") };
+                    assert!(source.downcast_ref::<reqwest::Error>().unwrap().is_redirect(), "{scenario}: expected redirect refusal, got {error}");
                 }
             };
             tokio::join!(serve, receive);

@@ -74,7 +74,11 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
             let cli = crate::cli::Cli::parse_from(["mini-agent", "--no-session"]);
             let cfg = crate::config::Config::default();
             let client = crate::provider::AnyClient::OpenRouter(
-                rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+                rig::providers::openrouter::Client::builder()
+                    .api_key("unused-test-key")
+                    .http_client(crate::provider_http::ProviderHttpClient::default())
+                    .build()
+                    .unwrap(),
             );
             let mut run = AgentRunState::default();
             let pending = PendingMainTurn::capture(&session, "read it");

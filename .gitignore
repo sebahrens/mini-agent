@@ -28,3 +28,6 @@ __pycache__/
 # Default Skill Gym root: episode worktrees and per-arm AppPaths trees.
 # Override with MINI_AGENT_GYM_ROOT to place it outside the repository.
 .gym/
+
+# Preserve the verified upstream manifest beside the maintained Rig patch.
+!patched-deps/rig-core/Cargo.toml.orig

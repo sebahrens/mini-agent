@@ -122,6 +122,19 @@ class ThirdPartyInventoryTests(unittest.TestCase):
             INVENTORY.parse_inventory(document)["packages"],
         )
 
+    def test_patched_path_dependency_keeps_its_upstream_license_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InventoryFixture(directory)
+            license_text = (ROOT / "patched-deps/rig-core/LICENSE").read_text()
+            fixture.crate("rig-core", "0.40.0", "MIT", {"LICENSE": license_text})
+            package = fixture.packages[-1]
+            package["id"] = "path+file:///repo/patched-deps/rig-core#0.40.0"
+            package["source"] = None
+            document = self.render(fixture)
+        self.assertIn("Package: rig-core 0.40.0\nLicense: MIT\n", document)
+        self.assertIn(license_text.strip(), document)
+        self.assertEqual({("rig-core", "0.40.0")}, INVENTORY.parse_inventory(document)["packages"])
+
     def test_vendored_native_trees_contribute_their_license_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = InventoryFixture(directory)

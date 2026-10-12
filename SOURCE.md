@@ -11,7 +11,10 @@ The source archive is covered by the `SHA256SUMS` file in that release. It conta
 mini-agent source tree, build and release scripts, the GPL license and modification notice, all
 Cargo dependency sources vendored with the locked dependency graph, and the VS Code extension's
 locked npm package tarballs. Its generated
-`.cargo/config.toml` makes Cargo use those vendored sources.
+`.cargo/config.toml` makes Cargo use those vendored sources. The maintained Rig 0.40.0 snapshot
+under `patched-deps/rig-core` is included directly from the tagged repository, together with its
+upstream license, original manifest, source metadata and documented HTTP error-source patch.
+It stays outside generated `vendor/` so assembly cannot overwrite the patch.
 
 After installing the Rust toolchain named in `rust-toolchain.toml`, a native full or lite binary can
 be rebuilt from the extracted source archive without downloading Cargo dependencies:

@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,48 @@ pub fn retry_delay(backoff: Duration, max_backoff: Duration) -> Duration {
     (backoff + jitter).min(max_backoff)
 }
 
+/// Retry hints belong to the particular failed HTTP request, carried through
+/// Rig's error source chain. Neither shared clients nor nested agents share a
+/// mutable last-response slot.
+pub fn retry_delay_for_error(
+    backoff: Duration,
+    max_backoff: Duration,
+    error: &(dyn std::error::Error + 'static),
+) -> Duration {
+    let computed = retry_delay(backoff, max_backoff);
+    for candidate in error_sources(error) {
+        if let Some(response) =
+            candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
+        {
+            return response
+                .retry_after
+                .to_str()
+                .ok()
+                .and_then(|value| parse_retry_after(value, SystemTime::now()))
+                .map_or(computed, |hint| computed.max(hint).min(max_backoff));
+        }
+    }
+    computed
+}
+
+fn error_sources<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |candidate| candidate.source()).take(32)
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim_matches([' ', '\t']);
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Oversized positive hints remain hints: the configured ceiling will
+        // clamp them rather than turning a provider's long wait into no wait.
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .map(|date| date.duration_since(now).unwrap_or_default())
+}
+
 pub fn simple_jitter(range_ms: u64) -> Duration {
     use std::time::SystemTime;
     let nanos = SystemTime::now()
@@ -110,12 +152,10 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
     // Context overflow cannot recover without changing the request. Check the
     // entire source chain before provider status or message fallbacks so token
     // counts such as 213500 never masquerade as HTTP 500.
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(candidate) = current {
+    for candidate in error_sources(error) {
         if is_context_length_error_message(&candidate.to_string()) {
             return false;
         }
-        current = candidate.source();
     }
 
     // Prefer Rig's preserved provider status over rendered-message heuristics.
@@ -126,8 +166,7 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         return is_retryable_status(provider_status.as_u16());
     }
 
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(e) = current {
+    for e in error_sources(error) {
         let msg = e.to_string();
 
         if message_has_retryable_status(&msg) {
@@ -168,8 +207,6 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         {
             return true;
         }
-
-        current = e.source();
     }
     false
 }
@@ -198,8 +235,7 @@ fn message_has_retryable_status(message: &str) -> bool {
 }
 
 fn provider_response_status(error: &(dyn std::error::Error + 'static)) -> Option<http::StatusCode> {
-    let mut current = Some(error);
-    while let Some(candidate) = current {
+    for candidate in error_sources(error) {
         if let Some(error) = candidate.downcast_ref::<rig::completion::PromptError>()
             && let Some(status) = error.provider_response_status()
         {
@@ -210,7 +246,11 @@ fn provider_response_status(error: &(dyn std::error::Error + 'static)) -> Option
         {
             return Some(status);
         }
-        current = candidate.source();
+        if let Some(response) =
+            candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
+        {
+            return Some(response.status);
+        }
     }
     None
 }
@@ -297,7 +337,7 @@ where
                 if attempt >= config.max_attempts || !is_retryable(&e) {
                     return Err(e);
                 }
-                let delay = retry_delay(backoff, max_backoff);
+                let delay = retry_delay_for_error(backoff, max_backoff, &e);
                 tracing::warn!(
                     "retryable error on first stream item (attempt {attempt}/{}): {e}",
                     config.max_attempts
@@ -322,6 +362,34 @@ mod tests {
     use super::*;
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn retry_after_seconds_http_dates_and_invalid_values_are_parsed_without_waiting() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for (value, expected) in [
+            ("0", Some(0)),
+            (" 120\t", Some(120)),
+            ("Sun, 06 Nov 1994 08:49:39 GMT", Some(2)),
+            ("Sunday, 06-Nov-94 08:49:39 GMT", Some(2)),
+            ("Sun Nov  6 08:49:39 1994", Some(2)),
+            ("Sun, 06 Nov 1994 08:49:36 GMT", Some(0)),
+            ("", None),
+            ("-1", None),
+            ("+1", None),
+            ("1.5", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(
+                parse_retry_after(value, now),
+                expected.map(Duration::from_secs),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse_retry_after("99999999999999999999999999", now),
+            Some(Duration::from_secs(u64::MAX))
+        );
+    }
 
     #[test]
     fn test_retry_config_defaults() {
@@ -353,6 +421,28 @@ mod tests {
     fn test_is_retryable_http_500() {
         let err = io::Error::other("HTTP 500 Internal Server Error");
         assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn cyclic_error_sources_are_bounded_for_classification_and_delay() {
+        #[derive(Debug)]
+        struct Cycle;
+        impl std::fmt::Display for Cycle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cycle")
+            }
+        }
+        impl std::error::Error for Cycle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self)
+            }
+        }
+        assert_eq!(error_sources(&Cycle).count(), 32);
+        assert!(!is_retryable(&Cycle));
+        assert_eq!(
+            retry_delay_for_error(Duration::ZERO, Duration::from_secs(1), &Cycle),
+            Duration::ZERO
+        );
     }
 
     #[test]

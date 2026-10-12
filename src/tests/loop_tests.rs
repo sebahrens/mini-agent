@@ -174,7 +174,11 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
         });
 
     let client = crate::provider::AnyClient::OpenRouter(
-        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap(),
     );
     let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
         .unwrap()
@@ -362,7 +366,11 @@ async fn a_goal_paused_during_verification_is_not_overwritten_by_its_result() {
         });
 
     let client = crate::provider::AnyClient::OpenRouter(
-        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap(),
     );
     let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
         .unwrap()
@@ -506,7 +514,11 @@ async fn goal_pause_cancels_the_running_verification() {
         });
 
     let client = crate::provider::AnyClient::OpenRouter(
-        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap(),
     );
     let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
         .unwrap()

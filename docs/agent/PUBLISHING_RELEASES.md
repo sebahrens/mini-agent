@@ -148,6 +148,12 @@ deliberately explicit:
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
 
+The CI `package` gate extracts `git archive HEAD` and tests, installs and probes that exact
+repository source candidate in isolation, including the real streaming Retry-After regression.
+A normalized Cargo `.crate` omits the maintained path dependency and is unsupported; this
+project neither publishes nor distributes such an artifact. The separate Corresponding Source
+gate also vendors the locked registry dependencies and verifies offline resolution.
+
 Nix packaging is intentionally unsupported. The former impure, unpinned package, overlay, and
 development-shell entry points were removed rather than presented as a working install channel.
 Restoring Nix support requires pinned inputs, Linux and macOS CI, default-feature parity, and a

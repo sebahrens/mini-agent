@@ -100,6 +100,7 @@ async fn run_loop_parts_with_state(
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
             .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .base_url("http://127.0.0.1:9")
             .build()
             .unwrap(),

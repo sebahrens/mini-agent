@@ -2462,19 +2462,19 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Package crate
-        run: cargo package --locked
-
-      - name: Verify packaged crate builds and installs in isolation
+      - name: Verify repository source candidate builds and installs in isolation
         run: |
-          crate=$(ls target/package/mini-agent-*.crate | tail -1)
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
-          tar xzf "$crate" -C "$tmpdir"
-          pkgdir=$(ls -d "$tmpdir"/mini-agent-*)
-          cargo test --locked --manifest-path "$pkgdir/Cargo.toml" \
-            rig_multi_turn_run_usage_saturates_before_completion_delivery
-          cargo install --locked --path "$pkgdir" --debug --root "$tmpdir/install"
+          mkdir "$tmpdir/source"
+          git archive --format=tar HEAD | tar xf - -C "$tmpdir/source"
+          cd "$tmpdir/source"
+          test -f patched-deps/rig-core/LICENSE
+          test -f patched-deps/rig-core/PATCH.md
+          cargo test --locked --bin mini-agent -- \
+            rig_multi_turn_run_usage_saturates_before_completion_delivery \
+            real_http_stream_retry_waits_for_the_capped_header_delay_and_recovers
+          cargo install --locked --path . --debug --root "$tmpdir/install"
           "$tmpdir/install/bin/mini-agent" --version | grep -Fq "mini-agent "
           "$tmpdir/install/bin/mini-agent" --js-runtime-check |
             grep -Fxq "JS runtime check: PASS (2)"

@@ -2023,6 +2023,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2826,6 +2832,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "blocking",
+ "bytes",
  "cap-std",
  "chrono",
  "clap",
@@ -2839,6 +2846,7 @@ dependencies = [
  "globset",
  "hnsw_rs",
  "http",
+ "httpdate",
  "ignore",
  "include_dir",
  "jsonschema",
@@ -4082,8 +4090,6 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rig-core"
 version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8731dd5532b3a12ce1613af73073fb2051ef750f50c504778c21d55ae933cac"
 dependencies = [
  "as-any",
  "async-stream",

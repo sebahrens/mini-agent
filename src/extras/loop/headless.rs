@@ -280,7 +280,9 @@ mod persistence_tests {
             let client = rig::providers::openrouter::Client::builder()
                 .api_key("test-key")
                 .base_url(format!("http://{address}"))
-                .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .http_client(crate::provider_http::ProviderHttpClient::new(
+                    reqwest::Client::builder().no_proxy().build().unwrap(),
+                ))
                 .build()
                 .unwrap();
             let agent = client
@@ -318,7 +320,11 @@ mod persistence_tests {
                     None,
                     &Sandbox::new(false, "bwrap"),
                     &crate::provider::AnyClient::OpenRouter(
-                        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+                        rig::providers::openrouter::Client::builder()
+                            .api_key("unused-test-key")
+                            .http_client(crate::provider_http::ProviderHttpClient::default())
+                            .build()
+                            .unwrap(),
                     ),
                 ),
             )

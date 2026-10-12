@@ -791,6 +791,30 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/provider_http.rs",
+        "let response_code = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        ".status(response.status())",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "if !response.status().is_success() {",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "let status = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/skills/coordinator.rs",
         "let holder = HeldTestLock::spawn(move |wait| {",
         1,
@@ -3711,6 +3735,30 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/provider_http.rs",
+        "let response_code = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        ".status(response.status())",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "if !response.status().is_success() {",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "let status = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
     // Owned real-Git fixture: config probe, old-authority marker, and hardened add.
     (
         "src/git/runner.rs",

@@ -196,7 +196,8 @@ reproducing code; focus on structure, relationships, and rationale.
 - mpsc channels for agent events, user events, and permission requests
 
 ## Dependencies
-- `rig` / `rig-core` — LLM client abstraction
+- `rig` / `rig-core` — LLM client abstraction, pinned to the licensed 0.40.0 source snapshot in `patched-deps/rig-core`. Its bounded HTTP error-source backport preserves request-owned response metadata through streaming conversion; see `patched-deps/rig-core/PATCH.md`. The snapshot is excluded from workspace membership, retains the existing dev overflow profile and feature selection, and remains a resolved dependency for license inventory and Corresponding Source.
+- `src/provider_http.rs` — all native provider clients reuse the configured reqwest client through this Rig adapter. It preserves successful response headers/body streams and failed `Retry-After` hints without global mutable metadata. The compile-time SDK marker rejects accidental resolution to an unpatched registry SDK. Retry classification and header discovery traverse at most 32 error sources.
 - `crossterm` — cross-platform terminal manipulation
 - `tokio` — async runtime
 - `serde` / `toml` — config parsing

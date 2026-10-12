@@ -1292,6 +1292,7 @@ async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
         context.memory = Some("stale prebuild memory".to_string());
         let client = rig::providers::openrouter::Client::builder()
             .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .base_url("http://127.0.0.1:9")
             .build()
             .unwrap();
@@ -1943,6 +1944,7 @@ async fn delayed_prebuild_preserves_configuration_and_services_across_interrupti
         context.current_prompt = Some("STARTUP_PROMPT_SENTINEL".into());
         let client = rig::providers::openrouter::Client::builder()
             .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .base_url(&endpoint)
             .build()
             .unwrap();

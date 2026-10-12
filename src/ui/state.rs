@@ -612,7 +612,11 @@ mod retirement_tests {
                     architecture: None,
                 };
                 let client = crate::provider::AnyClient::OpenRouter(
-                    rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+                    rig::providers::openrouter::Client::builder()
+                        .api_key("unused-test-key")
+                        .http_client(crate::provider_http::ProviderHttpClient::default())
+                        .build()
+                        .unwrap(),
                 );
                 let mut ui = super::UiContext::new(
                     &cli,
