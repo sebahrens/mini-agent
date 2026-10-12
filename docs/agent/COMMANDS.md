@@ -176,6 +176,10 @@ the containment probe has made a refusal decision. While the initial agent is
 still being built, the pending probe adds no warning; `/toggle` shows the
 current runtime report once it is available.
 
+`--print-config` reports an eligible JavaScript worker as `not probed`; configuration display
+starts no JavaScript worker and does not attest containment or advertise worker capabilities.
+Actual agent startup still requires the full containment probe and executable-content proofs.
+
 ## Memory (feature-gated)
 
 Requires the `memory` feature, which is included in the default build.

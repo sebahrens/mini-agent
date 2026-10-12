@@ -36,7 +36,7 @@ fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::R
                     anthropic_native: false,
                     input_token_cost: 0.0,
                     output_token_cost: 0.0,
-                    cache_multipliers: crate::pricing::CacheMultipliers::default(),
+                    cache_prices: crate::pricing::CachePrices::default(),
                 },
                 crate::print::HeadlessStopReason::Failed,
                 #[cfg(feature = "goal")]
@@ -2413,10 +2413,11 @@ async fn run_headless_goal_rounds(
                                 .charge(
                                     &resolved,
                                     &cfg_for_judge,
-                                    crate::extras::goal::judge::judge_prices(
+                                    crate::extras::goal::judge::judge_prices_with_cache_prices(
                                         &resolved,
                                         &cfg_for_judge,
                                         session_prices,
+                                        session_cache_prices,
                                     ),
                                     session_cache_prices,
                                 );

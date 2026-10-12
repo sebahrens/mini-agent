@@ -689,10 +689,6 @@ impl Session {
         }
     }
 
-    pub(crate) fn cache_multipliers(&self) -> crate::pricing::CacheMultipliers {
-        self.cache_prices().multipliers(self.input_token_cost)
-    }
-
     pub(crate) fn cached_converted_history(
         &self,
         keep_recent_tool_results: usize,
@@ -1208,7 +1204,7 @@ impl Session {
             anthropic_native,
             self.input_token_cost,
             self.output_token_cost,
-            self.cache_multipliers(),
+            self.cache_prices(),
         );
     }
 
@@ -1225,7 +1221,7 @@ impl Session {
                     charge.anthropic_native,
                     input_cost,
                     output_cost,
-                    charge.cache_multipliers,
+                    charge.cache_prices,
                 );
                 true
             }
@@ -1235,7 +1231,7 @@ impl Session {
                     charge.anthropic_native,
                     0.0,
                     0.0,
-                    crate::pricing::CacheMultipliers::default(),
+                    crate::pricing::CachePrices::default(),
                 );
                 self.unpriced_judge_tokens = self.unpriced_judge_tokens.saturating_add(
                     charge
@@ -1254,7 +1250,7 @@ impl Session {
         anthropic_native: bool,
         input_token_cost: f64,
         output_token_cost: f64,
-        cache_multipliers: crate::pricing::CacheMultipliers,
+        cache_prices: crate::pricing::CachePrices,
     ) {
         self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
@@ -1274,15 +1270,9 @@ impl Session {
                     usage.cached_input_tokens,
                     usage.cache_creation_input_tokens,
                 ));
-        self.total_cost += crate::pricing::estimate_cost(
-            crate::pricing::billable_input_tokens_with_multipliers(
-                anthropic_native,
-                usage.input_tokens,
-                usage.cached_input_tokens,
-                usage.cache_creation_input_tokens,
-                cache_multipliers,
-            ),
-            usage.output_tokens,
+        self.total_cost += cache_prices.estimate_cost(
+            anthropic_native,
+            usage,
             input_token_cost,
             output_token_cost,
         );
@@ -2070,7 +2060,7 @@ mod preflight_tests {
             usage,
             anthropic_native: false,
             prices: Some((2.0, 10.0)),
-            cache_multipliers: crate::pricing::CacheMultipliers::default(),
+            cache_prices: crate::pricing::CachePrices::default(),
             model: "cheap/judge".into(),
         };
         assert!(session.charge_judge_call(&priced));
@@ -2120,6 +2110,114 @@ mod preflight_tests {
         assert_eq!(explicit.cache_prices().read, Some(0.04));
         explicit.charge_usage_delta(usage, true);
         assert!((explicit.total_cost - 0.24).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_base_cache_charge_preserves_absolute_tiers_in_saved_session() {
+        let mut session = Session::new("anthropic", "zero-base-model", 1_000_000, "");
+        session.output_token_cost = 3.0;
+        session.set_cache_prices(crate::pricing::CachePrices {
+            read: Some(1.0),
+            write: Some(2.0),
+        });
+        let mut restored: Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let usage = crate::event::UsageDelta {
+            input_tokens: 5_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        restored.charge_usage_delta(usage, true);
+        assert_eq!(restored.total_cost, 6.0);
+        assert_eq!(restored.total_input_tokens, 5_000_000);
+        assert_eq!(restored.total_cached_input_tokens, 1_000_000);
+        assert_eq!(restored.total_cache_creation_input_tokens, 1_000_000);
+        for (read, write, expected) in [
+            (None, None, 0.0),
+            (Some(0.0), Some(0.0), 0.0),
+            (Some(1.0), None, 1.0),
+            (None, Some(2.0), 2.0),
+        ] {
+            session.total_cost = 0.0;
+            session.output_token_cost = 0.0;
+            session.set_cache_prices(crate::pricing::CachePrices { read, write });
+            session.charge_usage_delta(usage, true);
+            assert_eq!(session.total_cost, expected);
+        }
+        session.total_cost = 0.0;
+        session.output_token_cost = 3.0;
+        session.charge_usage_delta(usage, false);
+        assert_eq!(
+            session.total_cost, 3.0,
+            "non-native cached subsets are never separate charges"
+        );
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn zero_base_judge_cache_charge_uses_resolved_absolute_alias_and_session_rates() {
+        use crate::extras::goal::judge::{JudgeCall, judge_prices_with_cache_prices};
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "quick_models": {"cache-only-judge": {"provider":"anthropic", "model":"claude-opus-5-5", "input_token_cost":0.0, "output_token_cost":0.0, "cache_read_token_cost":1.0, "cache_write_token_cost":2.0}}
+        })).unwrap();
+        let mut main = Session::new("anthropic", "claude-fable-5-1", 1_000_000, "");
+        main.input_token_cost = 10.0;
+        main.output_token_cost = 50.0;
+        let mut resolved = crate::extras::goal::ResolvedJudge {
+            label: "cache-only-judge".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            same_provider_as_session: true,
+            same_as_session: false,
+        };
+        let call = JudgeCall {
+            outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                reason: "fixture".into(),
+            },
+            tokens: 2_000_000,
+            usage: crate::event::UsageDelta {
+                cached_input_tokens: 1_000_000,
+                cache_creation_input_tokens: 1_000_000,
+                ..Default::default()
+            },
+        };
+        let prices = judge_prices_with_cache_prices(
+            &resolved,
+            &cfg,
+            (main.input_token_cost, main.output_token_cost),
+            main.cache_prices(),
+        );
+        assert_eq!(
+            prices,
+            Some((0.0, 0.0)),
+            "the explicit alias cannot fall through to published Opus base rates"
+        );
+        let charge = call
+            .charge(&resolved, &cfg, prices, main.cache_prices())
+            .unwrap();
+        assert!(main.charge_judge_call(&charge));
+        assert_eq!(main.total_cost, 3.0);
+        assert_eq!(main.unpriced_judge_tokens, 0);
+        main.input_token_cost = 0.0;
+        main.output_token_cost = 0.0;
+        main.set_cache_prices(crate::pricing::CachePrices {
+            read: Some(4.0),
+            write: None,
+        });
+        resolved.same_as_session = true;
+        let prices =
+            judge_prices_with_cache_prices(&resolved, &cfg, (0.0, 0.0), main.cache_prices());
+        assert_eq!(prices, Some((0.0, 0.0)));
+        let charge = call
+            .charge(&resolved, &cfg, prices, main.cache_prices())
+            .unwrap();
+        main.charge_judge_call(&charge);
+        assert_eq!(
+            main.total_cost, 7.0,
+            "same-model judge uses the captured session cache rate"
+        );
     }
 
     #[cfg(feature = "goal")]

@@ -160,10 +160,14 @@ You can just set the matching env var with :
 
 | Provider   | Env var               |
 | ---------- | --------------------- |
+| OpenRouter | `OPENROUTER_API_KEY`  |
 | OpenAI     | `OPENAI_API_KEY`      |
-| Anthropic  | `ANTHROPIC_API_KEY`   |
+| Anthropic  | `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN` bearer) |
 | Gemini     | `GEMINI_API_KEY`      |
 | Ollama     | (none — local)        |
+
+See the [canonical environment reference](CONFIG.md#environment-variables) for precedence,
+endpoint fallbacks, application paths, ACP credentials and OS/internal controls.
 
 Then, you can change your configuration file (`~/.mini-agent/config.toml`
 on a fresh install; an existing legacy install keeps
@@ -418,7 +422,11 @@ objects/arrays. For Date, Map, Set, class instances, accessors, sparse arrays, o
 `undefined` or non-finite numbers, return `JSON.stringify(value)` (or another explicit string) so
 result conversion stays predictable and does not implicitly execute object hooks.
 
-On Windows, ordinary startup and `--print-config` evaluate worker status only when the `js` tool is
+`--print-config` displays JavaScript worker status as `not probed` when the tool is eligible;
+it starts no worker and advertises no worker capabilities. This speeds up configuration display,
+without changing executable digest checks or containment preflight for actual JavaScript use.
+
+On Windows, ordinary startup evaluates worker status only when the `js` tool is
 eligible. `--no-tools` and allowlists that omit `js` skip the worker check and learned-skill startup.
 An eligible check creates or reuses a persistent AppContainer profile and may add a persistent
 read/execute ACE for that

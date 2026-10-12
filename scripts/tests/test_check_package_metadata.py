@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1894,6 +1895,49 @@ class SupportedPackageSurfaceTests(unittest.TestCase):
             errors = CHECK_PACKAGE_METADATA.validate_removed_nix_surface(root)
             self.assertEqual(1, len(errors))
             self.assertIn("shell.nix", errors[0])
+
+
+class EnvironmentReferenceTests(unittest.TestCase):
+    @staticmethod
+    def read_names(sources: list[str]) -> set[str]:
+        names: set[str] = set()
+        constants: dict[str, set[str]] = {}
+        for source in sources:
+            for identifier, value in re.findall(
+                r"\bconst\s+(\w+)\s*:\s*&\s*(?:'static\s+)?str\s*=\s*\"([^\"\n]+)\"", source
+            ):
+                constants.setdefault(identifier, set()).add(value)
+                # Environment-name constants can also be consumed indirectly
+                # through probe arrays or configured fixture key names.
+                if value.startswith(("MINI_AGENT_", "ZS_", "LSP_FIXTURE_", "MCP_FIXTURE_")) and re.fullmatch(r"[A-Z][A-Z0-9_]*", value):
+                    names.add(value)
+        for source in sources:
+            for literal, clap in re.findall(
+                r'(?:(?:std::)?env::var(?:_os)?|get_env)\(\s*"([^"\n]+)"|\benv\s*=\s*"([^"\n]+)"', source
+            ):
+                names.add(literal or clap)
+            for identifier in re.findall(r'(?:std::)?env::var(?:_os)?\(\s*([\w:]+)\s*\)', source):
+                # Associated tool NAME constants are not environment names.
+                names.update(value for value in constants.get(identifier.split("::")[-1], set())
+                             if re.fullmatch(r"[A-Z][A-Z0-9_]*", value))
+        return names
+
+    def test_environment_table_covers_explicit_source_reads_and_indirect_public_controls(self) -> None:
+        root = SCRIPT.parents[1]
+        names = self.read_names([path.read_text() for path in (root / "src").rglob("*.rs")])
+        names.update({"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OLLAMA_API_KEY",
+                      "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "RUST_LOG", "ORT_DYLIB_PATH"})
+        doc = (root / "docs/agent/CONFIG.md").read_text()
+        reference = doc.split("## Environment variables\n", 1)[1].split("\n## ", 1)[0]
+        missing = sorted(name for name in names if f"`{name}`" not in reference)
+        self.assertEqual([], missing, "Document new env reads in the canonical environment table")
+        for classification in ("| Public control |", "| Input |", "| Internal family |"):
+            self.assertIn(classification, reference)
+        self.assertIn("no analytics or network telemetry", reference)
+
+    def test_environment_scan_covers_multiline_clap_and_named_constant_reads(self) -> None:
+        names = self.read_names(['const CONTROL: &str = "PRIVATE_CONTROL";\nstd::env::var_os(CONTROL);\nenv::var(\n"PUBLIC_CONTROL");\nget_env("TOKEN_CONTROL");\n#[arg(env = "CLI_CONTROL")]'])
+        self.assertEqual({"PRIVATE_CONTROL", "PUBLIC_CONTROL", "TOKEN_CONTROL", "CLI_CONTROL"}, names)
 
 
 if __name__ == "__main__":

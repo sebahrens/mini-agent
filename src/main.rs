@@ -33,7 +33,6 @@ mod ui;
 mod tests;
 
 use anyhow::Context;
-use clap::Parser;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -67,7 +66,7 @@ fn main() -> anyhow::Result<ExitCode> {
     // largest single stack frame at startup (hundreds of KiB in an unoptimized
     // build); here it sits directly on `main` rather than on top of the
     // runtime and startup frames, all under the 1 MiB Windows default stack.
-    let cli = cli::Cli::parse();
+    let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
         match cli::write_completions(shell, &mut std::io::stdout().lock()) {
             Ok(()) => {}

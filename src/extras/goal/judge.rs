@@ -537,7 +537,7 @@ impl JudgeCall {
             usage: self.usage,
             anthropic_native: cfg.is_anthropic_native(&resolved.provider),
             prices,
-            cache_multipliers: if resolved.same_as_session {
+            cache_prices: if resolved.same_as_session {
                 session_cache_prices
             } else {
                 crate::pricing::cache_prices_for_model(
@@ -547,8 +547,7 @@ impl JudgeCall {
                     Some(&resolved.label),
                     prices.map_or(0.0, |prices| prices.0),
                 )
-            }
-            .multipliers(prices.map_or(0.0, |prices| prices.0)),
+            },
             model: compact_str::format_compact!("{}/{}", resolved.provider, resolved.model),
         })
     }
@@ -563,7 +562,7 @@ pub struct JudgeCharge {
     /// Input and output price per million tokens of the judge model, or
     /// `None` when no price is known: the tokens are recorded without cost.
     pub prices: Option<(f64, f64)>,
-    pub cache_multipliers: crate::pricing::CacheMultipliers,
+    pub(crate) cache_prices: crate::pricing::CachePrices,
     /// `provider/model` of the judge, for saying which model went unpriced.
     pub model: compact_str::CompactString,
 }
@@ -595,11 +594,42 @@ pub fn judge_prices(
         .filter(|entry| matches(entry))
         .into_iter()
         .chain(quick.values().filter(|entry| matches(entry)))
-        .find_map(|entry| known((entry.input_token_cost, entry.output_token_cost)))
+        .find_map(|entry| {
+            let prices = (entry.input_token_cost, entry.output_token_cost);
+            known(prices).or_else(|| {
+                (prices == (0.0, 0.0)
+                    && cfg.is_anthropic_native(&entry.provider)
+                    && crate::pricing::CachePrices {
+                        read: entry.cache_read_token_cost,
+                        write: entry.cache_write_token_cost,
+                    }
+                    .has_valid_tier())
+                .then_some(prices)
+            })
+        })
         .or_else(|| {
             crate::config::Config::catalog_input_output_cost(&resolved.provider, &resolved.model)
                 .and_then(known)
         })
+}
+
+/// The session can have free base prices and independently priced cache tiers.
+/// Preserve that snapshot rather than looking up another model's base rates.
+pub(crate) fn judge_prices_with_cache_prices(
+    resolved: &ResolvedJudge,
+    cfg: &crate::config::Config,
+    session_prices: (f64, f64),
+    session_cache_prices: crate::pricing::CachePrices,
+) -> Option<(f64, f64)> {
+    if session_prices == (0.0, 0.0)
+        && resolved.same_as_session
+        && cfg.is_anthropic_native(&resolved.provider)
+        && session_cache_prices.has_valid_tier()
+    {
+        Some(session_prices)
+    } else {
+        judge_prices(resolved, cfg, session_prices)
+    }
 }
 
 /// Ask the judge.

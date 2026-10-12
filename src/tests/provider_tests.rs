@@ -1849,3 +1849,224 @@ fn builtin_provider_without_custom_entry_keeps_name_based_default() {
     let config = resolve_provider_config("local-vllm", &custom).unwrap();
     assert_eq!(config.credential_isolation, None);
 }
+
+#[test]
+fn environment_endpoint_fallbacks_preserve_configured_routes_and_provider_scope() {
+    use crate::provider::{resolve_base_url_with_env, resolve_provider_config};
+    let empty = HashMap::new();
+    for (name, variable) in [
+        ("openai", "OPENAI_BASE_URL"),
+        ("anthropic", "ANTHROPIC_BASE_URL"),
+    ] {
+        let config = resolve_provider_config(name, &empty).unwrap();
+        assert_eq!(
+            resolve_base_url_with_env(&config, |read| {
+                assert_eq!(read, variable);
+                Ok(" https://gateway.invalid/v1/ ".into())
+            }),
+            Some("https://gateway.invalid/v1/".into())
+        );
+        assert_eq!(
+            resolve_base_url_with_env(&config, |_| Ok("  ".into())),
+            None
+        );
+        assert_eq!(
+            resolve_base_url_with_env(&config, |_| Err(std::env::VarError::NotPresent)),
+            None
+        );
+        let mut custom = timeout_cfg(2, 2);
+        custom.provider_type = name.into();
+        custom.base_url = "https://configured.invalid/api".into();
+        let config =
+            resolve_provider_config(name, &HashMap::from([(name.to_owned(), custom)])).unwrap();
+        assert_eq!(
+            resolve_base_url_with_env(&config, |_| panic!(
+                "configured endpoint must not consult environment"
+            )),
+            Some("https://configured.invalid/api".into())
+        );
+    }
+    for name in ["openrouter", "gemini", "ollama"] {
+        let config = resolve_provider_config(name, &empty).unwrap();
+        assert_eq!(
+            resolve_base_url_with_env(&config, |_| panic!("unsupported provider fallback")),
+            None
+        );
+    }
+    let env = |name: &str| match name {
+        "OPENAI_BASE_URL" => Ok("http://127.0.0.1:1/v1".into()),
+        "OPENAI_API_KEY" => Ok("fake-key".into()),
+        _ => Err(std::env::VarError::NotPresent),
+    };
+    let client =
+        crate::provider::create_client_with_env("openai", None, &empty, None, env).unwrap();
+    let crate::provider::AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client)) =
+        client
+    else {
+        panic!("gateway env endpoint must select native completions style")
+    };
+    assert_eq!(client.base_url(), "http://127.0.0.1:1/v1");
+}
+
+async fn anthropic_fixture_headers(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        assert!(bytes.len() < 16 * 1024);
+        bytes.push(socket.read_u8().await.unwrap());
+    }
+    let headers = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length:")
+                .map(|value| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    assert!(length < 16 * 1024);
+    let mut body = vec![0; length];
+    socket.read_exact(&mut body).await.unwrap();
+    headers
+}
+
+#[tokio::test]
+async fn anthropic_bearer_factory_sends_only_typed_auth_and_preserves_sdk_defaults() {
+    use futures::StreamExt;
+    use rig::{client::CompletionClient, streaming::StreamingChat};
+    use tokio::io::AsyncWriteExt;
+    for scenario in ["environment-bearer", "configured-bearer", "cli-key"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let mut custom = timeout_cfg(2, 2);
+        custom.provider_type = "anthropic".into();
+        custom.base_url = endpoint.clone();
+        custom.inherit_builtin_key = true;
+        custom.headers.insert(
+            "X-Api-Key".into(),
+            "fake-default-key-must-be-omitted".into(),
+        );
+        let providers = if scenario == "configured-bearer" {
+            HashMap::from([("gateway".into(), custom)])
+        } else {
+            HashMap::new()
+        };
+        let provider = if scenario == "configured-bearer" {
+            "gateway"
+        } else {
+            "anthropic"
+        };
+        let env = |name: &str| match name {
+            "ANTHROPIC_AUTH_TOKEN" => Ok("fake-bearer-token".into()),
+            "ANTHROPIC_BASE_URL" => {
+                assert_ne!(scenario, "configured-bearer", "configured endpoint wins");
+                Ok(endpoint.clone())
+            }
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let client = crate::provider::create_client_with_env(
+            provider,
+            (scenario == "cli-key").then_some("fake-cli-key"),
+            &providers,
+            None,
+            env,
+        )
+        .unwrap();
+        let crate::provider::AnyClient::Anthropic(client) = client else {
+            panic!("native Anthropic protocol")
+        };
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("fake-bearer-token"));
+        assert!(!debug.contains("fake-cli-key"));
+        let agent = client.agent("fixture-model").max_tokens(16).build();
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let headers = anthropic_fixture_headers(&mut socket).await;
+            assert!(headers.starts_with("post /v1/messages http/1.1\r\n"));
+            assert!(headers.contains(&format!(
+                "\r\nanthropic-version: {}\r\n",
+                rig::providers::anthropic::completion::ANTHROPIC_VERSION_LATEST
+            )));
+            if scenario == "cli-key" {
+                assert!(headers.contains("\r\nx-api-key: fake-cli-key\r\n"));
+                assert!(!headers.contains("\r\nauthorization:"));
+            } else {
+                assert!(headers.contains("\r\nauthorization: bearer fake-bearer-token\r\n"));
+                assert!(!headers.contains("\r\nx-api-key:"));
+            }
+            assert!(!headers.contains("fake-default-key-must-be-omitted"));
+            socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nauth fixture").await.unwrap();
+        };
+        let request = async {
+            let mut stream = agent
+                .stream_chat("hello", Vec::<rig::completion::Message>::new())
+                .max_turns(1)
+                .await;
+            assert!(stream.next().await.unwrap().is_err());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, request);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn anthropic_bearer_redirects_refuse_other_origins_and_isolated_custom_tokens() {
+    use futures::StreamExt;
+    use rig::{client::CompletionClient, streaming::StreamingChat};
+    use tokio::io::AsyncWriteExt;
+    let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", source.local_addr().unwrap());
+    let env = |name: &str| match name {
+        "ANTHROPIC_BASE_URL" => Ok(endpoint.clone()),
+        "ANTHROPIC_AUTH_TOKEN" => Ok("fake-token".into()),
+        _ => Err(std::env::VarError::NotPresent),
+    };
+    let crate::provider::AnyClient::Anthropic(client) =
+        crate::provider::create_client_with_env("anthropic", None, &HashMap::new(), None, env)
+            .unwrap()
+    else {
+        unreachable!()
+    };
+    let agent = client.agent("fixture-model").max_tokens(16).build();
+    let server = async {
+        let (mut socket, _) = source.accept().await.unwrap();
+        let headers = anthropic_fixture_headers(&mut socket).await;
+        assert!(headers.contains("\r\nauthorization: bearer fake-token\r\n"));
+        assert!(!headers.contains("\r\nx-api-key:"));
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    };
+    let request = async {
+        let mut stream = agent
+            .stream_chat("hello", Vec::<rig::completion::Message>::new())
+            .max_turns(1)
+            .await;
+        tokio::select! { item = stream.next() => assert!(item.unwrap().is_err()), connection = destination.accept() => panic!("bearer crossed origin: {connection:?}") }
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server, request);
+    })
+    .await
+    .unwrap();
+    for name in ["gateway", "anthropic"] {
+        let mut custom = timeout_cfg(2, 2);
+        custom.provider_type = "anthropic".into();
+        custom.base_url = endpoint.clone();
+        let providers = HashMap::from([(name.to_owned(), custom)]);
+        let client =
+            crate::provider::create_client_with_env(name, None, &providers, None, |read| {
+                assert_ne!(
+                    read, "ANTHROPIC_AUTH_TOKEN",
+                    "isolated route cannot read vendor token"
+                );
+                Err(std::env::VarError::NotPresent)
+            });
+        assert!(client.is_err());
+    }
+}

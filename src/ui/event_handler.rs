@@ -692,7 +692,12 @@ async fn start_goal_verification(
                     call.charge(
                         &resolved,
                         &cfg,
-                        crate::extras::goal::judge::judge_prices(&resolved, &cfg, session_prices),
+                        crate::extras::goal::judge::judge_prices_with_cache_prices(
+                            &resolved,
+                            &cfg,
+                            session_prices,
+                            session_cache_prices,
+                        ),
                         session_cache_prices,
                     )
                 });

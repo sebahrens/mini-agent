@@ -315,3 +315,108 @@ fn explicit_inheritance_lets_custom_name_use_vendor_env_var() {
         .with_credential_isolation(Some(false));
     assert_eq!(resolver.resolve_with_env(env).unwrap(), "real-vendor-key");
 }
+
+#[test]
+fn anthropic_token_fallback_is_typed_and_preserves_existing_key_precedence() {
+    use crate::auth::ResolvedCredential;
+    let token_only = || mock_env(vec![("ANTHROPIC_AUTH_TOKEN", "opaque-fake-token")]);
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .resolve_credential_with_env(token_only())
+            .unwrap(),
+        ResolvedCredential::Bearer("opaque-fake-token".into())
+    );
+    let mut keys = HashMap::new();
+    keys.insert("anthropic".into(), "config-key".into());
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .with_config_keys(Some(&keys))
+            .resolve_credential_with_env(mock_env(vec![]))
+            .unwrap(),
+        ResolvedCredential::ApiKey("config-key".into())
+    );
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .with_config_keys(Some(&keys))
+            .resolve_credential_with_env(token_only())
+            .unwrap(),
+        ResolvedCredential::Bearer("opaque-fake-token".into())
+    );
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .with_config_keys(Some(&keys))
+            .resolve_credential_with_env(mock_env(vec![
+                ("ANTHROPIC_API_KEY", "env-key"),
+                ("ANTHROPIC_AUTH_TOKEN", "opaque-fake-token")
+            ]))
+            .unwrap(),
+        ResolvedCredential::ApiKey("env-key".into())
+    );
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .with_cli_key(Some("cli-key"))
+            .resolve_credential_with_env(token_only())
+            .unwrap(),
+        ResolvedCredential::ApiKey("cli-key".into())
+    );
+    // Credential kind is never guessed from a token-looking API-key value.
+    assert_eq!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .resolve_credential_with_env(mock_env(vec![(
+                "ANTHROPIC_API_KEY",
+                "Bearer token-looking-key"
+            )]))
+            .unwrap(),
+        ResolvedCredential::ApiKey("Bearer token-looking-key".into())
+    );
+    for credential in [
+        ResolvedCredential::Bearer("credential-canary".into()),
+        ResolvedCredential::ApiKey("credential-canary".into()),
+    ] {
+        assert!(!format!("{credential:?}").contains("credential-canary"));
+    }
+}
+
+#[test]
+fn anthropic_token_never_escapes_custom_isolation_or_explicit_key_env() {
+    use crate::auth::ResolvedCredential;
+    let read_token = || mock_env(vec![("ANTHROPIC_AUTH_TOKEN", "fake-vendor-token")]);
+    for resolver in [
+        AuthResolver::new(ProviderKind::Anthropic).with_custom_provider_name(Some("gateway")),
+        AuthResolver::new(ProviderKind::Anthropic)
+            .with_custom_provider_name(Some("anthropic"))
+            .with_credential_isolation(Some(true)),
+        AuthResolver::new(ProviderKind::Anthropic).with_env_override(Some("GATEWAY_KEY")),
+        AuthResolver::new(ProviderKind::OpenAI),
+    ] {
+        let env = read_token();
+        assert!(
+            resolver
+                .resolve_credential_with_env(|name| {
+                    assert_ne!(name, "ANTHROPIC_AUTH_TOKEN");
+                    env(name)
+                })
+                .is_err()
+        );
+    }
+    let inherited = AuthResolver::new(ProviderKind::Anthropic)
+        .with_custom_provider_name(Some("gateway"))
+        .with_credential_isolation(Some(false));
+    assert_eq!(
+        inherited.resolve_credential_with_env(read_token()).unwrap(),
+        ResolvedCredential::Bearer("fake-vendor-token".into())
+    );
+    assert!(
+        AuthResolver::new(ProviderKind::Anthropic)
+            .resolve_credential_with_env(mock_env(vec![("ANTHROPIC_AUTH_TOKEN", "")]))
+            .is_err()
+    );
+    let malformed = AuthResolver::new(ProviderKind::Anthropic)
+        .resolve_credential_with_env(|_| {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "secret-canary",
+            )))
+        })
+        .unwrap_err();
+    assert!(!malformed.to_string().contains("secret-canary"));
+}

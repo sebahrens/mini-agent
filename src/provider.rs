@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::agent::builder;
 use crate::agent::prompt;
 use crate::agent::runner::{self, AgentRunner};
-use crate::auth::{AuthResolver, ProviderKind};
+use crate::auth::{AuthResolver, ProviderKind, ResolvedCredential};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 use crate::context::ContextFiles;
@@ -211,8 +211,22 @@ pub(crate) fn default_model_for_provider(
     Some((m.to_string(), None))
 }
 
-fn resolve_base_url(config: &ProviderConfig) -> Option<String> {
-    config.base_url.clone()
+pub(crate) fn resolve_base_url_with_env<F>(config: &ProviderConfig, get_env: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    if let Some(url) = &config.base_url {
+        return Some(url.clone());
+    }
+    let name = match config.kind {
+        ProviderKind::Anthropic => "ANTHROPIC_BASE_URL",
+        ProviderKind::OpenAI => "OPENAI_BASE_URL",
+        _ => return None,
+    };
+    get_env(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned())
 }
 
 /// rig 0.37 exposes two distinct OpenAI client types:
@@ -2031,8 +2045,27 @@ pub fn create_client(
     custom_providers: &HashMap<String, CustomProviderConfig>,
     config_api_keys: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<AnyClient> {
+    create_client_with_env(
+        provider_name,
+        api_key,
+        custom_providers,
+        config_api_keys,
+        |name| std::env::var(name),
+    )
+}
+
+pub(crate) fn create_client_with_env<F>(
+    provider_name: &str,
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+    get_env: F,
+) -> anyhow::Result<AnyClient>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     let config = resolve_provider_config(provider_name, custom_providers)?;
-    let base_url = resolve_base_url(&config);
+    let base_url = resolve_base_url_with_env(&config, &get_env);
 
     let resolver = AuthResolver::new(config.kind)
         .with_cli_key(api_key)
@@ -2040,28 +2073,43 @@ pub fn create_client(
         .with_config_keys(config_api_keys)
         .with_custom_provider_name(Some(provider_name))
         .with_credential_isolation(config.credential_isolation);
-    let key = resolver.resolve()?;
+    let credential = resolver.resolve_credential_with_env(&get_env)?;
+    let key = credential.secret();
 
     // Every provider kind gets a client carrying the connect and
     // stream-inactivity bounds; the locked reqwest default has none.
     let custom = custom_providers.get(provider_name);
+    // Bearer auth is exclusive: a configured reqwest default x-api-key must
+    // not be merged back into the native SDK's bearer-only request headers.
+    let bearer_custom = custom
+        .filter(|_| matches!(&credential, ResolvedCredential::Bearer(_)))
+        .map(|custom| {
+            let mut custom = custom.clone();
+            custom
+                .headers
+                .retain(|name, _| !name.eq_ignore_ascii_case("x-api-key"));
+            custom
+        });
+    let http_custom = bearer_custom.as_ref().or(custom);
     let http_client = build_http_client(
         provider_name,
         config.danger_accept_invalid_certs,
-        custom,
+        http_custom,
         base_url.as_deref(),
     )?;
     match config.kind {
         ProviderKind::OpenAI => Ok(AnyClient::OpenAI(build_openai_client(
-            &key,
+            key,
             base_url.as_deref(),
             custom,
             http_client,
         )?)),
-        ProviderKind::Anthropic => build_anthropic_client(&key, base_url.as_deref(), http_client),
-        ProviderKind::Gemini => build_gemini_client(&key, base_url.as_deref(), http_client),
-        ProviderKind::Ollama => build_ollama_client(&key, base_url.as_deref(), http_client),
-        ProviderKind::OpenRouter => build_openrouter_client(&key, base_url.as_deref(), http_client),
+        ProviderKind::Anthropic => {
+            build_anthropic_client(credential, base_url.as_deref(), http_client)
+        }
+        ProviderKind::Gemini => build_gemini_client(key, base_url.as_deref(), http_client),
+        ProviderKind::Ollama => build_ollama_client(key, base_url.as_deref(), http_client),
+        ProviderKind::OpenRouter => build_openrouter_client(key, base_url.as_deref(), http_client),
     }
 }
 
@@ -2081,12 +2129,74 @@ macro_rules! build_provider_client {
     }};
 }
 
+// Rig's stock Anthropic builder accepts only x-api-key credentials. This small
+// typed builder retains the native extension and its default version/URL rules
+// while producing a bearer header directly, without a placeholder API key.
+#[derive(Default, Clone)]
+struct AnthropicBearerBuilder;
+struct AnthropicBearer(String);
+
+impl rig::client::ApiKey for AnthropicBearer {
+    fn into_header(self) -> Option<rig::http_client::Result<(HeaderName, HeaderValue)>> {
+        Some(
+            rig::http_client::make_auth_header(self.0).map(|(name, mut value)| {
+                value.set_sensitive(true);
+                (name, value)
+            }),
+        )
+    }
+}
+
+impl rig::client::ProviderBuilder for AnthropicBearerBuilder {
+    type Extension<H>
+        = anthropic::client::AnthropicExt
+    where
+        H: rig::http_client::HttpClientExt;
+    type ApiKey = AnthropicBearer;
+    const BASE_URL: &'static str =
+        <anthropic::client::AnthropicBuilder as rig::client::ProviderBuilder>::BASE_URL;
+    fn build<H>(
+        _: &rig::client::ClientBuilder<Self, Self::ApiKey, H>,
+    ) -> rig::http_client::Result<Self::Extension<H>>
+    where
+        H: rig::http_client::HttpClientExt,
+    {
+        Ok(anthropic::client::AnthropicExt)
+    }
+    fn finish<H>(
+        &self,
+        builder: rig::client::ClientBuilder<Self, Self::ApiKey, H>,
+    ) -> rig::http_client::Result<rig::client::ClientBuilder<Self, Self::ApiKey, H>> {
+        let url = anthropic::client::normalize_anthropic_base_url(builder.get_base_url());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(anthropic::completion::ANTHROPIC_VERSION_LATEST),
+        );
+        Ok(builder.base_url(url).http_headers(headers))
+    }
+}
+
 fn build_anthropic_client(
-    key: &str,
+    credential: ResolvedCredential,
     base_url: Option<&str>,
     http: reqwest::Client,
 ) -> anyhow::Result<AnyClient> {
-    build_provider_client!(anthropic::Client, Anthropic, key, base_url, http)
+    match credential {
+        ResolvedCredential::ApiKey(key) => {
+            build_provider_client!(anthropic::Client, Anthropic, key, base_url, http)
+        }
+        ResolvedCredential::Bearer(token) => {
+            let builder = rig::client::ClientBuilder::<AnthropicBearerBuilder>::default()
+                .api_key(AnthropicBearer(token))
+                .http_client(ProviderHttpClient::new(http));
+            let builder = match base_url {
+                Some(url) => builder.base_url(url),
+                None => builder,
+            };
+            Ok(AnyClient::Anthropic(builder.build()?))
+        }
+    }
 }
 
 fn build_gemini_client(

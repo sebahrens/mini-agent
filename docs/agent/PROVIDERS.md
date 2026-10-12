@@ -125,6 +125,23 @@ The API key is resolved in this priority order:
 3. **Config file** `api_keys` map — keyed by provider slug or custom provider name
 4. **Ollama** — returns an empty string (no key required)
 
+For native Anthropic, `ANTHROPIC_AUTH_TOKEN` is a typed bearer alternative after
+`--api-key` and the designated API-key environment variable, before config keys.
+It sends only `Authorization: Bearer <token>` for authentication, without `x-api-key`,
+following [Anthropic's API authentication contract](https://platform.claude.com/docs/en/api/overview).
+An isolated custom route or an explicit `api_key_env` does not inherit this token;
+`inherit_builtin_key = true` permits the native fallback for a custom route without
+an alternate `api_key_env`. Credentials are never classified by their string contents.
+
+`OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are endpoint fallbacks when no endpoint
+is configured. Configured custom endpoints always win. An OpenAI gateway fallback
+selects Chat Completions; explicit `api_style` still wins. Anthropic normalizes root,
+`/v1`, and `/v1/messages` URLs using the native SDK rules. All provider requests retain
+same-origin redirect enforcement and configured timeouts.
+
+See the [canonical environment reference](CONFIG.md#environment-variables) for
+all public, OS/library and internal/test variables.
+
 ### Config-level API keys
 
 ```json
@@ -192,6 +209,11 @@ configured input price. Raw model selections use catalog ratios before matching
 quick-model ratios. Missing or invalid prices fall back to 0.10x reads and
 1.25x writes; zero cache prices are valid. Saved sessions retain their resolved
 cache prices, and older sessions without these fields inherit catalog ratios.
+For a zero base input price, explicitly configured native cache tiers still
+charge their absolute USD/M rates; missing or free tiers contribute zero.
+Positive base prices retain the existing nearest-token equivalent rounding.
+Subagent token-budget normalization remains separate: explicit free tiers have
+zero weight, while positive or unknown tiers at a zero base use fallback ratios.
 Headless JSON, session totals, goal judges, and side questions use the same
 model-aware billing calculation. A side question retains the prices captured
 when it started, even if the main model changes before it completes. Production

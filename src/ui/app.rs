@@ -186,12 +186,13 @@ mod dot_command_tests {
             session: &mut session,
             context: &mut context,
             workspace,
-            client: crate::provider::AnyClient::Anthropic(
-                rig::providers::anthropic::Client::builder()
-                    .api_key("unused")
-                    .build()
-                    .unwrap(),
-            ),
+            client: crate::provider::create_client(
+                "anthropic",
+                Some("unused-test-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
             permission: None,
             ask_tx: None,
             sandbox: crate::sandbox::Sandbox::new(false, "none"),
@@ -299,12 +300,13 @@ mod btw_pricing_tests {
             session: &mut session,
             context: &mut context,
             workspace,
-            client: crate::provider::AnyClient::Anthropic(
-                rig::providers::anthropic::Client::builder()
-                    .api_key("unused")
-                    .build()
-                    .unwrap(),
-            ),
+            client: crate::provider::create_client(
+                "anthropic",
+                Some("unused-test-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
             permission: None,
             ask_tx: None,
             sandbox: crate::sandbox::Sandbox::new(false, "none"),
@@ -391,6 +393,43 @@ mod btw_pricing_tests {
         })
         .unwrap();
         assert_eq!(app.btw_total_cost, 0.25);
+        app.ui.session.input_token_cost = 0.0;
+        app.ui.session.output_token_cost = 0.0;
+        app.ui
+            .session
+            .set_cache_prices(crate::pricing::CachePrices {
+                read: Some(1.0),
+                write: None,
+            });
+        let cache_only = app
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                app.ui.session,
+                app.ui.cfg,
+            ))
+            .unwrap();
+        app.btw_inflight = 1;
+        app.ui.session.input_token_cost = 4.0;
+        app.ui
+            .session
+            .set_cache_prices(crate::pricing::CachePrices {
+                read: Some(0.2),
+                write: Some(5.0),
+            });
+        app.handle_btw_event(BtwEvent::Done {
+            id: cache_only,
+            response: "cache-only answer".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            app.btw_total_cost, 1.25,
+            "zero-base absolute cache pricing belongs to the request snapshot"
+        );
+        assert_eq!(app.btw_inflight, 0);
         assert_eq!(
             app.ui.session.total_cost, 0.0,
             "side questions stay outside main accounting"
@@ -1959,20 +1998,19 @@ impl<'a> App<'a> {
         if self.input.picker.as_ref().is_some_and(|p| p.active())
             && self.input.handle_picker_key(key)
         {
-            if let Some(RewindOutcome::Confirmed(idx)) = self.input.take_rewind_outcome() {
-                if crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx) > 0
-                {
-                    self.save_session()?;
-                    render_session(
-                        &mut self.renderer,
-                        self.ui.session,
-                        self.ui.cli,
-                        self.ui.cfg,
-                        self.ui.context,
-                    )?;
-                    self.renderer
-                        .write_line("rewound; /redo to restore", Color::Green)?;
-                }
+            if let Some(RewindOutcome::Confirmed(idx)) = self.input.take_rewind_outcome()
+                && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx) > 0
+            {
+                self.save_session()?;
+                render_session(
+                    &mut self.renderer,
+                    self.ui.session,
+                    self.ui.cli,
+                    self.ui.cfg,
+                    self.ui.context,
+                )?;
+                self.renderer
+                    .write_line("rewound; /redo to restore", Color::Green)?;
             }
             return Ok(());
         }
@@ -2134,6 +2172,9 @@ impl<'a> App<'a> {
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
         let terminal_error = matches!(&event, AgentEvent::Error { .. });
+        if terminal_error {
+            self.discard_interrupted_queue();
+        }
         let compaction_boundary_interactions = match &event {
             AgentEvent::CompactionBoundary { interactions } => Some(interactions.clone()),
             _ => None,
@@ -2250,7 +2291,7 @@ impl<'a> App<'a> {
 
         if let Err(error) = handled {
             if let Some(text) = failed_prompt {
-                self.input.load_text(&text);
+                self.restore_interrupted_prompt(&text);
             }
             if terminal_success {
                 // The completed response/accounting is installed before
@@ -2291,7 +2332,7 @@ impl<'a> App<'a> {
         }
 
         if let Some(text) = failed_prompt {
-            self.input.load_text(&text);
+            self.restore_interrupted_prompt(&text);
         }
 
         if let Some(interactions) = compaction_boundary_interactions {
@@ -4613,6 +4654,132 @@ mod interrupt_rewind_tests {
             serde_json::to_value(&app.ui.session.messages).unwrap(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn actual_provider_error_restores_draft_without_starting_queued_requests() {
+        let root = crate::tests::OwnedTestDirectory::new("app-provider-error-draft");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": {"error-fixture": {"provider_type":"openai", "base_url":"http://127.0.0.1:1", "api_style":"completions"}}
+        })).unwrap();
+        for progress in [false, true] {
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("error-fixture", "test-model", 128_000, "");
+            session.add_message(MessageRole::User, "earlier prompt");
+            session.add_message(MessageRole::Assistant, "earlier answer");
+            let ui = UiContext {
+                cli: &cli,
+                cfg: &cfg,
+                session: &mut session,
+                context: &mut context,
+                workspace,
+                client: crate::provider::create_client(
+                    "error-fixture",
+                    Some("unused-test-key"),
+                    &cfg.custom_providers_map(),
+                    cfg.api_keys.as_ref(),
+                )
+                .unwrap(),
+                permission: None,
+                ask_tx: None,
+                sandbox: crate::sandbox::Sandbox::new(false, "none"),
+                prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+                status_signals: None,
+                #[cfg(feature = "skills")]
+                skill_services: Arc::new(
+                    crate::extras::js::skills::session::SkillServiceOwner::new(),
+                ),
+                #[cfg(feature = "mcp")]
+                mcp_manager: None,
+            };
+            let mut app = fixture_app(ui);
+            let pending = PendingMainTurn::capture(app.ui.session, "failed provider prompt");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            if progress {
+                app.ui.session.add_tool_call_with_id(
+                    "provider-error-read",
+                    "read",
+                    &serde_json::json!({"path":"fixture.txt"}),
+                );
+            }
+            app.input.load_text("follow-up after provider failure");
+            app.run.pending_inputs.extend([
+                "must not call provider first".into(),
+                "must not call provider second".into(),
+            ]);
+            app.handle_agent_event(AgentEvent::Error {
+                message: "fixture provider error".into(),
+                interactions: Vec::new(),
+            })
+            .await
+            .unwrap();
+            // A queued run would install its agent, task and pending user turn
+            // before sending a provider request. All admission state stays idle.
+            assert!(!app.run.is_running);
+            assert!(app.run.agent.is_none());
+            assert!(app.run.main_abort.is_none());
+            assert!(app.run.pending_turn.is_none());
+            assert!(app.run.pending_inputs.is_empty());
+            assert!(
+                !app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .any(|message| message.content.starts_with("must not call provider"))
+            );
+            app.run_queue_command("").unwrap();
+            let lines = app.renderer.feed().line_count(4096);
+            let shown = app
+                .renderer
+                .feed()
+                .selected_text(4096, 0, lines - 1)
+                .unwrap();
+            assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+            assert!(shown.contains("queue is empty"), "{shown}");
+            if progress {
+                assert_eq!(app.input.buffer, "follow-up after provider failure");
+                assert!(
+                    app.ui
+                        .session
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::ToolResult)
+                );
+            } else {
+                assert_eq!(app.input.buffer, "failed provider prompt");
+                assert_eq!(app.ui.session.messages.len(), 2);
+                app.input.clear_buffer();
+                app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert_eq!(app.input.buffer, "follow-up after provider failure");
+            }
+        }
     }
 
     #[tokio::test]

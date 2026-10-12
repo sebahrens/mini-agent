@@ -13,6 +13,7 @@ src/
   cli.rs                   Flags and configuration resolution
   startup.rs               Workspace, session, permissions and provider setup
   provider.rs              AnyClient and AnyAgent provider dispatch
+  provider_http.rs         Parent provider HTTP adapter and request-owned retry hints
   config/                  Configuration types, loading and project trust
   paths.rs                 AppPaths and retained WorkspaceBinding capabilities
   fs.rs                    Stable filesystem access and atomic publication
@@ -89,7 +90,9 @@ chains and Git worktrees; see `src/extras/mod.rs` and `Cargo.toml` for declarati
 ## Main ownership boundaries
 
 - `AnyClient` and `AnyAgent` in `src/provider.rs` dispatch provider-specific
-  clients and Rig agents. `src/agent/builder.rs` registers tools and assembles
+  clients and Rig agents. `src/provider_http.rs` preserves each failed request's
+  Retry-After hint through the patched Rig transport without shared mutable
+  response metadata. `src/agent/builder.rs` registers tools and assembles
   the system prompt from context, selected prompt/persona and tool guidance.
 - `AgentRunner` and `AgentWorkScope` in `src/agent/runner.rs` own streaming
   work, usage events, cancellation and child cleanup. The TUI consumes typed

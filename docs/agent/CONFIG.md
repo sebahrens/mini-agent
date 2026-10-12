@@ -289,6 +289,76 @@ cargo test --features js,skills,skills-embed-dynamic
 Selecting `local` without the `skills-embed` feature is a startup error rather
 than a silent downgrade to `deterministic`.
 
+## Environment variables
+
+This is the canonical environment reference. CLI values win their environment-backed
+counterparts, which win config values. Provider keys retain the order documented below;
+configured provider endpoints win endpoint environment fallbacks.
+
+| Public control | Purpose and precedence |
+|---|---|
+| `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY` | Provider API keys: `--api-key` wins, then the designated provider environment variable, then `api_keys` in config. Ollama may run without a key. Isolated custom providers read only their designated `api_key_env` and their own config slot; `inherit_builtin_key = true` explicitly permits vendor credential inheritance. |
+| `ANTHROPIC_AUTH_TOKEN` | Native Anthropic bearer credential: `--api-key` and the designated API-key environment variable win; this token then wins config-file keys. It is consulted only when credential inheritance is allowed and no explicit `api_key_env` is configured. It sends `Authorization: Bearer <token>` without `x-api-key`; API-key values remain API keys regardless of their contents. Empty credentials are ignored. |
+| `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` | Endpoint fallbacks only when no endpoint is configured in `custom_providers`. A configured endpoint wins and its credential-isolation policy remains in force. Empty/whitespace fallbacks are ignored. Anthropic accepts its root, `/v1`, or `/v1/messages` form; OpenAI compatible gateway URLs select Chat Completions unless `api_style` explicitly selects another protocol. Other providers use their normal endpoint or a configured custom endpoint. |
+| `ZS_PROVIDER`, `ZS_MODEL` | Environment-backed `--provider` and `--model`: explicit CLI wins, then these values, then config/default provider and model selection. |
+| `OPENROUTER_MODEL` | Legacy model fallback after `--model`/`ZS_MODEL`, before config; only applies when OpenRouter is the provider in effect. |
+| `MINI_AGENT_HOME` | Application home for roots without a more specific `ZS_*_DIR` override; precedes default home/platform layout discovery. |
+| `ZS_CONFIG_DIR`, `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, `ZS_CREDENTIALS_DIR` | Override the corresponding persistence root before `MINI_AGENT_HOME` and platform defaults. `--config` selects an explicit config file; these variables still control other roots. See application paths above for artifact and no-persist policy. |
+| `EXA_API_KEY`, `CONTEXT7_API_KEY`, `GREP_APP_API_KEY` | Credentials for the corresponding built-in MCP registrations when enabled. User-configured registrations retain their own configured headers. |
+| `GITHUB_TOKEN`, `GH_TOKEN` | GitHub Gist sharing credentials. `GITHUB_TOKEN` is tried first; `GH_TOKEN` is used if the former cannot be read. Sharing is an explicit action and can disclose the shared session. |
+| `EDITOR` | Editor command fallback after config `editor`; otherwise the command is `editor`. |
+| `RUST_LOG` | Standard tracing filter for stderr; explicit `--log-level` wins. File logging remains controlled by `--verbose`/`--log-file`. |
+| `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the configured `acp_api_key`. |
+| `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
+| `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE` | Value `1` explicitly permits an insecure remote ACP TCP listener; other values retain the TLS requirement. |
+| `MINI_AGENT_ACP_TRUST_CLIENT_MCP` | Value `1` authorizes ACP client-supplied MCP registrations to launch; otherwise they are not trusted. It does not replace configured MCP policy. |
+
+Names designated by provider/embedding `api_key_env`, whole-string `${VAR}` custom
+provider headers, and configured MCP/LSP/hook `inherit_env` lists are also read when
+that configuration is used. These arbitrary names are chosen by the user rather than
+being additional built-in controls. Child environments follow their owning sandbox
+and permission contracts; setting a parent variable does not automatically delegate it.
+
+### OS and library inputs
+
+These inputs provide platform defaults or are consulted by underlying libraries; they
+are separate from application settings. Explicit application paths and client configuration
+win where applicable. Windows environment names are case-insensitive.
+
+| Input | Use |
+|---|---|
+| `HOME`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | Home expansion and platform persistence defaults, through the directory library. Application root overrides above win. |
+| `PATH`, `PATHEXT`, `CARGO_HOME` | Executable lookup, Windows executable suffixes, and Windows worker installed/development executable discovery. Selected executable identities are still checked by their launch boundary. |
+| `USER`, `USERNAME`, `HOSTNAME`, `HOST` | User/host statusline labels; the first available name in each pair is used. |
+| `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, `NO_COLOR` | Non-credential platform/terminal inputs preserved only by the relevant subprocess allow-list; terminal libraries can also consult them. |
+| `TMPDIR`, `TMP`, `TEMP` | Platform temporary-directory inputs. Sandboxed children receive the boundary's private temporary paths. |
+| `SYSTEMROOT`, `SystemRoot`, `WINDIR`, `COMSPEC`, `SYSTEMDRIVE`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` | Windows runtime/executable roots and explicitly permitted non-credential child environment inputs. |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy` | reqwest's standard proxy environment inputs. |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Native TLS/OpenSSL certificate-location inputs where that platform's TLS backend supports them. |
+| `ORT_DYLIB_PATH` | ONNX Runtime library location when using `skills-embed-dynamic`. |
+
+### Internal and test controls
+
+These names are not supported user settings. Private parent/worker protocol markers
+are generated by mini-agent's containment code; setting them manually grants no worker
+authority. Test/benchmark variables coordinate fixtures and are not analytics controls.
+The documentation regression checks explicit source reads, including test-only reads,
+so fixture names remain visible without advertising them as product configuration.
+
+| Internal family | Names and purpose |
+|---|---|
+| Private worker dispatch | `MINI_AGENT_INTERNAL_JS_WORKER`, `MINI_AGENT_INTERNAL_JS_GUARDIAN`: parent-owned broker/guardian dispatch. |
+| macOS containment fixtures | `MINI_AGENT_INTERNAL_MACOS_CONTAINMENT_PROBE`, `MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`, `MINI_AGENT_INTERNAL_MACOS_PARENT_DEATH_CANARY`, `MINI_AGENT_CONTAINMENT_EVIDENCE`, `MINI_AGENT_MACOS_CREDENTIAL_SENTINEL`, `MINI_AGENT_MACOS_DESCRIPTOR_BOUND`, `MINI_AGENT_MACOS_GUARDIAN_PGID`, `MINI_AGENT_MACOS_ONE_TIME_IMAGE`, `MINI_AGENT_MACOS_ORIGINAL_EXECUTABLE`, `MINI_AGENT_MACOS_SKILL_SENTINEL`, `MINI_AGENT_MACOS_WORKSPACE_SENTINEL`: hosted containment evidence and canaries. |
+| Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `ZS_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
+| Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
+| Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
+| Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
+| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
+
+mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
+local skill store; provider, embedding, MCP, sharing and explicitly invoked tool requests
+can still access the network according to their configured authority.
+
 ## Config-file privacy
 
 The global config can contain plaintext API keys, authorization headers, and
@@ -618,6 +688,12 @@ Accepted top-level keys:
 | `lsp`                     | object  | Language-server configuration; requires `lsp`. See LSP below. |
 | `advisor`                 | object  | Advisor configuration; requires `advisor`. See Advisor below. |
 | `colors`                  | object  | Background color overrides for the TUI. See the colors section below.                                                                                                       |
+
+Quick-model `cache_read_token_cost` and `cache_write_token_cost` are independent
+USD/M prices. On Anthropic-native routes, an explicit cache price still applies
+when `input_token_cost` is zero; missing or zero cache tiers add no charge.
+Positive base input rates preserve equivalent-token rounding. Session, headless,
+judge and side-question accounting retain these absolute tier prices.
 
 The macOS general-command Seatbelt profile permits reads from ordinary
 host-readable paths needed by developer tools, but explicitly denies the

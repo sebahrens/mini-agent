@@ -29,8 +29,51 @@ fn valid_price(price: f64) -> bool {
 }
 
 impl CachePrices {
+    #[cfg(feature = "goal")]
+    pub(crate) fn has_valid_tier(self) -> bool {
+        [self.read, self.write]
+            .into_iter()
+            .flatten()
+            .any(valid_price)
+    }
+
+    /// Charge native cache tiers independently when the uncached input is free.
+    /// A positive base keeps the historical equivalent-token rounding policy.
+    pub(crate) fn estimate_cost(
+        self,
+        anthropic_native: bool,
+        usage: crate::event::UsageDelta,
+        input_price: f64,
+        output_price: f64,
+    ) -> f64 {
+        if anthropic_native && input_price == 0.0 {
+            let tier = |tokens: u64, price: Option<f64>| {
+                tokens as f64 * price.filter(|price| valid_price(*price)).unwrap_or(0.0)
+                    / 1_000_000.0
+            };
+            return estimate_cost(usage.input_tokens, usage.output_tokens, 0.0, output_price)
+                + tier(usage.cached_input_tokens, self.read)
+                + tier(usage.cache_creation_input_tokens, self.write);
+        }
+        estimate_cost(
+            billable_input_tokens_with_multipliers(
+                anthropic_native,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+                self.multipliers(input_price),
+            ),
+            usage.output_tokens,
+            input_price,
+            output_price,
+        )
+    }
+
     pub(crate) fn multipliers(self, input_price: f64) -> CacheMultipliers {
         let ratio = |price: Option<f64>, fallback| {
+            if price == Some(0.0) {
+                return 0.0;
+            }
             if !input_price.is_finite() || input_price <= 0.0 {
                 return fallback;
             }
@@ -166,13 +209,14 @@ pub fn billable_input_tokens(
     cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
 ) -> u64 {
-    billable_input_tokens_with_multipliers(
-        anthropic_native,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        CacheMultipliers::default(),
-    )
+    if anthropic_native {
+        (input_tokens as f64
+            + cache_creation_input_tokens as f64 * ANTHROPIC_CACHE_WRITE_MULT
+            + cached_input_tokens as f64 * ANTHROPIC_CACHE_READ_MULT)
+            .round() as u64
+    } else {
+        input_tokens
+    }
 }
 
 pub(crate) fn billable_input_tokens_with_multipliers(
@@ -182,6 +226,14 @@ pub(crate) fn billable_input_tokens_with_multipliers(
     cache_creation_input_tokens: u64,
     multipliers: CacheMultipliers,
 ) -> u64 {
+    if multipliers == CacheMultipliers::default() {
+        return billable_input_tokens(
+            anthropic_native,
+            input_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        );
+    }
     if anthropic_native {
         (input_tokens as f64
             + cache_creation_input_tokens as f64 * multipliers.write
@@ -265,6 +317,50 @@ mod cache_pricing_tests {
     }
 
     #[test]
+    fn zero_base_explicit_free_cache_tiers_normalize_to_free_budget_units() {
+        assert_eq!(
+            CachePrices {
+                read: Some(0.0),
+                write: Some(0.0)
+            }
+            .multipliers(0.0),
+            CacheMultipliers {
+                read: 0.0,
+                write: 0.0
+            }
+        );
+        assert_eq!(
+            CachePrices {
+                read: Some(1.0),
+                write: None
+            }
+            .multipliers(0.0),
+            CacheMultipliers::default()
+        );
+        let one_cached_token = crate::event::UsageDelta {
+            cached_input_tokens: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            CachePrices {
+                read: Some(1.0),
+                write: None
+            }
+            .estimate_cost(true, one_cached_token, 0.0, 0.0),
+            0.000001
+        );
+        assert_eq!(
+            CachePrices {
+                read: Some(0.25),
+                write: Some(12.5)
+            }
+            .estimate_cost(true, one_cached_token, 10.0, 50.0),
+            0.0,
+            "positive-base nearest-token rounding remains unchanged"
+        );
+    }
+
+    #[test]
     fn unknown_missing_and_invalid_cache_rates_keep_independent_fallbacks() {
         let unknown = cache_prices_for_model(
             "anthropic",
@@ -312,7 +408,22 @@ mod cache_pricing_tests {
                     write: 1.25
                 }
             );
-            assert_eq!(rates.multipliers(invalid), CacheMultipliers::default());
+            assert_eq!(
+                rates.multipliers(invalid),
+                CacheMultipliers {
+                    read: 0.10,
+                    write: 0.0
+                }
+            );
+            assert_eq!(
+                CachePrices {
+                    read: Some(1.0),
+                    write: None
+                }
+                .multipliers(invalid),
+                CacheMultipliers::default(),
+                "positive and missing tiers still fall back when the base is invalid"
+            );
         }
         assert_eq!(
             CachePrices {

@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use compact_str::CompactString;
 
 use crate::config;
@@ -903,6 +903,36 @@ fn default_provider(
 }
 
 impl Cli {
+    pub fn parse_command_line() -> Self {
+        Self::try_parse_command_line_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    fn try_parse_command_line_from(
+        args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    ) -> Result<Self, clap::Error> {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        let completions = args
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_os_str() != "--")
+            .any(|arg| {
+                arg == "--completions"
+                    || arg
+                        .to_str()
+                        .is_some_and(|arg| arg.starts_with("--completions="))
+            });
+        let mut command = Self::command();
+        if completions {
+            // Clap treats environment-backed values as explicit for exclusive
+            // arguments. Local script generation ignores ambient model choices
+            // while still rejecting conflicting arguments supplied on argv.
+            command = command
+                .mut_arg("provider", |arg| arg.env(None::<&str>))
+                .mut_arg("model", |arg| arg.env(None::<&str>));
+        }
+        Self::from_arg_matches(&command.try_get_matches_from(args)?)
+    }
+
     pub fn output_format(&self) -> OutputFormat {
         self.output.unwrap_or_default()
     }
@@ -1289,6 +1319,38 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli() {
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_PROVIDER", Some("anthropic".into())),
+            ("ZS_MODEL", Some("ambient-model".into())),
+        ]);
+        for flag in [
+            vec!["mini-agent", "--completions", "zsh"],
+            vec!["mini-agent", "--completions=bash"],
+        ] {
+            let cli = Cli::try_parse_command_line_from(flag).unwrap();
+            assert!(cli.completions.is_some());
+            assert!(cli.provider.is_none());
+            assert!(cli.model.is_none());
+        }
+        assert!(
+            Cli::try_parse_command_line_from([
+                "mini-agent",
+                "--completions",
+                "zsh",
+                "--model",
+                "explicit"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_command_line_from(["mini-agent", "-p", "--", "--completions=zsh"])
+            .unwrap();
+        assert!(cli.completions.is_none());
+        assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cli.model.as_deref(), Some("ambient-model"));
     }
 
     /// The shipped default shape: OpenRouter with the deepseek quick model,

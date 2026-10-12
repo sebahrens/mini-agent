@@ -508,7 +508,7 @@ pub(crate) struct HeadlessPricing {
     pub anthropic_native: bool,
     pub input_token_cost: f64,
     pub output_token_cost: f64,
-    pub cache_multipliers: crate::pricing::CacheMultipliers,
+    pub cache_prices: crate::pricing::CachePrices,
 }
 
 impl HeadlessPricing {
@@ -517,20 +517,20 @@ impl HeadlessPricing {
             anthropic_native: cfg.is_anthropic_native(&session.provider),
             input_token_cost: session.input_token_cost,
             output_token_cost: session.output_token_cost,
-            cache_multipliers: session.cache_multipliers(),
+            cache_prices: session.cache_prices(),
         }
     }
 
     pub(crate) fn cost(self, usage: Usage) -> f64 {
-        crate::pricing::estimate_cost(
-            crate::pricing::billable_input_tokens_with_multipliers(
-                self.anthropic_native,
-                usage.input_tokens,
-                usage.cached_input_tokens,
-                usage.cache_creation_input_tokens,
-                self.cache_multipliers,
-            ),
-            usage.output_tokens,
+        self.cache_prices.estimate_cost(
+            self.anthropic_native,
+            crate::event::UsageDelta {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                ..Default::default()
+            },
             self.input_token_cost,
             self.output_token_cost,
         )
@@ -980,7 +980,39 @@ fn javascript_worker_entries(eligible: bool) -> Vec<(&'static str, String)> {
     #[cfg(feature = "js")]
     {
         if eligible {
-            javascript_worker_entries_for_status(crate::sandbox::worker::containment_status())
+            vec![
+                javascript_worker_compiled_entry(),
+                (
+                    "backend",
+                    crate::sandbox::worker::WorkerBackend::for_current_platform().to_string(),
+                ),
+                ("status", "not probed".to_string()),
+                (
+                    "reason",
+                    "configuration display does not run worker containment preflight".to_string(),
+                ),
+                ("assurance", "not attested".to_string()),
+                (
+                    "worker launch",
+                    "not started; containment not probed".to_string(),
+                ),
+                (
+                    "filesystem authority",
+                    "not granted; no worker process".to_string(),
+                ),
+                (
+                    "network authority",
+                    "not granted; no worker process".to_string(),
+                ),
+                (
+                    "parent-brokered spawn",
+                    "not advertised; containment not probed".to_string(),
+                ),
+                (
+                    "protocol version",
+                    crate::extras::js::protocol::PROTOCOL_VERSION.to_string(),
+                ),
+            ]
         } else {
             javascript_worker_entries_for_status(
                 crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
@@ -1728,6 +1760,52 @@ mod tests {
     }
 
     #[test]
+    fn zero_base_headless_json_cache_charge_preserves_request_snapshot() {
+        use super::{HeadlessPricing, HeadlessStopReason};
+        use crate::session::Session;
+
+        let root = crate::tests::OwnedTestDirectory::new("zero-base-headless-json");
+        let mut session = Session::new("anthropic", "cache-only", 1_000_000, "");
+        session.set_cache_prices(crate::pricing::CachePrices {
+            read: Some(1.0),
+            write: Some(2.0),
+        });
+        let pricing = HeadlessPricing::from_session(&session, &crate::config::Config::default());
+        session.input_token_cost = 4.0;
+        session.set_cache_prices(crate::pricing::CachePrices {
+            read: Some(0.2),
+            write: Some(5.0),
+        });
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            pricing.cost(usage),
+            3.0,
+            "the request retains its zero-base absolute tiers"
+        );
+        let rendered = render_headless_json(
+            root.path(),
+            "finished",
+            &[],
+            usage,
+            Vec::new(),
+            pricing,
+            HeadlessStopReason::Completed,
+            #[cfg(feature = "goal")]
+            None,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["cost"], 3.0);
+        assert_eq!(value["usage"]["cached_input_tokens"], 1_000_000);
+        assert_eq!(value["usage"]["cache_creation_input_tokens"], 1_000_000);
+    }
+
+    #[test]
     fn headless_json_reports_tool_stats_files_usage_and_invocation_cost() {
         let root = std::env::temp_dir().join("mini-agent-headless-json-test");
         let absolute_edit = root.join("src/lib.rs").to_string_lossy().into_owned();
@@ -1775,7 +1853,7 @@ mod tests {
             super::HeadlessPricing {
                 anthropic_native: true,
                 input_token_cost: 3.0,
-                cache_multipliers: crate::pricing::CacheMultipliers::default(),
+                cache_prices: crate::pricing::CachePrices::default(),
                 output_token_cost: 15.0,
             },
             super::HeadlessStopReason::Completed,
@@ -1923,6 +2001,33 @@ mod tests {
                 ("compiled", "false".to_string()),
                 ("status", "not compiled".to_string()),
             ]
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn config_reports_eligible_javascript_without_probing_or_starting_a_runtime() {
+        let entries = super::javascript_worker_entries(true)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(entries["compiled"], "true");
+        assert_eq!(entries["status"], "not probed");
+        assert_eq!(entries["assurance"], "not attested");
+        assert_eq!(
+            entries["worker launch"],
+            "not started; containment not probed"
+        );
+        assert_eq!(
+            entries["filesystem authority"],
+            "not granted; no worker process"
+        );
+        assert_eq!(
+            entries["network authority"],
+            "not granted; no worker process"
+        );
+        assert_eq!(
+            entries["parent-brokered spawn"],
+            "not advertised; containment not probed"
         );
     }
 

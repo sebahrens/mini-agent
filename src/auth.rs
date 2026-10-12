@@ -24,6 +24,30 @@ impl ProviderKind {
     }
 }
 
+/// Credential kind is determined by its source, never by inspecting the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedCredential {
+    ApiKey(String),
+    Bearer(String),
+}
+
+impl ResolvedCredential {
+    pub fn secret(&self) -> &str {
+        match self {
+            Self::ApiKey(value) | Self::Bearer(value) => value,
+        }
+    }
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ApiKey(_) => "ApiKey([REDACTED])",
+            Self::Bearer(_) => "Bearer([REDACTED])",
+        })
+    }
+}
+
 /// Resolver for API keys with priority: CLI arg > env var > config file > custom provider name
 #[derive(Debug, Clone)]
 pub struct AuthResolver {
@@ -100,10 +124,25 @@ impl AuthResolver {
         })
     }
 
+    pub fn resolve_credential_with_env<F: Fn(&str) -> Result<String, VarError>>(
+        &self,
+        get_env: F,
+    ) -> anyhow::Result<ResolvedCredential> {
+        self.resolve_credential_from_sources(get_env)
+    }
+
     pub fn resolve_with_env<F: Fn(&str) -> Result<String, VarError>>(
         &self,
         get_env: F,
     ) -> anyhow::Result<String> {
+        self.resolve_credential_with_env(get_env)
+            .map(|credential| credential.secret().to_owned())
+    }
+
+    fn resolve_credential_from_sources<F: Fn(&str) -> Result<String, VarError>>(
+        &self,
+        get_env: F,
+    ) -> anyhow::Result<ResolvedCredential> {
         let custom = self.custom_provider();
 
         // Priority 1: CLI argument
@@ -115,7 +154,7 @@ impl AuthResolver {
                     .as_deref()
                     .unwrap_or_else(|| self.env_var_name())
             );
-            return Ok(key.clone());
+            return Ok(ResolvedCredential::ApiKey(key.clone()));
         }
 
         // Priority 2: Environment variable. Custom providers only ever read
@@ -129,7 +168,19 @@ impl AuthResolver {
             && let Ok(key) = get_env(env_var)
             && !key.is_empty()
         {
-            return Ok(key);
+            return Ok(ResolvedCredential::ApiKey(key));
+        }
+
+        // Anthropic's native token is a second environment credential, after
+        // the designated API-key env and before config keys. An isolated route
+        // or explicitly designated alternate key env cannot inherit it.
+        if self.provider_kind == ProviderKind::Anthropic
+            && custom.is_none()
+            && self.api_key_env_override.is_none()
+            && let Ok(token) = get_env("ANTHROPIC_AUTH_TOKEN")
+            && !token.is_empty()
+        {
+            return Ok(ResolvedCredential::Bearer(token));
         }
 
         // Priority 3: Config file. Built-ins use their slug (and, for
@@ -145,17 +196,17 @@ impl AuthResolver {
                     if let Some(name) = own_config_slot
                         && let Some(key) = lookup(name)
                     {
-                        return Ok(key);
+                        return Ok(ResolvedCredential::ApiKey(key));
                     }
                 }
                 None => {
                     if let Some(key) = lookup(self.provider_slug()) {
-                        return Ok(key);
+                        return Ok(ResolvedCredential::ApiKey(key));
                     }
                     if let Some(name) = self.custom_provider_name.as_deref()
                         && let Some(key) = lookup(name)
                     {
-                        return Ok(key);
+                        return Ok(ResolvedCredential::ApiKey(key));
                     }
                 }
             }
@@ -163,7 +214,7 @@ impl AuthResolver {
 
         // Ollama doesn't require an API key
         if self.provider_kind == ProviderKind::Ollama {
-            return Ok(String::new());
+            return Ok(ResolvedCredential::ApiKey(String::new()));
         }
 
         match custom {

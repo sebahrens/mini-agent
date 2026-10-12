@@ -746,6 +746,7 @@ async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
             .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .build()
             .unwrap(),
     );
@@ -899,6 +900,7 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
     let mut client = AnyClient::OpenRouter(
         rig::providers::openrouter::Client::builder()
             .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
             .build()
             .unwrap(),
     );
