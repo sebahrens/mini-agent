@@ -21,6 +21,9 @@ version, resolved URL and the lockfile's `integrity` hash; the release
 packager verifies every tarball against that hash and rebuilds the bundle
 offline from them before publishing the archive.
 
+The pinned build and packaging tools require Node 22. The extension bundle
+continues to target Node 20 for the supported VS Code runtime.
+
 To rebuild `dist/extension.js` without network access, install the Node
 version in `editors/vscode/.nvmrc` and the npm named by `packageManager` in
 `editors/vscode/package.json`, then from the extracted archive root run:

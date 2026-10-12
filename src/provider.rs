@@ -854,6 +854,8 @@ pub struct ModelEntry {
     pub kind: Option<String>,
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub cache_write_price: Option<f64>,
 }
 
 impl ModelEntry {
@@ -865,6 +867,8 @@ impl ModelEntry {
             kind: m.r#type.clone(),
             input_price: None,
             output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
         }
     }
 }
@@ -986,6 +990,8 @@ pub async fn list_models_manual(
             kind: None,
             input_price: None,
             output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
         })
         .collect())
 }

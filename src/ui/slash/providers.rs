@@ -368,6 +368,14 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
             .renderer
             .write_line(&note, crossterm::style::Color::Yellow);
     }
+    ctx.session
+        .set_cache_prices(crate::pricing::cache_prices_for_model(
+            &ctx.session.provider,
+            model_id,
+            ctx.cfg,
+            None,
+            ctx.session.input_token_cost,
+        ));
 
     write_ok(ctx.renderer, format!("switched to model: {}", new_model));
 }
@@ -397,9 +405,13 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     // the old id (e.g. an OpenRouter id) is carried onto a provider where it
     // is invalid.
     let mut pricing = None;
+    let mut selected_alias = None;
     if let Some((model, costs)) = crate::provider::default_model_for_provider(new_provider, ctx.cfg)
     {
         ctx.session.model = compact_str::CompactString::new(&model);
+        if costs.is_some() {
+            selected_alias = provider_default_cache_alias(new_provider, &model, ctx.cfg);
+        }
         pricing = costs;
     }
     let model = ctx.session.model.to_string();
@@ -409,6 +421,14 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             .renderer
             .write_line(&note, crossterm::style::Color::Yellow);
     }
+    ctx.session
+        .set_cache_prices(crate::pricing::cache_prices_for_model(
+            new_provider,
+            &model,
+            ctx.cfg,
+            selected_alias,
+            ctx.session.input_token_cost,
+        ));
     ctx.rebuild_agent().await;
     ctx.session
         .update_context_window(ctx.cfg.resolve_context_window(
@@ -424,6 +444,29 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         ),
     );
     Ok(())
+}
+
+fn provider_default_cache_alias<'a>(
+    provider: &str,
+    model: &str,
+    cfg: &'a Config,
+) -> Option<&'a str> {
+    let quick = cfg.quick_models.as_ref()?;
+    let matches =
+        |entry: &config::QuickModelConfig| entry.provider == provider && entry.model == model;
+    if let Some(alias) = cfg.model.as_deref()
+        && quick.get(alias).is_some_and(matches)
+    {
+        return Some(alias);
+    }
+    if quick.get("deepseek-v4-pro").is_some_and(matches) {
+        return Some("deepseek-v4-pro");
+    }
+    quick
+        .iter()
+        .filter(|(_, entry)| matches(entry))
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(alias, _)| alias.as_str())
 }
 
 /// `/model` is the single model selector: `/model` shows the current model,
@@ -479,6 +522,14 @@ async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
             // preserve v1.4.x pricing/cost tracking
             ctx.session.input_token_cost = q.input_token_cost;
             ctx.session.output_token_cost = q.output_token_cost;
+            ctx.session
+                .set_cache_prices(crate::pricing::cache_prices_for_model(
+                    &q.provider,
+                    &q.model,
+                    ctx.cfg,
+                    Some(name),
+                    q.input_token_cost,
+                ));
             write_result(
                 ctx.renderer,
                 format!(
@@ -1132,6 +1183,8 @@ mod model_pricing_tests {
             kind: None,
             input_price: Some(99.0),
             output_price: Some(99.0),
+            cache_read_price: None,
+            cache_write_price: None,
         }];
         let pricing = resolve_model_pricing_from_listing(
             "anthropic",
@@ -1163,6 +1216,8 @@ mod model_pricing_tests {
             kind: None,
             input_price: Some(0.0),
             output_price: Some(0.0),
+            cache_read_price: None,
+            cache_write_price: None,
         }];
         let pricing = resolve_model_pricing_from_listing(&provider, "live", &cfg, Some(&listing));
         assert_eq!(pricing, Some((0.0, 0.0)));

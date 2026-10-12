@@ -1,10 +1,10 @@
 ---
-description: "HashEdit — zerostack's CRC-32 tagged, compare-and-swap file editing protocol."
+description: "HashEdit — mini-agent's CRC-32 tagged, compare-and-swap file editing protocol."
 ---
 
 # HashEdit
 
-HashEdit is zerostack's line-oriented edit mode. It does not maintain an anchor
+HashEdit is mini-agent's line-oriented edit mode. It does not maintain an anchor
 dictionary, reconcile moved lines, or keep per-session document state. A read
 returns ordinary one-based line numbers plus CRC-32 tags calculated from the
 current line text, and a file-level CRC-32 calculated from the complete

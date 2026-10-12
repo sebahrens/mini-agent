@@ -36,6 +36,7 @@ fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::R
                     anthropic_native: false,
                     input_token_cost: 0.0,
                     output_token_cost: 0.0,
+                    cache_multipliers: crate::pricing::CacheMultipliers::default(),
                 },
                 crate::print::HeadlessStopReason::Failed,
                 #[cfg(feature = "goal")]
@@ -73,6 +74,82 @@ fn resolve_startup_model_pricing(
     crate::ui::slash::resolve_model_pricing(provider, model, cfg)
 }
 
+fn resolve_startup_cache_prices(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+    openrouter_model: Option<&str>,
+    input_price: f64,
+) -> crate::pricing::CachePrices {
+    let raw_env_override =
+        provider == "openrouter" && openrouter_model.is_some_and(|model| !model.is_empty());
+    let selected = cli.quick_model.as_deref().or_else(|| {
+        (cli.model.is_none() && !raw_env_override)
+            .then_some(cfg.model.as_deref())
+            .flatten()
+    });
+    crate::pricing::cache_prices_for_model(provider, model, cfg, selected, input_price)
+}
+
+#[cfg(test)]
+mod startup_cache_pricing_tests {
+    use super::*;
+
+    #[test]
+    fn startup_cache_pricing_preserves_selected_alias_and_raw_override_precedence() {
+        use clap::Parser;
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider":"anthropic", "model":"operator", "quick_models": {
+                "operator":{"provider":"anthropic", "model":"claude-opus-5-5", "input_token_cost":8.0, "output_token_cost":40.0, "cache_read_token_cost":0.6}
+            }
+        })).unwrap();
+        let plain = Cli::parse_from(["mini-agent"]);
+        let selected =
+            resolve_startup_cache_prices(&plain, &cfg, "anthropic", "claude-opus-5-5", None, 8.0);
+        assert_eq!(selected.read, Some(0.6));
+        assert_eq!(selected.write, Some(10.0));
+        let raw = Cli::parse_from(["mini-agent", "--model", "claude-opus-5-5"]);
+        assert_eq!(
+            resolve_startup_cache_prices(&raw, &cfg, "anthropic", "claude-opus-5-5", None, 4.0)
+                .read,
+            Some(0.2)
+        );
+        let explicit = Cli::parse_from(["mini-agent", "--quick-model", "operator"]);
+        assert_eq!(
+            resolve_startup_cache_prices(
+                &explicit,
+                &cfg,
+                "anthropic",
+                "claude-opus-5-5",
+                None,
+                8.0
+            )
+            .read,
+            Some(0.6)
+        );
+        // An environment/raw selection on OpenRouter cannot borrow an alias's
+        // explicit cache rate, even if the raw id equals its underlying model.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider":"openrouter", "model":"operator", "quick_models": {
+                "operator":{"provider":"openrouter", "model":"vendor/model", "input_token_cost":8.0, "cache_read_token_cost":2.0}
+            }
+        })).unwrap();
+        assert_eq!(
+            resolve_startup_cache_prices(
+                &plain,
+                &cfg,
+                "openrouter",
+                "vendor/model",
+                Some("other/model"),
+                4.0
+            )
+            .read,
+            Some(1.0)
+        );
+    }
+}
+
 /// Regenerate embedded prompts/themes, printing the actual outcome instead
 /// of claiming success on failure. Returns true when regeneration succeeded.
 fn regen_resource(regen: fn() -> anyhow::Result<()>, what: &str, suffix: &str) -> bool {
@@ -106,13 +183,16 @@ fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result
     Ok(())
 }
 
-fn require_recent_session(result: anyhow::Result<Vec<Session>>) -> anyhow::Result<Session> {
+fn require_recent_session(
+    result: anyhow::Result<Vec<Session>>,
+    workspace: &std::path::Path,
+) -> anyhow::Result<Session> {
     let sessions =
         result.map_err(|error| anyhow::anyhow!("failed to continue session: {error}"))?;
     sessions
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("cannot continue: no saved sessions found"))
+        .ok_or_else(|| anyhow::anyhow!("cannot continue: no saved sessions for this workspace ({}); use --session or /sessions", workspace.display()))
 }
 fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
     cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
@@ -208,6 +288,13 @@ fn apply_resume_provider_decision(
             .unwrap_or((0.0, 0.0));
     session.input_token_cost = input;
     session.output_token_cost = output;
+    session.set_cache_prices(crate::pricing::cache_prices_for_model(
+        &target.provider,
+        &target.model,
+        cfg,
+        None,
+        input,
+    ));
     session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
 }
 
@@ -302,6 +389,13 @@ fn apply_startup_prompt_model(
     session.provider = qmc.provider.clone();
     session.input_token_cost = qmc.input_token_cost;
     session.output_token_cost = qmc.output_token_cost;
+    session.set_cache_prices(crate::pricing::cache_prices_for_model(
+        &qmc.provider,
+        &qmc.model,
+        cfg,
+        Some(qm_name),
+        qmc.input_token_cost,
+    ));
     session.update_context_window(cfg.resolve_context_window(
         &session.provider,
         &session.model,
@@ -743,12 +837,21 @@ impl Startup {
             session.input_token_cost = input;
             session.output_token_cost = output;
         }
+        session.set_cache_prices(resolve_startup_cache_prices(
+            &cli,
+            &cfg,
+            &provider,
+            &model,
+            std::env::var("OPENROUTER_MODEL").ok().as_deref(),
+            session.input_token_cost,
+        ));
 
         let mut session_resumed = false;
 
         if cli.continue_session && cli.session.is_none() {
             session = require_recent_session(
                 session::storage::find_recent_sessions_for_workspace(1, workspace.root()),
+                workspace.root(),
             )?;
             session_resumed = true;
         }
@@ -784,6 +887,17 @@ impl Startup {
             }
         }
 
+        if session_resumed {
+            let prices = crate::pricing::cache_prices_for_model(
+                &session.provider,
+                &session.model,
+                &cfg,
+                None,
+                session.input_token_cost,
+            );
+            session.cache_read_token_cost = session.cache_read_token_cost.or(prices.read);
+            session.cache_write_token_cost = session.cache_write_token_cost.or(prices.write);
+        }
         let resume_decision = if session_resumed {
             Some(resolve_resume_provider_decision(&cli, &cfg, &session)?)
         } else {
@@ -859,6 +973,15 @@ impl Startup {
 
         #[cfg(feature = "goal")]
         apply_goal_flags(&cli, &cfg, &session)?;
+
+        // Rename only the selected (possibly forked) session after setup has
+        // succeeded. Ephemeral invocations keep the rename in memory only.
+        if session_resumed && let Some(name) = cli.name.as_deref() {
+            session.name = CompactString::new(name);
+            if !cli.no_session {
+                session::storage::save_session(&session)?;
+            }
+        }
 
         Ok(Self {
             cli,
@@ -1438,11 +1561,7 @@ impl Startup {
                     .await;
                     Some((
                         files_changed,
-                        crate::print::HeadlessPricing {
-                            anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
-                            input_token_cost: self.session.input_token_cost,
-                            output_token_cost: self.session.output_token_cost,
-                        },
+                        crate::print::HeadlessPricing::from_session(&self.session, &self.cfg),
                     ))
                 } else {
                     None
@@ -1661,11 +1780,7 @@ impl Startup {
                 .await;
                 Some((
                     files_changed,
-                    crate::print::HeadlessPricing {
-                        anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
-                        input_token_cost: self.session.input_token_cost,
-                        output_token_cost: self.session.output_token_cost,
-                    },
+                    crate::print::HeadlessPricing::from_session(&self.session, &self.cfg),
                 ))
             } else {
                 None
@@ -2225,6 +2340,7 @@ async fn run_headless_goal_rounds(
             let judge_charge_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
             let judge_charge_out = judge_charge_slot.clone();
             let session_prices = (session.input_token_cost, session.output_token_cost);
+            let session_cache_prices = session.cache_prices();
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     // An operator who interrupts must not wait for a check;
@@ -2302,6 +2418,7 @@ async fn run_headless_goal_rounds(
                                         &cfg_for_judge,
                                         session_prices,
                                     ),
+                                    session_cache_prices,
                                 );
                             Some(verdict)
                         }
@@ -2564,10 +2681,22 @@ mod tests {
 
     #[test]
     fn continue_requires_a_readable_existing_session() {
-        let missing = require_recent_session(Ok(Vec::new())).unwrap_err();
-        assert!(missing.to_string().contains("no saved sessions"));
+        let workspace = std::path::Path::new("/workspace/project");
+        let missing = require_recent_session(Ok(Vec::new()), workspace).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("no saved sessions for this workspace")
+        );
+        assert!(
+            missing
+                .to_string()
+                .contains(&workspace.display().to_string())
+        );
+        assert!(missing.to_string().contains("use --session or /sessions"));
 
-        let unreadable = require_recent_session(Err(anyhow::anyhow!("corrupt store"))).unwrap_err();
+        let unreadable =
+            require_recent_session(Err(anyhow::anyhow!("corrupt store")), workspace).unwrap_err();
         assert!(
             unreadable
                 .to_string()
@@ -3399,6 +3528,8 @@ mod tests {
                     model: "uncatalogued/model".into(),
                     input_token_cost: 0.0,
                     output_token_cost: 0.0,
+                    cache_read_token_cost: None,
+                    cache_write_token_cost: None,
                     reserve_tokens: None,
                     temperature: None,
                     extra_body: None,
@@ -3755,6 +3886,74 @@ mod tests {
             ..Cli::default()
         };
         assert!(unavailable_sandbox_must_fail(&selected, &cfg, false));
+    }
+
+    #[tokio::test]
+    async fn session_resume_name_is_applied_and_persisted_unless_ephemeral() {
+        let root = crate::tests::OwnedTestDirectory::new("startup-session-name");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::process_paths().unwrap();
+        for continue_session in [false, true] {
+            for ephemeral in [false, true] {
+                let mut saved = Session::new("openrouter", "saved-model", 128_000, "old-name");
+                saved.working_dir = workspace.root().to_string_lossy().into();
+                saved.add_message(crate::session::MessageRole::User, "retained turn");
+                crate::session::storage::save_session(&saved).unwrap();
+                let cli = Cli {
+                    api_key: Some("unused-test-key".into()),
+                    no_context_files: true,
+                    no_tools: true,
+                    no_sandbox: true,
+                    no_session: ephemeral,
+                    continue_session,
+                    session: (!continue_session).then(|| saved.id.to_string()),
+                    name: Some("new-name".into()),
+                    ..Default::default()
+                };
+                let startup = super::Startup::init(
+                    cli,
+                    Config::default(),
+                    paths.clone(),
+                    workspace.clone(),
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(startup.session.id, saved.id);
+                assert_eq!(startup.session.name, "new-name");
+                assert_eq!(startup.session.messages[0].content, "retained turn");
+                let restored = crate::session::storage::load_session_exact(&saved.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    restored.name,
+                    if ephemeral { "old-name" } else { "new-name" }
+                );
+                crate::session::lock::release_session(&saved.id);
+                crate::session::storage::delete_session(&saved.id).unwrap();
+            }
+        }
     }
 
     #[test]

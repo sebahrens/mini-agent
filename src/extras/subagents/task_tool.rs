@@ -691,6 +691,47 @@ editing in a known location, grepping for a literal you will act on immediately.
             &config,
             specialization.as_ref(),
         )?;
+        let selected_alias = specialization
+            .as_ref()
+            .and_then(|specialization| specialization.model.as_deref())
+            .or(config.subagent_model.as_deref());
+        let quick = crate::config::quick_models_map(&config);
+        let matches = |entry: &&crate::config::QuickModelConfig| {
+            entry.provider == runtime.provider_name && entry.model == runtime.model_name
+        };
+        let selected = selected_alias
+            .and_then(|alias| quick.get(alias))
+            .filter(|entry| matches(entry));
+        let catalog_provider = if config.is_anthropic_native(&runtime.provider_name) {
+            "anthropic"
+        } else {
+            &runtime.provider_name
+        };
+        let input_price = selected
+            .map(|entry| entry.input_token_cost)
+            .or_else(|| {
+                crate::config::Config::catalog_input_output_cost(
+                    catalog_provider,
+                    &runtime.model_name,
+                )
+                .map(|price| price.0)
+            })
+            .or_else(|| {
+                quick
+                    .iter()
+                    .filter(|(_, entry)| matches(entry))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
+                    .map(|(_, entry)| entry.input_token_cost)
+            })
+            .unwrap_or(0.0);
+        let cache_multipliers = crate::pricing::cache_prices_for_model(
+            &runtime.provider_name,
+            &runtime.model_name,
+            &config,
+            selected_alias,
+            input_price,
+        )
+        .multipliers(input_price);
         let specialization = specialization.map(|resolved| resolved.prompt);
         let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
         let reasoning_exclusive =
@@ -763,12 +804,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                     cancellation_repair_usage.total(),
                 );
                 let output = Err("subagent cancelled before completion".to_string());
-                usage_cost_units(
+                usage_cost_units_with_multipliers(
                     &usage,
                     anthropic_native,
                     reasoning_exclusive,
                     &cancellation_prompt,
                     &output,
+                    cache_multipliers,
                 )
             });
             let future = Box::pin(async move {
@@ -860,12 +902,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let output = run
                     .response
                     .map(|response| enforce_bounded_report_contract(&response));
-                let cost_units = usage_cost_units(
+                let cost_units = usage_cost_units_with_multipliers(
                     &run.usage,
                     anthropic_native,
                     reasoning_exclusive,
                     &display_prompt,
                     &output,
+                    cache_multipliers,
                 );
                 ChildExecution { output, cost_units }
             });
@@ -1522,11 +1565,30 @@ fn usage_cost_units(
     prompt: &str,
     response: &Result<String, String>,
 ) -> u64 {
-    let itemized = crate::pricing::billable_input_tokens(
+    usage_cost_units_with_multipliers(
+        usage,
+        anthropic_native,
+        reasoning_exclusive,
+        prompt,
+        response,
+        crate::pricing::CacheMultipliers::default(),
+    )
+}
+
+fn usage_cost_units_with_multipliers(
+    usage: &Usage,
+    anthropic_native: bool,
+    reasoning_exclusive: bool,
+    prompt: &str,
+    response: &Result<String, String>,
+    multipliers: crate::pricing::CacheMultipliers,
+) -> u64 {
+    let itemized = crate::pricing::billable_input_tokens_with_multipliers(
         anthropic_native,
         usage.input_tokens,
         usage.cached_input_tokens,
         usage.cache_creation_input_tokens,
+        multipliers,
     )
     .saturating_add(usage.output_tokens)
     .saturating_add(usage.tool_use_prompt_tokens)
@@ -1537,6 +1599,15 @@ fn usage_cost_units(
     });
     if itemized > 0 {
         return itemized;
+    }
+    if anthropic_native && (usage.cached_input_tokens > 0 || usage.cache_creation_input_tokens > 0)
+    {
+        // Reported cache usage can legitimately be free. A positive rate that
+        // rounds below one proxy unit still consumes one; neither case is an
+        // absent usage report that warrants a total/text fallback.
+        let positive_cache_cost = (usage.cached_input_tokens > 0 && multipliers.read > 0.0)
+            || (usage.cache_creation_input_tokens > 0 && multipliers.write > 0.0);
+        return u64::from(positive_cache_cost);
     }
     if usage.total_tokens > 0 {
         return usage.total_tokens;
@@ -2016,6 +2087,8 @@ mod tests {
                 model: CompactString::new("test/reviewer"),
                 input_token_cost: 0.0,
                 output_token_cost: 0.0,
+                cache_read_token_cost: None,
+                cache_write_token_cost: None,
                 reserve_tokens: None,
                 temperature: None,
                 extra_body: Some(serde_json::json!({"seed": 7})),
@@ -2792,6 +2865,126 @@ mod tests {
         assert_eq!(
             usage_cost_units(&Usage::new(), false, false, "1234", &Ok("5678".into())),
             2
+        );
+    }
+
+    #[test]
+    fn task_cache_cost_units_follow_selected_model_without_becoming_dollar_charges() {
+        let cfg = crate::config::Config::default();
+        let usage = Usage {
+            cached_input_tokens: 1_000_000,
+            ..Usage::new()
+        };
+        for (model, input_price, expected_units) in [
+            ("claude-fable-5-1", 10.0, 25_000),
+            ("claude-opus-5-5", 4.0, 50_000),
+        ] {
+            let multipliers =
+                crate::pricing::cache_prices_for_model("anthropic", model, &cfg, None, input_price)
+                    .multipliers(input_price);
+            assert_eq!(
+                usage_cost_units_with_multipliers(
+                    &usage,
+                    true,
+                    false,
+                    "",
+                    &Ok(String::new()),
+                    multipliers
+                ),
+                expected_units
+            );
+        }
+    }
+
+    #[test]
+    fn task_cache_cost_units_distinguish_free_and_subtoken_rates_from_missing_usage() {
+        let reported = Usage {
+            cached_input_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+            ..Usage::new()
+        };
+        let free = crate::pricing::CachePrices {
+            read: Some(0.0),
+            write: Some(0.0),
+        }
+        .multipliers(4.0);
+        assert_eq!(
+            usage_cost_units_with_multipliers(
+                &reported,
+                true,
+                false,
+                "nonempty prompt",
+                &Ok("response".into()),
+                free
+            ),
+            0,
+            "reported free cache usage cannot acquire a fallback text or total charge"
+        );
+        assert_eq!(
+            usage_cost_units_with_multipliers(
+                &Usage {
+                    cached_input_tokens: 1,
+                    ..reported
+                },
+                true,
+                false,
+                "nonempty prompt",
+                &Ok("response".into()),
+                crate::pricing::CacheMultipliers {
+                    read: 0.025,
+                    write: 1.25
+                }
+            ),
+            1,
+            "positive fractional units cannot bypass the budget or trigger a million-unit fallback"
+        );
+        for (write_rate, expected) in [(0.0, 0), (0.1, 1)] {
+            assert_eq!(
+                usage_cost_units_with_multipliers(
+                    &Usage {
+                        cache_creation_input_tokens: 1,
+                        total_tokens: 1_000_000,
+                        ..Usage::new()
+                    },
+                    true,
+                    false,
+                    "nonempty prompt",
+                    &Ok("response".into()),
+                    crate::pricing::CacheMultipliers {
+                        read: 0.0,
+                        write: write_rate
+                    }
+                ),
+                expected,
+                "cache writes obey the same free/fractional rule as reads"
+            );
+        }
+        assert_eq!(
+            usage_cost_units_with_multipliers(
+                &Usage::new(),
+                true,
+                false,
+                "nonempty prompt",
+                &Ok("response".into()),
+                free
+            ),
+            6,
+            "missing usage still uses the conservative text estimate"
+        );
+        assert_eq!(
+            usage_cost_units_with_multipliers(
+                &Usage {
+                    total_tokens: 42,
+                    ..Usage::new()
+                },
+                true,
+                false,
+                "nonempty prompt",
+                &Ok("response".into()),
+                free
+            ),
+            42,
+            "total-only usage remains an available budget estimate"
         );
     }
 

@@ -1,10 +1,10 @@
 ---
-description: "Full zerostack configuration reference: config file locations, providers, permissions, hooks, MCP, themes, and every available option."
+description: "Full mini-agent configuration reference: config file locations, providers, permissions, hooks, MCP, themes, and every available option."
 ---
 
 # Configuration
 
-zerostack reads an optional TOML, YAML, or JSON config from one canonical
+mini-agent reads an optional TOML, YAML, or JSON config from one canonical
 configuration root, resolved in this order:
 
 1. `ZS_CONFIG_DIR`, when set.
@@ -17,7 +17,7 @@ configuration root, resolved in this order:
 
 `--print-config` shows the resolved values. Within that directory the filename
 priority is `config.toml`, `config.yaml`, `config.yml`, then `config.json`.
-If none exists, zerostack creates `config.toml` in that same directory.
+If none exists, mini-agent creates `config.toml` in that same directory.
 
 `ZS_DATA_DIR` does not redirect configuration. Set both `ZS_CONFIG_DIR` and
 `ZS_DATA_DIR` when a hermetic installation needs one physical root. A config
@@ -112,12 +112,12 @@ The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
 `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, and
 `ZS_CREDENTIALS_DIR`; each one takes precedence over `MINI_AGENT_HOME` and
 `~/.mini-agent` for its own root. Overrides must be absolute (a leading `~` is
-expanded). zerostack never uses the current directory as a fallback for
+expanded). mini-agent never uses the current directory as a fallback for
 user-global state.
 
 **Adopting `~/.mini-agent` from a legacy install** is explicit; nothing is
 moved automatically. Create the directory (or set `MINI_AGENT_HOME`) and
-zerostack uses it from the next start. The config, sessions, logs, chat
+mini-agent uses it from the next start. The config, sessions, logs, chat
 history, hook trust, memory, and learned skill database are then copied (never
 moved) from the legacy config/data roots. To keep everything else (prompts,
 themes, agents, credentials, remaining state), copy the legacy trees first:
@@ -148,7 +148,7 @@ when the `js` tool is eligible. `--no-tools` and a tool allowlist that omits `js
 preflight or initialize the learned-skill runtime. An eligible status preflight creates or reuses a
 persistent AppContainer profile and may add that profile's
 exact read/execute ACE to a supported, user-owned installed executable. These changes persist after
-exit, and zerostack currently provides no automatic profile cleanup, ACL rollback, or separate
+exit, and mini-agent currently provides no automatic profile cleanup, ACL rollback, or separate
 consent prompt. LPAC is not a filesystem namespace; host objects readable through applicable ACLs
 can remain visible, while the broader filesystem/network/child canaries are hosted
 reference-runner observations rather than local-attestation guarantees.
@@ -295,7 +295,7 @@ The global config can contain plaintext API keys, authorization headers, and
 other credentials. Its containing configuration directory is therefore a
 private persistence root:
 
-- On Unix, zerostack creates configuration directories as `0700` and config
+- On Unix, mini-agent creates configuration directories as `0700` and config
   files and atomic-write temporary files as `0600`, independent of the process
   umask. An existing current-user-owned real directory or regular file with
   broader mode bits is repaired through an opened handle before it is read or
@@ -305,7 +305,7 @@ private persistence root:
   DACL with inheritance disabled. Full access is limited to the current user
   and `SYSTEM`; inherited `Everyone` and ordinary `Users` access is removed.
 - A symbolic link, Windows reparse point, wrong file type, or path not owned by
-  the current user is rejected. zerostack does not chmod or rewrite through
+  the current user is rejected. mini-agent does not chmod or rewrite through
   such a path. Unsupported platforms fail closed instead of saving secrets
   with process-default permissions.
 
@@ -319,13 +319,13 @@ future lock or backup artifact must use the same `0600`/protected-DACL policy.
 ## Session-storage privacy
 
 Saved sessions and full tool outputs can contain prompts, source code, command
-output, authorization data, and other secrets. zerostack applies the same
+output, authorization data, and other secrets. mini-agent applies the same
 private-persistence policy to the state root's `sessions/` and
 `tool-outputs/` trees:
 
 - On Unix, newly created directories are `0700`; session, tool-output, lock,
   and atomic-write temporary files are `0600` from creation, independent of
-  umask. Before reading or replacing an existing path, zerostack repairs a
+  umask. Before reading or replacing an existing path, mini-agent repairs a
   current-user-owned real directory or regular file to the exact private mode.
 - On Windows, Unix mode bits do not provide protection. Directories and every
   final, lock, and temporary file receive a protected DACL from creation time,
@@ -495,7 +495,7 @@ verify_timeout_secs = 600
 verify_max_attempts = 3
 ```
 
-After the agent invokes a potentially mutating tool, zerostack runs this command
+After the agent invokes a potentially mutating tool, mini-agent runs this command
 in the startup workspace through the configured general sandbox. Known
 read-only tools do not trigger the gate; unknown tools are treated
 conservatively as potentially mutating. A failed attempt sends a sanitized,
@@ -594,8 +594,8 @@ Accepted top-level keys:
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. This also holds for an entry that shadows a built-in name (`custom`, `openai`, `google`, ...); see Custom provider credentials below. |
-| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
-| `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, zerostack automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
+| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "cache_read_token_cost"?, "cache_write_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
+| `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, mini-agent automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, recommended MCPs are auto-configured (see below).                                                   |
 | `enable-exa-mcp`          | boolean | Auto-configure the Exa Web Search MCP server. Default: `true`.                                                                                                         |
 | `enable-context7-mcp`     | boolean | Auto-configure the Context7 MCP server. Default: `false`.                                                                                                              |
@@ -702,12 +702,12 @@ or project file) or the `--no-hooks` CLI flag suppresses every non-managed
 hook; managed hooks still run regardless. A missing or invalid file is not an
 error — it just contributes nothing.
 
-**Largely compatible with Claude Code's `.claude/settings.json`**: zerostack
+**Largely compatible with Claude Code's `.claude/settings.json`**: mini-agent
 does not read that file directly, but its own `settings.json` uses the same
 basic `hooks` schema. For security, every command handler must add an `args`
-array (use `[]` when the executable takes no arguments); zerostack never
+array (use `[]` when the executable takes no arguments); mini-agent never
 implicitly passes `command` to a shell. Scripts may also need a change because
-zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
+mini-agent sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 
 ### Handler schema
 
@@ -753,7 +753,7 @@ stdin envelope and immediately before every condition and handler child, and a
 failed rebind or directory replacement denies subsequent launches. Conditions
 and handlers use that same selected root, environment, trust, and sandbox
 policy. Changing the parent process cwd cannot retarget them. Before every
-launch zerostack clears the ambient environment, then
+launch mini-agent clears the ambient environment, then
 restores only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`,
 `LC_ALL`, `COLORTERM`, `NO_COLOR`, `TMPDIR`, and the Windows runtime names
 `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERNAME`, and
@@ -780,12 +780,12 @@ values, stdin, or hook output.
 Inside containment, a fixed trusted launcher verifies the executable is
 visible and emits a private readiness record immediately before direct `exec`.
 If the wrapper starts but never reaches readiness (setup or pre-exec failure),
-zerostack classifies the outcome as policy denial rather than as a non-blocking
+mini-agent classifies the outcome as policy denial rather than as a non-blocking
 hook error; a `once` binding remains retryable.
 
 Hook subprocess output has non-configurable hard limits: 1 MiB for stdout,
 1 MiB for stderr, and 1.5 MiB combined. Stdout and stderr are drained
-concurrently. Exceeding any limit is a hard hook failure: zerostack kills and
+concurrently. Exceeding any limit is a hard hook failure: mini-agent kills and
 reaps the process group, retains at most the bounded prefixes for diagnostics,
 and never interprets truncated stdout as a complete hook decision. The same
 cleanup occurs on timeout or output-consumer failure.
@@ -794,7 +794,7 @@ cleanup occurs on timeout or output-consumer failure.
 semantics: omitted, `""`, or `"*"` matches every tool; a bare name or a
 `|`/`,`-separated list is an exact case-insensitive match after tool-name
 normalization (e.g. `Bash` ↔ `bash`, `Glob` ↔ `find_files`, `Edit|Write`
-matches zerostack's `write` tool); anything else is treated as a regex.
+matches mini-agent's `write` tool); anything else is treated as a regex.
 Invalid regexes are reported at load time.
 
 ### Events
@@ -877,7 +877,7 @@ lives inside the workspace (`./guard.sh`, `sh hooks/guard.sh`,
 `--config=hooks/policy.toml`, or a file named in an `if` condition such as
 `./check.sh`) is ordinary workspace content the model could otherwise rewrite
 to approve its own tool calls or escape the sandbox. When hooks load,
-zerostack records a SHA-256 digest of every such file: each argument, and each
+mini-agent records a SHA-256 digest of every such file: each argument, and each
 whitespace/shell-punctuation separated token of the arguments and condition,
 that resolves to an existing regular file inside the workspace (lexically or
 through a symlink) is bound, as is the resolved executable. Before every
@@ -945,7 +945,7 @@ the spill file keep the original result. If the projected context is still over
 budget, the same cleared projection is passed to the summarizer before the
 ordinary compaction flow runs.
 
-By default zerostack only compacts the conversation *between* turns, after a
+By default mini-agent only compacts the conversation *between* turns, after a
 response finishes, when the accumulated session history exceeds
 `context_window - reserve_tokens`. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, and `js`) retain their documented
@@ -992,7 +992,7 @@ not charged for the requests it completed before failing. The opt-in
 (see its row above).
 
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
-provider call zerostack compares the real provider-reported prompt size against
+provider call mini-agent compares the real provider-reported prompt size against
 `context_window`. When a tool-bearing call crosses the threshold, the runner
 finishes every tool in that call's batch, emits their correlated results in
 order, and pauses before another provider request can start. The TUI then
@@ -1015,7 +1015,7 @@ OpenRouter returns cached tokens as a breakdown of
 and Gemini says
 [`promptTokenCount` includes cached content](https://ai.google.dev/api/generate-content).
 Those routes therefore use the primary input count. For a non-native compatible
-gateway that reports cache components separately, zerostack uses the larger
+gateway that reports cache components separately, mini-agent uses the larger
 normalized `total_tokens - output_tokens` prompt count rather than adding cache
 details blindly.
 
@@ -1035,7 +1035,7 @@ soon as a complete provider snapshot arrives.
 - **Gated by `compact_enabled`.** `compact_enabled` is the master switch. If it
   is `false`, `mid_turn_compact_threshold` is ignored and nothing compacts.
 - **Range.** A fraction in `(0.0, 1.0]`. An out-of-range value is ignored
-  (mid-turn compaction stays off) and zerostack prints a warning at startup
+  (mid-turn compaction stays off) and mini-agent prints a warning at startup
   explaining the correct form, rather than failing silently. `0.80` is a
   reasonable starting value; it leaves headroom below the
   context window while still keeping the live prompt small enough to avoid the
@@ -1467,7 +1467,7 @@ notifications) and `terminal_prompt_marks` (OSC 133) are opt-in terminal
 signals for the same transitions.
 
 Requires the `status-signals` feature (included in the default build). Pass
-`--status-socket <path>` to have zerostack emit `start`, `stop`, and
+`--status-socket <path>` to have mini-agent emit `start`, `stop`, and
 `git-conflict` events over a Unix domain socket at `<path>`, for external
 status bars or tooling to watch. This is separate from the in-TUI status bar
 above. Each connection carries one newline-terminated event. Delivery is
@@ -1539,7 +1539,7 @@ write. With no matching `external_directory` rule an external path asks (or
 follows a stricter `"*": deny`). Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
-omitted, zerostack installs built-in exact-script allows (for commands such as
+omitted, mini-agent installs built-in exact-script allows (for commands such as
 `pwd`, `git status`, and `cargo test`) plus pattern-based deny rules. When the
 default sandbox backend is unavailable and the session fell back to running
 unsandboxed (shown as `sandbox:off` in the status bar), the built-in allows for
@@ -1791,7 +1791,7 @@ permission:
 When compiled with MCP support, `mcp_servers` accepts local stdio and remote
 URL-based servers. A local stdio entry launches `command` directly and passes
 `args` without shell parsing. `command` may be a bare executable name or an
-absolute executable path; zerostack resolves platform shims such as Windows
+absolute executable path; mini-agent resolves platform shims such as Windows
 `.cmd`/`.exe` launchers to an absolute identity before spawn. Bare names are
 searched only through the absolute entries of `PATH`: empty and relative
 entries (such as `.` or `::`) are ignored, so an executable planted in the
@@ -1808,7 +1808,7 @@ of their tools.
 The child environment is empty by default. `env` supplies explicit values and
 `inherit_env` names individual parent variables that the server is allowed to
 receive; an `env` value wins if the same name appears in both. `cwd` selects an
-explicit working directory. When omitted, zerostack captures the connection
+explicit working directory. When omitted, mini-agent captures the connection
 workspace and still applies it explicitly rather than inheriting mutable
 process-global state.
 
@@ -1839,7 +1839,7 @@ schema to 16 KiB; descriptions are safely truncated, while tools with invalid
 or oversized schemas are omitted. Startup notices report each applied bound.
 A server that exceeds the time or page budget is skipped without delaying the
 others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
-(default 120); on expiry zerostack cancels the request and returns a tool error
+(default 120); on expiry mini-agent cancels the request and returns a tool error
 the model can act on instead of stalling the turn. A stdio server's protocol
 messages are newline-delimited; one line may be at most 16 MiB, and a server
 that writes more without a newline is disconnected and its process tree
@@ -1950,7 +1950,7 @@ OAuth fields (all optional):
 | `client_id`     | dynamic registration           | Pre-registered client id. When omitted, the client registers on the fly. |
 | `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://127.0.0.1:<port>/callback`.   |
 
-The first time you connect, run `/mcp login <server>` inside the TUI. zerostack
+The first time you connect, run `/mcp login <server>` inside the TUI. mini-agent
 prints an authorization URL and attempts to copy it to your clipboard; the TUI
 distinguishes a confirmed clipboard write from an unacknowledged OSC 52
 terminal request. Open the URL in a browser, approve access, and the redirect
@@ -1969,7 +1969,7 @@ The credential directory and every final, temporary, and lock file are private
 from creation: `0700`/`0600` on Unix and a protected current-user/SYSTEM DACL
 on Windows. Existing owned regular paths are repaired to that policy; symlinks,
 reparse points, wrong-type paths, oversized records, and ambiguous legacy names
-fail closed. zerostack imports an unambiguous legacy
+fail closed. mini-agent imports an unambiguous legacy
 `<data_dir>/mcp-oauth/<server>.json` only when the canonical record is absent,
 leaves the legacy source in place for recovery, and can safely retry after an
 interruption. A private, non-secret migration marker prevents an explicit logout
@@ -2006,14 +2006,14 @@ immutable built-in registrations and these exact read-only tool names:
 Exa `websearch` and `webfetch`; Context7 `get_context` and `search_docs`; and
 Grep.app `search_code` and `search_repos`. They are exempt because they only
 retrieve public web, documentation, or source-search results. The exemption is
-bound to zerostack's built-in registration identity, not the configured server
+bound to mini-agent's built-in registration identity, not the configured server
 name or URL. Custom servers—including servers using the same name or
 endpoint—follow normal MCP permission rules, and any unlisted tool on a
 built-in server does too.
 
 ## ACP (Agent Communication Protocol) configuration
 
-When compiled with the `acp` feature, zerostack can act as an ACP agent server.
+When compiled with the `acp` feature, mini-agent can act as an ACP agent server.
 The following config keys are available:
 
 | Key           | Type    | Description                                            |
@@ -2037,7 +2037,7 @@ ACP server configs (in `acp_servers`) support two transport types:
 }
 ```
 
-When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
+When `--acp` is passed without `--acp-host`, mini-agent runs in stdio mode
 (the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
 `acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
 host defaults to `127.0.0.1`.
@@ -2074,7 +2074,7 @@ TLS, or a loopback bind behind an SSH tunnel or another encrypted, mutually
 authenticated channel.
 
 Every `session/new` request must provide an existing directory as `cwd`.
-zerostack canonicalizes that directory before creating the session and binds
+mini-agent canonicalizes that directory before creating the session and binds
 the session to that directory's filesystem identity. The binding retains an
 open directory capability and opens relative context, prompt, read, write,
 edit, search, list, and JavaScript paths through it. Each operation first
@@ -2237,13 +2237,13 @@ mechanically verifies valid, missing, and replayed credential behavior.
 
 ## TOML configuration
 
-Within each search directory, zerostack picks the first existing file in
+Within each search directory, mini-agent picks the first existing file in
 this priority order: `config.toml`, `config.yaml`, `config.yml`, then
 `config.json`. `config.json` is kept for backwards compatibility — since YAML
 is a superset of JSON, legacy JSON configs parse transparently through the
 YAML reader. If none exists, a default `config.toml` is created automatically.
 
-TOML is especially well suited for zerostack's permission rules and structured
+TOML is especially well suited for mini-agent's permission rules and structured
 settings. Hyphenated keys such as `permission-regex`, `permission-allow`,
 `permission-ask`, and `permission-deny` are idiomatic in TOML and avoid deeply
 nested tables:
@@ -2308,7 +2308,7 @@ characters like `*` or `/`.
 
 ## Edit System Modes
 
-zerostack supports two edit systems, selectable via `edit_system` config key,
+mini-agent supports two edit systems, selectable via `edit_system` config key,
 `--edit-system` CLI flag, or `/editsys` slash command:
 
 ### `similarity` (default)
@@ -2474,7 +2474,7 @@ rejects the definition. See
 
 The `[prompt_to_model]` table maps prompt names to quick-model names. When
 you switch to a prompt (via `/prompt`, `.name`, `/review`, chain transitions,
-or `default_prompt` at startup), zerostack looks up the mapping and
+or `default_prompt` at startup), mini-agent looks up the mapping and
 automatically switches the active model to the corresponding quick model.
 
 Values are quick-model names — the same names defined in `[quick_models]`.
@@ -2644,7 +2644,7 @@ The `/advisor` slash command provides runtime control:
 
 ## LSP
 
-zerostack can run language servers for the files the agent edits and feed
+mini-agent can run language servers for the files the agent edits and feed
 diagnostics (errors/warnings) back into `edit`/`write` tool results — the
 agent sees type errors immediately instead of discovering them on the next
 build. An `lsp_diagnostics` tool also lets the agent query one file or the
@@ -2789,7 +2789,7 @@ Behavior notes:
   launcher's PATH (or an absolute configured path); empty and relative PATH
   entries are ignored, so a workspace-planted server binary is never selected.
   A relative `command` with a directory component (`./my-ls`) is rejected; use
-  an absolute path. zerostack never auto-installs a language server. A missing
+  an absolute path. mini-agent never auto-installs a language server. A missing
   binary is skipped with a debug log.
 - Servers start lazily on the first edit touching one of their extensions
   using the canonical session cwd for both process cwd and `rootUri`.
@@ -2817,7 +2817,7 @@ Behavior notes:
 
 ## Logging
 
-zerostack uses the `tracing` framework for structured logging. By default, only
+mini-agent uses the `tracing` framework for structured logging. By default, only
 warnings and errors are printed to stderr at the `warn` level (with the `rig`
 crate silenced). Full debug and trace output is available via CLI flags.
 In the interactive TUI, diagnostics emitted while the alternate screen is active
@@ -2830,7 +2830,7 @@ stderr. File logging remains independent of these display limits.
 ### Verbose mode (`-v` / `--verbose`)
 
 ```bash
-zerostack -v
+mini-agent -v
 ```
 
 Enables full trace-level logging to a timestamped log file below the state
@@ -2839,7 +2839,7 @@ file is named `zerostack-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
 per instance — previous runs are never overwritten.
 
 With `-v`, visible diagnostic output stays at the default `warn` level. The
-log file captures everything at `trace` level for all zerostack
+log file captures everything at `trace` level for all mini-agent
 modules.
 
 ### Custom log file (`--log-file`)

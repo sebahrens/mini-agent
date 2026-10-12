@@ -629,6 +629,7 @@ async fn start_goal_verification(
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let client = ui.client.clone();
     let session_prices = (ui.session.input_token_cost, ui.session.output_token_cost);
+    let session_cache_prices = ui.session.cache_prices();
 
     run.goal_gate_generation = run
         .goal_gate_generation
@@ -692,6 +693,7 @@ async fn start_goal_verification(
                         &resolved,
                         &cfg,
                         crate::extras::goal::judge::judge_prices(&resolved, &cfg, session_prices),
+                        session_cache_prices,
                     )
                 });
                 verdict

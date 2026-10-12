@@ -1,10 +1,10 @@
 ---
-description: "How ARCHITECTURE.md files give the zerostack agent and its subagents high-level design context about your project."
+description: "How ARCHITECTURE.md files give the mini-agent agent and its subagents high-level design context about your project."
 ---
 
 # ARCHITECTURE.md
 
-zerostack supports an optional `ARCHITECTURE.md` file that gives both the main
+mini-agent supports an optional `ARCHITECTURE.md` file that gives both the main
 agent and exploration subagents high-level design context about your project.
 
 Keep paths and feature descriptions tied to the current source tree. This
@@ -53,7 +53,7 @@ making the agent's first responses more accurate.
 
 ## Discovery and Loading
 
-zerostack loads `ARCHITECTURE.md` files using the same recursive upward search
+mini-agent loads `ARCHITECTURE.md` files using the same recursive upward search
 as `AGENTS.md`:
 
 1. **Global**: `<config-root>/agent/ARCHITECTURE.md`, e.g.
@@ -67,7 +67,7 @@ where each block came from. This lets you define organization-wide conventions
 in the global file while having project-specific architecture in each repo.
 
 At an interactive startup, if no `ARCHITECTURE.md` is found anywhere in the
-directory tree, zerostack offers to create one. Headless runs (`-p`, `--goal`
+directory tree, mini-agent offers to create one. Headless runs (`-p`, `--goal`
 with `-p`, `--loop`, `--acp`) never ask, so they cannot stop on the question or
 consume piped input:
 
@@ -79,7 +79,7 @@ If you answer yes, a template is written to the project root. The template
 includes sections for directory layout, key types/traits, control flow, data
 flow, design decisions, dependencies, and entry points.
 
-When you accept and the template is created, zerostack automatically injects
+When you accept and the template is created, mini-agent automatically injects
 a system message instructing the agent to explore the codebase and populate
 the file with a thorough architectural overview.
 

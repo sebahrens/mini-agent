@@ -288,6 +288,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
             },
             anthropic_native: false,
             prices: Some((2.0, 10.0)),
+            cache_multipliers: crate::pricing::CacheMultipliers::default(),
             model: "judge/model".into(),
         }),
         interrupted: false,

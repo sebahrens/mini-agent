@@ -531,11 +531,24 @@ impl JudgeCall {
         resolved: &ResolvedJudge,
         cfg: &crate::config::Config,
         prices: Option<(f64, f64)>,
+        session_cache_prices: crate::pricing::CachePrices,
     ) -> Option<JudgeCharge> {
         self.usage.has_values().then(|| JudgeCharge {
             usage: self.usage,
             anthropic_native: cfg.is_anthropic_native(&resolved.provider),
             prices,
+            cache_multipliers: if resolved.same_as_session {
+                session_cache_prices
+            } else {
+                crate::pricing::cache_prices_for_model(
+                    &resolved.provider,
+                    &resolved.model,
+                    cfg,
+                    Some(&resolved.label),
+                    prices.map_or(0.0, |prices| prices.0),
+                )
+            }
+            .multipliers(prices.map_or(0.0, |prices| prices.0)),
             model: compact_str::format_compact!("{}/{}", resolved.provider, resolved.model),
         })
     }
@@ -550,6 +563,7 @@ pub struct JudgeCharge {
     /// Input and output price per million tokens of the judge model, or
     /// `None` when no price is known: the tokens are recorded without cost.
     pub prices: Option<(f64, f64)>,
+    pub cache_multipliers: crate::pricing::CacheMultipliers,
     /// `provider/model` of the judge, for saying which model went unpriced.
     pub model: compact_str::CompactString,
 }
@@ -694,6 +708,8 @@ mod tests {
                     model: (*model).into(),
                     input_token_cost: 0.0,
                     output_token_cost: 0.0,
+                    cache_read_token_cost: None,
+                    cache_write_token_cost: None,
                     reserve_tokens: None,
                     temperature: None,
                     extra_body: None,
@@ -1175,7 +1191,14 @@ mod tests {
                 ..crate::event::UsageDelta::default()
             },
         };
-        let charge = call.charge(&session, &cfg, Some((3.0, 15.0))).unwrap();
+        let charge = call
+            .charge(
+                &session,
+                &cfg,
+                Some((3.0, 15.0)),
+                crate::pricing::CachePrices::default(),
+            )
+            .unwrap();
         assert_eq!(charge.usage, call.usage);
         assert!(charge.anthropic_native);
         assert_eq!(charge.prices, Some((3.0, 15.0)));
@@ -1184,7 +1207,12 @@ mod tests {
             JudgeCall::unmetered(JudgeOutcome::Unavailable {
                 reason: "down".into()
             })
-            .charge(&session, &cfg, Some((3.0, 15.0))),
+            .charge(
+                &session,
+                &cfg,
+                Some((3.0, 15.0)),
+                crate::pricing::CachePrices::default()
+            ),
             None,
             "a call that reported nothing charges nothing"
         );

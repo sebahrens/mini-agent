@@ -24,6 +24,8 @@ async fn run_probe(
     listener: &tokio::net::TcpListener,
     marker: &str,
     js: bool,
+    current_spill: &std::path::Path,
+    other_spill: &std::path::Path,
 ) -> Vec<Value> {
     let server = async {
         let mut requests = Vec::new();
@@ -59,24 +61,31 @@ async fn run_probe(
                 serde_json::from_slice::<Value>(&bytes[header_len..header_len + body_len]).unwrap(),
             );
             let mut calls = vec![
-                ("read", json!({"path":"probe.txt", "offset":0, "limit":300})),
                 (
+                    "read",
+                    "read",
+                    json!({"path":"probe.txt", "offset":0, "limit":300}),
+                ),
+                (
+                    "todo_write",
                     "todo_write",
                     json!({"todos":[{"content":marker, "status":"pending", "priority":"high"}]}),
                 ),
+                ("spill-current", "read", json!({"path": current_spill})),
+                ("spill-other", "read", json!({"path": other_spill})),
             ];
             #[cfg(unix)]
-            calls.push(("shell", json!({"command":"pwd"})));
+            calls.push(("shell", "shell", json!({"command":"pwd"})));
             if js {
-                calls.push(("js", json!({"code":format!("const prior = scratch_get('owner'); scratch_put('last_probe', {marker:?}); prior")})));
+                calls.push(("js", "js", json!({"code":format!("const prior = scratch_get('owner'); scratch_put('last_probe', {marker:?}); prior")})));
             }
             let delta = if turn == 0 {
                 let calls: Vec<_> = calls
                     .into_iter()
                     .enumerate()
-                    .map(|(index, (name, args))| {
+                    .map(|(index, (label, name, args))| {
                         json!({
-                            "index":index, "id":format!("probe-{name}"), "type":"function",
+                            "index":index, "id":format!("probe-{label}"), "type":"function",
                             "function":{"name":name, "arguments":args.to_string()}
                         })
                     })
@@ -131,27 +140,29 @@ fn tool_result<'a>(requests: &'a [Value], name: &str) -> &'a str {
         .unwrap()
 }
 
-fn assert_spill(session: &mut Session, requests: &[Value]) {
+fn assert_complete_read_and_current_spill(session: &mut Session, requests: &[Value], marker: &str) {
     let text = tool_result(requests, "read");
-    assert!(text.contains("[tool output truncated:"), "{text}");
+    assert!(!text.contains("[tool output truncated:"), "{text}");
+    assert_eq!(text.matches("ACTIVE_WORKSPACE_PAYLOAD").count(), 300);
+    assert!(text.chars().count() > crate::session::TOOL_RESULT_SAVE_THRESHOLD);
     session.add_tool_result_with_id("probe-read", "read", text);
     let Some(crate::session::PersistedToolMessage::Result {
-        artifact_path: Some(path),
+        output,
+        artifact_path,
         ..
     }) = &session.messages.last().unwrap().tool
     else {
         panic!(
-            "session {} must receive its agent's live spill",
+            "session {} must preserve its complete bounded read",
             session.name
         );
     };
-    assert_eq!(
-        std::path::Path::new(path.as_str()).parent().unwrap(),
-        crate::session::storage::tool_output_dir(&session.id)
+    assert_eq!(output.as_str(), text);
+    assert!(artifact_path.is_none());
+    assert!(tool_result(requests, "spill-current").contains(marker));
+    assert!(
+        tool_result(requests, "spill-other").contains("Permission denied (non-interactive mode)")
     );
-    let full = std::fs::read_to_string(path.as_str()).unwrap();
-    assert!(full.contains("ACTIVE_WORKSPACE_PAYLOAD"));
-    assert!(full.chars().count() > crate::session::TOOL_RESULT_SAVE_THRESHOLD);
 }
 
 #[tokio::test]
@@ -249,6 +260,27 @@ async fn exercise_replacement(provider_changed: bool) {
             .unwrap(),
     );
     let mut session = Session::new("openrouter", "outgoing-model", 128_000, "outgoing");
+    let permission = Some(Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::default(),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace.root().to_path_buf()),
+            None,
+        )
+        .unwrap(),
+    )));
+    let outgoing_spill = crate::session::storage::save_tool_output(
+        &session.id,
+        "fixture_unbounded_tool",
+        "OUTGOING_SESSION_SPILL",
+    )
+    .unwrap();
+    let unrelated_spill = crate::session::storage::save_tool_output(
+        "unrelated-session",
+        "fixture_unbounded_tool",
+        "UNRELATED_SESSION_SPILL",
+    )
+    .unwrap();
     let outgoing_id = session.id.clone();
     let outgoing_todos = session.todos.clone();
     #[cfg(feature = "js")]
@@ -287,7 +319,7 @@ async fn exercise_replacement(provider_changed: bool) {
         reasoning_enabled: &mut reasoning_enabled,
         is_running: &mut is_running,
         input: &mut input,
-        permission: &None,
+        permission: &permission,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
         sandbox: &sandbox,
@@ -298,9 +330,17 @@ async fn exercise_replacement(provider_changed: bool) {
         mcp_manager: None,
     };
     ctx.rebuild_agent().await;
-    let before = run_probe(ctx.agent.as_ref().unwrap(), &listener, "before", js).await;
+    let before = run_probe(
+        ctx.agent.as_ref().unwrap(),
+        &listener,
+        "before",
+        js,
+        &outgoing_spill,
+        &unrelated_spill,
+    )
+    .await;
     assert_eq!(before[0]["model"], "outgoing-model");
-    assert_spill(ctx.session, &before);
+    assert_complete_read_and_current_spill(ctx.session, &before, "OUTGOING_SESSION_SPILL");
 
     let incoming_provider = if provider_changed {
         "replacement-fixture"
@@ -310,6 +350,12 @@ async fn exercise_replacement(provider_changed: bool) {
     let mut incoming = Session::new(incoming_provider, "incoming-model", 256_000, "incoming");
     incoming.working_dir = root.0.join("foreign").to_string_lossy().as_ref().into();
     let incoming_id = incoming.id.clone();
+    let incoming_spill = crate::session::storage::save_tool_output(
+        &incoming_id,
+        "fixture_unbounded_tool",
+        "INCOMING_SESSION_SPILL",
+    )
+    .unwrap();
     #[cfg(feature = "js")]
     let incoming_scratch = incoming.js_session_state.for_workspace(workspace.root());
     #[cfg(feature = "js")]
@@ -317,7 +363,15 @@ async fn exercise_replacement(provider_changed: bool) {
         .put("owner".into(), "\"incoming\"".into())
         .unwrap();
     ctx.replace_session(incoming).await.unwrap();
-    let after = run_probe(ctx.agent.as_ref().unwrap(), &listener, "after", js).await;
+    let after = run_probe(
+        ctx.agent.as_ref().unwrap(),
+        &listener,
+        "after",
+        js,
+        &incoming_spill,
+        &outgoing_spill,
+    )
+    .await;
     assert_eq!(after[0]["model"], "incoming-model");
     assert_eq!(ctx.session.id, incoming_id);
     assert_ne!(ctx.session.id, outgoing_id);
@@ -357,7 +411,7 @@ async fn exercise_replacement(provider_changed: bool) {
             Some("\"after\"")
         );
     }
-    assert_spill(ctx.session, &after);
+    assert_complete_read_and_current_spill(ctx.session, &after, "INCOMING_SESSION_SPILL");
 
     let saved = serde_json::to_value(&*ctx.session).unwrap();
     let mut invalid = Session::new(
@@ -371,7 +425,15 @@ async fn exercise_replacement(provider_changed: bool) {
     assert_eq!(serde_json::to_value(&*ctx.session).unwrap(), saved);
     assert_eq!(ctx.session.provider, incoming_provider);
     assert_eq!(matches!(ctx.client, AnyClient::OpenAI(_)), provider_changed);
-    let recovered = run_probe(ctx.agent.as_ref().unwrap(), &listener, "recovered", js).await;
+    let recovered = run_probe(
+        ctx.agent.as_ref().unwrap(),
+        &listener,
+        "recovered",
+        js,
+        &incoming_spill,
+        &outgoing_spill,
+    )
+    .await;
     assert_eq!(recovered[0]["model"], "incoming-model");
     assert!(
         tool_result(&recovered, "read").contains("read blocked:"),
@@ -630,4 +692,327 @@ async fn share_requires_confirmation_before_uploading() {
     let shown = rendered_text(ctx.renderer);
     assert!(shown.contains("usage: /share"), "{shown}");
     assert!(!shown.contains("share failed"), "{shown}");
+}
+
+#[tokio::test]
+async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
+    let root = FixtureRoot(std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "mini-agent-session-selection-{}",
+        uuid::Uuid::new_v4()
+    )));
+    std::fs::create_dir_all(&root.0).unwrap();
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(root.0.join("config").into_os_string()),
+        ),
+        ("ZS_DATA_DIR", Some(root.0.join("data").into_os_string())),
+        ("ZS_STATE_DIR", Some(root.0.join("state").into_os_string())),
+        ("ZS_CACHE_DIR", Some(root.0.join("cache").into_os_string())),
+    ]);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.0).unwrap());
+    let cli = Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--api-key",
+        "unused-test-key",
+        "--no-sandbox",
+        "--no-tools",
+    ]);
+    let cfg = Config::default();
+    let mut context = ContextFiles {
+        workspace_root: workspace.root().to_path_buf(),
+        agents: None,
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    let mut client = AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .build()
+            .unwrap(),
+    );
+    let mut session = Session::new("openrouter", "current-model", 128_000, "live");
+    session.working_dir = workspace.root().to_string_lossy().into();
+    crate::session::storage::save_session(&session).unwrap();
+    let live_id = session.id.clone();
+    let mut exact = Session::new("openrouter", "current-model", 128_000, "work");
+    exact.working_dir = session.working_dir.clone();
+    exact.add_message(MessageRole::User, "exact session");
+    crate::session::storage::save_session(&exact).unwrap();
+    let mut containing = Session::new("openrouter", "current-model", 128_000, "homework");
+    containing.working_dir = session.working_dir.clone();
+    crate::session::storage::save_session(&containing).unwrap();
+    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut agent = None;
+    let mut renderer = Renderer::new().unwrap();
+    let mut input = InputEditor::new();
+    let mut terminal_guard = TerminalGuard::detached_for_test();
+    let invalidated = std::sync::atomic::AtomicBool::new(false);
+    let mut show_reasoning = false;
+    let mut reasoning_enabled = false;
+    let mut is_running = false;
+    let mut todo_tools_enabled = true;
+    #[cfg(feature = "skills")]
+    let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+    let mut ctx = SlashCtx {
+        prebuild_invalidated: &invalidated,
+        agent: &mut agent,
+        client: &mut client,
+        renderer: &mut renderer,
+        session: &mut session,
+        cli: &cli,
+        cfg: &cfg,
+        context: &mut context,
+        workspace: &workspace,
+        show_reasoning: &mut show_reasoning,
+        reasoning_enabled: &mut reasoning_enabled,
+        is_running: &mut is_running,
+        input: &mut input,
+        permission: &None,
+        ask_tx: &None,
+        todo_tools_enabled: &mut todo_tools_enabled,
+        sandbox: &sandbox,
+        terminal_guard: &mut terminal_guard,
+        #[cfg(feature = "skills")]
+        skill_services: &skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager: None,
+    };
+
+    session::handle(&["/sessions", "WORK"], &mut ctx)
+        .await
+        .unwrap();
+    assert_eq!(ctx.session.id, exact.id);
+    assert_eq!(ctx.session.messages[0].content, "exact session");
+    session::handle(&["/sessions", "delete", "work"], &mut ctx)
+        .await
+        .unwrap();
+    assert!(
+        crate::session::storage::load_session_exact(&exact.id)
+            .unwrap()
+            .is_some()
+    );
+    let lines = ctx.renderer.feed().line_count(4096);
+    let shown = ctx
+        .renderer
+        .feed()
+        .selected_text(4096, 0, lines - 1)
+        .unwrap();
+    assert!(
+        shown.contains("cannot delete the active session"),
+        "{shown}"
+    );
+    session::handle(&["/sessions", "live"], &mut ctx)
+        .await
+        .unwrap();
+    assert_eq!(ctx.session.id, live_id);
+    session::handle(&["/sessions", "delete", "WORK"], &mut ctx)
+        .await
+        .unwrap();
+    assert!(
+        crate::session::storage::load_session_exact(&exact.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::session::storage::load_session_exact(&containing.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        crate::session::storage::load_session_exact(&live_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(feature = "export")]
+#[tokio::test]
+async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
+    let root = crate::tests::OwnedTestDirectory::new("public-session-filenames");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(root.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(root.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(root.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(root.path().join("cache").into_os_string()),
+        ),
+    ]);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let cli = Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--api-key",
+        "unused-test-key",
+        "--no-sandbox",
+        "--no-tools",
+    ]);
+    let cfg = Config::default();
+    let mut context = ContextFiles {
+        workspace_root: workspace.root().to_path_buf(),
+        agents: None,
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    let mut client = AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .build()
+            .unwrap(),
+    );
+    let mut session = Session::new("openrouter", "current-model", 128_000, "prompt-model");
+    session.add_message(MessageRole::User, "exported conversation");
+    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut agent = None;
+    let mut renderer = Renderer::new().unwrap();
+    let mut input = InputEditor::new();
+    let mut terminal_guard = TerminalGuard::detached_for_test();
+    let invalidated = std::sync::atomic::AtomicBool::new(false);
+    let mut show_reasoning = false;
+    let mut reasoning_enabled = false;
+    let mut is_running = false;
+    let mut todo_tools_enabled = true;
+    #[cfg(feature = "skills")]
+    let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+    let mut ctx = SlashCtx {
+        prebuild_invalidated: &invalidated,
+        agent: &mut agent,
+        client: &mut client,
+        renderer: &mut renderer,
+        session: &mut session,
+        cli: &cli,
+        cfg: &cfg,
+        context: &mut context,
+        workspace: &workspace,
+        show_reasoning: &mut show_reasoning,
+        reasoning_enabled: &mut reasoning_enabled,
+        is_running: &mut is_running,
+        input: &mut input,
+        permission: &None,
+        ask_tx: &None,
+        todo_tools_enabled: &mut todo_tools_enabled,
+        sandbox: &sandbox,
+        terminal_guard: &mut terminal_guard,
+        #[cfg(feature = "skills")]
+        skill_services: &skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager: None,
+    };
+
+    let exported_path = workspace.root().join(format!(
+        "mini-agent-session-{}.html",
+        session::short_id(&ctx.session.id)
+    ));
+    session::handle(&["/export"], &mut ctx).await.unwrap();
+    let html = std::fs::read_to_string(&exported_path).unwrap();
+    assert!(html.contains("exported conversation"));
+    std::fs::write(&exported_path, "retain existing export").unwrap();
+    session::handle(&["/export"], &mut ctx).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&exported_path).unwrap(),
+        "retain existing export"
+    );
+    for prefix in ["zerostack", "mini-agent"] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let header = json!({"type":"session", "format":"zerostack-session-jsonl", "version":1,
+            "id":id, "name":"legacy import", "provider":"openrouter", "model":"current-model", "created_at":"2026-10-12T12:00:00Z"});
+        let message = json!({"role":"user", "content":format!("legacy transcript via {prefix}")});
+        let path = root
+            .path()
+            .join(format!("{prefix}-session-{}.jsonl", session::short_id(&id)));
+        std::fs::write(&path, format!("{header}\n{message}\n")).unwrap();
+        session::handle(&["/import", path.to_str().unwrap()], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.session.id, id);
+        assert_eq!(ctx.session.name, "legacy import");
+        assert_eq!(
+            ctx.session.messages[0].content,
+            format!("legacy transcript via {prefix}")
+        );
+        let restored = crate::session::storage::load_session_exact(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&ctx.session.messages).unwrap()
+        );
+    }
+}
+
+#[test]
+fn rewind_shell_picker_restores_only_the_command_and_keeps_redo_complete() {
+    use crate::ui::pickers::rewind::RewindOutcome;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut session = Session::new("openrouter", "test-model", 128_000, "");
+    session.add_message(MessageRole::User, "earlier prompt");
+    session.add_message(MessageRole::Assistant, "earlier answer");
+    session.add_shell_interaction("!printf héllo", "CAPTURED_OUTPUT\nwith another line");
+    session.add_message(MessageRole::User, "later prompt");
+    let before = serde_json::to_value(&session.messages).unwrap();
+    let mut input = InputEditor::new();
+    input.start_rewind_picker(crate::ui::rewind_targets(&session));
+    for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
+        assert!(input.handle_picker_key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+    let Some(RewindOutcome::Confirmed(index)) = input.take_rewind_outcome() else {
+        panic!("the actual picker must confirm the selected shell turn");
+    };
+    assert_eq!(index, 2);
+    assert_eq!(
+        super::rewind_selected_turn(&mut session, &mut input, index),
+        2
+    );
+    assert_eq!(input.buffer, "!printf héllo");
+    assert_eq!(input.cursor, input.buffer.len());
+    assert_eq!(session.messages.len(), 2);
+    assert!(session.redo());
+    assert_eq!(serde_json::to_value(&session.messages).unwrap(), before);
+    assert_eq!(super::rewind_selected_turn(&mut session, &mut input, 1), 0);
+    assert_eq!(
+        super::rewind_selected_turn(&mut session, &mut input, usize::MAX),
+        0
+    );
+    assert_eq!(input.buffer, "!printf héllo");
+    assert_eq!(super::rewind_selected_turn(&mut session, &mut input, 3), 1);
+    assert_eq!(input.buffer, "later prompt");
 }

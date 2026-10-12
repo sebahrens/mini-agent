@@ -55,6 +55,45 @@ Contributors use the debug development build described in
 
 Do not run `cargo install mini-agent`: the crates.io package with that name is an unrelated project.
 
+### Shell completions
+
+`mini-agent --completions <shell>` prints a script for the flags in your installed
+binary and exits before loading configuration, connecting to providers, or
+starting the runtime. Regenerate it after updating the binary.
+
+For Bash, save the script and source it from `~/.bashrc`:
+
+```bash
+mkdir -p ~/.local/share/bash-completion/completions
+mini-agent --completions bash > ~/.local/share/bash-completion/completions/mini-agent
+source ~/.local/share/bash-completion/completions/mini-agent
+```
+
+For Zsh, put `~/.zfunc` in `fpath` before `compinit` in `~/.zshrc`:
+
+```zsh
+mkdir -p ~/.zfunc
+mini-agent --completions zsh > ~/.zfunc/_mini-agent
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit
+compinit
+```
+
+Fish loads its completion directory automatically:
+
+```fish
+mkdir -p ~/.config/fish/completions
+mini-agent --completions fish > ~/.config/fish/completions/mini-agent.fish
+```
+
+For PowerShell, save and dot-source the script; add the dot-source line to
+your `$PROFILE` to load it in future sessions:
+
+```powershell
+mini-agent --completions powershell > "$HOME/mini-agent-completions.ps1"
+. "$HOME/mini-agent-completions.ps1"
+```
+
 The repository retains a Homebrew formula for package-channel compatibility, but no canonical
 `sebahrens` tap is published yet, so this guide does not advertise a tap command that cannot work.
 
@@ -254,9 +293,9 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `-p <msg>` | Sends a message |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
-| `-c`, `--continue` | Continue the most recent session. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
-| `-r`, `--resume` | Print recent sessions and exit, each titled by its name, an opt-in generated title (`session_title_model`), or its first message. Use `--session <id-or-name>` to load one. |
-| `--name <name>` | Set a name for the new session |
+| `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
+| `-r`, `--resume` | Print recent sessions across workspaces and exit, including the saved workspace and a title from its name, an opt-in generated title (`session_title_model`), or its first message. Use `--session <id-or-name>` to load one. |
+| `--name <name>` | Name a new session or rename the selected session with `--continue`/`--session`. Renames are saved unless `--no-session` is set. |
 | `--session <id-or-name>` | Load a session: an exact ID or exact (case-insensitive) name wins, otherwise a unique ID prefix or name substring. A session another running process owns is continued in a forked copy. |
 | `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |
 | `--no-session` | Run ephemerally without saving a session or goal round records. |

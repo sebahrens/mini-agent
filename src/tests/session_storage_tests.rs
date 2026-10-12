@@ -434,7 +434,8 @@ fn failed_turn_rollback_removes_long_tool_output_and_defers_chat_history() {
     mark_main_turn_started(&mut session, &mut run, pending);
 
     let long_output = "sensitive-tool-output".repeat(TOOL_RESULT_SAVE_THRESHOLD + 1);
-    let (_, artifact) = session.add_tool_result_with_artifact("read", &long_output);
+    let (_, artifact) =
+        session.add_tool_result_with_artifact("fixture_unbounded_tool", &long_output);
     let artifact = artifact.expect("long output should be externalized");
     assert!(artifact.exists());
     run.pending_turn

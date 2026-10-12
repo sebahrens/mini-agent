@@ -555,6 +555,36 @@ fn rewind_to_truncates_and_records_restore_point() {
 }
 
 #[test]
+fn rewind_and_redo_restore_compaction_metadata_after_restart_without_refunding_costs() {
+    let mut session = Session::new("provider", "model", 128_000, "");
+    session.add_message(MessageRole::User, "old question");
+    session.add_message(MessageRole::Assistant, "old answer");
+    session.compress("retained recap".into(), 2, 15);
+    session.add_message(MessageRole::User, "new question");
+    session.add_message(MessageRole::Assistant, "new answer");
+    session.total_cost = 0.42;
+    session.calibrated_tokens = 1200;
+    session.calibrated_msg_count = session.messages.len();
+    let records = serde_json::to_value(&session.compactions).unwrap();
+    let removed = session.messages.len();
+    assert_eq!(session.rewind_to(0), removed);
+    assert!(session.compactions.is_empty());
+    assert_eq!(session.compacted_context(), (None, 0));
+    assert_eq!(session.total_cost, 0.42);
+    let mut restored: Session =
+        serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+    assert!(restored.redo());
+    assert_eq!(
+        serde_json::to_value(&restored.compactions).unwrap(),
+        records
+    );
+    assert_eq!(restored.compacted_context(), (Some("retained recap"), 1));
+    assert_eq!(restored.total_cost, 0.42);
+    assert_eq!(restored.calibrated_tokens, 1200);
+    assert_eq!(restored.calibrated_msg_count, restored.messages.len());
+}
+
+#[test]
 fn rewind_to_at_or_past_end_is_a_noop() {
     let mut s = Session::new("openai", "gpt-4", 128000, "");
     s.add_message(MessageRole::User, "only");

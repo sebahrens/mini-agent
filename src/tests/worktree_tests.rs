@@ -3091,7 +3091,7 @@ wait
         let remote = repo.path().with_extension("ignored source cleanup remote");
         let worktree = repo
             .path()
-            .with_extension("ignored source cleanup worktree");
+            .with_extension("ignored source cleanup 'worktree");
         std::fs::write(repo.path().join(".gitignore"), ".env\ncache/\n").unwrap();
         git(repo.path(), ["add", ".gitignore"]);
         git(repo.path(), ["commit", "-m", "ignore local source data"]);
@@ -3139,6 +3139,16 @@ wait
             error.contains("untracked or ignored files"),
             "unexpected: {error}"
         );
+        assert!(error.contains("Untracked paths: []"), "{error}");
+        assert!(
+            error.contains("ignored paths: [\".env\", \"cache/\"]"),
+            "{error}"
+        );
+        assert!(error.contains("worktree remove --force --"), "{error}");
+        #[cfg(not(windows))]
+        assert!(error.contains("'\"'\"'worktree'"), "{error}");
+        #[cfg(windows)]
+        assert!(error.contains("''worktree'"), "{error}");
         assert_eq!(
             std::fs::read(worktree.join(".env")).unwrap(),
             b"SECRET=preserve\n"
@@ -3152,11 +3162,57 @@ wait
             "source branch must be retained with the refused worktree cleanup"
         );
 
-        std::fs::remove_file(worktree.join(".env")).unwrap();
-        std::fs::remove_dir_all(worktree.join("cache")).unwrap();
-        cleanup_worktree(&worktree, "feature", repo.path(), true)
+        // The explicitly chosen manual command removes the ignored contents;
+        // automatic cleanup above preserved both them and the source branch.
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("remove"),
+                OsString::from("--force"),
+                OsString::from("--"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        assert!(!worktree.exists());
+        assert!(!git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_untracked_separately_and_never_suggests_force_removal() {
+        let repo = TempRepo::new("untracked cleanup report");
+        let worktree = repo.path().with_extension("untracked cleanup worktree");
+        std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        git(repo.path(), ["add", ".gitignore"]);
+        git(repo.path(), ["commit", "-m", "ignore build output"]);
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("feature"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        std::fs::write(worktree.join("keep.txt"), "preserved").unwrap();
+        std::fs::create_dir(worktree.join("target")).unwrap();
+        std::fs::write(worktree.join("target/build.bin"), "ignored").unwrap();
+        let error = cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.contains("Untracked paths: [\"keep.txt\"]"), "{error}");
+        assert!(error.contains("ignored paths: [\"target/\"]"), "{error}");
+        assert!(!error.contains("--force"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("keep.txt")).unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("target/build.bin")).unwrap(),
+            "ignored"
+        );
+        assert!(!git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]).is_empty());
     }
 
     #[tokio::test]

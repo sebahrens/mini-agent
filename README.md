@@ -470,6 +470,15 @@ It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.
 
+The public product name, command, and new export file names are `mini-agent`.
+Existing `zerostack` user-data directories, `.zerostack` project files, `ZS_*`
+environment variables, `ZEROSTACK_PROJECT_DIR` hook envelopes, log file names,
+and `zerostack::audit::*` targets remain compatibility identifiers. JSONL
+exports retain the `zerostack-session-jsonl` schema marker; `/import` accepts
+legacy version 1 and current version 2 records regardless of the file name.
+HTML exports are standalone viewing documents; use JSONL to import a transcript.
+See the [identity and package compatibility policy](docs/agent/PUBLISHING_RELEASES.md#product-identity-matrix).
+
 ## Security
 
 Report vulnerabilities privately through

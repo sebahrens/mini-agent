@@ -1,7 +1,12 @@
 //! Tests for the single-flight submission policy that prevents orphaning a
 //! running main agent run.
 
-use crate::ui::{SubmitAction, allowed_while_running, classify_submission};
+use crate::ui::{SubmitAction, allowed_while_running};
+
+fn classify_submission(is_running: bool, text: &str) -> SubmitAction {
+    let prompts = std::collections::HashMap::from([("prompt".into(), "test".into())]);
+    crate::ui::classify_submission(is_running, text, &prompts)
+}
 
 #[test]
 fn idle_runs_immediately() {
@@ -104,4 +109,56 @@ fn disabled_loop_controls_remain_blocked_during_a_run() {
 fn running_empty_is_ignored() {
     assert_eq!(classify_submission(true, ""), SubmitAction::Ignore);
     assert_eq!(classify_submission(true, "   "), SubmitAction::Ignore);
+}
+
+#[test]
+fn dot_messages_and_shortcuts_use_the_same_grammar_idle_or_running() {
+    let prompts = std::collections::HashMap::from([("plan".into(), "test".into())]);
+    for text in [
+        ".gitignore is wrong",
+        "  .gitignore is wrong",
+        "...continue",
+        ".file.md",
+        ".unknown prompt",
+    ] {
+        assert_eq!(
+            crate::ui::dot_submission(text, &prompts),
+            crate::ui::DotSubmission::Literal,
+            "{text}"
+        );
+        assert_eq!(
+            crate::ui::classify_submission(false, text, &prompts),
+            SubmitAction::Run
+        );
+        assert_eq!(
+            crate::ui::classify_submission(true, text, &prompts),
+            SubmitAction::Queue
+        );
+    }
+    for text in [
+        ".",
+        "  .",
+        ".plan",
+        "  .plan",
+        ".plan foo",
+        "  .plan foo",
+        ".unknownprompt",
+        "  .unknownprompt",
+        ".gitignore",
+        ".plan  ",
+    ] {
+        assert_ne!(
+            crate::ui::dot_submission(text, &prompts),
+            crate::ui::DotSubmission::Literal,
+            "{text}"
+        );
+        assert_eq!(
+            crate::ui::classify_submission(false, text, &prompts),
+            SubmitAction::Run
+        );
+        assert_eq!(
+            crate::ui::classify_submission(true, text, &prompts),
+            SubmitAction::RejectWhileRunning
+        );
+    }
 }

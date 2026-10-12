@@ -1148,17 +1148,12 @@ async fn try_merge_transaction(
         if trim_line(&status.stdout).is_empty() {
             return Ok(false);
         }
-        let untracked = run_query(
-            &main_repo_path,
-            "untracked-safety-scan",
-            ["ls-files", "--others", "-z"],
-        )
-        .await?;
-        if !untracked.stdout.is_empty() {
-            return Err(
-                "merge refused because the main workspace contains untracked or ignored files; commit or stash them manually"
-                    .to_string(),
-            );
+        let extras = worktree_extra_paths(&main_repo_path).await?;
+        if !extras.is_empty() {
+            return Err(format!(
+                "merge refused because the main workspace contains untracked or ignored files; commit or stash them manually. {}",
+                extras.describe(),
+            ));
         }
         Ok(true)
     })
@@ -2202,14 +2197,11 @@ pub async fn complete_merge(state: &mut MergeState) -> Result<(), String> {
             ));
         }
     }
-    match has_untracked_or_ignored_at(&state.info.worktree_path).await {
-        Ok(false) => {}
-        Ok(true) => {
+    match worktree_extra_paths(&state.info.worktree_path).await {
+        Ok(extras) if extras.is_empty() => {}
+        Ok(extras) => {
             state.repository_guard.take();
-            return Err(
-                "source worktree contains untracked or ignored files before cleanup; worktree and source branch retained"
-                    .to_string(),
-            );
+            return Err(retained_worktree_diagnostic(&state.info, &extras));
         }
         Err(error) => {
             state.repository_guard.take();
@@ -2322,11 +2314,16 @@ pub async fn cleanup_worktree(
     ensure_worktree_is_not_process_workspace(worktree_path)?;
     let source_ref = format!("refs/heads/{branch}");
     let source_oid = revision_oid(&main_repo_path, &source_ref).await?;
-    if has_untracked_or_ignored_at(worktree_path).await? {
-        return Err(
-            "source worktree contains untracked or ignored files before cleanup; worktree and source branch retained"
-                .to_string(),
-        );
+    let extras = worktree_extra_paths(worktree_path).await?;
+    if !extras.is_empty() {
+        return Err(retained_worktree_diagnostic(
+            &WorktreeInfo {
+                branch: branch.into(),
+                worktree_path: worktree_path.into(),
+                main_repo_path: main_repo_path.clone(),
+            },
+            &extras,
+        ));
     }
     let mut remove_args = vec![OsString::from("worktree"), OsString::from("remove")];
     if force {
@@ -2459,6 +2456,97 @@ async fn has_untracked_or_ignored_at(repo_path: &Path) -> Result<bool, String> {
     )
     .await
     .map(|output| !output.stdout.is_empty())
+}
+
+struct WorktreeExtraPaths {
+    untracked: Vec<String>,
+    ignored: Vec<String>,
+}
+
+impl WorktreeExtraPaths {
+    fn is_empty(&self) -> bool {
+        self.untracked.is_empty() && self.ignored.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        // Debug quoting escapes control characters instead of rendering file
+        // names as terminal instructions. Listings show top-level directories.
+        format!(
+            "Untracked paths: {:?}; ignored paths: {:?}.",
+            self.untracked, self.ignored
+        )
+    }
+}
+
+async fn worktree_extra_paths(repo_path: &Path) -> Result<WorktreeExtraPaths, String> {
+    let untracked = run_query(
+        repo_path,
+        "worktree-untracked-paths",
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    let ignored = run_query(
+        repo_path,
+        "worktree-ignored-paths",
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )
+    .await?;
+    let paths = |bytes: &[u8]| {
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                // Scan every file: Git's --directory option omits an
+                // untracked directory obstructing an indexed regular file.
+                // Group only the display, after preserving that safety scan.
+                let end = path
+                    .iter()
+                    .position(|byte| *byte == b'/')
+                    .map_or(path.len(), |index| index + 1);
+                String::from_utf8_lossy(&path[..end]).into_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    Ok(WorktreeExtraPaths {
+        untracked: paths(&untracked.stdout),
+        ignored: paths(&ignored.stdout),
+    })
+}
+
+fn retained_worktree_diagnostic(info: &WorktreeInfo, extras: &WorktreeExtraPaths) -> String {
+    let mut message = format!(
+        "source worktree contains untracked or ignored files before cleanup; worktree and source branch retained. {}",
+        extras.describe(),
+    );
+    if extras.untracked.is_empty() {
+        match (info.main_repo_path.to_str(), info.worktree_path.to_str()) {
+            (Some(main), Some(worktree)) => {
+                let quote = |value: &str| {
+                    #[cfg(windows)]
+                    let escaped = value.replace('\'', "''");
+                    #[cfg(not(windows))]
+                    let escaped = value.replace('\'', "'\"'\"'");
+                    format!("'{escaped}'")
+                };
+                message.push_str(&format!(
+                    " After checking these ignored paths and returning to the main repository, explicitly delete their contents with: git -C {} worktree remove --force -- {}. The source branch is retained.",
+                    quote(main), quote(worktree),
+                ));
+            }
+            _ => message.push_str(" Move or delete the listed ignored paths manually, then retry cleanup; the worktree path contains non-UTF-8 bytes."),
+        }
+    } else {
+        message.push_str(" Commit or move the untracked paths before retrying cleanup.");
+    }
+    message
 }
 
 pub async fn worktree_has_uncommitted(worktree_path: &Path) -> Result<bool, String> {

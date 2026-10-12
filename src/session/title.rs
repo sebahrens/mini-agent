@@ -157,6 +157,8 @@ mod tests {
                 model: "tiny-model".into(),
                 input_token_cost: 0.0,
                 output_token_cost: 0.0,
+                cache_read_token_cost: None,
+                cache_write_token_cost: None,
                 reserve_tokens: None,
                 temperature: None,
                 extra_body: None,

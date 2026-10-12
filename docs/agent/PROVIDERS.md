@@ -1,10 +1,10 @@
 ---
-description: "Configure LLM providers in zerostack: OpenRouter, OpenAI-compatible endpoints, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
+description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
 ---
 
 # Providers
 
-zerostack supports five built-in providers and allows custom provider
+mini-agent supports five built-in providers and allows custom provider
 definitions for OpenAI-compatible endpoints.
 
 ## Built-in Providers
@@ -30,7 +30,7 @@ The model is set with `--model` or `ZS_MODEL`:
 mini-agent --provider openai --model gpt-4o
 ```
 
-When a built-in provider is selected without an explicit model, zerostack uses
+When a built-in provider is selected without an explicit model, mini-agent uses
 these catalogued defaults: `claude-sonnet-5-5` for Anthropic, `gpt-5.5` for
 OpenAI, `gemini-3.7-flash` for Gemini/Google, `deepseek/deepseek-v4-pro` for OpenRouter,
 and `llama3.1` for Ollama. Direct-provider entries in the
@@ -51,7 +51,7 @@ An explicit `--model` or `/model` selection still overrides these defaults.
 
 ## Custom Providers
 
-Custom providers let you point zerostack at any OpenAI-compatible API (vLLM,
+Custom providers let you point mini-agent at any OpenAI-compatible API (vLLM,
 LiteLLM, Ollama, local models, enterprise gateways, etc.). Define them under
 the `custom_providers` key in the config file:
 
@@ -179,30 +179,47 @@ configured separately, in the `[reasoning]` config section — see
 
 ## Prompt caching
 
-zerostack enables prompt caching automatically where the underlying rig provider supports it. The behavior depends on which provider backs the model you choose.
+mini-agent enables prompt caching automatically where the underlying rig provider supports it. The behavior depends on which provider backs the model you choose.
 
-### Automatic — no zerostack action
+Anthropic-native cost accounting uses the model's cache-read and five-minute
+cache-write prices from the embedded catalog. For example, Fable 5.1 cache
+reads cost $0.25/M tokens, Opus 5.5 $0.20/M, and Sonnet 5.5 $0.10/M, as listed
+in [Anthropic's pricing reference](https://platform.claude.com/docs/en/about-claude/pricing).
+Quick models can set `cache_read_token_cost` and `cache_write_token_cost` in
+USD per million tokens. A selected alias's explicit cache prices win per tier;
+an absent tier inherits the catalog's cache-to-input ratio at the alias's
+configured input price. Raw model selections use catalog ratios before matching
+quick-model ratios. Missing or invalid prices fall back to 0.10x reads and
+1.25x writes; zero cache prices are valid. Saved sessions retain their resolved
+cache prices, and older sessions without these fields inherit catalog ratios.
+Headless JSON, session totals, goal judges, and side questions use the same
+model-aware billing calculation. A side question retains the prices captured
+when it started, even if the main model changes before it completes. Production
+prompt caching uses the default five-minute TTL; these rates do not describe
+the separately priced one-hour TTL.
+
+### Automatic — no mini-agent action
 
 These providers cache server-side without any markers in the request:
 
 - **OpenAI** — automatic above ~1024 tokens, 50% discount on cached input.
 - **Google Gemini 2.5+** — implicit caching, 75% discount.
 - **DeepSeek** — automatic, persistent across days, ~90% discount.
-- **xAI / Grok** — automatic, 75% discount; benefits from setting an `x-grok-conv-id` header which zerostack does not currently send.
+- **xAI / Grok** — automatic, 75% discount; benefits from setting an `x-grok-conv-id` header which mini-agent does not currently send.
 - **Moonshot, Groq (Kimi K2)** — automatic.
 
-For these providers, zerostack passes through to rig without additional configuration.
+For these providers, mini-agent passes through to rig without additional configuration.
 
-### Explicitly enabled by zerostack
+### Explicitly enabled by mini-agent
 
-These providers require `cache_control` markers; zerostack adds them via rig's `.with_prompt_caching()`:
+These providers require `cache_control` markers; mini-agent adds them via rig's `.with_prompt_caching()`:
 
 - **Anthropic (direct API)** — marks system prompt, the final tool definition, and the last message. All three breakpoints contribute to cumulative savings as the conversation grows.
-- **Claude via OpenRouter** — marks both the system prompt and the last user/tool message. The latter advances the cache boundary as the conversation grows, so prior turns and tool results are reused instead of re-billed. For `anthropic/*` model IDs, zerostack also pins `provider.order = ["Anthropic"]` with `allow_fallbacks: true`, because Bedrock and Vertex AI silently drop `cache_control` markers.
+- **Claude via OpenRouter** — marks both the system prompt and the last user/tool message. The latter advances the cache boundary as the conversation grows, so prior turns and tool results are reused instead of re-billed. For `anthropic/*` model IDs, mini-agent also pins `provider.order = ["Anthropic"]` with `allow_fallbacks: true`, because Bedrock and Vertex AI silently drop `cache_control` markers.
 
 ### Empirical impact
 
-Measured on Sonnet 4.6, second turn of a tool-heavy session (grep + read across the zerostack repo, ~6k-token system prompt including AGENTS.md and ARCHITECTURE.md):
+Measured on Sonnet 4.6, second turn of a tool-heavy session (grep + read across the mini-agent repo, ~6k-token system prompt including AGENTS.md and ARCHITECTURE.md):
 
 | Configuration               | turn 2 cost | reduction |
 | --------------------------- | ----------: | --------: |
@@ -213,7 +230,7 @@ Measured on Sonnet 4.6, second turn of a tool-heavy session (grep + read across 
 Projected monthly cost at 50 such turns per working day: $204 (baseline) → $26 (Anthropic direct) or $29 (OpenRouter Claude). The two cached paths are within ~$3/month of each other.
 
 Rig 0.40 marks the OpenRouter system block but not the conversation tail. For
-`anthropic/*` models, zerostack also sends OpenRouter's top-level
+`anthropic/*` models, mini-agent also sends OpenRouter's top-level
 `cache_control = { type = "ephemeral" }`; OpenRouter then advances the boundary
 to the last cacheable block on both streaming and non-streaming requests. Other
 OpenRouter models keep their provider-native caching behavior.

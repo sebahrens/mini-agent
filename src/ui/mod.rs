@@ -701,13 +701,84 @@ pub(crate) fn rewind_targets(session: &Session) -> Vec<(usize, String)> {
         .enumerate()
         .filter(|(_, m)| m.role == MessageRole::User)
         .map(|(idx, m)| {
-            let preview: String = m.content.chars().take(80).collect();
+            let text = crate::session::shell_interaction_command(&m.content)
+                .map(|command| format!("[shell] {command}"))
+                .unwrap_or_else(|| m.content.to_string());
+            let preview: String = text.chars().take(80).collect();
             (idx, preview.replace('\n', " "))
         })
         .collect()
 }
 
-pub(crate) fn classify_submission(is_running: bool, text: &str) -> SubmitAction {
+#[cfg(test)]
+mod rewind_target_tests {
+    use super::*;
+
+    #[test]
+    fn rewind_targets_label_shell_commands_without_captured_output() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "");
+        session.add_message(MessageRole::User, "ordinary\nprompt");
+        session.add_message(MessageRole::Assistant, "answer");
+        session.add_shell_interaction("!printf héllo", "CAPTURED_SHELL_TRANSCRIPT");
+        assert_eq!(
+            rewind_targets(&session),
+            vec![
+                (0, "ordinary prompt".into()),
+                (2, "[shell] !printf héllo".into()),
+            ]
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DotSubmission<'a> {
+    Literal,
+    Picker,
+    Switch(&'a str),
+    OneShot { prompt: &'a str, message: &'a str },
+    Unknown(&'a str),
+}
+
+/// Share the dot shortcut grammar between the busy gate and its idle handler.
+/// Unknown names with a message, filenames and ellipses are ordinary text;
+/// an unknown bare identifier remains a useful prompt-typo diagnostic.
+pub(crate) fn dot_submission<'a>(
+    text: &'a str,
+    prompts: &std::collections::HashMap<String, String>,
+) -> DotSubmission<'a> {
+    let Some(after_dot) = text.trim_start().strip_prefix('.') else {
+        return DotSubmission::Literal;
+    };
+    let after_dot = after_dot.trim();
+    if after_dot.is_empty() {
+        return DotSubmission::Picker;
+    }
+    let (prompt, message) = after_dot
+        .split_once(char::is_whitespace)
+        .map(|(prompt, message)| (prompt, message.trim()))
+        .unwrap_or((after_dot, ""));
+    if prompts.contains_key(prompt) {
+        if message.is_empty() {
+            DotSubmission::Switch(prompt)
+        } else {
+            DotSubmission::OneShot { prompt, message }
+        }
+    } else if message.is_empty()
+        && prompt
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        DotSubmission::Unknown(prompt)
+    } else {
+        DotSubmission::Literal
+    }
+}
+
+pub(crate) fn classify_submission(
+    is_running: bool,
+    text: &str,
+    prompts: &std::collections::HashMap<String, String>,
+) -> SubmitAction {
     // Whitespace-only input is never a prompt: providers reject it.
     if text.trim().is_empty() {
         return SubmitAction::Ignore;
@@ -720,7 +791,10 @@ pub(crate) fn classify_submission(is_running: bool, text: &str) -> SubmitAction 
     let t = text.trim_start();
     if t.is_empty() {
         SubmitAction::Ignore
-    } else if t.starts_with('/') || t.starts_with('.') || t.starts_with('!') {
+    } else if t.starts_with('/')
+        || t.starts_with('!')
+        || dot_submission(text, prompts) != DotSubmission::Literal
+    {
         SubmitAction::RejectWhileRunning
     } else {
         SubmitAction::Queue
@@ -1294,7 +1368,7 @@ pub(crate) fn context_exhausted_report(
         format!("  reserved for response ....... {reserve} tokens"),
         format!("  kept-recent budget .......... {keep_recent} tokens"),
         String::new(),
-        "This model and context-window combination is too small to run zerostack's \
+        "This model and context-window combination is too small to run mini-agent's \
          agentic loop on this task. To proceed you can:"
             .to_string(),
         "  - increase context_window (and the model server's real KV cache) so the \

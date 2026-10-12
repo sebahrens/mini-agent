@@ -130,6 +130,9 @@ sandbox tests.
 | Release assets | binary archives plus `mini-agent-vX.Y.Z-source.tar.gz` | Binary archives carry the executable, GPL text, modification notice, and source directions; the same release carries vendored Corresponding Source. |
 | AUR, Conda, and Homebrew recipe names | `zerostack-bin`, `zerostack`, and `zerostack.rb` | Retained only as package-channel compatibility names; each installs `mini-agent`. |
 | Persisted data, project policy, and hook environment | `zerostack`, `.zerostack`, and `ZEROSTACK_*` | Stable user-data compatibility contract; release-coordinate changes must not migrate or rename it. |
+| CLI environment, logs, and audit targets | `ZS_*`, `zerostack-*.log`, `zerostack::audit::*` | Retained compatibility identifiers; prose and executable examples use `mini-agent`. |
+| New HTML export and share file names | `mini-agent-session-<id>.html` | Public product name. HTML is a viewing format; session import uses JSONL or native JSON and does not restrict file names. |
+| JSONL session schema | `zerostack-session-jsonl` | Version 1 remains accepted alongside version 2. Existing exports require no rename or data migration. |
 
 ## Supported distribution surfaces
 

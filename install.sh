@@ -578,3 +578,5 @@ else
         echo "'hash -r' or open a new shell."
     fi
 fi
+
+echo "Shell completions: mini-agent --completions <shell> (bash, zsh, fish, powershell)"

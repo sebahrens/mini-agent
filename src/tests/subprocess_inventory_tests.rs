@@ -1567,6 +1567,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    ("src/pricing.rs", "output", 2, "NON-PROCESS"),
+    (
+        "src/ui/slash/session_restore_tests.rs",
+        "assert_eq!(output.as_str(), text);",
+        1,
+        "NON-PROCESS",
+    ),
     // Bounded read/replay and file-search regression outputs are strings.
     (
         "src/agent/runner.rs",
@@ -2630,6 +2637,29 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // These assertions compare mathematical output-token prices and a
+    // persisted tool-result string. Their full macro identities are bound;
+    // none of the receivers is a process builder or launches a command.
+    (
+        "src/pricing.rs",
+        &[
+            (
+                "3da7304e195dea8a708395cd9199725b7a4fc1475efb98d3b4c32caa595d770e",
+                1,
+            ),
+            (
+                "1374c30aaf4360bcbc3879e64ef7812293fefd8cdc85ddbbeefa5a39784561b5",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/ui/slash/session_restore_tests.rs",
+        &[(
+            "1d4fc664e3aae9cd30ae42c11543cc637c3e381962a3d6fba1aa27563788b516",
+            1,
+        )],
+    ),
     (
         "src/session/mod.rs",
         &[(

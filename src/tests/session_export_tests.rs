@@ -31,6 +31,171 @@ fn jsonl_round_trip_preserves_messages() {
     }
 }
 
+fn compacted_session_with_provider_reasoning() -> Session {
+    let mut session = Session::new("openai", "gpt-test", 128_000, "");
+    session.add_message(MessageRole::User, "earlier task");
+    session.add_message(MessageRole::Assistant, "earlier response");
+    session.compress("retained prior work".into(), 2, 12);
+    session.add_message(MessageRole::User, "read the file");
+    session.add_tool_call_with_id(
+        "call_visible",
+        "read",
+        &serde_json::json!({"path":"file.txt"}),
+    );
+    session.add_tool_result_with_id("call_visible", "read", "file contents");
+    session.record_tool_call_provenance(
+        "call_visible",
+        crate::session::PersistedCallProvenance {
+            provider_item_id: Some("fc_visible".into()),
+            provider_call_id: Some("call_visible".into()),
+            reasoning: vec![crate::session::PersistedReasoning {
+                id: Some("rs_visible".into()),
+                blocks: vec![crate::session::PersistedReasoningBlock::Encrypted {
+                    data: "opaque-reasoning".into(),
+                }],
+            }],
+        },
+    );
+    session.add_message(MessageRole::Assistant, "finished");
+    session.generated_title = Some("A generated session title".into());
+    session.total_cost = 0.125;
+    session
+        .permission_allowlist
+        .push(crate::session::PermissionAllowEntry {
+            tool: "write".into(),
+            pattern: "**".into(),
+        });
+    session
+}
+
+#[test]
+fn jsonl_roundtrip_restores_compaction_provenance_title_and_actual_model_history() {
+    use rig::completion::Message;
+    use rig::message::AssistantContent;
+    let session = compacted_session_with_provider_reasoning();
+    let jsonl = session_to_jsonl(&session).unwrap();
+    let header: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    assert_eq!(header["version"], 2);
+    assert!(header.get("permission_allowlist").is_none());
+    assert!(header.get("rewind_undo").is_none());
+    let current = Session::new("current", "current", 1000, "");
+    let restored = crate::ui::slash::parse_imported_session(
+        &jsonl,
+        &current,
+        &crate::config::Config::default(),
+        std::path::Path::new("active-workspace"),
+    )
+    .unwrap();
+    assert_eq!(restored.compactions.len(), 1);
+    assert_eq!(
+        restored.compacted_context(),
+        (Some("retained prior work"), 1)
+    );
+    assert_eq!(restored.generated_title, session.generated_title);
+    assert_eq!(restored.list_title(), "A generated session title");
+    assert_eq!(restored.tool_call_provenance, session.tool_call_provenance);
+    assert_eq!(restored.total_cost, session.total_cost);
+    assert!(restored.permission_allowlist.is_empty());
+    assert!(restored.rewind_undo.is_none());
+    #[cfg(feature = "memory")]
+    assert_eq!(
+        restored.active_compaction_ref(),
+        session.active_compaction_ref()
+    );
+    let history = crate::agent::runner::convert_history(&restored);
+    assert_eq!(
+        serde_json::to_value(&history).unwrap(),
+        serde_json::to_value(crate::agent::runner::convert_history(&session)).unwrap()
+    );
+    let first = serde_json::to_string(&history[0]).unwrap();
+    assert!(first.contains("[Recap of my prior work"), "{first}");
+    assert!(first.contains("retained prior work"), "{first}");
+    let call_items: Vec<_> = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. }
+                if content
+                    .iter()
+                    .any(|item| matches!(item, AssistantContent::ToolCall(_))) =>
+            {
+                Some(content)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(call_items.len(), 1);
+    let items: Vec<_> = call_items[0].iter().collect();
+    let [
+        AssistantContent::Reasoning(reasoning),
+        AssistantContent::ToolCall(call),
+    ] = items.as_slice()
+    else {
+        panic!("expected native reasoning immediately before its call: {items:?}");
+    };
+    assert_eq!(reasoning.id.as_deref(), Some("rs_visible"));
+    assert_eq!(call.id, "fc_visible");
+    assert_eq!(call.call_id.as_deref(), Some("call_visible"));
+}
+
+#[test]
+fn jsonl_roundtrip_excludes_concealed_redo_and_rejects_foreign_replay_metadata() {
+    let mut session = compacted_session_with_provider_reasoning();
+    session.rewind_to(0);
+    assert!(session.rewind_undo.is_some());
+    let jsonl = session_to_jsonl(&session).unwrap();
+    assert!(!jsonl.contains("retained prior work"));
+    assert!(!jsonl.contains("opaque-reasoning"));
+    let mut header: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+    // Even fields injected by another exporter cannot grant permissions or
+    // restore history absent from the visible transcript.
+    header["permission_allowlist"] = serde_json::json!([{"tool":"write","pattern":"**"}]);
+    header["rewind_undo"] = serde_json::to_value(&session.rewind_undo).unwrap();
+    header["compactions"] =
+        serde_json::to_value(&compacted_session_with_provider_reasoning().compactions).unwrap();
+    header["tool_call_provenance"] =
+        serde_json::to_value(&compacted_session_with_provider_reasoning().tool_call_provenance)
+            .unwrap();
+    let restored = crate::ui::slash::parse_imported_session(
+        &header.to_string(),
+        &Session::new("p", "m", 1000, ""),
+        &crate::config::Config::default(),
+        std::path::Path::new("active-workspace"),
+    )
+    .unwrap();
+    assert!(restored.messages.is_empty());
+    assert!(restored.compactions.is_empty());
+    assert!(restored.tool_call_provenance.is_empty());
+    assert!(restored.permission_allowlist.is_empty());
+    assert!(restored.rewind_undo.is_none());
+
+    // A visible call cannot borrow a different call's provider identity.
+    let source = compacted_session_with_provider_reasoning();
+    let mut lines: Vec<serde_json::Value> = session_to_jsonl(&source)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[0]["tool_call_provenance"]["call_visible"]["provider_call_id"] = "call_foreign".into();
+    let tampered = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let restored = crate::ui::slash::parse_imported_session(
+        &tampered,
+        &Session::new("p", "m", 1000, ""),
+        &crate::config::Config::default(),
+        std::path::Path::new("active-workspace"),
+    )
+    .unwrap();
+    assert!(restored.tool_call_provenance.is_empty());
+    assert_eq!(restored.messages.len(), source.messages.len());
+    let history = serde_json::to_string(&crate::agent::runner::convert_history(&restored)).unwrap();
+    assert!(history.contains("call_visible"), "{history}");
+    assert!(!history.contains("call_foreign"), "{history}");
+    assert!(!history.contains("opaque-reasoning"), "{history}");
+}
+
 /// The objective an export was working toward travels with it, and an export
 /// that carries one still imports. Reading the goal record as a message failed
 /// the whole file, so exporting a session with a goal produced something the
@@ -209,14 +374,14 @@ fn session_file_detection_rejects_ambiguous_and_unsupported_schemas() {
 
     let jsonl = session_to_jsonl(&session)
         .unwrap()
-        .replacen("\"version\":1", "\"version\":2", 1);
+        .replacen("\"version\":2", "\"version\":3", 1);
     let error = parse_session_file(&jsonl)
         .err()
         .expect("unsupported version must fail");
     assert!(
         error
             .to_string()
-            .contains("unsupported JSONL session version 2")
+            .contains("unsupported JSONL session version 3")
     );
 }
 

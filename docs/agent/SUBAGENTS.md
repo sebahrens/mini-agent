@@ -1,5 +1,5 @@
 ---
-description: "Parallel read-only subagents in zerostack: the task tool, model and provider overrides, and per-agent tool limits."
+description: "Parallel read-only subagents in mini-agent: the task tool, model and provider overrides, and per-agent tool limits."
 ---
 
 # Subagents (read-only codebase exploration)
@@ -344,7 +344,7 @@ same path-containment and approval rules as the parent:
 
 The main agent's `task` tool goes through the normal permission check
 (`check_perm("task", …)`), so users can allow, ask, or deny it through the
-normal TOML/YAML/JSON zerostack configuration described in
+normal TOML/YAML/JSON mini-agent configuration described in
 [CONFIG.md](CONFIG.md#permission-config).
 
 ## Configuration
@@ -364,12 +364,16 @@ normal TOML/YAML/JSON zerostack configuration described in
 All numeric task limits must be greater than zero.
 `task_max_output_bytes` must be at least 256, leaving room for an explicit
 partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
-Cost units use the provider-reported aggregate token usage when present.
-Cache-read input is charged at one tenth of its reported token count (rounded
-up, so a non-empty hit is never free); cache-creation input remains fully
-charged. If a provider omits the aggregate total, itemized usage is used. If it
-reports no usage at all, the task tool falls back to a text-size estimate so
-unknown usage is not treated as free.
+Cost units are a token-based budget proxy, not dollar charges. Itemized usage
+is preferred: Anthropic-native input uses the selected model's cache-read and
+cache-write ratios expressed as base-input-equivalent tokens, rounded to the
+nearest token. Published ratios come from the catalog; explicit selected
+quick-model cache prices override them. Missing rates retain the 0.10x read and
+1.25x write fallback. Output and separately reported reasoning/tool-prompt
+tokens are added without a dollar-price multiplier. Reported free cache usage
+consumes zero units; a positive cache cost below one rounded unit consumes one.
+Without itemized usage, the reported aggregate total is used; absent usage
+falls back to a text-size estimate so unknown usage is not treated as free.
 
 ### Model resolution (in order of precedence)
 

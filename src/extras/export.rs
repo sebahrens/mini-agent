@@ -25,10 +25,11 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         );
     }
     let mut out = String::new();
+    let replay = ImportedReplayMetadata::from_session(session);
     let header = serde_json::json!({
         "type": "session",
         "format": "zerostack-session-jsonl",
-        "version": 1,
+        "version": 2,
         "id": session.id.as_str(),
         "name": session.name.as_str(),
         "provider": session.provider.as_str(),
@@ -43,6 +44,9 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         "total_cache_creation_input_tokens": session.total_cache_creation_input_tokens,
         "total_real_input_tokens": session.total_real_input_tokens,
         "total_cost": session.total_cost,
+        "generated_title": replay.generated_title,
+        "compactions": replay.compactions,
+        "tool_call_provenance": replay.tool_call_provenance,
     });
     let header = header.to_string();
     if header.len() > MAX_SESSION_IMPORT_LINE_BYTES {
@@ -129,6 +133,67 @@ struct JsonlSessionHeader {
     created_at: CompactString,
     #[serde(flatten)]
     totals: ImportedTotals,
+    #[serde(flatten)]
+    replay: ImportedReplayMetadata,
+}
+
+/// Transcript metadata only. Permissions, private redo payloads and process-
+/// local state are never part of the JSONL interchange schema.
+/// Provider replay identities are transcript data, never skill invocation,
+/// verification, admission or capability evidence.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ImportedReplayMetadata {
+    #[serde(default)]
+    pub generated_title: Option<CompactString>,
+    #[serde(default)]
+    pub compactions: Vec<crate::session::Compaction>,
+    #[serde(default)]
+    pub tool_call_provenance:
+        std::collections::BTreeMap<CompactString, crate::session::PersistedCallProvenance>,
+}
+
+impl ImportedReplayMetadata {
+    fn from_session(session: &Session) -> Self {
+        let call_ids: std::collections::HashSet<_> = session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::ToolCall
+                    && matches!(
+                        message.tool,
+                        Some(crate::session::PersistedToolMessage::Call { .. })
+                    )
+            })
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        Self {
+            generated_title: session.generated_title.clone(),
+            compactions: if session.compacted_context().0.is_some() {
+                session.compactions.clone()
+            } else {
+                Vec::new()
+            },
+            tool_call_provenance: session
+                .tool_call_provenance
+                .iter()
+                .filter(|(id, provenance)| {
+                    call_ids.contains(id.as_str())
+                        && provenance
+                            .provider_call_id
+                            .as_deref()
+                            .is_none_or(|call_id| call_id == id.as_str())
+                })
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn apply(&self, session: &mut Session) {
+        session.generated_title = self.generated_title.clone();
+        session.compactions = self.compactions.clone();
+        session.tool_call_provenance = self.tool_call_provenance.clone();
+        session.retain_visible_replay_metadata();
+    }
 }
 
 /// Session totals carried in the JSONL header. Every field is optional: an
@@ -256,6 +321,7 @@ pub struct JsonlSessionImport {
     pub created_at: CompactString,
     pub messages: Vec<SessionMessage>,
     pub totals: ImportedTotals,
+    pub replay: ImportedReplayMetadata,
     pub goal: Option<ImportedGoal>,
 }
 
@@ -346,7 +412,7 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
             if parsed.kind != "session" || parsed.format != "zerostack-session-jsonl" {
                 anyhow::bail!("unsupported JSONL session format on line {}", index + 1);
             }
-            if parsed.version != 1 {
+            if !matches!(parsed.version, 1 | 2) {
                 anyhow::bail!(
                     "unsupported JSONL session version {} on line {}",
                     parsed.version,
@@ -400,6 +466,7 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         created_at: header.created_at,
         messages,
         totals: header.totals,
+        replay: header.replay,
         goal,
     })
 }

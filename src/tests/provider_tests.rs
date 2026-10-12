@@ -558,6 +558,8 @@ fn model(id: &str, kind: Option<&str>) -> ModelEntry {
         kind: kind.map(|s| s.to_string()),
         input_price: None,
         output_price: None,
+        cache_read_price: None,
+        cache_write_price: None,
     }
 }
 

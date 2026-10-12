@@ -41,7 +41,9 @@ function stringifyRawInput(rawInput: unknown): string | undefined {
   try {
     return JSON.stringify(rawInput);
   } catch {
-    return String(rawInput);
+    return typeof rawInput === 'bigint'
+      ? rawInput.toString()
+      : '[input could not be serialized]';
   }
 }
 

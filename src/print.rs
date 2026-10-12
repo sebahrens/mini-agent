@@ -508,6 +508,33 @@ pub(crate) struct HeadlessPricing {
     pub anthropic_native: bool,
     pub input_token_cost: f64,
     pub output_token_cost: f64,
+    pub cache_multipliers: crate::pricing::CacheMultipliers,
+}
+
+impl HeadlessPricing {
+    pub(crate) fn from_session(session: &Session, cfg: &crate::config::Config) -> Self {
+        Self {
+            anthropic_native: cfg.is_anthropic_native(&session.provider),
+            input_token_cost: session.input_token_cost,
+            output_token_cost: session.output_token_cost,
+            cache_multipliers: session.cache_multipliers(),
+        }
+    }
+
+    pub(crate) fn cost(self, usage: Usage) -> f64 {
+        crate::pricing::estimate_cost(
+            crate::pricing::billable_input_tokens_with_multipliers(
+                self.anthropic_native,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+                self.cache_multipliers,
+            ),
+            usage.output_tokens,
+            self.input_token_cost,
+            self.output_token_cost,
+        )
+    }
 }
 
 fn parse_git_status(output: &[u8]) -> BTreeMap<String, [u8; 2]> {
@@ -677,18 +704,7 @@ pub(crate) fn render_headless_json(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let billable_input = crate::pricing::billable_input_tokens(
-        pricing.anthropic_native,
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_input_tokens,
-    );
-    let cost = crate::pricing::estimate_cost(
-        billable_input,
-        usage.output_tokens,
-        pricing.input_token_cost,
-        pricing.output_token_cost,
-    );
+    let cost = pricing.cost(usage);
     let cost = if cost.is_finite() { cost } else { 0.0 };
     serde_json::to_string(&HeadlessJsonOutput {
         result: result.to_string(),
@@ -1069,7 +1085,7 @@ fn write_output(mut writer: impl IoWrite, output: &str) -> io::Result<()> {
     }
 }
 
-/// One session in `--resume` and `/sessions`: id, time, size and model, then
+/// One session in `--resume` and `/sessions`: id, time, size, model and workspace, then
 /// its title ([`Session::list_title`]) and the tail of its last message.
 pub(crate) fn session_list_line(s: &Session) -> String {
     let last = s
@@ -1087,11 +1103,16 @@ pub(crate) fn session_list_line(s: &Session) -> String {
         format!("{title}  ")
     };
     format!(
-        "  {}  {}  {}msgs  {}  {}{}",
+        "  {}  {}  {}msgs  {}  workspace:{}  {}{}",
         short_session_id(&s.id),
         crate::ui::events::format_time(&s.updated_at),
         s.messages.len(),
         s.model,
+        if s.working_dir.is_empty() {
+            "(unbound)".into()
+        } else {
+            crate::ui::events::sanitize_output(&s.working_dir)
+        },
         title,
         last,
     )
@@ -1658,7 +1679,9 @@ mod tests {
         session.add_message(MessageRole::User, "  fix the\nflaky   parser test  ");
         session.add_message(MessageRole::Assistant, "done, the parser test passes");
         assert_eq!(session.list_title(), "fix the flaky parser test");
+        session.working_dir = "/workspace/alpha".into();
         let line = super::session_list_line(&session);
+        assert!(line.contains("workspace:/workspace/alpha"), "{line}");
         let title_at = line.find("fix the flaky parser test").expect(&line);
         let preview_at = line.find("...done, the parser").expect(&line);
         assert!(title_at < preview_at, "{line}");
@@ -1752,6 +1775,7 @@ mod tests {
             super::HeadlessPricing {
                 anthropic_native: true,
                 input_token_cost: 3.0,
+                cache_multipliers: crate::pricing::CacheMultipliers::default(),
                 output_token_cost: 15.0,
             },
             super::HeadlessStopReason::Completed,

@@ -67,6 +67,14 @@ fn main() -> anyhow::Result<ExitCode> {
     // build); here it sits directly on `main` rather than on top of the
     // runtime and startup frames, all under the 1 MiB Windows default stack.
     let cli = cli::Cli::parse();
+    if let Some(shell) = cli.completions {
+        match cli::write_completions(shell, &mut std::io::stdout().lock()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => return Err(error).context("failed to write shell completions"),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.

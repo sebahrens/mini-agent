@@ -52,6 +52,417 @@ use super::{C_PERM, apply_current_prompt_mode};
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
+/// Pricing belongs to the side request, including when the main model changes
+/// before its completion. IDs are never reused and settlement consumes once.
+#[derive(Default)]
+struct BtwPricingSnapshots {
+    next_id: u32,
+    pending: std::collections::HashMap<u32, crate::print::HeadlessPricing>,
+}
+
+impl BtwPricingSnapshots {
+    fn start(&mut self, pricing: crate::print::HeadlessPricing) -> Option<u32> {
+        if self.pending.len() >= BTW_MAX_INFLIGHT {
+            return None;
+        }
+        let next = self.next_id.checked_add(1)?;
+        let id = self.next_id;
+        self.next_id = next;
+        self.pending.insert(id, pricing);
+        Some(id)
+    }
+
+    fn take(&mut self, id: u32) -> Option<crate::print::HeadlessPricing> {
+        self.pending.remove(&id)
+    }
+
+    fn cancel_all(&mut self) {
+        self.pending.clear();
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
+        let (git_status_tx, git_status_rx) = mpsc::channel(1);
+        let (btw_tx, btw_rx) = mpsc::channel(1);
+        let (title_tx, title_rx) = mpsc::channel(1);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        App {
+            ui,
+            run: AgentRunState::default(),
+            chain: ChainState::default(),
+            slash: SlashState {
+                show_reasoning: false,
+                reasoning_enabled: false,
+                todo_tools_enabled: false,
+            },
+            renderer: Renderer::new().unwrap(),
+            input: InputEditor::new(),
+            last_branch_check: std::time::Instant::now(),
+            git_status_tx,
+            git_status_rx,
+            git_status_in_flight: false,
+            ask_rx: None,
+            #[cfg(feature = "advisor")]
+            handoff_rx: None,
+            btw_tx,
+            btw_rx,
+            title_tx,
+            title_rx,
+            title_requested_for: None,
+            btw_abort: Vec::new(),
+            btw_inflight: 0,
+            btw_pricing: BtwPricingSnapshots::default(),
+            btw_total_cost: 0.0,
+            btw_total_in: 0,
+            btw_total_out: 0,
+            user_tx,
+            user_rx,
+            tui_log_rx: None,
+            deferred_user_events: Default::default(),
+            running: Arc::new(AtomicBool::new(false)),
+            event_handle: None,
+            prebuild: None,
+            terminal_guard: TerminalGuard::detached_for_test(),
+            model_cache_generation: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod dot_command_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+
+    fn transcript(app: &App<'_>) -> Vec<String> {
+        let feed = app.renderer.feed();
+        (0..feed.block_count())
+            .filter_map(|index| feed.block_text(index).map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn actual_dot_handler_preserves_literals_and_echoes_one_shot_once() {
+        let root = crate::tests::OwnedTestDirectory::new("dot-command-handler");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config {
+            prompt_to_model: None,
+            ..Default::default()
+        };
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        context
+            .prompts
+            .insert("plan".into(), "Test plan prompt".into());
+        let original = context.active_selection();
+        let mut session = Session::new("anthropic", "test-model", 128_000, "");
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::AnyClient::Anthropic(
+                rig::providers::anthropic::Client::builder()
+                    .api_key("unused")
+                    .build()
+                    .unwrap(),
+            ),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        for literal in [
+            ".gitignore is wrong",
+            "  .gitignore is wrong",
+            "...continue",
+            ".file.md",
+            "quoted .plan foo",
+        ] {
+            let mut text = compact_str::CompactString::new(literal);
+            assert!(
+                !app.handle_dot_command(&mut text).await.unwrap(),
+                "{literal}"
+            );
+            assert_eq!(text, literal);
+            assert_eq!(app.ui.context.active_selection(), original);
+            assert!(
+                transcript(&app).is_empty(),
+                "literal handling must defer its single echo to submission"
+            );
+        }
+        for (shortcut, message) in [
+            (".plan foo", "foo"),
+            ("  .plan foo", "foo"),
+            (".plan /help", "/help"),
+            (".plan !literal", "!literal"),
+        ] {
+            app.renderer.clear_content().unwrap();
+            let mut text = compact_str::CompactString::new(shortcut);
+            assert!(!app.handle_dot_command(&mut text).await.unwrap());
+            assert_eq!(text, message);
+            assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+            assert_eq!(app.chain.dot_prompt_restore, Some(original.clone()));
+            assert!(transcript(&app).is_empty());
+            app.echo_main_submission(&text).unwrap();
+            assert_eq!(
+                transcript(&app)
+                    .iter()
+                    .filter(|line| line.starts_with("> "))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![format!("> {message}")]
+            );
+            app.ui.context.restore_selection(original.clone());
+        }
+        app.renderer.clear_content().unwrap();
+        let mut typo = compact_str::CompactString::new(".unknownprompt");
+        assert!(app.handle_dot_command(&mut typo).await.unwrap());
+        assert!(
+            transcript(&app)
+                .iter()
+                .any(|line| line == "error: unknown prompt 'unknownprompt'")
+        );
+        assert_eq!(app.ui.context.active_selection(), original);
+        let mut picker = compact_str::CompactString::new("  .");
+        assert!(app.handle_dot_command(&mut picker).await.unwrap());
+        assert_eq!(app.input.buffer, ".");
+        let mut switch = compact_str::CompactString::new(" .plan  ");
+        assert!(app.handle_dot_command(&mut switch).await.unwrap());
+        assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+        assert!(
+            transcript(&app)
+                .iter()
+                .any(|line| line == "switched to prompt 'plan'")
+        );
+        assert!(
+            app.ui.session.messages.is_empty(),
+            "command-only shortcuts never submit an empty provider message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod btw_pricing_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+
+    #[test]
+    fn actual_btw_event_handler_charges_snapshot_and_ignores_duplicate_or_cancelled_ids() {
+        let root = crate::tests::OwnedTestDirectory::new("btw-pricing-handler");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+        ]);
+        let cli = crate::cli::Cli::default();
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("anthropic", "claude-fable-5-1", 1_000_000, "");
+        session.input_token_cost = 10.0;
+        session.output_token_cost = 50.0;
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::AnyClient::Anthropic(
+                rig::providers::anthropic::Client::builder()
+                    .api_key("unused")
+                    .build()
+                    .unwrap(),
+            ),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        let id = app
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                app.ui.session,
+                app.ui.cfg,
+            ))
+            .unwrap();
+        app.btw_inflight = 1;
+        app.ui.session.model = "claude-opus-5-5".into();
+        app.ui.session.input_token_cost = 4.0;
+        app.ui.session.output_token_cost = 20.0;
+        let event = BtwEvent::Done {
+            id,
+            response: "answer".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        };
+        app.handle_btw_event(event.clone()).unwrap();
+        assert_eq!(app.btw_total_cost, 0.25);
+        assert_eq!(app.btw_inflight, 0);
+        assert!(app.btw_pricing.pending.is_empty());
+        app.handle_btw_event(event).unwrap();
+        assert_eq!(
+            app.btw_total_cost, 0.25,
+            "duplicate Done cannot charge again"
+        );
+        let cancelled = app
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                app.ui.session,
+                app.ui.cfg,
+            ))
+            .unwrap();
+        app.btw_pricing.cancel_all();
+        let active = app
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                app.ui.session,
+                app.ui.cfg,
+            ))
+            .unwrap();
+        app.btw_inflight = 1;
+        app.handle_btw_event(BtwEvent::Done {
+            id: cancelled,
+            response: "stale".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap();
+        assert_eq!(app.btw_total_cost, 0.25);
+        assert_eq!(
+            app.btw_inflight, 1,
+            "stale result cannot settle the active request"
+        );
+        app.handle_btw_event(BtwEvent::Error {
+            id: active,
+            message: "fixture failure".into(),
+        })
+        .unwrap();
+        assert_eq!(app.btw_inflight, 0);
+        assert!(app.btw_pricing.pending.is_empty());
+        app.handle_btw_event(BtwEvent::Done {
+            id: active,
+            response: "stale after error".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap();
+        assert_eq!(app.btw_total_cost, 0.25);
+        assert_eq!(
+            app.ui.session.total_cost, 0.0,
+            "side questions stay outside main accounting"
+        );
+    }
+
+    #[test]
+    fn btw_pricing_snapshot_survives_model_switch_and_settles_each_request_once() {
+        let cfg = crate::config::Config::default();
+        let mut active = Session::new("anthropic", "claude-fable-5-1", 1_000_000, "");
+        active.input_token_cost = 10.0;
+        active.output_token_cost = 50.0;
+        let mut registry = BtwPricingSnapshots::default();
+        let id = registry
+            .start(crate::print::HeadlessPricing::from_session(&active, &cfg))
+            .unwrap();
+        active.model = "claude-opus-5-5".into();
+        active.input_token_cost = 4.0;
+        active.output_token_cost = 20.0;
+        let usage = rig::completion::Usage {
+            cached_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::print::HeadlessPricing::from_session(&active, &cfg).cost(usage),
+            0.2
+        );
+        assert_eq!(registry.take(id).unwrap().cost(usage), 0.25);
+        assert!(
+            registry.take(id).is_none(),
+            "duplicate completion cannot charge twice"
+        );
+
+        let retired = registry
+            .start(crate::print::HeadlessPricing::from_session(&active, &cfg))
+            .unwrap();
+        registry.cancel_all();
+        assert!(registry.pending.is_empty());
+        let current = registry
+            .start(crate::print::HeadlessPricing::from_session(&active, &cfg))
+            .unwrap();
+        assert_ne!(current, retired);
+        assert!(
+            registry.take(retired).is_none(),
+            "stale cancelled/retired result cannot charge a current request"
+        );
+        assert_eq!(registry.take(current).unwrap().cost(usage), 0.2);
+    }
+
+    #[test]
+    fn btw_pricing_retention_is_bounded_and_ids_never_wrap() {
+        let session = Session::new("anthropic", "unknown", 1_000, "");
+        let pricing = crate::print::HeadlessPricing::from_session(
+            &session,
+            &crate::config::Config::default(),
+        );
+        let mut registry = BtwPricingSnapshots::default();
+        let ids: Vec<_> = (0..BTW_MAX_INFLIGHT)
+            .map(|_| registry.start(pricing).unwrap())
+            .collect();
+        assert!(registry.start(pricing).is_none());
+        assert_eq!(registry.pending.len(), BTW_MAX_INFLIGHT);
+        assert!(registry.take(ids[0]).is_some());
+        let next = registry.start(pricing).unwrap();
+        assert!(!ids.contains(&next));
+        registry.cancel_all();
+        registry.next_id = u32::MAX;
+        assert!(registry.start(pricing).is_none());
+        assert!(registry.pending.is_empty());
+    }
+}
+
 #[cfg(feature = "git-worktree")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorktreePromptChoice {
@@ -615,7 +1026,7 @@ pub(crate) struct App<'a> {
         std::sync::Arc<crate::agent::runner::AgentWorkScope>,
     )>,
     btw_inflight: usize,
-    btw_next_id: u32,
+    btw_pricing: BtwPricingSnapshots,
     btw_total_cost: f64,
     btw_total_in: u64,
     btw_total_out: u64,
@@ -1012,7 +1423,7 @@ impl<'a> App<'a> {
             title_requested_for: None,
             btw_abort: Vec::new(),
             btw_inflight: 0,
-            btw_next_id: 0,
+            btw_pricing: BtwPricingSnapshots::default(),
             btw_total_cost: 0.0,
             btw_total_in: 0,
             btw_total_out: 0,
@@ -1225,6 +1636,7 @@ impl<'a> App<'a> {
 
         // Retire owned work before closing the services it can still use.
         const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        self.btw_pricing.cancel_all();
         for (_, abort, task, scope) in self.btw_abort.drain(..) {
             abort.abort();
             if let Err(error) =
@@ -1418,6 +1830,7 @@ impl<'a> App<'a> {
                         self.run.is_running,
                     ) {
                         InterruptTarget::Btw => {
+                            self.btw_pricing.cancel_all();
                             for (_, _, task, scope) in self.btw_abort.drain(..) {
                                 retire_scoped_task(
                                     task,
@@ -1547,16 +1960,8 @@ impl<'a> App<'a> {
             && self.input.handle_picker_key(key)
         {
             if let Some(RewindOutcome::Confirmed(idx)) = self.input.take_rewind_outcome() {
-                let text = self
-                    .ui
-                    .session
-                    .messages
-                    .get(idx)
-                    .map(|m| m.content.to_string());
-                if self.ui.session.rewind_to(idx) > 0 {
-                    if let Some(text) = text {
-                        self.input.load_text(&text);
-                    }
+                if crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx) > 0
+                {
                     self.save_session()?;
                     render_session(
                         &mut self.renderer,
@@ -1669,7 +2074,7 @@ impl<'a> App<'a> {
                 return Ok(());
             }
 
-            match classify_submission(self.run.is_running, &text) {
+            match classify_submission(self.run.is_running, &text, &self.ui.context.prompts) {
                 super::SubmitAction::Run => {}
                 super::SubmitAction::Ignore => {
                     return Ok(());
@@ -1706,21 +2111,20 @@ impl<'a> App<'a> {
                 }
             }
 
+            let one_shot = matches!(
+                super::dot_submission(&text, &self.ui.context.prompts),
+                super::DotSubmission::OneShot { .. }
+            );
             if self.handle_dot_command(&mut text).await? {
                 return Ok(());
             }
 
-            if text.starts_with('/') {
+            if !one_shot && text.starts_with('/') {
                 self.run_slash_command(&text).await?;
-            } else if text.starts_with('!') {
+            } else if !one_shot && text.starts_with('!') {
                 self.run_bang_command(&text).await?;
             } else {
-                for line in text.lines() {
-                    let safe_line = sanitize_output(line);
-                    self.renderer
-                        .write_line(&format!("> {}", safe_line), Color::Green)?;
-                }
-                self.renderer.write_line("", Color::White)?;
+                self.echo_main_submission(&text)?;
                 self.start_main_run(&text).await?;
             }
         }
@@ -2072,7 +2476,7 @@ impl<'a> App<'a> {
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
         self.run.pending_compaction_pressure = None;
-        self.run.pending_inputs.clear();
+        self.discard_interrupted_queue();
         self.run.agent_line_started = false;
         self.run.response_buf.clear();
         self.run.response_start_block = None;
@@ -2083,7 +2487,7 @@ impl<'a> App<'a> {
             self.settle_success_transaction();
         } else {
             if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
-                self.input.load_text(&text);
+                self.restore_interrupted_prompt(&text);
             }
             let _ = self.save_session();
         }
@@ -2110,7 +2514,7 @@ impl<'a> App<'a> {
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
         self.run.pending_compaction_pressure = None;
-        self.run.pending_inputs.clear();
+        self.discard_interrupted_queue();
         let failed_prompt = (!preserve_progress)
             .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
             .flatten();
@@ -2143,11 +2547,8 @@ impl<'a> App<'a> {
             }
             self.chain.loop_label = None;
         }
-        if !self.input.buffer.is_empty() {
-            self.input.clear_buffer();
-        }
         if let Some(text) = failed_prompt {
-            self.input.load_text(&text);
+            self.restore_interrupted_prompt(&text);
         }
         if let Some(selection) = self.chain.dot_prompt_restore.take() {
             self.ui.context.restore_selection(selection);
@@ -2167,6 +2568,27 @@ impl<'a> App<'a> {
             C_ERROR,
         )?;
         Ok(())
+    }
+
+    fn restore_interrupted_prompt(&mut self, text: &str) {
+        if !self.input.buffer.is_empty() && self.input.buffer != text {
+            self.input.discard_draft();
+        }
+        self.input.load_text(text);
+    }
+
+    /// Queued prompts must not restart the agent after an interrupt. Make the
+    /// discard visible; failure cleanup remains safe if presentation also fails.
+    fn discard_interrupted_queue(&mut self) {
+        let count = self.run.pending_inputs.len();
+        self.run.pending_inputs.clear();
+        if count > 0
+            && let Err(error) = self
+                .renderer
+                .write_line(&format!("dropped {count} queued inputs"), C_TOOL)
+        {
+            tracing::warn!(%error, count, "interrupted-run queue discard could not be displayed");
+        }
     }
 
     async fn start_main_run(&mut self, text: &str) -> anyhow::Result<()> {
@@ -2282,56 +2704,55 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn echo_main_submission(&mut self, text: &str) -> anyhow::Result<()> {
+        for line in text.lines() {
+            self.renderer
+                .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
+        }
+        self.renderer.write_line("", Color::White)?;
+        Ok(())
+    }
+
     async fn handle_dot_command(
         &mut self,
         text: &mut compact_str::CompactString,
     ) -> anyhow::Result<bool> {
-        if !text.starts_with('.') {
+        let action = super::dot_submission(text, &self.ui.context.prompts);
+        if action == super::DotSubmission::Literal {
             return Ok(false);
         }
-        let after_dot = text[1..].trim_start();
-
-        for line in text.lines() {
-            let safe_line = sanitize_output(line);
-            self.renderer
-                .write_line(&format!("> {}", safe_line), Color::Green)?;
+        // A one-shot returns its message to the caller, which echoes it once.
+        if !matches!(action, super::DotSubmission::OneShot { .. }) {
+            self.echo_main_submission(text)?;
         }
-        self.renderer.write_line("", Color::White)?;
-
-        if after_dot.is_empty() {
+        if action == super::DotSubmission::Picker {
             self.input.buffer = ".".into();
             self.input.cursor = 1;
             self.input.start_dot_picker();
             return Ok(true);
         }
 
-        if let Some((prompt_name, msg)) = after_dot.split_once(char::is_whitespace) {
-            let prompt_name = prompt_name.trim();
-            let msg = msg.trim();
-            if !prompt_name.is_empty() && self.ui.context.prompts.contains_key(prompt_name) {
-                self.chain.dot_prompt_restore = Some(self.ui.context.active_selection());
-                self.ui.invalidate_prebuild();
-                apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
-                apply_prompt_model(
-                    prompt_name,
-                    &mut self.ui,
-                    &mut self.run.agent,
-                    self.slash.reasoning_enabled,
-                    &mut self.renderer,
-                )
-                .await;
-                *text = msg.to_string().into();
-                self.run.agent = None;
-                return Ok(false);
-            } else {
-                self.renderer
-                    .write_line(&format!("error: unknown prompt '{}'", prompt_name), C_ERROR)?;
-                return Ok(true);
-            }
+        if let super::DotSubmission::OneShot {
+            prompt: prompt_name,
+            message: msg,
+        } = action
+        {
+            self.chain.dot_prompt_restore = Some(self.ui.context.active_selection());
+            self.ui.invalidate_prebuild();
+            apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
+            apply_prompt_model(
+                prompt_name,
+                &mut self.ui,
+                &mut self.run.agent,
+                self.slash.reasoning_enabled,
+                &mut self.renderer,
+            )
+            .await;
+            *text = msg.to_string().into();
+            self.run.agent = None;
+            return Ok(false);
         }
-
-        let prompt_name = after_dot.trim();
-        if self.ui.context.prompts.contains_key(prompt_name) {
+        if let super::DotSubmission::Switch(prompt_name) = action {
             self.ui.invalidate_prebuild();
             apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
             apply_prompt_model(
@@ -2347,10 +2768,12 @@ impl<'a> App<'a> {
                 .write_line(&format!("switched to prompt '{}'", prompt_name), C_AGENT)?;
             self.save_session()?;
             Ok(true)
-        } else {
+        } else if let super::DotSubmission::Unknown(prompt_name) = action {
             self.renderer
                 .write_line(&format!("error: unknown prompt '{}'", prompt_name), C_ERROR)?;
             Ok(true)
+        } else {
+            unreachable!("literal, picker and one-shot dot input already returned")
         }
     }
 
@@ -2414,8 +2837,19 @@ impl<'a> App<'a> {
             )?;
             return Ok(());
         }
-        let id = self.btw_next_id;
-        self.btw_next_id = self.btw_next_id.wrapping_add(1);
+        let Some(id) = self
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                self.ui.session,
+                self.ui.cfg,
+            ))
+        else {
+            self.renderer.write_line(
+                "[btw] side request capacity or request IDs exhausted",
+                C_ERROR,
+            )?;
+            return Ok(());
+        };
         let snapshot = crate::agent::runner::build_btw_snapshot_with_tool_result_retention(
             self.ui.session,
             &self.run.turn_trace,
@@ -3027,17 +3461,16 @@ impl<'a> App<'a> {
                 cached_input_tokens,
                 cache_creation_input_tokens,
             } => {
-                self.btw_total_cost += crate::pricing::estimate_cost(
-                    crate::pricing::billable_input_tokens(
-                        self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
-                        input_tokens,
-                        cached_input_tokens,
-                        cache_creation_input_tokens,
-                    ),
+                let Some(pricing) = self.btw_pricing.take(id) else {
+                    return Ok(());
+                };
+                self.btw_total_cost += pricing.cost(rig::completion::Usage {
+                    input_tokens,
                     output_tokens,
-                    self.ui.session.input_token_cost,
-                    self.ui.session.output_token_cost,
-                );
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                    ..rig::completion::Usage::default()
+                });
                 self.btw_total_in = self.btw_total_in.saturating_add(input_tokens);
                 self.btw_total_out = self.btw_total_out.saturating_add(output_tokens);
                 self.btw_abort.retain(|(i, _, _, _)| *i != id);
@@ -3050,6 +3483,9 @@ impl<'a> App<'a> {
                 self.renderer.write_line("", Color::White)?;
             }
             BtwEvent::Error { id, message } => {
+                if self.btw_pricing.take(id).is_none() {
+                    return Ok(());
+                }
                 self.btw_abort.retain(|(i, _, _, _)| *i != id);
                 self.btw_inflight = self.btw_inflight.saturating_sub(1);
                 self.renderer.write_line(
@@ -3409,6 +3845,7 @@ impl<'a> App<'a> {
                     &info.main_repo_path,
                     self.ui.cli.resolve_no_context_files(self.ui.cfg),
                 )?;
+                self.btw_pricing.cancel_all();
                 let merge_result = retire_workspace_owners_and_complete_merge(
                     &mut self.run,
                     &mut self.btw_abort,
@@ -4093,5 +4530,202 @@ mod input_reader_lifecycle_tests {
                 "completion-1"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod interrupt_rewind_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    use crate::session::MessageRole;
+
+    #[tokio::test]
+    async fn actual_rewind_confirmation_restores_shell_command_in_editor() {
+        let root = crate::tests::OwnedTestDirectory::new("app-shell-rewind");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "test-model", 128_000, "");
+        session.add_message(MessageRole::User, "earlier prompt");
+        session.add_message(MessageRole::Assistant, "earlier answer");
+        session.add_shell_interaction("!printf héllo", "CAPTURED_SHELL_CONTENTS");
+        session.add_message(MessageRole::User, "later prompt");
+        let before = serde_json::to_value(&session.messages).unwrap();
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::create_client(
+                "openrouter",
+                Some("unused-test-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        app.input
+            .start_rewind_picker(crate::ui::rewind_targets(app.ui.session));
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
+            app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.input.buffer, "!printf héllo");
+        assert_eq!(app.ui.session.messages.len(), 2);
+        assert!(app.ui.session.redo());
+        assert_eq!(
+            serde_json::to_value(&app.ui.session.messages).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_abort_and_failure_preserve_drafts_and_report_discarded_queue() {
+        let root = crate::tests::OwnedTestDirectory::new("app-interrupt-drafts");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        for fail in [false, true] {
+            for progress in [false, true] {
+                let workspace =
+                    Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                let mut context =
+                    crate::context::load(true).for_workspace_binding(true, &workspace);
+                let mut session = Session::new("openrouter", "test-model", 128_000, "");
+                session.add_message(MessageRole::User, "earlier prompt");
+                session.add_message(MessageRole::Assistant, "earlier answer");
+                let ui = UiContext {
+                    cli: &cli,
+                    cfg: &cfg,
+                    session: &mut session,
+                    context: &mut context,
+                    workspace,
+                    client: crate::provider::create_client(
+                        "openrouter",
+                        Some("unused-test-key"),
+                        &cfg.custom_providers_map(),
+                        cfg.api_keys.as_ref(),
+                    )
+                    .unwrap(),
+                    permission: None,
+                    ask_tx: None,
+                    sandbox: crate::sandbox::Sandbox::new(false, "none"),
+                    prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+                    status_signals: None,
+                    #[cfg(feature = "skills")]
+                    skill_services: Arc::new(
+                        crate::extras::js::skills::session::SkillServiceOwner::new(),
+                    ),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager: None,
+                };
+                let mut app = fixture_app(ui);
+                let pending = PendingMainTurn::capture(app.ui.session, "interrupted prompt");
+                crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+                if progress {
+                    app.ui.session.add_tool_call_with_id(
+                        "interrupted-read",
+                        "read",
+                        &serde_json::json!({"path":"fixture.txt"}),
+                    );
+                }
+                app.input.load_text("follow-up draft héllo");
+                app.run
+                    .pending_inputs
+                    .extend(["queued first".into(), "queued second".into()]);
+                if fail {
+                    app.fail_pending_main_turn().await;
+                } else {
+                    app.abort_main_run().await.unwrap();
+                }
+                assert!(!app.run.is_running);
+                assert!(app.run.pending_inputs.is_empty());
+                app.run_queue_command("").unwrap();
+                let lines = app.renderer.feed().line_count(4096);
+                let shown = app
+                    .renderer
+                    .feed()
+                    .selected_text(4096, 0, lines - 1)
+                    .unwrap();
+                assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+                assert!(shown.contains("queue is empty"), "{shown}");
+                if progress {
+                    assert_eq!(app.input.buffer, "follow-up draft héllo");
+                    assert!(
+                        app.ui
+                            .session
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::ToolResult)
+                    );
+                } else {
+                    assert_eq!(app.input.buffer, "interrupted prompt");
+                    assert_eq!(app.ui.session.messages.len(), 2);
+                    app.input.clear_buffer();
+                    app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+                        .await
+                        .unwrap();
+                    assert_eq!(app.input.buffer, "follow-up draft héllo");
+                }
+            }
+        }
     }
 }

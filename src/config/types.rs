@@ -94,6 +94,12 @@ pub struct QuickModelConfig {
     pub input_token_cost: f64,
     #[serde(default)]
     pub output_token_cost: f64,
+    /// Optional cache prices in USD per million tokens. Absent tiers inherit
+    /// the model's catalog ratio at this alias's selected input price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve_tokens: Option<u64>,
     /// Per-model temperature override (0.0–2.0). Takes precedence over the

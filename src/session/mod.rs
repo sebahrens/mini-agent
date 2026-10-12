@@ -437,6 +437,11 @@ pub struct RewindUndo {
     calibrated_msg_count: usize,
     #[serde(default)]
     pub(crate) calibrated_tool_results_cleared: usize,
+    /// Older restore points kept this metadata in the active session instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compactions: Option<Vec<Compaction>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_provenance: Option<BTreeMap<CompactString, PersistedCallProvenance>>,
 }
 
 #[derive(Default)]
@@ -565,6 +570,10 @@ pub struct Session {
     pub input_token_cost: f64,
     #[serde(default)]
     pub output_token_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_token_cost: Option<f64>,
     pub context_window: u64,
     pub model: CompactString,
     pub provider: CompactString,
@@ -661,6 +670,29 @@ impl GitStatus {
 }
 
 impl Session {
+    pub(crate) fn set_cache_prices(&mut self, prices: crate::pricing::CachePrices) {
+        self.cache_read_token_cost = prices.read;
+        self.cache_write_token_cost = prices.write;
+    }
+
+    /// Legacy saved sessions lack cache prices. Inherit their model's catalog
+    /// ratios at the persisted input rate before using the historical fallback.
+    pub(crate) fn cache_prices(&self) -> crate::pricing::CachePrices {
+        let catalog = crate::pricing::CachePrices::from_catalog(
+            &self.provider,
+            &self.model,
+            self.input_token_cost,
+        );
+        crate::pricing::CachePrices {
+            read: self.cache_read_token_cost.or(catalog.read),
+            write: self.cache_write_token_cost.or(catalog.write),
+        }
+    }
+
+    pub(crate) fn cache_multipliers(&self) -> crate::pricing::CacheMultipliers {
+        self.cache_prices().multipliers(self.input_token_cost)
+    }
+
     pub(crate) fn cached_converted_history(
         &self,
         keep_recent_tool_results: usize,
@@ -759,6 +791,8 @@ impl Session {
             calibrated_tool_results_cleared: 0,
             input_token_cost: 0.0,
             output_token_cost: 0.0,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             context_window,
             model: CompactString::new(model),
             provider: CompactString::new(provider),
@@ -1060,9 +1094,8 @@ impl Session {
         self.mark_history_changed();
     }
 
-    /// Drop provenance for calls that are no longer in the transcript. Called
-    /// where messages are removed for good; a rewind keeps its entries so
-    /// `/redo` restores complete records.
+    /// Drop provenance for calls that are no longer in the visible transcript.
+    /// Rewinds retain removed metadata in their private restore point.
     fn prune_tool_call_provenance(&mut self) {
         if self.tool_call_provenance.is_empty() {
             return;
@@ -1070,10 +1103,30 @@ impl Session {
         let live: HashSet<&str> = self
             .messages
             .iter()
+            .filter(|message| {
+                message.role == MessageRole::ToolCall
+                    && matches!(message.tool, Some(PersistedToolMessage::Call { .. }))
+            })
             .filter_map(|message| message.tool_call_id.as_deref())
             .collect();
-        self.tool_call_provenance
-            .retain(|id, _| live.contains(id.as_str()));
+        self.tool_call_provenance.retain(|id, provenance| {
+            live.contains(id.as_str())
+                && provenance
+                    .provider_call_id
+                    .as_deref()
+                    .is_none_or(|call_id| call_id == id.as_str())
+        });
+    }
+
+    /// Replay metadata describes visible history. Removed/foreign call ids
+    /// cannot survive a cut or an external import. Historical compaction
+    /// records remain useful while their latest recap is still present.
+    pub(crate) fn retain_visible_replay_metadata(&mut self) {
+        self.prune_tool_call_provenance();
+        if self.compacted_context().0.is_none() {
+            self.compactions.clear();
+        }
+        self.mark_history_changed();
     }
 
     fn add_message_with_tool_data(
@@ -1155,6 +1208,7 @@ impl Session {
             anthropic_native,
             self.input_token_cost,
             self.output_token_cost,
+            self.cache_multipliers(),
         );
     }
 
@@ -1171,11 +1225,18 @@ impl Session {
                     charge.anthropic_native,
                     input_cost,
                     output_cost,
+                    charge.cache_multipliers,
                 );
                 true
             }
             None => {
-                self.charge_usage_delta_at(charge.usage, charge.anthropic_native, 0.0, 0.0);
+                self.charge_usage_delta_at(
+                    charge.usage,
+                    charge.anthropic_native,
+                    0.0,
+                    0.0,
+                    crate::pricing::CacheMultipliers::default(),
+                );
                 self.unpriced_judge_tokens = self.unpriced_judge_tokens.saturating_add(
                     charge
                         .usage
@@ -1193,6 +1254,7 @@ impl Session {
         anthropic_native: bool,
         input_token_cost: f64,
         output_token_cost: f64,
+        cache_multipliers: crate::pricing::CacheMultipliers,
     ) {
         self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
@@ -1213,11 +1275,12 @@ impl Session {
                     usage.cache_creation_input_tokens,
                 ));
         self.total_cost += crate::pricing::estimate_cost(
-            crate::pricing::billable_input_tokens(
+            crate::pricing::billable_input_tokens_with_multipliers(
                 anthropic_native,
                 usage.input_tokens,
                 usage.cached_input_tokens,
                 usage.cache_creation_input_tokens,
+                cache_multipliers,
             ),
             usage.output_tokens,
             input_token_cost,
@@ -1446,7 +1509,7 @@ impl Session {
                 self.calibrated_tool_results_cleared.min(remaining_results);
         }
         self.messages.truncate(new_len);
-        self.mark_history_changed();
+        self.retain_visible_replay_metadata();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
         self.read_tracker.clear();
     }
@@ -1471,6 +1534,8 @@ impl Session {
             calibrated_tokens: self.calibrated_tokens,
             calibrated_msg_count: self.calibrated_msg_count,
             calibrated_tool_results_cleared: self.calibrated_tool_results_cleared,
+            compactions: Some(self.compactions.clone()),
+            tool_call_provenance: Some(self.tool_call_provenance.clone()),
         });
         self.truncate_to(new_len);
         removed
@@ -1489,6 +1554,12 @@ impl Session {
                 } else {
                     // Compatibility with the pre-tail-only persisted shape.
                     self.messages = u.messages;
+                }
+                if let Some(compactions) = u.compactions {
+                    self.compactions = compactions;
+                }
+                if let Some(provenance) = u.tool_call_provenance {
+                    self.tool_call_provenance = provenance;
                 }
                 self.mark_history_changed();
                 self.total_estimated_tokens = u.total_estimated_tokens;
@@ -1999,6 +2070,7 @@ mod preflight_tests {
             usage,
             anthropic_native: false,
             prices: Some((2.0, 10.0)),
+            cache_multipliers: crate::pricing::CacheMultipliers::default(),
             model: "cheap/judge".into(),
         };
         assert!(session.charge_judge_call(&priced));
@@ -2023,6 +2095,62 @@ mod preflight_tests {
         assert_eq!(json["unpriced_judge_tokens"], 1_100);
         let fresh = serde_json::to_value(Session::new("openai", "big", 1, "")).unwrap();
         assert!(fresh.get("unpriced_judge_tokens").is_none());
+    }
+
+    #[test]
+    fn legacy_session_cache_rates_fall_back_by_model_and_explicit_rates_round_trip() {
+        let mut session = Session::new("anthropic", "claude-opus-5-5", 1_000_000, "");
+        session.input_token_cost = 4.0;
+        session.output_token_cost = 20.0;
+        let legacy = serde_json::to_value(&session).unwrap();
+        assert!(legacy.get("cache_read_token_cost").is_none());
+        let mut restored: Session = serde_json::from_value(legacy).unwrap();
+        let usage = crate::event::UsageDelta {
+            cached_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        restored.charge_usage_delta(usage, true);
+        assert_eq!(restored.total_cost, 0.2);
+        restored.set_cache_prices(crate::pricing::CachePrices {
+            read: Some(0.04),
+            write: Some(5.0),
+        });
+        let mut explicit: Session =
+            serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
+        assert_eq!(explicit.cache_prices().read, Some(0.04));
+        explicit.charge_usage_delta(usage, true);
+        assert!((explicit.total_cost - 0.24).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn judge_cache_charge_uses_judge_rates_even_when_main_model_differs() {
+        let cfg = crate::config::Config::default();
+        let mut main = Session::new("anthropic", "claude-fable-5-1", 1_000_000, "");
+        main.input_token_cost = 10.0;
+        main.output_token_cost = 50.0;
+        let resolved = crate::extras::goal::ResolvedJudge {
+            label: "judge".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            same_provider_as_session: true,
+            same_as_session: false,
+        };
+        let call = crate::extras::goal::judge::JudgeCall {
+            outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                reason: "fixture".into(),
+            },
+            tokens: 1_000_000,
+            usage: crate::event::UsageDelta {
+                cached_input_tokens: 1_000_000,
+                ..Default::default()
+            },
+        };
+        let charge = call
+            .charge(&resolved, &cfg, Some((4.0, 20.0)), main.cache_prices())
+            .unwrap();
+        main.charge_judge_call(&charge);
+        assert_eq!(main.total_cost, 0.2);
     }
 
     #[test]

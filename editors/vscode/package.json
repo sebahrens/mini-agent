@@ -104,10 +104,10 @@
   "devDependencies": {
     "@types/node": "20.17.30",
     "@types/vscode": "1.91.0",
-    "@typescript-eslint/eslint-plugin": "7.18.0",
-    "@typescript-eslint/parser": "7.18.0",
+    "@typescript-eslint/eslint-plugin": "8.71.2",
+    "@typescript-eslint/parser": "8.71.2",
     "@vscode/test-electron": "3.1.0",
-    "@vscode/vsce": "3.9.2",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "0.25.0",
     "eslint": "8.57.1",
     "fflate": "0.8.3",
@@ -121,6 +121,7 @@
   },
   "overrides": {
     "fast-uri": "3.1.8",
-    "qs": "6.16.0"
+    "qs": "6.16.0",
+    "source-map-js": "1.2.2"
   }
 }

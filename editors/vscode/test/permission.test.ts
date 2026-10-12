@@ -73,6 +73,21 @@ describe('toolCallInputLines', () => {
   it('handles a tool call with no content at all', () => {
     expect(toolCallInputLines({ toolCallId: 'id' })).toEqual([]);
   });
+
+  it('keeps permission details usable when raw input cannot be serialized', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const hostile = {
+      toJSON() { throw new Error('cannot serialize'); },
+      toString() { throw new Error('cannot stringify'); },
+    };
+    for (const rawInput of [circular, hostile]) {
+      expect(toolCallInputLines({ toolCallId: 'id', rawInput }))
+        .toEqual(['input: [input could not be serialized]']);
+    }
+    expect(toolCallInputLines({ toolCallId: 'id', rawInput: 42n }))
+      .toEqual(['input: 42']);
+  });
 });
 
 describe('buildPermissionDetail', () => {

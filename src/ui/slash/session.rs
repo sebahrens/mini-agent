@@ -37,7 +37,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 
 #[cfg(feature = "export")]
 async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let default_name = format!("zerostack-session-{}.html", short_id(&ctx.session.id));
+    let default_name = default_export_filename(&ctx.session.id);
     let requested = parts
         .get(1)
         .map(|p| p.trim())
@@ -74,6 +74,11 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         Err(e) => write_error(ctx.renderer, format!("export failed: {}", e)),
     }
     Ok(())
+}
+
+#[cfg(feature = "export")]
+fn default_export_filename(session_id: &str) -> String {
+    format!("mini-agent-session-{}.html", short_id(session_id))
 }
 
 #[cfg(feature = "export")]
@@ -202,7 +207,7 @@ fn read_bounded_import(path: &str) -> anyhow::Result<String> {
 }
 
 /// Imported session ids become on-disk file names and are displayed by an
-/// 8-character prefix, so only accept ids shaped like the UUIDs zerostack
+/// 8-character prefix, so only accept ids shaped like the UUIDs mini-agent
 /// generates itself (36 chars, hyphenated hex).
 #[cfg_attr(not(feature = "export"), allow(dead_code))]
 fn validate_imported_session_id(id: &str) -> anyhow::Result<()> {
@@ -216,7 +221,7 @@ fn validate_imported_session_id(id: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "export")]
-fn parse_imported_session(
+pub(crate) fn parse_imported_session(
     content: &str,
     current: &crate::session::Session,
     cfg: &crate::config::Config,
@@ -229,6 +234,8 @@ fn parse_imported_session(
             // Never accept a concealed redo payload that is absent from the
             // visible top-level history.
             session.rewind_undo = None;
+            session.permission_allowlist.clear();
+            session.retain_visible_replay_metadata();
             session.working_dir = workspace.to_string_lossy().into_owned().into();
             Ok(session)
         }
@@ -249,6 +256,7 @@ fn parse_imported_session(
                     total.saturating_add(message.estimated_tokens)
                 });
             session.messages = import.messages;
+            import.replay.apply(&mut session);
             session.mark_history_changed();
             let quick_models = crate::config::quick_models_map(cfg);
             // What this installation knows about the model wins; the window
@@ -284,6 +292,13 @@ fn parse_imported_session(
                 session.output_token_cost = output;
             }
             import.totals.apply(&mut session);
+            session.set_cache_prices(crate::pricing::cache_prices_for_model(
+                &session.provider,
+                &session.model,
+                cfg,
+                None,
+                session.input_token_cost,
+            ));
             #[cfg(feature = "goal")]
             if let Some(goal) = &import.goal {
                 let goal = goal.restore(crate::extras::goal::GoalDefaults {
@@ -323,10 +338,7 @@ pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: 
 
 #[cfg(feature = "export")]
 async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let filename = format!(
-        "zerostack-session-{}.html",
-        &ctx.session.id[..8.min(ctx.session.id.len())]
-    );
+    let filename = default_export_filename(&ctx.session.id);
     let html = crate::extras::export::session_to_html(ctx.session);
     match parts.get(1).map(|arg| arg.trim()) {
         Some("confirm") if parts.len() == 2 => {}
@@ -340,9 +352,9 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         }
     }
     let description = if ctx.session.name.is_empty() {
-        "zerostack session".to_string()
+        "mini-agent session".to_string()
     } else {
-        format!("zerostack session: {}", ctx.session.name)
+        format!("mini-agent session: {}", ctx.session.name)
     };
     match crate::extras::export::share_gist(&filename, &html, &description).await {
         Ok(url) => write_ok(ctx.renderer, format!("shared as secret gist: {}", url)),
@@ -438,10 +450,18 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     } else if parts[1] == "delete" && parts.len() >= 3 {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
-        if sessions.is_empty() {
-            write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
-        } else if sessions.len() == 1 {
-            if let Some(s) = sessions.into_iter().next() {
+        match crate::session::storage::select_session(prefix, sessions) {
+            crate::session::storage::SessionSelection::NoMatch => {
+                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+            }
+            crate::session::storage::SessionSelection::One(s) => {
+                if s.id == ctx.session.id {
+                    write_error(
+                        ctx.renderer,
+                        "cannot delete the active session; load another session first",
+                    );
+                    return Ok(());
+                }
                 let id = s.id.clone();
                 let preview = s
                     .messages
@@ -457,22 +477,25 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                     );
                 }
             }
-        } else {
-            write_ok(
-                ctx.renderer,
-                format!("multiple sessions match '{}', be more specific", prefix),
-            );
-            for s in &sessions {
-                write_result(ctx.renderer, format_session_line(s));
+            crate::session::storage::SessionSelection::Ambiguous(sessions) => {
+                write_ok(
+                    ctx.renderer,
+                    format!("multiple sessions match '{}', be more specific", prefix),
+                );
+                for s in &sessions {
+                    write_result(ctx.renderer, format_session_line(s));
+                }
             }
         }
     } else {
         let prefix = parts[1].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
-        if sessions.is_empty() {
-            write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
-        } else if sessions.len() == 1 {
-            if let Some(s) = sessions.into_iter().next() {
+        match crate::session::storage::select_session(prefix, sessions) {
+            crate::session::storage::SessionSelection::NoMatch => {
+                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+            }
+            crate::session::storage::SessionSelection::One(s) => {
+                let s = *s;
                 let msg_count = s.messages.len();
                 // Loading a session another live process owns continues in a
                 // fork rather than overwriting its turns (mini-agent-e42za).
@@ -499,13 +522,14 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 }
                 write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
             }
-        } else {
-            write_ok(
-                ctx.renderer,
-                format!("multiple sessions match '{}':", prefix),
-            );
-            for s in &sessions {
-                write_result(ctx.renderer, format_session_line(s));
+            crate::session::storage::SessionSelection::Ambiguous(sessions) => {
+                write_ok(
+                    ctx.renderer,
+                    format!("multiple sessions match '{}':", prefix),
+                );
+                for s in &sessions {
+                    write_result(ctx.renderer, format_session_line(s));
+                }
             }
         }
     }
@@ -719,7 +743,7 @@ fn mutate_and_persist_session<T>(
                 }
                 *session = previous;
                 return Err(persistence_restart_required(format!(
-                    "save failed and disk contains a different session state ({error}); the previous live state was retained without autosaving and zerostack must restart to load the authoritative disk state"
+                    "save failed and disk contains a different session state ({error}); the previous live state was retained without autosaving and mini-agent must restart to load the authoritative disk state"
                 )));
             }
             Ok(None) => {
@@ -731,7 +755,7 @@ fn mutate_and_persist_session<T>(
             Err(reconcile_error) => {
                 *session = previous;
                 return Err(persistence_restart_required(format!(
-                    "save failed ({error}); disk reconciliation also failed ({reconcile_error}); previous in-memory state was restored without autosaving and zerostack must restart before continuing"
+                    "save failed ({error}); disk reconciliation also failed ({reconcile_error}); previous in-memory state was restored without autosaving and mini-agent must restart before continuing"
                 )));
             }
         }
@@ -777,6 +801,30 @@ async fn handle_rewind(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     }
     ctx.input.start_rewind_picker(targets);
     Ok(())
+}
+
+/// Apply a confirmed user-turn selection and put its editable input back in
+/// the editor. A recorded shell turn contributes its command, never its output.
+pub(crate) fn rewind_selected_turn(
+    session: &mut crate::session::Session,
+    input: &mut crate::ui::input::InputEditor,
+    index: usize,
+) -> usize {
+    let Some(message) = session
+        .messages
+        .get(index)
+        .filter(|message| message.role == crate::session::MessageRole::User)
+    else {
+        return 0;
+    };
+    let text = crate::session::shell_interaction_command(&message.content)
+        .unwrap_or(&message.content)
+        .to_string();
+    let removed = session.rewind_to(index);
+    if removed > 0 {
+        input.load_text(&text);
+    }
+    removed
 }
 
 async fn handle_retry(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -835,6 +883,21 @@ async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
 #[cfg(all(test, feature = "export"))]
 mod import_tests {
+    #[test]
+    fn public_export_names_use_mini_agent_and_a_character_safe_id_prefix() {
+        assert_eq!(
+            super::default_export_filename("12345678-rest"),
+            "mini-agent-session-12345678.html"
+        );
+        assert_eq!(
+            super::default_export_filename("短い"),
+            "mini-agent-session-短い.html"
+        );
+        assert_eq!(
+            super::default_export_filename(""),
+            "mini-agent-session-.html"
+        );
+    }
     use super::{commit_staged_import, parse_imported_session, resolve_export_path};
     use crate::config::Config;
     use crate::extras::export::session_to_jsonl;
@@ -1000,6 +1063,12 @@ mod import_tests {
         let mut native = Session::new("native-provider", "native-model", 32_000, "native");
         native.add_message(MessageRole::User, "concealed");
         native.add_message(MessageRole::Assistant, "history");
+        native
+            .permission_allowlist
+            .push(crate::session::PermissionAllowEntry {
+                tool: "write".into(),
+                pattern: "**".into(),
+            });
         assert_eq!(native.rewind_to(0), 2);
         assert!(native.messages.is_empty());
         assert!(native.rewind_undo.is_some());
@@ -1014,6 +1083,7 @@ mod import_tests {
         .unwrap();
         assert!(imported.messages.is_empty());
         assert!(imported.rewind_undo.is_none());
+        assert!(imported.permission_allowlist.is_empty());
     }
 
     #[test]
@@ -1196,6 +1266,90 @@ mod session_persistence_tests {
             !reloaded_clear.redo(),
             "clear must invalidate the redo point"
         );
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_undoes_a_tool_bearing_turn() {
+        let snapshot = RefCell::new(None);
+        let mut session = session_with_turn();
+        session.add_message(MessageRole::User, "read and search");
+        for (id, name) in [("call-read", "read"), ("call-grep", "grep")] {
+            session.add_tool_call_with_id(id, name, &serde_json::json!({"path":"x"}));
+            session.add_tool_result_with_id(id, name, "completed");
+            session.record_tool_call_provenance(
+                id,
+                crate::session::PersistedCallProvenance {
+                    provider_item_id: Some(format!("item-{id}").into()),
+                    provider_call_id: Some(id.into()),
+                    reasoning: vec![crate::session::PersistedReasoning {
+                        id: Some(format!("reason-{id}").into()),
+                        blocks: vec![crate::session::PersistedReasoningBlock::Summary {
+                            text: "checked".into(),
+                        }],
+                    }],
+                },
+            );
+        }
+        session.add_message(MessageRole::Assistant, "done");
+        session.total_input_tokens = 42;
+        session.total_cost = 0.25;
+        session.calibrated_tokens = 1000;
+        session.calibrated_msg_count = session.messages.len();
+        let messages = serde_json::to_value(&session.messages).unwrap();
+        let provenance = session.tool_call_provenance.clone();
+        assert_eq!(
+            mutate_and_persist_session(
+                &mut session,
+                undo_session_mutation,
+                |candidate| {
+                    *snapshot.borrow_mut() = Some(serde_json::to_string(candidate)?);
+                    Ok(())
+                },
+                |_| Ok(None)
+            )
+            .unwrap(),
+            PersistedMutation::Persisted(6)
+        );
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.tool_call_provenance.is_empty());
+        assert_eq!(session.total_input_tokens, 42);
+        assert_eq!(session.total_cost, 0.25);
+        let mut restarted = reload(&snapshot);
+        assert!(restarted.redo());
+        assert_eq!(serde_json::to_value(&restarted.messages).unwrap(), messages);
+        assert_eq!(restarted.tool_call_provenance, provenance);
+        assert_eq!(restarted.calibrated_tokens, 1000);
+        assert_eq!(restarted.calibrated_msg_count, restarted.messages.len());
+        assert_eq!(restarted.total_input_tokens, 42);
+        assert_eq!(restarted.total_cost, 0.25);
+        assert!(!restarted.redo());
+    }
+
+    #[test]
+    fn slash_session_mutation_undoes_shell_and_incomplete_tool_turns() {
+        let mut session = session_with_turn();
+        session.add_shell_interaction("!echo example", "example");
+        assert_eq!(undo_session_mutation(&mut session), Some(1));
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.redo());
+        assert!(
+            session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("!echo example")
+        );
+        session.add_message(MessageRole::User, "pending turn");
+        session.add_tool_call_with_id("pending", "read", &serde_json::json!({"path":"x"}));
+        assert_eq!(undo_session_mutation(&mut session), Some(2));
+        assert_eq!(session.messages.len(), 3);
+        // A summary/assistant with no user boundary is not an exchange.
+        let mut no_user = Session::new("p", "m", 1000, "");
+        no_user.add_message(MessageRole::System, "summary");
+        no_user.add_message(MessageRole::Assistant, "unpaired");
+        assert_eq!(undo_session_mutation(&mut no_user), None);
+        assert_eq!(no_user.messages.len(), 2);
     }
 
     /// mini-agent-yjupx: /rename goes through the guarded persist: it never

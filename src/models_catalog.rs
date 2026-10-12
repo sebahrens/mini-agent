@@ -28,6 +28,10 @@ struct RawModel {
     input_price: Option<f64>,
     #[serde(default)]
     output_price: Option<f64>,
+    #[serde(default)]
+    cache_read_price: Option<f64>,
+    #[serde(default)]
+    cache_write_price: Option<f64>,
 }
 
 static CATALOG: LazyLock<HashMap<String, Vec<ModelEntry>>> =
@@ -55,6 +59,8 @@ fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
                     kind: None,
                     input_price: m.input_price,
                     output_price: m.output_price,
+                    cache_read_price: m.cache_read_price,
+                    cache_write_price: m.cache_write_price,
                 })
                 .collect();
             (provider, entries)
@@ -77,5 +83,16 @@ mod tests {
         let catalog = parse_catalog("{not valid json");
 
         assert!(catalog.is_empty());
+    }
+
+    #[test]
+    fn catalog_cache_pricing_accepts_legacy_missing_and_explicit_zero_tiers() {
+        let parsed = parse_catalog(
+            r#"{"anthropic":[{"id":"legacy","name":"legacy","context":1000,"input_price":4,"output_price":20},{"id":"priced","name":"priced","context":1000,"input_price":4,"output_price":20,"cache_read_price":0,"cache_write_price":5}]}"#,
+        );
+        assert_eq!(parsed["anthropic"][0].cache_read_price, None);
+        assert_eq!(parsed["anthropic"][0].cache_write_price, None);
+        assert_eq!(parsed["anthropic"][1].cache_read_price, Some(0.0));
+        assert_eq!(parsed["anthropic"][1].cache_write_price, Some(5.0));
     }
 }

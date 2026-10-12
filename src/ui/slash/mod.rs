@@ -13,7 +13,7 @@ pub(crate) use memory::verify_memory_editor_preservation;
 mod providers;
 pub(crate) mod review;
 mod session;
-pub(crate) use session::is_persistence_restart_required;
+pub(crate) use session::{is_persistence_restart_required, rewind_selected_turn};
 pub(crate) mod settings;
 
 #[cfg(feature = "goal")]
@@ -26,6 +26,8 @@ mod session_restore_tests;
 pub(crate) use providers::{
     cached_model_ids, model_cache_generation, resolve_model_pricing, warm_model_cache,
 };
+#[cfg(all(test, feature = "export"))]
+pub(crate) use session::parse_imported_session;
 
 use smallvec::SmallVec;
 
@@ -241,6 +243,14 @@ impl SlashCtx<'_> {
         self.session.input_token_cost = qmc.input_token_cost;
         self.session.output_token_cost = qmc.output_token_cost;
         self.session
+            .set_cache_prices(crate::pricing::cache_prices_for_model(
+                &qmc.provider,
+                &qmc.model,
+                self.cfg,
+                Some(qm_name),
+                qmc.input_token_cost,
+            ));
+        self.session
             .update_context_window(self.cfg.resolve_context_window(
                 &self.session.provider,
                 &self.session.model,
@@ -322,6 +332,14 @@ pub(crate) async fn apply_prompt_model(
     ui.session.input_token_cost = qmc.input_token_cost;
     ui.session.output_token_cost = qmc.output_token_cost;
     ui.session
+        .set_cache_prices(crate::pricing::cache_prices_for_model(
+            &qmc.provider,
+            &qmc.model,
+            ui.cfg,
+            Some(qm_name),
+            qmc.input_token_cost,
+        ));
+    ui.session
         .update_context_window(ui.cfg.resolve_context_window(
             &ui.session.provider,
             &ui.session.model,
@@ -351,29 +369,18 @@ pub(crate) fn write_error(renderer: &mut Renderer, msg: impl std::fmt::Display) 
 }
 
 pub fn undo_last(session: &mut Session) -> usize {
-    let len = session.messages.len();
-    if len == 0 {
+    let Some(start) = session
+        .messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::User)
+    else {
         return 0;
-    }
-    let removed = if session.messages[len - 1].role == MessageRole::Assistant {
-        if len >= 2 && session.messages[len - 2].role == MessageRole::User {
-            2
-        } else {
-            1
-        }
-    } else if session.messages[len - 1].role == MessageRole::User {
-        1
-    } else {
-        0
     };
     // Rewind via the session helper so the context figure tracks the shortened
     // history (subtracts the removed turn from the calibration anchor rather than
     // going stale or resetting to a cold estimate) and the cut is reversible with
     // /redo.
-    if removed > 0 {
-        session.rewind_to(len - removed);
-    }
-    removed
+    session.rewind_to(start)
 }
 
 fn summarizer_input_budget(context_window: u64, reserve: u64) -> u64 {

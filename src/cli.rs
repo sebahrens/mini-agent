@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use compact_str::CompactString;
 
 use crate::config;
@@ -24,6 +24,14 @@ pub enum OutputFormat {
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version, about = "Minimal coding agent")]
 pub struct Cli {
+    #[arg(
+        long,
+        value_enum,
+        exclusive = true,
+        help = "Print a shell completion script and exit"
+    )]
+    pub completions: Option<clap_complete::Shell>,
+
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
     pub print: bool,
 
@@ -1223,12 +1231,65 @@ fn canonical_tool_name(name: &str) -> &str {
     if name == "bash" { "shell" } else { name }
 }
 
+pub fn write_completions(
+    shell: clap_complete::Shell,
+    output: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let mut script = Vec::new();
+    clap_complete::generate(
+        shell,
+        &mut Cli::command(),
+        crate::product::PUBLIC_NAME,
+        &mut script,
+    );
+    output.write_all(&script)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{Cli, OutputFormat, default_sandbox_backend};
     use crate::config;
+
+    #[test]
+    fn shell_completion_scripts_cover_current_flags_for_every_supported_shell() {
+        use clap::ValueEnum;
+        for shell in clap_complete::Shell::value_variants() {
+            let parsed =
+                Cli::try_parse_from(["mini-agent", "--completions", &shell.to_string()]).unwrap();
+            assert_eq!(parsed.completions, Some(*shell));
+            let mut script = Vec::new();
+            super::write_completions(*shell, &mut script).unwrap();
+            let script = String::from_utf8(script).unwrap();
+            assert!(script.contains("mini-agent"), "{shell}");
+            // Fish represents long options without their leading dashes.
+            assert!(script.contains("provider"), "{shell}");
+            assert!(script.contains("completions"), "{shell}");
+            assert_eq!(
+                script.contains("js-runtime-check"),
+                cfg!(feature = "js"),
+                "{shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_completion_generation_is_an_exclusive_local_command() {
+        for args in [
+            vec!["mini-agent", "--completions", "unknown"],
+            vec!["mini-agent", "--completions", "zsh", "-p", "hello"],
+            vec![
+                "mini-agent",
+                "--completions",
+                "bash",
+                "--provider",
+                "openai",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     /// The shipped default shape: OpenRouter with the deepseek quick model,
     /// plus an Anthropic quick model.

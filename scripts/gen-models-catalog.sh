@@ -71,7 +71,9 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
   def entry: {id: .value.id, name: .value.name, context: (.value.limit.context // null)};
   def priced_entry: entry + {
     input_price: (.value.cost.input // null),
-    output_price: (.value.cost.output // null)
+    output_price: (.value.cost.output // null),
+    cache_read_price: (.value.cost.cache_read // null),
+    cache_write_price: (.value.cost.cache_write // null)
   };
   def models_of($p; $c; e): ($p.models // {}) | to_entries | map(chat($c) | e) | sort_by(.id);
   def priced_models_of($p; $c):
