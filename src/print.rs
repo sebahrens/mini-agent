@@ -1252,6 +1252,12 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     }
     append_section(&mut output, "Model", &model_entries);
 
+    append_section(
+        &mut output,
+        "System instructions",
+        &system_instruction_entries(cli),
+    );
+
     let fmt_opt = |v: Option<u64>| -> String {
         match v {
             Some(n) => n.to_string(),
@@ -1387,6 +1393,22 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     write_output(io::stdout().lock(), &output)
 }
 
+fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
+    let show = |value: Option<&str>, default: &str| {
+        value.map_or_else(|| default.to_owned(), |value| format!("{value:?}"))
+    };
+    vec![
+        (
+            "system-prompt",
+            show(cli.system_prompt.as_deref(), "built-in persona"),
+        ),
+        (
+            "append-system-prompt",
+            show(cli.append_system_prompt.as_deref(), "none"),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -1410,6 +1432,21 @@ mod tests {
         let warning = "global config c.toml: unknown config key `sandbx` is ignored (did you mean `sandbox`?)";
         append_config_warnings(&mut report, &[warning.to_string()]);
         assert_eq!(report, format!("Warnings:\n  {warning}\n\n"));
+    }
+
+    #[test]
+    fn config_system_prompt_entries_escape_terminal_controls_and_show_defaults() {
+        let defaults = super::system_instruction_entries(&crate::cli::Cli::default());
+        assert_eq!(defaults[0].1, "built-in persona");
+        assert_eq!(defaults[1].1, "none");
+        let entries = super::system_instruction_entries(&crate::cli::Cli {
+            system_prompt: Some("persona\nsecond\u{1b}[2J".into()),
+            append_system_prompt: Some("extra".into()),
+            ..Default::default()
+        });
+        assert!(entries[0].1.contains("\\n"));
+        assert!(!entries[0].1.contains('\u{1b}'));
+        assert_eq!(entries[1].1, "\"extra\"");
     }
 
     /// Every way a goal can stop has its own exit code, so an unattended

@@ -185,10 +185,18 @@ impl WorkspaceBinding {
                 .extension()
                 .is_some_and(|value| value == extension)
                 && let Some(stem) = candidate.file_stem().and_then(|value| value.to_str())
-                && let Ok(mut file) = open_file_no_follow(&directory, &name)
             {
+                let display_path = self.root().join(path).join(candidate);
+                let mut file = match open_file_no_follow(&directory, &name) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        tracing::warn!(path = %display_path.display(), %error, "could not read workspace prompt file");
+                        continue;
+                    }
+                };
                 let mut content = String::new();
-                if file.read_to_string(&mut content).is_err() {
+                if let Err(error) = file.read_to_string(&mut content) {
+                    tracing::warn!(path = %display_path.display(), %error, "could not read workspace prompt file");
                     continue;
                 }
                 files.push((stem.to_string(), content));

@@ -306,7 +306,7 @@ fn glob_to_regex(pattern: &str) -> String {
                     re.push_str("[^/]*");
                 }
             }
-            '?' => re.push('.'),
+            '?' => re.push_str("[^/]"),
             '.' => re.push_str("\\."),
             '\\' => re.push_str("\\\\"),
             '(' | ')' | '[' | ']' | '{' | '}' | '+' | '^' | '$' | '|' => {

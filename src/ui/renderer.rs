@@ -751,6 +751,13 @@ impl Renderer {
         self.status_bg = status_bg;
     }
 
+    #[cfg(test)]
+    pub(crate) fn background_colors_for_test(
+        &self,
+    ) -> (Option<Color>, Option<Color>, Option<Color>) {
+        (self.chat_bg, self.input_bg, self.status_bg)
+    }
+
     fn color(&self, color: Color) -> Color {
         resolve_color(color, self.monochrome)
     }

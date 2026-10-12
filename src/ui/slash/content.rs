@@ -251,7 +251,7 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             write_result(ctx.renderer, "usage: /theme <name>  |  /theme default");
         }
     } else if parts[1] == "default" {
-        if ctx.context.current_theme_name.is_none() {
+        if ctx.context.current_theme_name.is_none() && storage::load_theme_name().is_none() {
             write_ok(ctx.renderer, "no active theme to clear");
         } else {
             ctx.context.current_theme_name = None;
@@ -282,6 +282,13 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
     } else {
         let name = parts[1].trim();
         if let Some(content) = ctx.context.themes.get(name) {
+            if let Err(error) = crate::context::themes::apply(content, ctx.renderer) {
+                write_error(
+                    ctx.renderer,
+                    format!("could not apply theme '{}': {}", name, error),
+                );
+                return Ok(());
+            }
             ctx.context.current_theme_name = Some(name.to_string());
             if let Err(e) = storage::save_theme_name(Some(name)) {
                 write_error(
@@ -289,7 +296,6 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
                     format!("warning: theme choice not saved: {}", e),
                 );
             }
-            crate::context::themes::apply(content, ctx.renderer);
             write_ok(ctx.renderer, format!("active theme: {}", name));
         } else {
             write_error(ctx.renderer, format!("unknown theme: '{}'", name));
@@ -362,5 +368,146 @@ mod active_agent_message_tests {
         let applied = active_agent_message("reviewer", "project", Some("plan"), true);
         assert!(applied.contains("security mode from its prompt (mode: plan)"));
         assert!(applied.ends_with("tools unchanged"));
+    }
+}
+
+#[cfg(test)]
+mod theme_selection_tests {
+    use super::*;
+    use crossterm::style::Color;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn theme_selection_reports_parse_error_and_preserves_active_and_saved_choice() {
+        let root = crate::tests::OwnedTestDirectory::new("theme-selection-errors");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli::default();
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let directory = context::themes::global_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("good.json"),
+            r##"{"chat_background":"#ff0000"}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("broken.json"),
+            "{\n  \"chat_background\":\n}",
+        )
+        .unwrap();
+        let mut context = context::load(true).for_workspace_binding(true, &workspace);
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        let mut session = crate::session::Session::new("anthropic", "fixture", 128_000, "");
+        let mut client = crate::provider::create_client(
+            "anthropic",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let mut agent = None;
+        let mut input = crate::ui::input::InputEditor::new();
+        let invalidated = AtomicBool::new(false);
+        let mut show_reasoning = false;
+        let mut reasoning_enabled = false;
+        let mut is_running = false;
+        let mut todo_tools_enabled = false;
+        let sandbox = crate::sandbox::Sandbox::new(false, "none");
+        let mut terminal_guard = crate::ui::terminal::TerminalGuard::detached_for_test();
+        #[cfg(feature = "skills")]
+        let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+        let mut ctx = SlashCtx {
+            prebuild_invalidated: &invalidated,
+            agent: &mut agent,
+            client: &mut client,
+            renderer: &mut renderer,
+            session: &mut session,
+            cli: &cli,
+            cfg: &cfg,
+            context: &mut context,
+            workspace: &workspace,
+            show_reasoning: &mut show_reasoning,
+            reasoning_enabled: &mut reasoning_enabled,
+            is_running: &mut is_running,
+            input: &mut input,
+            permission: &None,
+            ask_tx: &None,
+            todo_tools_enabled: &mut todo_tools_enabled,
+            sandbox: &sandbox,
+            terminal_guard: &mut terminal_guard,
+            #[cfg(feature = "skills")]
+            skill_services: &skill_services,
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        handle(&["/theme", "good"], &mut ctx).await.unwrap();
+        assert_eq!(ctx.context.current_theme_name.as_deref(), Some("good"));
+        assert_eq!(storage::load_theme_name().as_deref(), Some("good"));
+        let prior_colors = ctx.renderer.background_colors_for_test();
+        assert_eq!(
+            prior_colors,
+            (Some(Color::Rgb { r: 255, g: 0, b: 0 }), None, None)
+        );
+        handle(&["/theme", "broken"], &mut ctx).await.unwrap();
+        assert_eq!(ctx.context.current_theme_name.as_deref(), Some("good"));
+        assert_eq!(storage::load_theme_name().as_deref(), Some("good"));
+        assert_eq!(ctx.renderer.background_colors_for_test(), prior_colors);
+        let feed = ctx.renderer.feed();
+        let transcript: Vec<_> = (0..feed.block_count())
+            .filter_map(|index| feed.block_text(index))
+            .collect();
+        assert!(
+            transcript
+                .iter()
+                .any(|line| line.contains("could not apply theme 'broken'")
+                    && line.contains("line 3 column 1")),
+            "{transcript:?}"
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|line| line.contains("active theme: broken")),
+            "{transcript:?}"
+        );
+        ctx.context.themes.insert("broken".into(), "{}".into());
+        handle(&["/theme", "broken"], &mut ctx).await.unwrap();
+        assert_eq!(ctx.context.current_theme_name.as_deref(), Some("broken"));
+        assert_eq!(storage::load_theme_name().as_deref(), Some("broken"));
+        assert_eq!(
+            ctx.renderer.background_colors_for_test(),
+            (None, None, None)
+        );
+        ctx.context.themes.insert("broken".into(), "{".into());
+        assert!(
+            context::themes::apply_initial(ctx.context, ctx.cfg.colors.as_ref(), ctx.renderer)
+                .is_some()
+        );
+        assert_eq!(ctx.context.current_theme_name, None);
+        assert_eq!(storage::load_theme_name().as_deref(), Some("broken"));
+        handle(&["/theme", "default"], &mut ctx).await.unwrap();
+        assert_eq!(
+            storage::load_theme_name(),
+            None,
+            "default can clear a rejected saved choice"
+        );
     }
 }

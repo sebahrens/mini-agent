@@ -384,7 +384,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("-UseNewEnvironment", standard_user_step)
         self.assertIn("$installedBinary --print-config", standard_user_step)
         self.assertIn("$requiredStatus", standard_user_step)
-        self.assertIn("public_cached_status = 'available-enforced'", standard_user_step)
+        self.assertIn("public_config_status = 'not-probed-unattested'", standard_user_step)
+        self.assertIn("installed_runtime_check = 'passed'", standard_user_step)
         self.assertIn("-WorkingDirectory $standardRoot", standard_user_step)
         self.assertIn("[Parameter(Mandatory)][string] $UserHome", standard_user_step)
         self.assertIn("[Parameter(Mandatory)][string] $UserTemp", standard_user_step)
@@ -854,6 +855,65 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("FileSystemRights]::ReadAndExecute", standard_user_step)
         self.assertNotIn("phase6 standard user λ", standard_user_step)
 
+    def test_standard_user_config_requires_only_static_unprobed_worker_fields(self) -> None:
+        windows = job_body(self.workflow, "windows-worker-containment-gate")
+        step = windows.split(
+            "name: Validate the complete gate from a separate standard-user installation", 1
+        )[1].split("name: Run Phase 6 adversarial suites", 1)[0]
+        table = step.split("$requiredStatus = [ordered]@{", 1)[1].split("          }", 1)[0]
+        patterns = dict(re.findall(r"(?m)^ +([a-z]+) = '([^']+)'$", table))
+        self.assertEqual(set(patterns), {"compiled", "backend", "status", "assurance", "launch", "spawn"})
+        static = (
+            "  compiled true\n  backend windows-lpac\n  status not probed\n"
+            "  assurance not attested\n  worker launch not started; containment not probed\n"
+            "  parent-brokered spawn not advertised; containment not probed\n"
+        )
+        for key, pattern in patterns.items():
+            self.assertRegex(static, pattern, key)
+        for old, replacement, key in (
+            ("status not probed", "status available", "status"),
+            ("assurance not attested", "assurance enforced", "assurance"),
+            ("not started; containment not probed", "enabled with validated containment", "launch"),
+            ("not advertised; containment not probed", "disabled on Windows", "spawn"),
+            ("compiled true", "compiled false", "compiled"),
+            ("backend windows-lpac", "backend seatbelt", "backend"),
+        ):
+            with self.subTest(key=key):
+                self.assertNotRegex(static.replace(old, replacement), patterns[key])
+
+    def test_standard_user_explicit_runtime_check_precedes_all_native_proofs(self) -> None:
+        windows = job_body(self.workflow, "windows-worker-containment-gate")
+        step = windows.split(
+            "name: Validate the complete gate from a separate standard-user installation", 1
+        )[1].split("name: Run Phase 6 adversarial suites", 1)[0]
+
+        def require_contract(candidate: str) -> None:
+            self.assertIn("& $installedBinary --js-runtime-check *> $runtimeLog", candidate)
+            self.assertRegex(candidate, r"(?s)& \$installedBinary --js-runtime-check.+?if \(\$LASTEXITCODE -ne 0\).*?exit 27")
+            self.assertIn("$runtimeText -notmatch '(?m)^JS runtime check: PASS \\(2\\)\\r?$'", candidate)
+            self.assertIn("failure = 'nonzero-exit'", candidate)
+            self.assertIn("failure = 'missing-pass-witness'", candidate)
+            self.assertIn("exit 28", candidate)
+            self.assertIn("Remove-Item -LiteralPath $runtimeLog -Force", candidate)
+            self.assertLess(candidate.index("& $installedBinary --js-runtime-check"), candidate.index("$referenceResource ="))
+            self.assertLess(candidate.index("$referenceResource ="), candidate.index("$probeLog ="))
+            self.assertIn("js_worker_resource_benchmark", candidate)
+            self.assertIn("windows_js_worker_containment", candidate)
+            self.assertIn("WINDOWS_CONTAINMENT_PASS backend=lpac job_close=pass nested_parent_job=pass protocol=pass", candidate)
+            self.assertIn("exit 21", candidate)
+            self.assertIn("exit 22", candidate)
+
+        require_contract(step)
+        for candidate in (
+            step.replace("& $installedBinary --js-runtime-check *> $runtimeLog", "Write-Output 'JS runtime check: PASS (2)'", 1),
+            step.replace("exit 27", "return", 1),
+            step.replace("exit 28", "return", 1),
+            step.replace("windows_js_worker_containment", "unrelated_test", 1),
+            step.replace("js_worker_resource_benchmark", "unrelated_test"),
+        ):
+            with self.subTest(mutation=candidate[:60]), self.assertRaises(AssertionError):
+                require_contract(candidate)
+
     def test_windows_hosted_administrator_status_is_fail_closed(self) -> None:
         body = job_body(self.workflow, "windows-worker-containment-gate")
         status_step = body.split(
@@ -863,16 +923,21 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("--print-config", status_step)
         for claim in (
             "windows-lpac",
-            "unavailable",
-            "enforced backend class; inactive",
-            "disabled; no worker process starts",
-            "not active; no worker process",
-            "unavailable; no JS worker",
+            "not probed",
+            "not attested",
+            "not started; containment not probed",
+            "not advertised; containment not probed",
         ):
             with self.subTest(claim=claim):
                 self.assertIn(claim, status_step)
         self.assertIn("$evidence -notmatch", status_step)
         self.assertNotIn("continue-on-error", status_step)
+        self.assertIn("--js-runtime-check", status_step)
+        self.assertIn("if ($runtimeExit -eq 0)", status_step)
+        self.assertIn("JavaScript worker containment is unavailable", status_step)
+        self.assertIn("runtime self-check lacks the closed", status_step)
+        self.assertIn("runtime self-check emitted contradictory pass evidence", status_step)
+        self.assertIn("$global:LASTEXITCODE = 0", status_step)
 
     def test_each_platform_runs_and_uploads_the_a32_resource_hook(self) -> None:
         for job in (

@@ -109,6 +109,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("permission"),
     aliased("permission-regex", &["permission_regex"]),
     aliased("permission-allow", &["permission_allow"]),
+    aliased("permission-allow-prefix", &["permission_allow_prefix"]),
     aliased("permission-ask", &["permission_ask"]),
     aliased("permission-deny", &["permission_deny"]),
     key("restrictive"),

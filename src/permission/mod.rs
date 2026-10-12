@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod checker;
 pub mod pattern;
+pub(crate) mod shell_prefix;
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -55,6 +56,8 @@ pub struct PermissionConfig {
     pub doom_loop: Option<Action>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_entries: Option<HashMap<String, Vec<String>>>,
+    #[serde(skip)]
+    pub allow_prefix_entries: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entries: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]

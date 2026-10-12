@@ -4,6 +4,10 @@ description: "Complete reference of mini-agent slash commands, keyboard shortcut
 
 # Slash Commands
 
+For ad hoc main-agent instructions, use `--system-prompt <text|@file>` or
+`--append-system-prompt <text|@file>` at launch. See [system instructions](CONFIG.md#ad-hoc-system-instructions)
+for retained safety/tool guidance, file limits and placement.
+
 For shell flag completion outside the TUI, run `mini-agent --completions <shell>`
 with `bash`, `zsh`, `fish`, or `powershell`. This exclusive local command prints the installed
 binary's completion script and exits. See [installation instructions](GET_STARTED.md#shell-completions).
@@ -154,6 +158,13 @@ You are in read-only mode. Only read files and explore.
 | `/theme default` | Clear the active theme (use config colors). |
 | `/regen-prompts` | Restore built-in prompts to the prompts directory. |
 | `/regen-themes` | Restore built-in themes to the themes directory. |
+
+A theme must contain valid JSON before `/theme <name>` changes the active or
+saved choice. Invalid JSON reports the parse error with its line and column,
+leaving the previous theme active. If a saved theme is broken or unavailable
+at startup, mini-agent reports the problem and uses config colors; fixing the
+file restores that saved choice on the next start. Unreadable prompt and theme
+files are skipped with a warning containing their path and read error.
 
 ## Conversation
 
@@ -378,6 +389,8 @@ the agent. The command and its captured output are stored in the session history
 as one user message (``User ran `!cmd`:`` followed by the output in a fenced
 block), so the model sees the output as something you shared, never as its own
 reply. `/undo` removes that message, and `/retry` reloads the original `!cmd`.
+After process cleanup, the command and captured result are saved immediately unless
+`--no-session` is set. In the TUI, a save failure shows a warning and retains the live transcript.
 Works in both TUI and `--print` mode.
 In `--print` mode, a failed command or empty `!` exits nonzero. Captured output is still
 rendered and saved before reporting a command failure; `--output json` marks that result

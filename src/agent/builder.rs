@@ -141,12 +141,33 @@ pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_preamble_for_workspace(
     context: &ContextFiles,
     reasoning_enabled: bool,
     workspace_root: Option<&Path>,
     headless: bool,
     goal_block: Option<&str>,
+) -> String {
+    build_preamble_with_overrides(
+        context,
+        reasoning_enabled,
+        workspace_root,
+        headless,
+        goal_block,
+        None,
+        None,
+    )
+}
+
+fn build_preamble_with_overrides(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    workspace_root: Option<&Path>,
+    headless: bool,
+    goal_block: Option<&str>,
+    persona: Option<&str>,
+    appended: Option<&str>,
 ) -> String {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
@@ -229,7 +250,18 @@ pub(crate) fn build_preamble_for_workspace(
 
     let mut preamble = String::with_capacity(total_len);
     preamble.push_str(reasoning_prefix);
-    preamble.push_str(system_prompt);
+    if let Some(persona) = persona {
+        // Only the opening persona is replaceable. Workflow/authority rules
+        // and headless stopping guidance remain in the system prompt.
+        let (_, guidance) = system_prompt
+            .split_once("\n\n")
+            .expect("built-in prompt has a persona and guidance");
+        preamble.push_str(persona);
+        preamble.push_str("\n\n");
+        preamble.push_str(guidance);
+    } else {
+        preamble.push_str(system_prompt);
+    }
     preamble.push('\n');
     if !main_agent_persona.is_empty() {
         preamble.push_str("\n\n");
@@ -257,6 +289,10 @@ pub(crate) fn build_preamble_for_workspace(
     for content in &extra_files_content {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(content);
+    }
+    if let Some(appended) = appended {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(appended);
     }
     #[cfg(feature = "memory")]
     {
@@ -299,15 +335,17 @@ fn build_registered_preamble(
     workspace_root: &Path,
     sandbox: &Sandbox,
     registered_tools: &[&str],
-    headless: bool,
+    cli: &Cli,
     goal_block: Option<&str>,
 ) -> String {
-    let mut preamble = build_preamble_for_workspace(
+    let mut preamble = build_preamble_with_overrides(
         context,
         reasoning_enabled,
         Some(workspace_root),
-        headless,
+        cli.is_headless(),
         goal_block,
+        cli.system_prompt.as_deref(),
+        cli.append_system_prompt.as_deref(),
     );
     let has = |name: &str| registered_tools.contains(&name);
     if has("js") {
@@ -435,7 +473,7 @@ pub fn estimate_overhead(
         &context.workspace_root,
         sandbox,
         &registered_tools,
-        cli.is_headless(),
+        cli,
         goal_block,
     );
     crate::session::Session::estimate_tokens(&preamble)
@@ -866,7 +904,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         workspace_root,
         &sandbox,
         &registered_tools,
-        cli.is_headless(),
+        cli,
         goal_block.as_deref(),
     );
     let builder = AgentBuilder::new(model)
@@ -1222,6 +1260,117 @@ mod extra_file_tests {
     }
 
     #[test]
+    fn system_prompt_overrides_retain_guidance_and_append_before_memory() {
+        let mut context = empty_ctx();
+        context.current_prompt = Some("MODE_SENTINEL".into());
+        #[cfg(feature = "memory")]
+        {
+            context.memory = Some("MEMORY_SENTINEL".into());
+        }
+        for headless in [false, true] {
+            let prompt = super::build_preamble_with_overrides(
+                &context,
+                false,
+                None,
+                headless,
+                Some("GOAL_SENTINEL"),
+                Some("PERSONA_SENTINEL"),
+                Some("APPEND_SENTINEL"),
+            );
+            assert!(!prompt.contains("You are an expert coding assistant"));
+            assert!(prompt.contains("PERSONA_SENTINEL"));
+            assert!(prompt.contains("## Verification"));
+            assert!(prompt.contains("## Operating model"));
+            assert!(
+                prompt.find("MODE_SENTINEL").unwrap() < prompt.find("APPEND_SENTINEL").unwrap()
+            );
+            assert!(
+                prompt.find("APPEND_SENTINEL").unwrap() < prompt.find("GOAL_SENTINEL").unwrap()
+            );
+            #[cfg(feature = "memory")]
+            assert!(
+                prompt.find("APPEND_SENTINEL").unwrap() < prompt.find("MEMORY_SENTINEL").unwrap()
+            );
+            if headless {
+                assert!(prompt.contains("Do not end with a question"));
+                assert!(prompt.contains("granted authority"));
+            } else {
+                assert!(prompt.contains("## Safety"));
+                assert!(prompt.contains("explicit authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_system_prompt_overrides_reach_the_model_and_stay_byte_stable() {
+        use rig::completion::Prompt;
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+        let root = crate::tests::OwnedTestDirectory::new("system-prompt-model");
+        let model =
+            MockCompletionModel::from_turns([MockTurn::text("first"), MockTurn::text("second")]);
+        let cli = crate::cli::Cli {
+            print: true,
+            no_tools: true,
+            system_prompt: Some("PERSONA_SENTINEL".into()),
+            append_system_prompt: Some("APPEND_SENTINEL".into()),
+            ..Default::default()
+        };
+        let mut context = empty_ctx();
+        context.workspace_root = root.path().to_path_buf();
+        let agent = super::build_agent_inner(
+            model.clone(),
+            &cli,
+            &crate::config::Config::default(),
+            &context,
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap()),
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
+            "system-prompt-test",
+            None,
+            false,
+            None,
+            None,
+            #[cfg(feature = "js")]
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                reason: "no tools requested".into(),
+            },
+            #[cfg(feature = "js")]
+            crate::extras::js::session::ScratchStore::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await;
+        assert_eq!(agent.prompt("one").await.unwrap(), "first");
+        assert_eq!(agent.prompt("two").await.unwrap(), "second");
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let system = |request: &rig::completion::CompletionRequest| {
+            request
+                .chat_history
+                .iter()
+                .find_map(|message| match message {
+                    rig::completion::Message::System { content } => Some(content.clone()),
+                    _ => None,
+                })
+                .expect("the actual model request has a system message")
+        };
+        let first = system(&requests[0]);
+        assert!(first.contains("PERSONA_SENTINEL"));
+        assert!(first.contains("APPEND_SENTINEL"));
+        assert!(first.contains("Do not end with a question"));
+        assert_eq!(first.as_bytes(), system(&requests[1]).as_bytes());
+    }
+
+    #[test]
     fn headless_preamble_replaces_the_interactive_response_contract() {
         let context = empty_ctx();
         let interactive = super::build_preamble_for_workspace(
@@ -1435,7 +1584,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["shell"],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(preamble.contains("Run POSIX shell commands"));
@@ -1459,7 +1608,7 @@ mod js_tests {
             workspace.root(),
             &missing,
             &["read"],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(!missing_preamble.contains("shell commands"));
@@ -1486,7 +1635,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &[],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(!no_tools_preamble.contains("shell commands"));
@@ -1513,7 +1662,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["read"],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(!read_only_preamble.contains("shell commands"));
@@ -1535,7 +1684,11 @@ mod js_tests {
     async fn prompt_cache_prefix_is_byte_stable_across_consecutive_turns() {
         let workspace = workspace_binding();
         let sandbox = shell_sandbox();
-        let cli = crate::cli::Cli::default();
+        let cli = crate::cli::Cli {
+            system_prompt: Some("CACHE_PERSONA_SENTINEL".into()),
+            append_system_prompt: Some("CACHE_APPEND_SENTINEL".into()),
+            ..Default::default()
+        };
         let context = empty_context();
         let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
 
@@ -1550,9 +1703,14 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &first_names,
-            false,
+            &cli,
             None,
         );
+        assert_eq!(agent.preamble.as_deref(), Some(first_preamble.as_str()));
+        assert!(first_preamble.contains("CACHE_PERSONA_SENTINEL"));
+        assert!(first_preamble.contains("CACHE_APPEND_SENTINEL"));
+        assert!(first_preamble.contains("## Safety"));
+        assert!(first_preamble.contains(&sandbox.shell_capability().unwrap().model_guidance()));
         let first_tools = serde_json::to_vec(&first_definitions).unwrap();
 
         // A completed turn without an explicit context invalidation reuses the
@@ -1569,7 +1727,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &second_names,
-            false,
+            &cli,
             None,
         );
         let second_tools = serde_json::to_vec(&second_definitions).unwrap();
@@ -1588,7 +1746,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["js"],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(js.contains("**js**"));
@@ -1602,7 +1760,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["github_search"],
-            false,
+            &crate::cli::Cli::default(),
             None,
         );
         assert!(!mcp_only.contains("**js**"));
@@ -1617,7 +1775,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["read"],
-                false,
+                &crate::cli::Cli::default(),
                 None,
             );
             assert!(!without_lsp.contains("lsp_diagnostics"));
@@ -1627,7 +1785,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["lsp_diagnostics"],
-                false,
+                &crate::cli::Cli::default(),
                 None,
             );
             assert!(with_lsp.contains("lsp_diagnostics"));
@@ -1640,7 +1798,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["lsp_diagnostics", "edit"],
-                false,
+                &crate::cli::Cli::default(),
                 None,
             );
             assert!(with_lsp_and_edit.contains("after supported file changes"));

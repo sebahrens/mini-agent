@@ -256,6 +256,7 @@ const PINNED_HOOK_FILE_DENIAL: &str = "Blocked: this file is a configured hook e
 
 pub struct PermissionChecker {
     rules: HashMap<String, Vec<(Pattern, Action)>>,
+    shell_allow_prefixes: Vec<crate::permission::shell_prefix::ShellPrefix>,
     default_action: Action,
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
@@ -493,6 +494,26 @@ impl PermissionChecker {
             .or(configs.regex.doom_loop)
             .unwrap_or(Action::Ask);
 
+        let mut shell_allow_prefixes = Vec::new();
+        if let Some(entries) = &configs.glob.allow_prefix_entries {
+            for (tool, scripts) in entries {
+                if !matches!(tool.as_str(), "bash" | "shell") {
+                    anyhow::bail!("permission-allow-prefix supports only bash/shell");
+                }
+                for (index, script) in scripts.iter().enumerate() {
+                    shell_allow_prefixes.push(
+                        crate::permission::shell_prefix::ShellPrefix::parse(script).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "invalid permission-allow-prefix entry {} for {tool}: {error}",
+                                    index + 1
+                                )
+                            },
+                        )?,
+                    );
+                }
+            }
+        }
         let mut rules = Self::compile_config(&configs.glob, "permission", false)?;
         let regex_rules = Self::compile_config(&configs.regex, "permission-regex", true)?;
         for (tool, entries) in regex_rules {
@@ -607,6 +628,7 @@ impl PermissionChecker {
 
         let checker = PermissionChecker {
             rules,
+            shell_allow_prefixes,
             default_action,
             ext_dir_rules,
             doom_loop_action,
@@ -1033,6 +1055,17 @@ impl PermissionChecker {
                 };
                 if matches {
                     matched.push((pattern.specificity(), *action));
+                }
+            }
+        }
+
+        if self.apply_rules()
+            && tool == "shell"
+            && let Some(argv) = crate::permission::shell_prefix::literal_argv(policy_input)
+        {
+            for prefix in &self.shell_allow_prefixes {
+                if prefix.matches(&argv) {
+                    matched.push((prefix.specificity(), Action::Allow));
                 }
             }
         }

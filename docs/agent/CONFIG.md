@@ -143,9 +143,10 @@ parent to retry after the other process exits or the storage problem is repaired
 rotate by size while retaining one fixed version-1 private target-correlation key. Key rotation is
 not currently implemented.
 
-On Windows, normal startup and `--print-config` evaluate JavaScript worker containment status only
+On Windows, normal startup evaluates JavaScript worker containment status only
 when the `js` tool is eligible. `--no-tools` and a tool allowlist that omits `js` do not run this
-preflight or initialize the learned-skill runtime. An eligible status preflight creates or reuses a
+preflight or initialize the learned-skill runtime. `--print-config` only reports static eligibility
+as `not probed`; use `--js-runtime-check` for an explicit runtime check. An eligible status preflight creates or reuses a
 persistent AppContainer profile and may add that profile's
 exact read/execute ACE to a supported, user-owned installed executable. These changes persist after
 exit, and mini-agent currently provides no automatic profile cleanup, ACL rollback, or separate
@@ -350,7 +351,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Private worker dispatch | `MINI_AGENT_INTERNAL_JS_WORKER`, `MINI_AGENT_INTERNAL_JS_GUARDIAN`: parent-owned broker/guardian dispatch. |
 | macOS containment fixtures | `MINI_AGENT_INTERNAL_MACOS_CONTAINMENT_PROBE`, `MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`, `MINI_AGENT_INTERNAL_MACOS_PARENT_DEATH_CANARY`, `MINI_AGENT_CONTAINMENT_EVIDENCE`, `MINI_AGENT_MACOS_CREDENTIAL_SENTINEL`, `MINI_AGENT_MACOS_DESCRIPTOR_BOUND`, `MINI_AGENT_MACOS_GUARDIAN_PGID`, `MINI_AGENT_MACOS_ONE_TIME_IMAGE`, `MINI_AGENT_MACOS_ORIGINAL_EXECUTABLE`, `MINI_AGENT_MACOS_SKILL_SENTINEL`, `MINI_AGENT_MACOS_WORKSPACE_SENTINEL`: hosted containment evidence and canaries. |
 | Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `ZS_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
-| Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
+| Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_COMPLETION_ENV`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
 | Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
 | Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
 | MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
@@ -631,7 +632,8 @@ Accepted top-level keys:
 | `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
 | `permission-regex`        | object  | Same structure as `permission` but patterns are interpreted as regex instead of glob.                       |
-| `permission-allow`        | object  | Map of tool names to lists of glob patterns to allow. Works alongside the `permission` field. See below.    |
+| `permission-allow`        | object  | Map of tool names to allow patterns. Shell/bash entries match exact complete scripts, including literal metacharacters; other tools use globs. Works alongside `permission`.    |
+| `permission-allow-prefix` | object | Opt-in shell/bash argv prefixes for the limited simple-command syntax below. Compound scripts and unsupported syntax retain exact/Ask policy; deny rules still win. |
 | `permission-ask`          | object  | Map of tool names to lists of glob patterns to prompt on. Works alongside the `permission` field. See below.|
 | `permission-deny`         | object  | Map of tool names to lists of glob patterns to deny. Works alongside the `permission` field. See below.     |
 | `restrictive`             | boolean | Select restrictive permission mode (ask for every operation). Overridden by `accept_all`/`yolo` if those are also true.                                                     |
@@ -711,12 +713,39 @@ arguments and task JSON, set `MINI_AGENT_GYM=1`, and override `ZS_DATA_DIR`, `ZS
 user-widenable setting.
 
 JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
-`--print-config` reports its backend, assurance, and availability separately from the general
-subprocess backend. Linux becomes available only after the real empty-root `bwrap` preflight;
+`--print-config` displays the configured worker backend and reports an eligible JavaScript tool
+as `not probed`, without attesting containment, starting a worker, or advertising worker capabilities.
+Actual agent startup evaluates worker availability separately from the general subprocess backend.
+Linux becomes available only after the real empty-root `bwrap` preflight;
 validated macOS 26 hosts require the one-time-image Seatbelt denial and guardian lifecycle
 preflight and report typed `DeprecatedBestEffort` assurance; Windows requires a cached minimal
 LPAC/Job production attestation. Other macOS majors remain unavailable. No unavailable worker
 backend falls back to in-parent or uncontained JavaScript.
+
+## Ad hoc system instructions
+
+`--system-prompt <text|@file>` replaces the opening built-in persona paragraph
+for the main agent. The reasoning setting, built-in workflow, verification,
+safety/authority rules, and headless stopping guidance remain. Registered tool
+guidance, repository context, active named prompts, goals and permissions also
+remain in effect.
+
+`--append-system-prompt <text|@file>` adds instructions after the main context
+and `/add` files, before the memory block. Both flags work in the TUI and
+headless runs and can be combined. They affect the main agent; specialized
+subagent, advisor, summarizer, judge and `/btw` prompts keep their own contracts.
+
+An argument starting with `@` reads a UTF-8 file relative to the launch working
+directory (or an absolute path). The file is loaded once during argument parsing;
+later rebuilds retain those bytes. Only regular files are accepted (an explicit symlink to a regular file is allowed).
+Files over 524,288 bytes, missing files, special files and invalid UTF-8 are argument errors. Other arguments are literal text, including
+an explicitly empty persona. `--print-config` shows resolved text with escaped
+newlines and terminal controls. These options are not persisted in config.
+
+```bash
+mini-agent -p --append-system-prompt "Explain the validation evidence" "review this diff"
+mini-agent --system-prompt @persona.txt --append-system-prompt @team-rules.txt
+```
 
 ## System Prompt Suffix (`SUFFIX.md`)
 
@@ -1634,6 +1663,18 @@ nested `~/.ssh/**` deny always beats a broader `~/**` allow. On Windows, where
 a path is also matched in its verbatim spelling, matching rules combine
 fail-closed instead (deny, then ask, then allow).
 
+Tool argument validation happens before permissions or execution. `read.limit` must
+be positive (including an effective configured default); invalid windows return a
+JSON example instead of an inverted line range. Shell `timeout` must be 1–30000 ms
+in foreground mode or 1–86400000 ms in background mode; larger values are rejected
+with a background-job example rather than silently clamped. `todo_write` accepts
+only case-sensitive statuses `pending`, `in_progress`, `completed`, `cancelled` and
+priorities `high`, `medium`, `low`, both in its schema and runtime validation. A
+rejected write leaves the existing todo list unchanged. On the third identical
+failed tool call, the real visible error is retained and the loop notice is appended;
+a later identical call is still skipped. Directory name padding uses character counts
+rather than UTF-8 byte counts (terminal display width for wide/combining glyphs is separate).
+
 `todo_write` replaces the structured task list stored with the current session;
 `todo_read` reads that same session-local list and performs no filesystem access.
 Open items are retained in compaction context so an agent rebuild or compressed
@@ -1726,6 +1767,13 @@ as all stdout followed by all stderr with a newline separator. Interleaving
 between the two OS pipes is intentionally not reconstructed.
 
 There are two config fields for controlling permissions by pattern:
+
+Glob semantics are anchored to the complete input: `*` matches zero or more
+characters within one `/`-separated component, `?` matches one character except `/`,
+and `**` crosses separators. `**/` also matches zero intervening directories.
+Brackets are literal; character classes are not supported. Path tools normalize
+Windows separators first. Shell allows remain exact strings; these glob rules apply
+to shell asks/denies and other glob-based tools.
 
 - **`permission`** — patterns are treated as globs (e.g. `**/*.rs`, `src/**`).
 - **`permission-regex`** — same structure as `permission`, but patterns are
@@ -1853,6 +1901,31 @@ permission-regex:
     "^cargo (test|check|build)$": ask
     "^rm ": deny
 ```
+
+Shell/bash allow entries containing `*`, `?`, or `[` emit one load warning per
+authored entry, because these characters are literal in an exact-script allow.
+Warnings identify the config field and entry without echoing the script.
+
+An explicit argv-prefix scope is available separately:
+
+```toml
+permission-allow-prefix = { bash = ["git status", "cargo test"] }
+```
+
+`git status` allows `git status --short` and `git status --porcelain=v1`, but
+never `git status; rm -rf /`, pipelines, substitutions, or another command.
+The entire script must fit the portable subset: ASCII words containing letters,
+digits and `_-./:+=` (spaces/tabs separate words); the executable starts with
+a letter, underscore, dot or slash. Quotes, backslashes, newlines/control characters,
+`$`, backticks, `@`, `%`, commas, globs, comments, redirection, command separators,
+assignments before the executable and reserved shell control words are unsupported.
+This is deliberately narrower than Bash/sh or PowerShell parsing. Unsupported syntax
+falls back to ordinary exact-script/Ask policy. Prefix rules apply only in modes
+where configured rules apply, participate in specificity precedence, and cannot
+bypass deny rules. Session AllowAlways grants remain exact complete scripts.
+Only `bash`/`shell` are accepted in this map; invalid prefixes fail configuration.
+Project-local prefix grants require the same explicit trust as other permission
+settings; an untrusted project cannot enable them.
 
 Because Bash allows are exact-script only, use the non-regex permission field
 for explicit allowed scripts:

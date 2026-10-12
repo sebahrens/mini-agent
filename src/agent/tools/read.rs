@@ -181,13 +181,17 @@ impl Tool for ReadTool {
             "properties": {
                 "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
                 "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
-                "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" }
             },
             "required": ["path"]
         })
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
+        let limit = args.limit.unwrap_or(self.max_lines as usize);
+        if limit == 0 {
+            return Err(ToolError::Msg(r#"read limit must be at least 1 line. Example: {"path":"src/main.rs","offset":1,"limit":100}"#.into()));
+        }
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
         let requested = target.requested;
@@ -202,7 +206,6 @@ impl Tool for ReadTool {
             })
             .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
-        let limit = args.limit.unwrap_or(self.max_lines as usize);
         tracing::debug!(
             "tool read start: path={}, offset={}, limit={}",
             path,
@@ -548,6 +551,36 @@ fn numbered_excerpt(lines: &[String], start: usize, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn zero_read_limit_is_rejected_before_path_or_permission_effects() {
+        use super::*;
+        let tool = ReadTool::new(None, None, None, 100);
+        let error = tool
+            .call(crate::agent::tools::ReadArgs {
+                path: "missing-file".into(),
+                offset: Some(1),
+                limit: Some(0),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read limit must be at least 1"));
+        assert!(error.contains(r#"{"path":"src/main.rs","offset":1,"limit":100}"#));
+        assert!(!error.contains("No such file"));
+        let tool = ReadTool::new(None, None, None, 0);
+        assert!(
+            tool.call(crate::agent::tools::ReadArgs {
+                path: "missing-file".into(),
+                offset: None,
+                limit: None
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read limit")
+        );
+    }
+
     use super::{display_start, line_number_width, numbered_excerpt};
 
     use rig::tool::Tool;

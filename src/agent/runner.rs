@@ -335,6 +335,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 tool_name,
                 args,
                 outcome,
+                result,
                 internal_call_id,
                 ..
             } => {
@@ -345,7 +346,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
                     state.record_result(tool_name, fingerprint, outcome)
                 });
-                notice.map_or_else(Flow::cont, Flow::rewrite_result)
+                notice.map_or_else(Flow::cont, |notice| {
+                    Flow::rewrite_result(format!("{result}\n\n{notice}"))
+                })
             }
             _ => Flow::cont(),
         }
@@ -358,6 +361,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
 
 pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
     output.starts_with(TOOL_LOOP_NOTICE_PREFIX)
+        || output.contains(&format!("\n\n{TOOL_LOOP_NOTICE_PREFIX}"))
 }
 
 #[derive(Clone)]
@@ -4836,7 +4840,7 @@ mod tests {
 
     impl Tool for AlwaysFailTool {
         const NAME: &'static str = "always_fail";
-        type Error = MockToolError;
+        type Error = crate::agent::tools::ToolError;
         type Args = serde_json::Value;
         type Output = String;
 
@@ -4849,8 +4853,49 @@ mod tests {
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Err(MockToolError)
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Err(crate::agent::tools::ToolError::Msg(format!(
+                "deliberate tool failure #{attempt}"
+            )))
+        }
+    }
+
+    #[derive(Clone)]
+    struct OversizedFailTool(Arc<AtomicUsize>);
+
+    impl Tool for OversizedFailTool {
+        const NAME: &'static str = "oversized_fail";
+        type Error = crate::agent::tools::ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return an oversized error for guard and spill integration".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Err(crate::agent::tools::ToolError::Msg(format!(
+                "failure #{attempt}: {}\nraw-secret-canary: original error tail #{attempt}",
+                "M".repeat(crate::session::TOOL_RESULT_SAVE_THRESHOLD),
+            )))
+        }
+    }
+
+    struct SanitizeFailureHook;
+
+    impl<M: CompletionModel> AgentHook<M> for SanitizeFailureHook {
+        async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            match event {
+                StepEvent::ToolResult { result, .. } => {
+                    Flow::rewrite_result(result.replace("raw-secret-canary", "sanitized"))
+                }
+                _ => Flow::cont(),
+            }
         }
     }
 
@@ -5243,8 +5288,99 @@ mod tests {
         assert!(loop_events[1].contains("was not executed again"));
         let results = tool_result_texts(&interactions);
         assert_eq!(results.len(), 4);
-        assert!(results[2].starts_with(super::TOOL_LOOP_NOTICE_PREFIX));
+        assert!(results[2].contains("deliberate tool failure #3"));
+        assert!(results[2].contains(&format!("\n\n{}", super::TOOL_LOOP_NOTICE_PREFIX)));
         assert!(results[3].starts_with(super::TOOL_LOOP_NOTICE_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn large_third_failure_preserves_sanitized_error_notice_and_spill_correlation() {
+        let fixture = crate::tests::OwnedTestDirectory::new("loop-spill");
+        let root = fixture.path().to_path_buf();
+        let environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_DATA_DIR", Some(root.clone().into_os_string())),
+            ("ZS_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("ZS_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+        let mut session = crate::session::Session::new("test", "mock", 128_000, "");
+        let mut turns = Vec::new();
+        for index in 1..=4 {
+            turns.push(vec![
+                MockStreamEvent::tool_call(
+                    format!("failure-{index}"),
+                    OversizedFailTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        turns.push(vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(OversizedFailTool(executions.clone()))
+            .add_hook(SanitizeFailureHook)
+            .add_hook(super::ToolLoopGuard)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("try", Vec::<Message>::new())
+            .max_turns(5)
+            .await;
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            let item = item.expect("guard/spill stream must recover");
+            if let MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            ) = item
+            {
+                let output = tool_result
+                    .content
+                    .iter()
+                    .find_map(|content| match content {
+                        ToolResultContent::Text(text) => Some(text.text.clone()),
+                        ToolResultContent::Image(_) => None,
+                    })
+                    .unwrap();
+                session.add_tool_result_with_id(&tool_result.id, OversizedFailTool::NAME, &output);
+                results.push(output);
+            }
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+        assert_eq!(results.len(), 4);
+        let third = &results[2];
+        assert!(third.contains("sanitized: original error tail #3"));
+        assert!(third.contains("[tool output truncated:"));
+        assert!(super::is_tool_loop_notice(third));
+        assert!(third.contains("failed 3 times"));
+        assert!(!third.contains("raw-secret-canary"));
+        assert!(results[3].contains("was not executed again"));
+        let requests = model.requests();
+        assert_eq!(requests.len(), 5);
+        let history: Vec<_> = requests[3].chat_history.iter().cloned().collect();
+        assert!(tool_result_texts(&history).contains(&third.as_str()));
+        let Some(crate::session::PersistedToolMessage::Result {
+            output,
+            artifact_path: Some(path),
+            ..
+        }) = &session.messages[2].tool
+        else {
+            panic!("third result must retain its own full artifact through both hooks")
+        };
+        assert_eq!(output.as_str(), third);
+        let full = std::fs::read_to_string(path.as_str()).unwrap();
+        assert!(full.contains(&"M".repeat(crate::session::TOOL_RESULT_SAVE_THRESHOLD)));
+        assert!(full.contains("sanitized: original error tail #3"));
+        assert!(full.contains("failed 3 times"));
+        assert!(!full.contains("raw-secret-canary"));
+        drop(stream);
+        drop(environment);
     }
 
     #[tokio::test]

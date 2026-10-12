@@ -72,6 +72,7 @@ impl Tool for ShellTool {
                 "timeout": {
                     "type": "integer",
                     "minimum": 1,
+                    "maximum": 86_400_000,
                     "description": "Lower command deadline in milliseconds (optional; maximum 30000 foreground or 86400000 background)"
                 },
                 "background": {
@@ -90,10 +91,23 @@ impl Tool for ShellTool {
             args.timeout,
             args.background,
         );
-        if args.timeout == Some(0) {
-            return Err(ToolError::Msg(
-                "shell timeout must be at least 1 millisecond".to_string(),
-            ));
+        let maximum = if args.background {
+            DEFAULT_BACKGROUND_COMMAND_TIMEOUT
+        } else {
+            DEFAULT_COMMAND_LIMITS.timeout
+        };
+        if let Some(timeout) = args.timeout
+            && (timeout == 0 || std::time::Duration::from_millis(timeout) > maximum)
+        {
+            let mode = if args.background {
+                "background"
+            } else {
+                "foreground"
+            };
+            return Err(ToolError::Msg(format!(
+                "shell timeout must be between 1 and {} milliseconds for {mode} commands. For longer foreground work, use a background job. Example: {{\"command\":\"cargo test\",\"background\":true,\"timeout\":120000}}",
+                maximum.as_millis()
+            )));
         }
         // The complete script is the permission key and is passed unchanged to
         // the shell. Never split or tokenize it: Bash can execute nested
@@ -104,8 +118,7 @@ impl Tool for ShellTool {
             let timeout = args
                 .timeout
                 .map(std::time::Duration::from_millis)
-                .unwrap_or(DEFAULT_BACKGROUND_COMMAND_TIMEOUT)
-                .min(DEFAULT_BACKGROUND_COMMAND_TIMEOUT);
+                .unwrap_or(DEFAULT_BACKGROUND_COMMAND_TIMEOUT);
             let id = self
                 .sandbox
                 .start_background_command(args.command, timeout)
@@ -121,9 +134,7 @@ impl Tool for ShellTool {
 
         let mut limits = DEFAULT_COMMAND_LIMITS;
         if let Some(timeout_ms) = args.timeout {
-            limits.timeout = limits
-                .timeout
-                .min(std::time::Duration::from_millis(timeout_ms));
+            limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
         let output = self
             .sandbox
@@ -465,6 +476,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn out_of_range_shell_timeouts_are_rejected_before_starting_a_job() {
+        let tool = test_tool();
+        for (background, maximum) in [(false, 30_000), (true, 86_400_000)] {
+            for timeout in [0, maximum + 1, u64::MAX] {
+                let error = tool
+                    .call(BashArgs {
+                        command: "printf must-not-run".into(),
+                        timeout: Some(timeout),
+                        background,
+                    })
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&format!("between 1 and {maximum} milliseconds")));
+                assert!(error.contains("Example:"));
+                assert_eq!(tool.sandbox.running_background_job_count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn zero_timeout_is_rejected_instead_of_becoming_an_instant_deadline() {
         let error = test_tool()
             .call(BashArgs {
@@ -476,7 +508,8 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "shell timeout must be at least 1 millisecond");
+        assert!(error.contains("between 1 and 30000 milliseconds"));
+        assert!(error.contains(r#"{"command":"cargo test","background":true,"timeout":120000}"#));
     }
 
     #[cfg(unix)]

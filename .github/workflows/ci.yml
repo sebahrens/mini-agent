@@ -1714,13 +1714,10 @@ jobs:
           $requiredStatus = [ordered]@{
             compiled = '(?m)^  compiled[^\S\r\n]+true\r?$'
             backend = '(?m)^  backend[^\S\r\n]+windows-lpac\r?$'
-            status = '(?m)^  status[^\S\r\n]+available\r?$'
-            assurance = '(?m)^  assurance[^\S\r\n]+enforced\r?$'
-            launch = '(?m)^  worker launch[^\S\r\n]+enabled with validated containment\r?$'
-            processes = '(?m)^  native process limit[^\S\r\n]+1 worker process\r?$'
-            memory = '(?m)^  native memory limit[^\S\r\n]+256 MiB\r?$'
-            cpu = '(?m)^  native CPU limit[^\S\r\n]+35 seconds\r?$'
-            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+disabled on Windows\r?$'
+            status = '(?m)^  status[^\S\r\n]+not probed\r?$'
+            assurance = '(?m)^  assurance[^\S\r\n]+not attested\r?$'
+            launch = '(?m)^  worker launch[^\S\r\n]+not started; containment not probed\r?$'
+            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+not advertised; containment not probed\r?$'
           }
           $missingStatus = @()
           foreach ($entry in $requiredStatus.GetEnumerator()) {
@@ -1735,6 +1732,22 @@ jobs:
               ConvertTo-Json | Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-diagnostic.json')
             exit 24
           }
+          # Config display does not attest containment. Exercise the installed
+          # standard-user binary explicitly before every native proof below.
+          $runtimeLog = Join-Path $EvidenceRoot 'runtime-check.raw'
+          & $installedBinary --js-runtime-check *> $runtimeLog
+          if ($LASTEXITCODE -ne 0) {
+            @{ installed_runtime_check = 'failed'; failure = 'nonzero-exit' } |
+              ConvertTo-Json | Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-diagnostic.json')
+            exit 27
+          }
+          $runtimeText = Get-Content -LiteralPath $runtimeLog -Raw
+          if ($runtimeText -notmatch '(?m)^JS runtime check: PASS \(2\)\r?$') {
+            @{ installed_runtime_check = 'failed'; failure = 'missing-pass-witness' } |
+              ConvertTo-Json | Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-diagnostic.json')
+            exit 28
+          }
+          Remove-Item -LiteralPath $runtimeLog -Force
           $referenceResource = Join-Path $EvidenceRoot 'js-worker-Windows-reference.json'
           $resource = Join-Path $EvidenceRoot 'js-worker-Windows.json'
           $env:MINI_AGENT_JS_WORKER_BENCH = '1'
@@ -1768,7 +1781,8 @@ jobs:
             administrator = $false
             environment = 'new-allowlisted-non-admin'
             install = 'cargo-debug-js'
-            public_cached_status = 'available-enforced'
+            public_config_status = 'not-probed-unattested'
+            installed_runtime_check = 'passed'
             containment_probe = 'passed'
             protected_control = 'system-owned-read-execute-only'
             raw_output = $false
@@ -1883,19 +1897,29 @@ jobs:
           $required = [ordered]@{
             compiled = '(?m)^  compiled[^\S\r\n]+true\r?$'
             backend = '(?m)^  backend[^\S\r\n]+windows-lpac\r?$'
-            status = '(?m)^  status[^\S\r\n]+unavailable\r?$'
-            assurance = '(?m)^  assurance[^\S\r\n]+enforced backend class; inactive\r?$'
-            launch = '(?m)^  worker launch[^\S\r\n]+disabled; no worker process starts\r?$'
-            processes = '(?m)^  native process limit[^\S\r\n]+not active; no worker process\r?$'
-            memory = '(?m)^  native memory limit[^\S\r\n]+not active; no worker process\r?$'
-            cpu = '(?m)^  native CPU limit[^\S\r\n]+not active; no worker process\r?$'
-            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+unavailable; no JS worker\r?$'
+            status = '(?m)^  status[^\S\r\n]+not probed\r?$'
+            assurance = '(?m)^  assurance[^\S\r\n]+not attested\r?$'
+            launch = '(?m)^  worker launch[^\S\r\n]+not started; containment not probed\r?$'
+            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+not advertised; containment not probed\r?$'
           }
           foreach ($entry in $required.GetEnumerator()) {
             if ($evidence -notmatch $entry.Value) {
-              throw "hosted administrator --print-config lacks fail-closed Windows worker $($entry.Key) evidence"
+              throw "hosted administrator --print-config lacks static Windows worker $($entry.Key) evidence"
             }
           }
+          $runtimeEvidence = & $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE --js-runtime-check 2>&1 | Out-String
+          $runtimeExit = $LASTEXITCODE
+          if ($runtimeExit -eq 0) {
+            throw 'hosted administrator runtime self-check unexpectedly succeeded'
+          }
+          if ($runtimeEvidence -notmatch '(?m)^\s*JavaScript worker containment is unavailable\s*$') {
+            throw 'hosted administrator runtime self-check lacks the closed containment-unavailable witness'
+          }
+          if ($runtimeEvidence -match '(?m)^JS runtime check: PASS \(2\)\r?$') {
+            throw 'hosted administrator runtime self-check emitted contradictory pass evidence'
+          }
+          # The preceding nonzero exit is the required negative control.
+          $global:LASTEXITCODE = 0
 
       - name: Archive Windows containment evidence
         if: always()

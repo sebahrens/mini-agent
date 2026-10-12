@@ -382,9 +382,15 @@ pub(crate) fn load_for_workspace_binding(
 ) -> HashMap<String, String> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let user = crate::context::load_dir_files(&paths.prompts_dir(), "md");
+    let project_dir = std::path::Path::new(".zerostack/prompts");
     let project = workspace
-        .read_relative_dir_files(std::path::Path::new(".zerostack/prompts"), "md")
-        .unwrap_or_default();
+        .read_relative_dir_files(project_dir, "md")
+        .unwrap_or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %workspace.root().join(project_dir).display(), %error, "could not read workspace prompt directory");
+            }
+            Vec::new()
+        });
     let workspace_paths = paths.with_workspace_root(workspace.root()).ok();
     let project_trusted = workspace_paths
         .as_ref()

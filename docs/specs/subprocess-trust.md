@@ -69,6 +69,19 @@ ambiguous authorship, an unclassified launch site, invalid argv for the selected
 unavailable requested containment backend all deny launch. A caller must not silently retry under
 a more privileged profile.
 
+## Explicit shell prefix permission scope
+
+`src/permission/shell_prefix.rs` implements the opt-in `permission-allow-prefix`
+scope. It validates the entire script as a restricted ASCII argv form before
+matching a complete word prefix. Quoting, expansion, globbing, shell operators,
+redirection, comments, control characters, leading assignments and reserved control words
+cannot enter this scope. The original complete script remains the permission/audit
+identity and is passed unchanged to the configured shell. Denies run first; prefix
+allows participate only in configured-rule modes and normal specificity resolution.
+Exact configured allows and session AllowAlways grants retain their original scope.
+See [the configuration syntax](../agent/CONFIG.md#rule-precedence) for restrictions;
+this permission scope does not replace the model-action process boundary.
+
 ## Required launch contract
 
 The owner of a launch site must make all of these fields reviewable, even when the value is
@@ -194,8 +207,9 @@ An owned FIFO replaces the descendant's unbounded sleep loop. Failure controls c
 pre-readiness, partial readiness, and complete readiness; every path releases the gate
 and drains scoped work before propagating its original failure. Cleanup success is
 checked independently of that failure. `src/tests/process_gate.rs` owns the shared
-Unix FIFO implementation used by hook, ACP, and Git fixtures; feature gates keep it
-available to each independent consumer without enabling unrelated integrations.
+Unix FIFO implementation used by hook, ACP, Git and CLI prompt-file fixtures.
+It is available in Unix test builds, including minimal features, without enabling
+unrelated integrations.
 
 Git timeout and caller-drop tests reuse this process-state helper and an owned
 FIFO alias/descendant fixture. They capture the group-leading Git child and both
@@ -288,6 +302,14 @@ cover unused registration, held supervision, and external stash interference.
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.
+
+The CLI completion environment regression re-executes only its exact libtest case
+with fixed provider/model values and a private fixture marker. Its constructor is
+`TEST-ONLY`; the ordinary bounded sandbox output executor owns cleanup, with a
+15-second deadline and 64 KiB combined output limit. The parent test never mutates
+ambient model variables while parallel parser tests execute. On Unix the same
+bounded child also verifies rejection of a parent-owned FIFO prompt file with
+no writer; the parent retains fixture ownership even if the child must be killed.
 
 `TEST-ONLY` identifies a launch expression inside a `#[cfg(test)]` block in a production source file;
 it is checked for inventory drift but is not a production trust class. `NON-PROCESS` identifies a

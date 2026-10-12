@@ -34,7 +34,6 @@ use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
 use crate::ui::terminal::TerminalGuard;
-use crate::ui::utils::{parse_color, to_ansi_256};
 
 #[cfg(feature = "advisor")]
 use super::handle_human_handoff;
@@ -1111,24 +1110,11 @@ impl<'a> App<'a> {
             prompt_marks: ui.cfg.resolve_terminal_prompt_marks(),
         });
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
-        if let Some(ref theme_name) = ui.context.current_theme_name {
-            if let Some(content) = ui.context.themes.get(theme_name.as_str()) {
-                crate::context::themes::apply(content, &mut renderer);
-            }
-        } else if let Some(colors) = &ui.cfg.colors {
-            let chat_bg = colors.chat_background.as_deref().and_then(parse_color);
-            let input_bg = colors.input_background.as_deref().and_then(parse_color);
-            let status_bg = colors.status_background.as_deref().and_then(parse_color);
-            if matches!(colors.scheme_type, config::SchemeType::Ansi) {
-                renderer.set_background_colors(
-                    chat_bg.map(to_ansi_256),
-                    input_bg.map(to_ansi_256),
-                    status_bg.map(to_ansi_256),
-                );
-            } else {
-                renderer.set_background_colors(chat_bg, input_bg, status_bg);
-            }
-        }
+        let theme_warning = crate::context::themes::apply_initial(
+            ui.context,
+            ui.cfg.colors.as_ref(),
+            &mut renderer,
+        );
 
         let mut input = InputEditor::new();
         input.set_monochrome(ui.cli.no_color);
@@ -1295,6 +1281,21 @@ impl<'a> App<'a> {
                     let _ = renderer.write_line(&format!("worktree failed: {}", e), C_ERROR);
                 }
             }
+        }
+
+        // Session/worktree rendering clears the feed, so show this only after
+        // the final startup render and before any automatic prompt starts.
+        if let Some(warning) = theme_warning {
+            renderer.write_line(&sanitize_output(&warning), C_ERROR)?;
+        }
+        #[cfg(feature = "subagents")]
+        if let Some(notice) =
+            crate::extras::subagents::with_config(|config| config.fallback_notice.clone())
+                .ok()
+                .flatten()
+        {
+            renderer.write_line(&sanitize_output(&notice), C_ERROR)?;
+            renderer.write_line("", Color::White)?;
         }
 
         #[cfg(feature = "hooks")]
@@ -3382,13 +3383,6 @@ impl<'a> App<'a> {
         };
         let result = run.rendered_output();
 
-        for line in result.lines() {
-            let safe_line = sanitize_output(line);
-            self.renderer
-                .write_line(&safe_line, if run.succeeded() { C_AGENT } else { C_ERROR })?;
-        }
-        self.renderer.write_line("", Color::White)?;
-
         self.ui.session.add_shell_interaction(text, &result);
         if !self.ui.cli.no_session {
             let _ = crate::session::chat_history::append_entry(
@@ -3398,6 +3392,17 @@ impl<'a> App<'a> {
                 },
             );
         }
+        // The command already ran and its process cleanup is complete. Keep
+        // its transcript durable before fallible terminal presentation.
+        self.save_session()?;
+
+        for line in result.lines() {
+            let safe_line = sanitize_output(line);
+            self.renderer
+                .write_line(&safe_line, if run.succeeded() { C_AGENT } else { C_ERROR })?;
+        }
+        self.renderer.write_line("", Color::White)?;
+
         Ok(())
     }
 
@@ -3419,6 +3424,7 @@ impl<'a> App<'a> {
 
     fn stop_context_exhausted(&mut self, prompt_tokens: u64, threshold: f64) -> anyhow::Result<()> {
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+        self.discard_interrupted_queue();
         let rendered = stop_turn_context_exhausted(
             prompt_tokens,
             threshold,
@@ -3430,7 +3436,7 @@ impl<'a> App<'a> {
             self.settle_success_transaction();
         } else {
             if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
-                self.input.load_text(&text);
+                self.restore_interrupted_prompt(&text);
             }
             self.save_session()?;
         }
@@ -4783,6 +4789,200 @@ mod interrupt_rewind_tests {
     }
 
     #[tokio::test]
+    async fn actual_context_exhaustion_preserves_followup_draft_usage_and_drops_queue() {
+        let root = crate::tests::OwnedTestDirectory::new("app-context-stop-draft");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "compact_enabled": true, "mid_turn_compact_threshold": 0.8
+        }))
+        .unwrap();
+        for progress in [false, true] {
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("openrouter", "test-model", 128_000, "");
+            session.working_dir = workspace.root().to_string_lossy().into();
+            session.add_message(MessageRole::User, "earlier prompt");
+            session.add_message(MessageRole::Assistant, "earlier answer");
+            session.set_calibration(100, 20);
+            session.total_input_tokens = 10;
+            session.total_output_tokens = 2;
+            session.total_real_input_tokens = 10;
+            session.input_token_cost = 2.0;
+            session.output_token_cost = 4.0;
+            session.total_cost = 0.5;
+            let before = session.clone();
+            let ui = UiContext {
+                cli: &cli,
+                cfg: &cfg,
+                session: &mut session,
+                context: &mut context,
+                workspace,
+                client: crate::provider::create_client(
+                    "openrouter",
+                    Some("unused-test-key"),
+                    &cfg.custom_providers_map(),
+                    cfg.api_keys.as_ref(),
+                )
+                .unwrap(),
+                permission: None,
+                ask_tx: None,
+                sandbox: crate::sandbox::Sandbox::new(false, "none"),
+                prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+                status_signals: None,
+                #[cfg(feature = "skills")]
+                skill_services: Arc::new(
+                    crate::extras::js::skills::session::SkillServiceOwner::new(),
+                ),
+                #[cfg(feature = "mcp")]
+                mcp_manager: None,
+            };
+            let mut app = fixture_app(ui);
+            let pending = PendingMainTurn::capture(app.ui.session, "context-exhausted prompt");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            app.run.is_running = true;
+            app.run.awaiting_compaction_relief = true;
+            if progress {
+                app.ui.session.add_tool_call_with_id(
+                    "context-stop-read",
+                    "read",
+                    &serde_json::json!({"path":"fixture.txt"}),
+                );
+                app.run.response_buf = "observed partial answer".into();
+            }
+            app.input
+                .load_text("follow-up draft héllo after context exhaustion");
+            app.run.pending_inputs.extend([
+                "must not start queued first".into(),
+                "must not start queued second".into(),
+            ]);
+            app.handle_agent_event(AgentEvent::UsageDelta {
+                usage: crate::event::UsageDelta {
+                    input_tokens: 110_000,
+                    output_tokens: 100,
+                    total_tokens: 110_100,
+                    ..Default::default()
+                },
+                context_complete: true,
+                awaits_compaction_decision: true,
+            })
+            .await
+            .unwrap();
+            assert!(!app.run.is_running);
+            assert!(app.run.pending_turn.is_none());
+            assert!(app.run.main_abort.is_none());
+            assert!(app.run.compaction_decision_tx.is_none());
+            assert!(!app.run.awaiting_compaction_relief);
+            assert!(app.run.pending_inputs.is_empty());
+            // Exercise the ordinary queue admission point too: context stops
+            // must never launch the next queued prompt on a later idle tick.
+            app.finalize_turn().await.unwrap();
+            assert!(app.run.agent.is_none());
+            assert!(app.run.pending_turn.is_none());
+            assert!(app.run.main_abort.is_none());
+            assert!(
+                !app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .any(|message| message.content.starts_with("must not start queued"))
+            );
+            assert_eq!(app.ui.session.total_input_tokens, 110_010);
+            assert_eq!(app.ui.session.total_output_tokens, 102);
+            assert_eq!(app.ui.session.total_real_input_tokens, 110_010);
+            assert!((app.ui.session.total_cost - 0.7204).abs() < 1e-12);
+            let persisted = crate::session::storage::load_session_exact(&app.ui.session.id)
+                .unwrap()
+                .expect("context-stop settlement persists the session");
+            assert_eq!(
+                serde_json::to_value(&persisted.messages).unwrap(),
+                serde_json::to_value(&app.ui.session.messages).unwrap()
+            );
+            assert_eq!(persisted.total_input_tokens, 110_010);
+            assert!((persisted.total_cost - 0.7204).abs() < 1e-12);
+            app.run_queue_command("").unwrap();
+            let lines = app.renderer.feed().line_count(4096);
+            let shown = app
+                .renderer
+                .feed()
+                .selected_text(4096, 0, lines - 1)
+                .unwrap();
+            assert!(
+                shown.contains("not enough context to continue this turn"),
+                "{shown}"
+            );
+            assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+            assert!(shown.contains("queue is empty"), "{shown}");
+            if progress {
+                assert_eq!(
+                    app.input.buffer,
+                    "follow-up draft héllo after context exhaustion"
+                );
+                assert_eq!(
+                    app.ui.session.messages.last().unwrap().content,
+                    "observed partial answer"
+                );
+                assert!(app.ui.session.messages.iter().any(|message| {
+                    message.role == MessageRole::ToolResult
+                        && message.tool_call_id.as_deref() == Some("context-stop-read")
+                        && message
+                            .content
+                            .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
+                }));
+                assert_eq!(app.ui.session.calibrated_tokens, 110_100);
+            } else {
+                assert_eq!(app.input.buffer, "context-exhausted prompt");
+                assert_eq!(
+                    serde_json::to_value(&app.ui.session.messages).unwrap(),
+                    serde_json::to_value(&before.messages).unwrap()
+                );
+                assert_eq!(
+                    app.ui.session.total_estimated_tokens,
+                    before.total_estimated_tokens
+                );
+                assert_eq!(app.ui.session.calibrated_tokens, before.calibrated_tokens);
+                app.input.clear_buffer();
+                app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    app.input.buffer,
+                    "follow-up draft héllo after context exhaustion"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn actual_abort_and_failure_preserve_drafts_and_report_discarded_queue() {
         let root = crate::tests::OwnedTestDirectory::new("app-interrupt-drafts");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
@@ -4894,5 +5094,208 @@ mod interrupt_rewind_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod explicit_shell_persistence_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    use crate::session::MessageRole;
+
+    struct SessionRelease(String);
+
+    impl Drop for SessionRelease {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+
+    fn shell_ui<'a>(
+        cli: &'a crate::cli::Cli,
+        cfg: &'a crate::config::Config,
+        session: &'a mut Session,
+        context: &'a mut crate::context::ContextFiles,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> UiContext<'a> {
+        let shell =
+            crate::sandbox::ShellCapability::resolve("/bin/sh", workspace.root(), None).unwrap();
+        let sandbox = crate::sandbox::Sandbox::new(false, "none")
+            .with_workspace_binding(workspace.clone())
+            .with_resolved_shell(Some(shell));
+        UiContext {
+            cli,
+            cfg,
+            session,
+            context,
+            workspace,
+            client: crate::provider::create_client(
+                "openrouter",
+                Some("unused-test-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox,
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_explicit_shell_success_and_failure_are_saved_before_quit_unless_ephemeral() {
+        let root = crate::tests::OwnedTestDirectory::new("explicit-shell-persistence");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cfg = crate::config::Config::default();
+        for ephemeral in [false, true] {
+            for (command, marker) in [
+                ("!printf DURABLE_SHELL_SUCCESS", "DURABLE_SHELL_SUCCESS"),
+                (
+                    "!printf DURABLE_SHELL_FAILURE; exit 7",
+                    "DURABLE_SHELL_FAILURE",
+                ),
+            ] {
+                let cli = crate::cli::Cli {
+                    no_session: ephemeral,
+                    no_sandbox: true,
+                    tools: vec!["shell".into()],
+                    ..Default::default()
+                };
+                let workspace =
+                    Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                let mut context =
+                    crate::context::load(true).for_workspace_binding(true, &workspace);
+                let mut session = Session::new("openrouter", "fixture", 128_000, "");
+                session.working_dir = workspace.root().to_string_lossy().into();
+                session.total_cost = 0.125;
+                session.add_message(MessageRole::User, "earlier turn");
+                let id = session.id.clone();
+                let _session_release = SessionRelease(id.to_string());
+                let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+                let mut app = fixture_app(ui);
+                app.run_bang_command(command).await.unwrap();
+                assert_eq!(app.ui.session.messages.len(), 2);
+                let recorded = app.ui.session.messages.last().unwrap();
+                assert_eq!(recorded.role, MessageRole::User);
+                assert_eq!(
+                    crate::session::shell_interaction_command(&recorded.content),
+                    Some(command)
+                );
+                let body = recorded.content.split_once("`:\n```\n").unwrap().1;
+                assert!(body.starts_with(marker), "captured shell body: {body}");
+                let restored = crate::session::storage::load_session_exact(&id).unwrap();
+                if ephemeral {
+                    assert!(restored.is_none());
+                } else {
+                    let restored = restored.unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&restored.messages).unwrap(),
+                        serde_json::to_value(&app.ui.session.messages).unwrap()
+                    );
+                    assert_eq!(restored.total_cost, 0.125);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_explicit_shell_save_failure_keeps_live_record_and_warns() {
+        let root = crate::tests::OwnedTestDirectory::new("explicit-shell-save-failure");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_sandbox: true,
+            tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let _session_release = SessionRelease(session.id.to_string());
+        let blocked = crate::session::storage::session_path(&session.id).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.run_bang_command("!printf LIVE_SHELL_RECORD")
+            .await
+            .unwrap();
+        assert_eq!(app.ui.session.messages.len(), 1);
+        let body = app.ui.session.messages[0]
+            .content
+            .split_once("`:\n```\n")
+            .unwrap()
+            .1;
+        assert!(
+            body.starts_with("LIVE_SHELL_RECORD"),
+            "captured shell body: {body}"
+        );
+        assert!(blocked.is_dir());
+        let lines = app.renderer.feed().line_count(4096);
+        let shown = app
+            .renderer
+            .feed()
+            .selected_text(4096, 0, lines - 1)
+            .unwrap();
+        assert!(
+            shown.contains("warning: failed to save session:"),
+            "{shown}"
+        );
+        assert!(shown.contains("LIVE_SHELL_RECORD"), "{shown}");
     }
 }

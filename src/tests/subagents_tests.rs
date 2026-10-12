@@ -9,6 +9,104 @@
 #[cfg(test)]
 mod tests {
     #[test]
+    fn global_subagent_provider_fallback_reports_configured_and_effective_models() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "subagent_provider":"missing-subagent-provider", "subagent_model":"cheap-model"
+        }))
+        .unwrap();
+        let main = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let resolved = crate::extras::subagents::resolve_config(
+            &cfg,
+            Some("unused-test-key"),
+            "openrouter",
+            "main-model",
+            &main,
+        );
+        assert_eq!(resolved.provider_name, "openrouter");
+        assert_eq!(resolved.model_name, "main-model");
+        let notice = resolved.fallback_notice.as_ref().unwrap();
+        assert!(
+            notice.contains("configured: missing-subagent-provider / cheap-model"),
+            "{notice}"
+        );
+        assert!(notice.contains("unavailable: Unknown provider"), "{notice}");
+        assert!(
+            notice.contains("using main model: openrouter / main-model"),
+            "{notice}"
+        );
+        assert!(resolved.model_status().contains(notice));
+        assert_eq!(
+            resolved.config.subagent_model.as_deref(),
+            Some("cheap-model")
+        );
+    }
+
+    #[test]
+    fn global_subagent_quick_alias_fallback_uses_the_main_model_not_the_alias_model() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "subagent_model":"broken-alias",
+            "quick_models":{"broken-alias":{"provider":"missing-subagent-provider", "model":"alias-cheap-model", "input_token_cost":1, "output_token_cost":2}}
+        })).unwrap();
+        let main = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let resolved = crate::extras::subagents::resolve_config(
+            &cfg,
+            Some("unused-test-key"),
+            "openrouter",
+            "main-model",
+            &main,
+        );
+        assert_eq!(resolved.model_name, "main-model");
+        let notice = resolved.fallback_notice.as_ref().unwrap();
+        assert!(
+            notice.contains("missing-subagent-provider / alias-cheap-model"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("using main model: openrouter / main-model"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn available_global_subagent_selection_has_no_fallback_notice() {
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"subagent_model":"alternate-model"}))
+                .unwrap();
+        let main = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let resolved = crate::extras::subagents::resolve_config(
+            &cfg,
+            Some("unused-test-key"),
+            "openrouter",
+            "main-model",
+            &main,
+        );
+        assert!(resolved.fallback_notice.is_none());
+        assert_eq!(resolved.model_name, "alternate-model");
+        assert_eq!(
+            resolved.model_status(),
+            "current subagent model: openrouter / alternate-model"
+        );
+    }
+
+    #[test]
     fn task_tools_capture_each_agent_builds_repeated_read_policy() {
         let denying_agent = crate::extras::subagents::task_tool::TaskTool::new(None, None, true);
         let allowing_agent = crate::extras::subagents::task_tool::TaskTool::new(None, None, false);

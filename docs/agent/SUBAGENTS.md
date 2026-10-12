@@ -386,6 +386,14 @@ When the subagent uses a different provider than the main agent, a separate
 API client is created at startup. The subagent client is independent from the
 main agent's client and can be switched at runtime.
 
+If that global provider client cannot initialize, subagents use the main
+provider **and main model** instead. Startup displays the configured selection,
+the initialization error, and the model actually in use; `/subagent-model`
+shows the same fallback. Task calls then use the main model's pricing.
+A successful runtime subagent model switch clears the fallback notice.
+An unavailable model selected by a specialist persona still fails explicitly;
+it does not inherit this global fallback.
+
 ### Provider request parameters
 
 Every child request carries the same provider request-body parameters the main
@@ -449,7 +457,8 @@ and delivery record.
 | `/subagent-models [name]`          | List quick models or switch subagent to one|
 
 - **`/subagent-model`** with no arguments shows the current subagent provider
-  and model. With a model name, it switches the subagent to that model (using
+  and model, including any startup fallback from an unavailable configured
+  provider. With a model name, it switches the subagent to that model (using
   the same provider).
 - **`/subagent-models`** with no arguments lists quick models. With a quick
   model name, it switches the subagent to that quick model's provider + model.

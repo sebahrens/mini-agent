@@ -687,12 +687,8 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
     use crate::extras::subagents;
 
     if parts.len() < 2 {
-        let (provider_name, model_name) =
-            subagents::with_config(|cfg| (cfg.provider_name.clone(), cfg.model_name.clone()))?;
-        write_ok(
-            ctx.renderer,
-            format!("current subagent model: {} / {}", provider_name, model_name),
-        );
+        let status = subagents::with_config(|cfg| cfg.model_status())?;
+        write_ok(ctx.renderer, crate::ui::events::sanitize_output(&status));
         return Ok(());
     }
 

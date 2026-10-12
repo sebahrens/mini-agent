@@ -2564,3 +2564,96 @@ fn allow_always_on_a_path_containing_a_glob_does_not_match_a_sibling() {
     // Non-path tools keep their literal key and get no path scope.
     assert!(crate::permission::checker::exact_allow_scope_for_input("shell", "rm *").is_none());
 }
+
+#[test]
+fn explicit_shell_prefix_grants_validate_complete_commands_and_deny_precedence() {
+    let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+        "permission-allow-prefix": {"bash": ["git status"]},
+        "permission-deny": {"shell": ["git status --danger**"]},
+        "permission-ask": {"bash": ["git status --verbose**"]}
+    }))
+    .unwrap();
+    let configs = cfg.build_permission_config().unwrap();
+    let mut checker = PermissionChecker::new(
+        &configs,
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+    for tool in ["bash", "shell"] {
+        for command in [
+            "git status",
+            "git status --short",
+            "git\tstatus --porcelain=v1",
+        ] {
+            assert_eq!(
+                checker.check(tool, command),
+                CheckResult::Allowed,
+                "{command}"
+            );
+        }
+        for command in [
+            "git status; rm -rf /",
+            "git status && printf bad",
+            "git status | cat",
+            "git status\nrm -rf /",
+            "git status > log",
+            "git status $(id)",
+            "git status @args",
+            "git status \"--short\"",
+            "git statusx",
+            "gitx status",
+        ] {
+            assert_ne!(
+                checker.check(tool, command),
+                CheckResult::Allowed,
+                "{command}"
+            );
+        }
+        assert!(matches!(
+            checker.check(tool, "git status --dangerous"),
+            CheckResult::Denied(_)
+        ));
+        assert_eq!(
+            checker.check(tool, "git status --verbose"),
+            CheckResult::Ask
+        );
+    }
+    let mut restrictive = PermissionChecker::new(
+        &configs,
+        SecurityMode::Restrictive,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+    assert_eq!(
+        restrictive.check("shell", "git status --short"),
+        CheckResult::Ask
+    );
+    let mut exact = make_checker(SecurityMode::Restrictive);
+    exact.add_session_allowlist("shell".into(), "git status");
+    assert_eq!(exact.check("shell", "git status --short"), CheckResult::Ask);
+    for value in [
+        serde_json::json!({"read":["src"]}),
+        serde_json::json!({"bash":["git status; rm -rf /"]}),
+        serde_json::json!({"bash":["git status $HOME"]}),
+    ] {
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"permission-allow-prefix": value})).unwrap();
+        assert!(cfg.build_permission_config().is_err());
+    }
+}
+
+#[test]
+fn glob_question_mark_never_matches_a_path_separator() {
+    use crate::permission::pattern::Pattern;
+    let pattern = Pattern::new("a?b");
+    assert!(pattern.matches("axb"));
+    assert!(pattern.matches("aéb"));
+    assert!(pattern.matches("a\nb")); // Deny patterns retain embedded-line coverage.
+    assert!(!pattern.matches("a/b"));
+    assert!(Pattern::new("a*b").matches("axyb"));
+    assert!(!Pattern::new("a*b").matches("a/y/b"));
+    assert!(Pattern::new("a**b").matches("a/y/b"));
+}

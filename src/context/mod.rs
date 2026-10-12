@@ -26,16 +26,37 @@ pub(crate) fn load_embedded_files(embedded: &Dir, ext: &str) -> Vec<(String, Str
 
 pub(crate) fn load_dir_files(dir: &Path, ext: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
-    if dir.exists()
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == ext)
-                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                results.push((name.to_string(), content));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            // Windows can report NotFound for enumeration of an existing
+            // non-directory. Suppress only an actually absent optional path.
+            let absent = error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(dir)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if !absent {
+                tracing::warn!(path = %dir.display(), %error, "could not read prompt/theme directory");
+            }
+            return results;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(path = %dir.display(), %error, "could not read prompt/theme directory entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == ext)
+            && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => results.push((name.to_string(), content)),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not read prompt/theme file")
+                }
             }
         }
     }
@@ -638,4 +659,155 @@ mod repository_context_tests {
 #[cfg(feature = "archmd")]
 pub(crate) fn load_architecture_from(workspace_root: &Path) -> Option<String> {
     walk_context_files(Some(workspace_root)).1
+}
+
+#[cfg(test)]
+mod file_read_diagnostic_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, run);
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        (value, log)
+    }
+
+    #[test]
+    fn file_read_diagnostics_report_unreadable_global_and_workspace_files() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-theme-read-diagnostics");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let paths = crate::paths::process_paths().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        let project_prompts = workspace_dir.join(".zerostack/prompts");
+        for directory in [
+            paths.prompts_dir(),
+            paths.themes_dir(),
+            project_prompts.clone(),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let global_bad = paths.prompts_dir().join("global-invalid.md");
+        let theme_bad = paths.themes_dir().join("theme-invalid.json");
+        let project_bad = project_prompts.join("project-invalid.md");
+        for path in [&global_bad, &theme_bad, &project_bad] {
+            std::fs::write(path, [0xff]).unwrap();
+        }
+        std::fs::write(paths.prompts_dir().join("global-valid.md"), "GLOBAL_VALID").unwrap();
+        std::fs::write(paths.themes_dir().join("theme-valid.json"), "{}").unwrap();
+        std::fs::write(project_prompts.join("project-valid.md"), "PROJECT_VALID").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let ((prompts, themes), log) = capture_logs(|| {
+            (
+                prompts::load_for_workspace_binding(&workspace),
+                themes::load(),
+            )
+        });
+        assert_eq!(
+            prompts.get("global-valid").map(String::as_str),
+            Some("GLOBAL_VALID")
+        );
+        assert_eq!(
+            prompts.get("project-valid").map(String::as_str),
+            Some("PROJECT_VALID")
+        );
+        assert_eq!(themes.get("theme-valid").map(String::as_str), Some("{}"));
+        assert!(!prompts.contains_key("global-invalid"));
+        assert!(!prompts.contains_key("project-invalid"));
+        assert!(!themes.contains_key("theme-invalid"));
+        for path in [&global_bad, &theme_bad, &project_bad] {
+            assert!(log.contains(path.to_str().unwrap()), "{log}");
+        }
+        assert!(log.contains("could not read prompt/theme file"), "{log}");
+        assert!(
+            log.contains("could not read workspace prompt file"),
+            "{log}"
+        );
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("GLOBAL_VALID"));
+        assert!(!log.contains("PROJECT_VALID"));
+    }
+
+    #[test]
+    fn file_read_diagnostics_distinguish_absent_directories_from_read_failures() {
+        let root = crate::tests::OwnedTestDirectory::new("context-directory-diagnostics");
+        let missing = root.path().join("missing");
+        let (loaded, log) = capture_logs(|| load_dir_files(&missing, "md"));
+        assert!(loaded.is_empty());
+        assert!(
+            log.is_empty(),
+            "a missing optional directory is normal: {log}"
+        );
+        let not_directory = root.path().join("not-directory");
+        std::fs::write(&not_directory, "fixture").unwrap();
+        let (loaded, log) = capture_logs(|| load_dir_files(&not_directory, "md"));
+        assert!(loaded.is_empty());
+        assert!(
+            log.contains("could not read prompt/theme directory"),
+            "{log}"
+        );
+        assert!(log.contains(not_directory.to_str().unwrap()), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_diagnostics_report_rejected_workspace_symlink_without_reading_target() {
+        let root = crate::tests::OwnedTestDirectory::new("workspace-prompt-symlink-diagnostic");
+        std::fs::create_dir_all(root.path().join("prompts")).unwrap();
+        std::fs::write(root.path().join("target.md"), "TARGET_MUST_NOT_BE_READ").unwrap();
+        let link = root.path().join("prompts/link.md");
+        std::os::unix::fs::symlink("../target.md", &link).unwrap();
+        std::fs::write(root.path().join("prompts/good.md"), "good").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let (loaded, log) = capture_logs(|| {
+            workspace
+                .read_relative_dir_files(Path::new("prompts"), "md")
+                .unwrap()
+        });
+        assert_eq!(loaded, vec![("good".into(), "good".into())]);
+        assert!(log.contains(link.to_str().unwrap()), "{log}");
+        assert!(
+            log.contains("could not read workspace prompt file"),
+            "{log}"
+        );
+        assert!(!log.contains("TARGET_MUST_NOT_BE_READ"));
+    }
 }

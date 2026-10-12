@@ -1,8 +1,8 @@
 //! Ordinary startup must not print CI machine tokens when the macOS containment preflight fails.
 //!
 //! Running mini-agent inside an outer Seatbelt sandbox makes the nested worker launch fail, which
-//! is the "nested sandbox" case operators hit in practice. `--print-config` and `-p` must report
-//! that failure as a human-readable reason and keep `*_FAILED=` stage tokens off stderr; the CI
+//! is the "nested sandbox" case operators hit in practice. `--print-config` must stay unprobed;
+//! explicit runtime checks and `-p` keep `*_FAILED=` stage tokens off stderr; the CI
 //! evidence step opts into those tokens explicitly.
 #![cfg(all(feature = "js", target_os = "macos"))]
 
@@ -98,7 +98,7 @@ fn assert_no_failure_tokens(label: &str, output: &Output) {
 }
 
 #[test]
-fn print_config_reports_nested_preflight_failure_without_stderr_tokens() {
+fn print_config_stays_unprobed_and_explicit_check_fails_without_stderr_tokens() {
     if !outer_sandbox_usable() {
         eprintln!("skipping: sandbox-exec cannot apply an outer profile on this host");
         return;
@@ -110,17 +110,28 @@ fn print_config_reports_nested_preflight_failure_without_stderr_tokens() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.trim_start().starts_with("status") && line.contains("unavailable")),
-        "the nested preflight must fail so this test exercises the failure path: {stdout}"
+            .any(|line| line.trim_start().starts_with("status") && line.contains("not probed")),
+        "configuration display must not run the nested worker preflight: {stdout}"
     );
     assert_no_failure_tokens("--print-config", &output);
-    let reason = stdout
-        .lines()
-        .find(|line| line.trim_start().starts_with("reason"))
-        .unwrap_or_default();
+    let check = bounded_output(nested_command(&root.0, &["--js-runtime-check"]));
+    assert!(
+        !check.status.success(),
+        "the nested runtime check must fail"
+    );
+    let reason = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        reason.contains("JavaScript runtime self-check could not execute"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("JavaScript worker containment is unavailable"),
+        "{reason}"
+    );
+    assert_no_failure_tokens("--js-runtime-check", &check);
     assert!(
         !reason.contains("_FAILED="),
-        "the unavailable reason must be a human sentence: {reason}"
+        "the explicit check must use the closed unavailable diagnostic: {reason}"
     );
 }
 

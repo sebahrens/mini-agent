@@ -791,6 +791,12 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/cli.rs",
+        "tokio::process::Command::new(std::env::current_exe().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
         "src/provider_http.rs",
         "let response_code = response.status();",
         1,
@@ -1591,6 +1597,36 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/agent/runner.rs",
+        "assert_eq!(output.as_str(), third);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/todo.rs",
+        "status: status.into(),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/cli.rs",
+        "assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/cli.rs",
+        "output.exit_status.unwrap().success(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/cli.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        1,
+        "NON-PROCESS",
+    ),
     ("src/pricing.rs", "output", 2, "NON-PROCESS"),
     (
         "src/ui/slash/session_restore_tests.rs",
@@ -2109,7 +2145,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/agent/runner.rs", "output,", 1, "NON-PROCESS"),
+    ("src/agent/runner.rs", "output,", 2, "NON-PROCESS"),
     ("src/agent/runner.rs", "output.len(),", 1, "NON-PROCESS"),
     (
         "src/agent/tools/bash.rs",
@@ -2661,6 +2697,34 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // CLI executor output fields and todo labels are data. Full macro tokens
+    // bind these exemptions; constructors remain TEST-ONLY, not exempted here.
+    (
+        "src/cli.rs",
+        &[
+            (
+                "5da17685a5478627a5d0018f0bb97c840787645dfa5b8b84ba358081a56e9437",
+                1,
+            ),
+            (
+                "70251d766c54234bccb37237bbe744c2708d4881514462d0453c064fdb069eb4",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/agent/tools/todo.rs",
+        &[
+            (
+                "398b11681b8c76f11f4f6ee603b985d2aa8dd4ede75987aa1ea6cc318ba8da5d",
+                1,
+            ),
+            (
+                "e339cb76312cee0928f4a6625b6d943dfa3bb4b4262fa0765e8fd449ce25ef9e",
+                1,
+            ),
+        ],
+    ),
     // These assertions compare mathematical output-token prices and a
     // persisted tool-result string. Their full macro identities are bound;
     // none of the receivers is a process builder or launches a command.
@@ -2842,6 +2906,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/agent/runner.rs",
         &[
+            (
+                "1a503801a8a3fd36c212382d3ef072cd3109dc3f4c6145e652f9f73a5657d5a6",
+                1,
+            ),
             (
                 "dcb051101cba4c5c9e985c56a84b8932a34fc3f820b96b5d6d54433d53a731cb",
                 1,
@@ -3735,6 +3803,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/cli.rs",
+        "tokio::process::Command::new(std::env::current_exe().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
     (
         "src/provider_http.rs",
         "let response_code = response.status();",

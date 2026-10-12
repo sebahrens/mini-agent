@@ -187,13 +187,7 @@ mod picker_tests;
 mod platform_paths_tests;
 #[cfg(test)]
 mod portable_filename_tests;
-#[cfg(any(
-    all(unix, feature = "hooks"),
-    all(
-        any(feature = "acp", feature = "git-worktree"),
-        any(target_os = "linux", target_os = "macos")
-    )
-))]
+#[cfg(unix)]
 pub(crate) mod process_gate;
 #[cfg(all(test, unix))]
 mod process_group_guard_tests;

@@ -184,7 +184,7 @@ impl Tool for ListDirTool {
         let shown = cap.map(|c| total_entries.min(c)).unwrap_or(total_entries);
         let max_name = entries[..shown]
             .iter()
-            .map(|e| e.0.len())
+            .map(|e| e.0.chars().count())
             .max()
             .unwrap_or(0);
         let mut result = format!("Listing {}:\n", path);

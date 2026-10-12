@@ -12,6 +12,8 @@ pub const MAX_TODO_ITEMS: usize = 50;
 pub const MAX_TODO_CONTENT_CHARS: usize = 500;
 /// Maximum characters in one todo item's `status` or `priority`.
 pub const MAX_TODO_LABEL_CHARS: usize = 32;
+const TODO_STATUSES: [&str; 4] = ["pending", "in_progress", "completed", "cancelled"];
+const TODO_PRIORITIES: [&str; 3] = ["high", "medium", "low"];
 /// Upper bound on the bytes [`TodoStore::critical_context`] re-injects into
 /// every compaction summary. Items are dropped whole once the budget is
 /// reached so the block can never pin the context window.
@@ -150,11 +152,21 @@ fn validate_todos(list: &[TodoItem]) -> Result<(), ToolError> {
                 index + 1
             )));
         }
-        for (field, value) in [("status", &item.status), ("priority", &item.priority)] {
+        for (field, value, allowed) in [
+            ("status", &item.status, TODO_STATUSES.as_slice()),
+            ("priority", &item.priority, TODO_PRIORITIES.as_slice()),
+        ] {
             if value.chars().count() > MAX_TODO_LABEL_CHARS {
                 return Err(ToolError::Msg(format!(
                     "todo_write rejected: item {} {field} is longer than {MAX_TODO_LABEL_CHARS} characters. Use pending, in_progress, completed or cancelled for status and high, medium or low for priority. The existing todo list is unchanged.",
                     index + 1
+                )));
+            }
+            if !allowed.contains(&value.as_str()) {
+                return Err(ToolError::Msg(format!(
+                    "todo_write rejected: item {} {field} must be one of {} (case-sensitive). The existing todo list is unchanged. Example: {{\"todos\":[{{\"content\":\"Run tests\",\"status\":\"pending\",\"priority\":\"medium\"}}]}}",
+                    index + 1,
+                    allowed.join(", ")
                 )));
             }
         }
@@ -243,8 +255,8 @@ impl Tool for WriteTodoList {
                         "type": "object",
                         "properties": {
                             "content": { "type": "string", "maxLength": MAX_TODO_CONTENT_CHARS, "description": "Short task description" },
-                            "status": { "type": "string", "description": "pending, in_progress, completed, or cancelled" },
-                            "priority": { "type": "string", "description": "high, medium, or low" }
+                            "status": { "type": "string", "enum": TODO_STATUSES, "description": "pending, in_progress, completed, or cancelled" },
+                            "priority": { "type": "string", "enum": TODO_PRIORITIES, "description": "high, medium, or low" }
                         },
                         "required": ["content", "status", "priority"]
                     },
@@ -325,5 +337,65 @@ impl Tool for ReadTodoList {
 
     async fn call(&self, _args: TodoReadArgs) -> Result<String, ToolError> {
         Ok(format_todos(&self.store.snapshot()))
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn todo_labels_reject_invalid_values_without_replacing_stored_tasks() {
+        let store = TodoStore::default();
+        let original = TodoItem {
+            content: "original".into(),
+            status: "pending".into(),
+            priority: "medium".into(),
+        };
+        store.replace(vec![original.clone()]);
+        let tool = WriteTodoList::new_with_store(None, None, store.clone());
+        assert_eq!(
+            tool.parameters()["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            serde_json::json!(TODO_STATUSES)
+        );
+        assert_eq!(
+            tool.parameters()["properties"]["todos"]["items"]["properties"]["priority"]["enum"],
+            serde_json::json!(TODO_PRIORITIES)
+        );
+        for (status, priority) in [
+            ("done", "medium"),
+            ("Completed", "medium"),
+            ("pending", "urgent"),
+            ("pending", "HIGH"),
+        ] {
+            let error = tool
+                .call(TodoWriteArgs {
+                    todos: vec![TodoItem {
+                        content: "invalid".into(),
+                        status: status.into(),
+                        priority: priority.into(),
+                    }],
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("case-sensitive"));
+            assert!(error.contains("Example:"));
+            assert_eq!(store.snapshot(), vec![original.clone()]);
+            assert!(store.critical_context().unwrap().contains("original"));
+        }
+        for status in TODO_STATUSES {
+            for priority in TODO_PRIORITIES {
+                tool.call(TodoWriteArgs {
+                    todos: vec![TodoItem {
+                        content: "valid".into(),
+                        status: status.into(),
+                        priority: priority.into(),
+                    }],
+                })
+                .await
+                .unwrap();
+            }
+        }
+        assert!(store.critical_context().is_none());
     }
 }

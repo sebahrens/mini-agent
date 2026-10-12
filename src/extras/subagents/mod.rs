@@ -15,11 +15,32 @@ pub(crate) struct SubagentConfig {
     /// User-facing built-in or custom-provider alias corresponding to `client`.
     pub provider_name: String,
     pub model_name: String,
+    /// Retained so the TUI can restate a startup fallback after taking over
+    /// stderr, and model queries can report the actual selection honestly.
+    pub fallback_notice: Option<String>,
     /// CLI key retained only so a persona quick-model can select another
     /// provider with the same explicit credential semantics as startup.
     pub api_key: Option<String>,
     pub max_turns: usize,
     pub config: crate::config::Config,
+}
+
+impl SubagentConfig {
+    pub(crate) fn model_status(&self) -> String {
+        let current = format!(
+            "current subagent model: {} / {}",
+            self.provider_name, self.model_name
+        );
+        match &self.fallback_notice {
+            Some(notice) => format!("{current}; {notice}"),
+            None => current,
+        }
+    }
+
+    fn select_model(&mut self, model_name: String) {
+        self.model_name = model_name;
+        self.fallback_notice = None;
+    }
 }
 
 static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
@@ -90,6 +111,7 @@ pub(crate) fn resolve_config(
         (main_provider.to_owned(), main_model.to_owned())
     };
 
+    let mut fallback_notice = None;
     let sub_client = if sub_provider == main_provider {
         main_client.clone()
     } else {
@@ -101,6 +123,10 @@ pub(crate) fn resolve_config(
         ) {
             Ok(c) => c,
             Err(e) => {
+                fallback_notice = Some(format!(
+                    "subagent configured: {} / {} (unavailable: {}); using main model: {} / {}",
+                    sub_provider, sub_model, e, main_provider, main_model
+                ));
                 tracing::warn!(
                     "Could not initialize subagent provider '{}' ({}); \
                      falling back to main provider '{}'. \
@@ -121,6 +147,7 @@ pub(crate) fn resolve_config(
         client: sub_client,
         provider_name: sub_provider,
         model_name: sub_model,
+        fallback_notice,
         api_key: api_key.map(str::to_owned),
         max_turns: task_max_turns,
         config: cfg.clone(),
@@ -129,6 +156,9 @@ pub(crate) fn resolve_config(
 
 /// Install a resolved configuration as the process-wide subagent config.
 pub(crate) fn install(config: SubagentConfig) {
+    if let Some(notice) = &config.fallback_notice {
+        eprintln!("notice: {}", crate::ui::events::sanitize_output(notice));
+    }
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(config);
 }
@@ -138,20 +168,49 @@ pub fn set_client_and_model(client: AnyClient, provider_name: String, model_name
     if let Some(cfg) = guard.as_mut() {
         cfg.client = client;
         cfg.provider_name = provider_name;
-        cfg.model_name = model_name;
+        cfg.select_model(model_name);
     }
 }
 
 pub fn set_model_name(model_name: String) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cfg) = guard.as_mut() {
-        cfg.model_name = model_name;
+        cfg.select_model(model_name);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_runtime_model_selection_clears_the_fallback_notice() {
+        let cfg = crate::config::Config {
+            subagent_provider: Some("missing-subagent-provider".into()),
+            ..Default::default()
+        };
+        let main = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let mut resolved = resolve_config(
+            &cfg,
+            Some("unused-test-key"),
+            "openrouter",
+            "main-model",
+            &main,
+        );
+        assert!(resolved.fallback_notice.is_some());
+        resolved.select_model("chosen-runtime-model".into());
+        assert!(resolved.fallback_notice.is_none());
+        assert_eq!(
+            resolved.model_status(),
+            "current subagent model: openrouter / chosen-runtime-model"
+        );
+    }
 
     #[test]
     fn with_config_without_init_returns_error() {

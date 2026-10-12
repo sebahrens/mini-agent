@@ -123,3 +123,24 @@ async fn list_dir_omits_denied_entries() {
         assert!(!listing.contains("hidden.log"), "{listing}");
     }
 }
+
+#[tokio::test]
+async fn list_dir_sizes_name_padding_by_characters_instead_of_utf8_bytes() {
+    let root = TestDirectory::new();
+    std::fs::write(root.0.join("ééé"), "").unwrap();
+    std::fs::write(root.0.join("x"), "").unwrap();
+    let listing = ListDirTool::new(None, None, None)
+        .with_workspace(&root.0)
+        .call(ListDirArgs { path: None })
+        .await
+        .unwrap();
+    let rows: Vec<_> = listing.lines().skip(1).collect();
+    assert!(
+        rows.iter().any(|row| row.ends_with("ééé  0 B")),
+        "{listing}"
+    );
+    assert!(
+        rows.iter().any(|row| row.ends_with("x    0 B")),
+        "{listing}"
+    );
+}

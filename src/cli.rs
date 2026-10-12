@@ -14,6 +14,50 @@ fn default_sandbox_backend() -> String {
     }
 }
 
+fn parse_system_prompt_argument(value: &str) -> Result<String, String> {
+    use std::io::Read;
+
+    let Some(path) = value.strip_prefix('@') else {
+        return Ok(value.to_owned());
+    };
+    if path.is_empty() {
+        return Err("@FILE requires a file path".to_owned());
+    }
+    let cap = crate::agent::builder::MAX_EXTRA_FILE_BYTES;
+    let before = std::fs::metadata(path)
+        .map_err(|error| format!("cannot read system prompt file {path:?}: {error}"))?;
+    if !before.is_file() {
+        return Err(format!("system prompt file {path:?} is not a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Metadata can race replacement by a FIFO. Never block at open while
+        // checking the descriptor's type; explicit links to regular files work.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("cannot read system prompt file {path:?}: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("cannot inspect system prompt file {path:?}: {error}"))?
+        .is_file()
+    {
+        return Err(format!("system prompt file {path:?} is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read system prompt file {path:?}: {error}"))?;
+    if bytes.len() > cap {
+        return Err(format!("system prompt file {path:?} exceeds {cap} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("system prompt file {path:?} is not UTF-8"))
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     #[default]
@@ -53,6 +97,14 @@ pub struct Cli {
 
     #[arg(long = "load-prompt", help = "Load a named prompt (same as /prompt)")]
     pub load_prompt: Option<String>,
+
+    #[arg(long, value_name = "TEXT|@FILE", value_parser = parse_system_prompt_argument,
+        help = "Replace the built-in persona; retain workflow, safety, and tool guidance")]
+    pub system_prompt: Option<String>,
+
+    #[arg(long, value_name = "TEXT|@FILE", value_parser = parse_system_prompt_argument,
+        help = "Append system instructions before the memory block")]
+    pub append_system_prompt: Option<String>,
 
     #[arg(long = "print-config", help = "Print resolved configuration and exit")]
     pub print_config: bool,
@@ -1283,11 +1335,66 @@ mod tests {
     use crate::config;
 
     #[test]
+    fn system_prompt_arguments_load_bounded_utf8_once_and_preserve_literal_text() {
+        let root = crate::tests::OwnedTestDirectory::new("system-prompt-cli");
+        let path = root.path().join("instructions.txt");
+        std::fs::write(&path, "PERSONA_SENTINEL\nétude").unwrap();
+        let file = format!("@{}", path.display());
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "--system-prompt",
+            &file,
+            "--append-system-prompt",
+            "APPEND_SENTINEL\nsecond line",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.system_prompt.as_deref(),
+            Some("PERSONA_SENTINEL\nétude")
+        );
+        assert_eq!(
+            cli.append_system_prompt.as_deref(),
+            Some("APPEND_SENTINEL\nsecond line")
+        );
+        std::fs::write(&path, "changed later").unwrap();
+        assert_eq!(cli.clone().system_prompt, cli.system_prompt);
+        assert_eq!(
+            cli.system_prompt.as_deref(),
+            Some("PERSONA_SENTINEL\nétude")
+        );
+
+        let cap = crate::agent::builder::MAX_EXTRA_FILE_BYTES;
+        std::fs::write(&path, vec![b'x'; cap]).unwrap();
+        let boundary = Cli::try_parse_from(["mini-agent", "--system-prompt", &file]).unwrap();
+        assert_eq!(boundary.system_prompt.unwrap().len(), cap);
+        let directory = format!("@{}", root.path().display());
+        let error = Cli::try_parse_from(["mini-agent", "--system-prompt", &directory]).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+
+        for contents in [
+            vec![0xff],
+            vec![b'x'; crate::agent::builder::MAX_EXTRA_FILE_BYTES + 1],
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(Cli::try_parse_from(["mini-agent", "--append-system-prompt", &file]).is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(Cli::try_parse_from(["mini-agent", "--system-prompt", &file]).is_err());
+        assert!(Cli::try_parse_from(["mini-agent", "--system-prompt", "@"]).is_err());
+        let empty = Cli::try_parse_from(["mini-agent", "--system-prompt", ""]).unwrap();
+        assert_eq!(empty.system_prompt.as_deref(), Some(""));
+    }
+
+    #[test]
     fn shell_completion_scripts_cover_current_flags_for_every_supported_shell() {
         use clap::ValueEnum;
         for shell in clap_complete::Shell::value_variants() {
-            let parsed =
-                Cli::try_parse_from(["mini-agent", "--completions", &shell.to_string()]).unwrap();
+            let parsed = Cli::try_parse_command_line_from([
+                "mini-agent",
+                "--completions",
+                &shell.to_string(),
+            ])
+            .unwrap();
             assert_eq!(parsed.completions, Some(*shell));
             let mut script = Vec::new();
             super::write_completions(*shell, &mut script).unwrap();
@@ -1296,6 +1403,8 @@ mod tests {
             // Fish represents long options without their leading dashes.
             assert!(script.contains("provider"), "{shell}");
             assert!(script.contains("completions"), "{shell}");
+            assert!(script.contains("system-prompt"), "{shell}");
+            assert!(script.contains("append-system-prompt"), "{shell}");
             assert_eq!(
                 script.contains("js-runtime-check"),
                 cfg!(feature = "js"),
@@ -1321,12 +1430,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli() {
-        let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_PROVIDER", Some("anthropic".into())),
-            ("ZS_MODEL", Some("ambient-model".into())),
-        ]);
+    #[tokio::test]
+    async fn shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli() {
+        const CHILD: &str = "MINI_AGENT_TEST_COMPLETION_ENV";
+        if std::env::var_os(CHILD).is_none() {
+            // Clap reads process environment outside the fixture mutex. Give
+            // this regression its own process instead of changing env beneath
+            // concurrently executing parser/default-selection tests.
+            let fixture = crate::tests::OwnedTestDirectory::new("local-cli-env");
+            let fifo = fixture.path().join("prompt.fifo");
+            #[cfg(unix)]
+            drop(crate::tests::process_gate::ProcessGate::new(&fifo).unwrap());
+            let mut completion_env_child =
+                tokio::process::Command::new(std::env::current_exe().unwrap());
+            completion_env_child.args([
+                "--exact",
+                "cli::tests::shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli",
+                "--nocapture", "--test-threads=1",
+            ]).env(CHILD, &fifo).env("ZS_PROVIDER", "anthropic").env("ZS_MODEL", "ambient-model");
+            let output = crate::sandbox::Sandbox::new(false, "none")
+                .output_built_command_with_limits(
+                    completion_env_child,
+                    crate::sandbox::CommandLimits {
+                        timeout: std::time::Duration::from_secs(15),
+                        stdout_bytes: 32 * 1024,
+                        stderr_bytes: 32 * 1024,
+                        combined_bytes: 64 * 1024,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);
+            assert!(
+                output.exit_status.unwrap().success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("running 1 test"), "{stdout}");
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("cli::tests::shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli ... ok"), "{stdout}");
+            return;
+        }
         for flag in [
             vec!["mini-agent", "--completions", "zsh"],
             vec!["mini-agent", "--completions=bash"],
@@ -1351,6 +1499,14 @@ mod tests {
         assert!(cli.completions.is_none());
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
         assert_eq!(cli.model.as_deref(), Some("ambient-model"));
+        #[cfg(unix)]
+        {
+            let fifo = std::env::var_os(CHILD).unwrap();
+            let arg = format!("@{}", std::path::Path::new(&fifo).display());
+            let error = Cli::try_parse_command_line_from(["mini-agent", "--system-prompt", &arg])
+                .unwrap_err();
+            assert!(error.to_string().contains("not a regular file"));
+        }
     }
 
     /// The shipped default shape: OpenRouter with the deepseek quick model,

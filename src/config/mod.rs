@@ -212,6 +212,12 @@ pub struct Config {
     pub permission_allow: Option<HashMap<String, Vec<String>>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        rename = "permission-allow-prefix",
+        alias = "permission_allow_prefix"
+    )]
+    pub permission_allow_prefix: Option<HashMap<String, Vec<String>>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         rename = "permission-ask",
         alias = "permission_ask"
     )]
@@ -904,6 +910,47 @@ impl Config {
         self.enable_grepapp_mcp.unwrap_or(false)
     }
 
+    /// Explain authored shell allow metacharacters once during config loading.
+    /// Diagnostics identify the field/entry without echoing script secrets.
+    pub(crate) fn shell_exact_allow_warnings(&self) -> Vec<String> {
+        let mut entries = Vec::new();
+        for (field, value) in [
+            ("permission", &self.permission),
+            ("permission-regex", &self.permission_regex),
+        ] {
+            if let Some(map) = value.as_ref().and_then(serde_json::Value::as_object) {
+                for tool in ["bash", "shell"] {
+                    if let Some(rule) = map.get(tool) {
+                        if rule.as_str() == Some("allow") {
+                            entries.push(format!("{field}.{tool}"));
+                        }
+                        if let Some(patterns) = rule.as_object() {
+                            for (index, (pattern, action)) in patterns.iter().enumerate() {
+                                if action.as_str() == Some("allow")
+                                    && pattern.contains(['*', '?', '['])
+                                {
+                                    entries.push(format!("{field}.{tool} entry {}", index + 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(map) = &self.permission_allow {
+            for tool in ["bash", "shell"] {
+                if let Some(patterns) = map.get(tool) {
+                    for (index, pattern) in patterns.iter().enumerate() {
+                        if pattern.contains(['*', '?', '[']) {
+                            entries.push(format!("permission-allow.{tool} entry {}", index + 1));
+                        }
+                    }
+                }
+            }
+        }
+        entries.into_iter().map(|entry| format!("{entry}: shell/bash allow rules match the exact complete script; metacharacters do not grant a glob scope. Use an explicit script or permission-allow-prefix for a simple argv prefix.")).collect()
+    }
+
     pub fn build_permission_config(&self) -> anyhow::Result<PermissionConfigs> {
         fn parse_field(
             field: &str,
@@ -995,6 +1042,17 @@ impl Config {
             Ok(())
         }
 
+        if let Some(entries) = &self.permission_allow_prefix {
+            for (tool, scripts) in entries {
+                if !matches!(tool.as_str(), "bash" | "shell") {
+                    anyhow::bail!("permission-allow-prefix supports only bash/shell");
+                }
+                for script in scripts {
+                    crate::permission::shell_prefix::ShellPrefix::parse(script)?;
+                }
+            }
+            perm_configs.glob.allow_prefix_entries = Some(entries.clone());
+        }
         validate_entries("permission-allow", &self.permission_allow)?;
         validate_entries("permission-ask", &self.permission_ask)?;
         validate_entries("permission-deny", &self.permission_deny)?;

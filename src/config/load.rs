@@ -780,6 +780,8 @@ fn load_from_path(
         );
     }
 
+    emit_config_warnings(&mut warnings, cfg.shell_exact_allow_warnings());
+
     #[cfg(feature = "mcp")]
     inject_mcp_defaults(&mut cfg);
 
@@ -1839,6 +1841,95 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn project_shell_prefix_authority_requires_trust_for_both_key_spellings() {
+        use crate::permission::SecurityMode;
+        use crate::permission::checker::{CheckResult, PermissionChecker};
+
+        for key in ["permission-allow-prefix", "permission_allow_prefix"] {
+            let fixture = crate::tests::OwnedTestDirectory::new("project-shell-prefix-trust");
+            let root = fixture.path().to_path_buf();
+            let config_path = root.join("project/.zerostack/config.toml");
+            let trust_path = root.join("state/config/trusted-project-configs.json");
+            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            let global = root.join("global/config.toml");
+            std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+            let base_toml = "permission-allow-prefix = { bash = [\"git status\"] }\n";
+            std::fs::write(&global, base_toml).unwrap();
+            let local_toml = format!("chat_left_margin = 7\n{key} = {{ bash = [\"git push\"] }}\n");
+            std::fs::write(&config_path, &local_toml).unwrap();
+            let (_, _, sensitive) = split_project_override(&local_toml).unwrap();
+            assert!(sensitive.contains("permission-allow-prefix"));
+
+            let permission = |cfg: &Config, command: &str| {
+                PermissionChecker::new(
+                    &cfg.build_permission_config().unwrap(),
+                    SecurityMode::Standard,
+                    Some(root.join("project")),
+                    Some(vec!["standard".to_string()]),
+                )
+                .unwrap()
+                .check("shell", command)
+            };
+            let (headless, first_startup) =
+                super::load_from_path(global, Some(&config_path), &trust_path, false);
+            assert!(!first_startup);
+            assert_eq!(headless.chat_left_margin, Some(7));
+            assert_eq!(
+                permission(&headless, "git status --short"),
+                CheckResult::Allowed
+            );
+            assert_eq!(
+                permission(&headless, "git push origin main"),
+                CheckResult::Ask
+            );
+            assert!(!trust_path.exists());
+
+            let mut declined: Config = toml::from_str(base_toml).unwrap();
+            let outcome = apply_local_override_with_confirmation(
+                &mut declined,
+                &config_path,
+                &trust_path,
+                true,
+                &|description| {
+                    assert!(description.contains("permission-allow-prefix"));
+                    false
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, ProjectConfigTrustOutcome::Declined);
+            assert_eq!(
+                permission(&declined, "git push origin main"),
+                CheckResult::Ask
+            );
+            assert!(!trust_path.exists());
+
+            // The ordinary merge accepts an explicitly authorized override;
+            // the project loader must make that trust decision first.
+            let base: Config = toml::from_str(base_toml).unwrap();
+            let merged = super::merge_config_override(&base, &local_toml).unwrap();
+            assert_eq!(
+                permission(&merged, "git push origin main"),
+                CheckResult::Allowed
+            );
+            let mut approved = base;
+            let outcome = apply_local_override_with_confirmation(
+                &mut approved,
+                &config_path,
+                &trust_path,
+                true,
+                &|_| true,
+            )
+            .unwrap();
+            assert_eq!(outcome, ProjectConfigTrustOutcome::Approved);
+            assert_eq!(
+                permission(&approved, "git push origin main"),
+                CheckResult::Allowed
+            );
+            assert!(trust_path.exists());
+        }
+    }
+
+    #[test]
     fn headless_load_clamps_extreme_project_retry_to_the_user_policy() {
         let (root, config_path, trust_path) = fixture("retry-headless");
         let global = root.join("global/config.toml");
@@ -2462,6 +2553,38 @@ mod config_key_tests {
     /// Unknown keys warn with the nearest known key; a key owned only by
     /// builds with other Cargo features (here `mcp_servers`, `acp_host` and
     /// the JS keys) never warns, whichever feature row runs this test.
+    #[test]
+    fn load_warns_once_per_authored_shell_allow_metachar_entry_without_granting_it() {
+        let fixture = crate::tests::OwnedTestDirectory::new("shell-allow-warning");
+        let root = fixture.path().to_path_buf();
+        let global = root.join("config.toml");
+        std::fs::write(&global, r#"permission-allow = { bash = ["git status*", "cargo test?", "echo [secret-canary]", "git diff"] }
+permission-allow-prefix = { shell = ["git status"] }
+"#).unwrap();
+        let (cfg, _) = load_from_path(global, None, &root.join("trust.json"), false);
+        assert_eq!(cfg.load_warnings.len(), 3);
+        for warning in &cfg.load_warnings {
+            assert!(warning.contains("exact complete script"));
+            assert!(warning.contains("permission-allow-prefix"));
+            assert!(!warning.contains("secret-canary"));
+        }
+        let mut checker = crate::permission::checker::PermissionChecker::new(
+            &cfg.build_permission_config().unwrap(),
+            crate::permission::SecurityMode::Standard,
+            Some(root.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            checker.check("shell", "cargo test --lib"),
+            crate::permission::checker::CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check("shell", "git status --short"),
+            crate::permission::checker::CheckResult::Allowed
+        );
+    }
+
     #[test]
     fn load_warns_about_unknown_keys_only() {
         let root = scratch("unknown");

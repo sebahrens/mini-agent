@@ -972,15 +972,18 @@ minimal attestation above is necessary for runtime availability. The ignored rea
 to record denial-canary, supported-install-location, and lifecycle observations on the hosted
 reference runner.
 
-Evaluating Windows containment status during ordinary startup or `--print-config` performs
+Evaluating Windows containment status during ordinary agent startup performs
 production preflight only when the `js` tool is eligible. Global tool suppression and allowlists
-that omit `js` must not call the probe or initialize skill discovery. An eligible preflight creates
+that omit `js` must not call the probe or initialize skill discovery. `--print-config` displays
+static eligibility as `not probed`/`not attested` without starting a worker or advertising worker
+capabilities. `--js-runtime-check` explicitly runs the installed worker through containment and
+evaluates a pure expression, requiring its closed `JS runtime check: PASS (2)` witness. An eligible preflight creates
 or reuses a stable AppContainer profile and, for a
 supported current executable owned by the user, may add the package SID's exact read/execute ACE
 to the installed executable. The production profile and committed ACE persist after process exit.
 There is no automatic profile deletion, ACL rollback, explicit consent prompt, or cleanup command;
 protected, other-user-owned, remote, reparse-point, and unsupported executable locations are
-rejected instead of mutated. Merely querying status can therefore mutate supported Windows host
+rejected instead of mutated. Explicitly probing status can therefore mutate supported Windows host
 state even when no user JavaScript request is run.
 
 The A27 test must observe all of the following on its hosted reference runner before emitting its
@@ -1036,11 +1039,15 @@ The `windows-worker-containment-gate` CI job first lists tests and requires exac
 filter drift cannot pass by running zero tests. It installs beneath a path containing spaces and
 Unicode, prepares the protected-location negative control, runs the ignored real probe, exercises
 the worker runtime, and invokes the installed binary's `--print-config`. Its separate standard-user
-lane also installs the binary and requires that identity's own `--print-config` to report the same
-cached available/enforced status before it may emit pass evidence. Raw standard-user output is
+lane also installs the binary, validates its static `--print-config` report, and requires that
+identity's explicit `--js-runtime-check` to exit successfully with the exact closed pass witness
+before retaining both native resource measurements and the full containment marker checks.
+The hosted-administrator negative control likewise validates static configuration, then requires
+the explicit self-check to fail with the closed containment-unavailable diagnostic. Raw standard-user output is
 deleted rather than archived.
 CI run 31319107422 records the cached production attestation, full canary, supported user-owned
-install locations, protected-location negative control, and standard-user `--print-config` result.
+install locations, protected-location negative control, and the then-probing standard-user
+`--print-config` result. Current gates separate configuration display from explicit runtime proof.
 Hosted reference-runner evidence does not prove every current host has identical ACL visibility.
 No restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate
 general-command sandbox, whose own native gate passed independently in the same run.
