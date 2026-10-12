@@ -969,10 +969,6 @@ impl Cli {
             // Configured for another provider: prefer the provider's own
             // default; with none known, the configured id is the best guess.
             Some((model, _)) => provider_default().unwrap_or(model),
-            None if provider == default_provider(&qm) => qm
-                .get("deepseek-v4-pro")
-                .map(|q| q.model.clone())
-                .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro")),
             None => {
                 provider_default().unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro"))
             }
@@ -1331,6 +1327,45 @@ output_token_cost = 0.0
         assert_eq!(
             resolved(&quick_only, &[], None),
             ("anthropic".into(), "claude-sonnet-test".into())
+        );
+    }
+
+    #[test]
+    fn startup_and_provider_switch_share_the_same_model_default() {
+        for configuration in [
+            "",
+            DEFAULT_LIKE_CONFIG,
+            "provider = 'anthropic'\nmodel = 'claude-pinned'",
+            "[custom_providers.gateway]\nprovider_type = 'openai'\nbase_url = 'https://example.test/v1'\nmodel = 'gateway-default'",
+            "provider = 'openrouter'\nmodel = 'z-selected'\n[quick_models.a-first]\nprovider = 'openrouter'\nmodel = 'first'\n[quick_models.z-selected]\nprovider = 'openrouter'\nmodel = 'selected'\ninput_token_cost = 2.0\noutput_token_cost = 10.0",
+            "[quick_models.deepseek-v4-pro]\nprovider = 'openrouter'\nmodel = 'pro'\n[quick_models.deepseek-v4-flash]\nprovider = 'openrouter'\nmodel = 'flash'",
+        ] {
+            let cfg: config::Config = toml::from_str(configuration).unwrap();
+            for provider in [
+                "openrouter",
+                "anthropic",
+                "openai",
+                "gemini",
+                "google",
+                "ollama",
+                "gateway",
+            ] {
+                if let Some((switch_model, _)) =
+                    crate::provider::default_model_for_provider(provider, &cfg)
+                {
+                    let cli = Cli::try_parse_from(["mini-agent", "--provider", provider]).unwrap();
+                    assert_eq!(
+                        cli.resolve_model_with_env(&cfg, None).as_str(),
+                        switch_model,
+                        "startup and /provider disagree for {provider} in {configuration:?}"
+                    );
+                }
+            }
+        }
+        let cfg: config::Config = toml::from_str("provider = 'openrouter'\nmodel = 'z-selected'\n[quick_models.a-first]\nprovider = 'openrouter'\nmodel = 'first'\n[quick_models.z-selected]\nprovider = 'openrouter'\nmodel = 'selected'\ninput_token_cost = 2.0\noutput_token_cost = 10.0").unwrap();
+        assert_eq!(
+            crate::provider::default_model_for_provider("openrouter", &cfg),
+            Some(("selected".into(), Some((2.0, 10.0))))
         );
     }
 

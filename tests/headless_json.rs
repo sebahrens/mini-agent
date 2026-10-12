@@ -751,9 +751,29 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
             false,
         ),
         ("!", false, "", "empty command after '!'", false),
+        ("", false, "failed", "no prompt given", false),
+        ("   ", false, "failed", "no prompt given", false),
     ] {
         let root = TempRoot::new();
+        // Empty prompts must fail before client creation (even with no key),
+        // and cannot reach a configured provider or persist an empty message.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        if message.trim().is_empty() {
+            let address = listener.local_addr().unwrap();
+            std::fs::write(root.0.join("config.toml"), format!(
+                "[custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_EMPTY_PROMPT_KEY\"\n"
+            )).unwrap();
+        }
         let mut command = root.command();
+        if message.trim().is_empty() {
+            command.env_remove("HEADLESS_EMPTY_PROMPT_KEY").args([
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+            ]);
+        }
         command
             .env("OPENROUTER_API_KEY", "headless-json-test-key")
             .args(["--no-sandbox", "--no-context-files"]);
@@ -795,7 +815,19 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
         );
         assert_eq!(value["usage"]["total_tokens"], 0);
         assert_eq!(value["cost"], 0.0);
-        if saves_session {
+        if message.trim().is_empty() {
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(stderr.contains(detail), "{stderr}");
+            assert!(
+                !root.0.join("sessions").exists(),
+                "empty prompt created a session"
+            );
+            assert!(!root.0.join("chat-history.jsonl").exists());
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "empty prompt reached the provider"
+            );
+        } else if saves_session {
             let saved = root.saved_session();
             let messages = saved["messages"].as_array().unwrap();
             // The command and its output are one user-side message; the model
@@ -822,6 +854,25 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
                 "persistence failure must leave the blocker intact"
             );
         }
+    }
+}
+
+#[test]
+fn empty_headless_prompt_is_a_text_usage_error_without_initializing_a_provider() {
+    for message in [None, Some(""), Some(" \t\n ")] {
+        let root = TempRoot::new();
+        let mut command = root.command();
+        command.args(["--provider", "does-not-exist", "-p"]);
+        if let Some(message) = message {
+            command.arg(message);
+        }
+        let output = bounded_output(command);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("no prompt given"), "{stderr}");
+        assert!(!stderr.contains("mini-agent --setup"), "{stderr}");
+        assert!(!root.0.join("sessions").exists());
     }
 }
 

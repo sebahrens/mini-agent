@@ -14,6 +14,15 @@ use uuid::Uuid;
 pub const TOOL_RESULT_SAVE_THRESHOLD: usize = 12_000;
 pub const TOOL_RESULT_HEAD_CHARS: usize = 2_000;
 pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
+
+/// These built-ins enforce their own documented line, byte, or result caps.
+/// Applying the generic spill cap again would lose their continuation contract.
+pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
+    matches!(
+        name,
+        "read" | "shell" | "grep" | "find_files" | "list_dir" | "js"
+    )
+}
 pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 8;
 pub const CLEARED_TOOL_RESULT_NOTICE: &str =
     "[result cleared: old tool output omitted from the live context; re-run the tool if needed]";
@@ -1245,7 +1254,7 @@ impl Session {
             return (format!("{name}:\n{output}"), output.to_string(), Some(path));
         }
         let output_chars = output.chars().count();
-        if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
+        if tool_result_is_self_bounded(name) || output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
             return (format!("{name}:\n{output}"), output.to_string(), None);
         }
 
@@ -1446,7 +1455,7 @@ impl Session {
     /// restore point first so the cut can be undone with [`redo`](Self::redo).
     ///
     /// This is the shared primitive behind both `/undo` (rewind by one turn) and
-    /// the double-Esc rewind picker (rewind to a chosen earlier point): the only
+    /// the `/rewind` picker (rewind to a chosen earlier point): the only
     /// difference between them is which `new_len` they pass. Returns the number
     /// of messages removed (0 if `new_len` is already at or past the end, in
     /// which case no restore point is recorded).
@@ -2238,6 +2247,22 @@ mod preflight_tests {
         assert!(bounded.contains("storage unavailable"));
         assert!(!bounded.contains(&"M".repeat(80)));
         assert!(bounded.chars().count() < TOOL_RESULT_SAVE_THRESHOLD);
+    }
+
+    #[test]
+    fn self_bounded_tool_results_keep_their_own_limits_on_replay() {
+        let mut session = Session::new("test", "mock", 128_000, "");
+        let output = "bounded result\n".repeat(2_000);
+        for tool in ["read", "shell", "grep", "find_files", "list_dir", "js"] {
+            let (content, replay, artifact) = session.tool_result_content("id", tool, &output);
+            assert_eq!(content, format!("{tool}:\n{output}"));
+            assert_eq!(replay, output);
+            assert!(artifact.is_none());
+        }
+        // Namespaced MCP tools cannot borrow a built-in's exemption.
+        assert!(!tool_result_is_self_bounded("server__read"));
+        assert!(!tool_result_is_self_bounded("mcp_tool"));
+        session.add_tool_result_with_id("id", "read", &output);
     }
 }
 

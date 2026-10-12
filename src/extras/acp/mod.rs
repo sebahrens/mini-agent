@@ -6642,6 +6642,7 @@ mod workspace_tests {
         let first_find = FindFilesTool::new(None, None, 100)
             .with_workspace_binding(first_workspace.clone())
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "sentinel".into(),
                 path: Some(".".into()),
             })

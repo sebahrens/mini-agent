@@ -143,8 +143,9 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
 }
 
 /// Pick a sensible default model when targeting `provider`. Priority:
-/// a custom gateway's configured `model`, then a quick model targeting this
-/// provider (carrying its pricing), then a built-in fallback. Returns
+/// the configured model when it belongs to this provider, a custom gateway's
+/// configured model, the shipped default quick model, another quick model
+/// targeting this provider (carrying its pricing), then a built-in fallback. Returns
 /// (model, Option<(input_cost, output_cost)>), or None if `provider` is unknown
 /// and has no configured default. Used both by `/provider` and at startup so a
 /// chosen provider never keeps an id that is invalid on it.
@@ -152,14 +153,41 @@ pub(crate) fn default_model_for_provider(
     provider: &str,
     cfg: &Config,
 ) -> Option<(String, Option<(f64, f64)>)> {
+    let qm = crate::config::quick_models_map(cfg);
+    if let Some(configured) = cfg.model.as_deref() {
+        if let Some(quick) = qm.get(configured) {
+            if quick.provider == provider {
+                return Some((
+                    quick.model.to_string(),
+                    Some((quick.input_token_cost, quick.output_token_cost)),
+                ));
+            }
+        } else {
+            let owner = cfg.provider.as_deref().unwrap_or_else(|| {
+                qm.get("deepseek-v4-pro")
+                    .map(|quick| quick.provider.as_str())
+                    .unwrap_or("openrouter")
+            });
+            if owner == provider {
+                return Some((configured.to_owned(), None));
+            }
+        }
+    }
     if let Some(c) = cfg.custom_providers_map().get(provider)
         && let Some(m) = &c.model
     {
         return Some((m.to_string(), None));
     }
-    // Deterministic: prefer the alphabetically-first quick model for this provider
+    if let Some(quick) = qm.get("deepseek-v4-pro")
+        && quick.provider == provider
+    {
+        return Some((
+            quick.model.to_string(),
+            Some((quick.input_token_cost, quick.output_token_cost)),
+        ));
+    }
+    // Deterministic: otherwise prefer the alphabetically-first quick model for this provider
     // (HashMap iteration order would otherwise be unstable).
-    let qm = crate::config::quick_models_map(cfg);
     let mut names: Vec<&String> = qm.keys().collect();
     names.sort();
     for name in names {
@@ -172,10 +200,10 @@ pub(crate) fn default_model_for_provider(
         }
     }
     let m = match provider {
-        "anthropic" => "claude-sonnet-5",
+        "anthropic" => "claude-sonnet-5-5",
         "openai" => "gpt-5.5",
         "gemini" | "google" => "gemini-3.7-flash",
-        "openrouter" => "openrouter/auto", // OpenRouter's always-valid auto-router
+        "openrouter" => "deepseek/deepseek-v4-pro",
         "ollama" => "llama3.1",
         _ => return None,
     };

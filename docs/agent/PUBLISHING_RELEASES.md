@@ -200,6 +200,18 @@ Linux-only recipes on Ubuntu and the Homebrew formula on macOS.
 
 ## Quick start
 
+Refresh the embedded model catalog before preparing a release:
+
+```bash
+scripts/gen-models-catalog.sh
+cargo test --bin mini-agent -- models_catalog --test-threads=1
+```
+
+Review additions, prices and context windows; confirm removed model IDs against the provider's
+live inventory before committing `data/models.json`. The weekly `Update model catalog` workflow
+is currently disabled in repository settings pending owner approval for recurring refresh PRs;
+this manual step keeps releases current while it is disabled.
+
 ```bash
 just release patch   # 1.7.1 -> 1.7.2
 just release minor   # 1.7.1 -> 1.8.0

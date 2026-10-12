@@ -168,6 +168,17 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Four Unix-only Seatbelt/cache tests are correctly gated, restoring Windows test compilation.
+- The embedded catalog includes current Claude 5.5 and GPT-6 models, and Anthropic defaults to
+  Sonnet 5.5. Startup and `/provider` share default model selection.
+- Bounded read, shell, search and JavaScript results retain their own output limits in live and
+  replayed history. Saved output from unbounded tools can be read in headless mode through the
+  current session's private directory capability, while explicit deny rules still apply.
+- `find_files` interprets common patterns such as `src/*.rs` as globs; explicit regex mode is
+  available. HTTP 408, 409 and 425 completion errors use bounded retry backoff.
+- LSP selection is deterministic when servers share an extension. Empty, malformed and duplicate
+  prompt directives are removed from the prompt header and reported to the user.
+
 - The supported lexical-only skill backend logs its diagnostic at Debug; genuine retrieval
   failures still warn. VS Code waits for bounded child termination after ACP startup fails.
 - `/wt-merge` works with local-only target branches without requiring an upstream.

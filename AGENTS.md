@@ -28,6 +28,22 @@ Run production crate commands from the repository root:
 - **ALWAYS** write tests for new non-TUI code
 - **ALWAYS** update `docs/` when adding new modules
 
+### Scope validation to the change
+
+- Use `cargo test` filters for changed modules and their affected callers; a full suite is not a
+  mandatory gate for each bead. Batch related filters in one libtest invocation, for example
+  `cargo test --bin mini-agent -- find_files retry --test-threads=1`.
+- Run feature rows only when the change affects their code or cfg boundaries. Include native
+  containment tests for sandbox/runtime changes and integration tests for changed external
+  contracts. Shared startup, protocol, feature graph or dependency changes may require broader
+  coverage; record why rather than silently replacing it with a narrow unit test.
+- Reuse passing results for unchanged code. Repeat or broaden checks after new edits, failures,
+  or unresolved review findings, not merely because another gate or bead reached completion.
+- Parallel agents must coordinate Cargo runs: do not build different feature rows in the same
+  target directory while a test binary runs, because integration tests use that shared binary.
+- Never use `git checkout`, `git restore`, `git reset`, `git stash`, or `git clean` to repair another
+  agent's in-progress edits in the shared checkout.
+
 ## JS engine integration — where to put things
 
 | Concern | Location |

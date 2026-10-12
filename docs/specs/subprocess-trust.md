@@ -437,6 +437,11 @@ macro-context exemption are removed. The creation-boundary audit checks exemptio
 against the macro terminals it actually inspects, so obsolete digest entries cannot accumulate.
 The ACP protocol fixture’s tool-result `output` fields are data, with their
 exact macro context audited including the optional subagent event guard.
+The bounded-read/live-history and session-replay regressions compare returned
+text strings named `output`; file-search regressions inspect listing strings.
+Each new assertion has an exact source/occurrence and full macro-context digest
+classified `NON-PROCESS`; the replaced no-match assertion is removed. These
+classifications grant no process-launch exemption outside those exact contexts.
 
 The audit currently resolves as follows:
 

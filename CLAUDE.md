@@ -16,6 +16,22 @@ cargo install --path . --debug # required development build/install command
 **Never** run `cargo check` — `cargo test` catches type errors and tests in one pass.
 Write tests for new non-TUI production code and update `docs/` when adding modules.
 
+### Scope validation to the change
+
+- Use `cargo test` filters for changed modules and their affected callers; a full suite is not a
+  mandatory gate for each bead. Batch related filters in one libtest invocation, for example
+  `cargo test --bin mini-agent -- find_files retry --test-threads=1`.
+- Run feature rows only when the change affects their code or cfg boundaries. Include native
+  containment tests for sandbox/runtime changes and integration tests for changed external
+  contracts. Shared startup, protocol, feature graph or dependency changes may require broader
+  coverage; record why rather than silently replacing it with a narrow unit test.
+- Reuse passing results for unchanged code. Repeat or broaden checks after new edits, failures,
+  or unresolved review findings, not merely because another gate or bead reached completion.
+- Parallel agents must coordinate Cargo runs: do not build different feature rows in the same
+  target directory while a test binary runs, because integration tests use that shared binary.
+- Never use `git checkout`, `git restore`, `git reset`, `git stash`, or `git clean` to repair another
+  agent's in-progress edits in the shared checkout.
+
 ## JS engine implementation
 
 The integration lives at `src/extras/js/`. The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here. Delivered changes from the reviews are recorded under **Delivered amendments (2026-09-05)** and **Delivered corrections (2026-09-07)** in the owning spec and in `docs/specs/00-index.md`; preserve those contracts and close each named bead with its tests before describing later changes as delivered.

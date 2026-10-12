@@ -823,7 +823,13 @@ jobs:
           echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
 
       - name: Test JS spawn parity through the shared sandbox
-        run: cargo test --locked --features js,sandbox
+        # The feature matrix already runs the complete suite. This native
+        # containment gate needs the sandbox/JS consumers, rather than another
+        # full run of unrelated UI, session and provider tests.
+        run: >-
+          cargo test --locked --features js,sandbox --
+          sandbox:: extras::js:: agent::builder::js_tests::
+          tests::sandbox_platform_tests:: --test-threads=1
 
       - name: Test immutable learned-skill executable snapshots
         shell: bash

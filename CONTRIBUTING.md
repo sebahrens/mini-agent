@@ -35,6 +35,16 @@ cargo install --path . --debug # the development build/install command
 - Changes under `scripts/`, `.github/workflows/`, `packaging/` or the release documents are covered by
   `python3 -m unittest` suites in `scripts/tests/` and by `python3 scripts/check-package-metadata.py`.
 
+Scope local test runs to changed modules and their affected callers. Several libtest filters can
+run together, for example `cargo test --bin mini-agent -- find_files retry --test-threads=1`.
+Choose feature rows that exercise changed cfg boundaries, and retain integration and native
+containment coverage for affected contracts. Broaden coverage for shared startup, protocols,
+features or dependencies when needed, with the reason recorded. Reuse passing results until
+new edits, failures or review findings justify another run; do not repeat the full suite per bead.
+Parallel Cargo runs need separate target directories or serialization so one feature build cannot
+replace the binary another integration test is using. Hosted CI supplies the required platform
+matrix; a local focused test result does not establish that the whole matrix passed.
+
 ## Tests and documentation
 
 - Write tests for new non-TUI production code. A bug fix needs a regression test that fails without

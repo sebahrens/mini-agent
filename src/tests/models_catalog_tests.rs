@@ -50,7 +50,7 @@ fn direct_provider_catalog_entries_are_priced() {
 fn current_direct_provider_defaults_are_catalogued_and_priced() {
     let cfg = crate::config::Config::default();
     for (provider, expected) in [
-        ("anthropic", "claude-sonnet-5"),
+        ("anthropic", "claude-sonnet-5-5"),
         ("openai", "gpt-5.5"),
         ("gemini", "gemini-3.7-flash"),
         ("google", "gemini-3.7-flash"),
@@ -72,11 +72,41 @@ fn current_direct_provider_defaults_are_catalogued_and_priced() {
 #[test]
 fn refreshed_catalog_contains_current_anthropic_generation() {
     let anthropic = ids("anthropic");
-    for id in ["claude-fable-5-1", "claude-opus-5", "claude-sonnet-5"] {
+    for id in ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"] {
         assert!(
             anthropic.iter().any(|candidate| candidate == id),
             "missing {id}"
         );
+    }
+}
+
+#[test]
+fn current_models_resolve_context_and_pricing_offline() {
+    for (provider, model, context) in [
+        ("anthropic", "claude-haiku-5-5", 1_000_000),
+        ("anthropic", "claude-opus-5-5", 1_000_000),
+        ("anthropic", "claude-sonnet-5-5", 1_000_000),
+        ("openai", "gpt-6-luna", 1_050_000),
+        ("openai", "gpt-6-sol", 1_050_000),
+        ("openai", "gpt-6.1-sol", 1_050_000),
+    ] {
+        let entry = catalog_entries(provider)
+            .unwrap()
+            .iter()
+            .find(|entry| entry.id == model)
+            .unwrap_or_else(|| panic!("missing {provider}/{model}"));
+        assert_eq!(entry.context_length, Some(context));
+        let cfg = crate::config::Config::default();
+        let quick_models = crate::config::quick_models_map(&cfg);
+        assert_eq!(
+            cfg.known_context_window(provider, model, &quick_models),
+            Some(u64::from(context))
+        );
+        assert_eq!(
+            cfg.resolve_context_window(provider, model, &quick_models),
+            u64::from(context)
+        );
+        assert!(crate::config::Config::catalog_input_output_cost(provider, model).is_some());
     }
 }
 

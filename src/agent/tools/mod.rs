@@ -453,10 +453,22 @@ pub struct GrepArgs {
     pub count: bool,
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindFilesMode {
+    #[default]
+    Auto,
+    Glob,
+    Regex,
+}
+
 #[derive(Deserialize)]
 pub struct FindFilesArgs {
     pub pattern: String,
     pub path: Option<String>,
+    /// Auto treats glob metacharacters and path separators as a path glob.
+    #[serde(default)]
+    pub mode: FindFilesMode,
 }
 
 #[derive(Deserialize)]

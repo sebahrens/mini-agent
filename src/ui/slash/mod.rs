@@ -23,7 +23,9 @@ mod loop_command_tests;
 #[cfg(test)]
 mod session_restore_tests;
 
-pub(crate) use providers::{cached_model_ids, model_cache_generation, warm_model_cache};
+pub(crate) use providers::{
+    cached_model_ids, model_cache_generation, resolve_model_pricing, warm_model_cache,
+};
 
 use smallvec::SmallVec;
 

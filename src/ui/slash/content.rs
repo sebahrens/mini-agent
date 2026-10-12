@@ -185,6 +185,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     } else {
         let name = parts[1].trim();
         if ctx.context.prompts.contains_key(name) {
+            write_prompt_warnings(ctx.renderer, &ctx.context.prompts[name]);
             match apply_prompt_mode(name, ctx.context, ctx.permission) {
                 PromptModeOutcome::RestoredUserMode => {
                     if let Some(perm) = ctx.permission {
@@ -220,6 +221,12 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+fn write_prompt_warnings(renderer: &mut crate::ui::renderer::Renderer, content: &str) {
+    for warning in context::prompts::parse_directives(content).warnings {
+        write_result(renderer, format!("prompt warning: {warning}"));
+    }
 }
 
 async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -325,7 +332,26 @@ async fn handle_regen_themes(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod active_agent_message_tests {
-    use super::active_agent_message;
+    use super::{active_agent_message, write_prompt_warnings};
+
+    #[test]
+    fn prompt_mode_warnings_reach_activation_output() {
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        write_prompt_warnings(
+            &mut renderer,
+            "%%mode=\n%%unknown=value\n%%mode=readonly\n%%mode=yolo\nBody.",
+        );
+        let feed = renderer.feed();
+        let lines: Vec<_> = (0..feed.block_count())
+            .map(|index| feed.block_text(index).unwrap().to_string())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("prompt warning: ignoring empty prompt directive %%mode="));
+        assert!(lines[1].contains("prompt warning: ignoring unknown prompt directive %%unknown="));
+        assert!(lines[2].contains(
+            "prompt warning: ignoring duplicate prompt directive %%mode=; first nonempty value wins"
+        ));
+    }
 
     #[test]
     fn persona_confirmation_states_capabilities_are_unchanged() {

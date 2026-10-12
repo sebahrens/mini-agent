@@ -54,7 +54,7 @@ build does not know parks it.
 | `/provider` | Show the current provider. |
 | `/provider <name>` | Switch to a different provider. |
 | `/model` | Show the current model. From the command picker, Enter on `/model` opens the model picker: Tab switches between quick aliases and the provider's models, and the current model is marked `(current)`. |
-| `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. |
+| `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. Raw ids resolve pricing from the live listing, baked catalog, then a matching quick model, as at startup. Unknown prices reset both rates to zero and show a yellow note explaining that costs are not tracked. |
 | `/models` | List quick models and the provider's available models. |
 | `/models refresh` | Re-fetch the provider's model list (also retries a listing that failed recently). |
 | `/models <name>` | Same as `/model <name>`, kept for compatibility. |
@@ -362,6 +362,11 @@ In `--print` mode, a failed command or empty `!` exits nonzero. Captured output 
 rendered and saved before reporting a command failure; `--output json` marks that result
 with `"stop_reason":"failed"`.
 
+An empty or whitespace-only `-p` prompt is a local usage error (exit 2) before
+provider and session initialization. Text mode reports `no prompt given` on
+stderr; `--output json` emits one result with `stop_reason: "failed"`, zero usage
+and cost, and the same message. No provider request or session message is created.
+
 At startup, mini-agent resolves the configured shell once against the canonical
 workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
 with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
@@ -393,7 +398,7 @@ finishing, stops waiting and exits with status 130.
 | `!` | Empty command shows an error. |
 
 If you want to run a command and then discuss the output with the agent, just
-type `!<command>` first (it stores the output as an Assistant message), then
+type `!<command>` first (it stores the command and output as one user message), then
 follow up with a normal message asking the agent about it.
 
 In the TUI, typing `!` into an empty input opens a picker of shell commands you
@@ -509,6 +514,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `@<query>` | Activate the file picker when `@` starts a word (input start, or after whitespace, a newline, `(` or a quote, including a pasted trailing `@`); Tab or Enter inserts the highlighted path, a space keeps the typed text and closes the picker, Ctrl+W deletes the query, and Escape closes it. |
 | `Tab` | Insert two spaces when no picker is active. |
 | `Up / Down` | Move vertically in multiline input, one visual row at a time (long lines soft-wrap at the terminal width, breaking after whitespace where possible); at the first or last row, navigate command history (a recalled prompt puts the cursor at its end). |
+| `Ctrl+P / Ctrl+N` | Move up/down exactly like `Up / Down`, including command history at the input boundaries. |
 | `PageUp / PageDown` | Scroll viewport. |
 | `Home / End` | Move to the start/end of the current input line. With an empty input (or while a picker is open) they jump to the top/bottom of chat history instead. |
 | `Ctrl+Home / Ctrl+End` | Jump to the top/bottom of chat history. |

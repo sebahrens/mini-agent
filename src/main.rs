@@ -80,6 +80,12 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         print::exit_force_stopped();
     }
+    if let Err(error) = &result
+        && error.is::<startup::HeadlessUsageError>()
+    {
+        eprintln!("Error: {error}");
+        return Ok(ExitCode::from(2));
+    }
     match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         // A goal that stopped short is an outcome, not a crash: it exits with

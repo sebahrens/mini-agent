@@ -530,7 +530,7 @@ impl InputEditor {
         self.picker = Some(Picker::Prefixed(picker, "/provider "));
     }
 
-    /// Open the double-Esc rewind picker over the given `(message_index,
+    /// Open the `/rewind` picker over the given `(message_index,
     /// preview)` user turns. No-op when there is nothing to rewind to.
     pub fn start_rewind_picker(&mut self, targets: Vec<(usize, String)>) {
         if targets.is_empty() {

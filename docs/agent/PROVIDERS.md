@@ -31,13 +31,19 @@ mini-agent --provider openai --model gpt-4o
 ```
 
 When a built-in provider is selected without an explicit model, zerostack uses
-these catalogued defaults: `claude-sonnet-5` for Anthropic, `gpt-5.5` for
-OpenAI, `gemini-3.7-flash` for Gemini/Google, `openrouter/auto` for OpenRouter,
+these catalogued defaults: `claude-sonnet-5-5` for Anthropic, `gpt-5.5` for
+OpenAI, `gemini-3.7-flash` for Gemini/Google, `deepseek/deepseek-v4-pro` for OpenRouter,
 and `llama3.1` for Ollama. Direct-provider entries in the
 embedded catalog always include positive input and output prices; the refresh
 script omits entries whose upstream pricing is absent so the status line never
 silently treats a paid model as free. OpenRouter continues to refresh its
 marketplace pricing at runtime.
+
+Startup and `/provider <name>` use the same default resolver: the configured
+`model` when it belongs to that provider, a custom provider's own `model`, the
+`deepseek-v4-pro` quick model when it targets that provider, another matching
+quick model in alphabetical alias order, then the built-in defaults above.
+An explicit `--model` or `/model` selection still overrides these defaults.
 
 ## Provider Recipes
 

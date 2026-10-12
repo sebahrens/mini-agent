@@ -11,6 +11,165 @@ use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMod
 
 pub type PermCheck = Arc<Mutex<PermissionChecker>>;
 
+#[cfg(test)]
+mod tool_output_read_tests {
+    use super::*;
+
+    #[test]
+    fn current_session_spill_grant_is_read_only_scoped_and_preserves_denies() {
+        let root = crate::tests::OwnedTestDirectory::new("spill-permission");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+        ]);
+        let first = crate::session::storage::save_tool_output("first", "tool", "first").unwrap();
+        let second = crate::session::storage::save_tool_output("second", "tool", "second").unwrap();
+        let first_text = first.to_string_lossy();
+        let second_text = second.to_string_lossy();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(checker.check_path("read", &first_text), CheckResult::Ask);
+        checker.bind_tool_output_session("first").unwrap();
+        assert_eq!(
+            checker.check_path("read", &first_text),
+            CheckResult::Allowed
+        );
+        assert_eq!(checker.check_path("read", &second_text), CheckResult::Ask);
+        for tool in ["write", "edit", "list_dir", "grep", "js/read_file"] {
+            assert_eq!(
+                checker.check_path(tool, &first_text),
+                CheckResult::Ask,
+                "{tool}"
+            );
+        }
+        let nested = first.parent().unwrap().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("other.txt"), "nested").unwrap();
+        assert_eq!(
+            checker.check_path("read", &nested.join("other.txt").to_string_lossy()),
+            CheckResult::Ask
+        );
+        checker.bind_tool_output_session("second").unwrap();
+        assert_eq!(checker.check_path("read", &first_text), CheckResult::Ask);
+        assert_eq!(
+            checker.check_path("read", &second_text),
+            CheckResult::Allowed
+        );
+        drop(checker);
+        for config in [
+            PermissionConfig {
+                read: Some(ToolPerm::Simple(Action::Deny)),
+                ..PermissionConfig::default()
+            },
+            PermissionConfig {
+                external_directory: Some(
+                    [(
+                        format!("{}/**", second.parent().unwrap().display()),
+                        Action::Deny,
+                    )]
+                    .into(),
+                ),
+                ..PermissionConfig::default()
+            },
+        ] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap();
+            checker.bind_tool_output_session("second").unwrap();
+            assert!(matches!(
+                checker.check_path("read", &second_text),
+                CheckResult::Denied(_)
+            ));
+        }
+        for mode in [
+            SecurityMode::Restrictive,
+            SecurityMode::Guarded,
+            SecurityMode::ReadOnly,
+        ] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::default(),
+                mode,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap();
+            checker.bind_tool_output_session("first").unwrap();
+            assert_eq!(
+                checker.check_path("read", &first_text),
+                CheckResult::Allowed,
+                "{mode:?}"
+            );
+        }
+        drop(_environment);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn session_spill_grant_rejects_symlink_escape_and_replaced_directory() {
+        let root = crate::tests::OwnedTestDirectory::new("spill-replacement");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+        ]);
+        let path = crate::session::storage::save_tool_output("active", "tool", "original").unwrap();
+        let other = root.path().join("unrelated.txt");
+        std::fs::write(&other, "unrelated").unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace),
+            None,
+        )
+        .unwrap();
+        checker.bind_tool_output_session("active").unwrap();
+        let link = path.parent().unwrap().join("escape.txt");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(
+            checker.check_path("read", &link.to_string_lossy()),
+            CheckResult::Ask
+        );
+        assert!(checker.open_tool_output_file(&link).unwrap().is_err());
+        let fifo = path.parent().unwrap().join("not-an-artifact.fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path owned for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            checker.check_path("read", &fifo.to_string_lossy()),
+            CheckResult::Ask
+        );
+        assert!(checker.open_tool_output_file(&fifo).unwrap().is_err());
+        let directory = path.parent().unwrap();
+        std::fs::rename(directory, root.path().join("retained-original")).unwrap();
+        std::fs::create_dir(directory).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        assert_eq!(
+            checker.check_path("read", &path.to_string_lossy()),
+            CheckResult::Ask
+        );
+        assert!(checker.open_tool_output_file(&path).unwrap().is_err());
+        assert!(checker.bind_tool_output_session("active").is_err());
+        drop(checker);
+        drop(_environment);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     Allowed,
@@ -110,6 +269,9 @@ pub struct PermissionChecker {
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
     cached_resolved_cwd: Option<PathBuf>,
+    /// Only the active logical session's immediate spill files are readable.
+    /// Retain a directory capability so path replacement cannot widen the grant.
+    tool_output_binding: Option<(String, crate::paths::WorkspaceBinding)>,
     /// One-shot hook decisions, keyed by the invocation token the decorator
     /// created for a single wrapped call. Concurrent calls each own their own
     /// entry, so one hook verdict can never overwrite another call's.
@@ -149,6 +311,68 @@ struct HookOneShot {
 }
 
 impl PermissionChecker {
+    pub(crate) fn bind_tool_output_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if crate::paths::artifact_disabled("tool outputs") {
+            self.tool_output_binding = None;
+            anyhow::bail!("tool-output persistence is disabled by a legacy-path conflict");
+        }
+        if let Some((bound_session, binding)) = &self.tool_output_binding
+            && bound_session == session_id
+        {
+            return binding.validate().map_err(anyhow::Error::msg);
+        }
+        // A failed rebind must never leave the previous session's grant active.
+        self.tool_output_binding = None;
+        let root = crate::session::storage::tool_output_dir(session_id);
+        crate::paths::ensure_private_directory(&root)?;
+        let binding = crate::paths::WorkspaceBinding::capture(&root)?;
+        self.tool_output_binding = Some((session_id.to_owned(), binding));
+        Ok(())
+    }
+
+    /// Return a descriptor opened through the same capability that authorized
+    /// a spill read, rather than reopening the approved path ambiently.
+    pub(crate) fn open_tool_output_file(
+        &self,
+        path: &Path,
+    ) -> Option<std::io::Result<std::fs::File>> {
+        let (_, binding) = self.tool_output_binding.as_ref()?;
+        if path.parent() != Some(binding.root()) {
+            return None;
+        }
+        Some((|| {
+            binding.validate().map_err(std::io::Error::other)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("tool-output file has no name"))?;
+            let directory = binding.open_dir_relative(Path::new(""))?;
+            let before = directory.symlink_metadata(name)?;
+            if !before.is_file() || before.file_type().is_symlink() {
+                return Err(std::io::Error::other(
+                    "tool-output target is not a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            let file = {
+                use cap_std::fs::OpenOptionsExt;
+                let mut options = cap_std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                directory.open_with(name, &options)?.into_std()
+            };
+            #[cfg(not(unix))]
+            let file = binding.open_relative(Path::new(name))?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::other(
+                    "tool-output target is not a regular file",
+                ));
+            }
+            binding.validate().map_err(std::io::Error::other)?;
+            Ok(file)
+        })())
+    }
+
     /// Rebind relative path authorization to an explicitly selected workspace.
     /// Worktree switching uses this instead of mutating process-global CWD.
     #[cfg(any(feature = "git-worktree", test))]
@@ -396,6 +620,7 @@ impl PermissionChecker {
             permission_modes: resolved_modes,
             allow_all_mcp_calls: false,
             cached_resolved_cwd,
+            tool_output_binding: None,
             #[cfg(feature = "hooks")]
             hook_decisions: std::collections::HashMap::new(),
             #[cfg(feature = "hooks")]
@@ -917,6 +1142,13 @@ impl PermissionChecker {
         // nested external tree that policy explicitly denies.
         if external && external_action == Some(Action::Deny) {
             return CheckResult::Denied("Blocked by external directory deny rule".to_string());
+        }
+        if tool == "read"
+            && self
+                .open_tool_output_file(Path::new(abs_path))
+                .is_some_and(|file| file.is_ok())
+        {
+            return CheckResult::Allowed;
         }
         #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();

@@ -608,6 +608,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> Agent<M> {
+    if let Some(permission) = &permission
+        && let Err(error) = permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_tool_output_session(tool_output_session_id)
+    {
+        tracing::warn!(%error, "failed to bind current session tool-output reads");
+    }
     let workspace_root = workspace.root();
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
     let tools_enabled = !cli.resolve_no_tools(cfg);
@@ -950,6 +958,14 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
     additional_params: Option<serde_json::Value>,
 ) -> Agent<M> {
+    if let Some(permission) = permission
+        && let Err(error) = permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_tool_output_session(tool_output_session_id)
+    {
+        tracing::warn!(%error, "failed to bind current session tool-output reads");
+    }
     let cwd = workspace.root().display().to_string();
 
     let mut preamble = String::new();

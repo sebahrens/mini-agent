@@ -91,6 +91,67 @@ fn mode_directive_is_stripped_and_applied() {
 }
 
 #[test]
+fn prompt_mode_empty_unknown_and_malformed_directives_are_stripped_with_warnings() {
+    let raw = "%%mode=\r\n%%unknown=value\n%%missing-equals\n%%agent=\nBody.\n%%mode=yolo";
+    let directives = crate::context::prompts::parse_directives(raw);
+    assert_eq!(directives.mode, None);
+    assert_eq!(directives.agent, None);
+    assert_eq!(directives.content, "Body.\n%%mode=yolo");
+    assert_eq!(
+        directives.warnings,
+        vec![
+            "ignoring empty prompt directive %%mode=",
+            "ignoring unknown prompt directive %%unknown=",
+            "ignoring malformed prompt directive: expected %%key=value",
+            "ignoring empty prompt directive %%agent=",
+        ]
+    );
+    let mut context = make_context(&[("invalid", raw)]);
+    let perm = make_perm(SecurityMode::Guarded);
+    assert_eq!(
+        apply_prompt_mode("invalid", &mut context, &Some(perm.clone())),
+        PromptModeOutcome::None
+    );
+    assert_eq!(
+        context.current_prompt.as_deref(),
+        Some("Body.\n%%mode=yolo")
+    );
+    assert_eq!(current_mode(&perm), SecurityMode::Guarded);
+    let only_header = crate::context::prompts::parse_directives("%%mode=  ");
+    assert_eq!(only_header.content, "");
+    assert_eq!(only_header.warnings.len(), 1);
+}
+
+#[test]
+fn prompt_mode_duplicate_directives_keep_first_nonempty_value_with_warnings() {
+    let raw = "%%mode=\n%%mode=readonly\n%%mode=yolo\n%%agent=reviewer\n%%agent=default\n%%grant=config_dir:read\n%%grant=config_dir:edit\nBody.";
+    let directives = crate::context::prompts::parse_directives(raw);
+    assert_eq!(directives.mode, Some("readonly"));
+    assert_eq!(directives.agent, Some("reviewer"));
+    assert_eq!(directives.grant, Some("config_dir:read"));
+    assert_eq!(directives.content, "Body.");
+    assert_eq!(
+        directives.warnings,
+        vec![
+            "ignoring empty prompt directive %%mode=",
+            "ignoring duplicate prompt directive %%mode=; first nonempty value wins",
+            "ignoring duplicate prompt directive %%agent=; first nonempty value wins",
+            "ignoring duplicate prompt directive %%grant=; first nonempty value wins",
+        ]
+    );
+    let mut context = make_context(&[("review", raw)]);
+    add_agent(&mut context, "reviewer", "Review carefully.", None);
+    let perm = make_perm(SecurityMode::Standard);
+    assert_eq!(
+        apply_prompt_mode("review", &mut context, &Some(perm.clone())),
+        PromptModeOutcome::Applied(SecurityMode::ReadOnly)
+    );
+    assert_eq!(current_mode(&perm), SecurityMode::ReadOnly);
+    assert_eq!(context.current_agent_name.as_deref(), Some("reviewer"));
+    assert_eq!(context.current_prompt.as_deref(), Some("Body."));
+}
+
+#[test]
 fn prompt_mode_composes_security_and_main_agent_directives_in_either_order() {
     let mut context = make_context(&[(
         "review",

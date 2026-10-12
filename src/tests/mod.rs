@@ -5,6 +5,53 @@ use std::sync::{Mutex, MutexGuard};
 
 static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// An exclusively owned scratch directory, removed even when a test panics.
+/// Declare it before environment guards and retained filesystem capabilities
+/// so those are released before directory cleanup during unwinding.
+pub(crate) struct OwnedTestDirectory(std::path::PathBuf);
+
+impl OwnedTestDirectory {
+    pub(crate) fn new(label: &str) -> Self {
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve test scratch directory")
+            .join(format!("mini-agent-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).expect("create exclusive test scratch directory");
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for OwnedTestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to clean test directory {}: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_test_directory_cleans_up_after_panic() {
+    let mut path = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let directory = OwnedTestDirectory::new("panic-cleanup");
+        path = Some(directory.path().to_path_buf());
+        std::fs::create_dir(directory.path().join("nested")).unwrap();
+        std::fs::write(directory.path().join("nested/file"), "owned").unwrap();
+        panic!("fixture failure");
+    }));
+    assert!(result.is_err());
+    assert!(!path.unwrap().exists());
+}
+
 pub(crate) struct ScopedProcessEnv {
     previous: Vec<(OsString, Option<OsString>)>,
     _lock: MutexGuard<'static, ()>,

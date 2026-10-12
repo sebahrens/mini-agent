@@ -285,30 +285,49 @@ pub(crate) fn warm_model_cache(
     });
 }
 
-fn lookup_pricing_from_cache(provider: &str, model_id: &str) -> Option<(f64, f64)> {
-    MODEL_CACHE
-        .lock()
-        .unwrap()
-        .get(provider)
-        .and_then(|models| {
-            models.iter().find_map(|m| {
-                if m.id == model_id {
-                    m.input_price.zip(m.output_price).or_else(|| {
-                        crate::models_catalog::catalog_entries(provider).and_then(|entries| {
-                            entries.iter().find_map(|e| {
-                                if e.id == model_id {
-                                    e.input_price.zip(e.output_price)
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                    })
-                } else {
-                    None
-                }
-            })
+/// One pricing order for raw ids at startup and during a model switch. A stale
+/// live listing must not hide baked prices, and a previous model is never a
+/// pricing fallback for an unknown id.
+pub(crate) fn resolve_model_pricing(
+    provider: &str,
+    model_id: &str,
+    cfg: &Config,
+) -> Option<(f64, f64)> {
+    let listing = MODEL_CACHE.lock().unwrap().get(provider).cloned();
+    resolve_model_pricing_from_listing(provider, model_id, cfg, listing.as_deref())
+}
+
+fn resolve_model_pricing_from_listing(
+    provider: &str,
+    model_id: &str,
+    cfg: &Config,
+    listing: Option<&[ModelEntry]>,
+) -> Option<(f64, f64)> {
+    let live = listing
+        .and_then(|models| models.iter().find(|model| model.id == model_id))
+        .and_then(|model| model.input_price.zip(model.output_price));
+    live.or_else(|| Config::catalog_input_output_cost(provider, model_id))
+        .or_else(|| {
+            config::quick_models_map(cfg)
+                .into_iter()
+                .filter(|(_, quick)| quick.provider == provider && quick.model == model_id)
+                // Multiple aliases for one raw id resolve deterministically.
+                .min_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, quick)| (quick.input_token_cost, quick.output_token_cost))
         })
+}
+
+fn apply_model_pricing(
+    session: &mut crate::session::Session,
+    model_id: &str,
+    pricing: Option<(f64, f64)>,
+) -> Option<String> {
+    let (input, output) = pricing.unwrap_or((0.0, 0.0));
+    session.input_token_cost = input;
+    session.output_token_cost = output;
+    pricing.is_none().then(|| format!(
+        "no pricing known for {model_id}; costs will not be tracked (set input_token_cost/output_token_cost in a quick model)"
+    ))
 }
 
 async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
@@ -325,10 +344,9 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
             &new_model,
             &crate::config::quick_models_map(ctx.cfg),
         ));
-    if let Some((input, output)) = lookup_pricing_from_cache(&ctx.session.provider, model_id) {
-        ctx.session.input_token_cost = input;
-        ctx.session.output_token_cost = output;
-    } else if ctx.session.provider == "openrouter"
+    let mut pricing = resolve_model_pricing(&ctx.session.provider, model_id, ctx.cfg);
+    if pricing.is_none()
+        && ctx.session.provider == "openrouter"
         && let Ok(prices) = crate::provider::fetch_openrouter_pricing(
             ctx.cli.api_key.as_deref(),
             &ctx.cfg.custom_providers_map(),
@@ -337,8 +355,7 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
         .await
         && let Some(info) = prices.get(model_id)
     {
-        ctx.session.input_token_cost = info.input_cost;
-        ctx.session.output_token_cost = info.output_cost;
+        pricing = Some((info.input_cost, info.output_cost));
         if ctx.cfg.context_window.is_none()
             && crate::config::Config::catalog_context_window("openrouter", model_id).is_none()
             && let Some(cw) = info.context_length
@@ -346,6 +363,12 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
             ctx.session.update_context_window(cw);
         }
     }
+    if let Some(note) = apply_model_pricing(ctx.session, model_id, pricing) {
+        let _ = ctx
+            .renderer
+            .write_line(&note, crossterm::style::Color::Yellow);
+    }
+
     write_ok(ctx.renderer, format!("switched to model: {}", new_model));
 }
 
@@ -373,13 +396,18 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     // Default the model to something valid for the new provider. Otherwise
     // the old id (e.g. an OpenRouter id) is carried onto a provider where it
     // is invalid.
+    let mut pricing = None;
     if let Some((model, costs)) = crate::provider::default_model_for_provider(new_provider, ctx.cfg)
     {
         ctx.session.model = compact_str::CompactString::new(&model);
-        if let Some((inc, outc)) = costs {
-            ctx.session.input_token_cost = inc;
-            ctx.session.output_token_cost = outc;
-        }
+        pricing = costs;
+    }
+    let model = ctx.session.model.to_string();
+    let pricing = pricing.or_else(|| resolve_model_pricing(new_provider, &model, ctx.cfg));
+    if let Some(note) = apply_model_pricing(ctx.session, &model, pricing) {
+        let _ = ctx
+            .renderer
+            .write_line(&note, crossterm::style::Color::Yellow);
     }
     ctx.rebuild_agent().await;
     ctx.session
@@ -911,5 +939,245 @@ mod models_add_tests {
         assert!(parse_models_add(&["/models-add", "fast", "p", "m", "x", "2.0"]).is_err());
         assert!(parse_models_add(&["/models-add", "fast", "p", "m", "NaN", "2.0"]).is_err());
         assert!(parse_models_add(&["/models-add", "fast", "p", "m", "-1", "2.0"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod model_pricing_tests {
+    use super::*;
+    use crate::session::Session;
+
+    #[tokio::test]
+    async fn model_command_switches_unknown_and_catalog_models_without_stale_costs() {
+        use crate::ui::{input::InputEditor, renderer::Renderer, terminal::TerminalGuard};
+        let workspace =
+            crate::agent::tools::capture_workspace_binding(std::env::current_dir().unwrap());
+        let cli = Cli {
+            no_tools: true,
+            api_key: Some("unused-test-key".into()),
+            ..Cli::default()
+        };
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": { "unpriced-gateway": {
+                "provider_type": "openai", "base_url": "http://127.0.0.1:1/v1", "api_style": "completions"
+            } }
+        })).unwrap();
+        let mut context = crate::context::ContextFiles {
+            workspace_root: workspace.root().to_path_buf(),
+            agents: None,
+            prompts: Default::default(),
+            current_prompt: None,
+            current_prompt_name: None,
+            agent_definitions: Default::default(),
+            current_agent_name: None,
+            current_agent_explicit: false,
+            themes: Default::default(),
+            current_theme_name: None,
+            extra_files: Vec::new(),
+            extra_file_contents: Default::default(),
+            one_shot_restore: None,
+            chain_declined: Vec::new(),
+            #[cfg(feature = "memory")]
+            memory: None,
+            #[cfg(feature = "archmd")]
+            architecture: None,
+        };
+        let mut client = AnyClient::Anthropic(
+            rig::providers::anthropic::Client::builder()
+                .api_key("unused-test-key")
+                .build()
+                .unwrap(),
+        );
+        let mut session = Session::new("anthropic", "previous-model", 128_000, "");
+        session.input_token_cost = 7.0;
+        session.output_token_cost = 19.0;
+        let mut agent = None;
+        let mut renderer = Renderer::new().unwrap();
+        let mut input = InputEditor::new();
+        let mut terminal_guard = TerminalGuard::detached_for_test();
+        let invalidated = std::sync::atomic::AtomicBool::new(false);
+        let mut show_reasoning = false;
+        let mut reasoning_enabled = false;
+        let mut is_running = false;
+        let mut todo_tools_enabled = false;
+        let sandbox =
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+        #[cfg(feature = "skills")]
+        let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+        let mut ctx = SlashCtx {
+            prebuild_invalidated: &invalidated,
+            agent: &mut agent,
+            client: &mut client,
+            renderer: &mut renderer,
+            session: &mut session,
+            cli: &cli,
+            cfg: &cfg,
+            context: &mut context,
+            workspace: &workspace,
+            show_reasoning: &mut show_reasoning,
+            reasoning_enabled: &mut reasoning_enabled,
+            is_running: &mut is_running,
+            input: &mut input,
+            permission: &None,
+            ask_tx: &None,
+            todo_tools_enabled: &mut todo_tools_enabled,
+            sandbox: &sandbox,
+            terminal_guard: &mut terminal_guard,
+            #[cfg(feature = "skills")]
+            skill_services: &skill_services,
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        handle(&["/model", "unknown-pricing-test-model"], &mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.agent.is_some());
+        assert_eq!(ctx.session.model, "unknown-pricing-test-model");
+        assert_eq!(
+            (ctx.session.input_token_cost, ctx.session.output_token_cost),
+            (0.0, 0.0)
+        );
+        assert!(
+            ctx.renderer
+                .feed()
+                .block_text(0)
+                .unwrap()
+                .contains("no pricing known for unknown-pricing-test-model")
+        );
+        assert!(
+            ctx.renderer
+                .feed()
+                .block_text(1)
+                .unwrap()
+                .contains("switched to model")
+        );
+        let model = crate::models_catalog::catalog_entries("anthropic")
+            .unwrap()
+            .iter()
+            .find(|model| model.input_price.zip(model.output_price).is_some())
+            .unwrap();
+        let expected = model.input_price.zip(model.output_price).unwrap();
+        handle(&["/model", &model.id], &mut ctx).await.unwrap();
+        assert_eq!(ctx.session.model.as_str(), model.id);
+        assert_eq!(
+            (ctx.session.input_token_cost, ctx.session.output_token_cost),
+            expected
+        );
+        assert_eq!(
+            ctx.renderer.feed().block_count(),
+            3,
+            "known model emitted a pricing warning"
+        );
+        assert!(crate::provider::default_model_for_provider("unpriced-gateway", &cfg).is_none());
+        handle(&["/provider", "unpriced-gateway"], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.session.provider, "unpriced-gateway");
+        assert_eq!(
+            (ctx.session.input_token_cost, ctx.session.output_token_cost),
+            (0.0, 0.0)
+        );
+        assert!(
+            ctx.renderer
+                .feed()
+                .block_text(3)
+                .unwrap()
+                .contains("no pricing known for")
+        );
+        assert!(
+            ctx.renderer
+                .feed()
+                .block_text(4)
+                .unwrap()
+                .contains("switched to provider: unpriced-gateway")
+        );
+    }
+
+    #[test]
+    fn unknown_model_resets_previous_costs_and_produces_a_warning() {
+        let cfg = Config::default();
+        let provider = format!("pricing-unknown-{}", uuid::Uuid::new_v4());
+        let mut session = Session::new(&provider, "previous-model", 128_000, "");
+        session.input_token_cost = 7.0;
+        session.output_token_cost = 19.0;
+        let pricing = resolve_model_pricing(&provider, "unknown-model", &cfg);
+        let note = apply_model_pricing(&mut session, "unknown-model", pricing).unwrap();
+        assert_eq!(
+            (session.input_token_cost, session.output_token_cost),
+            (0.0, 0.0)
+        );
+        assert!(
+            note.contains("no pricing known for unknown-model"),
+            "{note}"
+        );
+        assert!(note.contains("costs will not be tracked"), "{note}");
+        assert!(
+            note.contains("input_token_cost/output_token_cost"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn catalog_prices_are_available_without_a_matching_live_listing() {
+        let model = crate::models_catalog::catalog_entries("anthropic")
+            .unwrap()
+            .iter()
+            .find(|model| model.input_price.zip(model.output_price).is_some())
+            .unwrap();
+        let expected = model.input_price.zip(model.output_price).unwrap();
+        let stale_listing = [ModelEntry {
+            id: "stale-unrelated-model".into(),
+            display: "stale".into(),
+            context_length: None,
+            kind: None,
+            input_price: Some(99.0),
+            output_price: Some(99.0),
+        }];
+        let pricing = resolve_model_pricing_from_listing(
+            "anthropic",
+            &model.id,
+            &Config::default(),
+            Some(&stale_listing),
+        );
+        assert_eq!(pricing, Some(expected));
+        let mut session = Session::new("anthropic", "previous-model", 128_000, "");
+        session.input_token_cost = 99.0;
+        session.output_token_cost = 99.0;
+        assert!(apply_model_pricing(&mut session, &model.id, pricing).is_none());
+        assert_eq!(
+            (session.input_token_cost, session.output_token_cost),
+            expected
+        );
+    }
+
+    #[test]
+    fn live_prices_precede_quick_model_prices_and_free_models_remain_known() {
+        let provider = format!("pricing-live-{}", uuid::Uuid::new_v4());
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "quick_models": { "local": { "provider": provider, "model": "live", "input_token_cost": 9.0, "output_token_cost": 10.0 } }
+        })).unwrap();
+        let listing = [ModelEntry {
+            id: "live".into(),
+            display: "live".into(),
+            context_length: None,
+            kind: None,
+            input_price: Some(0.0),
+            output_price: Some(0.0),
+        }];
+        let pricing = resolve_model_pricing_from_listing(&provider, "live", &cfg, Some(&listing));
+        assert_eq!(pricing, Some((0.0, 0.0)));
+        let mut session = Session::new(&provider, "previous-model", 128_000, "");
+        session.input_token_cost = 99.0;
+        session.output_token_cost = 99.0;
+        assert!(apply_model_pricing(&mut session, "live", pricing).is_none());
+        assert_eq!(
+            (session.input_token_cost, session.output_token_cost),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            resolve_model_pricing_from_listing(&provider, "live", &cfg, None),
+            Some((9.0, 10.0))
+        );
+        assert_eq!(resolve_model_pricing("other-provider", "live", &cfg), None);
     }
 }

@@ -200,11 +200,15 @@ compaction summary as a "Critical Context" block that is bounded to 32 KiB: fiel
 to the same caps (covering sessions restored from before the caps existed), and items that do not
 fit are counted in an omission note instead of emitted.
 
-`find_files` preserves filename-regex matching for valid regular expressions.
-If the supplied pattern is not valid regex, it is parsed as a workspace-relative
-path glob, so common forms such as `**/*.rs` search recursively. Capped output
-is selected with a bounded lexicographic top-N heap, making “first N” stable
-across filesystem traversal orders while still reporting the exact match count.
+`find_files` defaults to `mode: "auto"`: patterns containing `*`, `?`, `[`, `{`,
+or `/` are parsed as relative-path globs first, falling back to filename regex
+only if the glob is invalid. `src/*.rs` matches files directly in `src`, while
+basename globs such as `*.rs` and `test_*.rs` match at any depth. Other patterns
+retain filename-regex matching. Set `mode: "regex"` explicitly for patterns such
+as `^test_.*\.rs$`, or `mode: "glob"` for literal glob semantics. An empty result
+names the interpretation and suggests an alternative. Capped output is selected
+with a bounded lexicographic top-N heap, making “first N” stable across filesystem
+traversal orders while still reporting the exact match count.
 `list_dir` keeps only actual directories in its directory-first sort group and
 renders symbolic links as `name -> target`. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of

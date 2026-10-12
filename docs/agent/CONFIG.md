@@ -531,7 +531,7 @@ Accepted top-level keys:
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
-| `retry`                   | object  | Retry policy with `max_attempts` (default `3`, clamped to 1–10), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A project `.zerostack/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `3`, clamped to 1–10), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A project `.zerostack/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Transient HTTP statuses `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, and `529` are retried. Rig 0.40 exposes provider status and body but discards response headers, so `Retry-After` cannot be recovered and the bounded backoff policy applies. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |
@@ -580,7 +580,7 @@ Accepted top-level keys:
 | `js-read-unrestricted`    | boolean | Explicitly allow brokered JS reads outside configured roots; cannot be combined with `js-read-roots`. Default: `false`. |
 | `js-write-unrestricted`   | boolean | Explicitly allow brokered JS writes outside configured roots; cannot be combined with `js-write-roots`. Default: `false`. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo` (`accept` is an alias for `standard`). Any other value is rejected at startup with the list of accepted values. |
-| `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` hides output, `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
+| `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` omits previews and hidden-result placeholders during live rendering and session replay; tool-call lines remain visible. Task-list updates remain visible independently of this setting. `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
@@ -947,13 +947,21 @@ ordinary compaction flow runs.
 
 By default zerostack only compacts the conversation *between* turns, after a
 response finishes, when the accumulated session history exceeds
-`context_window - reserve_tokens`. Each textual tool result is independently
-bounded before Rig commits it to the live conversation: results over 12,000
-characters are written to the private tool-output directory and replaced for
-the model with a 2,000-character head, an omission/path notice, and an
-8,000-character tail. This applies at the common result boundary for built-in,
-shell, JavaScript, and MCP tools; it therefore also covers a very long single
-line. If the spill write fails, the head/tail bound remains in force and the
+`context_window - reserve_tokens`. Tools with their own output limits (`read`,
+`shell`, `grep`, `find_files`, `list_dir`, and `js`) retain their documented
+line, byte, and result limits in both live and replayed history. Their
+continuation hints remain intact, and a completed read window remains available
+when repeated-read protection asks the model to reuse it. Other textual tool
+results, including MCP results, are independently bounded before Rig commits
+them to the live conversation: results over 12,000 characters are written to
+the private tool-output directory and replaced with a 2,000-character head,
+an omission/path notice, and an 8,000-character tail. The `read` tool can open
+immediate spill files for the active session without an approval prompt,
+including in headless mode. This grant never includes other sessions, nested
+directories, writes, JavaScript file reads, or symlink escapes; explicit tool
+and external-directory deny rules still apply. The artifact directory is bound
+to its identity and reads use its retained directory capability. If the spill
+write fails, the head/tail bound remains in force and the
 notice reports that the complete output is unavailable. A single long turn with
 many individually bounded results can still exceed the model's real context
 limit before the between-turn check runs, because aggregate in-flight tool
@@ -2347,6 +2355,13 @@ selects the security mode and the second composes the prompt with a main-agent
 persona when the prompt is activated (via `/prompt <name>`, `.name`, or as the
 `default_prompt`). `%%agent=default` clears an active persona.
 
+Every leading `%%` directive line is stripped, including empty values,
+unknown keys, and malformed lines. These produce warnings in the load log and
+when activated with `/prompt`. For duplicate keys, the first nonempty value
+wins and later values produce a warning. An empty value does not reserve the
+key. The directive header ends at the first ordinary line; `%%` lines later
+in the prompt body are kept as prompt content.
+
 Valid modes: `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.
 
 A directive can only narrow the mode. The user's own selection (a CLI flag,
@@ -2634,6 +2649,11 @@ diagnostics (errors/warnings) back into `edit`/`write` tool results — the
 agent sees type errors immediately instead of discovering them on the next
 build. An `lsp_diagnostics` tool also lets the agent query one file or the
 whole project on demand.
+
+For a file extension claimed by multiple servers, user-configured servers
+take precedence in alphabetical server-name order, followed by built-ins in
+their declaration order. A same-named user entry replaces its built-in;
+`disabled = true` or an empty command removes that entry from selection.
 
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language

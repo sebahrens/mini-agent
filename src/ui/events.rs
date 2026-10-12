@@ -131,7 +131,9 @@ pub(crate) fn push_session_messages(
                 );
             }
             MessageRole::ToolResult => {
-                let text = tool_result_text(&msg.content, cfg);
+                let Some(text) = tool_result_text(&msg.content, cfg) else {
+                    continue;
+                };
                 let anchor = msg.tool_call_id.as_deref().unwrap_or("");
                 if feed.place_after_anchor(anchor, BlockStyle::ToolResult, text) {
                     // Sits under its call, before the call's own spacer.
@@ -167,39 +169,41 @@ fn push_runtime_availability(
 
 /// The transcript text for a stored tool result, shortened per
 /// `show_tool_details` like the live view.
-fn tool_result_text(content: &str, cfg: &Config) -> String {
-    let output = content
-        .split_once(":\n")
-        .map(|(_, output)| output)
-        .unwrap_or(content);
+fn tool_result_text(content: &str, cfg: &Config) -> Option<String> {
+    let (name, output) = content.split_once(":\n").unwrap_or(("", content));
+    // Task-list updates have their own live rendering regardless of the
+    // generic tool-preview preference; preserve that exception on replay.
+    if name == "todo_write" {
+        return Some(sanitize_output(output).to_string());
+    }
     let show_details = cfg
         .show_tool_details
         .as_ref()
         .map(|s| s.resolve())
         .unwrap_or(ResolvedShowToolDetails::Limited(3));
     match show_details {
-        ResolvedShowToolDetails::Off => "◈ result hidden by show_tool_details=false".to_string(),
+        ResolvedShowToolDetails::Off => None,
         ResolvedShowToolDetails::Limited(max_lines) => {
             let sanitized = sanitize_output(output);
             let char_count = sanitized.chars().count();
             let lines: Vec<&str> = sanitized.lines().collect();
             if lines.len() > max_lines {
                 let shown = lines[..max_lines].join("\n");
-                format!(
+                Some(format!(
                     "◈ result ({} chars, {} lines, showing {}):\n{}",
                     char_count,
                     lines.len(),
                     max_lines,
                     shown
-                )
+                ))
             } else {
-                format!("◈ result ({} chars):\n{}", char_count, sanitized)
+                Some(format!("◈ result ({} chars):\n{}", char_count, sanitized))
             }
         }
         ResolvedShowToolDetails::Unlimited => {
             let sanitized = sanitize_output(output);
             let char_count = sanitized.chars().count();
-            format!("◈ result ({} chars):\n{}", char_count, sanitized)
+            Some(format!("◈ result ({} chars):\n{}", char_count, sanitized))
         }
     }
 }
@@ -226,7 +230,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     );
     feed.push_line(
         BlockStyle::Plain,
-        "    !<command>  Run a shell command (output stored as assistant)",
+        "    !<command>  Run a shell command (command/output stored as a user message)",
     );
     feed.push_line(
         BlockStyle::Plain,
@@ -657,6 +661,31 @@ mod replay_tests {
         // One spacer per call/result pair, none between a call and its result.
         assert_eq!(rows[result_a + 1], "");
         assert_eq!(rows.len(), 6, "{rows:?}");
+
+        // Off matches live rendering: retain calls and their spacing, but
+        // add neither output nor one placeholder/spacer per hidden result.
+        let mut hidden = Feed::new();
+        let off = Config {
+            show_tool_details: Some(crate::config::ShowToolDetails::Bool(false)),
+            ..Config::default()
+        };
+        push_session_messages(&mut hidden, &session.messages, &off);
+        let rows = texts(&hidden);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[0].contains("◈ read"), "{rows:?}");
+        assert_eq!(rows[1], "");
+        assert!(rows[2].contains("◈ grep"), "{rows:?}");
+        assert_eq!(rows[3], "");
+        assert!(rows.iter().all(|row| !row.contains("result")), "{rows:?}");
+
+        let mut tasks = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        tasks.add_tool_call_with_id("tasks", "todo_write", &args);
+        tasks.add_tool_result_with_id("tasks", "todo_write", "task-list-update");
+        let mut feed = Feed::new();
+        push_session_messages(&mut feed, &tasks.messages, &off);
+        let rows = texts(&feed);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[1], "task-list-update", "{rows:?}");
     }
 
     /// mini-agent-5bvrb: the welcome screen names the lazygit key.
@@ -669,6 +698,15 @@ mod replay_tests {
         assert!(
             rows.iter()
                 .any(|row| row.contains("Ctrl+O") && row.contains("lazygit")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("!<command>") && row.contains("user message")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("stored as assistant")),
             "{rows:?}"
         );
     }

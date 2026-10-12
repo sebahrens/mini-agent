@@ -6714,6 +6714,7 @@ echo COMMITTED"#;
         assert_tty_open_failed_with_enxio(&output);
     }
 
+    #[cfg(unix)]
     #[test]
     fn macos_seatbelt_policy_command_matches_capability_matrix() {
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
@@ -7320,6 +7321,7 @@ echo PRIVATE_TEMP_PASS"#,
         let _ = std::fs::remove_file(&marker);
     }
 
+    #[cfg(unix)]
     #[test]
     fn macos_runtime_cache_selection_preserves_disjoint_overrides_and_moves_private_overlaps() {
         let scratch = ScratchDir::new();
@@ -7398,6 +7400,7 @@ echo PRIVATE_TEMP_PASS"#,
         assert!(validate_macos_runtime_cache(&candidate, &paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn seatbelt_profile_cache_is_byte_identical_to_uncached_build() {
         // Keep application path inputs stable across cached and manual builds.
@@ -7496,6 +7499,7 @@ echo PRIVATE_TEMP_PASS"#,
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn seatbelt_profile_cache_key_varies_correctly() {
         // Other tests temporarily replace process-wide application roots.

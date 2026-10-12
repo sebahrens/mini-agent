@@ -39,7 +39,7 @@ default build:
 ```toml
 # Cargo.toml
 [features]
-default = ["loop", "git-worktree", "mcp", "acp", "subagents", "archmd",
+default = ["loop", "goal", "git-worktree", "mcp", "acp", "subagents", "archmd",
            "status-signals", "multithread", "export", "js", "sandbox", "memory"]
 ```
 

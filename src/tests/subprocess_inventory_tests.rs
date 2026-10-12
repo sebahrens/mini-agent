@@ -1567,6 +1567,79 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Bounded read/replay and file-search regression outputs are strings.
+    (
+        "src/agent/runner.rs",
+        "assert!(output.chars().count() > crate::session::TOOL_RESULT_SAVE_THRESHOLD);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "assert!(output.contains(line), \"missing complete line: {line}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "assert!(!output.contains(\"tool output truncated\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "assert_eq!(replay_output.as_str(), output);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "output.starts_with(\"No files found matching the pattern.\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"Interpreted as regex\"), \"{output}\");",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "output.starts_with(&format!(\"{} files found:\", expected.len())),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "output.lines().any(|line| line",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.starts_with(\"1 files found:\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"test_a.rs\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(expected), \"{pattern}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/mod.rs",
+        "assert_eq!(replay, output);",
+        1,
+        "NON-PROCESS",
+    ),
     // `status` in the goal module is a `GoalStatus`, not a process exit
     // status, and `report_tool`'s is a `ReportStatus`. The identifier scanner
     // cannot tell them apart inside a macro, so each site is classified here.
@@ -2158,12 +2231,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/agent/tools/find_files.rs",
-        "assert_eq!(output, \"No files found matching the pattern.\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/agent/tools/grep.rs",
         "assert!(!output.contains(\"0 more matches\"));",
         1,
@@ -2563,6 +2630,13 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/session/mod.rs",
+        &[(
+            "cf9e3c16def70e185eb6021ca4adfd0ecc0df8ae47679c47b267f44925835cdc",
+            1,
+        )],
+    ),
     // Goal records carry a `status` field, so `goal.status` and
     // `outcome.status` inside an assertion or a format string look like a
     // process `status()` terminal to the scanner. None of these launch
@@ -2715,6 +2789,22 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/runner.rs",
         &[
             (
+                "dcb051101cba4c5c9e985c56a84b8932a34fc3f820b96b5d6d54433d53a731cb",
+                1,
+            ),
+            (
+                "0a0917e74a8b9a537ef30ef42f13c2d052f6d07e1f81805112593bfd69ac4111",
+                1,
+            ),
+            (
+                "381692062b911bb656a5d6addf0f0fbe24d8184a872fa7f21bd318b5cc747e56",
+                1,
+            ),
+            (
+                "8b4a02b427881148835e707cd0a76d14914217b024ae730e0f4bf77f074f1ca4",
+                1,
+            ),
+            (
                 "171453e5b2606177e62ffc589caee645490fd18305ae366b007a993e16b669db",
                 1,
             ),
@@ -2797,15 +2887,39 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/tools/find_files.rs",
         &[
             (
+                "36a39cd2cd56c5eee3bdefba64b4371c8d56e3c0eb582c77bbd8f47f6b51e22e",
+                1,
+            ),
+            (
+                "efef1521aaa237b5ca763ad839ac1df713a4cd27e56f9a8edeef8aa8ea91d5e4",
+                2,
+            ),
+            (
+                "48458250bb5860a3c3f6058899f70ac05575cb8b812b1ca7c237d1f9802494a1",
+                1,
+            ),
+            (
+                "a66786897e20a7770563edd278c1c85ee70570b0f4bc3be162205586615020cb",
+                1,
+            ),
+            (
+                "97fbc7e25bcf8468b43664c6d4fd5e39c79fadb742399b1ad2b58be8e64c2b29",
+                1,
+            ),
+            (
+                "b20c238b4f2fe5fab3be47c20839a6cf0a2604c3d115c5b4a7d101c8bc1f73c7",
+                1,
+            ),
+            (
+                "2f9f965dec5fb094307cf349922d1f400621ae69c5bc375933ae58f259994b02",
+                1,
+            ),
+            (
                 "205b255efe38d50d4e3ffd4840977d3744af25b4be13bacd284867d626d6eea0",
                 1,
             ),
             (
                 "44b3168425ceb3c6808eea846f357f1369ebc7da14a5bddef0ed7090e353dafb",
-                1,
-            ),
-            (
-                "55753c0c181d8223928b02a8bb73ee136fcf855df473a0c9e2e7662d79f4f026",
                 1,
             ),
             (

@@ -28,7 +28,7 @@ use rig::completion::Message;
 use rig::message::{ToolResultContent, UserContent};
 
 use crate::agent::runner::run_print;
-use crate::agent::tools::WriteTool;
+use crate::agent::tools::{ReadTool, WriteTool};
 use crate::permission::checker::PermissionChecker;
 use crate::permission::{PermissionConfigs, SecurityMode};
 use crate::retry::RetryConfig;
@@ -145,4 +145,86 @@ async fn headless_ask_denies_instead_of_hanging() {
         "expected the tool result fed back to the model on the second turn to \
          contain the non-interactive denial message, history: {second_call_history:?}"
     );
+}
+
+#[tokio::test]
+async fn headless_read_of_current_session_spill_reaches_the_model_without_asking() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("headless-spill");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
+        ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
+        ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+    ]);
+    let mut checker = guarded_checker();
+    checker.bind_tool_output_session("active-session").unwrap();
+    let path = crate::session::storage::save_tool_output(
+        "active-session",
+        "external-tool",
+        "the complete saved middle is readable\n",
+    )
+    .unwrap();
+    let model = MockCompletionModel::from_stream_turns(vec![
+        vec![
+            MockStreamEvent::tool_call("read-spill", "read", serde_json::json!({"path": path})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        vec![
+            MockStreamEvent::text("read complete"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let agent = AgentBuilder::new(model.clone())
+        .tool(ReadTool::new(
+            Some(Arc::new(Mutex::new(checker))),
+            None,
+            None,
+            2_000,
+        ))
+        .default_max_turns(2)
+        .build();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        run_print(
+            &agent,
+            "read the saved output",
+            false,
+            &RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        ),
+    )
+    .await
+    .expect("headless spill read must not await an approval")
+    .unwrap();
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let outputs: Vec<_> = requests[1]
+        .chat_history
+        .iter()
+        .flat_map(|message| match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|item| match item {
+                    UserContent::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .flat_map(|result| {
+            result.content.iter().filter_map(|part| match part {
+                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].contains("the complete saved middle is readable"));
+    assert!(!outputs[0].contains("Permission denied"));
+    drop(agent);
+    drop(_environment);
 }

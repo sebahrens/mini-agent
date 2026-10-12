@@ -14,6 +14,65 @@ use crate::session::{self, Session};
 
 // ── Helper functions ─────────────────────────────────────────────────────
 
+/// Invalid headless input is a local usage error, before provider/session setup.
+#[derive(Debug, thiserror::Error)]
+#[error("no prompt given")]
+pub(crate) struct HeadlessUsageError;
+
+fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::Result<()> {
+    if !cli.print || cli.message.iter().any(|part| !part.trim().is_empty()) {
+        return Ok(());
+    }
+    if cli.output_format() == OutputFormat::Json {
+        crate::print::headless_stdout(format_args!(
+            "{}\n",
+            crate::print::render_headless_json(
+                workspace,
+                "no prompt given",
+                &[],
+                rig::completion::Usage::default(),
+                Vec::new(),
+                crate::print::HeadlessPricing {
+                    anthropic_native: false,
+                    input_token_cost: 0.0,
+                    output_token_cost: 0.0,
+                },
+                crate::print::HeadlessStopReason::Failed,
+                #[cfg(feature = "goal")]
+                None,
+            )?
+        ));
+    }
+    Err(HeadlessUsageError.into())
+}
+
+fn resolve_startup_model_pricing(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+    openrouter_model: Option<&str>,
+) -> Option<(f64, f64)> {
+    if let Some(quick) = cli.resolve_quick_model(cfg) {
+        return Some((quick.input_token_cost, quick.output_token_cost));
+    }
+    // A selected config alias carries operator pricing, just like /models or
+    // /provider. A CLI/raw environment override selects raw-id pricing even
+    // when that id happens to equal the alias's underlying model.
+    let raw_env_override =
+        provider == "openrouter" && openrouter_model.is_some_and(|model| !model.is_empty());
+    if cli.model.is_none() && !raw_env_override {
+        let quick_models = config::quick_models_map(cfg);
+        if let Some(quick) = cfg.model.as_deref().and_then(|name| quick_models.get(name))
+            && quick.provider == provider
+            && quick.model == model
+        {
+            return Some((quick.input_token_cost, quick.output_token_cost));
+        }
+    }
+    crate::ui::slash::resolve_model_pricing(provider, model, cfg)
+}
+
 /// Regenerate embedded prompts/themes, printing the actual outcome instead
 /// of claiming success on failure. Returns true when regeneration succeeded.
 fn regen_resource(regen: fn() -> anyhow::Result<()>, what: &str, suffix: &str) -> bool {
@@ -143,21 +202,12 @@ fn apply_resume_provider_decision(
         &target.model,
         saved.provider != target.provider,
     );
-    session.input_token_cost = 0.0;
-    session.output_token_cost = 0.0;
     let qm = config::quick_models_map(cfg);
-    if let Some(model_cfg) = qm
-        .values()
-        .find(|model_cfg| model_cfg.provider == target.provider && model_cfg.model == target.model)
-    {
-        session.input_token_cost = model_cfg.input_token_cost;
-        session.output_token_cost = model_cfg.output_token_cost;
-    } else if let Some((input_cost, output_cost)) =
-        Config::catalog_input_output_cost(&target.provider, &target.model)
-    {
-        session.input_token_cost = input_cost;
-        session.output_token_cost = output_cost;
-    }
+    let (input, output) =
+        crate::ui::slash::resolve_model_pricing(&target.provider, &target.model, cfg)
+            .unwrap_or((0.0, 0.0));
+    session.input_token_cost = input;
+    session.output_token_cost = output;
     session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
 }
 
@@ -659,6 +709,7 @@ impl Startup {
         version_changed: bool,
         is_interactive: bool,
     ) -> anyhow::Result<Self> {
+        validate_headless_prompt(&cli, workspace.root())?;
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early.
@@ -679,22 +730,18 @@ impl Startup {
             name,
         );
 
-        // Resolve input/output token costs from quick models or defaults
-        if let Some(qm) = cli.resolve_quick_model(&cfg) {
-            session.input_token_cost = qm.input_token_cost;
-            session.output_token_cost = qm.output_token_cost;
-        } else if let Some(qm) = qm_map
-            .iter()
-            .find(|(_, v)| v.model.as_str() == model && v.provider.as_str() == provider)
-            .map(|(_, v)| v)
-        {
-            session.input_token_cost = qm.input_token_cost;
-            session.output_token_cost = qm.output_token_cost;
-        } else if let Some((input_cost, output_cost)) =
-            Config::catalog_input_output_cost(&provider, &model)
-        {
-            session.input_token_cost = input_cost;
-            session.output_token_cost = output_cost;
+        // Selected aliases retain their configured prices; raw ids share
+        // the same live/catalog/quick fallback as `/model`.
+        let costs = resolve_startup_model_pricing(
+            &cli,
+            &cfg,
+            &provider,
+            &model,
+            std::env::var("OPENROUTER_MODEL").ok().as_deref(),
+        );
+        if let Some((input, output)) = costs {
+            session.input_token_cost = input;
+            session.output_token_cost = output;
         }
 
         let mut session_resumed = false;
@@ -1363,7 +1410,7 @@ impl Startup {
     }
 
     async fn dispatch_print(mut self) -> anyhow::Result<()> {
-        let msg = self.cli.message.join(" ");
+        let msg = self.cli.message.join(" ").trim().to_string();
         let json_output = self.cli.output_format() == OutputFormat::Json;
         let change_baseline = if json_output {
             crate::print::capture_workspace_change_baseline(self.workspace.root()).await
@@ -3508,6 +3555,70 @@ mod tests {
             ..Cli::default()
         };
         assert_eq!(interactive_initial_message(&whitespace), None);
+    }
+
+    #[test]
+    fn startup_pricing_preserves_selected_aliases_but_raw_overrides_use_the_catalog() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic", "model": "sonnet",
+            "quick_models": { "sonnet": { "provider": "anthropic", "model": "claude-sonnet-5-5",
+                "input_token_cost": 42.0, "output_token_cost": 84.0 } }
+        }))
+        .unwrap();
+        let cli = Cli::default();
+        let (provider, model) = cli.resolve_provider_and_model(&cfg);
+        assert_eq!(
+            (provider.as_str(), model.as_str()),
+            ("anthropic", "claude-sonnet-5-5")
+        );
+        assert_eq!(
+            super::resolve_startup_model_pricing(&cli, &cfg, &provider, &model, None),
+            Some((42.0, 84.0))
+        );
+        let raw = Cli {
+            model: Some(model.to_string()),
+            ..Cli::default()
+        };
+        let catalog = crate::config::Config::catalog_input_output_cost(&provider, &model).unwrap();
+        assert_ne!(catalog, (42.0, 84.0));
+        assert_eq!(
+            super::resolve_startup_model_pricing(&raw, &cfg, &provider, &model, None),
+            Some(catalog)
+        );
+        let explicit = Cli {
+            quick_model: Some("sonnet".into()),
+            ..raw
+        };
+        assert_eq!(
+            super::resolve_startup_model_pricing(&explicit, &cfg, &provider, &model, None),
+            Some((42.0, 84.0))
+        );
+
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider": "openrouter", "model": "selected",
+            "quick_models": { "selected": { "provider": "openrouter", "model": "test/raw-env-model", "input_token_cost": 42.0, "output_token_cost": 84.0 },
+                "a-other": { "provider": "openrouter", "model": "test/raw-env-model", "input_token_cost": 1.0, "output_token_cost": 2.0 } }
+        })).unwrap();
+        assert_eq!(
+            super::resolve_startup_model_pricing(
+                &cli,
+                &cfg,
+                "openrouter",
+                "test/raw-env-model",
+                None
+            ),
+            Some((42.0, 84.0))
+        );
+        assert_eq!(
+            super::resolve_startup_model_pricing(
+                &cli,
+                &cfg,
+                "openrouter",
+                "test/raw-env-model",
+                Some("test/raw-env-model")
+            ),
+            Some((1.0, 2.0))
+        );
     }
 
     #[test]

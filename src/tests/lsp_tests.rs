@@ -297,6 +297,54 @@ fn user_override_replaces_builtin() {
 }
 
 #[test]
+fn lsp_user_server_wins_extension_overlap_deterministically() {
+    for _ in 0..20 {
+        let user = HashMap::from([("deno".to_string(), custom("deno", &[".ts"]))]);
+        let servers = resolve_servers(&user);
+        let (name, cfg) = server_for_path(&servers, Path::new("main.TS")).unwrap();
+        assert_eq!(name, "deno");
+        assert_eq!(cfg.command, "deno");
+        assert_eq!(servers[0].0, "deno");
+        assert_eq!(servers[1].0, "rust");
+        assert_eq!(servers[2].0, "go");
+        assert_eq!(servers[3].0, "typescript");
+    }
+}
+
+#[test]
+fn lsp_user_extension_ties_follow_name_order_and_disabled_entries_are_excluded() {
+    for reverse in [false, true] {
+        let mut entries = vec![
+            ("z-server".to_string(), custom("z-ls", &[".ts"])),
+            ("a-server".to_string(), custom("a-ls", &[".ts"])),
+            ("empty".to_string(), custom("", &[".ts"])),
+            (
+                "typescript".to_string(),
+                LspServerConfig {
+                    disabled: true,
+                    ..custom("disabled-ls", &[".ts"])
+                },
+            ),
+        ];
+        if reverse {
+            entries.reverse();
+        }
+        let servers = resolve_servers(&entries.into_iter().collect());
+        assert_eq!(
+            server_for_path(&servers, Path::new("main.ts")).unwrap().0,
+            "a-server"
+        );
+        assert_eq!(servers[0].0, "a-server");
+        assert_eq!(servers[1].0, "z-server");
+        assert!(
+            !servers
+                .iter()
+                .any(|(name, _)| name == "typescript" || name == "empty")
+        );
+    }
+}
+
+#[test]
 fn disabled_removes_builtin() {
     let mut user = HashMap::new();
     user.insert(

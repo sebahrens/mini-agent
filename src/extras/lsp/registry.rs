@@ -63,19 +63,23 @@ pub fn builtin_servers() -> Vec<(&'static str, LspServerConfig)> {
 /// Merges user config over the built-ins: a same-named entry replaces the
 /// built-in, `disabled = true` removes it, new names add custom servers.
 /// Entries without a command are dropped (they can only ever disable).
+/// User servers take precedence, ordered by name, followed by unoverridden
+/// built-ins in declaration order.
 pub fn resolve_servers(user: &HashMap<String, LspServerConfig>) -> Vec<(String, LspServerConfig)> {
-    let mut servers: HashMap<String, LspServerConfig> = builtin_servers()
+    let mut configured: Vec<_> = user.iter().collect();
+    configured.sort_unstable_by_key(|(name, _)| *name);
+    let mut servers: Vec<_> = configured
         .into_iter()
-        .map(|(name, cfg)| (name.to_string(), cfg))
+        .filter(|(_, cfg)| !cfg.disabled && !cfg.command.is_empty())
+        .map(|(name, cfg)| (name.clone(), cfg.clone()))
         .collect();
-    for (name, cfg) in user {
-        if cfg.disabled || cfg.command.is_empty() {
-            servers.remove(name);
-        } else {
-            servers.insert(name.clone(), cfg.clone());
-        }
-    }
-    servers.into_iter().collect()
+    servers.extend(
+        builtin_servers()
+            .into_iter()
+            .filter(|(name, _)| !user.contains_key(*name))
+            .map(|(name, cfg)| (name.to_string(), cfg)),
+    );
+    servers
 }
 
 /// First server claiming this path's extension (case-insensitive, dot

@@ -226,8 +226,18 @@ impl Tool for ReadTool {
             .await?;
             (Some(resolved), coaching)
         };
+        let spill_file = resolved.as_deref().and_then(|resolved| {
+            self.permission.as_ref().and_then(|permission| {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .open_tool_output_file(resolved)
+            })
+        });
         let file = if let Some(file) = capability_file {
             tokio::fs::File::from_std(file)
+        } else if let Some(file) = spill_file {
+            tokio::fs::File::from_std(file?)
         } else {
             crate::fs::open_stable_file(
                 resolved

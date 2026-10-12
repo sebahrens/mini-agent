@@ -28,16 +28,18 @@ pub(crate) struct LoadedPrompt {
     pub(crate) content: String,
 }
 
-/// Header directives shared by prompt modes. Recognized directives must form
+/// Header directives shared by prompt modes. Directives must form
 /// one contiguous block at the start of the file and may appear in either
-/// order. Their lines are removed before the prompt reaches the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// order. Their lines are removed before the prompt reaches the model, even
+/// when invalid. The first nonempty value for each recognized key wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptDirectives<'a> {
     pub(crate) mode: Option<&'a str>,
     pub(crate) agent: Option<&'a str>,
     /// `%%grant=<scope>:<tools>`; honoured only for embedded built-in prompts
     /// (see [`apply_project_trust`]) and only after the user approves it.
     pub(crate) grant: Option<&'a str>,
+    pub(crate) warnings: Vec<String>,
     pub(crate) content: &'a str,
 }
 
@@ -45,36 +47,47 @@ pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     let mut mode = None;
     let mut agent = None;
     let mut grant = None;
+    let mut warnings = Vec::new();
     loop {
         let line_end = content.find('\n').unwrap_or(content.len());
         let line = content[..line_end].trim().trim_end_matches('\r');
-        let directive = if let Some(value) = line.strip_prefix("%%mode=") {
-            Some((&mut mode, value.trim()))
-        } else if let Some(value) = line.strip_prefix("%%grant=") {
-            Some((&mut grant, value.trim()))
-        } else {
-            line.strip_prefix("%%agent=")
-                .map(|value| (&mut agent, value.trim()))
-        };
-        let Some((slot, value)) = directive else {
+        let Some(directive) = line.strip_prefix("%%") else {
             break;
         };
-        if value.is_empty() {
-            break;
-        }
-        if slot.is_none() {
-            *slot = Some(value);
-        }
         content = if line_end < content.len() {
             &content[line_end + 1..]
         } else {
             ""
         };
+        let Some((key, value)) = directive.split_once('=') else {
+            warnings.push("ignoring malformed prompt directive: expected %%key=value".into());
+            continue;
+        };
+        let slot = match key {
+            "mode" => &mut mode,
+            "agent" => &mut agent,
+            "grant" => &mut grant,
+            _ => {
+                warnings.push(format!("ignoring unknown prompt directive %%{key}="));
+                continue;
+            }
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            warnings.push(format!("ignoring empty prompt directive %%{key}="));
+        } else if slot.is_some() {
+            warnings.push(format!(
+                "ignoring duplicate prompt directive %%{key}=; first nonempty value wins"
+            ));
+        } else {
+            *slot = Some(value);
+        }
     }
     PromptDirectives {
         mode,
         agent,
         grant,
+        warnings,
         content,
     }
 }
@@ -284,6 +297,9 @@ pub(crate) fn apply_project_trust(
     prompts
         .into_iter()
         .map(|(name, prompt)| {
+            for warning in parse_directives(&prompt.content).warnings {
+                tracing::warn!(prompt = name, warning, "invalid prompt directive");
+            }
             let content = if prompt.source == PromptSource::Embedded {
                 prompt.content
             } else {
@@ -313,12 +329,15 @@ fn strip_grant_directive(name: &str, content: String) -> String {
         grant,
         "ignoring %%grant= directive: only built-in prompts may request a scoped grant"
     );
-    let mut rebuilt = String::new();
-    if let Some(mode) = directives.mode {
-        rebuilt.push_str(&format!("%%mode={mode}\n"));
-    }
-    if let Some(agent) = directives.agent {
-        rebuilt.push_str(&format!("%%agent={agent}\n"));
+    // Preserve unrelated header lines so their validation warnings remain
+    // visible when the prompt is activated. Remove every grant occurrence,
+    // including duplicates, rather than rebuilding only the winning values.
+    let header_len = content.len() - directives.content.len();
+    let mut rebuilt = String::with_capacity(content.len());
+    for line in content[..header_len].split_inclusive('\n') {
+        if !line.trim().starts_with("%%grant=") {
+            rebuilt.push_str(line);
+        }
     }
     rebuilt.push_str(directives.content);
     rebuilt
@@ -449,6 +468,60 @@ mod tests {
     fn write_prompt(path: &PathBuf, name: &str, content: &str) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::write(path.join(format!("{}.md", name)), content).unwrap();
+    }
+
+    #[test]
+    fn prompt_mode_load_logs_invalid_directives() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let td = TestDir::new();
+        write_prompt(
+            &td.global_dir(),
+            "invalid",
+            "%%mode=\n%%other=x\n%%mode=readonly\n%%mode=yolo\nBody.",
+        );
+        let loaded = tracing::subscriber::with_default(subscriber, || td.load());
+        assert_eq!(parse_directives(&loaded["invalid"]).content, "Body.");
+        let bytes = capture.0.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert!(log.contains("ignoring empty prompt directive %%mode="));
+        assert!(log.contains("ignoring unknown prompt directive %%other="));
+        assert!(log.contains("ignoring duplicate prompt directive %%mode="));
+        assert!(log.contains("prompt=\"invalid\""));
+    }
+
+    #[test]
+    fn prompt_mode_user_grant_stripping_preserves_other_header_warnings() {
+        let raw = "%%mode=\n%%mode=readonly\n%%mode=yolo\n%%other=x\n%%grant=config_dir:read\n%%grant=config_dir:edit\nBody.";
+        let loaded = strip_grant_directive("review", raw.into());
+        assert!(!loaded.contains("%%grant="));
+        let parsed = parse_directives(&loaded);
+        assert_eq!(parsed.mode, Some("readonly"));
+        assert_eq!(parsed.grant, None);
+        assert_eq!(parsed.content, "Body.");
+        assert_eq!(parsed.warnings.len(), 3);
+        assert!(parsed.warnings[0].contains("empty"));
+        assert!(parsed.warnings[1].contains("duplicate"));
+        assert!(parsed.warnings[2].contains("unknown"));
     }
 
     #[test]

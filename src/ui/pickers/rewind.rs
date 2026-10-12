@@ -20,7 +20,7 @@ enum Stage {
 const CONFIRM_REWIND: &str = "Rewind and start from here";
 const CONFIRM_CANCEL: &str = "Cancel";
 
-/// A two-level modal picker for the double-Esc rewind: first pick an earlier
+/// A two-level modal picker for `/rewind`: first pick an earlier
 /// user turn, then confirm the (destructive) rewind. Reuses [`ListPicker`] for
 /// rendering and selection at each level; the outcome is read back by the event
 /// loop, which owns the session and performs the actual rewind.

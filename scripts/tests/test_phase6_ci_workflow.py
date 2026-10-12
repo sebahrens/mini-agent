@@ -96,6 +96,18 @@ class ConditionParserTests(unittest.TestCase):
 
 
 class Phase6CiWorkflowTests(unittest.TestCase):
+    def test_spawn_parity_gate_batches_only_its_feature_consumers(self) -> None:
+        linux = job_body(WORKFLOW.read_text(encoding="utf-8"), "linux-sandbox-policy")
+        step = linux.split("- name: Test JS spawn parity through the shared sandbox", 1)[1].split("- name:", 1)[0]
+        body = step.split("run: >-\n", 1)[1]
+        command = shlex.split(" ".join(line.strip() for line in body.splitlines()))
+        self.assertEqual(command[:5], ["cargo", "test", "--locked", "--features", "js,sandbox"])
+        self.assertEqual(command[5], "--")
+        self.assertEqual(command[6:], [
+            "sandbox::", "extras::js::", "agent::builder::js_tests::",
+            "tests::sandbox_platform_tests::", "--test-threads=1",
+        ])
+
     SHARED_ADVERSARIAL_FILTERS = (
         "extras::js::tests::worker_protocol::",
         "extras::js::tests::worker_runtime::worker_runtime_",

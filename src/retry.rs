@@ -123,13 +123,7 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
     // status.  A known 4xx response must not become retryable merely because
     // its body happens to contain a word such as "connection".
     if let Some(provider_status) = provider_response_status(error) {
-        let code = provider_status.as_u16();
-        return code == 429
-            || code == 500
-            || code == 502
-            || code == 503
-            || code == 504
-            || code == 529;
+        return is_retryable_status(provider_status.as_u16());
     }
 
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
@@ -180,13 +174,17 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
 fn message_has_retryable_status(message: &str) -> bool {
     let tokens = message
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    let retryable = |token: &str| matches!(token, "429" | "500" | "502" | "503" | "504" | "529");
+    let retryable = |token: &str| token.parse().is_ok_and(is_retryable_status);
 
     tokens
         .windows(2)
@@ -355,6 +353,67 @@ mod tests {
     fn test_is_retryable_http_500() {
         let err = io::Error::other("HTTP 500 Internal Server Error");
         assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_http_408_409_and_425() {
+        for code in [408, 409, 425] {
+            let status = http::StatusCode::from_u16(code).unwrap();
+            let completion =
+                rig::completion::CompletionError::from_http_response(status, "retry later");
+            assert!(is_retryable(&completion), "provider status {code}");
+            let prompt = rig::completion::PromptError::from(completion);
+            assert!(is_retryable(&prompt), "prompt status {code}");
+            for message in [
+                format!("HTTP {code}"),
+                format!("HTTP error {code}"),
+                format!("status code {code}"),
+            ] {
+                assert!(
+                    is_retryable(&io::Error::other(message.clone())),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_request_statuses_schedule_a_bounded_stream_retry() {
+        for code in [408, 409, 425] {
+            let mut calls = 0;
+            let mut notices = Vec::new();
+            let config = RetryConfig {
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+            };
+            let mut stream = retry_stream_chat_with(
+                &config,
+                || {
+                    calls += 1;
+                    let item = if calls == 1 {
+                        Err(rig::completion::CompletionError::from_http_response(
+                            http::StatusCode::from_u16(code).unwrap(),
+                            "retry later",
+                        ))
+                    } else {
+                        Ok("recovered")
+                    };
+                    async { futures::stream::iter([item]) }
+                },
+                |notice| {
+                    notices.push(notice);
+                    std::future::ready(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(stream.next().await.unwrap().unwrap(), "recovered");
+            assert_eq!(calls, 2);
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].attempt, 1);
+            assert_eq!(notices[0].delay, Duration::from_millis(1));
+        }
     }
 
     #[test]

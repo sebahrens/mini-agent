@@ -69,7 +69,7 @@ impl Drop for UncommittedToolResultSpill {
     }
 }
 
-/// Caps every textual tool result before Rig commits it to the live model
+/// Caps unbounded textual tool results before Rig commits them to the live model
 /// history. The complete output is written to the logical session's private
 /// artifact directory and handed to transcript persistence out-of-band.
 #[derive(Clone)]
@@ -104,7 +104,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
         };
 
         let output_chars = result.chars().count();
-        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+        if crate::session::tool_result_is_self_bounded(tool_name)
+            || output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
+        {
             return Flow::cont();
         }
 
@@ -5010,6 +5012,83 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn self_bounded_read_keeps_all_400_lines_in_live_and_replayed_history() {
+        let root = crate::tests::OwnedTestDirectory::new("bounded-read");
+        let path = root.path().join("source.txt");
+        let lines: Vec<_> = (1..=400)
+            .map(|line| format!("line {line:03}: {}", "complete contents ".repeat(3)))
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let tracker = crate::agent::tools::ReadTracker::new(true);
+        let read = crate::agent::tools::ReadTool::new_with_tracker(
+            None,
+            None,
+            None,
+            2_000,
+            tracker.clone(),
+        );
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "read-provider-id",
+                    "read",
+                    serde_json::json!({"path": path, "offset": 1, "limit": 400}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let mut session = crate::session::Session::new("test", "mock", 128_000, "");
+        let agent = AgentBuilder::new(model.clone())
+            .tool(read)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("read the complete window", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let history: Vec<_> = requests[1].chat_history.iter().cloned().collect();
+        let outputs = tool_result_texts(&history);
+        assert_eq!(outputs.len(), 1);
+        let output = outputs[0];
+        assert!(output.chars().count() > crate::session::TOOL_RESULT_SAVE_THRESHOLD);
+        for line in &lines {
+            assert!(output.contains(line), "missing complete line: {line}");
+        }
+        assert!(!output.contains("tool output truncated"));
+        session.add_tool_result_with_id("read-provider-id", "read", output);
+        let Some(crate::session::PersistedToolMessage::Result {
+            output: replay_output,
+            artifact_path,
+            ..
+        }) = &session.messages[0].tool
+        else {
+            panic!("read result must be persisted structurally")
+        };
+        assert_eq!(replay_output.as_str(), output);
+        assert!(artifact_path.is_none());
+        let repeated =
+            crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 2_000, tracker)
+                .call(crate::agent::tools::ReadArgs {
+                    path: path.to_string_lossy().into_owned(),
+                    offset: Some(1),
+                    limit: Some(400),
+                })
+                .await
+                .unwrap_err();
+        assert!(repeated.to_string().contains("already read"));
     }
 
     #[test]

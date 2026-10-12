@@ -82,7 +82,7 @@ Before writing, the tool:
 
 1. opens the target through the same stable workspace/path boundary used by
    other file tools and reads it as UTF-8;
-2. normalizes CRLF pairs to LF for editing;
+2. normalizes CRLF pairs to LF for the file-level CRC comparison only;
 3. compares the complete normalized content with `file_crc`;
 4. verifies every selected line is in range and its tag matches its current
    content;
@@ -101,13 +101,13 @@ combining with an unobserved concurrent change elsewhere in the file.
 ## Newlines and file types
 
 HashEdit accepts UTF-8 text only. Invalid UTF-8 is rejected rather than decoded
-lossily. If the input contains CRLF, the final edited content is written with
-CRLF; otherwise it is written with LF. As with the other edit mode, the file
-tool is not a binary patch mechanism.
-
-Because the implementation detects whether *any* CRLF pair exists and then
-normalizes the whole file, a mixed-EOL file is not preserved byte-for-byte.
-That limitation is tracked separately from this protocol reference.
+lossily. Replacement text uses the original file's dominant line ending: CRLF
+when CRLF pairs outnumber bare LF endings, otherwise LF (including ties).
+CRLF pairs in the replacement are first normalized to LF, then converted to
+the chosen ending. Untouched byte ranges keep their original endings, so a
+mixed-EOL file is preserved outside the selected ranges. Normalizing the
+whole file to LF is only part of the CRC comparison, not the write path.
+As with the other edit mode, the tool is not a binary patch mechanism.
 
 ## Failure recovery
 

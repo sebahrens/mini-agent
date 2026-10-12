@@ -7,6 +7,10 @@ description: "How ARCHITECTURE.md files give the zerostack agent and its subagen
 zerostack supports an optional `ARCHITECTURE.md` file that gives both the main
 agent and exploration subagents high-level design context about your project.
 
+Keep paths and feature descriptions tied to the current source tree. This
+content is supplied to the model repeatedly; prefer a short ownership map and
+links to detailed specifications over line counts or a duplicated file inventory.
+
 ## What It Does
 
 When `ARCHITECTURE.md` files exist (at the project root and/or in parent
@@ -149,7 +153,7 @@ reproducing code; focus on structure, relationships, and rationale.
 ## Directory Layout
 - `src/agent/` — Agent building, prompt construction, tool execution
 - `src/ui/` — TUI event loop, renderer, input handling, slash commands
-- `src/provider/` — LLM provider abstraction (OpenAI, Anthropic, etc.)
+- `src/provider.rs` — LLM provider abstraction (OpenAI, Anthropic, etc.)
 - `src/config/` — Config parsing, validation, resolution
 - `src/extras/` — Optional features gated behind Cargo features
 - `src/extras/loop/validation.rs` — Shared bounded, sandboxed loop-validator execution, operation-scoped cancellation, and diagnostics
@@ -199,7 +203,9 @@ reproducing code; focus on structure, relationships, and rationale.
 
 ## Entry Points
 - `main.rs` — binary entry, CLI parsing, session init
-- `run_interactive()` — TUI main loop
+- `src/startup.rs` — resolved workspace, session, permission and provider setup
+- `src/ui/app.rs` — interactive application loop
+- `src/ui/slash/` — slash command handlers
 ```
 
 ## Comparison with AGENTS.md

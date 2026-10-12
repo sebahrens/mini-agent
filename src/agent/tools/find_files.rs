@@ -12,8 +12,8 @@ use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_bound_path,
-    check_perm_path, combine_coaching, is_skip_dir, is_vcs_metadata,
+    AskSender, FindFilesArgs, FindFilesMode, PermCheck, ToolError, check_perm,
+    check_perm_bound_path, check_perm_path, combine_coaching, is_skip_dir, is_vcs_metadata,
 };
 
 fn path_changed_error(path: &Path) -> std::io::Error {
@@ -1108,18 +1108,47 @@ enum FindFilesPattern {
 }
 
 impl FindFilesPattern {
-    fn compile(pattern: &str) -> Result<Self, ToolError> {
-        match Regex::new(pattern) {
-            Ok(regex) => Ok(Self::FileNameRegex(regex)),
-            Err(regex_error) => GlobBuilder::new(pattern)
+    fn compile(pattern: &str, mode: FindFilesMode) -> Result<Self, ToolError> {
+        let compile_regex = || {
+            Regex::new(pattern)
+                .map(Self::FileNameRegex)
+                .map_err(|error| ToolError::Msg(format!("Invalid filename regex: {error}")))
+        };
+        let compile_glob = || {
+            // A basename glob searches at every depth; a path glob is relative
+            // to the requested search root and retains separator boundaries.
+            let glob_pattern = if pattern.contains('/') {
+                pattern.to_string()
+            } else {
+                format!("**/{pattern}")
+            };
+            GlobBuilder::new(&glob_pattern)
                 .literal_separator(true)
                 .build()
                 .map(|glob| Self::RelativePathGlob(glob.compile_matcher()))
-                .map_err(|glob_error| {
-                    ToolError::Msg(format!(
-                        "Invalid filename regex or relative-path glob: regex: {regex_error}; glob: {glob_error}"
-                    ))
+                .map_err(|error| ToolError::Msg(format!("Invalid relative-path glob: {error}")))
+        };
+        match mode {
+            FindFilesMode::Regex => compile_regex(),
+            FindFilesMode::Glob => compile_glob(),
+            FindFilesMode::Auto if pattern.contains(['*', '?', '[', '{', '/']) => compile_glob()
+                .or_else(|glob_error| {
+                    compile_regex().map_err(|regex_error| {
+                        ToolError::Msg(format!("{glob_error}; {regex_error}"))
+                    })
                 }),
+            FindFilesMode::Auto => compile_regex(),
+        }
+    }
+
+    fn no_matches_hint(&self) -> &'static str {
+        match self {
+            Self::RelativePathGlob(_) => {
+                "Interpreted as glob; try **/*.rs for recursive paths or mode: \"regex\" for a filename regex."
+            }
+            Self::FileNameRegex(_) => {
+                "Interpreted as regex; try mode: \"glob\" with **/*.rs for recursive paths."
+            }
         }
     }
 
@@ -1163,7 +1192,7 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Recursively find files using a filename regex or, when the value is not valid regex, a relative-path glob such as `**/*.rs`. Respects .gitignore. Returns the deterministic lexicographically first results when capped. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
+        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Returns the deterministic lexicographically first results when capped. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1172,11 +1201,17 @@ impl Tool for FindFilesTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Filename regex, or a relative-path glob such as **/*.rs when not valid regex"
+                    "description": "Relative-path glob (src/*.rs, **/*.rs), basename glob at any depth (test_*.rs), or filename regex (^test_.*\\.rs$) with mode regex"
                 },
                 "path": {
                     "type": "string",
                     "description": "Directory to search in (defaults to current working directory)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "glob", "regex"],
+                    "default": "auto",
+                    "description": "Auto treats *, ?, [, {, or / as glob syntax, falling back to filename regex only for invalid globs; regex explicitly matches filenames"
                 }
             },
             "required": ["pattern"]
@@ -1192,7 +1227,8 @@ impl Tool for FindFilesTool {
         let coaching =
             check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
 
-        let pattern = FindFilesPattern::compile(&args.pattern)?;
+        let pattern = FindFilesPattern::compile(&args.pattern, args.mode)?;
+        let no_matches_hint = pattern.no_matches_hint();
 
         let requested_path = args.path.as_deref().unwrap_or(".");
         if requested_path.is_empty() {
@@ -1276,7 +1312,7 @@ impl Tool for FindFilesTool {
                 ToolError::Msg(format!("find_files directory walker failed: {error}"))
             })??;
         if total_matches == 0 {
-            let msg = "No files found matching the pattern.".to_string();
+            let msg = format!("No files found matching the pattern.\n{no_matches_hint}");
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -1423,6 +1459,7 @@ mod tests {
         );
 
         let call = tool.call(FindFilesArgs {
+            mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "needle".to_string(),
             path: Some(external.path().to_string_lossy().into_owned()),
         });
@@ -1459,6 +1496,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some("nested".to_string()),
             })
@@ -1472,6 +1510,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
                 path: Some("src/agent/tools".to_string()),
             })
@@ -1494,6 +1533,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some(external.to_string_lossy().into_owned()),
             },
@@ -1521,6 +1561,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(requested.to_string_lossy().into_owned()),
             },
@@ -1542,6 +1583,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some("~".to_string()),
             },
@@ -1568,6 +1610,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(link.to_string_lossy().into_owned()),
             },
@@ -1598,6 +1641,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "marker".to_string(),
             path: Some(link.to_string_lossy().into_owned()),
         });
@@ -1632,6 +1676,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "must_not_be_returned".to_string(),
             path: Some(authorized.to_string_lossy().into_owned()),
         });
@@ -1692,13 +1737,18 @@ mod tests {
 
         let output = FindFilesTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!(".*{marker}$"),
                 path: Some(workspace.to_string_lossy().into_owned()),
             })
             .await
             .unwrap();
 
-        assert_eq!(output, "No files found matching the pattern.");
+        assert!(
+            output.starts_with("No files found matching the pattern."),
+            "{output}"
+        );
+        assert!(output.contains("Interpreted as regex"), "{output}");
     }
 
     #[tokio::test]
@@ -1710,6 +1760,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: None,
             })
@@ -1722,6 +1773,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
                 path: None,
             })
@@ -1738,6 +1790,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(String::new()),
             })
@@ -1765,6 +1818,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some(external.to_string_lossy().into_owned()),
             })
@@ -1785,6 +1839,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
             })
@@ -1804,6 +1859,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
             })
@@ -1824,6 +1880,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 10)
             .call(FindFilesArgs {
+                mode: FindFilesMode::Auto,
                 pattern: "**/*.rs".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
             })
@@ -1848,6 +1905,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn common_globs_and_explicit_regex_find_the_expected_paths() {
+        let dir = TempDir::new("common_globs");
+        std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        for name in [
+            "test_root.rs",
+            "src/test_a.rs",
+            "src/deep/test_b.rs",
+            "src/other.txt",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        for (pattern, mode, expected) in [
+            ("src/*.rs", "auto", vec!["src/test_a.rs"]),
+            (
+                "test_*.rs",
+                "auto",
+                vec!["test_root.rs", "src/test_a.rs", "src/deep/test_b.rs"],
+            ),
+            (
+                "*.rs",
+                "auto",
+                vec!["test_root.rs", "src/test_a.rs", "src/deep/test_b.rs"],
+            ),
+            (
+                r"^test_.*\.rs$",
+                "regex",
+                vec!["test_root.rs", "src/test_a.rs", "src/deep/test_b.rs"],
+            ),
+            ("test_*.rs", "regex", vec![]),
+            ("test_root.rs", "glob", vec!["test_root.rs"]),
+        ] {
+            let args = serde_json::from_value(serde_json::json!({
+                "pattern": pattern,
+                "path": dir.path().to_string_lossy(),
+                "mode": mode,
+            }))
+            .unwrap();
+            let output = FindFilesTool::new(None, None, 20).call(args).await.unwrap();
+            if expected.is_empty() {
+                assert!(output.contains("Interpreted as regex"), "{output}");
+            } else {
+                assert!(
+                    output.starts_with(&format!("{} files found:", expected.len())),
+                    "{pattern}: {output}"
+                );
+                for name in expected {
+                    assert!(
+                        output.lines().any(|line| line
+                            == dir
+                                .path()
+                                .canonicalize()
+                                .unwrap()
+                                .join(name)
+                                .to_string_lossy()),
+                        "{pattern}: missing {name}: {output}"
+                    );
+                }
+            }
+        }
+
+        // Omitted mode keeps the existing JSON shape while selecting globs.
+        let args = serde_json::from_value(serde_json::json!({
+            "pattern": "src/*.rs",
+            "path": dir.path().to_string_lossy(),
+        }))
+        .unwrap();
+        let output = FindFilesTool::new(None, None, 20).call(args).await.unwrap();
+        assert!(output.starts_with("1 files found:"), "{output}");
+        assert!(output.contains("test_a.rs"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn invalid_patterns_and_no_matches_report_the_interpretation() {
+        let dir = TempDir::new("pattern_diagnostics");
+        std::fs::write(dir.path().join("aa}"), "").unwrap();
+        for (pattern, mode, expected) in [
+            ("missing*.rs", FindFilesMode::Auto, "Interpreted as glob"),
+            ("^missing$", FindFilesMode::Regex, "Interpreted as regex"),
+            ("a{2}}", FindFilesMode::Auto, "1 files found:"),
+        ] {
+            let output = FindFilesTool::new(None, None, 10)
+                .call(FindFilesArgs {
+                    pattern: pattern.to_string(),
+                    path: Some(dir.path().to_string_lossy().into_owned()),
+                    mode,
+                })
+                .await
+                .unwrap();
+            assert!(output.contains(expected), "{pattern}: {output}");
+        }
+        for mode in [
+            FindFilesMode::Auto,
+            FindFilesMode::Glob,
+            FindFilesMode::Regex,
+        ] {
+            let error = FindFilesTool::new(None, None, 10)
+                .call(FindFilesArgs {
+                    pattern: "[".to_string(),
+                    path: Some(dir.path().to_string_lossy().into_owned()),
+                    mode,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Invalid"), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn capped_results_are_lexicographically_first_independent_of_walk_order() {
         let dir = TempDir::new("deterministic_cap");
         for name in ["z.txt", "m.txt", "a.txt", "b.txt"] {
@@ -1856,6 +2021,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 2)
             .call(FindFilesArgs {
+                mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^[a-z]\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
             })
@@ -1969,6 +2135,7 @@ mod tests {
         ] {
             let listing = tool
                 .call(FindFilesArgs {
+                    mode: crate::agent::tools::FindFilesMode::Regex,
                     pattern: r"\.txt$".to_string(),
                     path: path.map(str::to_string),
                 })

@@ -233,6 +233,7 @@ Here is some keybindings to speed up your coding experience:
 | `Ctrl+R` | Toggle reasoning/thinking |
 | `Ctrl+G` | Open input in `$EDITOR` |
 | `Ctrl+O` | Launch `lazygit` |
+| `Ctrl+P` / `Ctrl+N` | Move up/down in input; at its boundaries, navigate command history |
 | `Ctrl+C` | Interrupt the agent |
 | `Ctrl+Shift+C` | Copy selected text (Windows) |
 | `Ctrl+V` | Paste Unicode clipboard text (Windows) |
@@ -254,7 +255,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
-| `-r`, `--resume` | List recent sessions for selection, each titled by its name, an opt-in generated title (`session_title_model`), or its first message. |
+| `-r`, `--resume` | Print recent sessions and exit, each titled by its name, an opt-in generated title (`session_title_model`), or its first message. Use `--session <id-or-name>` to load one. |
 | `--name <name>` | Set a name for the new session |
 | `--session <id-or-name>` | Load a session: an exact ID or exact (case-insensitive) name wins, otherwise a unique ID prefix or name substring. A session another running process owns is continued in a forked copy. |
 | `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |

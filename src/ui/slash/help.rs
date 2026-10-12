@@ -336,6 +336,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         "  Ctrl+W/U/K             delete word/before/after cursor",
     );
     emit(false, "  Ctrl+A/E/B/F           move line edge/character");
+    emit(
+        false,
+        "  Ctrl+P/Ctrl+N          move up/down; history at input boundaries",
+    );
     emit(false, "  Alt+B/F/D              move word/delete next word");
     emit(
         false,
@@ -405,6 +409,12 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("Ctrl+O") && line.contains("lazygit")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Ctrl+P")
+                && line.contains("Ctrl+N")
+                && line.contains("history")),
             "{lines:?}"
         );
     }
