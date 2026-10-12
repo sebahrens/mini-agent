@@ -464,6 +464,7 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     assert!(other_read.call(read_args()).await.is_ok());
     owner_edit
         .call(EditArgs {
+            fuzzy: false,
             path: path.clone(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".to_string()),
@@ -505,6 +506,7 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
 
     assert!(read.call(alias_args()).await.is_ok());
     edit.call(EditArgs {
+        fuzzy: false,
         path: target.to_string_lossy().into_owned(),
         replace_all: false,
         block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".to_string()),

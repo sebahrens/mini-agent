@@ -23,7 +23,7 @@ use crate::session::{GitStatus, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::{InputEditor, Picker};
-use crate::ui::permission_handler::handle_permission_request;
+use crate::ui::permission_handler::{PermissionEvent, PermissionState};
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
@@ -35,18 +35,18 @@ use crate::ui::state::{
 };
 use crate::ui::terminal::TerminalGuard;
 
+#[cfg(feature = "git-worktree")]
+use super::apply_current_prompt_mode;
 #[cfg(feature = "advisor")]
 use super::handle_human_handoff;
 #[cfg(all(feature = "mcp", feature = "git-worktree"))]
 use super::rebind_mcp_manager;
 use super::{
-    C_AGENT, C_BTW, C_ERROR, C_TOOL, PrebuildPayload, apply_prompt_mode, classify_submission,
-    mid_turn_compact_and_respawn, pending_main_turn_has_progress,
+    C_AGENT, C_BTW, C_ERROR, C_PERM, C_TOOL, PrebuildPayload, apply_prompt_mode,
+    classify_submission, mid_turn_compact_and_respawn, pending_main_turn_has_progress,
     preserve_pending_main_turn_progress, record_started_main_turn, refresh_display,
     rollback_pending_main_turn, spawn_event_thread, start_main_run, stop_turn_context_exhausted,
 };
-#[cfg(feature = "git-worktree")]
-use super::{C_PERM, apply_current_prompt_mode};
 
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
@@ -98,13 +98,14 @@ pub(super) mod test_support {
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
             },
-            renderer: Renderer::new().unwrap(),
+            renderer: Renderer::for_app_test().unwrap(),
             input: InputEditor::new(),
             last_branch_check: std::time::Instant::now(),
             git_status_tx,
             git_status_rx,
             git_status_in_flight: false,
             ask_rx: None,
+            permission_prompt: None,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
             btw_tx,
@@ -1045,6 +1046,7 @@ pub(crate) struct App<'a> {
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
     git_status_in_flight: bool,
     ask_rx: Option<mpsc::Receiver<crate::permission::ask::AskRequest>>,
+    permission_prompt: Option<PermissionState>,
     #[cfg(feature = "advisor")]
     handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
 
@@ -1454,6 +1456,7 @@ impl<'a> App<'a> {
             git_status_rx,
             git_status_in_flight: false,
             ask_rx,
+            permission_prompt: None,
             #[cfg(feature = "advisor")]
             handoff_rx,
             btw_tx,
@@ -1502,14 +1505,18 @@ impl<'a> App<'a> {
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         let result = self.run_inner().await;
-        if result.is_err() && self.run.pending_turn.is_some() {
-            self.fail_pending_main_turn().await;
+        if result.is_err() {
+            self.cancel_pending_permissions();
+            if self.run.pending_turn.is_some() {
+                self.fail_pending_main_turn().await;
+            }
         }
         result
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
+            self.expire_abandoned_permission()?;
             self.drain_tui_diagnostics()?;
             // Every adoption/rebuild path returns here, including a prompt that
             // awaited prebuild and deferred events that immediately continue.
@@ -1520,7 +1527,9 @@ impl<'a> App<'a> {
                         .write_line(&sanitize_output(&notice), C_ERROR)?;
                 }
             }
-            if let Some(event) = self.deferred_user_events.pop_front() {
+            if self.permission_prompt.is_none()
+                && let Some(event) = self.deferred_user_events.pop_front()
+            {
                 match self.handle_user_event(event).await? {
                     ControlFlow::Break(()) => break,
                     ControlFlow::Continue(()) => continue,
@@ -1566,25 +1575,8 @@ impl<'a> App<'a> {
                         self.refresh()?;
                     }
                 }
-                Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await } => {
-                    // A goal's time budget measures how long the agent worked,
-                    // not how long the user took to answer.
-                    #[cfg(feature = "goal")]
-                    if let Some(collector) = self.run.goal_round.as_mut() {
-                        collector.pause_clock();
-                    }
-                    handle_permission_request(
-                        ask_req,
-                        &mut self.renderer,
-                        &mut self.ui,
-                        &mut self.run,
-                        &mut self.user_rx,
-                        &mut self.deferred_user_events,
-                    ).await?;
-                    #[cfg(feature = "goal")]
-                    if let Some(collector) = self.run.goal_round.as_mut() {
-                        collector.resume_clock();
-                    }
+                Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await }, if self.permission_prompt.is_none() => {
+                    self.begin_permission_request(ask_req)?;
                     self.refresh()?;
                 }
                 Some(bev) = self.btw_rx.recv() => {
@@ -1628,8 +1620,13 @@ impl<'a> App<'a> {
                 }
             }
 
+            if self.permission_prompt.is_some() {
+                self.refresh()?;
+            }
+
             #[cfg(feature = "advisor")]
-            if let Some(ref mut rx) = self.handoff_rx
+            if self.permission_prompt.is_none()
+                && let Some(ref mut rx) = self.handoff_rx
                 && let Ok(req) = rx.try_recv()
             {
                 handle_human_handoff(
@@ -1672,6 +1669,7 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn teardown(mut self) {
+        self.cancel_pending_permissions();
         self.pause_event_thread();
 
         // Retire owned work before closing the services it can still use.
@@ -1734,7 +1732,137 @@ impl<'a> App<'a> {
         )
     }
 
+    fn begin_permission_request(
+        &mut self,
+        request: crate::permission::ask::AskRequest,
+    ) -> anyhow::Result<()> {
+        // Cancellation settles the owning run before another request can be
+        // adopted. A dropped caller or a request left by that run cannot grant.
+        if !self.run.is_running || request.reply.is_closed() {
+            let _ = request
+                .reply
+                .send(crate::permission::ask::UserDecision::Deny);
+            return Ok(());
+        }
+        self.permission_prompt = Some(PermissionState::begin(
+            request,
+            &mut self.renderer,
+            &self.ui,
+            &mut self.run,
+        )?);
+        #[cfg(feature = "goal")]
+        if let Some(collector) = self.run.goal_round.as_mut() {
+            collector.pause_clock();
+        }
+        Ok(())
+    }
+
+    fn resume_permission_clock(&mut self) {
+        #[cfg(feature = "goal")]
+        if let Some(collector) = self.run.goal_round.as_mut() {
+            collector.resume_clock();
+        }
+    }
+
+    fn expire_abandoned_permission(&mut self) -> anyhow::Result<()> {
+        if self
+            .permission_prompt
+            .as_ref()
+            .is_some_and(PermissionState::abandoned)
+        {
+            if let Some(prompt) = self.permission_prompt.take() {
+                prompt.decline_on_cancel(&self.ui);
+                prompt.finish(&mut self.renderer)?;
+            }
+            self.resume_permission_clock();
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
+    /// Deny both the displayed request and the sequential channel backlog
+    /// before settlement; no waiter from the retired run can become a grant.
+    fn cancel_pending_permissions(&mut self) {
+        if let Some(prompt) = self.permission_prompt.take() {
+            prompt.decline_on_cancel(&self.ui);
+            if let Err(error) = prompt.finish(&mut self.renderer) {
+                tracing::warn!(%error, "permission overlay cleanup failed");
+            }
+            drop(prompt);
+        }
+        self.renderer.permission_prompt = None;
+        if let Some(receiver) = self.ask_rx.as_mut() {
+            while let Ok(request) = receiver.try_recv() {
+                let _ = request
+                    .reply
+                    .send(crate::permission::ask::UserDecision::Deny);
+            }
+        }
+        self.resume_permission_clock();
+    }
+
+    async fn handle_permission_event(&mut self, event: &UserEvent) -> anyhow::Result<bool> {
+        self.expire_abandoned_permission()?;
+        let Some(mut prompt) = self.permission_prompt.take() else {
+            return Ok(false);
+        };
+        let effect = prompt.handle_event(
+            event,
+            &mut self.renderer,
+            &mut self.ui,
+            &mut self.run,
+            &mut self.deferred_user_events,
+        )?;
+        match effect {
+            PermissionEvent::Unhandled => {
+                self.permission_prompt = Some(prompt);
+                return Ok(false);
+            }
+            PermissionEvent::Waiting => self.permission_prompt = Some(prompt),
+            PermissionEvent::Finished => self.resume_permission_clock(),
+            PermissionEvent::Stop { instruction } => {
+                // Reply and abort happen in one polling turn before awaiting
+                // cleanup, preventing a denial from launching an alternative.
+                drop(prompt);
+                self.abort_main_run().await?;
+                if self.run.agent_rx.is_some() {
+                    // Ordinary interruption retains cleanup ownership on a
+                    // timeout. Permission stop must exit the input loop rather
+                    // than admit an instruction or another turn before that
+                    // exact workspace has settled; teardown retries it.
+                    return Err(anyhow::anyhow!(
+                        "permission stop cleanup is still pending; no next turn was admitted"
+                    ));
+                }
+                self.renderer
+                    .write_line("permission denied; run stopped", C_PERM)?;
+                if instruction {
+                    self.permission_prompt =
+                        Some(PermissionState::instruction(&mut self.renderer)?);
+                }
+            }
+            PermissionEvent::Instruction(text) => {
+                if !text.is_empty() {
+                    // Preserve the restored original prompt/follow-up in the
+                    // kill ring. This instruction is an editable next draft,
+                    // never an automatically admitted queued request.
+                    self.input.discard_draft();
+                    self.input.load_text(&text);
+                    self.renderer.write_line(
+                        "stop instruction placed in editor; press Enter to send",
+                        C_PERM,
+                    )?;
+                }
+            }
+        }
+        self.refresh()?;
+        Ok(true)
+    }
+
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        if self.handle_permission_event(&ev).await? {
+            return Ok(ControlFlow::Continue(()));
+        }
         match ev {
             UserEvent::Resize => {
                 self.renderer.resize();
@@ -1813,6 +1941,7 @@ impl<'a> App<'a> {
                 }
             }
             UserEvent::Quit => {
+                self.cancel_pending_permissions();
                 // The terminal may already be gone (SIGHUP): drawing can fail,
                 // but stopping the run and saving must still happen.
                 if self.run.is_running
@@ -2172,6 +2301,9 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        if matches!(&event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+            self.cancel_pending_permissions();
+        }
         let terminal_error = matches!(&event, AgentEvent::Error { .. });
         if terminal_error {
             self.discard_interrupted_queue();
@@ -2503,6 +2635,7 @@ impl<'a> App<'a> {
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
     async fn fail_pending_main_turn(&mut self) {
+        self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
@@ -2514,6 +2647,7 @@ impl<'a> App<'a> {
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI failed-run cleanup failed");
         }
+        self.cancel_pending_permissions();
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -2536,6 +2670,7 @@ impl<'a> App<'a> {
     }
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         let validation_active = self.run.cancel_validation();
 
@@ -2552,6 +2687,7 @@ impl<'a> App<'a> {
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI interrupted-run cleanup failed");
         }
+        self.cancel_pending_permissions();
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -3423,6 +3559,7 @@ impl<'a> App<'a> {
     }
 
     fn stop_context_exhausted(&mut self, prompt_tokens: u64, threshold: f64) -> anyhow::Result<()> {
+        self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         self.discard_interrupted_queue();
         let rendered = stop_turn_context_exhausted(
@@ -5297,5 +5434,768 @@ mod explicit_shell_persistence_tests {
             "{shown}"
         );
         assert!(shown.contains("LIVE_SHELL_RECORD"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod permission_loop_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    use crate::permission::ask::{AskRequest, UserDecision};
+    use crate::session::MessageRole;
+    use tokio::sync::oneshot;
+
+    /// Test-owned tasks are aborted even when an assertion unwinds. No native
+    /// processes or network requests are launched by this channel fixture.
+    struct OwnedRunner(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for OwnedRunner {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+    impl OwnedRunner {
+        async fn joined(mut self) {
+            let result = tokio::time::timeout(Duration::from_secs(2), self.0.as_mut().unwrap())
+                .await
+                .expect("exact fixture runner did not settle after cancellation");
+            // Keep the handle in the RAII guard until the await completes, so a
+            // deadline/assertion failure still aborts rather than detaches it.
+            self.0.take();
+            assert!(
+                result.unwrap_err().is_cancelled(),
+                "the exact owned run must be aborted"
+            );
+        }
+    }
+    struct Retired(Arc<AtomicBool>);
+    impl Drop for Retired {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn environment(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
+        crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ])
+    }
+    fn fixture_config() -> config::Config {
+        serde_json::from_value(serde_json::json!({
+            "custom_providers": {"permission-fixture": {"provider_type":"openai", "base_url":"http://127.0.0.1:1", "api_style":"completions"}}
+        })).unwrap()
+    }
+    fn fixture_ui<'a>(
+        cli: &'a crate::cli::Cli,
+        cfg: &'a config::Config,
+        session: &'a mut Session,
+        context: &'a mut crate::context::ContextFiles,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> UiContext<'a> {
+        UiContext {
+            cli,
+            cfg,
+            session,
+            context,
+            workspace,
+            client: crate::provider::create_client(
+                "permission-fixture",
+                Some("unused-local-fixture-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        }
+    }
+    fn request(input: &str) -> (AskRequest, oneshot::Receiver<UserDecision>) {
+        let (reply, receiver) = oneshot::channel();
+        (
+            AskRequest {
+                tool: "shell".into(),
+                input: input.into(),
+                #[cfg(feature = "acp")]
+                tool_call_id: Some(input.into()),
+                suggested_pattern: None,
+                additional_allow_patterns: Vec::new(),
+                reply,
+            },
+            receiver,
+        )
+    }
+    fn shown(app: &App<'_>) -> String {
+        let lines = app.renderer.feed().line_count(4096);
+        app.renderer
+            .feed()
+            .selected_text(4096, 0, lines.saturating_sub(1))
+            .unwrap_or_default()
+    }
+    async fn sent<T>(sender: &mpsc::Sender<T>, message: T) {
+        let result = tokio::time::timeout(Duration::from_secs(2), sender.send(message))
+            .await
+            .expect("fixture event channel did not accept a message before its deadline");
+        assert!(result.is_ok(), "fixture event receiver closed unexpectedly");
+    }
+    async fn replied(receiver: oneshot::Receiver<UserDecision>) -> UserDecision {
+        tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("permission decision did not arrive before its deadline")
+            .expect("permission decision sender was dropped without a decision")
+    }
+    async fn drain(app: &mut App<'_>) {
+        // Cancel only this borrowed event-loop wait. The App and its owned run
+        // remain live for before-answer assertions and the next polling pass.
+        match tokio::time::timeout(Duration::from_millis(100), app.run_inner()).await {
+            Err(_) => {}
+            Ok(Ok(())) => panic!("fixture App exited before the controlled event loop deadline"),
+            Ok(Err(error)) => panic!("fixture App event loop failed: {error:#}"),
+        }
+    }
+    async fn runner(app: &mut App<'_>) -> (OwnedRunner, Arc<AtomicBool>, mpsc::Sender<AgentEvent>) {
+        let (events, receiver) = mpsc::channel(8);
+        let keep_events = events.clone();
+        let retired = Arc::new(AtomicBool::new(false));
+        let observed = retired.clone();
+        let (started, ready) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _retired = Retired(observed);
+            let _events = keep_events;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        let task = OwnedRunner(Some(task));
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("fixture runner did not signal readiness")
+            .unwrap();
+        app.run.is_running = true;
+        app.run.main_abort = Some(task.0.as_ref().unwrap().abort_handle());
+        app.run.agent_rx = Some(receiver);
+        (task, retired, events)
+    }
+
+    #[tokio::test]
+    async fn actual_permission_wait_drains_btw_agent_title_logs_and_preserves_paste_before_answer()
+    {
+        let root = crate::tests::OwnedTestDirectory::new("permission-background-loop");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        session.total_cost = 0.25;
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let pending = PendingMainTurn::capture(app.ui.session, "permission-wait prompt");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        let (task, retired, agent_events) = runner(&mut app).await;
+        let (asks, receiver) = mpsc::channel(4);
+        app.ask_rx = Some(receiver);
+        let (ask, mut decision) = request("printf permission-reviewed");
+        sent(&asks, ask).await;
+        drain(&mut app).await;
+        assert!(app.permission_prompt.is_some());
+        let id = app
+            .btw_pricing
+            .start(crate::print::HeadlessPricing::from_session(
+                app.ui.session,
+                &cfg,
+            ))
+            .unwrap();
+        app.btw_inflight = 1;
+        sent(
+            &app.btw_tx,
+            BtwEvent::Done {
+                id,
+                response: "BACKGROUND_BTW_BEFORE_ANSWER".into(),
+                input_tokens: 2,
+                output_tokens: 3,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        )
+        .await;
+        sent(
+            &app.title_tx,
+            SessionTitleResult {
+                session_id: app.ui.session.id.clone(),
+                title: Ok("BACKGROUND_TITLE".into()),
+            },
+        )
+        .await;
+        let (logs, log_receiver) = mpsc::channel(2);
+        app.tui_log_rx = Some(log_receiver);
+        sent(&logs, "BACKGROUND_LOG_BEFORE_ANSWER".into()).await;
+        sent(
+            &agent_events,
+            AgentEvent::Token("BACKGROUND_AGENT_BEFORE_ANSWER".into()),
+        )
+        .await;
+        sent(&app.user_tx, UserEvent::Paste("DEFERRED_USER_DRAFT".into())).await;
+        drain(&mut app).await;
+        let transcript = shown(&app);
+        let terminal = app.renderer.captured_output();
+        for marker in [
+            "BACKGROUND_BTW_BEFORE_ANSWER",
+            "BACKGROUND_AGENT_BEFORE_ANSWER",
+            "BACKGROUND_LOG_BEFORE_ANSWER",
+        ] {
+            assert!(transcript.contains(marker), "{marker}: {transcript}");
+            assert!(
+                terminal.contains(marker),
+                "background output must be painted before approval: {marker}"
+            );
+        }
+        assert_eq!(
+            app.ui.session.generated_title.as_deref(),
+            Some("BACKGROUND_TITLE")
+        );
+        assert!(matches!(
+            decision.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(app.renderer.permission_prompt.is_some());
+        assert_eq!(
+            app.ui.session.total_cost, 0.25,
+            "side question accounting never mutates main cost"
+        );
+        assert_eq!(
+            app.input.buffer, "",
+            "paste waits until the approval is answered"
+        );
+        sent(
+            &app.user_tx,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        )
+        .await;
+        drain(&mut app).await;
+        assert!(matches!(replied(decision).await, UserDecision::Deny));
+        assert!(app.run.is_running, "ordinary denial does not stop the run");
+        assert!(app.permission_prompt.is_none());
+        assert_eq!(app.input.buffer, "DEFERRED_USER_DRAFT");
+        drop(agent_events);
+        sent(&app.user_tx, UserEvent::Quit).await;
+        tokio::time::timeout(Duration::from_secs(2), app.run_inner())
+            .await
+            .unwrap()
+            .unwrap();
+        task.joined().await;
+        assert!(retired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn actual_permission_stop_retires_exact_run_denies_backlog_and_stages_next_instruction() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-stop-loop");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        for (key, modifiers, progress) in [
+            (KeyCode::Esc, KeyModifiers::NONE, false),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, false),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, false),
+            (KeyCode::Char('s'), KeyModifiers::NONE, false),
+            (KeyCode::Esc, KeyModifiers::NONE, true),
+            (KeyCode::Char('s'), KeyModifiers::NONE, true),
+        ] {
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+            session.add_message(MessageRole::User, "earlier user");
+            session.add_message(MessageRole::Assistant, "earlier answer");
+            session.total_cost = 0.25;
+            let mut app = fixture_app(fixture_ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+            ));
+            let pending = PendingMainTurn::capture(app.ui.session, "interrupted original prompt");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            app.run.is_running = true;
+            if progress {
+                app.ui.session.add_tool_call_with_id(
+                    "permission-progress-read",
+                    "read",
+                    &serde_json::json!({"path":"fixture.txt"}),
+                );
+                app.ui.session.total_cost = 0.5;
+            }
+            app.input.load_text("recoverable follow-up draft");
+            app.run
+                .pending_inputs
+                .extend(["stale queued first".into(), "stale queued second".into()]);
+            let (task, retired, agent_events) = runner(&mut app).await;
+            drop(agent_events);
+            let (asks, receiver) = mpsc::channel(4);
+            app.ask_rx = Some(receiver);
+            let (ask, first) = request("printf current-request");
+            sent(&asks, ask).await;
+            drain(&mut app).await;
+            let (backlog, second) = request("printf stale-request");
+            sent(&asks, backlog).await;
+            sent(&app.user_tx, UserEvent::Key(KeyEvent::new(key, modifiers))).await;
+            drain(&mut app).await;
+            assert!(matches!(replied(first).await, UserDecision::Deny));
+            assert!(matches!(replied(second).await, UserDecision::Deny));
+            task.joined().await;
+            assert!(retired.load(Ordering::SeqCst));
+            assert!(!app.run.is_running);
+            assert!(
+                app.run.main_abort.is_none()
+                    && app.run.agent_rx.is_none()
+                    && app.run.agent.is_none()
+            );
+            assert!(app.run.pending_inputs.is_empty() && app.run.pending_turn.is_none());
+            assert!(app.ui.session.permission_allowlist.is_empty());
+            assert_eq!(app.ui.session.total_cost, if progress { 0.5 } else { 0.25 });
+            if progress {
+                assert!(app.ui.session.messages.iter().any(|message| {
+                    message.role == MessageRole::ToolResult
+                        && message.tool_call_id.as_deref() == Some("permission-progress-read")
+                        && message
+                            .content
+                            .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
+                }));
+            } else {
+                assert_eq!(app.ui.session.messages.len(), 2);
+            }
+            assert_eq!(
+                app.input.buffer,
+                if progress {
+                    "recoverable follow-up draft"
+                } else {
+                    "interrupted original prompt"
+                }
+            );
+            let transcript = shown(&app);
+            assert!(
+                transcript.contains("permission denied; run stopped"),
+                "{transcript}"
+            );
+            assert!(
+                transcript.contains("dropped 2 queued inputs"),
+                "{transcript}"
+            );
+            // A request sent after the retired generation is never displayed
+            // or granted, even if the UI receives a stale allow key afterward.
+            if key == KeyCode::Char('s') {
+                sent(
+                    &app.user_tx,
+                    UserEvent::Paste("Read the file instead".into()),
+                )
+                .await;
+                drain(&mut app).await;
+                assert!(!shown(&app).contains("> Read the file instead"));
+                sent(
+                    &app.user_tx,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                )
+                .await;
+                drain(&mut app).await;
+                assert_eq!(app.input.buffer, "Read the file instead");
+                assert!(
+                    app.ui
+                        .session
+                        .messages
+                        .iter()
+                        .all(|message| message.content != "Read the file instead")
+                );
+                assert!(!app.run.is_running && app.run.pending_inputs.is_empty());
+                app.input.clear_buffer();
+                app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    app.input.buffer,
+                    if progress {
+                        "recoverable follow-up draft"
+                    } else {
+                        "interrupted original prompt"
+                    }
+                );
+                if !progress {
+                    app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT))
+                        .await
+                        .unwrap();
+                    assert_eq!(app.input.buffer, "recoverable follow-up draft");
+                }
+            }
+            if key != KeyCode::Char('s') && !progress {
+                app.input.clear_buffer();
+                app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert_eq!(app.input.buffer, "recoverable follow-up draft");
+            }
+            let (stale, stale_reply) = request("printf post-retirement-request");
+            sent(&asks, stale).await;
+            drain(&mut app).await;
+            assert!(matches!(replied(stale_reply).await, UserDecision::Deny));
+            assert!(app.permission_prompt.is_none() && !app.run.is_running);
+            assert!(app.ui.session.permission_allowlist.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_abandoned_permission_cannot_turn_a_late_allow_into_a_session_grant() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-abandoned-loop");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let pending = PendingMainTurn::capture(app.ui.session, "caller-timeout prompt");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        let (task, retired, agent_events) = runner(&mut app).await;
+        drop(agent_events);
+        let (asks, receiver) = mpsc::channel(4);
+        app.ask_rx = Some(receiver);
+        let (ask, decision) = request("printf timed-out-request");
+        sent(&asks, ask).await;
+        drain(&mut app).await;
+        assert!(app.permission_prompt.is_some());
+        drop(decision);
+        sent(
+            &app.user_tx,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        )
+        .await;
+        drain(&mut app).await;
+        assert!(app.permission_prompt.is_none() && app.renderer.permission_prompt.is_none());
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        sent(&app.user_tx, UserEvent::Quit).await;
+        tokio::time::timeout(Duration::from_secs(2), app.run_inner())
+            .await
+            .unwrap()
+            .unwrap();
+        task.joined().await;
+        assert!(retired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn actual_permission_stages_preserve_prompt_folder_and_explicit_session_grants() {
+        use crate::permission::checker::{CheckResult, PermissionChecker, PromptGrantOffer};
+        let root = crate::tests::OwnedTestDirectory::new("permission-grant-loop");
+        let _environment = environment(&root);
+        let workspace_path = root.path().join("workspace");
+        let external = root.path().join("outside");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let target = external.join("review.txt");
+        std::fs::write(&target, "review fixture").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        for kind in ["prompt-accept", "prompt-decline", "folder", "session"] {
+            let workspace =
+                Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_path).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+            let mut checker = PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                crate::permission::SecurityMode::Standard,
+                Some(workspace_path.clone()),
+                None,
+            )
+            .unwrap();
+            if kind.starts_with("prompt-") {
+                checker.set_prompt_grant_offer(Some(PromptGrantOffer {
+                    prompt: "review".into(),
+                    dir: external.clone(),
+                    tools: vec!["read", "edit"],
+                }));
+            }
+            let permission = Arc::new(std::sync::Mutex::new(checker));
+            let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+            ui.permission = Some(permission.clone());
+            let mut app = fixture_app(ui);
+            let pending = PendingMainTurn::capture(app.ui.session, "grant review prompt");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            app.run.is_running = true;
+            let (asks, receiver) = mpsc::channel(4);
+            app.ask_rx = Some(receiver);
+            let (mut ask, mut decision) = request(&path);
+            ask.tool = "read".into();
+            ask.suggested_pattern = Some(path.clone());
+            ask.additional_allow_patterns = vec![format!("{}-specific-second", path)];
+            sent(&asks, ask).await;
+            drain(&mut app).await;
+            if kind == "prompt-decline" {
+                assert!(
+                    app.renderer
+                        .captured_output()
+                        .contains("prompt 'review' asks")
+                );
+                sent(
+                    &app.user_tx,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+                )
+                .await;
+                drain(&mut app).await;
+                assert!(matches!(
+                    decision.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(
+                    app.permission_prompt.is_some(),
+                    "declining the broad prompt grant falls back to per-call approval"
+                );
+                assert!(app.ui.session.permission_allowlist.is_empty());
+                assert!(
+                    permission
+                        .lock()
+                        .unwrap()
+                        .prompt_grant_offer_for("read", &path)
+                        .is_none()
+                );
+            }
+            let answer = match kind {
+                "folder" => 'f',
+                "session" => 'a',
+                _ => 'y',
+            };
+            sent(
+                &app.user_tx,
+                UserEvent::Key(KeyEvent::new(KeyCode::Char(answer), KeyModifiers::NONE)),
+            )
+            .await;
+            drain(&mut app).await;
+            match (kind, replied(decision).await) {
+                ("session", UserDecision::AllowAlways(pattern)) => {
+                    assert_eq!(pattern, path);
+                    assert_eq!(app.ui.session.permission_allowlist.len(), 2);
+                    assert!(
+                        app.ui
+                            .session
+                            .permission_allowlist
+                            .iter()
+                            .all(|entry| entry.tool == "read")
+                    );
+                }
+                ("prompt-decline", UserDecision::AllowOnce) => {
+                    assert!(app.ui.session.permission_allowlist.is_empty());
+                    assert_eq!(
+                        permission.lock().unwrap().check_path("edit", &path),
+                        CheckResult::Ask
+                    );
+                }
+                ("prompt-accept" | "folder", UserDecision::AllowOnce) => {
+                    assert!(!app.ui.session.permission_allowlist.is_empty());
+                    assert_eq!(
+                        permission.lock().unwrap().check_path("edit", &path),
+                        CheckResult::Allowed
+                    );
+                    assert_eq!(
+                        permission.lock().unwrap().check_path("write", &path),
+                        CheckResult::Ask
+                    );
+                }
+                (_, other) => panic!("unexpected grant for {kind}: {other:?}"),
+            }
+            assert!(app.permission_prompt.is_none() && app.run.is_running);
+            sent(&app.user_tx, UserEvent::Quit).await;
+            tokio::time::timeout(Duration::from_secs(2), app.run_inner())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_terminal_error_denies_displayed_permission_and_backlog_before_settlement() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-error-loop");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let pending = PendingMainTurn::capture(app.ui.session, "failed permission prompt");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        app.run.pending_inputs.push_back("stale error queue".into());
+        let (asks, receiver) = mpsc::channel(4);
+        app.ask_rx = Some(receiver);
+        let (first, first_reply) = request("printf error-first");
+        sent(&asks, first).await;
+        drain(&mut app).await;
+        let (second, second_reply) = request("printf error-second");
+        sent(&asks, second).await;
+        let (events, receiver) = mpsc::channel(2);
+        app.run.agent_rx = Some(receiver);
+        sent(
+            &events,
+            AgentEvent::Error {
+                message: "permission owner failed".into(),
+                interactions: Vec::new(),
+            },
+        )
+        .await;
+        drop(events); // Real terminal event is followed by owned runner closure.
+        drain(&mut app).await;
+        assert!(matches!(replied(first_reply).await, UserDecision::Deny));
+        assert!(matches!(replied(second_reply).await, UserDecision::Deny));
+        assert!(app.permission_prompt.is_none() && app.renderer.permission_prompt.is_none());
+        assert!(
+            !app.run.is_running && app.run.agent_rx.is_none() && app.run.pending_turn.is_none()
+        );
+        assert!(
+            app.run.pending_inputs.is_empty() && app.ui.session.permission_allowlist.is_empty()
+        );
+        assert_eq!(app.input.buffer, "failed permission prompt");
+        assert!(shown(&app).contains("permission owner failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actual_permission_stop_timeout_retains_cleanup_and_blocks_next_instruction() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-retirement-timeout");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let pending = PendingMainTurn::capture(app.ui.session, "unsettled original prompt");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        app.run
+            .pending_inputs
+            .push_back("must not restart unsettled work".into());
+        let (task, retired, retained_events) = runner(&mut app).await;
+        let (asks, receiver) = mpsc::channel(4);
+        app.ask_rx = Some(receiver);
+        let (ask, decision) = request("printf unsettled-request");
+        sent(&asks, ask).await;
+        drain(&mut app).await;
+        assert!(app.permission_prompt.is_some());
+        sent(
+            &app.user_tx,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+        )
+        .await;
+        // The test holds one exact-run sender beyond cancellation. Advancing
+        // Tokio time deterministically triggers the real retirement timeout.
+        let error = tokio::time::timeout(Duration::from_secs(20), app.run())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("permission stop cleanup is still pending")
+        );
+        assert!(matches!(replied(decision).await, UserDecision::Deny));
+        assert!(
+            app.run.agent_rx.is_some(),
+            "teardown must retain the exact unsettled receiver"
+        );
+        assert!(app.run.pending_inputs.is_empty() && app.run.pending_turn.is_none());
+        assert!(!app.run.is_running && app.run.agent.is_none());
+        assert!(app.permission_prompt.is_none() && app.renderer.permission_prompt.is_none());
+        assert_eq!(app.input.buffer, "unsettled original prompt");
+        assert!(
+            !app.renderer
+                .captured_output()
+                .contains("Next user instruction (draft)")
+        );
+        task.joined().await;
+        assert!(retired.load(Ordering::SeqCst));
+        drop(retained_events); // Release the controlled cleanup obstruction.
+        tokio::time::timeout(Duration::from_secs(2), app.teardown())
+            .await
+            .unwrap();
     }
 }

@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Color;
-use tokio::sync::mpsc;
 
 use crate::event::UserEvent;
 use crate::permission::checker::PromptGrantOffer;
@@ -21,8 +20,9 @@ enum PromptInput {
     /// Allow read, edit and list_dir on the request's folder for the session.
     AllowFolder,
     Deny,
-    /// Esc / Ctrl+C / Ctrl+D: refuse without further questions.
+    /// Esc / Ctrl+C / Ctrl+D: deny and stop the current run.
     Abort,
+    StopWithInstruction,
     /// `e`: expand or collapse the prompt's view of the request. Never an
     /// answer.
     ToggleFull,
@@ -34,10 +34,10 @@ enum PromptInput {
 fn permission_options(folder: Option<&std::path::Path>) -> String {
     match folder {
         Some(folder) => format!(
-            "  (y) allow once  (a) allow for this session  (f) allow read+edit+list in {} for this session  (n) deny  (ESC) abort",
+            "  (y) allow once  (a) allow for this session  (f) allow read+edit+list in {} for this session  (n) deny once  (s) deny and stop with instruction  (ESC) deny and stop",
             folder.display()
         ),
-        None => "  (y) allow once  (a) allow for this session  (n) deny  (ESC) abort".to_string(),
+        None => "  (y) allow once  (a) allow for this session  (n) deny once  (s) deny and stop with instruction  (ESC) deny and stop".to_string(),
     }
 }
 
@@ -50,8 +50,7 @@ fn prompt_grant_header(offer: &PromptGrantOffer) -> String {
     )
 }
 
-const PROMPT_GRANT_OPTIONS: &str =
-    "  (y) allow for this session  (n) ask for each access instead  (ESC) deny this request";
+const PROMPT_GRANT_OPTIONS: &str = "  (y) allow for this session  (n) ask for each access instead  (s) deny and stop with instruction  (ESC) deny and stop";
 
 fn classify_prompt_key(key: KeyEvent) -> PromptInput {
     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -65,14 +64,11 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('a' | 'A') if plain => PromptInput::AllowSession,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
+        KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
         KeyCode::Char('e' | 'E') if plain => PromptInput::ToggleFull,
         KeyCode::Esc => PromptInput::Abort,
         _ => PromptInput::Ignore,
     }
-}
-
-fn defer_during_prompt(event: &UserEvent) -> bool {
-    matches!(event, UserEvent::Resize | UserEvent::Paste(_))
 }
 
 /// Transcript navigation that stays available while a prompt waits, so the
@@ -128,211 +124,313 @@ fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
     renderer.draw_bottom("", 0, &statusline, statusline_key, false)
 }
 
-/// Show `header` and `options`, then wait for one recognised key. The
-/// transcript scrolls (wheel, arrows, PageUp/PageDown, Home/End) while the
-/// prompt waits. Resize repaints the prompt and is also deferred, as is paste;
-/// a closed input channel or a quit request aborts.
-async fn read_prompt_input(
-    header: &str,
-    options: &str,
-    renderer: &mut Renderer,
-    user_rx: &mut mpsc::Receiver<UserEvent>,
-    deferred_user_events: &mut VecDeque<UserEvent>,
-    accept: impl Fn(PromptInput) -> bool,
-) -> anyhow::Result<PromptInput> {
-    let header = sanitize_for_review(header);
-    let was_at_bottom = !renderer.is_scrolling();
-    renderer.write_line(&header, C_PERM)?;
-    renderer.write_line(options, C_PERM)?;
-    renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
-        tool: header,
-        options: options.into(),
-        expanded: false,
-    });
-    renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
-    draw_prompt(renderer)?;
-
-    let input = loop {
-        let Some(event) = user_rx.recv().await else {
-            break PromptInput::Abort;
-        };
-        if let Some(scroll) = prompt_scroll(&event) {
-            apply_prompt_scroll(renderer, scroll)?;
-            draw_prompt(renderer)?;
-            continue;
-        }
-        match event {
-            UserEvent::Key(key) => {
-                let input = classify_prompt_key(key);
-                if input == PromptInput::ToggleFull {
-                    if let Some(prompt) = renderer.permission_prompt.as_mut() {
-                        prompt.expanded = !prompt.expanded;
-                    }
-                    draw_prompt(renderer)?;
-                    continue;
-                }
-                if input != PromptInput::Ignore && accept(input) {
-                    break input;
-                }
-            }
-            UserEvent::Quit => {
-                // Refuse the request, then let the main loop quit.
-                deferred_user_events.push_back(UserEvent::Quit);
-                break PromptInput::Abort;
-            }
-            UserEvent::Resize => {
-                renderer.resize();
-                renderer.invalidate();
-                draw_prompt(renderer)?;
-                deferred_user_events.push_back(UserEvent::Resize);
-            }
-            event if defer_during_prompt(&event) => {
-                deferred_user_events.push_back(event);
-            }
-            _ => {}
-        }
-    };
-    renderer.permission_prompt = None;
-    if was_at_bottom {
-        // Reviewing the transcript was a detour: follow the output again.
-        renderer.scroll_to_bottom()?;
-    }
-    Ok(input)
+/// The main App loop owns this state; no permission handler waits on a
+/// receiver. Dropping an unanswered state explicitly denies its exact request.
+pub(crate) struct PermissionState {
+    request: Option<crate::permission::ask::AskRequest>,
+    offer: Option<PromptGrantOffer>,
+    folder: Option<std::path::PathBuf>,
+    was_at_bottom: bool,
+    instruction: Option<String>,
 }
 
-pub async fn handle_permission_request(
-    ask_req: crate::permission::ask::AskRequest,
-    renderer: &mut Renderer,
-    ui: &mut UiContext<'_>,
-    run: &mut AgentRunState,
-    user_rx: &mut mpsc::Receiver<UserEvent>,
-    deferred_user_events: &mut VecDeque<UserEvent>,
-) -> anyhow::Result<()> {
-    use crate::permission::ask::UserDecision;
+pub(crate) enum PermissionEvent {
+    Unhandled,
+    Waiting,
+    Finished,
+    Stop { instruction: bool },
+    Instruction(String),
+}
 
-    run.was_reasoning = false;
-    if run.agent_line_started {
-        renderer.write_line("", Color::White)?;
-        run.agent_line_started = false;
+impl Drop for PermissionState {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            let _ = request
+                .reply
+                .send(crate::permission::ask::UserDecision::Deny);
+        }
     }
+}
 
-    let (prompt_offer, folder) = match ui.permission.as_ref() {
-        Some(perm) => {
-            let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+impl PermissionState {
+    pub(crate) fn begin(
+        request: crate::permission::ask::AskRequest,
+        renderer: &mut Renderer,
+        ui: &UiContext<'_>,
+        run: &mut AgentRunState,
+    ) -> anyhow::Result<Self> {
+        run.was_reasoning = false;
+        if run.agent_line_started {
+            renderer.write_line("", Color::White)?;
+            run.agent_line_started = false;
+        }
+        let (offer, folder) = ui.permission.as_ref().map_or((None, None), |permission| {
+            let guard = permission.lock().unwrap_or_else(|error| error.into_inner());
             (
-                guard.prompt_grant_offer_for(&ask_req.tool, &ask_req.input),
-                guard.folder_grant_scope(&ask_req.tool, &ask_req.input),
+                guard.prompt_grant_offer_for(&request.tool, &request.input),
+                guard.folder_grant_scope(&request.tool, &request.input),
             )
-        }
-        None => (None, None),
-    };
-
-    // A built-in prompt's scoped grant is offered once, before the first
-    // per-call approval it would cover. Declining falls back to per-call.
-    if let Some(offer) = prompt_offer {
-        let header = prompt_grant_header(&offer);
-        let input = read_prompt_input(
-            &header,
-            PROMPT_GRANT_OPTIONS,
-            renderer,
-            user_rx,
-            deferred_user_events,
-            |input| {
-                matches!(
-                    input,
-                    PromptInput::AllowOnce | PromptInput::Deny | PromptInput::Abort
-                )
-            },
-        )
-        .await?;
-        let Some(perm) = ui.permission.clone() else {
-            let _ = ask_req.reply.send(UserDecision::Deny);
-            return Ok(());
+        });
+        let state = Self {
+            request: Some(request),
+            offer,
+            folder,
+            was_at_bottom: !renderer.is_scrolling(),
+            instruction: None,
         };
-        match input {
-            PromptInput::AllowOnce => {
-                let entries = perm
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .accept_prompt_grant();
-                let _ = ask_req.reply.send(UserDecision::AllowOnce);
-                return record_session_grants(entries, renderer, ui, run);
-            }
-            PromptInput::Abort => {
-                perm.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .decline_prompt_grant();
-                let _ = ask_req.reply.send(UserDecision::Deny);
-                return Ok(());
-            }
-            _ => {
-                perm.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .decline_prompt_grant();
-            }
+        state.show(renderer)?;
+        renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
+        Ok(state)
+    }
+
+    /// Collect a next-turn draft only after the App has retired the denied run.
+    pub(crate) fn instruction(renderer: &mut Renderer) -> anyhow::Result<Self> {
+        let state = Self {
+            request: None,
+            offer: None,
+            folder: None,
+            was_at_bottom: !renderer.is_scrolling(),
+            instruction: Some(String::new()),
+        };
+        state.show_instruction(renderer)?;
+        Ok(state)
+    }
+
+    pub(crate) fn abandoned(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| request.reply.is_closed())
+    }
+
+    pub(crate) fn decline_on_cancel(&self, ui: &UiContext<'_>) {
+        if self.offer.is_some()
+            && let Some(permission) = &ui.permission
+        {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .decline_prompt_grant();
         }
     }
 
-    let header = format!(
-        "[permission] {}: {}",
-        ask_req.tool,
-        sanitize_for_review(&ask_req.input)
-    );
-    let options = permission_options(folder.as_deref());
-    let has_folder = folder.is_some();
-    let input = read_prompt_input(
-        &header,
-        &options,
-        renderer,
-        user_rx,
-        deferred_user_events,
-        |input| input != PromptInput::AllowFolder || has_folder,
-    )
-    .await?;
-
-    let (decision, entries) = match input {
-        PromptInput::AllowOnce => (UserDecision::AllowOnce, Vec::new()),
-        PromptInput::AllowSession => {
-            let pattern = ask_req
-                .suggested_pattern
-                .clone()
-                .unwrap_or_else(|| suggest_pattern(&ask_req.tool, &ask_req.input));
-            renderer.write_line(&format!("  -> will allow: {}", pattern), Color::Green)?;
-            let mut entries = vec![(ask_req.tool.to_string(), pattern.clone())];
-            entries.extend(
-                ask_req
-                    .additional_allow_patterns
-                    .iter()
-                    .map(|extra| (ask_req.tool.to_string(), extra.clone())),
-            );
-            (UserDecision::AllowAlways(pattern), entries)
+    pub(crate) fn finish(&self, renderer: &mut Renderer) -> std::io::Result<()> {
+        renderer.permission_prompt = None;
+        if self.was_at_bottom {
+            renderer.scroll_to_bottom()?;
         }
-        PromptInput::AllowFolder => match (&folder, ui.permission.as_ref()) {
-            (Some(folder), Some(perm)) => {
-                let entries = perm
+        Ok(())
+    }
+
+    fn show(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
+        let request = self.request.as_ref().expect("approval owns its request");
+        let (header, options) = match &self.offer {
+            Some(offer) => (prompt_grant_header(offer), PROMPT_GRANT_OPTIONS.to_string()),
+            None => (
+                format!("[permission] {}: {}", request.tool, request.input),
+                permission_options(self.folder.as_deref()),
+            ),
+        };
+        let header = sanitize_for_review(&header);
+        renderer.write_line(&header, C_PERM)?;
+        renderer.write_line(&options, C_PERM)?;
+        renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+            tool: header,
+            options: options.into(),
+            expanded: false,
+        });
+        draw_prompt(renderer)?;
+        Ok(())
+    }
+
+    fn show_instruction(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
+        renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+            tool: format!(
+                "Run stopped. Next user instruction (draft): {}",
+                sanitize_for_review(self.instruction.as_deref().unwrap_or_default())
+            )
+            .into(),
+            options: "[Enter] put instruction in editor; review before sending  [Esc] skip".into(),
+            expanded: true,
+        });
+        draw_prompt(renderer)?;
+        Ok(())
+    }
+
+    pub(crate) fn handle_event(
+        &mut self,
+        event: &UserEvent,
+        renderer: &mut Renderer,
+        ui: &mut UiContext<'_>,
+        run: &mut AgentRunState,
+        deferred: &mut VecDeque<UserEvent>,
+    ) -> anyhow::Result<PermissionEvent> {
+        use crate::permission::ask::UserDecision;
+        if let Some(scroll) = prompt_scroll(event) {
+            apply_prompt_scroll(renderer, scroll)?;
+            draw_prompt(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        if matches!(event, UserEvent::Resize) {
+            renderer.resize();
+            renderer.invalidate();
+            draw_prompt(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        if let Some(instruction) = self.instruction.as_mut() {
+            match event {
+                UserEvent::Key(key) => match key.code {
+                    KeyCode::Enter => {
+                        let text = instruction.trim().to_string();
+                        self.finish(renderer)?;
+                        return Ok(PermissionEvent::Instruction(text));
+                    }
+                    KeyCode::Esc => {
+                        self.finish(renderer)?;
+                        return Ok(PermissionEvent::Finished);
+                    }
+                    _ if classify_prompt_key(*key) == PromptInput::Abort => {
+                        self.finish(renderer)?;
+                        return Ok(PermissionEvent::Finished);
+                    }
+                    KeyCode::Backspace => {
+                        instruction.pop();
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && !character.is_control() =>
+                    {
+                        instruction.push(character)
+                    }
+                    _ => {}
+                },
+                UserEvent::Paste(text) => {
+                    // One line; a paste cannot submit or replay queued input.
+                    instruction.extend(text.chars().filter(|character| !character.is_control()));
+                }
+                _ => return Ok(PermissionEvent::Unhandled),
+            }
+            self.show_instruction(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        let input = match event {
+            UserEvent::Key(key) => classify_prompt_key(*key),
+            UserEvent::Paste(text) => {
+                deferred.push_back(UserEvent::Paste(text.clone()));
+                return Ok(PermissionEvent::Waiting);
+            }
+            _ => return Ok(PermissionEvent::Unhandled),
+        };
+        if input == PromptInput::ToggleFull {
+            if let Some(prompt) = renderer.permission_prompt.as_mut() {
+                prompt.expanded = !prompt.expanded;
+            }
+            draw_prompt(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        if input == PromptInput::Ignore
+            || (input == PromptInput::AllowFolder && self.folder.is_none())
+            || (self.offer.is_some()
+                && matches!(input, PromptInput::AllowSession | PromptInput::AllowFolder))
+        {
+            return Ok(PermissionEvent::Waiting);
+        }
+        if matches!(input, PromptInput::Abort | PromptInput::StopWithInstruction) {
+            if self.offer.is_some()
+                && let Some(permission) = &ui.permission
+            {
+                permission
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .add_session_folder_grant(
-                        folder,
-                        &crate::permission::checker::FOLDER_GRANT_TOOLS,
-                    );
-                renderer.write_line(
-                    &format!(
-                        "  -> will allow read, edit and list_dir in {}",
-                        folder.display()
-                    ),
-                    Color::Green,
-                )?;
-                (UserDecision::AllowOnce, entries)
+                    .unwrap_or_else(|error| error.into_inner())
+                    .decline_prompt_grant();
+            }
+            if let Some(request) = self.request.take() {
+                let _ = request.reply.send(UserDecision::Deny);
+            }
+            self.finish(renderer)?;
+            return Ok(PermissionEvent::Stop {
+                instruction: input == PromptInput::StopWithInstruction,
+            });
+        }
+        if self.offer.take().is_some() {
+            let Some(permission) = &ui.permission else {
+                self.finish(renderer)?;
+                return Ok(PermissionEvent::Finished);
+            };
+            if input == PromptInput::Deny {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .decline_prompt_grant();
+                self.show(renderer)?;
+                return Ok(PermissionEvent::Waiting);
+            }
+            let request = self.request.take().expect("approval owns its request");
+            let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .accept_prompt_grant()
+            } else {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .decline_prompt_grant();
+                Vec::new()
+            };
+            self.finish(renderer)?;
+            record_session_grants(entries, renderer, ui, run)?;
+            return Ok(PermissionEvent::Finished);
+        }
+        let request = self.request.take().expect("approval owns its request");
+        if input == PromptInput::AllowFolder {
+            let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                match (&self.folder, &ui.permission) {
+                    (Some(folder), Some(permission)) => permission
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .add_session_folder_grant(
+                            folder,
+                            &crate::permission::checker::FOLDER_GRANT_TOOLS,
+                        ),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            self.finish(renderer)?;
+            record_session_grants(entries, renderer, ui, run)?;
+            return Ok(PermissionEvent::Finished);
+        }
+        let (decision, entries) = match input {
+            PromptInput::AllowOnce => (UserDecision::AllowOnce, Vec::new()),
+            PromptInput::AllowSession => {
+                let pattern = request
+                    .suggested_pattern
+                    .clone()
+                    .unwrap_or_else(|| suggest_pattern(&request.tool, &request.input));
+                renderer.write_line(&format!("  -> will allow: {}", pattern), Color::Green)?;
+                let mut entries = vec![(request.tool.to_string(), pattern.clone())];
+                entries.extend(
+                    request
+                        .additional_allow_patterns
+                        .iter()
+                        .map(|extra| (request.tool.to_string(), extra.clone())),
+                );
+                (UserDecision::AllowAlways(pattern), entries)
             }
             _ => (UserDecision::Deny, Vec::new()),
-        },
-        PromptInput::Deny | PromptInput::Abort | PromptInput::ToggleFull | PromptInput::Ignore => {
-            (UserDecision::Deny, Vec::new())
-        }
-    };
-    let _ = ask_req.reply.send(decision);
-    record_session_grants(entries, renderer, ui, run)
+        };
+        let entries = if request.reply.send(decision).is_ok() {
+            entries
+        } else {
+            Vec::new()
+        };
+        self.finish(renderer)?;
+        record_session_grants(entries, renderer, ui, run)?;
+        Ok(PermissionEvent::Finished)
+    }
 }
 
 /// Report and persist session grants. The checker already holds them (the
@@ -420,10 +518,15 @@ mod tests {
     }
 
     #[test]
-    fn resize_and_paste_are_deferred_until_after_the_prompt() {
-        assert!(defer_during_prompt(&UserEvent::Resize));
-        assert!(defer_during_prompt(&UserEvent::Paste("text".into())));
-        assert!(!defer_during_prompt(&UserEvent::ScrollUp));
+    fn stop_with_instruction_has_an_explicit_key() {
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            PromptInput::StopWithInstruction
+        );
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            PromptInput::Ignore
+        );
     }
 
     #[test]

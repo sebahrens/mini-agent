@@ -49,7 +49,7 @@ async fn call_formats_todo_items_with_icons() {
         todos: vec![
             TodoItem {
                 content: "High priority task".to_string(),
-                status: CompactString::new("high"),
+                status: CompactString::new("pending"),
                 priority: CompactString::new("high"),
             },
             TodoItem {
@@ -69,7 +69,7 @@ async fn call_formats_todo_items_with_icons() {
             },
             TodoItem {
                 content: "Low priority task".to_string(),
-                status: CompactString::new("low"),
+                status: CompactString::new("pending"),
                 priority: CompactString::new("low"),
             },
         ],

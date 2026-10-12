@@ -610,6 +610,7 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
     crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
     crate::agent::tools::edit::EditTool::new(None, None)
         .call(crate::agent::tools::EditArgs {
+            fuzzy: false,
             path: file.to_string_lossy().into_owned(),
             block: Some(
                 "<<<<<<< SEARCH\nold contents\n=======\nnew contents\n>>>>>>> REPLACE".into(),

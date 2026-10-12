@@ -399,6 +399,7 @@ async fn handle_similarity(
     block: &str,
     content: &str,
     replace_all: bool,
+    fuzzy: bool,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     let blocks = parse_blocks(block)?;
     let line_ending = dominant_line_ending(content);
@@ -421,19 +422,56 @@ async fn handle_similarity(
 
         let search = with_line_ending(&blk.search, line_ending);
         let replace = with_line_ending(&blk.replace, line_ending);
+        if replace_all {
+            // Exact occurrences retain left-to-right, non-overlapping priority.
+            // Include disjoint whitespace variants too, translating each span
+            // through the byte map. Overlapping normalized ranges remain in
+            // the plan so the atomic overlap check rejects them before writing.
+            let exact: Vec<_> = content
+                .match_indices(&search)
+                .map(|(start, _)| (start, start + search.len()))
+                .collect();
+            let normalized = NormalizedText::new(content);
+            let normalized_search = normalize_whitespace(&search);
+            let mut all = exact.clone();
+            if !normalized_search.is_empty() {
+                all.extend(
+                    overlapping_match_indices(&normalized.text, &normalized_search)
+                        .map(|start| normalized.source_range(start, normalized_search.len()))
+                        .filter(|(start, end)| {
+                            let next = exact.partition_point(|(_, exact_end)| exact_end <= start);
+                            exact
+                                .get(next)
+                                .is_none_or(|(exact_start, _)| exact_start >= end)
+                        }),
+                );
+            }
+            if !all.is_empty() {
+                all.sort_unstable();
+                all.dedup();
+                for (start, end) in all {
+                    let note = if exact.binary_search(&(start, end)).is_ok() {
+                        String::new()
+                    } else {
+                        format!(
+                            "matched after whitespace normalization; replaced region:\n{}",
+                            bounded_match_excerpt(content, start, end)
+                        )
+                    };
+                    resolved.push(ResolvedSim {
+                        byte_start: start,
+                        byte_end: end,
+                        replace: replace.clone(),
+                        note,
+                    });
+                }
+                continue;
+            }
+        }
         match find_best_match(content, &search) {
             MatchResult::Exact(pos) => {
                 let count = overlapping_match_indices(content, &search).count();
-                if replace_all {
-                    resolved.extend(content.match_indices(&search).map(|(byte_start, _)| {
-                        ResolvedSim {
-                            byte_start,
-                            byte_end: byte_start + search.len(),
-                            replace: replace.clone(),
-                            note: String::new(),
-                        }
-                    }));
-                } else if count > 1 {
+                if count > 1 {
                     const MAX_MATCH_PREVIEWS: usize = 10;
                     let line_starts: Vec<usize> = std::iter::once(0)
                         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
@@ -495,6 +533,14 @@ async fn handle_similarity(
                 )));
             }
             MatchResult::FuzzyApply(start, end, sim) => {
+                if !fuzzy {
+                    let line = content[..start].matches('\n').count() + 1;
+                    return Err(ToolError::Msg(format!(
+                        "{label}SEARCH text did not match exactly or after whitespace normalization in '{path}'. Closest match at line {line}, {:.0}% similar:\n{}\n\nRead that region and copy the exact text into SEARCH. To deliberately apply this unique approximate match, pass fuzzy: true (without replace_all). No edits were applied.",
+                        sim * 100.0,
+                        bounded_match_excerpt(content, start, end)
+                    )));
+                }
                 resolved.push(ResolvedSim {
                     byte_start: start,
                     byte_end: end,
@@ -507,13 +553,18 @@ async fn handle_similarity(
                 });
             }
             MatchResult::AmbiguousFuzzy(first, second) => {
+                let spans = line_spans(content);
+                let first_span = spans[first.0 - 1];
+                let preview =
+                    bounded_match_excerpt(content, first_span.start, first_span.content_end);
                 return Err(ToolError::Msg(format!(
-                    "{label}search text had multiple fuzzy matches above the apply threshold in {}: line {} ({:.0}%) and line {} ({:.0}%).\n\nCopy the exact text or add more surrounding context to make the SEARCH block unique.",
+                    "{label}search text had multiple fuzzy matches above the apply threshold in {}: line {} ({:.0}%) and line {} ({:.0}%).\nFirst candidate preview:\n{}\n\nCopy the exact text or add more surrounding context to make the SEARCH block unique; fuzzy opt-in never chooses among ambiguous candidates.",
                     path,
                     first.0,
                     first.1 * 100.0,
                     second.0,
                     second.1 * 100.0,
+                    preview,
                 )));
             }
             MatchResult::FuzzySuggest(line, sim, preview) => {
@@ -878,7 +929,7 @@ impl Tool for EditTool {
 
     fn description(&self) -> String {
         match edit_system() {
-            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Markers must start at column 0. Use the 11-character literal-safe markers when the content itself contains <<<<<<< SEARCH, =======, or >>>>>>> REPLACE lines. Each block finds exact text and replaces it; multiple blocks are atomic. Set replace_all to replace every exact occurrence. If exact matching fails, whitespace normalization and fuzzy matching are attempted for one target.".to_string(),
+            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Markers must start at column 0. Use the 11-character literal-safe markers when the content itself contains <<<<<<< SEARCH, =======, or >>>>>>> REPLACE lines. Each block finds exact text and replaces it; multiple blocks are atomic. Exact and whitespace-normalized matches apply automatically. Set replace_all to replace all exact occurrences and disjoint whitespace-normalized variants. Approximate matches only suggest a preview unless fuzzy=true explicitly opts into one unique match at >=85% similarity. fuzzy and replace_all cannot be combined.".to_string(),
             EditSystem::Hashedit => "Edit a file using tag-based line references. Copy tagged lines from read output. Edit is CAS-guarded via file-level CRC-32 hash. All edits in one call are applied atomically.".to_string(),
         }
     }
@@ -890,7 +941,8 @@ impl Tool for EditTool {
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
                     "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks. Markers must begin at column 0. Standard form:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nIf searched or replacement content contains any standard marker as a full line, use literal-safe markers instead:\n<<<<<<<<<<< SEARCH\ncontent including <<<<<<< SEARCH or =======\n===========\nreplacement including >>>>>>> REPLACE\n>>>>>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file." },
-                    "replace_all": { "type": "boolean", "default": false, "description": "Replace every exact, non-overlapping occurrence of each SEARCH block. When false, each SEARCH block must identify one unique target." }
+                    "replace_all": { "type": "boolean", "default": false, "description": "Replace all exact non-overlapping occurrences and disjoint whitespace-normalized variants of each SEARCH block. Overlapping normalized ranges are rejected. Cannot combine with fuzzy. When false, each SEARCH block must identify one unique target." },
+                    "fuzzy": { "type": "boolean", "default": false, "description": "Explicitly allow one unique approximate match at >=85% similarity when exact and whitespace-normalized matching fail. Otherwise return a preview and copy exact text. Cannot combine with replace_all; lower-confidence and ambiguous matches still fail." }
                 },
                 "required": ["path", "block"]
             }),
@@ -930,6 +982,11 @@ impl Tool for EditTool {
         if args.block.is_none() && args.replace_all {
             return Err(ToolError::Msg(
                 "'replace_all' is only supported with SEARCH/REPLACE blocks.".to_string(),
+            ));
+        }
+        if args.fuzzy && (args.replace_all || args.block.is_none()) {
+            return Err(ToolError::Msg(
+                "'fuzzy' is only supported with SEARCH/REPLACE blocks and cannot be combined with 'replace_all'. Copy exact source text or use a single deliberate fuzzy edit.".to_string(),
             ));
         }
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
@@ -1035,7 +1092,7 @@ impl Tool for EditTool {
 
         // Determine mode: V1 (block) or V2 (edits)
         let (notes, mut ranges) = if let Some(ref block) = args.block {
-            handle_similarity(&path, block, &content, args.replace_all).await?
+            handle_similarity(&path, block, &content, args.replace_all, args.fuzzy).await?
         } else if let (Some(file_crc), Some(edits)) = (&args.file_crc, &args.edits) {
             if args.replace_all {
                 return Err(ToolError::Msg(
@@ -1266,6 +1323,7 @@ mod tests {
 
         let error = tool
             .call(EditArgs {
+                fuzzy: false,
                 path: allowed_link.to_string_lossy().into_owned(),
                 replace_all: false,
                 block: Some(
@@ -1314,6 +1372,7 @@ mod tests {
         let tool = EditTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx));
 
         let call = tool.call(EditArgs {
+            fuzzy: false,
             path: link.to_string_lossy().into_owned(),
             replace_all: false,
             block: Some(

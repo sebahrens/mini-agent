@@ -218,8 +218,12 @@ the error says that no closest-match suggestion was computed.
 SEARCH/REPLACE edits require a unique match, including occurrences that overlap
 in the original or whitespace-normalized text. For example, `aba` is ambiguous
 in `ababa`; add context to select the intended occurrence. With `replace_all`,
-exact replacements proceed left to right over non-overlapping occurrences.
-Exact-match ambiguity errors report the total count and at most ten previews.
+exact replacements proceed left to right over non-overlapping occurrences, and
+disjoint whitespace-normalized variants are included. Overlapping normalized
+source ranges fail without writing. Exact-match ambiguity errors report the total
+count and at most ten previews. Approximate matches provide a preview by default;
+only `fuzzy: true` permits a unique match at 85% or higher similarity. It cannot
+be combined with `replace_all` or hashedit, and all blocks remain atomic.
 
 Recursive `grep` and `find_files` traversal, plus `list_dir` directory reads,
 run on the bounded blocking pool rather than occupying an async runtime worker.

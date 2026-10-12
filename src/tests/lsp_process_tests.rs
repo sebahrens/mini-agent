@@ -985,6 +985,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
         let uri = file_uri(&source).unwrap();
         let edited = edit
             .call(EditArgs {
+                fuzzy: false,
                 path: path.clone(),
                 block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".into()),
                 replace_all: false,

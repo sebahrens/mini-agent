@@ -176,6 +176,7 @@ async fn read_and_edit_home_paths_resolve_through_the_ambient_path() {
     let edited = EditTool::new_with_tracker(None, None, None, tracker)
         .with_workspace(fixture.workspace.clone())
         .call(EditArgs {
+            fuzzy: false,
             path: "$HOME/notes.txt".into(),
             replace_all: false,
             block: Some(

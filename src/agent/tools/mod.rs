@@ -396,6 +396,8 @@ pub struct EditArgs {
     #[serde(default)]
     pub replace_all: bool,
     #[serde(default)]
+    pub fuzzy: bool,
+    #[serde(default)]
     pub block: Option<String>,
     #[serde(default)]
     pub file_crc: Option<String>,

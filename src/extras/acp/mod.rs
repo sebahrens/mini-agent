@@ -6661,6 +6661,7 @@ mod workspace_tests {
         EditTool::new(None, None)
             .with_workspace_binding(first_workspace)
             .call(EditArgs {
+                fuzzy: false,
                 path: "created.txt".into(),
                 replace_all: false,
                 block: Some(

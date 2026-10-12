@@ -120,6 +120,7 @@ async fn edit_through_in_workspace_symlink_names_the_link() {
     let error = EditTool::new_with_tracker(None, None, None, ReadTracker::new(true))
         .with_workspace(fixture.workspace.clone())
         .call(EditArgs {
+            fuzzy: false,
             path: "packages/x/lib.ts".into(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\nexport {}\n=======\nexport {};\n>>>>>>> REPLACE".into()),

@@ -478,6 +478,9 @@ pub(crate) fn prompt_block_rows(
 }
 
 pub struct Renderer {
+    /// An owned terminal-byte capture for App tests, never process stdout.
+    #[cfg(test)]
+    test_output: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
@@ -550,12 +553,42 @@ struct Notice {
     until: std::time::Instant,
 }
 
+#[cfg(test)]
+enum TestOutput {
+    Capture(Arc<std::sync::Mutex<Vec<u8>>>),
+    Stdout(io::Stdout),
+}
+
+#[cfg(test)]
+impl Write for TestOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Capture(capture) => capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .write(bytes),
+            Self::Stdout(stdout) => stdout.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Capture(capture) => capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .flush(),
+            Self::Stdout(stdout) => stdout.flush(),
+        }
+    }
+}
+
 /// How long a transient notice stays on the status line.
 pub(crate) const NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Renderer {
     pub fn new() -> io::Result<Self> {
         Ok(Renderer {
+            #[cfg(test)]
+            test_output: None,
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -599,6 +632,37 @@ impl Renderer {
             activity_signals: crate::ui::terminal::ActivitySignals::default(),
             last_activity: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_app_test() -> io::Result<Self> {
+        let mut renderer = Self::new()?;
+        renderer.test_output = Some(Arc::new(std::sync::Mutex::new(Vec::new())));
+        Ok(renderer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_output(&self) -> String {
+        let bytes = self
+            .test_output
+            .as_ref()
+            .expect("test capture configured")
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[cfg(not(test))]
+    fn writer(&self) -> io::Stdout {
+        io::stdout()
+    }
+
+    #[cfg(test)]
+    fn writer(&self) -> TestOutput {
+        match &self.test_output {
+            Some(bytes) => TestOutput::Capture(Arc::clone(bytes)),
+            None => TestOutput::Stdout(io::stdout()),
+        }
     }
 
     /// Set the number of statusline rows (1-3). Call once at startup.
@@ -678,7 +742,7 @@ impl Renderer {
         if out.is_empty() {
             return Ok(());
         }
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         stdout.write_all(out.as_bytes())?;
         stdout.flush()?;
         if title_changed {
@@ -763,6 +827,10 @@ impl Renderer {
     }
 
     fn terminal_size(&self) -> (u16, u16) {
+        #[cfg(test)]
+        if self.test_output.is_some() {
+            return (180, 50);
+        }
         crossterm::terminal::size().unwrap_or((80, 24))
     }
 
@@ -1198,7 +1266,7 @@ impl Renderer {
         // shrank, the terminal was resized); keep the offset inside the
         // scrollable range so the arithmetic below never underflows.
         self.scroll_offset = clamp_scroll_offset(self.scroll_offset, total, visible);
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         write!(stdout, "{}", Hide)?;
 
         let auto_scroll = self.scroll_offset == 0;
@@ -1378,7 +1446,7 @@ impl Renderer {
         self.partial.clear();
         self.scroll_offset = 0;
         self.clear_selection();
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         if let Some(bg) = self.chat_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
@@ -1407,7 +1475,7 @@ impl Renderer {
         let avail = rows.saturating_sub(reserve);
         let old_start = avail.saturating_sub(old_height as u16).saturating_add(1);
         let new_start = avail.saturating_sub(new_height as u16).saturating_add(1);
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         for row in old_start..new_start {
             stdout.execute(MoveTo(0, row))?;
             if let Some(bg) = self.input_bg {
@@ -1420,7 +1488,7 @@ impl Renderer {
     }
 
     fn draw_separator(&self, row: u16, cols: u16) -> io::Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         stdout.execute(MoveTo(0, row))?;
         if let Some(bg) = self.input_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -1478,7 +1546,7 @@ impl Renderer {
         prefix: Option<(&str, Color)>,
         cols: u16,
     ) -> io::Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         stdout.execute(MoveTo(0, screen_row))?;
         if let Some(bg) = self.status_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -1652,7 +1720,7 @@ impl Renderer {
     /// Needed after a statusline-only redraw or a picker overlay, both of
     /// which move the cursor.
     pub(crate) fn restore_bottom_cursor(&self) -> io::Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         match self.bottom_cursor {
             Some((x, row)) => {
                 stdout.execute(MoveTo(x, row))?;
@@ -1700,7 +1768,7 @@ impl Renderer {
             BottomRedrawPlan::Full => {}
         }
         let reserve = self.statusline_reserve();
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
 
         if let Some(prompt_rows) = self.overlay_prompt_rows(cols, rows) {
             let line_count = prompt_rows.len();
@@ -1906,7 +1974,7 @@ impl Renderer {
         }
 
         let drawn_frame = self.spinner_frame;
-        let mut stdout = io::stdout();
+        let mut stdout = self.writer();
         stdout.execute(MoveTo(0, self.input_base_row))?;
         if let Some(bg) = self.input_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;

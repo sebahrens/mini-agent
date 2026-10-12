@@ -364,16 +364,124 @@ mod tests {
         ] {
             let source = std::fs::read_to_string(path).unwrap();
             assert!(
-                !source.contains("session.working_dir"),
+                !production_uses_serialized_workspace(&source),
                 "{path} must use the active WorkspaceBinding, not serialized session state"
             );
         }
 
         let startup = include_str!("../startup.rs");
         assert!(
-            !startup.contains("self.session.working_dir"),
+            !production_uses_serialized_workspace(startup),
             "startup runtime consumers must use the captured WorkspaceBinding"
         );
+    }
+
+    fn production_uses_serialized_workspace(source: &str) -> bool {
+        use syn::visit::Visit;
+
+        fn test_only(attributes: &[syn::Attribute]) -> bool {
+            attributes.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute
+                        .parse_args::<syn::Path>()
+                        .is_ok_and(|path| path.is_ident("test"))
+            })
+        }
+
+        #[derive(Default)]
+        struct WorkspaceUse(bool);
+
+        fn macro_uses_serialized_workspace(tokens: proc_macro2::TokenStream) -> bool {
+            use proc_macro2::TokenTree;
+
+            let tokens: Vec<_> = tokens.into_iter().collect();
+            tokens.windows(3).any(|window| {
+                matches!(&window[0], TokenTree::Ident(name) if name == "session")
+                    && matches!(&window[1], TokenTree::Punct(dot) if dot.as_char() == '.')
+                    && matches!(&window[2], TokenTree::Ident(name) if name == "working_dir")
+            }) || tokens.into_iter().any(|token| {
+                matches!(token, TokenTree::Group(group) if macro_uses_serialized_workspace(group.stream()))
+            })
+        }
+
+        impl<'ast> Visit<'ast> for WorkspaceUse {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if !test_only(&item.attrs) {
+                    syn::visit::visit_item_mod(self, item);
+                }
+            }
+
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                if !test_only(&item.attrs) {
+                    syn::visit::visit_item_fn(self, item);
+                }
+            }
+
+            fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+                if !test_only(&item.attrs) {
+                    syn::visit::visit_impl_item_fn(self, item);
+                }
+            }
+
+            fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+                if matches!(&field.member, syn::Member::Named(name) if name == "working_dir") {
+                    let session = match field.base.as_ref() {
+                        syn::Expr::Path(path) => path.path.is_ident("session"),
+                        syn::Expr::Field(base) => {
+                            matches!(&base.member, syn::Member::Named(name) if name == "session")
+                        }
+                        _ => false,
+                    };
+                    self.0 |= session;
+                }
+                syn::visit::visit_expr_field(self, field);
+            }
+
+            fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+                // Startup stores the captured WorkspaceBinding in serialized
+                // metadata. That write consumes no authority from the old
+                // metadata; reading it on the right-hand side still fails.
+                self.visit_expr(&assignment.right);
+            }
+
+            fn visit_macro(&mut self, macro_: &'ast syn::Macro) {
+                self.0 |= macro_uses_serialized_workspace(macro_.tokens.clone());
+            }
+        }
+
+        let syntax = syn::parse_file(source).expect("workspace consumer must parse as Rust");
+        let mut uses = WorkspaceUse::default();
+        uses.visit_file(&syntax);
+        uses.0
+    }
+
+    #[test]
+    fn workspace_source_guard_ignores_test_fixtures_but_rejects_production_reads() {
+        assert!(!production_uses_serialized_workspace(
+            r#"
+            fn production() { let text = "session.working_dir"; }
+            #[cfg(test)] mod fixtures {
+                fn fixture() { let _ = session.working_dir; }
+            }
+            #[cfg(test)] fn fixture() { let _ = self.session.working_dir; }
+            struct Consumer;
+            impl Consumer {
+                #[cfg(test)] fn fixture(&self) { let _ = self.session.working_dir; }
+            }
+            fn remember_binding() { session.working_dir = workspace.root(); }
+            "#
+        ));
+        for source in [
+            "fn consumer() { let _ = session . working_dir; }",
+            "fn consumer() { let _ = self.ui.session.working_dir; }",
+            "#[cfg(feature = \"git-worktree\")] fn consumer() { let _ = session.working_dir; }",
+            "mod consumer { fn read() { let _ = session.working_dir; } }",
+            "fn consumer() { println!(\"{}\", session . working_dir); }",
+            "fn consumer() { wrapper!(nested!(self.ui.session.working_dir)); }",
+            "fn consumer() { target = session.working_dir; }",
+        ] {
+            assert!(production_uses_serialized_workspace(source), "{source}");
+        }
     }
 
     #[tokio::test]

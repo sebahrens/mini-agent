@@ -626,7 +626,7 @@ Accepted top-level keys:
 | `always_show_welcome`     | boolean | Always show the welcome banner on startup, bypassing the one-shot marker file. Default: `false`.                                                                               |
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
-| `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
+| `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with explicit fuzzy opt-in, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
 | `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. `inherit_builtin_key` (default `false`) is the explicit opt-in to reuse the `provider_type` vendor key; see Custom provider credentials below. See the OpenAI API styles section below. |
 | `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
 | `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
@@ -1811,7 +1811,9 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
   for this session in one approval: the directory itself for `list_dir`,
   otherwise the file's parent. It does not cover `write`, so creating files
   still asks.
-- `n` denies the call; `Esc`, `Ctrl+C`, or `Ctrl+D` abort it.
+- `n` denies this call; `Esc`, `Ctrl+C`, or `Ctrl+D` deny and stop the run.
+  `s` stops the run and offers an optional instruction as the next editable
+  user draft; it is sent only after a separate Enter.
 
 Session grants never override a `deny` rule (see below). ACP clients keep
 their own approval choices.
@@ -1867,6 +1869,15 @@ an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with
 another repository's `build.rs` or a file under `~/.cargo/registry` asks via
 the `/**` external rule. Tool `ask` and `deny` rules still apply to every
 spelling.
+
+In the TUI, a waiting permission prompt keeps draining background output.
+`n` denies one request and lets the agent continue. `Esc`, `Ctrl-C`, and
+`Ctrl-D` deny and stop the run; pending requests are denied and queued inputs
+are discarded before another run can start. `s` stops the same way, then
+collects an optional one-line instruction into the next editable user draft.
+The instruction is sent only when you review it and press Enter again; it is
+not an automatic queued request or a permission grant. Session and folder
+approval keys retain their displayed scopes.
 
 As a TOML-friendly alternative to the nested `permission` object, you can use
 `permission-allow`, `permission-ask`, and `permission-deny` at the top level.
@@ -2464,9 +2475,19 @@ mini-agent supports two edit systems, selectable via `edit_system` config key,
 
 The classic aider-style SEARCH/REPLACE format. The LLM copies exact text from
 read output into `<<<<<<< SEARCH` blocks and provides replacements in
-`>>>>>>> REPLACE` blocks. Falls back to whitespace normalization and fuzzy
-matching when the exact text doesn't match. A SEARCH section containing only
-whitespace is rejected rather than being interpreted as an insertion point.
+`>>>>>>> REPLACE` blocks. Exact matches and whitespace-only normalized matches
+apply automatically. When neither matches, the tool reports a closest-match
+preview and asks for an exact SEARCH block without changing the file. A call can
+explicitly pass `fuzzy: true` to apply one unique approximate match at 85% or
+higher similarity; ambiguous or lower-confidence matches still fail.
+
+`replace_all: true` replaces every exact non-overlapping occurrence plus disjoint
+whitespace-normalized variants, including tabs, trailing whitespace and collapsed
+blank lines. Exact occurrences take priority where source ranges overlap;
+overlapping normalized ranges fail atomically. `replace_all` and `fuzzy: true`
+cannot be combined. Both options apply only to SEARCH/REPLACE blocks. A SEARCH
+section containing only whitespace is rejected rather than being interpreted as
+an insertion point.
 
 ```
 edit_system = "similarity"

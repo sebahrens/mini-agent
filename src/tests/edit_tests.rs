@@ -17,6 +17,18 @@ fn rebuilt_edit_and_read_definitions_follow_the_selected_edit_system() {
     let similarity_read = ReadTool::new(None, None, None, 1024);
     assert!(similarity_edit.description().contains("SEARCH/REPLACE"));
     assert!(similarity_edit.parameters()["properties"]["block"].is_object());
+    assert_eq!(
+        similarity_edit.parameters()["properties"]["fuzzy"]["default"],
+        false
+    );
+    let old_args: EditArgs = serde_json::from_value(serde_json::json!({
+        "path":"existing.txt", "block":"old compatible call"
+    }))
+    .unwrap();
+    assert!(
+        !old_args.fuzzy,
+        "omitted flag always preserves strict matching"
+    );
     assert!(similarity_read.description().contains("line numbers"));
 
     set_edit_system(EditSystem::Hashedit);
@@ -64,6 +76,7 @@ async fn test_sim_rejects_no_blocks() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some("no blocks here".into()),
@@ -84,6 +97,7 @@ async fn test_sim_rejects_empty_search() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\n=======\nreplacement\n>>>>>>> REPLACE".into()),
@@ -104,6 +118,7 @@ async fn test_sim_rejects_whitespace_only_search() {
     std::fs::write(tmp.path(), original).unwrap();
     let result = edit::EditTool::new(None, None)
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\n   \t\n=======\nreplacement\n>>>>>>> REPLACE".into()),
@@ -127,6 +142,7 @@ async fn test_sim_search_not_found() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some(
@@ -150,6 +166,7 @@ async fn test_sim_single_block_replacement() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\nafter\n=======\nmiddle\n>>>>>>> REPLACE".into()),
@@ -177,6 +194,7 @@ async fn test_sim_literal_safe_markers_can_edit_standard_marker_lines() {
     let tool = edit::EditTool::new(None, None);
 
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: Some(
@@ -203,6 +221,7 @@ async fn test_sim_markers_must_begin_at_column_zero() {
     let tool = edit::EditTool::new(None, None);
 
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: Some(
@@ -225,6 +244,7 @@ async fn test_sim_multi_block_atomic() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some(
@@ -260,6 +280,7 @@ async fn test_sim_multi_match_returns_error() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: Some("<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE".into()),
@@ -331,6 +352,7 @@ async fn test_sim_replace_all_replaces_every_exact_occurrence() {
 
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: true,
             block: Some("<<<<<<< SEARCH\nhello\n=======\ngoodbye\n>>>>>>> REPLACE".into()),
@@ -363,6 +385,7 @@ async fn test_sim_preserves_crlf_line_endings() {
     std::fs::write(tmp.path(), "line1\r\nline2\r\nline3\r\n").unwrap();
     let tool = edit::EditTool::new(None, None);
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: Some("<<<<<<< SEARCH\nline2\n=======\nmodified\n>>>>>>> REPLACE".into()),
@@ -414,6 +437,7 @@ async fn test_hash_single_line_edit() {
     let tagged = make_tagged_line(4, "fn main() {");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -450,6 +474,7 @@ async fn test_hash_range_edit() {
     let l4 = make_tagged_line(4, "line4");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -479,6 +504,7 @@ async fn test_hash_delete_via_empty_text() {
     let tool = edit::EditTool::new(None, None);
     let tagged = make_tagged_line(2, "remove me");
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: None,
@@ -506,6 +532,7 @@ async fn test_hash_file_crc_mismatch() {
     let tagged = make_tagged_line(1, "hello world");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -535,6 +562,7 @@ async fn test_hash_tag_mismatch() {
     let bad_tag = crc32_hex(b"different content");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -562,6 +590,7 @@ async fn test_hash_invalid_tag_format() {
     let tool = edit::EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -591,6 +620,7 @@ async fn test_hash_crlf_preserved() {
     let tool = edit::EditTool::new(None, None);
     let tagged = make_tagged_line(2, "line2");
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: None,
@@ -624,6 +654,7 @@ async fn test_hash_multi_edit_atomic() {
     let l4 = make_tagged_line(4, "ddd");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -654,6 +685,7 @@ async fn test_hash_multi_edit_atomic() {
 async fn sim_edit(tmp: &TempFile, search: &str, replace: &str) -> Result<String, String> {
     let tool = edit::EditTool::new(None, None);
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: Some(format!(
@@ -703,25 +735,44 @@ async fn test_sim_fuzzy_match_must_be_unique() {
     let original = "fn a() {\n    value = 100;\n}\nfn b() {\n    value = 100;\n}\n";
     std::fs::write(tmp.path(), original).unwrap();
 
-    let message = sim_edit(&tmp, "    value = 101;", "    value = 200;")
-        .await
-        .expect_err("ambiguous fuzzy matches must be rejected");
-
-    assert!(message.contains("multiple fuzzy matches"), "{message}");
-    assert!(message.contains("line 2"), "{message}");
-    assert!(message.contains("line 5"), "{message}");
-    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+    for fuzzy in [false, true] {
+        let mut args = block_args(tmp.path(), "    value = 101;", "    value = 200;", false);
+        args.fuzzy = fuzzy;
+        let message = edit::EditTool::new(None, None)
+            .call(args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("multiple fuzzy matches"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("line 5"), "{message}");
+        assert!(message.contains("First candidate preview:"), "{message}");
+        assert!(message.contains("    value = 100;"), "{message}");
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+    }
 }
 
 #[tokio::test]
 async fn test_sim_single_fuzzy_match_echoes_replaced_region() {
     select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_fuzzy_echo.txt");
-    std::fs::write(tmp.path(), "keep\n    value = 100;\nend\n").unwrap();
-
-    let result = sim_edit(&tmp, "    value = 101;", "    value = 200;")
+    let original = "keep\n    value = 100;\nend\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let message = sim_edit(&tmp, "    value = 101;", "    value = 200;")
         .await
-        .expect("one fuzzy candidate should apply");
+        .expect_err("fuzzy matching must not apply without explicit opt-in");
+    assert!(message.contains("Closest match at line 2"), "{message}");
+    assert!(message.contains("    value = 100;"), "{message}");
+    assert!(message.contains("copy the exact text"), "{message}");
+    assert!(message.contains("fuzzy: true"), "{message}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+
+    let mut args = block_args(tmp.path(), "    value = 101;", "    value = 200;", false);
+    args.fuzzy = true;
+    let result = edit::EditTool::new(None, None)
+        .call(args)
+        .await
+        .expect("explicit opt-in permits one high-confidence fuzzy candidate");
 
     assert!(result.contains("fuzzy match"), "{result}");
     assert!(
@@ -820,6 +871,7 @@ async fn test_hash_range_rejects_descending_lines() {
     let l2 = make_tagged_line(2, "line2");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -851,6 +903,7 @@ async fn test_hash_range_rejects_non_contiguous_lines() {
     let l4 = make_tagged_line(4, "line4");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -894,6 +947,7 @@ async fn test_hash_rejects_line_zero() {
     ] {
         let result = tool
             .call(EditArgs {
+                fuzzy: false,
                 path: tmp.path().into(),
                 replace_all: false,
                 block: None,
@@ -921,6 +975,7 @@ async fn test_hash_rejects_overlapping_edits() {
     let l4 = make_tagged_line(4, "line4");
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -948,6 +1003,7 @@ async fn test_hash_rejects_overlapping_edits() {
     // Two edits targeting the same single line overlap as well.
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -983,6 +1039,7 @@ async fn test_hash_rejects_zero_length_and_nonempty_ranges_at_same_start() {
 
     let result = edit::EditTool::new(None, None)
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -1021,6 +1078,7 @@ async fn test_hash_adjacent_edits_are_allowed() {
     let l1 = make_tagged_line(1, "line1");
     let l2 = make_tagged_line(2, "line2");
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: None,
@@ -1056,6 +1114,7 @@ async fn test_hash_multiline_replacement_uses_dominant_crlf() {
     let tool = edit::EditTool::new(None, None);
 
     tool.call(EditArgs {
+        fuzzy: false,
         path: tmp.path().into(),
         replace_all: false,
         block: None,
@@ -1101,6 +1160,7 @@ async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() 
 
     edit::EditTool::new(None, None)
         .call(EditArgs {
+            fuzzy: false,
             path: tmp.path().into(),
             replace_all: false,
             block: None,
@@ -1193,6 +1253,7 @@ fn search_replace_block(search: &str, replace: &str) -> String {
 
 fn block_args(path: &str, search: &str, replace: &str, replace_all: bool) -> EditArgs {
     EditArgs {
+        fuzzy: false,
         path: path.into(),
         replace_all,
         block: Some(search_replace_block(search, replace)),
@@ -1289,6 +1350,7 @@ async fn edit_rejects_an_invalid_mode_without_reading_the_file() {
     let tool = bounded_edit_tool(&root, 64);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: "large.txt".into(),
             replace_all: false,
             block: None,
@@ -1312,6 +1374,7 @@ async fn edit_rejects_replace_all_in_hashedit_mode_before_reading() {
     let tool = bounded_edit_tool(&root, 4096);
     let result = tool
         .call(EditArgs {
+            fuzzy: false,
             path: "file.txt".into(),
             replace_all: true,
             block: None,
@@ -1326,4 +1389,109 @@ async fn edit_rejects_replace_all_in_hashedit_mode_before_reading() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("'replace_all' is only supported"), "{error}");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn edit_replace_all_includes_exact_and_normalized_unicode_spans() {
+    select_edit_system(EditSystem::Similarity);
+    for (original, search, replacement, expected) in [
+        (
+            "é keep\n\tvalue = 1; \nunchanged\n\tvalue = 1;  \nend\n",
+            "    value = 1;",
+            "    value = 2;",
+            "é keep\n    value = 2;\nunchanged\n    value = 2;\nend\n",
+        ),
+        (
+            "keep\n    value = 1;\nunchanged\n\tvalue = 1;  \nend\n",
+            "    value = 1;",
+            "    value = 2;",
+            "keep\n    value = 2;\nunchanged\n    value = 2;\nend\n",
+        ),
+        (
+            "keep\r\n\té = 1;  \r\n\r\n\r\n\tz = 2;\r\nbetween\r\n    é = 1;\r\n\r\n    z = 2;\r\nend\r\n",
+            "    é = 1;\n\n    z = 2;",
+            "REPLACED",
+            "keep\r\nREPLACED\r\nbetween\r\nREPLACED\r\nend\r\n",
+        ),
+        (
+            "\té = 1;  \nseparator\n\té = 1;",
+            "    é = 1;",
+            "é = 2;",
+            "é = 2;\nseparator\né = 2;",
+        ),
+    ] {
+        let tmp = TempFile::new("replace_all_normalized.txt");
+        std::fs::write(tmp.path(), original).unwrap();
+        let result = edit::EditTool::new(None, None)
+            .call(block_args(tmp.path(), search, replacement, true))
+            .await
+            .unwrap();
+        assert!(result.contains("Applied 2 edit(s)"), "{result}");
+        assert!(result.contains("whitespace normalization"), "{result}");
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn edit_replace_all_rejects_overlapping_normalized_ranges_without_writing() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("replace_all_normalized_overlap.txt");
+    let original = "a \na \na \n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let error = edit::EditTool::new(None, None)
+        .call(block_args(tmp.path(), "a\na", "replacement", true))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("overlap"), "{error}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn edit_fuzzy_opt_in_rejects_low_confidence_and_invalid_modes_atomically() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("fuzzy_invalid.txt");
+    let original = "keep\nabcdefghij\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let mut args = block_args(tmp.path(), "abcdefXXXX", "changed", false);
+    args.fuzzy = true;
+    let error = edit::EditTool::new(None, None)
+        .call(args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Closest match"), "{error}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+
+    let mut args = block_args(tmp.path(), "keep", "changed", false);
+    args.block = Some(format!(
+        "{}\n{}",
+        search_replace_block("keep", "changed"),
+        search_replace_block("abcdefghiX", "changed")
+    ));
+    let error = edit::EditTool::new(None, None)
+        .call(args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Block 2"), "{error}");
+    assert!(error.contains("fuzzy: true"), "{error}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+
+    for block in [Some(search_replace_block("keep", "changed")), None] {
+        let args = EditArgs {
+            path: "must-not-be-opened-missing-file".into(),
+            replace_all: block.is_some(),
+            fuzzy: true,
+            block,
+            file_crc: Some("00000000".into()),
+            edits: Some(Vec::new()),
+        };
+        let error = edit::EditTool::new(None, None)
+            .call(args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'fuzzy' is only supported"), "{error}");
+    }
 }
