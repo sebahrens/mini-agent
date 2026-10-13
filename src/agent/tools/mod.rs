@@ -1,3 +1,4 @@
+pub(crate) mod ask_user;
 pub(crate) mod bash;
 pub(crate) mod concurrency;
 pub(crate) mod crc;
@@ -12,6 +13,7 @@ pub(crate) mod lsp;
 pub(crate) mod memoize;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
+pub(crate) mod notebook;
 pub(crate) mod read;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
@@ -205,7 +207,14 @@ impl ReadVersion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadKind {
+    Raw,
+    NotebookView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TrackedRead {
+    kind: ReadKind,
     path: String,
     offset: usize,
     limit: usize,
@@ -234,20 +243,51 @@ impl ReadTracker {
         metadata: &std::fs::Metadata,
         served_content_crc32: u32,
     ) -> Option<String> {
+        self.check_read_kind(
+            ReadKind::Raw,
+            path,
+            offset,
+            limit,
+            metadata,
+            served_content_crc32,
+        )
+    }
+
+    pub(crate) fn check_notebook_view(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        crc: u32,
+    ) -> Option<String> {
+        self.check_read_kind(ReadKind::NotebookView, path, offset, limit, metadata, crc)
+    }
+
+    fn check_read_kind(
+        &self,
+        kind: ReadKind,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        served_content_crc32: u32,
+    ) -> Option<String> {
         if !self.deny_repeated_reads {
             return None;
         }
         let version = ReadVersion::new(metadata, served_content_crc32);
         let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
         if !tracked.iter().any(|entry| {
-            entry.path == path
+            entry.kind == kind
+                && entry.path == path
                 && entry.offset == offset
                 && entry.limit == limit
                 && entry.version == version
         }) {
             return None;
         }
-        let end = offset + limit;
+        let end = offset.saturating_add(limit);
         Some(format!(
             "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Reuse the earlier result if it is still available, or read a different section by changing offset or limit.",
             offset + 1,
@@ -263,10 +303,45 @@ impl ReadTracker {
         metadata: &std::fs::Metadata,
         served_content_crc32: u32,
     ) {
+        self.record_read_kind(
+            ReadKind::Raw,
+            path,
+            offset,
+            limit,
+            metadata,
+            served_content_crc32,
+        )
+    }
+
+    pub(crate) fn record_notebook_view(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        crc: u32,
+    ) {
+        self.record_read_kind(ReadKind::NotebookView, path, offset, limit, metadata, crc)
+    }
+
+    fn record_read_kind(
+        &self,
+        kind: ReadKind,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        served_content_crc32: u32,
+    ) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        tracked
-            .retain(|entry| entry.path != path || entry.offset != offset || entry.limit != limit);
+        tracked.retain(|entry| {
+            entry.kind != kind
+                || entry.path != path
+                || entry.offset != offset
+                || entry.limit != limit
+        });
         tracked.push(TrackedRead {
+            kind,
             path: path.to_string(),
             offset,
             limit,
@@ -287,7 +362,8 @@ impl ReadTracker {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|entry| {
-                entry.path == path
+                entry.kind == ReadKind::Raw
+                    && entry.path == path
                     && entry.offset == 0
                     && entry.limit >= total_lines
                     && entry.version == version
@@ -379,6 +455,8 @@ pub fn is_vcs_metadata(name: &str) -> bool {
 #[derive(Deserialize)]
 pub struct ReadArgs {
     pub path: String,
+    #[serde(default)]
+    pub raw_notebook: bool,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -523,21 +601,32 @@ async fn handle_ask_inner(
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     ask_tx
-        .send(AskRequest {
-            tool: CompactString::new(tool),
-            input: input.to_string(),
-            #[cfg(feature = "acp")]
-            tool_call_id: crate::permission::ask::current_tool_call_id(),
-            suggested_pattern,
-            additional_allow_patterns: additional_allow_patterns.clone(),
-            reply: reply_tx,
-        })
+        .send(
+            AskRequest {
+                tool: CompactString::new(tool),
+                input: input.to_string(),
+                #[cfg(feature = "acp")]
+                tool_call_id: crate::permission::ask::current_tool_call_id(),
+                suggested_pattern,
+                additional_allow_patterns: additional_allow_patterns.clone(),
+                reply: reply_tx,
+            }
+            .into(),
+        )
         .await
         .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
     let decision = reply_rx.await;
+    if let Some(required) = crate::question::required() {
+        return Err(ToolError::Msg(required.to_string()));
+    }
     crate::spend::run::admit_current_effect()
         .await
         .map_err(|error| ToolError::Msg(error.to_string()))?;
+    // Financial preparation may suspend. Recheck clarification immediately
+    // before accepting a permission reply or mutating the grant list.
+    if let Some(required) = crate::question::required() {
+        return Err(ToolError::Msg(required.to_string()));
+    }
     match decision {
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {

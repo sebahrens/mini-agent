@@ -877,6 +877,7 @@ mod tests {
                 .is_err()
         );
         read.call(ReadArgs {
+            raw_notebook: false,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -921,6 +922,7 @@ mod tests {
         );
         // An already-read snapshot does not override a later read denial.
         read.call(ReadArgs {
+            raw_notebook: false,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -951,6 +953,7 @@ mod tests {
             "replacement\n"
         );
         read.call(ReadArgs {
+            raw_notebook: false,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -1188,6 +1191,7 @@ mod tests {
             ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
                 .with_workspace(root.path())
                 .call(ReadArgs {
+                    raw_notebook: false,
                     path: "target.txt".into(),
                     offset: None,
                     limit: None,
@@ -1612,6 +1616,7 @@ mod tests {
         let tracker = ReadTracker::new(true);
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .call(ReadArgs {
+                raw_notebook: false,
                 path: alias.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -1720,6 +1725,7 @@ mod tests {
             ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
                 .with_workspace(root.path())
                 .call(ReadArgs {
+                    raw_notebook: false,
                     path: "target.txt".into(),
                     offset: None,
                     limit: None,
@@ -1870,7 +1876,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for MutationD
             extensions,
             ..
         } = event
-            && matches!(tool_name, "edit" | "write")
+            && matches!(tool_name, "edit" | "write" | "notebook_edit")
             && matches!(outcome, rig::tool::ToolOutcome::Success)
             && let Some(diff) = extensions.get::<MutationDiff>()
             && diff.bounded()

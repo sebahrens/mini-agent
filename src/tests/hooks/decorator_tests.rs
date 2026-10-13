@@ -301,7 +301,8 @@ async fn hook_approval_describes_the_rewritten_call_and_runs_only_when_approved(
             let request = tokio::select! {
                 request = ask_rx.recv() => request.expect("approval channel closed"),
                 result = &mut call => panic!("call completed before approval: {result:?}"),
-            };
+            }
+            .into_permission();
             assert_eq!(request.tool, "bash");
             assert_eq!(request.input, r#"{"command":"echo rewritten"}"#);
             request
@@ -1089,7 +1090,8 @@ async fn hook_ask_without_permission_channel_or_live_reply_has_zero_mcp_effects(
         let request = tokio::select! {
             request = rx.recv() => request.unwrap(),
             result = &mut call => panic!("call bypassed approval: {result:?}"),
-        };
+        }
+        .into_permission();
         assert_eq!(request.tool, "registered_search");
         assert_eq!(request.input, r#"{"query":"effective"}"#);
         let approved = matches!(

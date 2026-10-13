@@ -1110,6 +1110,7 @@ pub(crate) enum HeadlessStopReason {
     Failed,
     Budget,
     SchemaFailed,
+    AwaitingUser,
     /// A goal stopped for a reason of its own. Each maps to a distinct process
     /// exit code so a script can tell "resume me, I ran out of budget" from
     /// "stop retrying, this cannot be done".
@@ -1144,7 +1145,7 @@ impl HeadlessStopReason {
             #[cfg(feature = "goal")]
             Self::GoalBlocked => 21,
             #[cfg(feature = "goal")]
-            Self::GoalAwaitingUser => 22,
+            Self::GoalAwaitingUser | Self::AwaitingUser => 22,
             #[cfg(feature = "goal")]
             Self::GoalPaused => 23,
             #[cfg(feature = "goal")]
@@ -1322,13 +1323,15 @@ fn interaction_summary(
                 continue;
             };
             *by_name.entry(call.function.name.clone()).or_default() += 1;
-            if matches!(call.function.name.as_str(), "write" | "edit")
-                && let Some(path) = call
-                    .function
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|path| normalize_tool_path(root, path))
+            if matches!(
+                call.function.name.as_str(),
+                "write" | "edit" | "notebook_edit"
+            ) && let Some(path) = call
+                .function
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|path| normalize_tool_path(root, path))
             {
                 files.insert(path);
             }

@@ -245,7 +245,9 @@ pub(crate) fn pr_command(
         crate::sandbox::ShellDialect::PowerShell => {
             // Windows PowerShell's legacy native binder loses embedded double
             // quotes. Pass an already encoded Win32 argv through ProcessStartInfo
-            // instead, without making proposal text PowerShell source.
+            // instead, without making proposal text PowerShell source. Direct
+            // constructors and the captured FileSystem location avoid cmdlet
+            // initialization while retaining the same foreground operation.
             let args = ["pr", "create", "--title", title, "--body", body]
                 .into_iter()
                 .map(windows_native_arg)
@@ -253,7 +255,7 @@ pub(crate) fn pr_command(
                 .join(" ");
             let args = args.replace('\'', "''");
             Ok(format!(
-                "$miniGitPrInfo = New-Object System.Diagnostics.ProcessStartInfo; $miniGitPrInfo.FileName = 'gh'; $miniGitPrInfo.Arguments = '{args}'; $miniGitPrInfo.WorkingDirectory = (Get-Location).ProviderPath; $miniGitPrInfo.UseShellExecute = $false; $miniGitPrInfo.RedirectStandardOutput = $true; $miniGitPrInfo.RedirectStandardError = $true; $miniGitPrProcess = New-Object System.Diagnostics.Process; $miniGitPrProcess.StartInfo = $miniGitPrInfo; try {{ [void]$miniGitPrProcess.Start(); $miniGitPrOut = $miniGitPrProcess.StandardOutput.ReadToEndAsync(); $miniGitPrErr = $miniGitPrProcess.StandardError.ReadToEndAsync(); $miniGitPrProcess.WaitForExit(); [Console]::Out.Write($miniGitPrOut.GetAwaiter().GetResult()); [Console]::Error.Write($miniGitPrErr.GetAwaiter().GetResult()); $miniGitPrCode = $miniGitPrProcess.ExitCode }} finally {{ $miniGitPrProcess.Dispose() }}; exit $miniGitPrCode"
+                "$miniGitPrInfo = [System.Diagnostics.ProcessStartInfo]::new(); $miniGitPrInfo.FileName = 'gh'; $miniGitPrInfo.Arguments = '{args}'; $miniGitPrInfo.WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath; $miniGitPrInfo.UseShellExecute = $false; $miniGitPrInfo.RedirectStandardOutput = $true; $miniGitPrInfo.RedirectStandardError = $true; $miniGitPrProcess = [System.Diagnostics.Process]::new(); $miniGitPrProcess.StartInfo = $miniGitPrInfo; try {{ [void]$miniGitPrProcess.Start(); $miniGitPrOut = $miniGitPrProcess.StandardOutput.ReadToEndAsync(); $miniGitPrErr = $miniGitPrProcess.StandardError.ReadToEndAsync(); $miniGitPrProcess.WaitForExit(); [Console]::Out.Write($miniGitPrOut.GetAwaiter().GetResult()); [Console]::Error.Write($miniGitPrErr.GetAwaiter().GetResult()); $miniGitPrCode = $miniGitPrProcess.ExitCode }} finally {{ $miniGitPrProcess.Dispose() }}; exit $miniGitPrCode"
             ))
         }
     }
@@ -1256,6 +1258,18 @@ mod tests {
         assert!(command.contains(".FileName = 'gh'"));
         assert!(command.contains(".Arguments = '\"pr\" \"create\" \"--title\" \"a''; $(danger)\" \"--body\" \"line1\n''line2''\"'"));
         assert!(command.contains(".UseShellExecute = $false"));
+        assert!(command.contains("[System.Diagnostics.ProcessStartInfo]::new()"));
+        assert!(command.contains("[System.Diagnostics.Process]::new()"));
+        assert!(command.contains(
+            ".WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath;"
+        ));
+        assert!(command.contains("$miniGitPrProcess.StartInfo = $miniGitPrInfo;"));
+        assert!(command.contains("ReadToEndAsync()"));
+        assert!(command.contains("finally { $miniGitPrProcess.Dispose() }"));
+        assert!(command.ends_with("exit $miniGitPrCode"));
+        assert!(!command.contains("New-Object"));
+        assert!(!command.contains("Get-Location"));
+        assert!(!command.contains("NATIVE32_STAGE"));
         assert_eq!(windows_native_arg("a\\\"b\\"), "\"a\\\\\\\"b\\\\\"");
     }
     #[test]
@@ -1484,6 +1498,13 @@ mod native_actor_tests {
             assert!(command.contains("FileName='gh';"));
             assert!(command.contains("Arguments='--self-test';"));
             assert!(command.contains("UseShellExecute=$false;"));
+            assert!(command.contains("$miniGitPrProcess.StartInfo=$miniGitPrInfo;"));
+            if !cmdlets {
+                assert!(command.contains(
+                    "$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath"
+                ));
+                assert!(!command.contains("[System.Environment]::CurrentDirectory"));
+            }
             assert!(command.contains("ReadToEndAsync()"));
             assert!(command.contains("finally{$miniGitPrProcess.Dispose()}"));
             assert!(command.ends_with("exit $miniGitPrCode"));
@@ -1549,7 +1570,8 @@ mod native_actor_tests {
         let request = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_permission();
         assert_eq!(request.tool, "git/commit");
         assert_eq!(request.input, message);
         assert_eq!(
@@ -1658,7 +1680,8 @@ mod native_actor_tests {
             let request = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .into_permission();
             assert_eq!(request.tool, "git/diff");
             if decision {
                 request
@@ -1898,7 +1921,7 @@ mod native_pr_tests {
     }
     async fn approved_terminal(
         actor: &mut Actor,
-        requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>,
+        requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::UserRequest>,
     ) -> AgentEvent {
         let terminal = actor.terminal();
         tokio::pin!(terminal);
@@ -1908,6 +1931,7 @@ mod native_pr_tests {
                 event=&mut terminal=>return event,
                 request=requests.recv(),if open=>{
                     if let Some(request)=request {
+                        let request=request.into_permission();
                         request.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
                     } else { open=false; }
                 }
@@ -1945,7 +1969,8 @@ mod native_pr_tests {
         let request = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_permission();
         assert!(!repo.workspace.root().join("gh-argv").exists());
         request
             .reply
@@ -2078,7 +2103,8 @@ mod native_pr_tests {
         let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_permission();
         request
             .reply
             .send(crate::permission::ask::UserDecision::AllowOnce)
@@ -2138,7 +2164,8 @@ mod native_pr_tests {
                                 events.push(event);
                             }
                             panic!("native fixture closed before Ask: {events:?}")
-                        });
+                        })
+                        .into_permission();
                 assert_eq!(pending.tool, "shell");
                 assert!(!repo.workspace.root().join("gh-ready").exists());
                 pending
@@ -2222,7 +2249,7 @@ fn native_launch_stage_control(cmdlets: bool) -> String {
     } else {
         (
             "[System.Diagnostics.ProcessStartInfo]::new()",
-            "[System.Environment]::CurrentDirectory",
+            "$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath",
             "[System.Diagnostics.Process]::new()",
         )
     };
@@ -2237,6 +2264,7 @@ fn native_launch_stage_control(cmdlets: bool) -> String {
          $miniGitPrInfo.UseShellExecute=$false;\
          $miniGitPrInfo.RedirectStandardOutput=$true;$miniGitPrInfo.RedirectStandardError=$true;\
          $miniGitPrProcess={process};\
+         $miniGitPrProcess.StartInfo=$miniGitPrInfo;\
          [Console]::Error.WriteLine('NATIVE32_STAGE process '+$miniGitPrClock.ElapsedMilliseconds);\
          try {{\
          if(-not $miniGitPrProcess.Start()){{throw 'native32 inert launch failed'}};\
@@ -2378,14 +2406,15 @@ mod windows_native_pr_tests {
                 b"NATIVE32_PREFLIGHT",
             )
             .await;
-            for (label, cmdlets) in [("cmdlets", true), ("typed constructors", false)] {
-                self.shell_preflight(
-                    label,
-                    &native_launch_stage_control(cmdlets),
-                    b"NATIVE32_STAGE_PREFLIGHT",
-                )
-                .await;
-            }
+            // The archived cmdlet control already timed out before its info
+            // marker on the hosted runner. Do not let that known negative stop
+            // the independent positive or the five real PR acceptance cases.
+            self.shell_preflight(
+                "typed constructors",
+                &native_launch_stage_control(false),
+                b"NATIVE32_STAGE_PREFLIGHT",
+            )
+            .await;
         }
         async fn shell_preflight(&self, label: &str, command: &str, expected_stdout: &[u8]) {
             use crate::agent::tools::bash::{ForegroundResult, ShellTool};
@@ -2502,7 +2531,7 @@ mod windows_native_pr_tests {
         }
     }
     async fn request(
-        requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>,
+        requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::UserRequest>,
     ) -> crate::permission::ask::AskRequest {
         let request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
             .await

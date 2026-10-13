@@ -648,6 +648,7 @@ pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
             | "skill_search"
             | "skill_list"
             | "todo_read"
+            | "ask_user_question"
     )
 }
 
@@ -1948,6 +1949,7 @@ where
             .await;
     };
     let btw_future = crate::spend::run::scope(spend, btw_future);
+    let btw_future = crate::question::scope(None, btw_future);
     let work_scope = AgentWorkScope::new();
     let task_scope = Arc::clone(&work_scope);
     let join = tokio::spawn(async move {
@@ -2452,7 +2454,10 @@ where
         .add_hook(crate::spend::run::AdmissionHook(
             crate::spend::run::Run::current(),
         ))
-        .tool_extensions(crate::spend::run::current_extensions())
+        .add_hook(crate::question::QuestionGuard)
+        .tool_extensions(crate::question::extend_current(
+            crate::spend::run::current_extensions(),
+        ))
         .await
 }
 
@@ -2678,6 +2683,7 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let spend_run = crate::spend::run::Run::current();
+    let question_turn = crate::question::QuestionTurn::current();
     let retry_config = retry_config.bounded();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
     let (compaction_decision_tx, mut compaction_decision_rx) =
@@ -2738,6 +2744,24 @@ where
                 retained
             }};
         }
+        // Only inspect a parked question after the SDK's atomic tool batch
+        // has drained; returning on its first result could lose later real
+        // results from tools that already completed.
+        macro_rules! park_question {
+            () => {
+                if let Some(question) = crate::question::required() {
+                    finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx)
+                        .await;
+                    let _ = event_tx
+                        .send(AgentEvent::AwaitingUser {
+                            question: Box::new(question),
+                            interactions: completed_so_far!(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+        }
         // `None` means the initial prompt. Continuations install only their
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
@@ -2797,7 +2821,10 @@ where
                             .add_hook(crate::spend::run::AdmissionHook(
                                 crate::spend::run::Run::current(),
                             ))
-                            .tool_extensions(crate::spend::run::current_extensions())
+                            .add_hook(crate::question::QuestionGuard)
+                            .tool_extensions(crate::question::extend_current(
+                                crate::spend::run::current_extensions(),
+                            ))
                             .await
                     }
                 },
@@ -2817,6 +2844,7 @@ where
             match result {
                 Ok(stream) => stream,
                 Err(error) => {
+                    park_question!();
                     tracing::error!("agent stream start failed after retries: {error}");
                     let error = retry::with_context_length_hint(&error.to_string());
                     let _ = event_tx
@@ -3012,7 +3040,10 @@ where
                                 })
                                 .await;
                         }
-                        if compaction_requested && tool_calls.pending.is_empty() {
+                        if compaction_requested
+                            && tool_calls.pending.is_empty()
+                            && crate::question::required().is_none()
+                        {
                             let mut boundary_interactions = completed_interactions.clone();
                             boundary_interactions.extend(interactions.iter().cloned());
                             let _ = event_tx
@@ -3074,6 +3105,8 @@ where
                             usage.cached_input_tokens,
                             usage.cache_creation_input_tokens,
                         );
+
+                        park_question!();
 
                         if finalize_interactive_tool_calls(
                             &mut tool_calls,
@@ -3284,6 +3317,7 @@ where
                             &event_tx,
                         )
                         .await;
+                        park_question!();
                         if let Some((attempt, delay)) =
                             completion_retry.retry_delay(&retry_config, &e)
                         {
@@ -3317,6 +3351,7 @@ where
             }
 
             finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx).await;
+            park_question!();
 
             if !terminal_response_seen
                 && !retrying_interrupted_completion
@@ -3435,6 +3470,7 @@ where
     let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
 
     let agent_future = crate::spend::run::scope(spend_run, agent_future);
+    let agent_future = crate::question::scope(question_turn, agent_future);
     let join = tokio::spawn(agent_future);
 
     (
@@ -3689,7 +3725,10 @@ where
                 .add_hook(crate::spend::run::AdmissionHook(
                     crate::spend::run::Run::current(),
                 ))
-                .tool_extensions(crate::spend::run::current_extensions())
+                .add_hook(crate::question::QuestionGuard)
+                .tool_extensions(crate::question::extend_current(
+                    crate::spend::run::current_extensions(),
+                ))
                 .await
         }
     }))
@@ -3748,6 +3787,13 @@ where
                 failure: Some(anyhow::anyhow!($($arg)*)),
             };
         }};
+    }
+    macro_rules! park_question {
+        () => {
+            if let Some(question) = crate::question::required() {
+                fail_turn!(question);
+            }
+        };
     }
     macro_rules! await_turn {
         ($work:expr) => {
@@ -3930,6 +3976,7 @@ where
                             fail_turn!(error);
                         }
                     }
+                    park_question!();
                     if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
                         fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
                     }
@@ -4029,6 +4076,7 @@ where
                 Ok(_) => {}
                 Err(e) => {
                     tool_calls.finalize_unresolved(&mut interactions);
+                    park_question!();
                     if let Some((attempt, delay)) = completion_retry.retry_delay(retry_config, &e) {
                         tracing::warn!(
                             "agent retry {attempt}/{max} after mid-stream error: {e}",
@@ -4048,6 +4096,7 @@ where
         }
 
         tool_calls.finalize_unresolved(&mut interactions);
+        park_question!();
 
         if !terminal_response_seen && !retrying_interrupted_completion {
             if let Err(error) =
@@ -5344,6 +5393,7 @@ mod tests {
         let repeated =
             crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 2_000, tracker)
                 .call(crate::agent::tools::ReadArgs {
+                    raw_notebook: false,
                     path: path.to_string_lossy().into_owned(),
                     offset: Some(1),
                     limit: Some(400),

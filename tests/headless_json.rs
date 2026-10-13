@@ -350,7 +350,7 @@ impl TempRoot {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
-        let budget_fixture = outcome.starts_with("budget_");
+        let budget_fixture = outcome.starts_with("budget_") || outcome.starts_with("question_");
         let outcome = match outcome {
             "budget_effect" => "permission_allow",
             "budget_schema" => "schema_effect_repair",
@@ -360,7 +360,11 @@ impl TempRoot {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let verification_config = if outcome == "verification" {
+        let verification_config = if outcome == "question_error" {
+            "verify_command=\"echo unexpected > verification-started.txt\"\nverify_max_attempts=1\n"
+        } else if outcome == "question_fail" {
+            "headless_questions=\"fail\"\nverify_command=\"echo unexpected > verification-started.txt\"\nverify_max_attempts=1\n"
+        } else if outcome == "verification" {
             "verify_command=\"trap '' TERM; echo $$ > command.pid; exec /bin/sleep 30\"\n"
         } else if outcome == "verification_without_shell" {
             "verify_command=\"test -f effect.txt && printf checked > verified.txt\"\nverify_max_attempts=1\n"
@@ -387,7 +391,11 @@ impl TempRoot {
         let session_path = self.0.join("sessions");
         let waiting = self.0.join("provider.waiting");
         std::thread::spawn(move || -> io::Result<()> {
-            let requests = if matches!(outcome, "compaction" | "budget_compaction") {
+            let requests = if outcome == "question_fail" {
+                4 // Any extra request is answered and captured until owned child settlement.
+            } else if outcome == "question_error" {
+                2
+            } else if matches!(outcome, "compaction" | "budget_compaction") {
                 17
             } else if matches!(
                 outcome,
@@ -404,6 +412,7 @@ impl TempRoot {
                     // A goal runs its bounded round, then the wrap-up round.
                     | "goal_rounds"
                     | "tool_completed"
+                    | "notebook_native"
                     | "flood_after_tool"
                     | "flood_reasoning_after_tool"
                     | "gated_partial_failure"
@@ -499,6 +508,7 @@ impl TempRoot {
                     // the `--tools` allowlist. `--no-tools` is the exception
                     // and means exactly what it says — such a loop can only be
                     // driven by its validator.
+                    "notebook_native" => Some(&["notebook_edit"]),
                     "validation_no_tools" => Some(&[]),
                     "validation_read_only" => Some(&["read", "goal_report"]),
                     "verification_without_shell"
@@ -577,14 +587,18 @@ impl TempRoot {
                 let (status, content_type, body) = if failed {
                     (if outcome == "gated_transient_failure" { "500 Internal Server Error" } else { "400 Bad Request" }, "application/json", r#"{"error":{"message":"local provider failure","type":"invalid_request_error"}}"#.to_owned())
                 } else {
-                    let partial = ((outcome.starts_with("permission_")
-                        || matches!(
-                            outcome,
-                            "schema_effect_repair"
-                                | "schema_effect_cancel"
-                                | "schema_effect_bad_privacy"
-                        ))
-                        && index == 0)
+                    let question = (outcome == "question_error" && index == 0)
+                        || (outcome == "question_fail" && index == 1);
+                    let partial = question
+                        || (outcome == "question_fail" && index == 0)
+                        || ((outcome.starts_with("permission_")
+                            || matches!(
+                                outcome,
+                                "schema_effect_repair"
+                                    | "schema_effect_cancel"
+                                    | "schema_effect_bad_privacy"
+                            ))
+                            && index == 0)
                         || (outcome == "schema_unknown_tool" && index == 1)
                         || matches!(
                             outcome,
@@ -593,6 +607,7 @@ impl TempRoot {
                         || (matches!(
                             outcome,
                             "tool_completed"
+                                | "notebook_native"
                                 | "flood_after_tool"
                                 | "flood_reasoning_after_tool"
                                 | "gated_partial_failure"
@@ -646,17 +661,28 @@ impl TempRoot {
                         }
                     }
                     if partial {
-                        let call = chunk(
-                            serde_json::json!({"tool_calls":[{"index":0, "id":if shell {"shell-active"} else {"write-progress"}, "type":"function", "function":{
-                                "name":if shell {"shell"} else {"write"},
-                                "arguments": if shell {
-                                    serde_json::json!({"command":"trap '' TERM; echo $$ > command.pid; exec /bin/sleep 30"}).to_string()
-                                } else {
-                                    serde_json::json!({"path":if outcome.starts_with("permission_") { "tmp/effect.txt" } else { "effect.txt" }, "content":"written\n"}).to_string()
-                                }
-                            }}]}),
-                            serde_json::Value::Null,
-                        );
+                        let call = if question {
+                            chunk(
+                                serde_json::json!({"tool_calls":[{"index":0,"id":"question-headless-exact","type":"function","function":{
+                                    "name":"ask_user_question","arguments":serde_json::json!({"question":"Which branch?","options":[{"label":"main","description":"Primary branch"}]}).to_string()
+                                }}]}),
+                                serde_json::Value::Null,
+                            )
+                        } else {
+                            chunk(
+                                serde_json::json!({"tool_calls":[{"index":0, "id":if shell {"shell-active"} else {"write-progress"}, "type":"function", "function":{
+                                    "name":if outcome == "notebook_native" {"notebook_edit"} else if shell {"shell"} else {"write"},
+                                    "arguments": if outcome == "notebook_native" {
+                                        serde_json::json!({"path":"book.ipynb", "mode":"replace", "cell_id":"owned-cell", "source":"literal $HOME\n!never executes\n"}).to_string()
+                                    } else if shell {
+                                        serde_json::json!({"command":"trap '' TERM; echo $$ > command.pid; exec /bin/sleep 30"}).to_string()
+                                    } else {
+                                        serde_json::json!({"path":if outcome.starts_with("permission_") { "tmp/effect.txt" } else { "effect.txt" }, "content":"written\n"}).to_string()
+                                    }
+                                }}]}),
+                                serde_json::Value::Null,
+                            )
+                        };
                         body.push_str(&format!("data: {call}\n\n"));
                     }
                     let mut finish = chunk(
@@ -4686,4 +4712,218 @@ fn usd_budget_headless_rolling_preparation_preserves_history_receipts_and_budget
     assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
     assert!(!root.0.join("request-1.json").exists());
     assert!(!root.0.join("effect.txt").exists());
+}
+
+#[test]
+fn ask_user_headless_default_error_continues_and_fail_parks_after_prior_effect_with_exact_usage() {
+    for (mode, expected_calls) in [("question_error", 2_u64), ("question_fail", 2_u64)] {
+        let root = TempRoot::new();
+        let mut provider = SchemaProviderOwner(Some(root.local_provider(mode)));
+        let ordinary = root.provider_command("write,ask_user_question");
+        #[cfg(not(unix))]
+        let mut command = ordinary;
+        #[cfg(unix)]
+        let mut command = {
+            // Exercise the new ordinary headless consumer on the unchanged
+            // Windows 1 MiB main-thread budget, using the existing exec probe.
+            let mut limited = root.command_for("/bin/sh");
+            limited
+                .args([
+                    "-c",
+                    "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                    "question-stack-probe",
+                ])
+                .arg(ordinary.get_program())
+                .args(ordinary.get_args());
+            for (key, value) in ordinary.get_envs() {
+                match value {
+                    Some(value) => {
+                        limited.env(key, value);
+                    }
+                    None => {
+                        limited.env_remove(key);
+                    }
+                }
+            }
+            limited
+        };
+        command.args(["-p", "Clarify this change", "--output", "json"]);
+        let output = bounded_output(command);
+        std::fs::write(root.0.join("budget.fixture_done"), "settled").unwrap();
+        provider.finish();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+        assert_eq!(
+            output.status.code(),
+            Some(if mode == "question_fail" { 22 } else { 0 }),
+            "{result}: {stderr}"
+        );
+        assert_eq!(
+            result["stop_reason"],
+            if mode == "question_fail" {
+                "awaiting_user"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(result["usage"]["input_tokens"], expected_calls * 100);
+        assert_eq!(result["usage"]["output_tokens"], expected_calls * 20);
+        let saved = root.saved_session();
+        assert_eq!(saved["total_input_tokens"], expected_calls * 100);
+        assert_eq!(saved["total_output_tokens"], expected_calls * 20);
+        assert!(saved["permission_allowlist"].as_array().unwrap().is_empty());
+        assert!(
+            !root
+                .0
+                .join(format!("request-{expected_calls}.json"))
+                .exists()
+        );
+        assert!(!root.0.join("verification-started.txt").exists());
+        let second: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.0.join("request-1.json")).unwrap()).unwrap();
+        if mode == "question_fail" {
+            assert!(root.0.join("effect.txt").exists());
+            assert_eq!(saved["pending_question"], result["pending_question"]);
+            assert_eq!(
+                saved["pending_question"]["questions"][0]["question"],
+                "Which branch?"
+            );
+            assert_eq!(saved["pending_question"]["id"].as_str().unwrap().len(), 36);
+        } else {
+            assert!(!root.0.join("effect.txt").exists());
+            assert!(saved.get("pending_question").is_none());
+            assert!(
+                serde_json::to_string(&second)
+                    .unwrap()
+                    .contains("reasonable low-risk assumption")
+            );
+        }
+    }
+}
+
+#[cfg(feature = "goal")]
+#[test]
+fn ask_user_headless_goal_fail_parks_without_verification_or_automatic_round() {
+    let root = TempRoot::new();
+    let mut provider = SchemaProviderOwner(Some(root.local_provider("question_fail")));
+    let mut command = root.provider_command("write,ask_user_question");
+    command.args([
+        "-p",
+        "Clarify then work",
+        "--output",
+        "json",
+        "--goal",
+        "Clarify then work",
+        "--goal-check",
+        "echo unexpected > goal-verification-started.txt",
+    ]);
+    let output = bounded_output(command);
+    std::fs::write(root.0.join("budget.fixture_done"), "settled").unwrap();
+    provider.finish();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(22),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["stop_reason"], "awaiting_user");
+    assert_eq!(result["goal"]["status"], "awaiting user");
+    assert_eq!(result["usage"]["input_tokens"], 200);
+    assert_eq!(result["usage"]["output_tokens"], 40);
+    assert!(!root.0.join("request-2.json").exists());
+    assert!(!root.0.join("goal-verification-started.txt").exists());
+    assert!(root.saved_session()["pending_question"].is_object());
+}
+
+#[test]
+fn notebook_native_actual_headless_registration_mutation_metadata_and_history() {
+    let root = TempRoot::new();
+    let fixture = r#"{"nbformat":4,"nbformat_minor":5,"metadata":{"owner":"kept"},"cells":[{"cell_type":"code","id":"owned-cell","source":["old\n"],"metadata":{"tag":"kept"},"outputs":[{"output_type":"stream","name":"stdout","text":["prior output\n"]}],"execution_count":9}]}"#;
+    std::fs::write(root.0.join("book.ipynb"), fixture).unwrap();
+    let server = root.local_provider("notebook_native");
+    let template = root.provider_command("notebook_edit");
+    #[cfg(not(unix))]
+    let mut command = template;
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = root.command_for("/bin/sh");
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args([
+                "-c",
+                "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                "notebook-stack-probe",
+            ])
+            .arg(template.get_program())
+            .args(template.get_args());
+        command
+    };
+    command.args(["-p", "--output", "stream-json", "replace one notebook cell"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert!(output.status.success(), "{stderr}");
+    let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let call = records
+        .iter()
+        .find(|record| record["type"] == "tool_call" && record["name"] == "notebook_edit")
+        .unwrap();
+    let result = records
+        .iter()
+        .find(|record| record["type"] == "tool_result" && record["name"] == "notebook_edit")
+        .unwrap();
+    assert_eq!(result["is_error"], false, "{records:?}: {stderr}");
+    let mutation = records
+        .iter()
+        .find(|record| record["type"] == "file_mutation" && record["name"] == "notebook_edit")
+        .unwrap_or_else(|| panic!("missing notebook mutation record: {records:?}: {stderr}"));
+    assert_eq!(mutation["id"], call["id"]);
+    assert_eq!(mutation["id"], result["id"]);
+    assert_eq!(result["is_error"], false);
+    assert!(mutation["diff"]["before_sha256"].is_string());
+    assert!(mutation["diff"]["after_sha256"].is_string());
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.0.join("book.ipynb")).unwrap()).unwrap();
+    let before: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    for key in ["metadata", "outputs", "execution_count", "id", "cell_type"] {
+        assert_eq!(written["cells"][0][key], before["cells"][0][key]);
+    }
+    assert_eq!(written["metadata"], before["metadata"]);
+    assert_eq!(
+        written["cells"][0]["source"],
+        serde_json::json!(["literal $HOME\n", "!never executes\n"])
+    );
+    assert_eq!(root.saved_session()["total_input_tokens"], 200);
+    assert_eq!(root.saved_session()["total_output_tokens"], 40);
+    let final_record = records
+        .iter()
+        .find(|record| record["type"] == "result")
+        .unwrap();
+    assert_eq!(
+        final_record["files_changed"],
+        serde_json::json!(["book.ipynb"])
+    );
+    let first: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.0.join("request-0.json")).unwrap()).unwrap();
+    assert_eq!(first["tools"][0]["function"]["name"], "notebook_edit");
+    assert_eq!(first["tools"].as_array().unwrap().len(), 1);
+    assert!(first["tools"][0]["function"]["parameters"]["properties"]["cell_id"].is_object());
+    assert!(root.0.join("request-1.json").exists());
+    assert!(!root.0.join("request-2.json").exists());
+    assert!(!root.0.join("never").exists());
 }

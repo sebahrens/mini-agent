@@ -313,7 +313,11 @@ mod tests {
             path: Some(link.to_string_lossy().into_owned()),
         });
         let swap = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(
                 PathBuf::from(&request.input),
                 std::fs::canonicalize(&checked_target).unwrap()

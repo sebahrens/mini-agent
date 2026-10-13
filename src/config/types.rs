@@ -3,6 +3,15 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// Behavior when an ordinary headless turn asks for clarification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeadlessQuestions {
+    #[default]
+    Error,
+    Fail,
+}
+
 /// Presentation of retained reasoning; this does not change model requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

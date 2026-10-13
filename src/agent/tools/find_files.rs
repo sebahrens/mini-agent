@@ -1499,7 +1499,8 @@ mod tests {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("find_files did not request path permission")
-                .expect("find_files permission channel closed");
+                .expect("find_files permission channel closed")
+                .into_permission();
             assert_eq!(request.tool.as_str(), "find_files");
             assert_eq!(
                 PathBuf::from(request.input.as_str()),
@@ -1536,7 +1537,8 @@ mod tests {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("find_files did not request path permission")
-                .expect("find_files permission channel closed");
+                .expect("find_files permission channel closed")
+                .into_permission();
             assert_eq!(request.tool.as_str(), "find_files");
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_external);
             request
@@ -1722,7 +1724,11 @@ mod tests {
             path: Some(link.to_string_lossy().into_owned()),
         });
         let swap = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&swapped, &link).unwrap();
@@ -1758,7 +1764,11 @@ mod tests {
             path: Some(authorized.to_string_lossy().into_owned()),
         });
         let replace = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::rename(&authorized, &moved).unwrap();
             std::os::unix::fs::symlink(&swapped, &authorized).unwrap();

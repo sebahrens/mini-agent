@@ -39,6 +39,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
         "read"
             | "write"
             | "edit"
+            | "notebook_edit"
             | "grep"
             | "find_files"
             | "list_dir"
@@ -58,6 +59,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "advisor"
             | "lsp_diagnostics"
             | "skills_search"
+            | "ask_user_question"
     )
 }
 
@@ -527,11 +529,13 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "read",
         "write",
         "edit",
+        "notebook_edit",
         "grep",
         "find_files",
         "list_dir",
         "todo_write",
         "todo_read",
+        "ask_user_question",
     ];
     names.push("git");
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
@@ -901,12 +905,16 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 ask_tx.clone(),
                 max_text_file_size,
                 max_read_lines,
-                read_tracker,
+                read_tracker.clone(),
             )
             .with_workspace_binding(workspace.clone()),
         ));
         base_tools.push(Box::new(write_tool));
         base_tools.push(Box::new(edit_tool));
+        base_tools.push(Box::new(tools::ask_user::AskUserTool::new(
+            ask_tx.clone(),
+            cfg.headless_questions.unwrap_or_default(),
+        )));
         if shell_tool_enabled {
             base_tools.push(Box::new(
                 tools::ShellTool::new(
@@ -926,6 +934,14 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
                 .with_workspace_binding(workspace.clone()),
         ));
+        base_tools.push(Box::new(tools::notebook::NotebookTool::new(
+            permission.clone(),
+            ask_tx.clone(),
+            workspace.clone(),
+            read_tracker.clone(),
+            cfg.max_text_file_size,
+            cfg.mutation_diff_options(),
+        )));
         base_tools.push(Box::new(
             tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
                 .with_workspace_binding(workspace.clone()),
@@ -1694,6 +1710,29 @@ mod extra_file_tests {
     }
 }
 
+#[cfg(test)]
+mod notebook_registration_tests {
+    use super::*;
+    #[test]
+    fn notebook_cold_schema_estimate_respects_tool_selection() {
+        let cfg = crate::config::Config::default();
+        let sandbox = Sandbox::new(false, "bwrap");
+        let cli = crate::cli::Cli {
+            tools: vec!["notebook_edit".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            estimated_registered_tools(&cli, &cfg, &sandbox),
+            ["notebook_edit"]
+        );
+        let disabled = crate::cli::Cli {
+            no_tools: true,
+            ..Default::default()
+        };
+        assert!(estimated_registered_tools(&disabled, &cfg, &sandbox).is_empty());
+    }
+}
+
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_tests {
     use super::is_reserved_builtin_tool_name;
@@ -1704,6 +1743,7 @@ mod mcp_tests {
             "read",
             "write",
             "edit",
+            "notebook_edit",
             "grep",
             "find_files",
             "list_dir",

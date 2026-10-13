@@ -68,8 +68,53 @@ pub(crate) fn current_tool_call_id() -> Option<String> {
     CURRENT_TOOL_CALL.try_with(Clone::clone).ok().flatten()
 }
 
-pub type AskSender = mpsc::Sender<AskRequest>;
-pub type AskReceiver = mpsc::Receiver<AskRequest>;
+pub type AskSender = mpsc::Sender<UserRequest>;
+pub type AskReceiver = mpsc::Receiver<UserRequest>;
+
+/// Frontend transport only. Question replies cannot be used as approvals.
+#[derive(Debug)]
+pub enum UserRequest {
+    Permission(AskRequest),
+    Question(QuestionRequest),
+}
+
+impl From<AskRequest> for UserRequest {
+    fn from(request: AskRequest) -> Self {
+        Self::Permission(request)
+    }
+}
+
+impl UserRequest {
+    pub(crate) fn cancel(self) {
+        match self {
+            Self::Permission(request) => {
+                let _ = request.reply.send(UserDecision::Deny);
+            }
+            Self::Question(request) => {
+                let _ = request
+                    .reply
+                    .send(crate::question::QuestionAnswer::Cancelled);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_permission(self) -> AskRequest {
+        match self {
+            Self::Permission(request) => request,
+            Self::Question(_) => panic!("expected permission request, received question"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct QuestionRequest {
+    pub(crate) id: String,
+    pub(crate) questions: crate::question::QuestionBatch,
+    #[cfg(feature = "acp")]
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) reply: oneshot::Sender<crate::question::QuestionAnswer>,
+}
 
 #[derive(Debug)]
 pub struct AskRequest {
@@ -211,6 +256,7 @@ mod tests {
             loop {
                 tokio::select! {
                     Some(ask) = ask_rx.recv() => {
+                        let ask = ask.into_permission();
                         let decision = if ask.input == "slow" { UserDecision::Deny } else { UserDecision::AllowOnce };
                         approvals.push((ask.input, ask.tool_call_id));
                         let _ = ask.reply.send(decision);
@@ -272,7 +318,7 @@ mod tests {
             let respond = async {
                 let mut ids = Vec::new();
                 for _ in 0..2 {
-                    let ask = ask_rx.recv().await.unwrap();
+                    let ask = ask_rx.recv().await.unwrap().into_permission();
                     ids.push(ask.tool_call_id);
                     let _ = ask.reply.send(UserDecision::AllowOnce);
                 }

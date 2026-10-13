@@ -25,6 +25,7 @@ use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::{PermissionEvent, PermissionState};
 use crate::ui::pickers::rewind::RewindOutcome;
+use crate::ui::question_handler::{QuestionEvent, QuestionState};
 use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
     copy_to_clipboard, read_from_clipboard,
@@ -106,6 +107,7 @@ pub(super) mod test_support {
             git_status_in_flight: false,
             ask_rx: None,
             permission_prompt: None,
+            question_prompt: None,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
             btw_tx,
@@ -1126,8 +1128,9 @@ pub(crate) struct App<'a> {
     git_status_tx: mpsc::Sender<GitStatusRefresh>,
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
     git_status_in_flight: bool,
-    ask_rx: Option<mpsc::Receiver<crate::permission::ask::AskRequest>>,
+    ask_rx: Option<mpsc::Receiver<crate::permission::ask::UserRequest>>,
     permission_prompt: Option<PermissionState>,
+    question_prompt: Option<QuestionState>,
     #[cfg(feature = "advisor")]
     handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
 
@@ -1332,7 +1335,7 @@ impl<'a> App<'a> {
     pub(crate) async fn new(
         mut ui: UiContext<'a>,
         agent: Option<AnyAgent>,
-        ask_rx: Option<mpsc::Receiver<crate::permission::ask::AskRequest>>,
+        ask_rx: Option<mpsc::Receiver<crate::permission::ask::UserRequest>>,
         auto_trigger_msg: Option<String>,
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
@@ -1551,6 +1554,9 @@ impl<'a> App<'a> {
         if let Some(warning) = theme_warning {
             renderer.write_line(&sanitize_output(&warning), C_ERROR)?;
         }
+        if let Some(question) = &ui.session.pending_question {
+            renderer.write_line(&sanitize_output(&question.notice()), Color::Yellow)?;
+        }
         if let Some(notice) = &ui.cfg.update_notice {
             renderer.write_line(&sanitize_output(notice), Color::DarkGrey)?;
             renderer.write_line("", Color::White)?;
@@ -1589,12 +1595,15 @@ impl<'a> App<'a> {
                 ui.cfg.resolve_keep_recent_tool_results(),
             );
             let (prompt, history, pending_turn) = initial_turn.into_runner_inputs();
+            run.question_turn = Some(crate::question::QuestionTurn::default());
+            ui.session.pending_question = None;
             let runner = run
                 .agent
                 .as_ref()
                 .unwrap()
                 .clone()
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                .with_question_turn(run.question_turn.clone())
                 .spawn_runner(
                     prompt,
                     history,
@@ -1727,6 +1736,7 @@ impl<'a> App<'a> {
             git_status_in_flight: false,
             ask_rx,
             permission_prompt: None,
+            question_prompt: None,
             #[cfg(feature = "advisor")]
             handoff_rx,
             btw_tx,
@@ -1801,7 +1811,7 @@ impl<'a> App<'a> {
                         .write_line(&sanitize_output(&notice), C_ERROR)?;
                 }
             }
-            if self.permission_prompt.is_none()
+            if (self.permission_prompt.is_none() && self.question_prompt.is_none())
                 && let Some(event) = self.deferred_user_events.pop_front()
             {
                 match self.handle_user_event(event).await? {
@@ -1851,8 +1861,8 @@ impl<'a> App<'a> {
                         self.refresh()?;
                     }
                 }
-                Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await }, if self.permission_prompt.is_none() => {
-                    self.begin_permission_request(ask_req)?;
+                Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await }, if (self.permission_prompt.is_none() && self.question_prompt.is_none()) => {
+                    self.begin_user_request(ask_req)?;
                     self.refresh()?;
                 }
                 Some(bev) = self.btw_rx.recv() => {
@@ -1898,12 +1908,12 @@ impl<'a> App<'a> {
                 }
             }
 
-            if self.permission_prompt.is_some() {
+            if self.permission_prompt.is_some() || self.question_prompt.is_some() {
                 self.refresh()?;
             }
 
             #[cfg(feature = "advisor")]
-            if self.permission_prompt.is_none()
+            if (self.permission_prompt.is_none() && self.question_prompt.is_none())
                 && let Some(ref mut rx) = self.handoff_rx
                 && let Ok(req) = rx.try_recv()
             {
@@ -2017,6 +2027,38 @@ impl<'a> App<'a> {
         )
     }
 
+    fn begin_user_request(
+        &mut self,
+        request: crate::permission::ask::UserRequest,
+    ) -> anyhow::Result<()> {
+        match request {
+            crate::permission::ask::UserRequest::Permission(request) => {
+                self.begin_permission_request(request)
+            }
+            crate::permission::ask::UserRequest::Question(request) => {
+                if !self.run.is_running
+                    || request.reply.is_closed()
+                    || self
+                        .run
+                        .question_turn
+                        .as_ref()
+                        .is_none_or(|turn| turn.id() != request.id)
+                {
+                    let _ = request
+                        .reply
+                        .send(crate::question::QuestionAnswer::Cancelled);
+                    return Ok(());
+                }
+                self.question_prompt = Some(QuestionState::begin(request, &mut self.renderer)?);
+                #[cfg(feature = "goal")]
+                if let Some(collector) = self.run.goal_round.as_mut() {
+                    collector.pause_clock();
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn begin_permission_request(
         &mut self,
         request: crate::permission::ask::AskRequest,
@@ -2051,6 +2093,17 @@ impl<'a> App<'a> {
 
     fn expire_abandoned_permission(&mut self) -> anyhow::Result<()> {
         if self
+            .question_prompt
+            .as_ref()
+            .is_some_and(QuestionState::abandoned)
+        {
+            if let Some(prompt) = self.question_prompt.take() {
+                prompt.finish(&mut self.renderer)?;
+            }
+            self.resume_permission_clock();
+            self.refresh()?;
+        }
+        if self
             .permission_prompt
             .as_ref()
             .is_some_and(PermissionState::abandoned)
@@ -2068,6 +2121,12 @@ impl<'a> App<'a> {
     /// Deny both the displayed request and the sequential channel backlog
     /// before settlement; no waiter from the retired run can become a grant.
     fn cancel_pending_permissions(&mut self) {
+        if let Some(prompt) = self.question_prompt.take() {
+            if let Err(error) = prompt.finish(&mut self.renderer) {
+                tracing::warn!(%error,"question overlay cleanup failed");
+            }
+            drop(prompt);
+        }
         if let Some(prompt) = self.permission_prompt.take() {
             prompt.decline_on_cancel(&self.ui);
             if let Err(error) = prompt.finish(&mut self.renderer) {
@@ -2078,9 +2137,7 @@ impl<'a> App<'a> {
         self.renderer.permission_prompt = None;
         if let Some(receiver) = self.ask_rx.as_mut() {
             while let Ok(request) = receiver.try_recv() {
-                let _ = request
-                    .reply
-                    .send(crate::permission::ask::UserDecision::Deny);
+                request.cancel();
             }
         }
         self.resume_permission_clock();
@@ -2088,6 +2145,31 @@ impl<'a> App<'a> {
 
     async fn handle_permission_event(&mut self, event: &UserEvent) -> anyhow::Result<bool> {
         self.expire_abandoned_permission()?;
+        if let Some(mut prompt) = self.question_prompt.take() {
+            match prompt.handle(event, &mut self.renderer)? {
+                QuestionEvent::Unhandled => {
+                    self.question_prompt = Some(prompt);
+                    return Ok(false);
+                }
+                QuestionEvent::Waiting => self.question_prompt = Some(prompt),
+                QuestionEvent::Finished => self.resume_permission_clock(),
+                QuestionEvent::Stop => {
+                    drop(prompt);
+                    self.abort_main_run().await?;
+                    if self.run.agent_rx.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "question cancellation cleanup is still pending; no next turn was admitted"
+                        ));
+                    }
+                    self.renderer.write_line(
+                        "question cancelled; run stopped without an answer or permission grant",
+                        C_PERM,
+                    )?;
+                }
+            }
+            self.refresh()?;
+            return Ok(true);
+        }
         let Some(mut prompt) = self.permission_prompt.take() else {
             return Ok(false);
         };
@@ -2631,7 +2713,12 @@ impl<'a> App<'a> {
                     self.renderer.chain_prompt = None;
                     if let Some(phase) = self.chain.pending.take() {
                         self.chain.label_msg = None;
-                        self.run_chain_transition(phase, None).await?;
+                        self.run_chain_transition(
+                            phase,
+                            None,
+                            crate::question::QuestionOrigin::ContinueUserTurn,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -2695,7 +2782,12 @@ impl<'a> App<'a> {
                     });
                     return Ok(());
                 }
-                self.run_chain_transition(phase, Some(&trimmed)).await?;
+                self.run_chain_transition(
+                    phase,
+                    Some(&trimmed),
+                    crate::question::QuestionOrigin::NewUserTurn,
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -2752,7 +2844,8 @@ impl<'a> App<'a> {
                 self.run_bang_command(&text).await?;
             } else {
                 self.echo_main_submission(&text)?;
-                self.start_main_run(&text).await?;
+                self.start_main_run(&text, crate::question::QuestionOrigin::NewUserTurn)
+                    .await?;
             }
         }
 
@@ -2767,7 +2860,10 @@ impl<'a> App<'a> {
             return crate::startup::heap_future(|| self.handle_git_terminal(event)).await;
         }
 
-        if matches!(&event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+        if matches!(
+            &event,
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. }
+        ) {
             self.cancel_pending_permissions();
         }
         #[cfg(feature = "git-worktree")]
@@ -2789,7 +2885,7 @@ impl<'a> App<'a> {
                 .run
                 .take()
                 .map(|captured| (captured, response.clone())),
-            AgentEvent::Error { .. } => {
+            AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. } => {
                 self.chain.plan = Default::default();
                 None
             }
@@ -2840,7 +2936,7 @@ impl<'a> App<'a> {
                 self.run.awaiting_compaction_relief = false;
                 self.run.pending_compaction_pressure = None;
             }
-            AgentEvent::Error { .. } => {
+            AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. } => {
                 self.run.awaiting_compaction_relief = false;
                 self.run.pending_compaction_pressure = None;
             }
@@ -3077,7 +3173,7 @@ impl<'a> App<'a> {
         if !self.run.is_running {
             self.settle_success_transaction();
         }
-        if self.chain.plan.pending.is_some() {
+        if self.chain.plan.pending.is_some() || self.ui.session.pending_question.is_some() {
             return Ok(());
         }
 
@@ -3126,7 +3222,8 @@ impl<'a> App<'a> {
                         .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
                 }
                 self.renderer.write_line("", Color::White)?;
-                self.start_main_run(&next).await?;
+                self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
+                    .await?;
             }
         }
 
@@ -3364,7 +3461,7 @@ impl<'a> App<'a> {
             !self.run.is_running
                 && self.run.agent_rx.is_none()
                 && self.run.pending_turn.is_none()
-                && self.permission_prompt.is_none(),
+                && (self.permission_prompt.is_none() && self.question_prompt.is_none()),
             "finish or stop the current run before a Git command"
         );
         self.ui.workspace.validate().map_err(anyhow::Error::msg)?;
@@ -3405,7 +3502,7 @@ impl<'a> App<'a> {
             !self.run.is_running
                 && self.run.agent_rx.is_none()
                 && self.run.pending_turn.is_none()
-                && self.permission_prompt.is_none(),
+                && (self.permission_prompt.is_none() && self.question_prompt.is_none()),
             "finish or stop the current run before a Git command"
         );
         self.chain.pending = None;
@@ -3603,7 +3700,8 @@ impl<'a> App<'a> {
     async fn advance_git_queue(&mut self) -> anyhow::Result<()> {
         if let Some(next) = self.run.pending_inputs.pop_front() {
             self.echo_main_submission(&next)?;
-            self.start_main_run(&next).await?;
+            self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
+                .await?;
         }
         Ok(())
     }
@@ -3846,7 +3944,10 @@ impl<'a> App<'a> {
                 self.echo_main_submission(&text)?;
                 // This is an ordinary user turn: fresh request profile and
                 // budget admission, then ordinary per-tool Ask/deny checks.
-                let result = crate::startup::heap_future(|| self.start_main_run(&text)).await;
+                let result = crate::startup::heap_future(|| {
+                    self.start_main_run(&text, crate::question::QuestionOrigin::NewUserTurn)
+                })
+                .await;
                 if !self.run.is_running {
                     self.input.load_text(&text);
                     if let Err(error) = result {
@@ -3891,7 +3992,11 @@ impl<'a> App<'a> {
         Ok(true)
     }
 
-    async fn start_main_run(&mut self, text: &str) -> anyhow::Result<()> {
+    async fn start_main_run(
+        &mut self,
+        text: &str,
+        question_origin: crate::question::QuestionOrigin,
+    ) -> anyhow::Result<()> {
         #[cfg(feature = "git-worktree")]
         anyhow::ensure!(
             self.chain.git.work.is_none(),
@@ -3953,6 +4058,7 @@ impl<'a> App<'a> {
         start_main_run(
             text,
             true,
+            question_origin,
             &mut self.run,
             &mut self.ui,
             &self.slash,
@@ -3972,6 +4078,7 @@ impl<'a> App<'a> {
         start_main_run(
             text,
             false,
+            crate::question::QuestionOrigin::NewUserTurn,
             &mut self.run,
             &mut self.ui,
             &self.slash,
@@ -4018,6 +4125,7 @@ impl<'a> App<'a> {
         &mut self,
         phase: crate::extras::chain::ChainPhase,
         extra: Option<&str>,
+        question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
         let next_name = phase.next_prompt_name();
         self.ui.invalidate_prebuild();
@@ -4042,7 +4150,7 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
         self.run.agent = None;
-        self.start_main_run(&msg).await?;
+        self.start_main_run(&msg, question_origin).await?;
         Ok(())
     }
 
@@ -4289,6 +4397,8 @@ impl<'a> App<'a> {
         // The selected-session branch makes this generic slash future large.
         // Build it in the short factory frame so it does not inflate every
         // user-event/event-loop polling frame, including unrelated commands.
+        let prior_question_session = self.ui.session.id.clone();
+        let had_pending_question = self.ui.session.pending_question.is_some();
         let result = crate::startup::heap_future(|| {
             crate::ui::slash::handle_slash(
                 text,
@@ -4305,6 +4415,11 @@ impl<'a> App<'a> {
         .await;
         if needs_tty {
             self.rebind_event_thread();
+        }
+        if prior_question_session != self.ui.session.id
+            || (had_pending_question && self.ui.session.pending_question.is_none())
+        {
+            self.run.question_turn = None;
         }
 
         if result.as_ref().is_err_and(|error| {
@@ -4454,7 +4569,8 @@ impl<'a> App<'a> {
         self.ui.invalidate_prebuild();
         self.run.agent = None;
         self.echo_main_submission(&message)?;
-        self.start_main_run(&message).await?;
+        self.start_main_run(&message, crate::question::QuestionOrigin::NewUserTurn)
+            .await?;
         if !self.run.is_running
             && let Some(selection) = self.chain.dot_prompt_restore.take()
         {
@@ -4712,6 +4828,8 @@ impl<'a> App<'a> {
                         self.ui.session,
                         self.ui.cfg.resolve_keep_recent_tool_results(),
                     );
+                self.run.question_turn = Some(crate::question::QuestionTurn::default());
+                self.ui.session.pending_question = None;
                 let runner = self
                     .run
                     .agent
@@ -4723,6 +4841,7 @@ impl<'a> App<'a> {
                         self.ui.cfg,
                         crate::spend::RequestKind::Turn,
                     )
+                    .with_question_turn(self.run.question_turn.clone())
                     .spawn_runner(
                         prompt,
                         history,
@@ -4824,6 +4943,8 @@ impl<'a> App<'a> {
                     self.ensure_agent().await;
                     self.run.request_tool_results_cleared = 0;
                     let prompt = crate::extras::goal::driver::first_round_prompt(&goal);
+                    self.run.question_turn = Some(crate::question::QuestionTurn::default());
+                    self.ui.session.pending_question = None;
                     let runner = self
                         .run
                         .agent
@@ -4835,6 +4956,7 @@ impl<'a> App<'a> {
                             self.ui.cfg,
                             crate::spend::RequestKind::Turn,
                         )
+                        .with_question_turn(self.run.question_turn.clone())
                         .spawn_runner(
                             prompt,
                             Vec::new(),
@@ -7134,7 +7256,7 @@ mod permission_loop_tests {
         let (asks, receiver) = mpsc::channel(4);
         app.ask_rx = Some(receiver);
         let (ask, mut decision) = request("printf permission-reviewed");
-        sent(&asks, ask).await;
+        sent(&asks, ask.into()).await;
         drain(&mut app).await;
         assert!(app.permission_prompt.is_some());
         let id = app
@@ -7278,10 +7400,10 @@ mod permission_loop_tests {
             let (asks, receiver) = mpsc::channel(4);
             app.ask_rx = Some(receiver);
             let (ask, first) = request("printf current-request");
-            sent(&asks, ask).await;
+            sent(&asks, ask.into()).await;
             drain(&mut app).await;
             let (backlog, second) = request("printf stale-request");
-            sent(&asks, backlog).await;
+            sent(&asks, backlog.into()).await;
             sent(&app.user_tx, UserEvent::Key(KeyEvent::new(key, modifiers))).await;
             drain(&mut app).await;
             assert!(matches!(replied(first).await, UserDecision::Deny));
@@ -7377,7 +7499,7 @@ mod permission_loop_tests {
                 assert_eq!(app.input.buffer, "recoverable follow-up draft");
             }
             let (stale, stale_reply) = request("printf post-retirement-request");
-            sent(&asks, stale).await;
+            sent(&asks, stale.into()).await;
             drain(&mut app).await;
             assert!(matches!(replied(stale_reply).await, UserDecision::Deny));
             assert!(app.permission_prompt.is_none() && !app.run.is_running);
@@ -7414,7 +7536,7 @@ mod permission_loop_tests {
         let (asks, receiver) = mpsc::channel(4);
         app.ask_rx = Some(receiver);
         let (ask, decision) = request("printf timed-out-request");
-        sent(&asks, ask).await;
+        sent(&asks, ask.into()).await;
         drain(&mut app).await;
         assert!(app.permission_prompt.is_some());
         drop(decision);
@@ -7486,7 +7608,7 @@ mod permission_loop_tests {
             ask.tool = "read".into();
             ask.suggested_pattern = Some(path.clone());
             ask.additional_allow_patterns = vec![format!("{}-specific-second", path)];
-            sent(&asks, ask).await;
+            sent(&asks, ask.into()).await;
             drain(&mut app).await;
             if kind == "prompt-decline" {
                 assert!(
@@ -7816,7 +7938,7 @@ mod permission_loop_tests {
             .into();
             let (asks, receiver) = mpsc::channel(4);
             app.ask_rx = Some(receiver);
-            sent(&asks, ask).await;
+            sent(&asks, ask.into()).await;
             drain(&mut app).await;
             let eligible = !matches!(kind, "read" | "external");
             assert_eq!(
@@ -7995,10 +8117,10 @@ mod permission_loop_tests {
         let (asks, receiver) = mpsc::channel(4);
         app.ask_rx = Some(receiver);
         let (first, first_reply) = request("printf error-first");
-        sent(&asks, first).await;
+        sent(&asks, first.into()).await;
         drain(&mut app).await;
         let (second, second_reply) = request("printf error-second");
-        sent(&asks, second).await;
+        sent(&asks, second.into()).await;
         let (events, receiver) = mpsc::channel(2);
         app.run.agent_rx = Some(receiver);
         sent(
@@ -8055,7 +8177,7 @@ mod permission_loop_tests {
         let (asks, receiver) = mpsc::channel(4);
         app.ask_rx = Some(receiver);
         let (ask, decision) = request("printf unsettled-request");
-        sent(&asks, ask).await;
+        sent(&asks, ask.into()).await;
         drain(&mut app).await;
         assert!(app.permission_prompt.is_some());
         sent(
@@ -8157,6 +8279,7 @@ mod mutation_consumer_tests {
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .with_workspace(root.path())
             .call(ReadArgs {
+                raw_notebook: false,
                 path: "target.txt".into(),
                 offset: None,
                 limit: None,
@@ -9875,7 +9998,8 @@ mod git_command_consumer_tests {
         let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_permission();
         let mut native = app.run.agent_rx.take().unwrap();
         let call = tokio::time::timeout(Duration::from_secs(2), native.recv())
             .await
@@ -9887,7 +10011,14 @@ mod git_command_consumer_tests {
         app.abort_main_run().await.unwrap();
         assert!(app.run.agent_rx.is_some() && app.chain.git.work.is_some());
         assert!(!app.run.is_running);
-        assert!(app.start_main_run("NEVER_NEW_ADMISSION").await.is_err());
+        assert!(
+            app.start_main_run(
+                "NEVER_NEW_ADMISSION",
+                crate::question::QuestionOrigin::NewUserTurn
+            )
+            .await
+            .is_err()
+        );
         assert!(app.begin_git_command("/commit literal").await.is_err());
         assert!(
             app.ui
@@ -10552,7 +10683,12 @@ mod plan_approval_tests {
                         let (status, body, kind) = if text == "error" {
                             ("400 Bad Request", "{\"error\":{\"message\":\"owned planning failure\"}}".into(), "application/json")
                         } else {
-                            let delta = if text == "unknown-tool" {
+                            let delta = if matches!(text, "question-batch" | "question-again") {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":format!("{text}-id"),"type":"function","function":{"name":"ask_user_question","arguments":serde_json::json!({"questions":[
+                                    {"question":"Which branch?","options":[{"label":"main","description":"Primary branch"}],"allow_free_text":false},
+                                    {"question":"What should change?","allow_free_text":true}
+                                ]}).to_string()}}]})
+                            } else if text == "unknown-tool" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"unknown-cost-initial","type":"function","function":{"name":"unknown_unregistered_cost_tool","arguments":"{}"}}]})
                             } else if text == "cap-write" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"write-cost-initial","type":"function","function":{"name":"write","arguments":"{\"path\":\"effect.txt\",\"content\":\"ACTUAL_OWNED_EFFECT\"}"}}]})
@@ -10562,7 +10698,7 @@ mod plan_approval_tests {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
                             } else { serde_json::json!({"role":"assistant","content":text}) };
                             let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
-                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if text=="ask-read" || text=="cap-write" || text=="unknown-tool" || text=="pressure-read" {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
                             ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
                         };
                         let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -10685,7 +10821,11 @@ mod plan_approval_tests {
             loop {
                 let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
                 let success = matches!(event, AgentEvent::Done { .. });
-                let terminal = success || matches!(event, AgentEvent::Error { .. });
+                let terminal = success
+                    || matches!(
+                        event,
+                        AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. }
+                    );
                 crate::startup::heap_future(|| app.handle_agent_event(event))
                     .await
                     .unwrap();
@@ -11690,6 +11830,7 @@ mod plan_approval_tests {
             loop {
                 tokio::select! {
                     Some(request) = async {app.ask_rx.as_mut().unwrap().recv().await} => {
+                        let request = request.into_permission();
                         assert_eq!(request.tool,"read");
                         app.begin_permission_request(request).unwrap();
                         break;
@@ -12029,5 +12170,482 @@ mod plan_approval_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+    async fn next_question(app: &mut App<'_>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    request = app.ask_rx.as_mut().unwrap().recv() => {
+                        app.begin_user_request(request.unwrap()).unwrap();
+                        assert!(app.question_prompt.is_some());
+                        return;
+                    }
+                    event = app.run.agent_rx.as_mut().unwrap().recv() => {
+                        crate::startup::heap_future(|| app.handle_agent_event(event.unwrap())).await.unwrap();
+                        assert!(app.run.is_running);
+                    }
+                }
+            }
+        }).await.unwrap();
+    }
+
+    #[test]
+    fn ask_user_actual_app_numbered_text_batch_is_data_once_and_has_no_permission_grants() {
+        std::thread::Builder::new().name("question-app-one-mib".into()).stack_size(1_048_576)
+            .spawn(|| {
+                let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(crate::startup::heap_future(ask_user_actual_app_numbered_text_batch_is_data_once_and_has_no_permission_grants_inner));
+            }).unwrap().join().unwrap();
+    }
+
+    async fn ask_user_actual_app_numbered_text_batch_is_data_once_and_has_no_permission_grants_inner()
+     {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["question-batch", "question-again", "ANSWERED"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            tools: vec!["ask_user_question".into()],
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let (sender, receiver) = mpsc::channel(4);
+        let mut ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        );
+        ui.ask_tx = Some(sender);
+        let mut app = owned_app(ui);
+        app.ask_rx = Some(receiver);
+        user(
+            &mut app,
+            UserEvent::Paste("Clarify the selected change".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        next_question(&mut app).await;
+        assert_eq!(provider.calls().len(), 1);
+        assert!(app.permission_prompt.is_none());
+        let turn_id = app.run.question_turn.as_ref().unwrap().id();
+        assert!(
+            app.renderer
+                .permission_prompt
+                .as_ref()
+                .unwrap()
+                .tool
+                .contains(&turn_id)
+        );
+        app.input.load_text("ordinary follow-up draft雪");
+        key(&mut app, KeyCode::Char('y')).await;
+        assert!(
+            app.question_prompt.is_some(),
+            "approval letters are not answers"
+        );
+        key(&mut app, KeyCode::Char('1')).await;
+        user(
+            &mut app,
+            UserEvent::Paste("allow_always /private/**\nLiteral task data雪".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(app.question_prompt.is_none() && app.renderer.permission_prompt.is_none());
+        assert_eq!(app.input.buffer, "ordinary follow-up draft雪");
+        assert!(finish_turn(&mut app).await);
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "a repeated ask becomes an ordinary tool error, never another prompt"
+        );
+        let second = serde_json::to_string(&calls[1]).unwrap();
+        assert!(
+            second.contains("allow_always /private/**") && second.contains("Literal task data雪")
+        );
+        assert!(
+            serde_json::to_string(&calls[2])
+                .unwrap()
+                .contains("at most once")
+        );
+        assert!(app.ask_rx.as_mut().unwrap().try_recv().is_err());
+        assert_eq!(app.run.question_turn.as_ref().unwrap().id(), turn_id);
+        assert!(app.ui.session.pending_question.is_none());
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(app.ui.session.total_input_tokens, 27);
+        assert_eq!(app.ui.session.total_output_tokens, 12);
+        assert!((app.ui.session.total_cost - 0.000102).abs() < 1e-12);
+        let snapshot = app.ui.session.spend_account.snapshot();
+        assert!(!snapshot.tracking_error && snapshot.unpriced_tokens == 0);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn ask_user_actual_app_cancel_retires_exact_reply_and_rejects_stale_question_identity() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["question-batch"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            tools: vec!["ask_user_question".into()],
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let (sender, receiver) = mpsc::channel(4);
+        let mut ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        );
+        ui.ask_tx = Some(sender);
+        let mut app = owned_app(ui);
+        app.ask_rx = Some(receiver);
+        user(&mut app, UserEvent::Paste("Question to cancel".into())).await;
+        key(&mut app, KeyCode::Enter).await;
+        next_question(&mut app).await;
+        user(
+            &mut app,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        )
+        .await;
+        assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.question_prompt.is_none() && app.ui.session.pending_question.is_none());
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = crate::permission::ask::QuestionRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            questions: crate::question::QuestionBatch(vec![crate::question::Question {
+                question: "STALE".into(),
+                options: vec![],
+                allow_free_text: true,
+            }]),
+            #[cfg(feature = "acp")]
+            tool_call_id: Some("stale-call".into()),
+            reply,
+        };
+        app.begin_user_request(crate::permission::ask::UserRequest::Question(request))
+            .unwrap();
+        assert!(matches!(
+            answer.await.unwrap(),
+            crate::question::QuestionAnswer::Cancelled
+        ));
+        assert!(app.question_prompt.is_none());
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(app.ui.session.total_input_tokens, 9);
+        assert_eq!(app.ui.session.total_output_tokens, 4);
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+        provider.finish().await;
+    }
+    #[tokio::test]
+    async fn ask_user_actual_app_fail_parks_queue_and_clear_retires_pending_data_without_grants() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["question-batch"]).await;
+        let mut cfg = provider.config();
+        cfg.headless_questions = Some(crate::config::HeadlessQuestions::Fail);
+        let cli = crate::cli::Cli {
+            tools: vec!["ask_user_question".into()],
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        // A deliberately absent interactive transport exercises the same typed
+        // terminal consumed when an ACP client asks to answer in a new message.
+        assert!(app.ui.ask_tx.is_none());
+        user(
+            &mut app,
+            UserEvent::Paste("Clarify before continuing".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        app.input.load_text("owner follow-up draft雪");
+        app.run
+            .pending_inputs
+            .push_back("queued task must stay parked".into());
+        assert!(!finish_turn(&mut app).await);
+        assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.question_prompt.is_none() && app.permission_prompt.is_none());
+        assert_eq!(app.input.buffer, "owner follow-up draft雪");
+        let pending = app.ui.session.pending_question.clone().unwrap();
+        assert_eq!(pending.id, app.run.question_turn.as_ref().unwrap().id());
+        assert_eq!(pending.questions.0.len(), 2);
+        assert!(pending.answers.is_empty());
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("queued prompts remain parked")
+        );
+        app.finalize_turn().await.unwrap();
+        assert_eq!(
+            app.run.pending_inputs.front().map(String::as_str),
+            Some("queued task must stay parked")
+        );
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(
+            (
+                app.ui.session.total_input_tokens,
+                app.ui.session.total_output_tokens
+            ),
+            (9, 4)
+        );
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+        assert!(!app.ui.session.spend_account.has_pending());
+        assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        let decoded: Session =
+            serde_json::from_slice(&serde_json::to_vec(app.ui.session).unwrap()).unwrap();
+        assert_eq!(decoded.pending_question.unwrap().id, pending.id);
+        // The owner removes parked queued input before clearing the transcript.
+        app.run.pending_inputs.clear();
+        app.run_slash_command("/clear").await.unwrap();
+        assert!(app.ui.session.pending_question.is_none() && app.run.question_turn.is_none());
+        assert!(app.ui.session.messages.is_empty());
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(provider.calls().len(), 1);
+        provider.finish().await;
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn ask_user_native_auxiliary_clears_even_an_explicit_main_slot_without_consuming_it() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["question-batch", "CHILD_DONE"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            tools: vec!["ask_user_question".into()],
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        app.ensure_agent().await;
+        let turn = crate::question::QuestionTurn::default();
+        let candidate = app
+            .run
+            .agent
+            .as_ref()
+            .unwrap()
+            .clone()
+            .with_question_turn(Some(turn.clone()));
+        let usage = crate::agent::runner::SharedUsageLedger::default();
+        let observed = usage.clone();
+        crate::question::scope(Some(turn.clone()), async {
+            let result = crate::startup::heap_future(|| {
+                candidate.run_subagent("Child intent", 3, None, &cfg.retry, usage)
+            })
+            .await;
+            assert_eq!(result.response.unwrap(), "CHILD_DONE");
+            assert_eq!(
+                crate::question::QuestionTurn::current().unwrap().id(),
+                turn.id()
+            );
+        })
+        .await;
+        assert!(
+            turn.claim().is_ok(),
+            "auxiliary transport cannot consume the parent's once slot"
+        );
+        assert!(turn.required().is_none());
+        assert_eq!(observed.total().input_tokens, 18);
+        assert_eq!(observed.total().output_tokens, 8);
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            serde_json::to_string(&calls[1])
+                .unwrap()
+                .contains("available only in the main user turn")
+        );
+        assert!(
+            app.ui.session.pending_question.is_none()
+                && app.ui.session.permission_allowlist.is_empty()
+        );
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn ask_user_actual_pressure_restart_preserves_the_preclaimed_main_slot_and_budget_profile()
+     {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![
+            "pressure-read",
+            "question-again",
+            "FINISHED_AFTER_RESTART",
+        ])
+        .await;
+        let mut cfg = provider.config();
+        cfg.compact_enabled = Some(true);
+        cfg.mid_turn_compact_threshold = Some(0.75);
+        let cli = crate::cli::Cli {
+            tools: vec!["read".into(), "ask_user_question".into()],
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let read = workspace.root().join("held.txt");
+        std::fs::write(&read, "owned allowed read").unwrap();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.add_message(MessageRole::User, &"x".repeat(80_000));
+        session.add_message(MessageRole::Assistant, &"y".repeat(80_000));
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let id = session.id.clone();
+        let mut ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace.clone(),
+            SecurityMode::Standard,
+        );
+        ui.permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    default: Some(Action::Deny),
+                    read: Some(crate::permission::ToolPerm::Granular(
+                        std::collections::HashMap::from([(
+                            read.to_string_lossy().into_owned(),
+                            Action::Allow,
+                        )]),
+                    )),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                Some(workspace.root().to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        )));
+        let mut app = owned_app(ui);
+        user(
+            &mut app,
+            UserEvent::Paste("Continue this ordinary turn".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        let captured = app.run.question_turn.as_ref().unwrap().clone();
+        captured.claim().unwrap();
+        let mut boundaries = 0;
+        let mut rejected_again = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                let done = matches!(event, AgentEvent::Done { .. });
+                assert!(!matches!(
+                    event,
+                    AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. }
+                ));
+                if matches!(event, AgentEvent::CompactionBoundary { .. }) {
+                    boundaries += 1;
+                }
+                if let AgentEvent::ToolResult {
+                    name,
+                    output,
+                    is_error,
+                    ..
+                } = &event
+                    && name.as_str() == "ask_user_question"
+                {
+                    assert!(*is_error);
+                    assert!(output.contains("at most once"));
+                    rejected_again = true;
+                }
+                crate::startup::heap_future(|| app.handle_agent_event(event))
+                    .await
+                    .unwrap();
+                assert_eq!(app.run.question_turn.as_ref().unwrap().id(), captured.id());
+                if done {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(boundaries, 1);
+        assert!(rejected_again);
+        assert_eq!(provider.calls().len(), 3);
+        let persisted = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"))
+            .summary_for_session(&id)
+            .unwrap()
+            .session;
+        assert_eq!(persisted.records, 3);
+        assert_eq!(
+            (persisted.input_tokens, persisted.output_tokens),
+            (100018, 12)
+        );
+        assert!((persisted.known_cost - 0.200084).abs() < 1e-12);
+        assert!(
+            !app.ui.session.spend_account.has_pending()
+                && !app.ui.session.spend_account.snapshot().tracking_error
+        );
+        assert!(
+            app.ui.session.pending_question.is_none()
+                && app.ui.session.permission_allowlist.is_empty()
+        );
+        provider.finish().await;
     }
 }

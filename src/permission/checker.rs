@@ -406,6 +406,7 @@ impl PermissionChecker {
             ("read", &config.read),
             ("write", &config.write),
             ("edit", &config.edit),
+            ("notebook_edit", &config.notebook_edit),
             ("grep", &config.grep),
             ("find_files", &config.find_files),
             ("list_dir", &config.list_dir),
@@ -734,7 +735,7 @@ impl PermissionChecker {
     /// hook dispatcher bound at load time, in any security mode.
     #[cfg(feature = "hooks")]
     fn writes_pinned_hook_file(&self, tool: &str, relative: Option<&str>) -> bool {
-        if !matches!(tool, "write" | "edit" | "js/write_file") {
+        if !matches!(tool, "write" | "edit" | "notebook_edit" | "js/write_file") {
             return false;
         }
         let Some(relative) = relative else {
@@ -762,7 +763,7 @@ impl PermissionChecker {
         if self.mode == SecurityMode::Standard
             && !rule_matched
             && action == Action::Allow
-            && matches!(tool, "write" | "edit" | "js/write_file")
+            && matches!(tool, "write" | "edit" | "notebook_edit" | "js/write_file")
             && relative.is_some_and(is_git_execution_metadata)
         {
             Action::Ask
@@ -817,6 +818,13 @@ impl PermissionChecker {
 
     fn resolve_check_action(&self, tool: &str, matched: &[(usize, Action)]) -> Action {
         let base = Self::resolve_matched(matched);
+        if tool == "notebook_edit"
+            && base.is_none()
+            && self.mode == SecurityMode::Standard
+            && self.default_action == Action::Deny
+        {
+            return Action::Deny;
+        }
         match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
             SecurityMode::ReadOnly | SecurityMode::PlanWrite => base.unwrap_or_else(|| {
@@ -836,7 +844,12 @@ impl PermissionChecker {
             SecurityMode::Standard => base.unwrap_or({
                 if matches!(
                     tool,
-                    "shell" | "bash" | "js/fetch" | "memory_write" | "memory_edit"
+                    "shell"
+                        | "bash"
+                        | "js/fetch"
+                        | "memory_write"
+                        | "memory_edit"
+                        | "notebook_edit"
                 ) {
                     // Bash scripts and network destinations are opaque,
                     // security-sensitive permission keys. An unmatched call
@@ -898,6 +911,9 @@ impl PermissionChecker {
                 }
             }),
             SecurityMode::Standard => {
+                if tool == "notebook_edit" && base.is_none() {
+                    return stricter_action(Action::Ask, self.default_action);
+                }
                 let a = base.unwrap_or(self.default_action);
                 let is_external = external && !capability_contained;
                 if matched.is_empty() && self.is_path_tool(tool) && !is_external {
@@ -1221,22 +1237,7 @@ impl PermissionChecker {
         // `external_directory` decision: only an allow rule that names an
         // absolute location, or an explicit external allow, grants access.
         let external_allow_needs_anchor = external && external_action != Some(Action::Allow);
-        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
-        if self.apply_rules()
-            && let Some(rules) = self.rules.get(tool)
-        {
-            for (pattern, action) in rules {
-                if *action == Action::Allow
-                    && external_allow_needs_anchor
-                    && !pattern.is_absolute_anchored()
-                {
-                    continue;
-                }
-                if inputs.iter().any(|input| pattern.matches_path(input)) {
-                    matched.push((pattern.specificity(), *action));
-                }
-            }
-        }
+        let matched = self.match_path_rules(tool, &inputs, external_allow_needs_anchor);
 
         let action =
             self.resolve_path_action(tool, &matched, abs_path, external, external_action, false);
@@ -1390,16 +1391,7 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
-        if self.apply_rules()
-            && let Some(rules) = self.rules.get(tool)
-        {
-            for (pattern, action) in rules {
-                if pattern.matches_path(&logical) || pattern.matches_path(&relative) {
-                    matched.push((pattern.specificity(), *action));
-                }
-            }
-        }
+        let matched = self.match_path_rules(tool, &[&logical, &relative], false);
 
         let action = self.resolve_path_action(tool, &matched, &logical, false, None, true);
         let action = self.ask_before_git_execution_metadata_write(
@@ -1420,8 +1412,42 @@ impl PermissionChecker {
     /// Check whether any deny rule matches the given inputs. Deny rules are
     /// the security baseline and must be evaluated before the session
     /// allowlist to prevent `AllowAlways` from bypassing them.
+    fn match_path_rules(
+        &self,
+        tool: &str,
+        inputs: &[&str],
+        external_allow_needs_anchor: bool,
+    ) -> SmallVec<[(usize, Action); 4]> {
+        let mut matched = SmallVec::new();
+        if !self.apply_rules() {
+            return matched;
+        }
+        for name in std::iter::once(tool).chain((tool == "notebook_edit").then_some("edit")) {
+            if let Some(rules) = self.rules.get(name) {
+                for (pattern, action) in rules {
+                    if *action == Action::Allow
+                        && external_allow_needs_anchor
+                        && !pattern.is_absolute_anchored()
+                    {
+                        continue;
+                    }
+                    if inputs.iter().any(|input| pattern.matches_path(input)) {
+                        matched.push((pattern.specificity(), *action));
+                    }
+                }
+            }
+            if !matched.is_empty() {
+                break;
+            }
+        }
+        matched
+    }
+
     fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
-        if let Some(rules) = self.rules.get(tool) {
+        for name in std::iter::once(tool).chain((tool == "notebook_edit").then_some("edit")) {
+            let Some(rules) = self.rules.get(name) else {
+                continue;
+            };
             for (pattern, action) in rules {
                 let matches = |input: &&str| {
                     if is_path_tool_name(tool) {
@@ -2029,6 +2055,7 @@ fn is_path_tool_name(tool: &str) -> bool {
         "read"
             | "write"
             | "edit"
+            | "notebook_edit"
             | "grep"
             | "find_files"
             | "list_dir"

@@ -1059,7 +1059,8 @@ mod tests {
             let request = ask_rx
                 .recv()
                 .await
-                .expect("symlink target approval request");
+                .expect("symlink target approval request")
+                .into_permission();
             assert_eq!(request.tool.as_str(), "read");
             assert_eq!(
                 PathBuf::from(&request.input),
@@ -1103,7 +1104,8 @@ mod tests {
                 let request = ask_rx
                     .recv()
                     .await
-                    .expect("isolated child approval request");
+                    .expect("isolated child approval request")
+                    .into_permission();
                 let request_path = PathBuf::from(&request.input);
                 let decision = if request_path == std::fs::canonicalize(&allowed).unwrap() {
                     UserDecision::AllowOnce

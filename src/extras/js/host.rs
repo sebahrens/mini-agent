@@ -6816,7 +6816,8 @@ mod tests {
         let prompt = ask_rx
             .recv()
             .await
-            .expect("spawn should request permission");
+            .expect("spawn should request permission")
+            .into_permission();
         std::fs::rename(&replacement, &executable).unwrap();
         prompt.reply.send(UserDecision::AllowOnce).unwrap();
 
@@ -7271,7 +7272,11 @@ mod tests {
             let result = broker.dispatch(request, PermCancellation::new()).await;
             (result, broker)
         });
-        let prompt = ask_rx.recv().await.expect("model spawn should reach Ask");
+        let prompt = ask_rx
+            .recv()
+            .await
+            .expect("model spawn should reach Ask")
+            .into_permission();
         prompt.reply.send(UserDecision::AllowOnce).unwrap();
         let (result, broker) = dispatch.await.unwrap();
         let result = result.unwrap();
@@ -7690,7 +7695,8 @@ mod tests {
         let permission = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
             .await
             .expect("fetch must reach permission before its outer timeout")
-            .expect("permission channel closed");
+            .expect("permission channel closed")
+            .into_permission();
         let error = tokio::time::timeout(Duration::from_secs(1), host_call)
             .await
             .expect("outer timeout must return")
@@ -8246,9 +8252,13 @@ mod tests {
             Some(fetch_permission(Action::Ask)),
             {
                 let (ask_tx, mut ask_rx) =
-                    tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(1);
+                    tokio::sync::mpsc::channel::<crate::permission::ask::UserRequest>(1);
                 let approval = tokio::spawn(async move {
-                    let request = ask_rx.recv().await.expect("fetch should ask permission");
+                    let request = ask_rx
+                        .recv()
+                        .await
+                        .expect("fetch should ask permission")
+                        .into_permission();
                     assert_eq!(request.tool.as_str(), "js/fetch");
                     assert_eq!(
                         request.input.as_str(),
@@ -8625,6 +8635,7 @@ mod tests {
                 .with_workspace_binding(workspace.clone());
         let native_output = native_read
             .call(crate::agent::tools::ReadArgs {
+                raw_notebook: false,
                 path: "gold-eiffel.js".to_string(),
                 offset: None,
                 limit: None,
@@ -8846,7 +8857,11 @@ mod tests {
             source.clone(),
             policy.clone(),
         ));
-        let request = ask_rx.recv().await.expect("read should request permission");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("read should request permission")
+            .into_permission();
         std::fs::rename(&source, &original_source).unwrap();
         symlink(&outside_source, &source).unwrap();
         request
@@ -8875,7 +8890,8 @@ mod tests {
         let request = ask_rx
             .recv()
             .await
-            .expect("write should request permission");
+            .expect("write should request permission")
+            .into_permission();
         std::fs::rename(&write_parent, &original_parent).unwrap();
         symlink(&outside_root, &write_parent).unwrap();
         request
@@ -8996,7 +9012,11 @@ mod tests {
             Some(ask_tx),
             source.clone(),
         ));
-        let request = ask_rx.recv().await.expect("read should request permission");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("read should request permission")
+            .into_permission();
         assert_eq!(request.tool.as_str(), "js/read_file");
         assert_eq!(
             request.input.as_str(),
@@ -9198,7 +9218,8 @@ mod tests {
         let request = ask_rx
             .recv()
             .await
-            .expect("external write should request permission");
+            .expect("external write should request permission")
+            .into_permission();
         assert_eq!(request.tool.as_str(), "js/write_file");
         let expected_target = target
             .parent()
@@ -9238,7 +9259,11 @@ mod tests {
             Some(ask_tx.clone()),
             source.clone(),
         ));
-        let request = ask_rx.recv().await.expect("read should request permission");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("read should request permission")
+            .into_permission();
         assert_eq!(request.tool, "js/read_file");
         assert_eq!(
             request.input.as_str(),
@@ -9263,7 +9288,8 @@ mod tests {
         let request = ask_rx
             .recv()
             .await
-            .expect("write should request permission");
+            .expect("write should request permission")
+            .into_permission();
         assert_eq!(request.tool, "js/write_file");
         let expected_target = target
             .parent()
@@ -9295,7 +9321,8 @@ mod tests {
         let request = ask_rx
             .recv()
             .await
-            .expect("spawn should request permission");
+            .expect("spawn should request permission")
+            .into_permission();
         assert_eq!(request.tool, "bash");
         assert_eq!(
             request.input,

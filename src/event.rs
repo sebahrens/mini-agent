@@ -118,6 +118,12 @@ pub enum AgentEvent {
         message: CompactString,
         interactions: Vec<rig::completion::Message>,
     },
+    /// Completed progress retained while the exact main turn waits for a new
+    /// ordinary user message. This is data, never an approval or live reply.
+    AwaitingUser {
+        question: Box<crate::question::QuestionRequired>,
+        interactions: Vec<rig::completion::Message>,
+    },
     Retrying {
         attempt: usize,
         max: usize,

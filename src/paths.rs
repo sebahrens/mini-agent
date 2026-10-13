@@ -400,6 +400,43 @@ impl WorkspaceBinding {
         base: Option<&crate::fs::ContentDigest>,
         before_final_identity_check: impl FnOnce(),
     ) -> io::Result<()> {
+        self.replace_relative_atomic_with_hook_and_cancellation(
+            path,
+            content,
+            expected,
+            base,
+            before_final_identity_check,
+            None,
+        )
+    }
+
+    pub(crate) fn replace_relative_atomic_expecting_cancellable(
+        &self,
+        path: &Path,
+        content: &[u8],
+        expected: &crate::fs::CheckedMetadata,
+        base: &crate::fs::ContentDigest,
+        cancellation: &crate::fs::AtomicWriteCancellation,
+    ) -> io::Result<()> {
+        self.replace_relative_atomic_with_hook_and_cancellation(
+            path,
+            content,
+            expected,
+            Some(base),
+            || {},
+            Some(cancellation),
+        )
+    }
+
+    fn replace_relative_atomic_with_hook_and_cancellation(
+        &self,
+        path: &Path,
+        content: &[u8],
+        expected: &crate::fs::CheckedMetadata,
+        base: Option<&crate::fs::ContentDigest>,
+        before_final_identity_check: impl FnOnce(),
+        cancellation: Option<&crate::fs::AtomicWriteCancellation>,
+    ) -> io::Result<()> {
         if !expected.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -455,7 +492,11 @@ impl WorkspaceBinding {
             }
             drop(current);
             before_final_identity_check();
-            exchange_relative(&parent, &temp, &name)?;
+            if let Some(cancellation) = cancellation {
+                cancellation.publish(|| exchange_relative(&parent, &temp, &name))?;
+            } else {
+                exchange_relative(&parent, &temp, &name)?;
+            }
 
             if entry_matches_regular_file(&parent, &temp, expected)? {
                 // The exchange displaced the approved inode to `temp`. Validate

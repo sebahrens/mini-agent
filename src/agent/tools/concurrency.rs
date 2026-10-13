@@ -43,6 +43,13 @@ impl ConcurrencyBoundTool {
             access,
         }
     }
+
+    fn question_admission() -> Result<(), ToolError> {
+        match crate::question::required() {
+            Some(required) => Err(ToolError::ToolCallError(Box::new(required))),
+            None => Ok(()),
+        }
+    }
 }
 
 impl ToolDyn for ConcurrencyBoundTool {
@@ -67,7 +74,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                     crate::spend::run::admit_current_effect()
                         .await
                         .map_err(|error| ToolError::ToolCallError(error.into()))?;
-
+                    Self::question_admission()?;
                     self.inner.call(args).await
                 }
                 ToolAccess::Write => {
@@ -75,7 +82,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                     crate::spend::run::admit_current_effect()
                         .await
                         .map_err(|error| ToolError::ToolCallError(error.into()))?;
-
+                    Self::question_admission()?;
                     self.inner.call(args).await
                 }
             }
@@ -102,7 +109,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                     crate::spend::run::admit_current_effect()
                         .await
                         .map_err(|error| ToolError::ToolCallError(error.into()))?;
-
+                    Self::question_admission()?;
                     self.inner.call_with_extensions(args, extensions).await
                 }
                 ToolAccess::Write => {
@@ -110,12 +117,13 @@ impl ToolDyn for ConcurrencyBoundTool {
                     crate::spend::run::admit_current_effect()
                         .await
                         .map_err(|error| ToolError::ToolCallError(error.into()))?;
-
+                    Self::question_admission()?;
                     self.inner.call_with_extensions(args, extensions).await
                 }
             }
         };
         let future = crate::spend::run::scope(spend, future);
+        let future = crate::question::scope_extensions(extensions, future);
         #[cfg(feature = "acp")]
         let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
         Box::pin(future)
@@ -137,7 +145,9 @@ impl ToolDyn for ConcurrencyBoundTool {
                     if let Err(error) = crate::spend::run::admit_current_effect().await {
                         return ToolExecutionResult::denied(error.to_string());
                     }
-
+                    if let Err(error) = Self::question_admission() {
+                        return ToolExecutionResult::denied(error.to_string());
+                    }
                     self.inner.call_structured(args, extensions).await
                 }
                 ToolAccess::Write => {
@@ -145,12 +155,15 @@ impl ToolDyn for ConcurrencyBoundTool {
                     if let Err(error) = crate::spend::run::admit_current_effect().await {
                         return ToolExecutionResult::denied(error.to_string());
                     }
-
+                    if let Err(error) = Self::question_admission() {
+                        return ToolExecutionResult::denied(error.to_string());
+                    }
                     self.inner.call_structured(args, extensions).await
                 }
             }
         };
         let future = crate::spend::run::scope(spend, future);
+        let future = crate::question::scope_extensions(extensions, future);
         #[cfg(feature = "acp")]
         let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
         Box::pin(future)
@@ -416,7 +429,8 @@ mod usd_budget_boundary_tests {
         let ask = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_permission();
         assert_eq!(ask.tool.as_str(), "write");
         account
             .observe(&Receipt::new(
@@ -453,5 +467,88 @@ mod usd_budget_boundary_tests {
                 .check_path("write", &root.path().join("late.txt").to_string_lossy()),
             CheckResult::Ask
         ));
+    }
+}
+
+#[cfg(test)]
+mod question_boundary_tests {
+    use super::*;
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::{CheckResult, PermissionChecker};
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+    #[tokio::test]
+    async fn ask_user_parked_question_rejects_late_real_write_approval_before_grant_or_effect() {
+        for parked in [false, true] {
+            let root = crate::tests::OwnedTestDirectory::new("question-late-write");
+            let permission = Arc::new(std::sync::Mutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::from(PermissionConfig {
+                        write: Some(ToolPerm::Simple(Action::Ask)),
+                        ..Default::default()
+                    }),
+                    SecurityMode::Standard,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            ));
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let tools = bind(vec![Box::new(
+                crate::agent::tools::write::WriteTool::new(
+                    Some(permission.clone()),
+                    Some(sender),
+                    None,
+                )
+                .with_workspace_root(root.path().to_path_buf()),
+            )]);
+            let turn = crate::question::QuestionTurn::default();
+            let mut extensions = ToolCallExtensions::new();
+            extensions.insert(turn.clone());
+            let task = tokio::spawn(async move {
+                tools[0]
+                    .call_structured(
+                        serde_json::json!({"path":"late.txt","content":"actual effect"})
+                            .to_string(),
+                        &extensions,
+                    )
+                    .await
+            });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_permission();
+            if parked {
+                turn.require(crate::question::QuestionBatch(vec![
+                    crate::question::Question {
+                        question: "Clarify first".into(),
+                        options: vec![],
+                        allow_free_text: true,
+                    },
+                ]));
+            }
+            request
+                .reply
+                .send(UserDecision::AllowAlways("late.txt".into()))
+                .unwrap();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.path().join("late.txt").exists(), !parked);
+            assert_eq!(
+                matches!(outcome.outcome(), rig::tool::ToolOutcome::Success),
+                !parked
+            );
+            let policy = permission
+                .lock()
+                .unwrap()
+                .check_path("write", &root.path().join("late.txt").to_string_lossy());
+            assert_eq!(matches!(policy, CheckResult::Ask), parked);
+            if parked {
+                assert!(outcome.extensions().is_empty());
+                assert!(outcome.model_output().contains("user answer"));
+            }
+        }
     }
 }

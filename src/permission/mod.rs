@@ -47,6 +47,7 @@ pub struct PermissionConfig {
     pub read: Option<ToolPerm>,
     pub write: Option<ToolPerm>,
     pub edit: Option<ToolPerm>,
+    pub notebook_edit: Option<ToolPerm>,
     pub grep: Option<ToolPerm>,
     pub find_files: Option<ToolPerm>,
     pub list_dir: Option<ToolPerm>,
@@ -97,6 +98,7 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "read"
             | "write"
             | "edit"
+            | "notebook_edit"
             | "grep"
             | "find_files"
             | "list_dir"
@@ -285,11 +287,14 @@ pub(crate) fn build_interactive_permission_at(
     Option<ask::AskSender>,
     Option<ask::AskReceiver>,
 )> {
-    let Some(permission) = build_permission_checker_at(cfg, authority, working_dir)? else {
+    let permission = build_permission_checker_at(cfg, authority, working_dir)?;
+    // Clarification is frontend interaction, independent of permission mode.
+    // A missing checker still cannot turn a question answer into a grant.
+    if !authority.tools_enabled {
         return Ok((None, None, None));
-    };
+    }
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
-    Ok((Some(permission), Some(ask_tx), Some(ask_rx)))
+    Ok((permission, Some(ask_tx), Some(ask_rx)))
 }
 
 /// Build a permission policy for a frontend that cannot securely prompt.
@@ -1606,5 +1611,61 @@ mod mode_cycle_tests {
             cfg.permission_mode_cycle.unwrap(),
             vec!["readonly", "guarded"]
         );
+    }
+}
+
+#[cfg(test)]
+mod question_channel_tests {
+    use super::*;
+    use rig::tool::Tool;
+    #[tokio::test]
+    async fn ask_user_channel_is_independent_of_skipped_checks_but_no_tools_disables_it() {
+        let root = crate::tests::OwnedTestDirectory::new("question-channel");
+        let cfg = crate::config::Config::default();
+        for no_tools in [false, true] {
+            let cli = crate::cli::Cli {
+                dangerously_skip_permissions: true,
+                no_tools,
+                ..Default::default()
+            };
+            let authority = resolve_execution_authority(
+                &cli,
+                &cfg,
+                crate::sandbox::SandboxPolicy::Disabled,
+                "unused",
+            )
+            .unwrap();
+            let (permission, sender, receiver) =
+                build_interactive_permission_at(&cfg, authority, Some(root.path().to_path_buf()))
+                    .unwrap();
+            assert!(permission.is_none());
+            if no_tools {
+                assert!(sender.is_none() && receiver.is_none());
+                continue;
+            }
+            let mut receiver = receiver.unwrap();
+            let tool = crate::agent::tools::ask_user::AskUserTool::new(
+                sender,
+                crate::config::HeadlessQuestions::Error,
+            );
+            let args =
+                serde_json::from_value(serde_json::json!({"question":"Which branch?"})).unwrap();
+            crate::question::scope(Some(crate::question::QuestionTurn::default()), async {
+                let (result, ()) = tokio::join!(tool.call(args), async {
+                    let ask::UserRequest::Question(question) = receiver.recv().await.unwrap()
+                    else {
+                        panic!("question is not permission")
+                    };
+                    question
+                        .reply
+                        .send(crate::question::QuestionAnswer::Answered(vec![
+                            crate::question::Answer::Text("main".into()),
+                        ]))
+                        .unwrap();
+                });
+                assert!(result.unwrap().contains("main"));
+            })
+            .await;
+        }
     }
 }

@@ -670,6 +670,7 @@ async fn handle_redo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 }
 
 fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
+    session.pending_question = None;
     session.messages.clear();
     session.total_estimated_tokens = 0;
     session.reset_calibration();

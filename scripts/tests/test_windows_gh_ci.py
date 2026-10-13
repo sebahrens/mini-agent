@@ -79,9 +79,10 @@ def validate_stage_controls(source, helper):
     required = [
         "New-Object System.Diagnostics.ProcessStartInfo",
         "[System.Diagnostics.ProcessStartInfo]::new()",
-        "(Get-Location).ProviderPath", "[System.Environment]::CurrentDirectory",
+        "(Get-Location).ProviderPath", "$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath",
         "New-Object System.Diagnostics.Process", "[System.Diagnostics.Process]::new()",
         "FileName='gh';", "Arguments='--self-test';", "UseShellExecute=$false;",
+        "$miniGitPrProcess.StartInfo=$miniGitPrInfo;",
         "ReadToEndAsync()", "finally", "Dispose()", "exit $miniGitPrCode",
     ]
     required += ["NATIVE32_STAGE " + name + " " for name in
@@ -105,6 +106,21 @@ def validate_stage_controls(source, helper):
     production = source.split("fn pr_command(", 1)[1].split("fn require_mutation_success", 1)[0]
     if "NATIVE32_STAGE" in production or "--self-test" in production:
         raise AssertionError("stage controls must not instrument the real PR command")
+    for fragment in ["[System.Diagnostics.ProcessStartInfo]::new()", "[System.Diagnostics.Process]::new()",
+                     "$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath",
+                     "$miniGitPrProcess.StartInfo = $miniGitPrInfo;", "ReadToEndAsync()",
+                     "finally {{ $miniGitPrProcess.Dispose() }}; exit $miniGitPrCode"]:
+        if fragment not in production:
+            raise AssertionError("missing direct foreground PR guard: " + fragment)
+    if "New-Object" in production or "Get-Location" in production:
+        raise AssertionError("PR launch must not initialize cmdlets")
+    positive = source.split("async fn literal_shell_preflight(", 1)[1].split(
+        "async fn shell_preflight(", 1
+    )[0]
+    if "native_launch_stage_control(false)" not in positive or "native_launch_stage_control(true)" in positive:
+        raise AssertionError("independent typed positive must not await the known cmdlet negative")
+    if '[("cmdlets", true)' in positive:
+        raise AssertionError("known cmdlet timeout must not prevent native acceptance cases")
 
 
 class WindowsGhCiTests(unittest.TestCase):
@@ -154,6 +170,19 @@ class WindowsGhCiTests(unittest.TestCase):
                 validate_stage_controls(source.replace(before, after), helper)
         with self.assertRaises(AssertionError):
             validate_stage_controls(source, helper.replace("if matched {", "if true {"))
+
+    def test_direct_launch_and_independent_positive_cannot_regress_to_cmdlets(self):
+        source = (ROOT / "src/ui/slash/git.rs").read_text()
+        helper = (ROOT / "tests/fixtures/windows_gh_fixture.rs").read_text()
+        for before, after in [
+            ("$miniGitPrInfo = [System.Diagnostics.ProcessStartInfo]::new();", "$miniGitPrInfo = New-Object System.Diagnostics.ProcessStartInfo;"),
+            ("$miniGitPrProcess = [System.Diagnostics.Process]::new();", "$miniGitPrProcess = New-Object System.Diagnostics.Process;"),
+            ("$miniGitPrProcess.StartInfo=$miniGitPrInfo;", ""),
+            ("native_launch_stage_control(false)", "native_launch_stage_control(true)"),
+            (".WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath;", ".WorkingDirectory = [System.Environment]::CurrentDirectory;"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                validate_stage_controls(source.replace(before, after), helper)
 
     def test_stack_lane_requires_exact_four_actual_portable_consumers(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

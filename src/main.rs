@@ -24,6 +24,7 @@ mod process_creation;
 mod product;
 mod provider;
 mod provider_http;
+mod question;
 mod retry;
 mod sandbox;
 mod session;
@@ -101,6 +102,16 @@ fn main() -> anyhow::Result<ExitCode> {
             print::exit_force_stopped();
         }
         return Ok(ExitCode::from(2));
+    }
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<question::QuestionRequired>())
+    {
+        report_runtime_headless_error(
+            &runtime,
+            "awaiting your answer; send a new user message to continue\n".into(),
+        );
+        return Ok(ExitCode::from(22));
     }
     match result {
         Ok(()) => Ok(ExitCode::SUCCESS),

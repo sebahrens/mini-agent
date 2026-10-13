@@ -638,6 +638,7 @@ pub(crate) enum AgentActivity {
     Idle,
     Working,
     WaitingForApproval,
+    WaitingForUserAnswer,
 }
 
 impl AgentActivity {
@@ -646,6 +647,7 @@ impl AgentActivity {
             AgentActivity::Idle => "idle",
             AgentActivity::Working => "working",
             AgentActivity::WaitingForApproval => "waiting for approval",
+            AgentActivity::WaitingForUserAnswer => "waiting for your answer",
         }
     }
 }
@@ -722,7 +724,9 @@ pub(crate) fn activity_sequences(
     if signals.prompt_marks {
         match next {
             AgentActivity::Working => out.push_str(COMMAND_START),
-            AgentActivity::Idle | AgentActivity::WaitingForApproval => {
+            AgentActivity::Idle
+            | AgentActivity::WaitingForApproval
+            | AgentActivity::WaitingForUserAnswer => {
                 if next == AgentActivity::Idle && previous.is_some() {
                     out.push_str(COMMAND_END);
                 }
@@ -734,6 +738,7 @@ pub(crate) fn activity_sequences(
     let body = match (previous, next) {
         (Some(_), AgentActivity::Idle) => Some("turn finished"),
         (Some(_), AgentActivity::WaitingForApproval) => Some("waiting for approval"),
+        (Some(_), AgentActivity::WaitingForUserAnswer) => Some("waiting for your answer"),
         _ => None,
     };
     if let Some(body) = body {
@@ -1422,6 +1427,36 @@ mod tests {
 
     /// mini-agent-qfrps: a finished turn and a waiting prompt notify in the
     /// configured style; the first frame and unchanged frames do not.
+    #[test]
+    fn ask_user_terminal_status_identifies_task_answer_without_approval_language() {
+        use crate::config::TerminalNotify;
+        let sequence = title_sequence(AgentActivity::WaitingForUserAnswer);
+        assert!(sequence.contains("waiting for your answer"));
+        assert!(!sequence.contains("approval"));
+        assert_eq!(
+            activity_sequences(
+                Some(AgentActivity::Working),
+                AgentActivity::WaitingForUserAnswer,
+                notify(TerminalNotify::Osc9)
+            ),
+            format!(
+                "\x1b]9;{}: waiting for your answer\x07",
+                crate::product::PUBLIC_NAME
+            )
+        );
+        assert_eq!(
+            activity_sequences(
+                Some(AgentActivity::Working),
+                AgentActivity::WaitingForUserAnswer,
+                ActivitySignals {
+                    notify: TerminalNotify::Off,
+                    prompt_marks: true
+                }
+            ),
+            format!("{PROMPT_START}{INPUT_START}")
+        );
+    }
+
     #[test]
     fn notifications_follow_the_configured_style() {
         use crate::config::TerminalNotify;

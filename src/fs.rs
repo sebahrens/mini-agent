@@ -985,7 +985,6 @@ impl AtomicWritePublicationProbe {
 }
 
 impl AtomicWriteCancellation {
-    #[cfg(any(feature = "js", test))]
     pub(crate) fn cancel(&self) {
         #[cfg(windows)]
         self.0.cancel_requested.store(true, Ordering::Release);
@@ -1025,7 +1024,10 @@ impl AtomicWriteCancellation {
         }
     }
 
-    fn publish<T>(&self, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    pub(crate) fn publish<T>(
+        &self,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
         #[cfg(test)]
         if let Some(probe) = &self.0.publication_probe
             && probe.point == AtomicWriteProbePoint::BeforeDecision
@@ -1249,6 +1251,24 @@ pub(crate) async fn atomic_write_resolved_expecting(
         Some(approved_parent),
         Some(base),
         AtomicWriteCancellation::default(),
+    )
+    .await
+}
+
+/// Exact-content companion used by cancellable notebook publication.
+pub(crate) async fn atomic_write_resolved_expecting_cancellable(
+    path: &Path,
+    contents: &[u8],
+    approved_parent: CheckedMetadata,
+    base: ContentDigest,
+    cancellation: AtomicWriteCancellation,
+) -> std::io::Result<()> {
+    atomic_write_resolved_inner(
+        path,
+        contents,
+        Some(approved_parent),
+        Some(base),
+        cancellation,
     )
     .await
 }

@@ -78,7 +78,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
 /// request's context (and a long command's full text) can be reviewed
 /// before answering. The prompt claims none of these keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptScroll {
+pub(super) enum PromptScroll {
     LineUp,
     LineDown,
     PageUp,
@@ -87,7 +87,7 @@ enum PromptScroll {
     Bottom,
 }
 
-fn prompt_scroll(event: &UserEvent) -> Option<PromptScroll> {
+pub(super) fn prompt_scroll(event: &UserEvent) -> Option<PromptScroll> {
     match event {
         UserEvent::ScrollUp => Some(PromptScroll::LineUp),
         UserEvent::ScrollDown => Some(PromptScroll::LineDown),
@@ -104,7 +104,10 @@ fn prompt_scroll(event: &UserEvent) -> Option<PromptScroll> {
     }
 }
 
-fn apply_prompt_scroll(renderer: &mut Renderer, scroll: PromptScroll) -> std::io::Result<()> {
+pub(super) fn apply_prompt_scroll(
+    renderer: &mut Renderer,
+    scroll: PromptScroll,
+) -> std::io::Result<()> {
     match scroll {
         PromptScroll::LineUp => renderer.scroll_line_up(),
         PromptScroll::LineDown => renderer.scroll_line_down(),
@@ -120,7 +123,7 @@ fn apply_prompt_scroll(renderer: &mut Renderer, scroll: PromptScroll) -> std::io
 /// height is reconciled first so the transcript is sized around the
 /// prompt's (possibly multi-row) layout. The statusline keeps showing what
 /// the last frame built (model, mode, context), not blank rows.
-fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
+pub(super) fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
     renderer.sync_input_height("")?;
     renderer.render_viewport()?;
     let (statusline_key, statusline) = renderer.last_statusline();

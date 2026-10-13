@@ -25,6 +25,16 @@ The actual App compaction budget matrix also runs on an owned 1 MiB Rust
 thread and joins it before fixture teardown. Its exact `.spawn(|| ...)` site
 is classified as a non-process operation in both checked catalogues.
 
+## Clarification transport inventory
+
+The clarification App regression creates and joins one additional owned 1 MiB
+Rust thread; its exact `.spawn(|| ...)` site is a non-process operation. ACP's
+clarification completion notification sets `ToolCallStatus::Completed` on an
+RPC data builder. The permission and pressure regression macros inspect
+`ToolResult.output` event data. The checked inventories bind these exact sites
+and full macro tokens; clarification adds no subprocess launch or worker
+capability. Existing process negative controls remain unchanged.
+
 ## App thread regression inventory
 
 The fixed 1 MiB App picker and ordinary-event regressions create owned Rust

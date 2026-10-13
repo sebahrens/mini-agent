@@ -872,7 +872,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 4, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
@@ -917,7 +917,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         ".status(ToolCallStatus::Completed)",
-        1,
+        2,
         "NON-PROCESS",
     ),
     ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
@@ -1634,6 +1634,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Pressure continuation assertion inspects SDK ToolResult output text.
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(\"at most once\"));",
+        1,
+        "NON-PROCESS",
+    ),
     // Captured native SDK output text and child ExitStatus assertions are data.
     (
         "src/spend/request_tests.rs",
@@ -2112,6 +2119,31 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/find_files.rs",
         "assert!(output.contains(\"No files found\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    // Notebook parser/view assertions inspect owned String data, not processes.
+    (
+        "src/agent/tools/notebook.rs",
+        "Notebook::parse(output.as_bytes(), MAX_NOTEBOOK_BYTES)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/notebook.rs",
+        "assert!(output.contains(&nested));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/notebook.rs",
+        "assert!(output.contains(\"output bytes omitted\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/notebook.rs",
+        "assert!(output.len() < MAX_VIEW_BYTES);",
         1,
         "NON-PROCESS",
     ),
@@ -3053,7 +3085,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             // Approval regression: select! matches ToolResult.output and
             // records its text; it neither constructs nor launches a process.
             (
-                "a3a0a96b7dec31cf2b96758c38bebbbbebf90bb7b2543532aa394a7df144856f",
+                "2a651fc8fe75c0ea45234d99f2df6ce44f16757d00e1e47552e415e404271e09",
                 1,
             ),
         ],
@@ -3647,6 +3679,28 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
         ],
     ),
+    // Exact full-token contexts of those four notebook String assertions.
+    (
+        "src/agent/tools/notebook.rs",
+        &[
+            (
+                "b8a22ea3c44dfa022f99d414246e65b1f175ab4687fbda633be9246605ad946b",
+                1,
+            ),
+            (
+                "4969b09c8c9f35749df4497141b936749b60113dcb2157fa414e843e9df55dc8",
+                1,
+            ),
+            (
+                "7b1e5cde9d702c82371414edbf74788deb26b002323f724baa0c78855e282023",
+                1,
+            ),
+            (
+                "eb165b6c9b108e4be2dd9adf719be30b28d8595cf218016abed3be374e00db78",
+                1,
+            ),
+        ],
+    ),
     (
         "src/print.rs",
         &[
@@ -3794,6 +3848,12 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/ui/app.rs",
         &[
+            // Genuine pressure/question regression matches ToolResult.output
+            // inside its timeout future; this is event data, not process IO.
+            (
+                "3edad67d0872deca14b82de9ca22e3c54e8603ce632c80b8eaf55297b8a68d97",
+                1,
+            ),
             // Context diagnostic assertions inspect captured renderer strings,
             // never process builders; bind each complete macro invocation.
             (
@@ -4267,7 +4327,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 4, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
@@ -4341,7 +4401,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         ".status(ToolCallStatus::Completed)",
-        1,
+        2,
         "NON-PROCESS",
     ),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),

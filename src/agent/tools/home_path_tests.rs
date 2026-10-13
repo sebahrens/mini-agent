@@ -165,6 +165,7 @@ async fn read_and_edit_home_paths_resolve_through_the_ambient_path() {
     let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
+            raw_notebook: false,
             path: "$HOME/notes.txt".into(),
             offset: None,
             limit: None,

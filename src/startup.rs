@@ -2067,6 +2067,13 @@ impl Startup {
             // Snapshot before the session moves into the persistence block.
             #[cfg(feature = "goal")]
             let finished_goal = self.session.goal_store.snapshot();
+            let pending_question = failure
+                .as_ref()
+                .and_then(|error| error.downcast_ref::<crate::question::QuestionRequired>())
+                .cloned();
+            if let Some(question) = &pending_question {
+                self.session.pending_question = Some(question.clone());
+            }
             let mut persistence_failure = None;
             let mut title_accounting = None;
             if !self.cli.no_session {
@@ -2128,7 +2135,9 @@ impl Startup {
                 }
             }
             if let Some((files_changed, pricing)) = json_context {
-                let stop_reason = if failure.as_ref().is_some_and(|error| {
+                let stop_reason = if pending_question.is_some() {
+                    crate::print::HeadlessStopReason::AwaitingUser
+                } else if failure.as_ref().is_some_and(|error| {
                     error
                         .downcast_ref::<crate::spend::run::BudgetStopped>()
                         .is_some()
@@ -2166,6 +2175,9 @@ impl Startup {
                     finished_goal.as_ref(),
                 )?;
                 let mut rendered: serde_json::Value = serde_json::from_str(&rendered)?;
+                if let Some(question) = &pending_question {
+                    rendered["pending_question"] = serde_json::to_value(question)?;
+                }
                 if schema.is_some() {
                     rendered["result_json"] = schema_outcome
                         .result_json
@@ -2521,6 +2533,25 @@ pub(crate) async fn run_goal_rounds_for_loop(
         )
     })
     .await;
+    if let Some(failure) = rounds.turn.failure.as_ref()
+        && let Some(question) = failure.downcast_ref::<crate::question::QuestionRequired>()
+    {
+        session.pending_question = Some(question.clone());
+        if !rounds.persisted {
+            crate::extras::goal::driver::persist_round(
+                session,
+                &rounds.prompt,
+                crate::agent::runner::HeadlessTurn {
+                    response: rounds.turn.response.clone(),
+                    usage: rounds.turn.usage,
+                    interactions: rounds.turn.interactions.clone(),
+                    failure: None,
+                },
+                cfg,
+                cli.no_session,
+            )?;
+        }
+    }
     if let Some(failure) = rounds.turn.failure {
         return Err(failure);
     }
@@ -2575,6 +2606,8 @@ async fn run_headless_goal_rounds(
     // everyone who reads them.
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
+    let question_turn = crate::question::QuestionTurn::default();
+    session.pending_question = None;
     let output = if cli.is_loop_mode() && !cli.print {
         crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)
     } else {
@@ -2595,18 +2628,29 @@ async fn run_headless_goal_rounds(
     #[cfg(feature = "goal")]
     let mut round_started = std::time::Instant::now();
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
-    let mut turn = agent
-        .clone()
-        .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-        .run_print_with_output(
-            message,
-            output,
-            &cfg.retry,
-            history,
-            #[cfg(feature = "hooks")]
-            loop_round_info(session, loop_mode),
-        )
-        .await;
+    let mut turn = heap_future(|| {
+        // The chained setters move a large AnyAgent. Construct it in this
+        // short factory frame before the owned request starts polling HTTP.
+        let agent = agent
+            .clone()
+            .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+            .with_question_turn(Some(question_turn.clone()));
+        #[cfg(feature = "hooks")]
+        let loop_info = loop_round_info(session, loop_mode);
+        async move {
+            agent
+                .run_print_with_output(
+                    message,
+                    output,
+                    &cfg.retry,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+        }
+    })
+    .await;
     #[cfg(feature = "goal")]
     let mut round_elapsed = round_started.elapsed();
 
@@ -2657,6 +2701,21 @@ async fn run_headless_goal_rounds(
             summary.tokens_used = summary
                 .tokens_used
                 .saturating_add(std::mem::take(&mut pending_compaction_tokens));
+
+            if let Some(question) = turn
+                .failure
+                .as_ref()
+                .and_then(|error| error.downcast_ref::<crate::question::QuestionRequired>())
+            {
+                session.pending_question = Some(question.clone());
+                let outcome = driver::park_for_question(&session.goal_store, summary);
+                if let driver::RoundOutcome::Stopped { line, .. } = outcome {
+                    let _ = crate::print::headless_stderr_async(format!("{line}\n")).await;
+                }
+                // The ordinary persistence path below commits this partial
+                // round once. No verification/judge or automatic relaunch.
+                break;
+            }
 
             let sandbox_for_checks = sandbox.clone();
             let cfg_for_checks = cfg.clone();
@@ -2929,18 +2988,29 @@ async fn run_headless_goal_rounds(
             round_prompt = relaunch.prompt.clone();
             persisted = false;
             round_started = std::time::Instant::now();
-            let next = round_agent
-                .clone()
-                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-                .run_print_with_output(
-                    &relaunch.prompt,
-                    output,
-                    &cfg.retry,
-                    next_history,
-                    #[cfg(feature = "hooks")]
-                    loop_round_info(session, loop_mode),
-                )
-                .await;
+            let next = heap_future(|| {
+                // Automatic rounds retain the same clarification identity;
+                // only this round's owned financial/request profile is fresh.
+                let round_agent = round_agent
+                    .clone()
+                    .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                    .with_question_turn(Some(question_turn.clone()));
+                #[cfg(feature = "hooks")]
+                let loop_info = loop_round_info(session, loop_mode);
+                async move {
+                    round_agent
+                        .run_print_with_output(
+                            &relaunch.prompt,
+                            output,
+                            &cfg.retry,
+                            next_history,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                        .await
+                }
+            })
+            .await;
             round_elapsed = round_started.elapsed();
             // Only the final round's transcript is returned; earlier rounds are
             // already persisted above.

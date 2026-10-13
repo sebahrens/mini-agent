@@ -348,6 +348,32 @@ pub async fn handle_agent_event(
             renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
         }
         AgentEvent::CompactionBoundary { .. } => {}
+        AgentEvent::AwaitingUser { question, interactions } => {
+            ui.session.adopt_provider_tool_identity(&interactions);
+            let notice=question.notice();
+            ui.session.pending_question = Some(*question);
+            run.was_reasoning = false;
+            run.is_running = false;
+            run.pending_compaction_pressure = None;
+            run.compaction_decision_tx = None;
+            if let Some(signals) = &ui.status_signals { signals.send_stop(); }
+            finalize_response_segment(renderer, run)?;
+            crate::ui::preserve_pending_main_turn_progress(run, ui.session);
+            run.response_buf.clear();
+            run.response_start_block = None;
+            run.agent_line_started = false;
+            run.settle(std::time::Duration::from_secs(5)).await?;
+            #[cfg(feature = "goal")]
+            if ui.session.goal_store.is_active() {
+                let collector = run.goal_round.take().unwrap_or_default();
+                let open_todos = ui.session.todos.snapshot().iter().filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled")).count();
+                let summary = collector.finish(ui.session.goal_store.snapshot().as_ref().expect("active goal"), crate::extras::goal::gate::RoundEnd::AwaitingUser, open_todos);
+                crate::extras::goal::driver::park_for_question(&ui.session.goal_store, summary);
+            }
+            save_session_if_settled(ui.session, ui.cli, run, renderer)?;
+            renderer.write_line(&sanitize_output(&notice), Color::Yellow)?;
+            renderer.write_line("queued prompts remain parked", Color::Yellow)?;
+        }
         AgentEvent::Error {
             message: e,
             interactions,
@@ -965,6 +991,7 @@ async fn finish_goal_round(
             };
             let runner = round_agent
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                .with_question_turn(run.question_turn.clone())
                 .spawn_runner(
                     relaunch.prompt,
                     history,

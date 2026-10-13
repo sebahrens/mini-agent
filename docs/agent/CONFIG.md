@@ -3307,3 +3307,30 @@ Markdown definitions and 1024 entries per layer, with a 256 KiB limit per
 prompt; oversized, invalid UTF-8, link, and special-file definitions are
 omitted with a diagnostic. Global prompt/specialist aliases retain their
 existing compatibility policy.
+
+### Clarifying questions
+
+`headless_questions` accepts `"error"` (default) or `"fail"`. The default returns
+an ordinary `ask_user_question` tool error so the main agent can state a low-risk
+assumption within its existing permissions. `"fail"` parks for a user answer,
+preserves observed usage and earlier effects, emits `awaiting_user`, and exits
+22 in headless mode. A goal parks before verification or another automatic round.
+This setting grants no capability. Tools-disabled invocations do not expose the
+question tool. See [Clarifying questions](ASK_USER_QUESTION.md) for the bounded
+arguments, TUI and ACP answer transport and persisted-data contract.
+
+### Notebook permissions and reads
+
+`notebook_edit` is a configurable path permission for `.ipynb` cell mutations.
+Notebook-specific matching rules take precedence; otherwise configured `edit`
+rules apply. A matching deny for either name always wins, including against
+previous approvals. Runtime `edit` grants do not implicitly grant
+`notebook_edit`. Unmatched Standard asks before notebook edits unless the configured default denies, while unmatched
+ReadOnly/PlanWrite edits are denied. Approving a notebook mutation does not grant
+read access to its stored source, outputs or metadata.
+
+`read` renders `.ipynb` files as virtual cell/source/output lines by default;
+`offset` and `limit` then refer to that view. Set `raw_notebook: true` to request
+raw JSON, raw edit hashes or whole-file overwrite authorization. The cell view
+is not a full raw-file read. See [Notebook cells](TOOL_RUNTIME.md#notebook-cells)
+for the bounded format and output limits.

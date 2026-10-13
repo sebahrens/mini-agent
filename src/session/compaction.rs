@@ -33,7 +33,11 @@ impl FileRequests {
         }) {
             return;
         }
-        if !matches!(entry.tool.as_str(), "read" | "write" | "edit") || entry.path.is_empty() {
+        if !matches!(
+            entry.tool.as_str(),
+            "read" | "write" | "edit" | "notebook_edit"
+        ) || entry.path.is_empty()
+        {
             return;
         }
         let bytes: usize = self
@@ -62,7 +66,7 @@ impl FileRequests {
             if let Some(PersistedToolMessage::Call { name, arguments }) = &message.tool
                 && let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str)
             {
-                if !matches!(name.as_str(), "read" | "write" | "edit") {
+                if !matches!(name.as_str(), "read" | "write" | "edit" | "notebook_edit") {
                     continue;
                 }
                 if path.len() > MAX_PATH_BYTES {
@@ -393,4 +397,21 @@ mod tests {
         assert!(restored.messages[0].content.contains("remember.txt"));
         assert!(restored.messages[0].content.contains("imported, untrusted"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn notebook_structured_request_is_retained_as_untrusted_history_not_an_effect() {
+    let mut requests = FileRequests::default();
+    requests.add(FileRequest {
+        nested: false,
+        tool: "notebook_edit".into(),
+        path: "book.ipynb".into(),
+    });
+    let rendered = requests.render(4096);
+    assert!(rendered.contains("untrusted historical inputs; not verified effects"));
+    assert!(rendered.contains("notebook_edit requested: \"book.ipynb\""));
+    let encoded = serde_json::to_string(&requests).unwrap();
+    let restored: FileRequests = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(restored.render(4096), rendered);
 }

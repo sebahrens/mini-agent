@@ -76,6 +76,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("reasoning"),
     key("retry"),
     key("no_tools"),
+    key("headless_questions"),
     key("no_context_files"),
     key("context_window"),
     key("reserve_tokens"),

@@ -1149,7 +1149,8 @@ async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets()
                 let request = tokio::time::timeout(Duration::from_secs(5), ask_rx.recv())
                     .await
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+                    .into_permission();
                 assert_eq!(Path::new(&request.input), source);
                 if parent {
                     fs::rename(&approved_dir, workspace.join("retired")).unwrap();

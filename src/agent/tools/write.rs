@@ -534,6 +534,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
 
         read.call(ReadArgs {
+            raw_notebook: false,
             path: "existing.txt".into(),
             offset: None,
             limit: None,
@@ -564,6 +565,7 @@ mod tests {
             WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
 
         read.call(ReadArgs {
+            raw_notebook: false,
             path: "existing.txt".into(),
             offset: None,
             limit: None,
@@ -762,7 +764,11 @@ mod tests {
             overwrite: false,
         });
         let swap = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             let expected = std::fs::canonicalize(checked_target.parent().unwrap())
                 .unwrap()
                 .join(checked_target.file_name().unwrap());

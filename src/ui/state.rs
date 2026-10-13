@@ -389,6 +389,9 @@ pub(crate) struct AgentRunState {
     /// When streamed tokens last repainted the chat (repaint throttling).
     pub last_stream_paint: Option<std::time::Instant>,
     pub pending_turn: Option<PendingMainTurn>,
+    /// Clarification identity of the logical main user turn. Automatic
+    /// phases, retries and context relief preserve this exact slot.
+    pub question_turn: Option<crate::question::QuestionTurn>,
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,

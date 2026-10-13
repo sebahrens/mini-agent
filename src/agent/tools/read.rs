@@ -163,7 +163,7 @@ impl Tool for ReadTool {
     type Output = String;
 
     fn description(&self) -> String {
-        match edit_system() {
+        let text = match edit_system() {
             EditSystem::Similarity => format!(
                 "Read a UTF-8 text file with right-aligned 'N| content' line numbers. Defaults to the first {} lines. Files larger than {} bytes require an explicit offset or limit; the selected text must fit within that byte cap. Use a smaller line window for large files.",
                 self.max_lines, self.max_text_file_size
@@ -172,7 +172,10 @@ impl Tool for ReadTool {
                 "Read a UTF-8 text file with CRC-32 tagged lines for tag-based editing. Each line is prefixed with 'N|TAG' where TAG is an 8-char hex CRC-32 of the line content. Use these tags with the edit tool for CAS-guarded edits. Defaults to the first {} lines. Files larger than {} bytes require an explicit offset or limit; the selected text must fit within that byte cap.",
                 self.max_lines, self.max_text_file_size
             ),
-        }
+        };
+        format!(
+            "{text} .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -181,14 +184,22 @@ impl Tool for ReadTool {
             "properties": {
                 "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
                 "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" }
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" },
+                "raw_notebook": { "type": "boolean", "description": "For .ipynb: read raw JSON instead of virtual cell/source/output lines; required for raw hashedit or full-file overwrite authorization", "default": false }
             },
             "required": ["path"]
         })
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
+        let notebook_view =
+            !args.raw_notebook && super::notebook::is_notebook(Path::new(&args.path));
         let limit = args.limit.unwrap_or(self.max_lines as usize);
+        let limit = if notebook_view {
+            limit.min(self.max_lines as usize)
+        } else {
+            limit
+        };
         if limit == 0 {
             return Err(ToolError::Msg(r#"read limit must be at least 1 line. Example: {"path":"src/main.rs","offset":1,"limit":100}"#.into()));
         }
@@ -200,9 +211,12 @@ impl Tool for ReadTool {
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         let capability_file = bound_workspace
             .map(|workspace| {
-                workspace.open_relative(relative).map_err(|error| {
-                    crate::agent::tools::bound_open_error(workspace, relative, error)
+                (if notebook_view {
+                    workspace.open_regular_relative(relative)
+                } else {
+                    workspace.open_relative(relative)
                 })
+                .map_err(|error| crate::agent::tools::bound_open_error(workspace, relative, error))
             })
             .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
@@ -254,6 +268,49 @@ impl Tool for ReadTool {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
         let metadata = file.metadata().await?;
+
+        if notebook_view {
+            use tokio::io::AsyncReadExt;
+            let cap = super::notebook::byte_limit(self.max_text_file_size);
+            if !metadata.is_file() || metadata.len() > cap {
+                return Err(ToolError::Msg("Notebook view requires a regular bounded notebook; use raw_notebook:true for raw line windows".into()));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(cap.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() as u64 > cap {
+                return Err(ToolError::Msg(
+                    "Notebook grew beyond the raw-file cap".into(),
+                ));
+            }
+            let render_path = path.clone();
+            let view = crate::agent::runner::spawn_blocking_scoped(move || {
+                super::notebook::view(&bytes, &render_path, offset, limit, cap)
+            })
+            .await
+            .map_err(|_| ToolError::Msg("Notebook view job failed".into()))??;
+            if let Some(blocked) = self.read_tracker.check_notebook_view(
+                &permission_path,
+                offset,
+                limit,
+                &metadata,
+                view.crc,
+            ) {
+                return Err(ToolError::Msg(blocked));
+            }
+            self.read_tracker.record_notebook_view(
+                &permission_path,
+                offset,
+                limit,
+                &metadata,
+                view.crc,
+            );
+            return Ok(match coaching {
+                Some(coaching) => format!("{coaching}\n\n{}", view.text),
+                None => view.text,
+            });
+        }
 
         let file_size = metadata.len();
         let explicitly_bounded = args.offset.is_some() || args.limit.is_some();
@@ -557,6 +614,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 100);
         let error = tool
             .call(crate::agent::tools::ReadArgs {
+                raw_notebook: false,
                 path: "missing-file".into(),
                 offset: Some(1),
                 limit: Some(0),
@@ -570,6 +628,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 0);
         assert!(
             tool.call(crate::agent::tools::ReadArgs {
+                raw_notebook: false,
                 path: "missing-file".into(),
                 offset: None,
                 limit: None
@@ -618,6 +677,7 @@ mod tests {
 
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
+                raw_notebook: false,
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(6),
                 limit: Some(2),
@@ -644,6 +704,7 @@ mod tests {
 
         let output = tool
             .call(ReadArgs {
+                raw_notebook: false,
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(3),
                 limit: Some(2),
@@ -670,6 +731,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                raw_notebook: false,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -693,6 +755,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                raw_notebook: false,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -744,12 +807,17 @@ mod tests {
         let tool = ReadTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None, 100);
 
         let call = tool.call(ReadArgs {
+            raw_notebook: false,
             path: link.to_string_lossy().into_owned(),
             offset: None,
             limit: None,
         });
         let swap = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(
                 PathBuf::from(&request.input),
                 std::fs::canonicalize(&checked_target).unwrap()

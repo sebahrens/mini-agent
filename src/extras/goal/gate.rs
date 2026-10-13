@@ -41,6 +41,9 @@ pub enum RoundEnd {
     /// The run failed before the agent could finish: a provider error, an
     /// exhausted per-response turn budget, or a failed verification gate.
     Failed(String),
+    /// A typed main-agent clarification parked after actual work settled.
+    /// Unlike an interrupt, its observed usage and active time still count.
+    AwaitingUser,
     /// The user interrupted.
     Cancelled,
 }
@@ -101,7 +104,7 @@ impl RoundSummary {
     /// says so. Only a round that did neither counts as a stall, which is why
     /// a question to the user is a report rather than silence.
     fn made_progress(&self) -> bool {
-        self.mutating_tool_calls > 0 || self.report.is_some()
+        self.mutating_tool_calls > 0 || self.report.is_some() || self.end == RoundEnd::AwaitingUser
     }
 }
 
@@ -338,6 +341,17 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // Row 1. An interrupted round is not the agent's verdict on anything.
     if round.end == RoundEnd::Cancelled {
         return Step::Decided(gate_interrupted());
+    }
+
+    // A real clarification is not a completion claim or a failed round.
+    // Preserve its observed accounting without verification or an automatic
+    // wrap-up request, even when this round also exhausted a bound.
+    if round.end == RoundEnd::AwaitingUser {
+        return Step::Decided(GateDecision::stop(
+            GoalStatus::AwaitingUser,
+            "the agent needs a user answer before continuing",
+            VerdictSource::Runtime,
+        ));
     }
 
     // Rows 2 to 4. A failed run gets retried; repeated failure parks the goal

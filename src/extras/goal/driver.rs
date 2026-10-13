@@ -1046,6 +1046,36 @@ pub fn apply_decision(
     }
 }
 
+/// Settle a typed clarification stop without calling any verification tier.
+/// Every frontend uses the normal decision application so real round usage,
+/// active time, transcript and progress remain attributable exactly once.
+pub(crate) fn park_for_question(
+    store: &super::GoalStore,
+    mut summary: RoundSummary,
+) -> RoundOutcome {
+    let Some(goal) = store.snapshot().filter(|goal| !goal.status.is_terminal()) else {
+        return RoundOutcome::Inactive;
+    };
+    summary.end = RoundEnd::AwaitingUser;
+    let super::gate::Step::Decided(decision) = super::gate::gate_pre(&goal, &summary) else {
+        // The closed AwaitingUser gate cannot request verification. Keep the
+        // host decision conservative if that table is extended later.
+        return apply_decision(
+            store,
+            &summary,
+            super::gate::GateDecision::Stop {
+                status: GoalStatus::AwaitingUser,
+                reason: "the agent needs a user answer before continuing".into(),
+                paused_reason: None,
+                source: super::VerdictSource::Runtime,
+                evidence: Vec::new(),
+            },
+            &Verification::default(),
+        );
+    };
+    apply_decision(store, &summary, decision, &Verification::default())
+}
+
 /// Judge the round that just ended and record the result.
 ///
 /// This is the one place a round is folded into the goal, so the TUI, headless
@@ -1749,6 +1779,41 @@ mod outcome_recording_tests {
         assert!(
             source.counts_toward_promotion(),
             "a checks-backed verdict is promotion evidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod question_park_tests {
+    use super::*;
+    #[test]
+    fn ask_user_goal_park_records_real_round_usage_without_verification_or_relaunch() {
+        let store = super::super::GoalStore::default();
+        let mut goal =
+            super::super::Goal::new("Clarify then work", vec!["verified".into()]).unwrap();
+        goal.checks.push(super::super::GoalCheck::new("NEVER_RUN"));
+        goal.judge = super::super::JudgePolicy::Session;
+        store.set(goal, false).unwrap();
+        let summary = RoundSummary {
+            end: RoundEnd::AwaitingUser,
+            tool_calls: 2,
+            mutating_tool_calls: 1,
+            tokens_used: 240,
+            active: std::time::Duration::from_millis(7),
+            ..RoundSummary::completed()
+        };
+        assert!(matches!(
+            park_for_question(&store, summary),
+            RoundOutcome::Stopped { .. }
+        ));
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.status, GoalStatus::AwaitingUser);
+        assert_eq!(goal.progress.rounds, 1);
+        assert_eq!(goal.progress.tokens_used, 240);
+        assert!(goal.last_verdict.as_ref().unwrap().evidence.is_empty());
+        assert_eq!(
+            goal.last_verdict.as_ref().unwrap().source,
+            super::super::VerdictSource::Runtime
         );
     }
 }

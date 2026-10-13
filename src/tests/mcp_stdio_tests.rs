@@ -1317,9 +1317,17 @@ async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
             todo_tools_enabled: false,
         };
         let mut prebuild = Some(prebuild);
-        crate::ui::start_main_run("hello", false, &mut run, &mut ui, &slash, &mut prebuild)
-            .await
-            .unwrap();
+        crate::ui::start_main_run(
+            "hello",
+            false,
+            crate::question::QuestionOrigin::NewUserTurn,
+            &mut run,
+            &mut ui,
+            &slash,
+            &mut prebuild,
+        )
+        .await
+        .unwrap();
         assert!(prebuild.is_none());
         assert!(ui.context.memory.is_none());
         assert!(
@@ -1631,7 +1639,11 @@ async fn builder_omissions_reach_the_headless_notice_sink_after_collection() {
     let fixture = FixtureBuild::compile();
     let mut leases = Vec::new();
     let mut handles = Vec::new();
-    for (server, tool) in [("reserved", "read"), ("safe", "probe")] {
+    for (server, tool) in [
+        ("reserved", "read"),
+        ("reserved-notebook", "notebook_edit"),
+        ("safe", "probe"),
+    ] {
         let lease = fixture.lease(server);
         handles.push(
             McpClientHandle::connect(
@@ -1677,6 +1689,7 @@ async fn builder_omissions_reach_the_headless_notice_sink_after_collection() {
         [
             "connection notice",
             "MCP tool 'read' from server 'reserved' omitted: name reserved by a built-in tool",
+            "MCP tool 'notebook_edit' from server 'reserved-notebook' omitted: name reserved by a built-in tool",
             "late catalog notice",
         ]
     );
@@ -2020,6 +2033,7 @@ async fn delayed_prebuild_preserves_configuration_and_services_across_interrupti
         let mut first = Box::pin(crate::ui::start_main_run(
             "first",
             false,
+            crate::question::QuestionOrigin::NewUserTurn,
             &mut run,
             &mut ui,
             &slash,
@@ -2041,6 +2055,7 @@ async fn delayed_prebuild_preserves_configuration_and_services_across_interrupti
                 crate::ui::start_main_run(
                     "after interruption",
                     false,
+                    crate::question::QuestionOrigin::NewUserTurn,
                     &mut run,
                     &mut ui,
                     &slash,

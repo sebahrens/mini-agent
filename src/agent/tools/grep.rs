@@ -867,7 +867,8 @@ mod tests {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("grep did not request path permission")
-                .expect("grep permission channel closed");
+                .expect("grep permission channel closed")
+                .into_permission();
             assert_eq!(request.tool.as_str(), "grep");
             assert_eq!(
                 PathBuf::from(request.input.as_str()),
@@ -899,7 +900,8 @@ mod tests {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("grep did not request path permission")
-                .expect("grep permission channel closed");
+                .expect("grep permission channel closed")
+                .into_permission();
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_root);
             let pattern = request
                 .suggested_pattern
@@ -1007,7 +1009,8 @@ mod tests {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("grep did not request path permission")
-                .expect("grep permission channel closed");
+                .expect("grep permission channel closed")
+                .into_permission();
             assert_eq!(request.tool.as_str(), "grep");
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_external);
             request
@@ -1274,7 +1277,11 @@ mod tests {
             count: false,
         });
         let swap = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&swapped, &link).unwrap();
@@ -1315,7 +1322,11 @@ mod tests {
             count: false,
         });
         let replace = async {
-            let request = ask_rx.recv().await.expect("permission request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("permission request")
+                .into_permission();
             assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::rename(&authorized, &moved).unwrap();
             std::os::unix::fs::symlink(&swapped, &authorized).unwrap();

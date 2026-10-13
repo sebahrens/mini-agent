@@ -2005,6 +2005,7 @@ pub struct AnyAgent {
     /// different unit entirely.
     turn_token_budget: Option<u64>,
     spend: Option<crate::spend::run::Run>,
+    question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
     context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "lsp")]
@@ -2021,6 +2022,7 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            question_turn: None,
             completion_verification: None,
             context_snapshot: None,
             #[cfg(feature = "lsp")]
@@ -2045,6 +2047,16 @@ impl AnyAgent {
         kind: crate::spend::RequestKind,
     ) -> Self {
         self.spend = Some(crate::spend::run::Run::for_session(session, cfg, kind));
+        self
+    }
+
+    /// Only an explicit main invocation supplies this identity. Cached agents
+    /// and auxiliary requests start without clarification authority.
+    pub(crate) fn with_question_turn(
+        mut self,
+        turn: Option<crate::question::QuestionTurn>,
+    ) -> Self {
+        self.question_turn = turn;
         self
     }
 
@@ -2125,6 +2137,7 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            question_turn: None,
             completion_verification: None,
             context_snapshot: None,
             #[cfg(feature = "lsp")]
@@ -2242,7 +2255,7 @@ impl AnyAgent {
         // Construct the aggregate provider future in a short heap_future frame
         // before layering cancellation and task-local scopes around it.
         // Box::pin(async { ... }) still reserves its temporary in this poll.
-        let mut turn = crate::spend::run::scope(
+        let future = crate::spend::run::scope(
             self.spend.clone(),
             crate::print::run_headless_turn(crate::startup::heap_future(|| async {
                 if let Some(spend) = crate::spend::run::Run::current()
@@ -2256,7 +2269,9 @@ impl AnyAgent {
                     Some(
                         match runner::await_headless_work(self.turn_gate.lock()).await {
                             Ok(guard) => guard,
-                            Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                            Err(error) => {
+                                return runner::HeadlessTurn::failed_before_start(error);
+                            }
                         },
                     )
                 } else {
@@ -2374,8 +2389,8 @@ impl AnyAgent {
                     }
                 }
             })),
-        )
-        .await;
+        );
+        let mut turn = crate::question::scope(self.question_turn.clone(), future).await;
         // SDK hook errors carry a string. Recover the typed budget outcome
         // only when this exact parent-owned run actually refused admission.
         if let Some(spend) = &self.spend {
@@ -2387,7 +2402,13 @@ impl AnyAgent {
                 .saturating_add(accepted.nonnegative_difference(projected))
                 .into();
         }
-        if self.spend.as_ref().is_some_and(|run| run.was_refused()) && turn.failure.is_some() {
+        if self.spend.as_ref().is_some_and(|run| run.was_refused())
+            && turn.failure.as_ref().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::question::QuestionRequired>()
+                    .is_none()
+            })
+        {
             turn.failure = Some(crate::spend::run::BudgetStopped.into());
         }
         turn
@@ -2402,7 +2423,7 @@ impl AnyAgent {
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
     ) -> runner::SubagentRunOutput {
-        crate::spend::run::scope(
+        let future = crate::spend::run::scope(
             self.spend.clone().or_else(crate::spend::run::Run::current),
             async {
                 #[cfg(feature = "skills")]
@@ -2490,8 +2511,8 @@ impl AnyAgent {
                     }
                 }
             },
-        )
-        .await
+        );
+        crate::question::scope(None, future).await
     }
 
     /// Async because, under `hooks`, the `UserPromptSubmit` gate must resolve
@@ -2557,7 +2578,8 @@ impl AnyAgent {
     {
         // The typed dispatch child is large in debug builds. Construct it in
         // the short factory frame while the spend scope still owns every poll.
-        crate::spend::run::scope(
+        let question_turn = self.question_turn.clone();
+        let future = crate::spend::run::scope(
             self.spend.clone(),
             crate::startup::heap_future(|| async move {
                 if let Some(spend) = crate::spend::run::Run::current()
@@ -2673,8 +2695,8 @@ impl AnyAgent {
                     ),
                 }
             }),
-        )
-        .await
+        );
+        crate::question::scope(question_turn, future).await
     }
 
     pub fn spawn_btw(
@@ -2685,27 +2707,29 @@ impl AnyAgent {
         id: u32,
         retry_config: RetryConfig,
     ) -> crate::agent::runner::BtwRunner {
-        crate::spend::run::scope_sync(self.spend.clone(), || match self.inner {
-            AnyAgentInner::OpenRouter(a) => {
-                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-            }
-            AnyAgentInner::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => {
+        crate::question::scope_sync(None, || {
+            crate::spend::run::scope_sync(self.spend.clone(), || match self.inner {
+                AnyAgentInner::OpenRouter(a) => {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
-                OpenAiAgent::Completions(a) => {
+                AnyAgentInner::OpenAI(a) => match a {
+                    OpenAiAgent::Responses(a) => {
+                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                    }
+                    OpenAiAgent::Completions(a) => {
+                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                    }
+                },
+                AnyAgentInner::Anthropic(a) => {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
-            },
-            AnyAgentInner::Anthropic(a) => {
-                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-            }
-            AnyAgentInner::Gemini(a) => {
-                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-            }
-            AnyAgentInner::Ollama(a) => {
-                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-            }
+                AnyAgentInner::Gemini(a) => {
+                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                }
+                AnyAgentInner::Ollama(a) => {
+                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                }
+            })
         })
     }
 }
@@ -4034,6 +4058,7 @@ mod compaction_quality_tests {
             session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path":path}));
             let output = read
                 .call(ReadArgs {
+                    raw_notebook: false,
                     path,
                     offset: None,
                     limit: None,

@@ -72,7 +72,11 @@ fn lsp_tool(root: &Path, config: PermissionConfig) -> (LspTool, Option<AskReceiv
 }
 
 async fn answer_once(mut ask_rx: AskReceiver, expected_path: &Path) {
-    let request = ask_rx.recv().await.expect("permission request");
+    let request = ask_rx
+        .recv()
+        .await
+        .expect("permission request")
+        .into_permission();
     assert_eq!(request.tool.as_str(), "lsp_diagnostics");
     assert_eq!(Path::new(&request.input), expected_path);
     request.reply.send(UserDecision::AllowOnce).unwrap();
@@ -1202,7 +1206,13 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
 
     let first_tool = tool.clone();
     let task = tokio::spawn(async move { first_tool.call(LspArgs { path: None }).await });
-    let request = ask_rx.as_mut().unwrap().recv().await.unwrap();
+    let request = ask_rx
+        .as_mut()
+        .unwrap()
+        .recv()
+        .await
+        .unwrap()
+        .into_permission();
     assert_eq!(request.tool.as_str(), "lsp_diagnostics");
     assert_eq!(Path::new(&request.input), root_path);
     let pattern = request
@@ -1228,7 +1238,8 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
         tokio::time::timeout(Duration::from_secs(1), ask_rx.as_mut().unwrap().recv())
             .await
             .expect("project AllowAlways must not authorize a sibling path")
-            .unwrap();
+            .unwrap()
+            .into_permission();
     assert_eq!(Path::new(&sibling_request.input), sibling);
     sibling_request.reply.send(UserDecision::Deny).unwrap();
     let output = tokio::time::timeout(Duration::from_secs(1), task)
@@ -1247,7 +1258,8 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
         tokio::time::timeout(Duration::from_secs(1), ask_rx.as_mut().unwrap().recv())
             .await
             .expect("repeat aggregate must reach the still-unauthorized sibling")
-            .unwrap();
+            .unwrap()
+            .into_permission();
     assert_eq!(
         Path::new(&repeated_request.input),
         sibling,
@@ -1296,7 +1308,13 @@ async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_nam
 
     let first_tool = tool.clone();
     let first = tokio::spawn(async move { first_tool.call(LspArgs { path: None }).await });
-    let root_request = ask_rx.as_mut().unwrap().recv().await.unwrap();
+    let root_request = ask_rx
+        .as_mut()
+        .unwrap()
+        .recv()
+        .await
+        .unwrap()
+        .into_permission();
     assert_eq!(Path::new(&root_request.input), project);
     let descendants = root_request.suggested_pattern.clone().unwrap();
     let exact = root_request.additional_allow_patterns.first().unwrap();
@@ -1313,7 +1331,13 @@ async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_nam
         .send(UserDecision::AllowAlways(descendants))
         .unwrap();
 
-    let sibling_request = ask_rx.as_mut().unwrap().recv().await.unwrap();
+    let sibling_request = ask_rx
+        .as_mut()
+        .unwrap()
+        .recv()
+        .await
+        .unwrap()
+        .into_permission();
     assert_eq!(Path::new(&sibling_request.input), sibling_file);
     sibling_request.reply.send(UserDecision::Deny).unwrap();
     let output = first.await.unwrap().unwrap();
@@ -1326,7 +1350,8 @@ async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_nam
         tokio::time::timeout(Duration::from_secs(1), ask_rx.as_mut().unwrap().recv())
             .await
             .expect("the exact root scope must suppress a repeated root prompt")
-            .unwrap();
+            .unwrap()
+            .into_permission();
     assert_eq!(Path::new(&repeated_request.input), sibling_file);
     repeated_request.reply.send(UserDecision::Deny).unwrap();
     second.await.unwrap().unwrap();
@@ -1878,7 +1903,13 @@ async fn explicit_lsp_allow_always_suppresses_later_asks() {
             })
             .await
     });
-    let request = ask_rx.as_mut().unwrap().recv().await.unwrap();
+    let request = ask_rx
+        .as_mut()
+        .unwrap()
+        .recv()
+        .await
+        .unwrap()
+        .into_permission();
     assert_eq!(Path::new(&request.input), canonical);
     let pattern = crate::ui::utils::suggest_pattern(&request.tool, &request.input);
     assert_ne!(pattern, "*");

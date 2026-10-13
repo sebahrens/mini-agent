@@ -52,6 +52,7 @@ struct CommittedTurn {
 
 #[derive(Default)]
 struct SessionHistory {
+    pending_question: Option<crate::question::QuestionRequired>,
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
     summary: Option<String>,
@@ -1856,6 +1857,234 @@ fn allow_always_scope(
     (pattern, meta)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum QuestionSelection {
+    Choice(usize),
+    NewMessage,
+}
+
+/// Decode only an exact advertised identity. This does not construct a
+/// permission decision, even though ACP renders the choices with that RPC.
+fn question_selection(
+    id: &str,
+    index: usize,
+    item: &crate::question::Question,
+    selected: &str,
+) -> Option<QuestionSelection> {
+    let prefix = format!("{id}:{index}");
+    if item.allow_free_text && selected == format!("{prefix}:new-message") {
+        return Some(QuestionSelection::NewMessage);
+    }
+    (0..item.options.len())
+        .find(|choice| selected == format!("{prefix}:choice:{choice}"))
+        .map(QuestionSelection::Choice)
+}
+
+#[cfg(test)]
+mod question_selection_tests {
+    use super::*;
+    use crate::question::{Question, QuestionOption};
+
+    #[test]
+    fn ask_user_acp_answers_require_exact_current_advertised_option_ids() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut item = Question {
+            question: "Which branch?".into(),
+            options: vec![QuestionOption {
+                label: "main".into(),
+                description: String::new(),
+            }],
+            allow_free_text: true,
+        };
+        assert_eq!(
+            question_selection(&id, 0, &item, &format!("{id}:0:choice:0")),
+            Some(QuestionSelection::Choice(0))
+        );
+        assert_eq!(
+            question_selection(&id, 0, &item, &format!("{id}:0:new-message")),
+            Some(QuestionSelection::NewMessage)
+        );
+        for stale in [
+            format!("{id}:1:choice:0"),
+            format!("{}:0:choice:0", uuid::Uuid::new_v4()),
+            format!("{id}:0:choice:1"),
+            format!("{id}:0:choice:00"),
+            format!("{id}:0:cancel"),
+            "allow_once".into(),
+            "allow_always".into(),
+            "main".into(),
+            "0".into(),
+        ] {
+            assert_eq!(question_selection(&id, 0, &item, &stale), None);
+        }
+        item.allow_free_text = false;
+        assert_eq!(
+            question_selection(&id, 0, &item, &format!("{id}:0:new-message")),
+            None
+        );
+        assert_eq!(
+            question_selection(&id, 0, &item, &format!("{id}:0:choice:0")),
+            Some(QuestionSelection::Choice(0))
+        );
+    }
+}
+
+/// Clarification uses advertised option IDs as task data only. This path
+/// never calls permission grant installation or constructs UserDecision.
+async fn drive_question_request(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    mut question: crate::permission::ask::QuestionRequest,
+    control: &Arc<TurnControl>,
+    #[cfg(feature = "goal")] blocked_ms: &Arc<std::sync::atomic::AtomicU64>,
+) {
+    use crate::question::{Answer, QuestionAnswer};
+    if question.questions.validate().is_err()
+        || question.id.len() != 36
+        || uuid::Uuid::parse_str(&question.id).is_err()
+        || question.reply.is_closed()
+        || control.is_cancelled()
+    {
+        let _ = question.reply.send(QuestionAnswer::Cancelled);
+        return;
+    }
+    let synthetic = question.tool_call_id.is_none();
+    let call_id = ToolCallId::new(
+        question
+            .tool_call_id
+            .clone()
+            .unwrap_or_else(|| format!("question-{}", question.id)),
+    );
+    if synthetic {
+        let announced = ToolCall::new(
+            call_id.clone(),
+            "Clarification (task data, no permission grant)",
+        );
+        if cx
+            .send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCall(announced),
+            ))
+            .is_err()
+        {
+            let _ = question.reply.send(QuestionAnswer::Cancelled);
+            return;
+        }
+    }
+    let mut answers = Vec::new();
+    let mut waiting = false;
+    for (index, item) in question.questions.0.iter().enumerate() {
+        let prefix = format!("{}:{index}", question.id);
+        let mut options = item
+            .options
+            .iter()
+            .enumerate()
+            .map(|(choice, option)| {
+                PermissionOption::new(
+                    format!("{prefix}:choice:{choice}"),
+                    crate::ui::events::sanitize_output(&option.label),
+                    PermissionOptionKind::AllowOnce,
+                )
+            })
+            .collect::<Vec<_>>();
+        let other_id = format!("{prefix}:new-message");
+        if item.allow_free_text {
+            options.push(PermissionOption::new(
+                other_id.clone(),
+                "Answer in a new user message (park this turn)",
+                PermissionOptionKind::AllowOnce,
+            ));
+        }
+        options.push(PermissionOption::new(
+            format!("{prefix}:cancel"),
+            "Cancel clarification",
+            PermissionOptionKind::RejectOnce,
+        ));
+        let content = item
+            .options
+            .iter()
+            .enumerate()
+            .map(|(choice, option)| {
+                format!("{}. {} — {}", choice + 1, option.label, option.description)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fields = ToolCallUpdateFields::new()
+            .title(format!(
+                "Clarification {}/{}: {}",
+                index + 1,
+                question.questions.0.len(),
+                crate::ui::events::sanitize_output(&item.question)
+            ))
+            .content(vec![ToolCallContent::from(ContentBlock::Text(
+                TextContent::new(crate::ui::events::sanitize_output(&content)),
+            ))]);
+        let req = RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new(call_id.clone(), fields),
+            options,
+        );
+        #[cfg(feature = "goal")]
+        let started = std::time::Instant::now();
+        let response = tokio::select! {
+            biased;
+            _=control.cancelled()=>None,
+            _=question.reply.closed()=>None,
+            response=cx.send_request(req).block_task()=>Some(response),
+        };
+        #[cfg(feature = "goal")]
+        blocked_ms.fetch_add(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let selected = match response {
+            Some(Ok(response)) => match response.outcome {
+                RequestPermissionOutcome::Selected(selected) => {
+                    Some(selected.option_id.0.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match selected
+            .as_deref()
+            .and_then(|selected| question_selection(&question.id, index, item, selected))
+        {
+            Some(QuestionSelection::NewMessage) => {
+                waiting = true;
+                break;
+            }
+            Some(QuestionSelection::Choice(choice)) => answers.push(Answer::Option(choice)),
+            None => {
+                let _ = question.reply.send(QuestionAnswer::Cancelled);
+                return;
+            }
+        }
+    }
+    if synthetic {
+        let text = if waiting {
+            "Waiting for the next ordinary user message; no free-text reply protocol or permission grant was used"
+        } else {
+            "Clarification answered; no permission was granted"
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::from(ContentBlock::Text(
+                TextContent::new(text),
+            ))]);
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id, fields)),
+        ));
+    }
+    let answer = if waiting {
+        QuestionAnswer::AwaitingUser(answers)
+    } else {
+        QuestionAnswer::Answered(answers)
+    };
+    let _ = question.reply.send(answer);
+}
+
 async fn drive_permission_bridge(
     cx: ConnectionTo<Client>,
     session_id: SessionId,
@@ -1873,7 +2102,7 @@ async fn drive_permission_bridge(
     const OPT_DENY: &str = "deny";
 
     loop {
-        let mut ask = tokio::select! {
+        let ask = tokio::select! {
             biased;
             _ = control.cancelled() => break,
             ask = ask_rx.recv() => match ask {
@@ -1882,6 +2111,21 @@ async fn drive_permission_bridge(
             },
         };
 
+        let mut ask = match ask {
+            crate::permission::ask::UserRequest::Permission(ask) => ask,
+            crate::permission::ask::UserRequest::Question(question) => {
+                drive_question_request(
+                    &cx,
+                    &session_id,
+                    question,
+                    &control,
+                    #[cfg(feature = "goal")]
+                    &blocked_ms,
+                )
+                .await;
+                continue;
+            }
+        };
         let (suggested, allow_always_meta) = allow_always_scope(&ask);
         let synthetic_tool_call_id = ask.tool_call_id.is_none();
         let title = if synthetic_tool_call_id {
@@ -1992,7 +2236,7 @@ async fn drive_permission_bridge(
     }
     // Drain remaining buffered asks as Deny after control cancelled.
     while let Ok(ask) = ask_rx.try_recv() {
-        let _ = ask.reply.send(UserDecision::Deny);
+        ask.cancel();
     }
 }
 
@@ -2054,6 +2298,7 @@ async fn run_prompt(
     let blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(feature = "goal")]
     let round_started = std::time::Instant::now();
+    history.pending_question = None;
     let result = execute_prompt(
         state,
         prompt_text,
@@ -2088,31 +2333,68 @@ async fn run_prompt(
     if !registration.complete_and_settle() {
         outcome.reason = StopReason::Cancelled;
         outcome.error = None;
+        outcome.question = None;
     }
     // Settle the goal round this prompt turn was, before the transcript is
     // committed, so the gate sees the round's own record.
     #[cfg(feature = "goal")]
-    let goal_line = settle_acp_goal_round(
-        &goal_store_for_gate,
-        outcome.reason,
-        outcome.error.as_deref(),
-        outcome.progress.as_deref().unwrap_or(&[]),
-        &todo_snapshot,
-        state,
-        &sandbox_for_gate,
-        &crate::extras::goal::driver::RoundCost {
-            usage: outcome.usage,
-            // What the agent worked for, excluding whatever the user spent
-            // deciding on a permission prompt.
-            active: round_started
-                .elapsed()
-                .saturating_sub(std::time::Duration::from_millis(
-                    blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
-                )),
-        },
-    )
-    .await;
+    let goal_line = if outcome.question.is_some() {
+        goal_store_for_gate
+            .snapshot()
+            .filter(|goal| goal.status.is_running())
+            .and_then(|goal| {
+                let open_todos = todo_snapshot
+                    .iter()
+                    .filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled"))
+                    .count();
+                let cost = crate::extras::goal::driver::RoundCost {
+                    usage: outcome.usage,
+                    active: round_started.elapsed().saturating_sub(
+                        std::time::Duration::from_millis(
+                            blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    ),
+                };
+                let summary = crate::extras::goal::driver::summary_from_headless_turn(
+                    &goal,
+                    outcome.progress.as_deref().unwrap_or(&[]),
+                    &cost,
+                    None,
+                    open_todos,
+                    false,
+                );
+                match crate::extras::goal::driver::park_for_question(&goal_store_for_gate, summary)
+                {
+                    crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } => {
+                        goal_store_for_gate.snapshot().map(|goal| (line, goal))
+                    }
+                    _ => None,
+                }
+            })
+    } else {
+        settle_acp_goal_round(
+            &goal_store_for_gate,
+            outcome.reason,
+            outcome.error.as_deref(),
+            outcome.progress.as_deref().unwrap_or(&[]),
+            &todo_snapshot,
+            state,
+            &sandbox_for_gate,
+            &crate::extras::goal::driver::RoundCost {
+                usage: outcome.usage,
+                // What the agent worked for, excluding whatever the user spent
+                // deciding on a permission prompt.
+                active: round_started
+                    .elapsed()
+                    .saturating_sub(std::time::Duration::from_millis(
+                        blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
+            },
+        )
+        .await
+    };
 
+    history.pending_question = outcome.question.clone();
     if let Some(progress) = outcome.progress
         && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
     {
@@ -2159,6 +2441,21 @@ async fn run_prompt(
     // tell the two apart. Progress the turn made is still committed above.
     if let Some(error) = outcome.error {
         let _ = respond_terminal_error(registration, responder, error);
+    } else if let Some(question) = outcome.question {
+        // ACP options carry answers as data. A free-text answer comes as the
+        // next ordinary prompt, after this exact reply/turn is retired.
+        let mut response = PromptResponse::new(StopReason::EndTurn);
+        response.meta = Some(serde_json::Map::from_iter([
+            ("stop_reason".to_owned(), serde_json::json!("awaiting_user")),
+            (
+                "pending_question".to_owned(),
+                serde_json::to_value(question).map_err(|_| {
+                    agent_client_protocol::Error::new(-32603, "Could not encode bounded question")
+                })?,
+            ),
+        ]));
+        registration.settle();
+        let _ = responder.respond(response);
     } else {
         let _ = respond_terminal(registration, responder, outcome.reason);
     }
@@ -2283,6 +2580,7 @@ struct PromptOutcome {
     /// Ignored when `error` is set: a failed turn is answered with a JSON-RPC
     /// error, never with a stop reason.
     reason: StopReason,
+    question: Option<crate::question::QuestionRequired>,
     progress: Option<Vec<Message>>,
     /// An internal failure; the prompt request fails with this message.
     error: Option<String>,
@@ -2310,6 +2608,7 @@ impl PromptOutcome {
     fn cancelled(progress: Option<Vec<Message>>) -> Self {
         Self {
             reason: StopReason::Cancelled,
+            question: None,
             progress,
             error: None,
             #[cfg(feature = "goal")]
@@ -2320,6 +2619,7 @@ impl PromptOutcome {
     fn failed(error: String) -> Self {
         Self {
             reason: StopReason::Refusal,
+            question: None,
             progress: None,
             error: Some(error),
             #[cfg(feature = "goal")]
@@ -2603,7 +2903,9 @@ async fn execute_prompt(
         return Ok(PromptOutcome::cancelled(None));
     };
 
-    let agent = agent.with_spend(crate::spend::run::Run::current());
+    let agent = agent
+        .with_spend(crate::spend::run::Run::current())
+        .with_question_turn(Some(crate::question::QuestionTurn::default()));
     let Some(paused_runner) = run_owned_pre_run(
         &control,
         &work_scope,
@@ -2751,6 +3053,7 @@ async fn relay_prompt_events(
         let Some(event) = event else {
             return PromptOutcome {
                 reason: StopReason::Refusal,
+                question: None,
                 progress: None,
                 #[cfg(feature = "goal")]
                 usage: rig::completion::Usage::default(),
@@ -2907,10 +3210,27 @@ async fn relay_prompt_events(
                 control.cancel();
                 return cancelled_after_runner(&mut rx).await;
             }
+            AgentEvent::AwaitingUser {
+                question,
+                interactions,
+            } => {
+                // Closing this receiver waits for the exact run and its owned
+                // effects. A future ordinary user prompt gets a fresh slot.
+                while rx.recv().await.is_some() {}
+                return PromptOutcome {
+                    reason: StopReason::EndTurn,
+                    question: Some(*question),
+                    progress: Some(interactions),
+                    error: None,
+                    #[cfg(feature = "goal")]
+                    usage,
+                };
+            }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
+                    question: None,
                     progress: Some(interactions),
                     error: None,
                     #[cfg(feature = "goal")]
@@ -2924,6 +3244,7 @@ async fn relay_prompt_events(
                 while rx.recv().await.is_some() {}
                 return PromptOutcome {
                     reason: StopReason::Refusal,
+                    question: None,
                     progress: Some(interactions),
                     error: Some(message.to_string()),
                     #[cfg(feature = "goal")]
@@ -2940,7 +3261,9 @@ async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>
     let mut progress = None;
     while let Some(event) = rx.recv().await {
         match event {
-            AgentEvent::Done { interactions, .. } | AgentEvent::Error { interactions, .. }
+            AgentEvent::Done { interactions, .. }
+            | AgentEvent::Error { interactions, .. }
+            | AgentEvent::AwaitingUser { interactions, .. }
                 if !interactions.is_empty() =>
             {
                 progress = Some(interactions);
@@ -3923,14 +4246,17 @@ mod protocol_tests {
             .connect_with(agent, async move |_cx| {
                 let (reply, receiver) = tokio::sync::oneshot::channel();
                 ask_tx
-                    .send(AskRequest {
-                        tool: "write".into(),
-                        input: requested.to_owned(),
-                        tool_call_id: Some("write-call".to_owned()),
-                        suggested_pattern: None,
-                        additional_allow_patterns: Vec::new(),
-                        reply,
-                    })
+                    .send(
+                        AskRequest {
+                            tool: "write".into(),
+                            input: requested.to_owned(),
+                            tool_call_id: Some("write-call".to_owned()),
+                            suggested_pattern: None,
+                            additional_allow_patterns: Vec::new(),
+                            reply,
+                        }
+                        .into(),
+                    )
                     .await
                     .unwrap();
                 let (request, responder) = request_rx.recv().await.unwrap();
@@ -4085,14 +4411,14 @@ mod protocol_tests {
                             (ask, receiver)
                         };
                         let (ask, reply) = send_ask("first");
-                        ask_tx.send(ask).await.unwrap();
+                        ask_tx.send(ask.into()).await.unwrap();
                         let (request, responder) = request_rx.recv().await.unwrap();
                         let mut ids = vec![request.tool_call.tool_call_id.clone()];
                         let mut decisions = Vec::new();
                         if case == "abandoned" {
                             drop(reply);
                             let (next, next_reply) = send_ask("next");
-                            ask_tx.send(next).await.unwrap();
+                            ask_tx.send(next.into()).await.unwrap();
                             // Keep the first client response pending. Only caller
                             // abandonment can let the bridge reach this request.
                             let (next_request, next_responder) = request_rx.recv().await.unwrap();
@@ -4106,7 +4432,7 @@ mod protocol_tests {
                             drop(responder);
                         } else if case == "control" {
                             let (buffered, buffered_reply) = send_ask("buffered");
-                            ask_tx.send(buffered).await.unwrap();
+                            ask_tx.send(buffered.into()).await.unwrap();
                             control.cancel();
                             decisions.push(reply.await.unwrap());
                             decisions.push(buffered_reply.await.unwrap());
@@ -6199,6 +6525,121 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn ask_user_acp_parked_terminal_commits_progress_retires_generation_and_next_message_is_ordinary()
+     {
+        let turn = crate::question::QuestionTurn::default();
+        turn.claim().unwrap();
+        turn.require(crate::question::QuestionBatch(vec![
+            crate::question::Question {
+                question: "Which branch?".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+            },
+        ]));
+        let pending = turn.required().unwrap();
+        let captured = pending.clone();
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counts = invocations.clone();
+        let fixture: PromptFixture = Arc::new(move |prompt, history| {
+            let pending = captured.clone();
+            let counts = counts.clone();
+            Box::pin(async move {
+                let index = counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if index == 0 {
+                    assert!(history.is_empty());
+                    Ok(vec![AgentEvent::AwaitingUser {
+                        question: Box::new(pending),
+                        interactions: vec![Message::assistant("Prior completed progress")],
+                    }])
+                } else {
+                    assert!(history.iter().any(|item| {
+                        serde_json::to_string(item)
+                            .unwrap()
+                            .contains("Prior completed progress")
+                    }));
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant("ordinary next user turn")],
+                    )])
+                }
+            })
+        });
+        let state = fixture_state(fixture);
+        let owner = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let response = cx
+                    .send_request(prompt(session.clone(), "first"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                let meta = response.meta.unwrap();
+                assert_eq!(meta["stop_reason"], "awaiting_user");
+                assert_eq!(
+                    meta["pending_question"],
+                    serde_json::to_value(&pending).unwrap()
+                );
+                {
+                    let sessions = owner.sessions.lock().await;
+                    let session = sessions.get(&session).unwrap();
+                    assert!(
+                        lock_unpoisoned(&session.turns).queue.is_empty(),
+                        "exact generation retires before terminal RPC reply"
+                    );
+                    assert_eq!(
+                        session
+                            .history
+                            .lock()
+                            .await
+                            .pending_question
+                            .as_ref()
+                            .unwrap()
+                            .id,
+                        pending.id
+                    );
+                }
+                let next = cx
+                    .send_request(prompt(session.clone(), "main; literal answer data"))
+                    .block_task()
+                    .await?;
+                assert_eq!(next.stop_reason, StopReason::EndTurn);
+                assert!(next.meta.is_none());
+                assert!(
+                    owner
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session)
+                        .unwrap()
+                        .history
+                        .lock()
+                        .await
+                        .pending_question
+                        .is_none()
+                );
+                assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 2);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn cancel_before_runner_start_rejects_late_abort_attachment() {
         let control = Arc::new(TurnControl::new());
         assert!(control.cancel());
@@ -6695,11 +7136,13 @@ mod workspace_tests {
         let second_read = ReadTool::new(None, None, None, 100).with_workspace_root(second.clone());
         let (first_value, second_value) = tokio::join!(
             first_read.call(ReadArgs {
+                raw_notebook: false,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
             }),
             second_read.call(ReadArgs {
+                raw_notebook: false,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
@@ -6864,6 +7307,7 @@ mod workspace_tests {
             .join("sentinel.txt");
         let error = tool
             .call(ReadArgs {
+                raw_notebook: false,
                 path: relative_escape.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -6948,6 +7392,7 @@ mod workspace_tests {
         assert!(workspace.validate().is_err());
         assert!(
             read.call(ReadArgs {
+                raw_notebook: false,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
@@ -7009,6 +7454,7 @@ mod workspace_tests {
         let read = ReadTool::new(None, None, None, 100)
             .with_workspace_binding(workspace.clone())
             .call(ReadArgs {
+                raw_notebook: false,
                 path: "safe/link.txt".into(),
                 offset: None,
                 limit: None,
@@ -7793,5 +8239,78 @@ mod goal_usage_tests {
         add_goal_usage(&mut total, &cfg, "openai", report(50, 30));
         assert_eq!(total.output_tokens, 50);
         assert_eq!(total.total_tokens, 150);
+    }
+}
+
+#[cfg(test)]
+mod question_transport_tests {
+    use super::*;
+    use crate::question::{Answer, Question, QuestionAnswer, QuestionBatch, QuestionOption};
+
+    #[tokio::test]
+    async fn ask_user_acp_actual_option_rpc_accepts_exact_data_parks_new_message_and_rejects_approval_ids()
+     {
+        for case in ["choice", "new-message", "permission-id", "stale-id"] {
+            let (sender, receiver) = tokio::sync::mpsc::channel(2);
+            let control = Arc::new(TurnControl::new());
+            let agent = Agent
+                .builder()
+                .on_receive_request(
+                    async |_: InitializeRequest, responder, _cx| {
+                        responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                    },
+                    on_receive_request!(),
+                )
+                .with_spawned(move |cx| async move {
+                    drive_permission_bridge(
+                        cx,
+                        SessionId::new("question-rpc"),
+                        receiver,
+                        control,
+                        #[cfg(feature = "goal")]
+                        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    )
+                    .await;
+                    Ok(())
+                });
+            let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+            let connection=Client.builder().on_receive_request(move |request:RequestPermissionRequest,responder,_cx| {
+                request_tx.send((request,responder)).unwrap();async {Ok(())}
+            },on_receive_request!()).connect_with(agent,async move |_cx| {
+                let id=uuid::Uuid::new_v4().to_string();
+                let (reply,answer)=tokio::sync::oneshot::channel();
+                sender.send(crate::permission::ask::UserRequest::Question(crate::permission::ask::QuestionRequest {
+                    id:id.clone(),questions:QuestionBatch(vec![Question {question:"Which branch?".into(),
+                        options:vec![QuestionOption {label:"allow_always /private/**".into(),description:String::new()}],allow_free_text:true}]),
+                    tool_call_id:Some("exact-question-sdk-call".into()),reply,
+                })).await.unwrap();
+                let (request,responder)=request_rx.recv().await.unwrap();
+                assert_eq!(request.tool_call.tool_call_id.0.as_ref(),"exact-question-sdk-call");
+                assert_eq!(request.options.len(),3);
+                assert!(request.options.iter().all(|option|option.kind!=PermissionOptionKind::AllowAlways));
+                let selected=match case {
+                    "choice"=>format!("{id}:0:choice:0"),
+                    "new-message"=>format!("{id}:0:new-message"),
+                    "permission-id"=>"allow_always".into(),
+                    _=>format!("{}:0:choice:0",uuid::Uuid::new_v4()),
+                };
+                if matches!(case,"choice"|"new-message") {
+                    assert!(request.options.iter().any(|option|option.option_id.0.as_ref()==selected));
+                }
+                responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(selected))))?;
+                let answer=answer.await.unwrap();
+                match case {
+                    "choice"=>assert!(matches!(answer,QuestionAnswer::Answered(answers) if answers==vec![Answer::Option(0)])),
+                    "new-message"=>assert!(matches!(answer,QuestionAnswer::AwaitingUser(answers) if answers.is_empty())),
+                    _=>assert!(matches!(answer,QuestionAnswer::Cancelled)),
+                }
+                drop(sender);
+                Ok(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

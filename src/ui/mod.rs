@@ -14,6 +14,7 @@ mod permission_handler;
 pub(crate) mod pickers;
 mod plan;
 pub(crate) mod prebuild;
+mod question_handler;
 pub(crate) mod renderer;
 pub(crate) mod slash;
 pub(crate) mod state;
@@ -981,6 +982,7 @@ pub(crate) async fn adopt_prebuild(
 pub(crate) async fn start_main_run(
     text: &str,
     record_chat_history: bool,
+    question_origin: crate::question::QuestionOrigin,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     slash: &SlashState,
@@ -1033,12 +1035,21 @@ pub(crate) async fn start_main_run(
             h.into()
         }
     };
+    if matches!(
+        question_origin,
+        crate::question::QuestionOrigin::NewUserTurn
+    ) {
+        ui.session.pending_question = None;
+    }
+    run.question_turn = question_origin.capture(run.question_turn.take());
+    let question_turn = run.question_turn.clone();
     let agent = run.agent.as_ref().unwrap().clone();
     // Construct this measured large child in the short factory frame. The
     // exact request/profile scope and its owned await remain on this turn.
     let runner = crate::startup::heap_future(|| {
         agent
             .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+            .with_question_turn(question_turn)
             .spawn_runner(
                 text.to_string(),
                 history,
@@ -1287,6 +1298,7 @@ pub(crate) async fn mid_turn_compact_and_respawn(
         .unwrap()
         .clone()
         .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+        .with_question_turn(run.question_turn.clone())
         .spawn_runner(
             MID_TURN_CONTINUE_PROMPT.to_string(),
             history,

@@ -520,19 +520,30 @@ argument-encoder tests are separate evidence.
 The explicit disabled foreground path currently owns the direct child but does
 not attach the Job owner used by AppContainer helpers and trusted hooks. Its
 descendant retirement assertion remains a failing acceptance requirement; the
-bypass is not documented as providing that Job guarantee. To diagnose the
-remaining hosted failures without changing policy or deadlines, the native
-typed case first runs a separate literal PowerShell preflight through ordinary
-Shell Ask, followed by two independently asked inert-helper controls. Fixed
-elapsed labels distinguish `New-Object`/`Get-Location` initialization from typed
-.NET constructors and inner process start/exit; both invoke only the copied
-helper's pure `--self-test`. Helper role-validation timings are printed only after
-its existing marker and copied-image checks succeed. These observations do not
-attribute the launch delay or establish descendant containment. Failed assertions
-report only fixed owned marker files (no-follow, 4096 bytes per file), copied image
-size, and bounded actual tool results. All original readiness, command, settlement
-and cleanup bounds remain. The production PR script remains unchanged; no
-diagnostic marker is inserted into it.
+bypass is not documented as providing that Job guarantee. The hosted diagnostic reached only `NATIVE32_STAGE entered` before the first
+`New-Object` initialization exceeded its unchanged 15-second command bound.
+The PR command now constructs `ProcessStartInfo` and `Process` directly with
+.NET `::new()` and obtains the current FileSystem provider location from
+`$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath`.
+Literal argv encoding, normal Shell Ask, async stdout/stderr drains, exit status,
+finally disposal and foreground ownership are unchanged. Microsoft documents
+[direct constructors](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_object_creation)
+and the [FileSystem location](https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.pathintrinsics.currentfilesystemlocation)
+/[provider path](https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.pathinfo.providerpath)
+used by this command.
+
+The typed case first runs the separately asked literal preflight and an independent
+inert-helper direct-constructor control. The archived cmdlet variant and exact
+failed hosted transcript remain diagnostic evidence; its known timeout no longer
+prevents the independent positive or five real PR cases from executing. The inert
+control explicitly attaches its constructed `StartInfo` to `Process`, uses the
+same FileSystem location as production, and invokes only the copied helper's
+pure `--self-test`. Fixed stage and role-validation labels stay outside the real
+PR script. Failed assertions retain only no-follow bounded owned marker files,
+copied-image size and bounded actual results. All existing readiness, command,
+settlement and cleanup bounds remain. The exact five native cases must still pass
+on a fresh hosted Windows run; no native repair or descendant guarantee is claimed
+from pure or macOS checks.
 
 ### Cached LSP diagnostic metadata
 
@@ -604,3 +615,56 @@ completion and observed usage are retained. See [COST_TRACKING.md](COST_TRACKING
 for pricing, private-ledger bounds, failure handling and the reported-estimate
 limit. Existing command classes, deadlines, URL policy and permission precedence
 are preserved.
+
+### Notebook cells
+
+`src/agent/tools/notebook.rs` implements `notebook_edit` and the cell view used
+by `read` for `.ipynb` files. Notebook source is literal data; these operations
+never run a kernel, shell, or cell. The builtin name is reserved against MCP
+shadowing and included in cold context schema estimates. Select exactly one
+zero-based `cell_index`
+or `cell_id`. `replace` updates source while preserving type, execution count,
+outputs, attachments, metadata and unknown fields. `insert` adds before the
+selected cell (index equal to the cell count appends), with an optional
+`cell_type` of `code`, `markdown` or `raw`; `delete` removes that cell. Source
+strings remain strings, and source arrays remain arrays. Inserts into notebook
+4.0–4.4 do not mint cell IDs or change the format version; 4.5+ requires valid
+unique IDs and receives a new ID on insertion.
+
+Untouched JSON field payloads remain validated raw JSON, preserving large
+integers and opaque metadata. Opaque nesting is not recursively traversed;
+byte caps, rather than an assumed semantic nesting limit, bound its handling.
+Notebook input and resulting serialization must fit `max_text_file_size`
+(default 1 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
+256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
+name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
+invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell
+types are preserved; mutation of an unknown type is refused.
+
+The default `read` view shows virtual cell/source/output lines. Its existing
+`offset`/`limit` arguments address those virtual lines, and the limit is capped
+by `max_read_lines`. Returned text is capped at 64 KiB (or the configured text
+cap, if smaller); text outputs have separate 4 KiB per-cell and 16 KiB overall
+limits with explicit omissions, and at most 4,096 output objects per cell.
+Opaque rich output payloads are omitted. This view provides no raw line hashes,
+raw-file CRC or whole-file overwrite authorization. Set `raw_notebook: true`
+to use the ordinary raw JSON line reader and its existing edit/write contract.
+
+`notebook_edit` uses its own permission name, with matching configured `edit`
+rules as fallback when no notebook-specific rule matches. Either tool's deny
+rules apply before approvals, hooks and Yolo; prior runtime `edit` grants do
+not become notebook grants. Unmatched Standard asks unless the configured
+default denies; ReadOnly/PlanWrite refuse unmatched notebook edits. Explicit notebook approval uses the normal single-file
+approval path and mandatory concurrency/spend wrappers. Mutation authority does
+not confer read disclosure: unchecked Ask or denied reads suppress preimages,
+neighbor previews and typed diffs, including equality hints for no-op source.
+
+Workspace publication retains the captured regular-file identity, exact
+content digest and parent capability, with the existing atomic exchange and
+displaced-content rollback. External publication uses the existing file-edit
+approved-parent and exact-content contract. Blocking preparation and publication remain owned jobs.
+Cancellation wins a shared atomic decision before publication, preventing the
+exchange; an already-started publication remains owned until it settles and may
+have an ambiguous caller outcome. External aliases and approved parent identity
+are revalidated; symlink/FIFO workspace targets are refused. No file creation,
+implicit permission grant or notebook execution occurs.

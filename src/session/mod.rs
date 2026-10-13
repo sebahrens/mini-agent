@@ -539,6 +539,10 @@ pub struct Session {
     /// unless that opt-in setting is on (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<CompactString>,
+    /// Bounded clarification data only: imported records never recreate a
+    /// waiter or approval. A new ordinary user turn supplies the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_question: Option<crate::question::QuestionRequired>,
     pub messages: Vec<SessionMessage>,
     /// Provider-native identity and reasoning for persisted tool calls, keyed
     /// by the call record's `tool_call_id`. A session file written before this
@@ -822,6 +826,7 @@ impl Session {
                 .map(|p| CompactString::new(p.to_string_lossy()))
                 .unwrap_or_default(),
             permission_allowlist: Vec::new(),
+            pending_question: None,
             todos: crate::agent::tools::TodoStore::default(),
             #[cfg(feature = "goal")]
             goal_store: crate::extras::goal::GoalStore::default(),

@@ -613,7 +613,8 @@ async fn resolve_permission(
                 invocation_cancellation.map(PermCancellation::begin_permission_prompt);
             let (reply_tx, reply_rx) = oneshot::channel();
             if ask_tx
-                .send(AskRequest {
+                .send(
+                    AskRequest {
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),
                     #[cfg(feature = "acp")]
@@ -623,7 +624,9 @@ async fn resolve_permission(
                     suggested_pattern: None,
                     additional_allow_patterns: Vec::new(),
                     reply: reply_tx,
-                })
+                }
+                    .into(),
+                )
                 .await
                 .is_err()
             {
@@ -1857,7 +1860,11 @@ mod js_permission_bridge {
         let bridge = ask_owner.bridge();
         let approval =
             tokio::spawn(async move { bridge.check_async("read", "ask-file.txt").await });
-        let request = ask_rx.recv().await.expect("ask request should arrive");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("ask request should arrive")
+            .into_permission();
         request
             .reply
             .send(UserDecision::AllowOnce)
@@ -2003,7 +2010,7 @@ mod js_permission_bridge {
         let mut request = tokio::select! {
             request = ask_rx.recv() => request.expect("ask request should arrive"),
             result = &mut check => panic!("permission completed before prompt readiness: {result:?}"),
-        };
+        }.into_permission();
         assert!(invocation.permission_prompt_pending());
         tokio::time::advance(Duration::from_secs(61)).await;
         assert_eq!(check.await, Err(PermissionBridgeError::TimedOut));
