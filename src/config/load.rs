@@ -1833,7 +1833,7 @@ pub(crate) fn trust_project_config(
     let mut store = load_project_config_trust(trust_store).map_err(|error| error.to_string())?;
     store.bindings.push(binding);
     if let Some(parent) = trust_store.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        crate::fs::ensure_private_directory(parent).map_err(|error| error.to_string())?;
     }
     save_project_config_trust(trust_store, &store).map_err(|error| error.to_string())
 }
@@ -3665,7 +3665,7 @@ pub(crate) mod bounded_project_trust_tests {
         std::fs::write(&config, [0xff]).unwrap();
         assert!(read_project_config(&config).is_err());
         let private = paths.config_dir.join("config.toml");
-        std::fs::write(&private, "model='owned'\n").unwrap();
+        crate::fs::private_atomic_write_sync(&private, b"model='owned'\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3686,7 +3686,8 @@ pub(crate) mod bounded_project_trust_tests {
         assert!(read_config_content(&private).is_err());
         let store = paths.project_config_trust_file();
         crate::fs::ensure_private_directory(store.parent().unwrap()).unwrap();
-        std::fs::write(&store, vec![b'x'; MAX_PROJECT_TRUST_BYTES + 1]).unwrap();
+        crate::fs::private_atomic_write_sync(&store, &vec![b'x'; MAX_PROJECT_TRUST_BYTES + 1])
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
