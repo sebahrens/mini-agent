@@ -31,6 +31,178 @@ pub(crate) fn background_hint_is_light(hint: &str) -> Option<bool> {
     ))
 }
 
+#[derive(Default)]
+pub(crate) struct BackgroundQuery {
+    pub(crate) color: Option<crossterm::style::Color>,
+    pub(crate) pending: std::collections::VecDeque<crossterm::event::Event>,
+}
+
+/// Query only before the App starts its input thread. Crossterm remains the
+/// sole decoder: unrelated keys, paste, mouse and incomplete replies are
+/// retained as their original events for that thread, never read as raw bytes.
+pub(crate) fn query_background(enabled: bool) -> BackgroundQuery {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        if enabled
+            && is_attached()
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+            && std::env::var("TERM").is_ok_and(|term| term != "dumb")
+        {
+            let mut out = io::stdout();
+            if out
+                .write_all(b"\x1b]11;?\x07")
+                .and_then(|()| out.flush())
+                .is_ok()
+            {
+                return collect_background_events(Duration::from_millis(150), |remaining| {
+                    if crossterm::event::poll(remaining)? {
+                        crossterm::event::read().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                });
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = enabled;
+    BackgroundQuery::default()
+}
+
+#[cfg(any(unix, test))]
+fn osc_rgb(value: &str) -> Option<crossterm::style::Color> {
+    let mut parts = value.split('/');
+    let mut component = || {
+        let value = parts.next()?;
+        if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let number = u32::from_str_radix(value, 16).ok()?;
+        let maximum = (1u32 << (4 * value.len())) - 1;
+        u8::try_from((number * 255 + maximum / 2) / maximum).ok()
+    };
+    let (r, g, b) = (component()?, component()?, component()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(crossterm::style::Color::Rgb { r, g, b })
+}
+
+#[cfg(any(unix, test))]
+fn osc_rgb_prefix(value: &str) -> bool {
+    let parts: Vec<_> = value.split('/').collect();
+    parts.len() <= 3
+        && parts.iter().enumerate().all(|(index, part)| {
+            part.len() <= 4
+                && (index + 1 == parts.len() || !part.is_empty())
+                && part.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
+#[derive(Default)]
+#[cfg(any(unix, test))]
+struct BackgroundReply {
+    wire: String,
+    events: std::collections::VecDeque<crossterm::event::Event>,
+}
+
+#[cfg(any(unix, test))]
+impl BackgroundReply {
+    fn consume(
+        &mut self,
+        event: crossterm::event::Event,
+        pending: &mut std::collections::VecDeque<crossterm::event::Event>,
+    ) -> Option<crossterm::style::Color> {
+        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+        // The Unix decoder presents OSC's ESC] as Alt+] and its BEL as Ctrl+G.
+        // Split ESC/ST fragments also work. Paste events remain wholly opaque.
+        let piece = match &event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc if key.modifiers.is_empty() => Some("\x1b".to_owned()),
+                KeyCode::Char(']') if key.modifiers == KeyModifiers::ALT => {
+                    Some("\x1b]".to_owned())
+                }
+                KeyCode::Char('\\') if key.modifiers == KeyModifiers::ALT => {
+                    Some("\x1b\\".to_owned())
+                }
+                KeyCode::Char('g') if key.modifiers == KeyModifiers::CONTROL => {
+                    Some("\x07".to_owned())
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii()
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                {
+                    Some(c.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(piece) = piece else {
+            self.flush(pending);
+            pending.push_back(event);
+            return None;
+        };
+        self.wire.push_str(&piece);
+        self.events.push_back(event);
+        const PREFIX: &str = "\x1b]11;rgb:";
+        if let Some(body) = self.wire.strip_prefix(PREFIX) {
+            let completed = body
+                .strip_suffix('\x07')
+                .or_else(|| body.strip_suffix("\x1b\\"));
+            if let Some(body) = completed {
+                if let Some(color) = osc_rgb(body) {
+                    self.wire.clear();
+                    self.events.clear();
+                    return Some(color);
+                }
+            } else if self.wire.len() <= 32
+                && osc_rgb_prefix(body.strip_suffix('\x1b').unwrap_or(body))
+            {
+                return None;
+            }
+        } else if PREFIX.starts_with(&self.wire) {
+            return None;
+        }
+        self.flush(pending);
+        None
+    }
+
+    fn flush(&mut self, pending: &mut std::collections::VecDeque<crossterm::event::Event>) {
+        pending.append(&mut self.events);
+        self.wire.clear();
+    }
+}
+
+#[cfg(any(unix, test))]
+fn collect_background_events(
+    timeout: Duration,
+    mut next: impl FnMut(Duration) -> io::Result<Option<crossterm::event::Event>>,
+) -> BackgroundQuery {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut result = BackgroundQuery::default();
+    let mut reply = BackgroundReply::default();
+    // Bound both the absolute wait and consumed events. The 128th event is
+    // preserved too; everything not consumed remains in crossterm's queue.
+    for _ in 0..128 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Some(event)) = next(remaining) else {
+            break;
+        };
+        if let Some(color) = reply.consume(event, &mut result.pending) {
+            result.color = Some(color);
+            break;
+        }
+    }
+    reply.flush(&mut result.pending);
+    result
+}
+
 pub(crate) fn background_color_is_light(color: crossterm::style::Color) -> bool {
     use crossterm::style::Color;
     let ansi = [
@@ -102,6 +274,187 @@ mod background_hint_tests {
         assert_eq!(background_hint_is_light(&"0".repeat(129)), None);
         assert!(background_color_is_light(crossterm::style::Color::White));
         assert!(!background_color_is_light(crossterm::style::Color::Black));
+    }
+
+    fn key(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    }
+
+    fn reply(body: &str, split_escape: bool, st: bool) -> Vec<crossterm::event::Event> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut events = if split_escape {
+            vec![
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                key(KeyCode::Char(']'), KeyModifiers::NONE),
+            ]
+        } else {
+            vec![key(KeyCode::Char(']'), KeyModifiers::ALT)]
+        };
+        events.extend(format!("11;rgb:{body}").chars().map(|c| {
+            key(
+                KeyCode::Char(c),
+                if c.is_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                },
+            )
+        }));
+        if st && split_escape {
+            events.extend([
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                key(KeyCode::Char('\\'), KeyModifiers::NONE),
+            ]);
+        } else if st {
+            events.push(key(KeyCode::Char('\\'), KeyModifiers::ALT));
+        } else {
+            events.push(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        }
+        events
+    }
+
+    fn collect(events: Vec<crossterm::event::Event>) -> BackgroundQuery {
+        let mut events = events.into_iter();
+        collect_background_events(Duration::from_secs(1), |_| Ok(events.next()))
+    }
+
+    #[test]
+    fn osc_background_accepts_bel_st_and_split_escape_with_hex_scaling() {
+        use crossterm::style::Color;
+        for (body, expected) in [
+            (
+                "ffff/ffff/ffff",
+                Color::Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                },
+            ),
+            ("0/0/0", Color::Rgb { r: 0, g: 0, b: 0 }),
+            (
+                "ff/80/00",
+                Color::Rgb {
+                    r: 255,
+                    g: 128,
+                    b: 0,
+                },
+            ),
+            (
+                "FFF/800/000",
+                Color::Rgb {
+                    r: 255,
+                    g: 128,
+                    b: 0,
+                },
+            ),
+        ] {
+            for split in [false, true] {
+                for st in [false, true] {
+                    let result = collect(reply(body, split, st));
+                    assert_eq!(result.color, Some(expected), "{body}/{split}/{st}");
+                    assert!(result.pending.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osc_background_preserves_opaque_input_and_exact_key_state_in_order() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
+        let unrelated = vec![
+            key(KeyCode::Char('雪'), KeyModifiers::NONE),
+            Event::Paste("\x1b]11;rgb:ffff/ffff/ffff\x07\n雪".into()),
+            Event::Resize(91, 37),
+            Event::FocusLost,
+            Event::Key(KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::CAPS_LOCK,
+            }),
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::ALT,
+            }),
+        ];
+        let mut input = unrelated.clone();
+        input.extend(reply("ffff/ffff/ffff", false, false));
+        let result = collect(input);
+        assert!(result.color.is_some());
+        assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), unrelated);
+        // Pasted response-looking text alone is task input, not a color reply.
+        assert!(collect(vec![unrelated[1].clone()]).color.is_none());
+    }
+
+    #[test]
+    fn osc_background_invalid_incomplete_and_interleaved_replies_replay_exactly() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        for body in [
+            "fffff/0/0",
+            "ff/ff",
+            "ff//ff",
+            "ff/ff/ff/ff",
+            "gg/0/0",
+            "-1/0/0",
+        ] {
+            let input = reply(body, false, false);
+            let result = collect(input.clone());
+            assert!(result.color.is_none(), "{body}");
+            assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), input);
+        }
+        let mut incomplete = reply("ff/ff/ff", true, true);
+        incomplete.pop();
+        let mut interleaved = reply("ff/ff/ff", false, false);
+        interleaved.insert(6, Event::Resize(20, 10));
+        let invalid_key = vec![
+            key(KeyCode::Char(']'), KeyModifiers::ALT),
+            key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        ];
+        for input in [incomplete, interleaved, invalid_key] {
+            let result = collect(input.clone());
+            assert!(result.color.is_none());
+            assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), input);
+        }
+    }
+
+    #[test]
+    fn osc_background_deadline_event_bound_and_read_errors_retain_consumed_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let normal = key(KeyCode::Char('x'), KeyModifiers::NONE);
+        let mut calls = 0;
+        let result = collect_background_events(Duration::from_secs(1), |_| {
+            calls += 1;
+            Ok(Some(normal.clone()))
+        });
+        assert_eq!(calls, 128);
+        assert_eq!(result.pending.len(), 128);
+        assert!(result.color.is_none());
+        let first = key(KeyCode::Char(']'), KeyModifiers::ALT);
+        let mut calls = 0;
+        let result = collect_background_events(Duration::from_secs(1), |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(Some(first.clone()))
+            } else {
+                Err(io::Error::other("fixture read failure"))
+            }
+        });
+        assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), vec![first]);
+        let mut calls = 0;
+        let result = collect_background_events(Duration::from_millis(5), |_| {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(Some(normal.clone()))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), vec![normal]);
     }
 }
 

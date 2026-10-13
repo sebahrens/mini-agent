@@ -504,6 +504,7 @@ pub struct Renderer {
     input_visible_line_count: usize,
     monochrome: bool,
     palette: ForegroundPalette,
+    terminal_background: Option<Color>,
     chat_bg: Option<Color>,
     input_bg: Option<Color>,
     status_bg: Option<Color>,
@@ -615,6 +616,7 @@ impl Renderer {
             input_visible_line_count: 0,
             monochrome: false,
             palette: ForegroundPalette::default(),
+            terminal_background: None,
             chat_bg: None,
             input_bg: None,
             status_bg: None,
@@ -843,6 +845,14 @@ impl Renderer {
         self.feed.set_palette(palette);
         self.last_chat_snapshot = None;
         self.last_bottom_snapshot = None;
+    }
+
+    pub(crate) fn set_terminal_background(&mut self, color: Option<Color>) {
+        self.terminal_background = color;
+    }
+
+    pub(crate) fn terminal_background(&self) -> Option<Color> {
+        self.terminal_background
     }
 
     #[cfg(test)]

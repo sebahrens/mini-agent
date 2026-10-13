@@ -1342,6 +1342,10 @@ impl<'a> App<'a> {
             title_status: ui.cfg.resolve_terminal_title(),
         })?;
 
+        // No input thread exists yet: retain every unrelated decoded event for
+        // its sole owner instead of flushing or racing raw terminal input.
+        let background = crate::ui::terminal::query_background(!ui.cli.no_color);
+
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
 
@@ -1349,6 +1353,7 @@ impl<'a> App<'a> {
         let last_branch_check = std::time::Instant::now();
 
         let mut renderer = Renderer::new()?;
+        renderer.set_terminal_background(background.color);
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
         renderer.set_title_status(ui.cfg.resolve_terminal_title());
@@ -1610,7 +1615,11 @@ impl<'a> App<'a> {
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
-        let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
+        let event_handle = Some(super::spawn_event_thread_with_events(
+            user_tx.clone(),
+            running.clone(),
+            background.pending,
+        ));
         super::spawn_termination_listener(user_tx.clone());
 
         let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {

@@ -82,6 +82,11 @@ fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer) {
         .filter(|color| *color != crossterm::style::Color::Reset)
         .map(crate::ui::terminal::background_color_is_light)
         .or_else(|| {
+            renderer
+                .terminal_background()
+                .map(crate::ui::terminal::background_color_is_light)
+        })
+        .or_else(|| {
             std::env::var("COLORFGBG")
                 .ok()
                 .and_then(|hint| crate::ui::terminal::background_hint_is_light(&hint))
@@ -146,6 +151,78 @@ pub(crate) fn apply_initial(
 mod themes_tests {
     use super::*;
     use crossterm::style::Color;
+
+    #[test]
+    fn themes_default_uses_retained_osc_background_and_explicit_colors_win() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        renderer.set_terminal_background(Some(Color::White));
+        apply_colors(&ColorsConfig::default(), &mut renderer);
+        assert_eq!(
+            renderer.foreground_palette_for_test().text,
+            Color::Rgb {
+                r: 36,
+                g: 41,
+                b: 47
+            }
+        );
+        renderer.set_terminal_background(Some(Color::Black));
+        apply_colors(&ColorsConfig::default(), &mut renderer);
+        assert_eq!(
+            renderer.foreground_palette_for_test().text,
+            Color::Rgb {
+                r: 230,
+                g: 237,
+                b: 243
+            }
+        );
+        let explicit = ColorsConfig {
+            chat_background: Some("#ffffff".into()),
+            text: Some("#123456".into()),
+            ..ColorsConfig::default()
+        };
+        apply_colors(&explicit, &mut renderer);
+        let palette = renderer.foreground_palette_for_test();
+        assert_eq!(
+            palette.tool,
+            Color::Rgb {
+                r: 137,
+                g: 80,
+                b: 0
+            }
+        );
+        assert_eq!(
+            palette.text,
+            Color::Rgb {
+                r: 18,
+                g: 52,
+                b: 86
+            }
+        );
+        // Reset/reload reuses the renderer's terminal hint instead of querying
+        // beside the running input reader. Named full palettes remain explicit.
+        apply(
+            include_str!("../../data/themes/default-light.json"),
+            &mut renderer,
+        )
+        .unwrap();
+        assert_eq!(
+            renderer.foreground_palette_for_test().text,
+            Color::Rgb {
+                r: 36,
+                g: 41,
+                b: 47
+            }
+        );
+        apply_colors(&ColorsConfig::default(), &mut renderer);
+        assert_eq!(
+            renderer.foreground_palette_for_test().text,
+            Color::Rgb {
+                r: 230,
+                g: 237,
+                b: 243
+            }
+        );
+    }
 
     #[test]
     fn themes_foregrounds_repaint_cached_roles_and_markdown_without_changing_text() {

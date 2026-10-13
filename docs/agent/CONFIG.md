@@ -1679,10 +1679,20 @@ foreground palettes and explicit `default-light` / `default-dark` variants in
 `/theme`; choosing a theme retains its saved precedence over config colors.
 
 Without a saved theme, foreground defaults follow an explicit `chat_background`,
-then the final ANSI background index in `COLORFGBG` (including 256-color indices),
-then the dark preset. Configured foreground roles override those defaults.
-Background detection currently uses this hint without reading terminal input;
-OSC 11 querying is not yet enabled. Changing a theme invalidates feed and
+then a detected terminal background, then the final ANSI background index in
+`COLORFGBG` (including 256-color indices), then the dark preset. Configured
+foreground roles override those defaults.
+
+On Unix interactive terminals, startup sends one OSC 11 background query before
+the input thread starts. The query uses crossterm's existing event decoder with
+one 150 ms deadline and a 128-event limit. Complete bounded RGB replies select
+the default palette; unrelated input, bracketed paste, malformed replies and
+incomplete replies at the deadline replay unchanged through the input thread.
+Unsupported terminals, noninteractive streams and Windows use the fallback
+above. The retained background also applies to later theme resets without
+starting a second reader. This cosmetic hint grants no permissions. A reply
+arriving after the deadline is ordinary input, so slow/unsupported terminals
+can use `COLORFGBG` or an explicit theme. Changing a theme invalidates feed and
 Markdown color caches so existing messages repaint. Monochrome output still
 emits no RGB colors.
 

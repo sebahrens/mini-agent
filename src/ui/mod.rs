@@ -357,6 +357,9 @@ fn event_counts_as_paste_followup(event: &event::Event) -> bool {
 /// Peek through non-key terminal events without treating them as pasted text.
 /// Every event read here is retained in order for normal dispatch.
 fn queue_paste_followups(pending: &mut VecDeque<event::Event>) -> bool {
+    if pending.iter().any(event_counts_as_paste_followup) {
+        return true;
+    }
     let deadline = Instant::now() + PASTE_BURST_WINDOW;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -494,9 +497,16 @@ pub(crate) fn spawn_event_thread(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    spawn_event_thread_with_events(user_tx, running, VecDeque::new())
+}
+
+pub(crate) fn spawn_event_thread_with_events(
+    user_tx: mpsc::Sender<UserEvent>,
+    running: Arc<AtomicBool>,
+    mut pending_events: VecDeque<event::Event>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut paste_burst = PasteBurst::default();
-        let mut pending_events = VecDeque::new();
         let mut errors = ReaderErrors::default();
         let on_error = |errors: &mut ReaderErrors| match errors.on_error() {
             ReaderErrorAction::Retry(delay) => {
@@ -1775,6 +1785,26 @@ mod reader_error_tests {
 #[cfg(test)]
 mod paste_followup_tests {
     use super::*;
+
+    #[test]
+    fn paste_followup_retains_startup_replay_and_detects_its_pending_key_without_io() {
+        let original = VecDeque::from([
+            event::Event::Resize(80, 24),
+            event::Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('雪'),
+                KeyModifiers::NONE,
+            )),
+            event::Event::Paste("two\nlines".into()),
+        ]);
+        let mut pending = original.clone();
+        assert!(queue_paste_followups(&mut pending));
+        assert_eq!(pending, original);
+        let mut burst = PasteBurst::default();
+        assert_eq!(
+            burst.on_enter(queue_paste_followups(&mut pending)),
+            EnterVerdict::Newline
+        );
+    }
 
     #[test]
     fn only_key_presses_extend_an_unbracketed_paste_burst() {
