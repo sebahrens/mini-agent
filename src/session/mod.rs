@@ -1222,9 +1222,32 @@ impl Session {
         (content, artifact)
     }
 
+    /// Evidence that an imported/legacy transcript may contain prior model
+    /// calls. This marks count history incomplete; it never invents a count.
+    pub(crate) fn has_model_call_history(&self) -> bool {
+        self.total_input_tokens > 0
+            || self.total_output_tokens > 0
+            || self.total_real_input_tokens > 0
+            || self.total_cached_input_tokens > 0
+            || self.total_cache_creation_input_tokens > 0
+            || self.total_cost > 0.0
+            || self.unpriced_judge_tokens > 0
+            || !self.compactions.is_empty()
+            || self.messages.iter().any(|message| {
+                matches!(
+                    message.role,
+                    MessageRole::Assistant
+                        | MessageRole::ToolCall
+                        | MessageRole::ToolResult
+                        | MessageRole::SubagentToolCall
+                )
+            })
+    }
+
     pub(crate) fn initialize_spend_account(&mut self, cap: Option<f64>) -> anyhow::Result<()> {
         let cap = crate::spend::validate_cap(cap)?;
         if !self.spend_account.matches_session(&self.id) {
+            let prior_calls = self.spend_account.model_call_count();
             let baseline = if self.spend_account.is_uninitialised() {
                 self.total_cost
             } else {
@@ -1236,6 +1259,11 @@ impl Session {
             // uncertainty along with the labeled cost estimate. Rekeying does
             // not make an unread or unpriced request free, or mint old rows.
             self.spend_account.inherit_uncertainty(prior);
+            if let Some((count, complete)) = prior_calls {
+                self.spend_account.inherit_call_count(count, complete);
+            } else if self.has_model_call_history() {
+                self.spend_account.inherit_call_count(0, false);
+            }
         }
         self.spend_account.set_cap(cap)?;
         Ok(())

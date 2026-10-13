@@ -25,9 +25,23 @@ pub enum StatusSpan {
         text: String,
         fg: Option<Color>,
         bg: Option<Color>,
+        layout: SpanLayout,
     },
     /// Expands to fill remaining width (splits evenly when several are present).
     Flex,
+}
+
+/// Layout metadata stays with the exact resolved item; values are never
+/// classified by parsing their display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpanLayout {
+    Separator,
+    Decoration,
+    Item {
+        priority: u8,
+        plain: String,
+        compact: Option<String>,
+    },
 }
 
 /// Runtime values the statusline can show beyond the session itself.
@@ -106,6 +120,16 @@ pub fn build(session: &Session, ctx: &StatusContext) -> Vec<Vec<StatusSpan>> {
 pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     let mut state = std::collections::hash_map::DefaultHasher::new();
     session.id.hash(&mut state);
+    session.spend_account.model_call_count().hash(&mut state);
+    session
+        .known_input_output_prices()
+        .is_some()
+        .hash(&mut state);
+    session
+        .spend_account
+        .snapshot()
+        .tracking_error
+        .hash(&mut state);
     session.name.hash(&mut state);
     session.messages.len().hash(&mut state);
     session.compactions.len().hash(&mut state);
@@ -118,6 +142,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     session.total_real_input_tokens.hash(&mut state);
     session.recorded_total_cost().to_bits().hash(&mut state);
     session.effective_context_tokens().hash(&mut state);
+    session.ctx_is_estimated().hash(&mut state);
     session.context_window.hash(&mut state);
     session.model.hash(&mut state);
     session.provider.hash(&mut state);
@@ -196,12 +221,18 @@ pub fn build_lines(
                 text: " ".to_string(),
                 fg: None,
                 bg: None,
+                layout: SpanLayout::Separator,
             });
         }
         first.push(StatusSpan::Text {
             text: single_line_safe(label),
             fg: Some(Color::Red),
             bg: None,
+            layout: SpanLayout::Item {
+                priority: 255,
+                plain: single_line_safe(label),
+                compact: None,
+            },
         });
     }
     lines
@@ -232,9 +263,10 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     .unwrap_or_else(|| " ".to_string());
                 raw.push((
                     StatusSpan::Text {
-                        text,
+                        text: single_line_safe(&text),
                         fg: color(&seg.color),
                         bg: color(&seg.bg),
+                        layout: SpanLayout::Separator,
                     },
                     true,
                 ));
@@ -244,8 +276,21 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                 if let Some(mut text) =
                     resolve_item(item, session, ctx, always).map(|text| single_line_safe(&text))
                 {
+                    let plain = text.clone();
+                    let layout = SpanLayout::Item {
+                        priority: item_priority(item, seg.priority),
+                        compact: if matches!(item, "mode" | "sandbox" | "goal" | "loop") {
+                            None
+                        } else {
+                            seg.min
+                                .as_ref()
+                                .map(|value| single_line_safe(value))
+                                .or_else(|| compact_item(item, session, ctx))
+                        },
+                        plain,
+                    };
                     if let Some(glyph) = resolve_icon(seg.icon.as_ref(), item) {
-                        text = format!("{glyph} {text}");
+                        text = format!("{} {text}", single_line_safe(&glyph));
                     }
                     // A live-state override (e.g. the context meter turning
                     // amber/red as it fills) wins over the configured color so
@@ -261,20 +306,30 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     if let Some(l) = &seg.left {
                         raw.push((
                             StatusSpan::Text {
-                                text: powerline_glyph(l),
+                                text: single_line_safe(&powerline_glyph(l)),
                                 fg: cap,
                                 bg: None,
+                                layout: SpanLayout::Decoration,
                             },
                             false,
                         ));
                     }
-                    raw.push((StatusSpan::Text { text, fg, bg }, false));
+                    raw.push((
+                        StatusSpan::Text {
+                            text,
+                            fg,
+                            bg,
+                            layout,
+                        },
+                        false,
+                    ));
                     if let Some(r) = &seg.right {
                         raw.push((
                             StatusSpan::Text {
-                                text: powerline_glyph(r),
+                                text: single_line_safe(&powerline_glyph(r)),
                                 fg: cap,
                                 bg: None,
+                                layout: SpanLayout::Decoration,
                             },
                             false,
                         ));
@@ -303,6 +358,202 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
     cleaned.into_iter().map(|(s, _)| s).collect()
 }
 
+fn item_priority(item: &str, configured: Option<u8>) -> u8 {
+    match item {
+        "sandbox" => 255,
+        "mode" => 254,
+        "goal" | "loop" => 253,
+        "prompt" => 240,
+        _ => configured
+            .unwrap_or(match item {
+                "tokens_input" | "tokens_output" | "calls" | "cache_hit_ratio" | "btw" => 20,
+                "cost" => 30,
+                "git_branch" | "git_status" | "git_changes" | "cwd" | "cwd_full" => 40,
+                "context" | "context_used" | "context_max" | "context_percentage" => 80,
+                _ => 100,
+            })
+            .min(239),
+    }
+}
+
+fn compact_item(item: &str, session: &Session, ctx: &StatusContext) -> Option<String> {
+    match item {
+        "context" => Some(format!("ctx {}%", context_percentage(session).unwrap_or(0))),
+        "cwd_full" => Some(basename(&ctx.workspace.to_string_lossy())),
+        "cwd" => Some("…".into()),
+        _ => None,
+    }
+}
+
+fn fixed_width(spans: &[StatusSpan]) -> usize {
+    spans
+        .iter()
+        .map(|span| match span {
+            StatusSpan::Text { text, .. } => crate::ui::utils::display_width(text),
+            StatusSpan::Flex => 0,
+        })
+        .sum()
+}
+
+fn clean_layout(spans: &mut Vec<StatusSpan>) {
+    let mut seen_item = false;
+    let mut separator = false;
+    spans.retain(|span| match span {
+        StatusSpan::Text {
+            layout: SpanLayout::Separator,
+            ..
+        } => {
+            let keep = seen_item && !separator;
+            separator = true;
+            keep
+        }
+        StatusSpan::Flex => {
+            separator = true;
+            true
+        }
+        _ => {
+            seen_item = true;
+            separator = false;
+            true
+        }
+    });
+    while matches!(
+        spans.last(),
+        Some(StatusSpan::Text {
+            layout: SpanLayout::Separator,
+            ..
+        }) | Some(StatusSpan::Flex)
+    ) {
+        spans.pop();
+    }
+}
+
+/// Cell-bounded layout used by the actual renderer at each terminal width.
+/// Wide layouts remain byte-for-byte identical. Narrow layouts shed decoration,
+/// then use compact forms, then drop complete items in ascending priority.
+pub(crate) fn fit_line(spans: &[StatusSpan], width: usize) -> Vec<StatusSpan> {
+    let mut result = spans.to_vec();
+    if fixed_width(&result) <= width {
+        return result;
+    }
+    result.retain(|span| {
+        !matches!(
+            span,
+            StatusSpan::Text {
+                layout: SpanLayout::Decoration,
+                ..
+            }
+        )
+    });
+    for span in &mut result {
+        if let StatusSpan::Text { text, layout, .. } = span {
+            match layout {
+                SpanLayout::Item { plain, .. } => *text = plain.clone(),
+                SpanLayout::Separator => *text = " ".into(),
+                SpanLayout::Decoration => unreachable!(),
+            }
+        }
+    }
+    clean_layout(&mut result);
+    // Context first, then paths; configured compact forms use their item priority.
+    let mut compact: Vec<_> = result
+        .iter()
+        .enumerate()
+        .filter_map(|(index, span)| {
+            if let StatusSpan::Text {
+                layout:
+                    SpanLayout::Item {
+                        priority,
+                        compact: Some(_),
+                        ..
+                    },
+                ..
+            } = span
+            {
+                Some((*priority, index))
+            } else {
+                None
+            }
+        })
+        .collect();
+    compact.sort_by_key(|&(priority, index)| (std::cmp::Reverse(priority), index));
+    for (_, index) in compact {
+        if fixed_width(&result) <= width {
+            return result;
+        }
+        if let StatusSpan::Text {
+            text,
+            layout:
+                SpanLayout::Item {
+                    compact: Some(short),
+                    ..
+                },
+            ..
+        } = &mut result[index]
+            && crate::ui::utils::display_width(short) < crate::ui::utils::display_width(text)
+        {
+            *text = short.clone();
+        }
+    }
+    while fixed_width(&result) > width {
+        let candidate = result
+            .iter()
+            .enumerate()
+            .filter_map(|(index, span)| {
+                if let StatusSpan::Text {
+                    layout: SpanLayout::Item { priority, .. },
+                    ..
+                } = span
+                {
+                    Some((*priority, index))
+                } else {
+                    None
+                }
+            })
+            .min();
+        let item_count = result
+            .iter()
+            .filter(|span| {
+                matches!(
+                    span,
+                    StatusSpan::Text {
+                        layout: SpanLayout::Item { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        if item_count <= 1 {
+            break;
+        }
+        if let Some((_, index)) = candidate {
+            result.remove(index);
+            clean_layout(&mut result);
+        } else {
+            break;
+        }
+    }
+    // A sole oversized item is visibly clipped, never silently cut mid-word.
+    if fixed_width(&result) > width {
+        for span in &mut result {
+            if let StatusSpan::Text { text, .. } = span {
+                *text = ellipsize(text, width);
+            }
+        }
+    }
+    result
+}
+
+pub(crate) fn ellipsize(text: &str, width: usize) -> String {
+    if crate::ui::utils::display_width(text) <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}…", crate::ui::utils::display_prefix(text, width - 1))
+}
+
 /// Context fill as an integer percentage of the window, or `None` when the
 /// window is unknown (so the meter shows `0%` rather than dividing by zero).
 /// Deliberately not clamped: a value past 100% is a real "over budget" state
@@ -324,7 +575,7 @@ fn dynamic_item_color(item: &str, session: &Session) -> Option<Color> {
     if item == "sandbox" {
         return Some(Color::Red);
     }
-    if item != "context_percentage" {
+    if !matches!(item, "context_percentage" | "context") {
         return None;
     }
     match context_percentage(session)? {
@@ -378,20 +629,36 @@ fn resolve_item(
             .reasoning_effort
             .map(|effort| format!("effort:{effort}")),
         "tokens_input" => (session.total_input_tokens > 0 || always)
-            .then(|| fmt_tokens(session.total_input_tokens)),
+            .then(|| format!("in:{}", fmt_tokens(session.total_input_tokens))),
         "tokens_output" => (session.total_output_tokens > 0 || always)
-            .then(|| fmt_tokens(session.total_output_tokens)),
+            .then(|| format!("out:{}", fmt_tokens(session.total_output_tokens))),
+        "calls" => Some(match session.spend_account.model_call_count() {
+            Some((count, true)) => format!("calls:{count}"),
+            Some((0, false)) => "calls:?".into(),
+            Some((count, false)) => format!("calls:≥{count}"),
+            None if !session.has_model_call_history() => "calls:0".into(),
+            None => "calls:?".into(),
+        }),
+        "context" => Some(format!(
+            "ctx {}/{} {}%",
+            resolve_item("context_used", session, ctx, always)?,
+            fmt_tokens(session.context_window),
+            context_percentage(session).unwrap_or(0)
+        )),
         "cache_hit_ratio" => {
             let total = session.total_real_input_tokens;
-            (total > 0 || always).then(|| {
-                let percent = session
-                    .total_cached_input_tokens
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .unwrap_or(0)
-                    .min(100);
-                format!("cache:{percent}%")
-            })
+            (session.total_cached_input_tokens > 0
+                || session.total_cache_creation_input_tokens > 0
+                || always)
+                .then(|| {
+                    let percent = session
+                        .total_cached_input_tokens
+                        .saturating_mul(100)
+                        .checked_div(total)
+                        .unwrap_or(0)
+                        .min(100);
+                    format!("cache:{percent}%")
+                })
         }
         "context_used" => {
             // A `~` marks the figure as an estimate until the provider reports
@@ -404,8 +671,21 @@ fn resolve_item(
         }
         "context_max" => Some(fmt_tokens(session.context_window)),
         "context_percentage" => Some(format!("{}%", context_percentage(session).unwrap_or(0))),
-        "cost" => (session.recorded_total_cost() > 0.0 || session.show_cost_always || always)
-            .then(|| format!("${:.4}", session.recorded_total_cost())),
+        "cost" => {
+            let amount = session.recorded_total_cost();
+            let unknown = session.known_input_output_prices().is_none()
+                || session.spend_account.snapshot().tracking_error;
+            if unknown {
+                Some(if amount > 0.0 {
+                    format!("${amount:.4}+?")
+                } else {
+                    "cost:?".into()
+                })
+            } else {
+                (amount > 0.0 || session.show_cost_always || always)
+                    .then(|| format!("${amount:.4}"))
+            }
+        }
         "prompt" => ctx.prompt_name.map(|s| format!("prompt:{s}")),
         "mode" => ctx.perm_mode.map(|m| format!("mode:{m}")),
         "sandbox" => ctx.sandbox_label.map(str::to_string),
@@ -676,17 +956,15 @@ pub fn default_spec() -> StatusLineConfig {
         sep(" "),
         seg("reasoning_effort", Some("dark_grey")),
         sep("  |  "),
-        seg("context_used", Some("dark_grey")),
-        sep("/"),
-        seg("context_max", Some("dark_grey")),
+        seg("context", Some("dark_grey")),
+        sep("  "),
+        seg("calls", Some("dark_grey")),
         sep(" "),
-        seg("context_percentage", Some("dark_grey")),
-        sep("  \u{21d1}"),
         seg("tokens_input", Some("dark_grey")),
         sep(" "),
-        seg("cache_hit_ratio", Some("dark_grey")),
-        sep(" \u{21d3}"),
         seg("tokens_output", Some("dark_grey")),
+        sep(" "),
+        seg("cache_hit_ratio", Some("dark_grey")),
         StatusLineSegment {
             item: "flex_separator".into(),
             ..Default::default()
@@ -694,6 +972,8 @@ pub fn default_spec() -> StatusLineConfig {
         seg("sandbox", Some("red")),
         sep(" "),
         seg("loop", Some("dark_grey")),
+        sep(" "),
+        seg("goal", Some("dark_grey")),
         sep(" "),
         seg("mode", Some("dark_grey")),
         sep(" "),

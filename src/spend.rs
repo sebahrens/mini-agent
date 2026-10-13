@@ -255,6 +255,8 @@ struct State {
     ledger_ready: bool,
     notice_shown: bool,
     observation_revision: u64,
+    model_calls: u64,
+    call_history_complete: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -283,6 +285,10 @@ impl AccountSnapshot {
 #[serde(deny_unknown_fields)]
 struct SavedAccount {
     version: u8,
+    #[serde(default)]
+    model_calls: Option<u64>,
+    #[serde(default)]
+    call_history_complete: bool,
     session_id: String,
     legacy_estimate: f64,
     observed_cost: f64,
@@ -295,6 +301,8 @@ impl Serialize for Account {
         let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         SavedAccount {
             version: 1,
+            model_calls: Some(state.model_calls),
+            call_history_complete: state.call_history_complete,
             session_id: state.session_id.clone(),
             legacy_estimate: state.legacy_estimate,
             observed_cost: state.historical_observed_cost + state.observed_cost,
@@ -320,6 +328,10 @@ impl<'de> Deserialize<'de> for Account {
             ));
         }
         Ok(Self(Arc::new(Mutex::new(State {
+            model_calls: saved.model_calls.unwrap_or(0),
+            call_history_complete: saved.model_calls.is_some()
+                && saved.call_history_complete
+                && !saved.tracking_error,
             session_id: saved.session_id,
             legacy_estimate: saved.legacy_estimate,
             historical_observed_cost: saved.observed_cost,
@@ -361,6 +373,7 @@ impl Account {
             session_id: session_id.into(),
             cap,
             legacy_estimate,
+            call_history_complete: legacy_estimate == 0.0,
             ..Default::default()
         }))))
     }
@@ -371,6 +384,7 @@ impl Account {
     pub(crate) fn inherit_uncertainty(&self, prior: AccountSnapshot) {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state.tracking_error |= prior.tracking_error;
+        state.call_history_complete &= !prior.tracking_error;
         state.unpriced_tokens = state.unpriced_tokens.max(prior.unpriced_tokens);
     }
     pub(crate) fn is_uninitialised(&self) -> bool {
@@ -393,6 +407,10 @@ impl Account {
         let cap = validate_cap(cap)?;
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state.cap = cap;
+        state.model_calls = state
+            .model_calls
+            .max(prior.records.saturating_sub(prior.unreported_records) as u64);
+        state.call_history_complete &= prior.unreported_records == 0;
         state.ledger_ready = true;
         state.historical_observed_cost = state
             .historical_observed_cost
@@ -412,6 +430,19 @@ impl Account {
             tracking_error: state.tracking_error,
         }
     }
+    /// Display-only count of deduplicated canonical reported requests. Older
+    /// checkpoints and missing reports remain a lower bound, never exact zero.
+    pub(crate) fn model_call_count(&self) -> Option<(u64, bool)> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (!state.session_id.is_empty()).then_some((state.model_calls, state.call_history_complete))
+    }
+
+    pub(crate) fn inherit_call_count(&self, count: u64, complete: bool) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.model_calls = state.model_calls.max(count);
+        state.call_history_complete &= complete;
+    }
+
     /// One atomic read for reports. Revision is runtime-only and tracks even
     /// known-free receipts; it never creates or replays persisted observations.
     pub(crate) fn report_snapshot(&self) -> (AccountSnapshot, bool, u64) {
@@ -475,6 +506,11 @@ impl Account {
             return Ok(false);
         }
         state.observation_revision = state.observation_revision.saturating_add(1);
+        if row.usage_reported {
+            state.model_calls = state.model_calls.saturating_add(1);
+        } else {
+            state.call_history_complete = false;
+        }
         if let Some(cost) = row.cost {
             let sum = state.observed_cost + cost;
             if sum.is_finite() {
@@ -528,10 +564,9 @@ impl Account {
             .remove(&id);
     }
     pub(crate) fn tracking_failed(&self) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .tracking_error = true;
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.tracking_error = true;
+        state.call_history_complete = false;
     }
 }
 
@@ -721,5 +756,127 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("cost-free-persistence");
         Ledger::new(root.path()).flush(&free).unwrap();
         assert!(free.admit_effect().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod model_call_count_tests {
+    use super::*;
+    fn receipt(kind: RequestKind, rate: f64, reported: bool) -> Receipt {
+        Receipt::new(
+            "s",
+            "p",
+            "m",
+            kind,
+            if reported {
+                UsageDelta {
+                    input_tokens: 10,
+                    ..Default::default()
+                }
+            } else {
+                UsageDelta::default()
+            },
+            PriceSnapshot::capture(
+                Some((rate, rate)),
+                crate::pricing::CachePrices::default(),
+                false,
+            ),
+        )
+    }
+    #[test]
+    fn model_call_count_deduplicates_paid_free_auxiliary_and_preserves_money() {
+        let account = Account::new("s", None, 0.0).unwrap();
+        for (kind, rate) in [
+            (RequestKind::Turn, 1.0),
+            (RequestKind::Title, 0.0),
+            (RequestKind::Compaction, 2.0),
+        ] {
+            let receipt = receipt(kind, rate, true);
+            assert!(account.observe(&receipt).unwrap());
+            assert!(!account.observe(&receipt.clone()).unwrap());
+            account.acknowledge(receipt.id());
+        }
+        assert_eq!(account.model_call_count(), Some((3, true)));
+        assert!((account.snapshot().recorded_spend() - 0.000030).abs() < 1e-12);
+        let saved = serde_json::to_string(&account).unwrap();
+        let restored: Account = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.model_call_count(), Some((3, true)));
+        restored
+            .reconcile(
+                None,
+                &ledger::Totals {
+                    records: 5,
+                    unreported_records: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(restored.model_call_count(), Some((4, false)));
+        assert!(restored.admit_effect().is_ok());
+    }
+    #[test]
+    fn model_call_count_old_checkpoints_missing_reports_and_saturation_are_honest() {
+        let old: Account = serde_json::from_value(serde_json::json!({"version":1,"session_id":"s","legacy_estimate":0.0,"observed_cost":0.0,"unpriced_tokens":0,"tracking_error":false})).unwrap();
+        assert_eq!(old.model_call_count(), Some((0, false)));
+        old.observe(&receipt(RequestKind::Turn, 0.0, false))
+            .unwrap();
+        assert_eq!(old.model_call_count(), Some((0, false)));
+        old.inherit_call_count(u64::MAX, false);
+        old.observe(&receipt(RequestKind::Turn, 1.0, true)).unwrap();
+        assert_eq!(old.model_call_count(), Some((u64::MAX, false)));
+        assert_eq!(Account::default().model_call_count(), None);
+    }
+}
+
+#[cfg(test)]
+mod model_call_uncertainty_tests {
+    use super::*;
+
+    #[test]
+    fn tracking_failure_without_a_receipt_never_claims_an_exact_zero() {
+        let account = Account::new("s", None, 0.0).unwrap();
+        assert_eq!(account.model_call_count(), Some((0, true)));
+        account.tracking_failed();
+        assert_eq!(account.model_call_count(), Some((0, false)));
+        assert_eq!(account.snapshot().recorded_spend(), 0.0);
+        assert!(account.snapshot().tracking_error);
+        let restored: Account =
+            serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+        assert_eq!(restored.model_call_count(), Some((0, false)));
+        let fork = Account::new("fork", None, 0.0).unwrap();
+        fork.inherit_uncertainty(account.snapshot());
+        fork.inherit_call_count(0, true);
+        assert_eq!(fork.model_call_count(), Some((0, false)));
+    }
+
+    #[test]
+    fn live_unpriced_report_counts_but_saved_uncertainty_remains_a_lower_bound() {
+        let account = Account::new("s", None, 0.0).unwrap();
+        let receipt = Receipt::new(
+            "s",
+            "p",
+            "m",
+            RequestKind::Turn,
+            UsageDelta {
+                input_tokens: 1,
+                ..Default::default()
+            },
+            PriceSnapshot::capture(None, crate::pricing::CachePrices::default(), false),
+        );
+        assert!(account.observe(&receipt).unwrap());
+        assert_eq!(account.model_call_count(), Some((1, true)));
+        assert!(account.snapshot().tracking_error);
+        let restored: Account =
+            serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+        assert_eq!(restored.model_call_count(), Some((1, false)));
+        assert_eq!(
+            restored.snapshot().recorded_spend(),
+            account.snapshot().recorded_spend()
+        );
+        let ambiguous: Account = serde_json::from_value(serde_json::json!({"version":1,
+            "session_id":"s", "model_calls":0, "call_history_complete":true,
+            "legacy_estimate":0.0,"observed_cost":0.0,"unpriced_tokens":0,"tracking_error":true}))
+        .unwrap();
+        assert_eq!(ambiguous.model_call_count(), Some((0, false)));
     }
 }

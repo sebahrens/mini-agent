@@ -1503,6 +1503,28 @@ The status bar at the bottom is configurable through `[statusline]`: up to 3
 lines, each an ordered list of segments. When `[statusline]` is absent, a
 built-in single-line layout is used.
 
+The default line distinguishes `ctx 10k/1.0M 1%` (the current request context)
+from `in:134k out:1k` (cumulative session tokens across model requests). Each
+request can resend the context, so cumulative input can exceed the current
+context many times. `calls:13` counts accepted, deduplicated reported model
+requests, including auxiliary requests; `calls:≥13` means a tracked minimum and
+`calls:?` means older/imported history, an unreported request, or tracking uncertainty prevents
+an exact count. Counts survive session saves without reading the ledger during rendering.
+`cache:85%` reports cumulative cache reads against normalized prompt tokens and
+appears when cache usage has been reported. Unknown pricing displays dim
+`cost:?`; a previously recorded amount with incomplete pricing displays `$0.1234+?`.
+Known zero prices remain distinct from unknown prices. `/context` and `/cost`
+provide the full breakdown.
+
+When the terminal narrows, whole items fold instead of silently losing their
+last letters. Icons, caps, and decorative separators go first; the combined
+`context` item can shorten to `ctx 1%`, and paths can shorten to a basename or
+`…`. Lower-priority token/call/cache totals, then cost, then Git/path items drop
+before model and context. Prompt, mode, sandbox, and goal/loop state remain last.
+A remaining item too wide for the row gets a visible trailing `…`. The renderer
+reserves the last terminal cell on every platform to avoid eager console
+wrapping; resizing relayouts the retained spans at the new cell width.
+
 ```toml
 # Line 1
 [[statusline.lines]]
@@ -1549,6 +1571,8 @@ Each segment has:
 | `left`  | Powerline cap glyph drawn before the item. A name (see below) or any literal string. Optional. |
 | `right` | Powerline cap glyph drawn after the item. Optional. |
 | `icon`  | Glyph shown before the value. `true` uses the item's built-in icon; a string sets a custom one (a named icon or a literal glyph). Optional. Needs a Nerd Font. |
+| `priority` | Optional retention priority (0–239): larger values drop later. Safety state and prompt have protected higher priorities. |
+| `min` | Optional literal compact form used before dropping an item; sanitized, never evaluated; mode/sandbox/goal/loop retain their actual value. |
 | `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`, `background_jobs`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
 
 Items with a built-in icon (used by `icon = true`): `git_branch`, `git_changes`,
@@ -1596,13 +1620,15 @@ Available items:
 | `model`               | The active model id. |
 | `model_short`         | The model id without its provider prefix (e.g. `deepseek-v4-pro`). |
 | `provider`            | The active provider name. |
-| `tokens_input`        | Total input tokens this session. |
-| `tokens_output`       | Total output tokens this session. |
+| `tokens_input`        | Cumulative session input tokens (`in:<n>`). |
+| `tokens_output`       | Cumulative session output tokens (`out:<n>`). |
 | `cache_hit_ratio`     | Cached input as a percentage of provider-normalized prompt tokens (`cache:<n>%`). |
+| `calls`               | Deduplicated reported model requests (`calls:<n>`, `calls:≥<n>`, or `calls:?`). |
+| `context`             | Combined current context/window/percentage (`ctx <used>/<max> <n>%`); folds to `ctx <n>%`. |
 | `context_used`        | Current context size in tokens. |
 | `context_max`         | The model's context window. |
 | `context_percentage`  | Context used as a percentage of the max. |
-| `cost`                | Session cost (hidden at `$0.0000` unless `show_cost_always` is set). |
+| `cost`                | Recorded session cost; `cost:?` when pricing is unknown, or a recorded amount suffixed `+?` when incomplete. Known zero is hidden unless `show_cost_always` is set. |
 | `prompt`              | Active prompt (`prompt:<name>`). |
 | `mode`                | Current security mode (`mode:<name>`), including `standard`. |
 | `sandbox`             | Red `sandbox:off` while shell commands run unsandboxed because the default sandbox backend was unavailable (hidden otherwise, including under an explicit `--no-sandbox`). In the default layout; a custom layout that omits it still gets it appended to the first line while degraded. |

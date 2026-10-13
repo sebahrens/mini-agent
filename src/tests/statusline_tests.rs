@@ -118,6 +118,7 @@ fn skipped_optional_item_drops_adjacent_separator() {
     };
     let mut session = Session::new("openrouter", "m", 1000, "");
     session.total_cost = 0.0;
+    session.set_input_output_prices(Some((0.0, 0.0)));
     let lines = statusline::build_lines(&spec, &session, &ctx());
     assert_eq!(
         line_text(&lines[0]),
@@ -135,6 +136,7 @@ fn cost_shown_when_always_flag_set() {
     };
     let mut session = Session::new("openrouter", "m", 1000, "");
     session.show_cost_always = true;
+    session.set_input_output_prices(Some((0.0, 0.0)));
     let lines = statusline::build_lines(&spec, &session, &ctx());
     assert_eq!(line_text(&lines[0]), "$0.0000");
 }
@@ -223,7 +225,8 @@ fn caps_skipped_when_item_is_hidden() {
             }],
         }],
     };
-    let session = Session::new("openrouter", "m", 1000, "");
+    let mut session = Session::new("openrouter", "m", 1000, "");
+    session.set_input_output_prices(Some((0.0, 0.0)));
     let lines = statusline::build_lines(&spec, &session, &ctx());
     assert!(lines[0].is_empty());
 }
@@ -317,7 +320,7 @@ fn always_shows_zero_tokens() {
     assert!(line_text(&statusline::build_lines(&hidden, &session, &ctx())[0]).is_empty());
     assert_eq!(
         line_text(&statusline::build_lines(&forced, &session, &ctx())[0]),
-        "0"
+        "in:0"
     );
 }
 
@@ -589,5 +592,244 @@ fn mode_cycle_status_item_shows_standard_guarded_and_yolo_and_invalidates_cache(
         let key = statusline::cache_key(&session, &context);
         assert_ne!(Some(key), previous);
         previous = Some(key);
+    }
+}
+
+#[test]
+fn labels_distinguish_context_cumulative_tokens_and_unknown_cost() {
+    let mut session = Session::new("p", "m", 1_000_000, "");
+    session.total_input_tokens = 134_000;
+    session.total_output_tokens = 1_000;
+    session.total_real_input_tokens = 134_000;
+    session.total_cached_input_tokens = 113_900;
+    session.set_calibration(9_000, 1_000);
+    let text =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(text.contains("ctx 10k/1.0M 1%"), "{text}");
+    assert!(text.contains("in:134k out:1k cache:85%"), "{text}");
+    assert!(text.contains("cost:?"), "{text}");
+    assert!(
+        text.contains("calls:?"),
+        "old totals cannot imply an exact call count: {text}"
+    );
+    assert!(!text.contains('⇑') && !text.contains('⇓'));
+    session.set_input_output_prices(Some((0.0, 0.0)));
+    session.show_cost_always = true;
+    let free =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(free.contains("$0.0000") && !free.contains("cost:?"));
+}
+
+#[test]
+fn reported_calls_refresh_cache_even_with_known_free_usage() {
+    let mut session = Session::new("p", "m", 1000, "");
+    session.set_input_output_prices(Some((0.0, 0.0)));
+    session.initialize_spend_account(None).unwrap();
+    let before = statusline::cache_key(&session, &ctx());
+    let receipt = crate::spend::Receipt::new(
+        &session.id,
+        "p",
+        "m",
+        crate::spend::RequestKind::Title,
+        crate::event::UsageDelta {
+            input_tokens: 1,
+            ..Default::default()
+        },
+        crate::spend::PriceSnapshot::capture(
+            Some((0.0, 0.0)),
+            crate::pricing::CachePrices::default(),
+            false,
+        ),
+    );
+    session.spend_account.observe(&receipt).unwrap();
+    assert_ne!(before, statusline::cache_key(&session, &ctx()));
+    let text =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(text.contains("calls:1"), "{text}");
+    let same = statusline::cache_key(&session, &ctx());
+    assert!(!session.spend_account.observe(&receipt).unwrap());
+    assert_eq!(same, statusline::cache_key(&session, &ctx()));
+}
+
+#[test]
+fn default_narrow_layout_preserves_complete_safety_and_prompt_items() {
+    let mut session = Session::new("p", "provider/very-long-model-name", 1_000_000, "");
+    session.total_input_tokens = 134_000;
+    session.total_output_tokens = 1_000;
+    session.git_branch = Some("feature/long-branch-name".into());
+    let mut context = ctx();
+    context.prompt_name = Some("code");
+    context.perm_mode = Some("yolo");
+    let spans = &statusline::build_lines(&statusline::default_spec(), &session, &context)[0];
+    assert_eq!(statusline::fit_line(spans, 500), *spans);
+    let fitted = statusline::fit_line(spans, 59);
+    let text = line_text(&fitted);
+    assert!(
+        text.contains("prompt:code") && text.contains("mode:yolo"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("in:134k") && !text.contains("out:1k"),
+        "{text}"
+    );
+    assert!(!text.contains("prompt:cod\0"));
+    let visible: String = fitted
+        .iter()
+        .filter_map(|span| match span {
+            StatusSpan::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(crate::ui::utils::display_width(&visible) <= 59);
+    // An extremely long surviving safety item is visibly marked, even at 30 columns.
+    context.sandbox_label = Some("sandbox:off-unavailable-backend-with-long-label");
+    let spans = &statusline::build_lines(&statusline::default_spec(), &session, &context)[0];
+    let text = line_text(&statusline::fit_line(spans, 29)).replace("\0FLEX\0", "");
+    assert!(text.ends_with('…'), "{text}");
+    assert!(crate::ui::utils::display_width(&text) <= 29);
+}
+
+#[test]
+fn custom_priority_compact_forms_and_unicode_are_cell_bounded_and_inert() {
+    let mut model = seg("model");
+    model.priority = Some(200);
+    model.min = Some("m\x1b[2J\n".into());
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![
+                model,
+                seg("separator"),
+                seg("tokens_input"),
+                seg("separator"),
+                seg("prompt"),
+            ],
+        }],
+    };
+    let mut session = Session::new("p", "very-long-model", 1000, "");
+    session.total_input_tokens = 1000;
+    let mut context = ctx();
+    context.prompt_name = Some("e\u{301}界😀");
+    let spans = &statusline::build_lines(&spec, &session, &context)[0];
+    let compact = line_text(&statusline::fit_line(spans, 15));
+    assert!(compact.contains("prompt:e\u{301}界😀"), "{compact}");
+    assert!(!compact.contains('\x1b') && !compact.contains('\n'));
+    for width in 0..=40 {
+        let fitted = statusline::fit_line(spans, width);
+        let text = line_text(&fitted).replace("\0FLEX\0", "");
+        assert!(
+            crate::ui::utils::display_width(&text) <= width,
+            "{width}: {text}"
+        );
+        if width == 0 {
+            assert!(text.is_empty());
+        }
+    }
+    assert_eq!(statusline::ellipsize("界界界", 4), "界…");
+    assert_eq!(statusline::ellipsize("e\u{301}long", 2), "e\u{301}…");
+}
+
+#[test]
+fn safety_state_cannot_be_hidden_by_a_compact_form_or_low_priority() {
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![
+                StatusLineSegment {
+                    item: "model".into(),
+                    priority: Some(255),
+                    ..Default::default()
+                },
+                seg("separator"),
+                StatusLineSegment {
+                    item: "sandbox".into(),
+                    priority: Some(0),
+                    min: Some("".into()),
+                    ..Default::default()
+                },
+            ],
+        }],
+    };
+    let session = Session::new("p", "a-very-long-model-name", 1000, "");
+    let mut context = ctx();
+    context.sandbox_label = Some("sandbox:off");
+    let spans = &statusline::build_lines(&spec, &session, &context)[0];
+    assert_eq!(line_text(&statusline::fit_line(spans, 11)), "sandbox:off");
+}
+
+#[test]
+fn imported_history_and_rekeyed_accounts_keep_call_count_incomplete() {
+    let mut session = Session::new("p", "m", 1000, "");
+    session.add_message(
+        crate::session::MessageRole::Assistant,
+        "imported reply with missing usage",
+    );
+    session.initialize_spend_account(None).unwrap();
+    assert_eq!(session.spend_account.model_call_count(), Some((0, false)));
+    let receipt = crate::spend::Receipt::new(
+        &session.id,
+        "p",
+        "m",
+        crate::spend::RequestKind::Turn,
+        crate::event::UsageDelta {
+            input_tokens: 1,
+            ..Default::default()
+        },
+        crate::spend::PriceSnapshot::capture(
+            Some((0.0, 0.0)),
+            crate::pricing::CachePrices::default(),
+            false,
+        ),
+    );
+    session.spend_account.observe(&receipt).unwrap();
+    session.id = "forked-logical-session".into();
+    session.initialize_spend_account(None).unwrap();
+    assert_eq!(session.spend_account.model_call_count(), Some((1, false)));
+    let text =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(text.contains("calls:≥1"));
+}
+
+#[test]
+fn combined_context_warning_color_survives_its_compact_form() {
+    let mut session = Session::new("p", "m", 1000, "");
+    session.overhead_tokens = 1100;
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("context")],
+        }],
+    };
+    let spans = &statusline::build_lines(&spec, &session, &ctx())[0];
+    let compact = statusline::fit_line(spans, 8);
+    assert_eq!(line_text(&compact), "ctx 110%");
+    assert_eq!(first_fg(&compact), Some(crossterm::style::Color::Red));
+}
+
+#[test]
+fn cache_only_and_subagent_only_legacy_history_never_claims_zero_calls() {
+    for variant in 0..4 {
+        let mut session = Session::new("p", "m", 1000, "");
+        match variant {
+            0 => session.total_cached_input_tokens = 100,
+            1 => session.total_cache_creation_input_tokens = 100,
+            2 => session.total_cost = 0.1,
+            _ => session.add_message(
+                crate::session::MessageRole::SubagentToolCall,
+                "historical nested request",
+            ),
+        }
+        let spec = StatusLineConfig {
+            lines: vec![StatusLineLine {
+                segments: vec![seg("calls")],
+            }],
+        };
+        assert_eq!(
+            line_text(&statusline::build_lines(&spec, &session, &ctx())[0]),
+            "calls:?"
+        );
+        session.initialize_spend_account(None).unwrap();
+        assert_eq!(session.spend_account.model_call_count(), Some((0, false)));
+        assert_eq!(
+            line_text(&statusline::build_lines(&spec, &session, &ctx())[0]),
+            "calls:?"
+        );
     }
 }

@@ -1587,15 +1587,19 @@ impl Renderer {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
 
-        let total = cols as usize;
+        // Reserve the last cell even on legacy consoles with eager autowrap.
+        let total = cols.saturating_sub(1) as usize;
         let mut budget = total;
 
         if let Some((prefix, color)) = prefix {
             write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
-            let take = crate::ui::utils::display_prefix(prefix, budget);
-            budget -= display_width(take);
+            let take = super::statusline::ellipsize(prefix, budget);
+            budget -= display_width(&take);
             write!(stdout, "{}", take)?;
         }
+
+        let fitted = super::statusline::fit_line(spans, budget);
+        let spans = fitted.as_slice();
 
         // Fixed width of all text spans; flex shares what is left.
         let fixed: usize = spans
@@ -1609,7 +1613,7 @@ impl Renderer {
             .iter()
             .filter(|s| matches!(s, StatusSpan::Flex))
             .count();
-        let mut flex_left = budget.saturating_sub(fixed);
+        let flex_left = budget.saturating_sub(fixed);
         let mut flex_seen = 0usize;
 
         for span in spans {
@@ -1617,16 +1621,16 @@ impl Renderer {
                 break;
             }
             match span {
-                StatusSpan::Text { text, fg, bg } => {
+                StatusSpan::Text { text, fg, bg, .. } => {
                     let bgc = bg.or(self.status_bg);
                     if let Some(c) = bgc {
                         write!(stdout, "{}", SetBackgroundColor(self.color(c)))?;
                     }
                     let fgc = fg.unwrap_or(Color::DarkGrey);
                     write!(stdout, "{}", SetForegroundColor(self.color(fgc)))?;
-                    let piece = crate::ui::utils::display_prefix(text, budget);
-                    budget = budget.saturating_sub(display_width(piece));
-                    write!(stdout, "{}", piece)?;
+                    debug_assert!(display_width(text) <= budget);
+                    budget = budget.saturating_sub(display_width(text));
+                    write!(stdout, "{}", text)?;
                     write!(stdout, "{}", ResetColor)?;
                     if let Some(bg) = self.status_bg {
                         write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -1645,7 +1649,6 @@ impl Renderer {
                         0
                     };
                     let width = (base + extra).min(budget);
-                    flex_left = flex_left.saturating_sub(width);
                     budget = budget.saturating_sub(width);
                     write!(stdout, "{}", " ".repeat(width))?;
                 }
@@ -2853,5 +2856,87 @@ mod mutation_diff_capture_tests {
             );
             assert_eq!(renderer.native_size_queries.get(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod statusline_layout_tests {
+    use super::*;
+    use crate::config::types::{StatusLineConfig, StatusLineLine, StatusLineSegment};
+    use crate::session::Session;
+    use crate::ui::statusline::{self, StatusContext};
+
+    #[test]
+    fn actual_statusline_draw_reserves_last_cell_and_marks_unicode_clipping() {
+        let renderer = Renderer::for_app_test().unwrap();
+        let session = Session::new("p", "m", 1000, "/workspace");
+        let context = StatusContext {
+            workspace: std::path::Path::new("/workspace"),
+            loop_label: None,
+            goal_label: None,
+            prompt_name: Some("界界界界界界界界"),
+            reasoning_effort: None,
+            perm_mode: None,
+            chain_label: None,
+            background_jobs: 0,
+            btw_cost: 0.0,
+            btw_in: 0,
+            btw_out: 0,
+            sandbox_label: None,
+        };
+        let spec = StatusLineConfig {
+            lines: vec![StatusLineLine {
+                segments: vec![StatusLineSegment {
+                    item: "prompt".into(),
+                    ..Default::default()
+                }],
+            }],
+        };
+        let spans = statusline::build_lines(&spec, &session, &context);
+        renderer
+            .draw_statusline_row(5, &spans[0], None, 12)
+            .unwrap();
+        let text = crate::ui::events::sanitize_output(&renderer.captured_output());
+        assert_eq!(text, "prompt:界…");
+        assert!(display_width(&text) <= 11);
+        renderer.capture_bytes().lock().unwrap().clear();
+        renderer
+            .draw_statusline_row(5, &spans[0], None, 30)
+            .unwrap();
+        let wide = crate::ui::events::sanitize_output(&renderer.captured_output());
+        assert_eq!(wide, "prompt:界界界界界界界界");
+        assert!(!wide.contains('…'));
+    }
+
+    #[test]
+    fn actual_statusline_draw_splits_flex_and_relayouts_on_resize_without_rebuild() {
+        let renderer = Renderer::for_app_test().unwrap();
+        let item = |text: &str| StatusSpan::Text {
+            text: text.into(),
+            fg: None,
+            bg: None,
+            layout: statusline::SpanLayout::Item {
+                priority: 100,
+                plain: text.into(),
+                compact: None,
+            },
+        };
+        let spans = [
+            item("a"),
+            StatusSpan::Flex,
+            item("b"),
+            StatusSpan::Flex,
+            item("c"),
+        ];
+        renderer.draw_statusline_row(5, &spans, None, 12).unwrap();
+        let text = crate::ui::events::sanitize_output(&renderer.captured_output());
+        assert_eq!(text, "a    b    c");
+        assert_eq!(display_width(&text), 11);
+        renderer.capture_bytes().lock().unwrap().clear();
+        renderer.draw_statusline_row(5, &spans, None, 6).unwrap();
+        assert_eq!(
+            crate::ui::events::sanitize_output(&renderer.captured_output()),
+            "a b c"
+        );
     }
 }

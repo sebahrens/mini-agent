@@ -138,3 +138,14 @@ receipt retries cannot charge or append the same receipt twice.
 `src/spend/request_tests.rs` owns fake native HTTP fixtures for raw auxiliary
 accounting, cancellation, SDK invalid-tool failures, captured prices and refusal
 of subsequent requests. Production credentials and paid endpoints are not used.
+
+The status bar's `calls` counter is display metadata on the same session account.
+Only deduplicated accepted receipts with a canonical usage report increment it,
+including free and auxiliary model requests. It does not change prices, admission,
+receipt IDs, or token/cost arithmetic. Older checkpoints default to incomplete
+call history; unreported requests or tracking failures do not manufacture an exact
+count. Canonical unpriced reports still count while live; persisted tracking
+uncertainty is restored conservatively as a lower bound. Existing
+ledger reconciliation supplies a lower bound from reported rows, and a new
+logical-session key retains the historical count and its completeness marker.
+Neither rendering nor resizing opens the ledger or performs provider work.

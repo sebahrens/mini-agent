@@ -285,6 +285,12 @@ pub struct StatusLineSegment {
     /// even when its value is zero (normally hidden).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always: Option<bool>,
+    /// Higher values retain the item longer when the row is narrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// Literal compact form; never evaluated as a directive or template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<CompactString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
