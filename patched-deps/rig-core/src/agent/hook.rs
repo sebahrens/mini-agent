@@ -514,6 +514,9 @@ pub enum StepEvent<'a, M: CompletionModel> {
     /// [`Flow::Terminate`]. Across a [`HookStack`], [`RewriteArgs`](Flow::RewriteArgs)
     /// is chained: `args` reflects prior hooks' rewrites (see the module docs).
     ToolCall {
+        /// Canonical assistant tool ID (`ToolCall.id`), including native protocols
+        /// whose optional provider call ID is absent.
+        tool_id: &'a str,
         /// Name of the tool about to be called.
         tool_name: &'a str,
         /// Provider-supplied tool call ID, when available.
@@ -1190,6 +1193,7 @@ where
         &self,
         ctx: &HookContext,
         tool_name: &str,
+        tool_id: &str,
         tool_call_id: Option<&str>,
         internal_call_id: &str,
         args: &str,
@@ -1200,6 +1204,7 @@ where
                     ctx,
                     StepEvent::ToolCall {
                         tool_name,
+                        tool_id,
                         tool_call_id,
                         internal_call_id,
                         args,
@@ -1267,6 +1272,7 @@ where
         &'a self,
         ctx: &'a HookContext,
         tool_name: &'a str,
+        tool_id: &'a str,
         tool_call_id: Option<&'a str>,
         internal_call_id: &'a str,
         args: &'a str,
@@ -1297,6 +1303,7 @@ where
         &'a self,
         ctx: &'a HookContext,
         tool_name: &'a str,
+        tool_id: &'a str,
         tool_call_id: Option<&'a str>,
         internal_call_id: &'a str,
         args: &'a str,
@@ -1304,7 +1311,14 @@ where
     where
         M: 'a,
     {
-        Box::pin(self.resolve_tool_call(ctx, tool_name, tool_call_id, internal_call_id, args))
+        Box::pin(self.resolve_tool_call(
+            ctx,
+            tool_name,
+            tool_id,
+            tool_call_id,
+            internal_call_id,
+            args,
+        ))
     }
 
     fn observes_dyn(&self, kind: StepEventKind) -> bool {
@@ -1433,6 +1447,7 @@ where
         &self,
         ctx: &HookContext,
         tool_name: &str,
+        tool_id: &str,
         tool_call_id: Option<&str>,
         internal_call_id: &str,
         args: &str,
@@ -1445,6 +1460,7 @@ where
                 .resolve_tool_call_boxed(
                     ctx,
                     tool_name,
+                    tool_id,
                     tool_call_id,
                     internal_call_id,
                     args_for_hook,
@@ -1506,13 +1522,21 @@ where
             // here (this result is observe-only).
             StepEvent::ToolCall {
                 tool_name,
+                tool_id,
                 tool_call_id,
                 internal_call_id,
                 args,
             } => {
-                self.resolve_tool_call(ctx, tool_name, tool_call_id, internal_call_id, args)
-                    .await
-                    .0
+                self.resolve_tool_call(
+                    ctx,
+                    tool_name,
+                    tool_id,
+                    tool_call_id,
+                    internal_call_id,
+                    args,
+                )
+                .await
+                .0
             }
             // Chain tool-result rewrites: thread the effective (model-visible)
             // result through each hook (the first hook sees the tool's real
@@ -1640,6 +1664,7 @@ mod tests {
     fn tool_call_event() -> StepEvent<'static, M> {
         StepEvent::ToolCall {
             tool_name: "add",
+            tool_id: "canonical1",
             tool_call_id: Some("tc1"),
             internal_call_id: "ic1",
             args: "{}",
@@ -2069,7 +2094,7 @@ mod tests {
 
         async fn resolve(stack: &HookStack<M>) -> (Flow, Option<Value>) {
             stack
-                .resolve_tool_call(&ctx(), "add", Some("tc1"), "ic1", "{}")
+                .resolve_tool_call(&ctx(), "add", "canonical1", Some("tc1"), "ic1", "{}")
                 .await
         }
 

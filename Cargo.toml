@@ -201,6 +201,9 @@ core-foundation = "0.10"
 security-framework = "3.7"
 security-framework-sys = "2.17"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_ToolHelp"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }

@@ -40,7 +40,7 @@ def validate_native_step(workflow):
     names = set(re.findall(r"ui::slash::git::windows_native_pr_tests::(\w+): test", body))
     if names != CASES:
         raise AssertionError("exact five acceptance cases required")
-    if body.count("if ($LASTEXITCODE -ne 0)") != 4:
+    if body.count("if ($LASTEXITCODE -ne 0)") != 5:
         raise AssertionError("each compilation/discovery/proof exit must be checked")
     if "cargo build" in body or "--release" in body or "RUST_MIN_STACK" in body:
         raise AssertionError("development policy or fixed stack boundary widened")
@@ -199,6 +199,25 @@ class WindowsGhCiTests(unittest.TestCase):
         self.assertNotIn("repo.git", source)
         self.assertNotIn('target_os = "macos"', source)
         self.assertIn("127.0.0.1:9", source)
+
+    def test_suspended_job_prototype_is_exact_and_cannot_replace_pr_acceptance(self):
+        body = validate_native_step((ROOT / ".github/workflows/ci.yml").read_text())
+        required_guards = ["$prototypeActual.Count -ne 2", "Compare-Object -ReferenceObject $prototypeExpected -DifferenceObject $prototypeActual", "$prototypeExit -ne 0", "^test result: ok\\. 2 passed; 0 failed; 0 ignored;", "--bin mini-agent $prototypeFilter -- --ignored --list", "--bin mini-agent $prototypeFilter -- --ignored --nocapture --test-threads=1"]
+        def require_prototype_guards(candidate):
+            for required in required_guards:
+                if required not in candidate:
+                    raise AssertionError("missing prototype guard: " + required)
+        require_prototype_guards(body)
+        for required in required_guards:
+            with self.subTest(guard=required), self.assertRaises(AssertionError):
+                require_prototype_guards(body.replace(required, "removed prototype guard"))
+        names = set(re.findall(r"general_process_prototype_tests::(\w+): test", body))
+        self.assertEqual(names, {"windows_general_suspended_job_cancel_and_leader_exit_retire_exact_descendant", "windows_general_suspended_job_setup_failures_never_execute_helper"})
+        self.assertLess(body.index("$prototypeResult ="), body.index("--bin mini-agent $filter -- --ignored --nocapture"))
+        source = (ROOT / "src/tests/windows_foreground_job_tests.rs").read_text()
+        for required in ["creation_guard()", "CREATE_SUSPENDED", "AssignProcessToJobObject(family.job.raw(), process)", "GetProcessIdOfThread(thread.raw())", "ResumeThread(thread.raw()) } != 1", "family.retire().await.unwrap()", "active_job_processes(&family.job).unwrap(), 0"]:
+            self.assertIn(required, source)
+        self.assertIn("Production Shell does not use this owner", source)
 
     def test_missing_or_weakened_discovery_controls_are_rejected(self):
         original = (ROOT / ".github/workflows/ci.yml").read_text()

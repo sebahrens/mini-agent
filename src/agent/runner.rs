@@ -2435,6 +2435,7 @@ async fn continue_prompt_injector<M>(
     retry_history: &[Message],
     continuation_bridge: &[Message],
     max_turns: usize,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
 ) -> StreamingResult<M::StreamingResponse>
 where
     M: CompletionModel + 'static,
@@ -2451,6 +2452,7 @@ where
         .stream_chat(current_prompt.clone(), new_history)
         .max_turns(max_turns)
         .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+        .add_hook(native_capture)
         .add_hook(crate::spend::run::AdmissionHook(
             crate::spend::run::Run::current(),
         ))
@@ -2557,6 +2559,7 @@ where
         None,
         false,
         work_scope,
+        crate::agent::native_capture::NativeCaptureHook::default(),
     )
     .0
 }
@@ -2606,6 +2609,39 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    spawn_agent_paused_in_scope_with_native_capture(
+        agent,
+        prompt,
+        history,
+        retry_config,
+        turn_token_budget,
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        completion_verification,
+        work_scope,
+        crate::agent::native_capture::NativeCaptureHook::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_agent_paused_in_scope_with_native_capture<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Arc<[Message]>,
+    retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    completion_verification: Option<CompletionVerification>,
+    work_scope: Arc<AgentWorkScope>,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
+) -> PausedAgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
     let (runner, start_tx) = spawn_agent_with_start_mode(
         agent,
         prompt,
@@ -2620,6 +2656,7 @@ where
         completion_verification,
         true,
         Arc::clone(&work_scope),
+        native_capture,
     );
     PausedAgentRunner::new(
         runner,
@@ -2660,6 +2697,7 @@ where
         None,
         false,
         work_scope,
+        crate::agent::native_capture::NativeCaptureHook::default(),
     )
     .0
 }
@@ -2677,6 +2715,7 @@ fn spawn_agent_with_start_mode<M>(
     completion_verification: Option<CompletionVerification>,
     start_paused: bool,
     work_scope: Arc<AgentWorkScope>,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
 ) -> (AgentRunner, Option<tokio::sync::oneshot::Sender<()>>)
 where
     M: CompletionModel + 'static,
@@ -2818,6 +2857,7 @@ where
                             .tool_concurrency(
                                 crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
                             )
+                            .add_hook(native_capture.clone())
                             .add_hook(crate::spend::run::AdmissionHook(
                                 crate::spend::run::Run::current(),
                             ))
@@ -3430,6 +3470,7 @@ where
                     &retry_history,
                     &continuation_bridge,
                     remaining_turns,
+                    native_capture.clone(),
                 )
                 .await,
             );
@@ -3550,6 +3591,7 @@ where
         turn_token_budget,
         history,
         completion_verification,
+        crate::agent::native_capture::NativeCaptureHook::default(),
         #[cfg(feature = "hooks")]
         loop_info,
     )
@@ -3565,6 +3607,7 @@ pub(crate) async fn run_print_with_output_and_verification<M, H>(
     turn_token_budget: Option<u64>,
     history: H,
     completion_verification: Option<CompletionVerification>,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> HeadlessTurn
 where
@@ -3589,6 +3632,7 @@ where
                 history.into(),
                 RunnerStreamPolicy::default(),
                 completion_verification,
+                native_capture,
                 #[cfg(feature = "hooks")]
                 loop_info,
             )
@@ -3638,6 +3682,7 @@ where
         history.into(),
         stream_policy,
         None,
+        crate::agent::native_capture::NativeCaptureHook::default(),
         #[cfg(feature = "hooks")]
         loop_info,
     )
@@ -3697,6 +3742,7 @@ async fn run_print_with_stream_policy_and_verification<M>(
     history: Arc<[Message]>,
     stream_policy: RunnerStreamPolicy,
     completion_verification: Option<CompletionVerification>,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> HeadlessTurn
 where
@@ -3717,11 +3763,13 @@ where
         let h = first_attempt_history
             .take()
             .unwrap_or_else(|| history.to_vec());
+        let capture = native_capture.clone();
         async move {
             agent
                 .stream_chat(p, h)
                 .max_turns(max_turns)
                 .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                .add_hook(capture)
                 .add_hook(crate::spend::run::AdmissionHook(
                     crate::spend::run::Run::current(),
                 ))
@@ -4142,6 +4190,7 @@ where
                 &retry_history,
                 &continuation_bridge,
                 remaining_turns,
+                native_capture.clone(),
             )));
             usage_ledger.start_stream();
             turns_at_stream_start = turns_used;
@@ -5838,6 +5887,7 @@ mod tests {
             Some(verification),
             false,
             super::AgentWorkScope::new(),
+            crate::agent::native_capture::NativeCaptureHook::default(),
         )
         .0;
 
@@ -5922,6 +5972,7 @@ mod tests {
             Some(verification),
             false,
             super::AgentWorkScope::new(),
+            crate::agent::native_capture::NativeCaptureHook::default(),
         )
         .0;
 

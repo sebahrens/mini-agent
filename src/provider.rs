@@ -2009,6 +2009,7 @@ pub struct AnyAgent {
     /// different unit entirely.
     turn_token_budget: Option<u64>,
     spend: Option<crate::spend::run::Run>,
+    native_capture: Option<crate::agent::native_capture::NativeCapture>,
     question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
     context_snapshot: Option<builder::PreambleSnapshot>,
@@ -2026,6 +2027,7 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            native_capture: None,
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
@@ -2036,6 +2038,17 @@ impl AnyAgent {
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    // Capture is not yet enabled by a frontend: Session/domain policy is a
+    // separately reviewed step. Tests inject an explicitly owned collection.
+    #[cfg(test)]
+    pub(crate) fn with_native_capture(
+        mut self,
+        capture: crate::agent::native_capture::NativeCapture,
+    ) -> Self {
+        self.native_capture = Some(capture);
+        self
     }
 
     #[cfg(any(feature = "acp", feature = "subagents", test))]
@@ -2141,6 +2154,7 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            native_capture: None,
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
@@ -2303,6 +2317,7 @@ impl AnyAgent {
                                 self.turn_token_budget,
                                 history,
                                 self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::default(),
                                 #[cfg(feature = "hooks")]
                                 loop_info,
                             )
@@ -2320,6 +2335,7 @@ impl AnyAgent {
                                     self.turn_token_budget,
                                     history,
                                     self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
                                     #[cfg(feature = "hooks")]
                                     loop_info,
                                 )
@@ -2336,6 +2352,7 @@ impl AnyAgent {
                                     self.turn_token_budget,
                                     history,
                                     self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
                                     #[cfg(feature = "hooks")]
                                     loop_info,
                                 )
@@ -2353,6 +2370,10 @@ impl AnyAgent {
                                 self.turn_token_budget,
                                 history,
                                 self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::for_native(
+                                    self.native_capture.clone(),
+                                    &a.model.model,
+                                ),
                                 #[cfg(feature = "hooks")]
                                 loop_info,
                             )
@@ -2369,6 +2390,7 @@ impl AnyAgent {
                                 self.turn_token_budget,
                                 history,
                                 self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::default(),
                                 #[cfg(feature = "hooks")]
                                 loop_info,
                             )
@@ -2385,6 +2407,7 @@ impl AnyAgent {
                                 self.turn_token_budget,
                                 history,
                                 self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::default(),
                                 #[cfg(feature = "hooks")]
                                 loop_info,
                             )
@@ -2616,6 +2639,7 @@ impl AnyAgent {
                 };
                 let turn_token_budget = self.turn_token_budget;
                 let completion_verification = self.completion_verification;
+                let native_capture = self.native_capture;
                 match self.inner {
                     AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
                         a,
@@ -2658,19 +2682,26 @@ impl AnyAgent {
                             work_scope,
                         ),
                     },
-                    AnyAgentInner::Anthropic(a) => runner::spawn_agent_paused_in_scope(
-                        a,
-                        prompt,
-                        history,
-                        retry_config,
-                        turn_token_budget,
-                        #[cfg(feature = "skills")]
-                        turn_guard,
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                        completion_verification.clone(),
-                        work_scope,
-                    ),
+                    AnyAgentInner::Anthropic(a) => {
+                        let capture = crate::agent::native_capture::NativeCaptureHook::for_native(
+                            native_capture,
+                            &a.model.model,
+                        );
+                        runner::spawn_agent_paused_in_scope_with_native_capture(
+                            a,
+                            prompt,
+                            history,
+                            retry_config,
+                            turn_token_budget,
+                            #[cfg(feature = "skills")]
+                            turn_guard,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                            completion_verification.clone(),
+                            work_scope,
+                            capture,
+                        )
+                    }
                     AnyAgentInner::Gemini(a) => runner::spawn_agent_paused_in_scope(
                         a,
                         prompt,

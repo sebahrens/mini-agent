@@ -629,3 +629,14 @@ fixture checks executable metadata against an owned marker script and never
 executes it. All constructor, macro-identity and cross-family negatives remain
 enforced. The existing combined 1 MiB App consumer also submits `/doctor`
 before its declined Git confirmation without creating an agent or repository.
+
+
+## Native capture test-thread inventory
+
+The native completed-content control in `src/provider_effort_replay_probe.rs`
+creates exactly one named `std::thread::Builder` thread with a 1 MiB stack and
+joins it before fixture teardown. Its exact `.spawn(|| {` occurrence is
+`NON-PROCESS` in both checked classification tables. It runs the existing
+owned loopback fixture and ordinary runner, adds no subprocess launch or
+creation-boundary exemption, and does not change the scanner or its negative
+controls.

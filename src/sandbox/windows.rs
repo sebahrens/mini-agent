@@ -11,6 +11,10 @@
 use super::profile_journal::{
     MAX_CONTROL_RECORD_BYTES, RecordKind, is_staging_leaf, validate_payload,
 };
+
+#[cfg(test)]
+#[path = "../tests/windows_foreground_job_tests.rs"]
+mod general_process_prototype_tests;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, c_void};

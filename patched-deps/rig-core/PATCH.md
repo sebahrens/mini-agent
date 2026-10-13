@@ -114,3 +114,16 @@ interleaved source blocks. They also prove nonempty thinking is not duplicated,
 interrupted signatures do not complete, and generic delta-only aggregation is
 unchanged. This backport does not deliver application Session replay/frontier,
 mutable memory placement, or effort/session controls by itself.
+
+## Canonical tool-call hook identity (partial mini-agent-i7ro6.46)
+
+`StepEvent::ToolCall` additionally borrows `tool_id` directly from the assistant's
+`ToolCall.id` in `run_single_tool`. The leaf, erased, and nested `HookStack`
+resolution paths forward it unchanged, including argument rewrites and skipped
+calls. The optional `tool_call_id` still means `ToolCall.call_id`; the internal
+Rig event ID is unchanged. Native Anthropic calls can legitimately have a
+canonical tool-use ID and no optional provider call ID. This additive event
+field provides exact correlation without guessing from tool names or callback
+order. No tool execution, Flow, result, billing, or transport behavior changes.
+The application native capture fixture verifies both real canonical tool-use
+IDs, absent optional IDs, and distinct internal IDs on actual SDK calls.

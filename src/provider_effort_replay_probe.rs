@@ -164,7 +164,9 @@ async fn run_probe(summary: &str, canonical: bool) -> Value {
         .default_max_turns(2)
         .tool(ProbeRead(Arc::clone(&calls)))
         .build();
-    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner));
+    let capture = crate::agent::native_capture::NativeCapture::default();
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner))
+        .with_native_capture(capture.clone());
     let output = crate::print::HeadlessOutputPolicy::legacy(false, true);
     let retry = RetryConfig {
         max_attempts: 1,
@@ -233,6 +235,41 @@ async fn run_probe(summary: &str, canonical: bool) -> Value {
         .await;
     assert!(second_replay.failure.is_none());
     assert_eq!(calls.load(Ordering::Acquire), 2);
+    let (captured_turns, capture_unavailable) = capture.snapshot();
+    assert_eq!(capture_unavailable, None);
+    assert_eq!(captured_turns.len(), 4);
+    assert!(
+        captured_turns
+            .iter()
+            .all(|turn| turn.configured_model == "claude-opus-5-5")
+    );
+    let captured_native =
+        rig::providers::anthropic::completion::Message::try_from(Message::Assistant {
+            id: None,
+            content: captured_turns[0].content.clone(),
+        })
+        .unwrap();
+    let captured_native = serde_json::to_value(captured_native).unwrap();
+    assert_eq!(captured_turns[0].advertised_tools.len(), 2);
+    assert_eq!(
+        captured_turns[0]
+            .advertised_tools
+            .iter()
+            .map(|tool| tool.tool_id.as_str())
+            .collect::<Vec<_>>(),
+        ["toolu_probe_one", "toolu_probe_two"]
+    );
+    assert!(
+        captured_turns[0]
+            .advertised_tools
+            .iter()
+            .all(|tool| !tool.internal_id.is_empty() && tool.provider_id.is_none()),
+        "native canonical tool ID must not be relabeled as an optional provider call ID"
+    );
+    assert_ne!(
+        captured_turns[0].advertised_tools[0].internal_id,
+        captured_turns[0].advertised_tools[1].internal_id
+    );
     let mut requests = wire.finish();
     assert_eq!(requests.len(), 4);
     requests.iter_mut().for_each(without_cache);
@@ -280,6 +317,8 @@ async fn run_probe(summary: &str, canonical: bool) -> Value {
     json!({
         "sequence_case":if canonical{"thinking_first_with_redacted"}else{"adversarial_interleaved"},
         "original_typed_assistant":original_typed,
+        "owned_captured_turns":captured_turns,
+        "captured_native_content":captured_native["content"],
         "raw_sdk_choice_before_assembler":raw_choice,
         "raw_choice_native_conversion":raw_native,
         "raw_capture_request":raw_request[0],
@@ -309,6 +348,10 @@ async fn effort46_native_completed_projection_preserves_sdk_followup_order() {
         assert_eq!(
             case["raw_choice_native_conversion"]["content"], case["expected_first_assistant"],
             "native completed projection changed or duplicated blocks"
+        );
+        assert_eq!(
+            case["captured_native_content"], case["expected_first_assistant"],
+            "owned capture changed ModelTurnFinished content"
         );
         assert_eq!(
             case["first_sdk_followup"], case["expected_first_assistant"],
@@ -400,5 +443,252 @@ async fn effort46_native_interrupted_nonempty_thinking_is_display_only() {
             .any(|item| matches!(item, rig::message::AssistantContent::Reasoning(_))),
         "incomplete native thinking became completed replay content"
     );
+    assert_eq!(wire.finish().len(), 1);
+}
+
+#[test]
+fn effort46_owned_capture_interactive_complete_recovered_and_incomplete_controls() {
+    std::thread::Builder::new()
+        .name("effort46-native-capture-one-mib".into())
+        .stack_size(1_048_576)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(owned_capture_interactive_controls());
+        })
+        .unwrap()
+        .join()
+        .expect("native capture one-MiB consumer");
+}
+
+async fn owned_capture_interactive_controls() {
+    use crate::agent::native_capture::{NativeCapture, Unavailable};
+    use crate::event::AgentEvent;
+    let incomplete = start()
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"partial display"}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"incomplete signature"}}),
+        );
+    for (case, response) in [
+        (
+            "complete",
+            start()
+                + &thinking(0, "", "completed empty signature")
+                + &redacted(1)
+                + &text(2, "settled")
+                + &finish(),
+        ),
+        (
+            "unknown",
+            tool_turn("", false).replace("probe_read", "unregistered_tool"),
+        ),
+        ("incomplete", incomplete),
+    ] {
+        let wire = Wire::new(vec![(true, response)]);
+        let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+            unreachable!()
+        };
+        let inner = rig::agent::AgentBuilder::new(model)
+            .max_tokens(1000)
+            .default_max_turns(1)
+            .build();
+        let capture = NativeCapture::default();
+        let mut runner = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner))
+            .with_native_capture(capture.clone())
+            .spawn_runner(
+                "literal capture control".into(),
+                Vec::<Message>::new(),
+                RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await;
+        let mut done = false;
+        let mut failed = false;
+        let mut usage = crate::event::UsageDelta::default();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = runner.event_rx.recv().await {
+                match event {
+                    AgentEvent::Done { .. } => done = true,
+                    AgentEvent::Error { .. } => failed = true,
+                    AgentEvent::UsageDelta {
+                        usage: delta,
+                        awaits_compaction_decision,
+                        ..
+                    } => {
+                        usage.input_tokens += delta.input_tokens;
+                        usage.output_tokens += delta.output_tokens;
+                        if awaits_compaction_decision {
+                            runner
+                                .compaction_decision_tx
+                                .as_ref()
+                                .unwrap()
+                                .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. } => {
+                        panic!("zero registered tools dispatched in {case}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("owned interactive runner retirement");
+        let (frames, unavailable) = capture.snapshot();
+        match case {
+            "complete" => {
+                assert!(done && !failed);
+                assert_eq!(unavailable, None);
+                assert_eq!(frames.len(), 1);
+                assert!(frames[0].advertised_tools.is_empty());
+                let native =
+                    rig::providers::anthropic::completion::Message::try_from(Message::Assistant {
+                        id: None,
+                        content: frames[0].content.clone(),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(native).unwrap()["content"],
+                    json!([
+                        {"type":"thinking","thinking":"","signature":"completed empty signature"},
+                        {"type":"redacted_thinking","data":"opaque-redacted-two"},
+                        {"type":"text","text":"settled"},
+                    ])
+                );
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            "unknown" => {
+                assert!(failed && !done);
+                assert_eq!(unavailable, Some(Unavailable::RecoveredToolContent));
+                assert!(
+                    frames.is_empty(),
+                    "recovered model content became an accepted projection"
+                );
+            }
+            "incomplete" => {
+                assert!(
+                    frames
+                        .iter()
+                        .all(|frame| frame.content.iter().all(|block| !matches!(
+                            block,
+                            rig::completion::AssistantContent::Reasoning(_)
+                        ))),
+                    "incomplete signature became completed content"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(wire.finish().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn effort46_owned_capture_precedes_canonical_budget_stop_without_second_charge_or_effect() {
+    use crate::agent::native_capture::NativeCapture;
+    use crate::spend::{Account, Ledger, PriceSnapshot, RequestKind, run::Run};
+    let root = crate::tests::OwnedTestDirectory::new("effort46-capture-budget");
+    let ledger = Arc::new(Ledger::new(root.path()));
+    let prices = PriceSnapshot::capture(Some((2.0, 4.0)), Default::default(), true);
+    let profile = Run::fixture(
+        Account::new("capture-budget", Some(0.000001), 0.0).unwrap(),
+        ledger.clone(),
+        "capture-budget",
+        prices,
+    );
+    let profile = profile.with_captured_profile(
+        "anthropic",
+        "claude-opus-5-5",
+        prices,
+        &crate::config::Config::default(),
+        RequestKind::Turn,
+    );
+    let wire = Wire::new(vec![(true, tool_turn("", true))]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inner = rig::agent::AgentBuilder::new(model)
+        .max_tokens(1000)
+        .default_max_turns(2)
+        .tool(ProbeRead(calls.clone()))
+        .build();
+    let capture = NativeCapture::default();
+    let turn = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner))
+        .with_native_capture(capture.clone())
+        .with_spend(Some(profile.clone()))
+        .run_print_with_output(
+            "literal capped request",
+            crate::print::HeadlessOutputPolicy::legacy(false, true),
+            &RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            Vec::<Message>::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    assert_eq!(
+        turn.failure.as_ref().unwrap().to_string(),
+        crate::spend::run::BUDGET_STOP
+    );
+    assert_eq!(turn.usage.input_tokens, 10);
+    assert_eq!(turn.usage.output_tokens, 2);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    let (frames, unavailable) = capture.snapshot();
+    assert_eq!(unavailable, None);
+    assert_eq!(
+        frames.len(),
+        1,
+        "later accounting termination suppressed accepted native content"
+    );
+    assert_eq!(
+        frames[0]
+            .content
+            .iter()
+            .filter(|item| matches!(item, rig::completion::AssistantContent::ToolCall(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        frames[0].advertised_tools.len(),
+        2,
+        "guard-skipped tool callbacks still require exact correlation"
+    );
+    assert!(
+        frames[0]
+            .advertised_tools
+            .iter()
+            .all(|tool| tool.provider_id.is_none())
+    );
+    let totals = ledger
+        .summary_for_session("capture-budget")
+        .unwrap()
+        .session;
+    assert_eq!(totals.records, 1);
+    assert_eq!(totals.input_tokens, 10);
+    assert_eq!(totals.output_tokens, 2);
+    assert!((totals.known_cost - 0.000028).abs() < 1e-12);
+    let account = profile.account.snapshot();
+    assert!((account.recorded_spend() - 0.000028).abs() < 1e-12);
+    assert!(!account.tracking_error);
+    assert!(profile.admit().is_err());
     assert_eq!(wire.finish().len(), 1);
 }

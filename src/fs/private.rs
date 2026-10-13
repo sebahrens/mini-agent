@@ -1863,6 +1863,31 @@ mod windows {
         workspace
             .create_relative_private_atomic(Path::new("published.json"), b"{}")
             .unwrap();
+        {
+            // Observe only this inert fixture's fixed target before the
+            // unchanged nonrepairing assertion. No security is repaired and
+            // no diagnostic observation is used to admit the file.
+            let published_path = root.path().join("published.json");
+            let diagnostic = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&published_path)
+                .unwrap();
+            let observed = information(diagnostic.as_raw_handle() as Handle).unwrap();
+            let owner = ensure_current_owner(diagnostic.as_raw_handle() as Handle).is_ok();
+            let dacl = dacl_sddl(&published_path, false).unwrap();
+            let current_user = current_user_sid_string().unwrap();
+            eprintln!(
+                "MCP_PRIVATE_TEMP_DIAGNOSTIC attributes={:#x} regular={} reparse={} links={} current_owner={} closed_dacl={} dacl={}",
+                observed.file_attributes,
+                diagnostic.metadata().unwrap().is_file(),
+                observed.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                observed._number_of_links,
+                owner,
+                super::closed_private_dacl(&dacl, &current_user),
+                dacl.chars().take(2048).collect::<String>(),
+            );
+        }
         let published = open_checked(
             &root.path().join("published.json"),
             super::PrivateFileAccess::Read,

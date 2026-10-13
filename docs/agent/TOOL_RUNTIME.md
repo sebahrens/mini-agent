@@ -715,3 +715,42 @@ redacted, text, and tool block order; partial thinking remains display-only.
 Other provider aggregation and tool-batch validation remain unchanged. The
 fixture also records the application's current history conversion separately;
 SDK projection support alone does not imply saved-history replay support.
+
+### Native completed-content capture (partial mini-agent-i7ro6.46)
+
+`src/agent/native_capture.rs` owns a bounded, explicitly passed collection of
+native Anthropic `ModelTurnFinished` content. The typed Anthropic `AnyAgent`
+branch installs its observer on initial/retry streams and on runner-generated
+continuations, before the financial admission hook; the observer always returns
+`Continue` and adds no accounting observer, background job, or security grant.
+Other typed provider branches use an empty observer. Frontends do not yet enable
+this collection or replay it into saved sessions: prefix compatibility and
+live/resumed replay remain separate unfinished work.
+
+The collection preserves completed block order and exact SDK run/turn keys. A
+canonical assistant `ToolCall.id`, the optional provider call ID, and Rig's
+internal event ID remain distinct. Bijection checks use the canonical ID rather
+than tool names, arguments, callback order, or an inferred provider ID. Limits
+are 128 turns, 256 blocks per turn, 2 MiB of serialized content per turn, 16 MiB
+of captured content/identity payload in total, and 512 bytes per identity.
+Overflow, conflicting duplicate observations, recovered tools, or unavailable
+call identity mark the collection unavailable without truncating it into a valid
+replay prefix or suppressing ordinary effect/accounting settlement. An empty
+collection or absence of an error marker does not prove a completed transport,
+a compatible request prefix, or permission to reuse opaque content.
+
+
+### Windows foreground ownership experiment
+
+The test-only module `src/tests/windows_foreground_job_tests.rs`, registered under
+`sandbox::windows`, probes a general command created suspended, assigned to a retained
+kill-on-close Job, and resumed only after an exact initial-thread and membership check.
+Its owned inert GH image exercises setup failure, cancellation before resume, and family
+retirement after both a waiting and an already-exited leader. The existing Windows CI
+GH lane discovers exactly two prototype tests before running all five ordinary permission
+and foreground-result acceptance cases.
+
+This module is an experiment for mini-agent-i7ro6.108. Production disabled Shell does not
+yet use it; the observed descendant-settlement gap remains open. A successful prototype
+does not prove production integration or atomic recovery from a parent crash between
+creation and assignment. The broker-only worker and AppContainer launcher are unchanged.

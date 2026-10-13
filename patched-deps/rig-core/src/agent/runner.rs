@@ -624,6 +624,7 @@ where
         .resolve_tool_call(
             ctx,
             tool_name,
+            &tool_call.id,
             tool_call.call_id.as_deref(),
             internal_call_id,
             &args,

@@ -1915,11 +1915,26 @@ fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
     )
     .unwrap();
     assert!(context.replace_memory_if_changed(m.context_block()));
-    let first = crate::agent::builder::build_preamble(&context, true);
+    let first = crate::agent::builder::build_preamble_for_workspace(
+        &context,
+        true,
+        Some(context.workspace_root.as_path()),
+        false,
+        None,
+    );
     assert!(first.contains("\"topic\" — decision first line"));
     assert!(!first.contains("full body"));
     assert!(!context.replace_memory_if_changed(m.context_block()));
-    assert_eq!(first, crate::agent::builder::build_preamble(&context, true));
+    assert_eq!(
+        first,
+        crate::agent::builder::build_preamble_for_workspace(
+            &context,
+            true,
+            Some(context.workspace_root.as_path()),
+            false,
+            None,
+        )
+    );
     m.write(
         WriteTarget::Note,
         "new first line",
@@ -1928,7 +1943,13 @@ fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
     )
     .unwrap();
     assert!(context.replace_memory_if_changed(m.context_block()));
-    let next = crate::agent::builder::build_preamble(&context, true);
+    let next = crate::agent::builder::build_preamble_for_workspace(
+        &context,
+        true,
+        Some(context.workspace_root.as_path()),
+        false,
+        None,
+    );
     assert_ne!(first, next);
     assert!(next.contains("\"topic\" — new first line"));
     assert!(!next.contains("decision first line"));

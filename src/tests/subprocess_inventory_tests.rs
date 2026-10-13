@@ -871,6 +871,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned one-MiB native capture consumer, joined before fixture teardown.
+    (
+        "src/provider_effort_replay_probe.rs",
+        ".spawn(|| {",
+        1,
+        "NON-PROCESS",
+    ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
     ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
@@ -4360,6 +4367,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned one-MiB native capture consumer, joined before fixture teardown.
+    (
+        "src/provider_effort_replay_probe.rs",
+        ".spawn(|| {",
+        1,
+        "NON-PROCESS",
+    ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
     ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
