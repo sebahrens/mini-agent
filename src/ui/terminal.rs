@@ -544,6 +544,11 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// What was successfully emitted during this attachment; this does not
+    /// query the terminal or claim the terminal implemented each protocol.
+    pub(crate) fn diagnostic_protocols(&self) -> (bool, bool, bool) {
+        self.session.diagnostic_protocols()
+    }
     #[cfg(test)]
     pub(crate) fn detached_for_test() -> Self {
         Self {
@@ -555,7 +560,24 @@ impl TerminalGuard {
             },
         }
     }
+}
 
+impl<T: TerminalOperations> TerminalSession<T> {
+    fn diagnostic_protocols(&self) -> (bool, bool, bool) {
+        let requested = |action| {
+            self.undo
+                .iter()
+                .any(|undo| matches!(undo, Undo::Action(candidate) if *candidate == action))
+        };
+        (
+            self.attached,
+            requested(TerminalAction::DisablePaste),
+            requested(TerminalAction::PopKeyboard),
+        )
+    }
+}
+
+impl TerminalGuard {
     /// Attaches the terminal. `mouse_capture = false` skips enabling mouse
     /// reporting so the terminal's own text selection keeps working.
     pub fn new(options: TerminalOptions) -> Result<Self, TerminalLifecycleError> {
@@ -807,6 +829,26 @@ mod tests {
                 .unwrap()
                 .calls
                 .contains(&Operation::Action(TerminalAction::PopKeyboard))
+        );
+    }
+
+    #[test]
+    fn doctor_protocol_metadata_tracks_successful_emission_without_terminal_operations() {
+        for (failure, expected) in [(None, (true, true, true)), (Some(9), (true, true, false))] {
+            let (terminal, state) = mock(failure);
+            let mut session = TerminalSession::new(terminal).unwrap();
+            let calls = state.lock().unwrap().calls.clone();
+            assert_eq!(session.diagnostic_protocols(), expected);
+            assert_eq!(state.lock().unwrap().calls, calls);
+            session.suspend().unwrap();
+            let calls = state.lock().unwrap().calls.clone();
+            assert_eq!(session.diagnostic_protocols(), (false, false, false));
+            assert_eq!(state.lock().unwrap().calls, calls);
+            assert_restored(&state);
+        }
+        assert_eq!(
+            TerminalGuard::detached_for_test().diagnostic_protocols(),
+            (false, false, false)
         );
     }
 

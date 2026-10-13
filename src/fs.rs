@@ -20,8 +20,10 @@ pub(crate) use private::atomic_write_with_failure as private_atomic_write_with_f
 #[cfg(all(test, windows))]
 pub(crate) use private::dacl_sddl as private_dacl_sddl;
 pub(crate) use private::{
-    atomic_create as private_atomic_create_sync, atomic_write as private_atomic_write_sync,
-    ensure_directory as ensure_private_directory, open_existing as open_private_file,
+    PrivateFileAccess, atomic_create as private_atomic_create_sync,
+    atomic_write as private_atomic_write_sync, ensure_directory as ensure_private_directory,
+    open_checked as open_private_file_checked, open_existing as open_private_file,
+    validate_checked as validate_private_file,
 };
 // Export destinations are chosen by the operator, not application state; only
 // the learned-skill distiller writes to one today.

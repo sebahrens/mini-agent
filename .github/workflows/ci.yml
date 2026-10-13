@@ -631,17 +631,18 @@ jobs:
       - name: Test native one MiB App event loops
         shell: pwsh
         run: |
-          $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack', 'actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack')
+          $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack', 'actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack', 'actual_plan_confirmation_event_loop_runs_on_one_mib_stack')
           $listing = @(& cargo test --locked --bin mini-agent -- @filters --list)
           if ($LASTEXITCODE -ne 0) { throw 'App stack test discovery failed' }
           $expected = @(
             'ui::app::workspace_session_picker_tests::actual_standard_app_event_loop_runs_on_one_mib_stack: test'
             'ui::app::workspace_session_picker_tests::actual_session_picker_event_loop_runs_on_one_mib_stack: test'
             'ui::app::git_confirmation_stack_tests::actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack: test'
+            'ui::app::plan_approval_tests::actual_plan_confirmation_event_loop_runs_on_one_mib_stack: test'
           ) | Sort-Object
           $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^ui::app::.*one_mib_stack: test$' } | Sort-Object)
           $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
-          if ($actual.Count -ne 3 -or $difference.Count -ne 0) { throw 'Expected the exact three native App stack consumers' }
+          if ($actual.Count -ne 4 -or $difference.Count -ne 0) { throw 'Expected the exact four native App stack consumers' }
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native one MiB App event loop failed' }
 

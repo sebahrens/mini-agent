@@ -36,6 +36,7 @@ pub(crate) struct LoadedPrompt {
 pub(crate) struct PromptDirectives<'a> {
     pub(crate) mode: Option<&'a str>,
     pub(crate) agent: Option<&'a str>,
+    pub(crate) next: Option<PromptNext>,
     /// `%%grant=<scope>:<tools>`; honoured only for embedded built-in prompts
     /// (see [`apply_project_trust`]) and only after the user approves it.
     pub(crate) grant: Option<&'a str>,
@@ -43,10 +44,17 @@ pub(crate) struct PromptDirectives<'a> {
     pub(crate) content: &'a str,
 }
 
+/// Closed opt-in for the interactive plan approval workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptNext {
+    Code,
+}
+
 pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     let mut mode = None;
     let mut agent = None;
     let mut grant = None;
+    let mut next = None;
     let mut warnings = Vec::new();
     loop {
         let line_end = content.find('\n').unwrap_or(content.len());
@@ -67,6 +75,7 @@ pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
             "mode" => &mut mode,
             "agent" => &mut agent,
             "grant" => &mut grant,
+            "next" => &mut next,
             _ => {
                 warnings.push(format!("ignoring unknown prompt directive %%{key}="));
                 continue;
@@ -83,9 +92,17 @@ pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
             *slot = Some(value);
         }
     }
+    let next = next.and_then(|value| match value {
+        "code" => Some(PromptNext::Code),
+        _ => {
+            warnings.push("ignoring invalid %%next= directive: expected code".into());
+            None
+        }
+    });
     PromptDirectives {
         mode,
         agent,
+        next,
         grant,
         warnings,
         content,
@@ -347,7 +364,8 @@ fn neutralize_untrusted_directive(name: &str, content: String) -> String {
     let directives = parse_directives(&content);
     let drop_mode = directives.mode.filter(|mode| *mode != "last_user_mode");
     let drop_agent = directives.agent;
-    if drop_mode.is_none() && drop_agent.is_none() {
+    let drop_next = directives.next;
+    if drop_mode.is_none() && drop_agent.is_none() && drop_next.is_none() {
         return content;
     }
     if let Some(mode) = drop_mode {
@@ -362,6 +380,12 @@ fn neutralize_untrusted_directive(name: &str, content: String) -> String {
             prompt = name,
             agent,
             "ignoring %%agent= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
+        );
+    }
+    if drop_next.is_some() {
+        tracing::warn!(
+            prompt = name,
+            "ignoring %%next= directive from untrusted project prompt"
         );
     }
     let mut neutralized = String::new();
@@ -1001,5 +1025,71 @@ mod tests {
 
         assert_eq!(prompts["autoconfig"], "%%mode=last_user_mode\nBody.");
         assert_eq!(prompt_grant_offer(&prompts, "autoconfig", &td.paths), None);
+    }
+}
+
+#[cfg(test)]
+mod plan_next_tests {
+    use super::*;
+
+    #[test]
+    fn plan_next_is_closed_first_value_wins_and_is_removed_from_model_text() {
+        let parsed = parse_directives("%%next=code\r\n%%mode=planwrite\r\n%%next=code\r\nplan雪");
+        assert_eq!(parsed.next, Some(PromptNext::Code));
+        assert_eq!(parsed.mode, Some("planwrite"));
+        assert_eq!(parsed.content, "plan雪");
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("duplicate"))
+        );
+        let malformed = parse_directives("%%next=shell\n%%next=code\nplan");
+        assert_eq!(malformed.next, None);
+        assert!(
+            malformed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("expected code"))
+        );
+        assert_eq!(
+            parse_directives("%%next=\n%%next=code\nplan").next,
+            Some(PromptNext::Code)
+        );
+        assert_eq!(parse_directives("plan\n%%next=code").next, None);
+    }
+
+    #[test]
+    fn plan_next_requires_owned_or_trusted_project_prompt_provenance() {
+        for (source, trusted, expected) in [
+            (PromptSource::Embedded, false, Some(PromptNext::Code)),
+            (PromptSource::User, false, Some(PromptNext::Code)),
+            (PromptSource::Project, false, None),
+            (PromptSource::Project, true, Some(PromptNext::Code)),
+        ] {
+            let loaded = HashMap::from([(
+                "custom-plan".into(),
+                LoadedPrompt {
+                    source,
+                    content: "%%next=code\n%%mode=planwrite\nplan".into(),
+                },
+            )]);
+            let prompts = apply_project_trust(loaded, trusted);
+            let parsed = parse_directives(&prompts["custom-plan"]);
+            assert_eq!(parsed.next, expected);
+            assert_eq!(parsed.content, "plan");
+        }
+        // A next-only untrusted header must not escape neutralization.
+        let loaded = HashMap::from([(
+            "plan".into(),
+            LoadedPrompt {
+                source: PromptSource::Project,
+                content: "%%next=code\nplan".into(),
+            },
+        )]);
+        assert_eq!(
+            parse_directives(&apply_project_trust(loaded, false)["plan"]).next,
+            None
+        );
     }
 }

@@ -12,6 +12,7 @@ pub(crate) mod input;
 pub(crate) mod markdown;
 mod permission_handler;
 pub(crate) mod pickers;
+mod plan;
 pub(crate) mod prebuild;
 pub(crate) mod renderer;
 pub(crate) mod slash;
@@ -656,8 +657,7 @@ pub(crate) enum SubmitAction {
 /// status the driver checks before it relaunches.
 pub(crate) fn allowed_while_running(text: &str) -> bool {
     let t = text.trim_start();
-    t == "/context"
-        || t.starts_with("/context ")
+    crate::ui::slash::is_readonly_diagnostic(t)
         || t == "/queue"
         || t.starts_with("/queue ")
         || t == "/btw"
@@ -1023,19 +1023,19 @@ pub(crate) async fn start_main_run(
             h.into()
         }
     };
-    let runner = run
-        .agent
-        .as_ref()
-        .unwrap()
-        .clone()
-        .spawn_runner(
+    let agent = run.agent.as_ref().unwrap().clone();
+    // Construct this measured large child in the short factory frame. The
+    // exact request/profile scope and its owned await remain on this turn.
+    let runner = crate::startup::heap_future(|| {
+        agent.spawn_runner(
             text.to_string(),
             history,
             ui.cfg.retry.clone(),
             #[cfg(feature = "hooks")]
             None,
         )
-        .await;
+    })
+    .await;
     run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);

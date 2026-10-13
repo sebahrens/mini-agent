@@ -1,5 +1,120 @@
 use std::process::Command;
 
+#[cfg(all(unix, feature = "lsp"))]
+#[test]
+fn doctor_lsp_executable_metadata_does_not_launch_or_disclose_arguments_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TempRoot::new();
+    let binary = root.0.join("doctor-lsp-fixture");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nprintf started > doctor-lsp-executed-marker\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = root.0.join("config.toml");
+    let quoted = toml::Value::String(binary.to_string_lossy().into()).to_string();
+    let bytes = format!(
+        "provider='ollama'\n[lsp]\nenabled=true\n[lsp.servers.doctor-probe]\ncommand={quoted}\nargs=['DOCTOR_PRIVATE_ARG']\nextensions=['.rs']\n[lsp.servers.doctor-probe.env]\nDOCTOR_PRIVATE_ENV='DOCTOR_PRIVATE_VALUE'\n"
+    );
+    std::fs::write(&config, &bytes).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = root.command();
+    command.arg("--doctor");
+    let output = bounded_output(command);
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("doctor-probe: found; metadata only, launch/handshake not verified"));
+    assert!(!report.contains("DOCTOR_PRIVATE"));
+    assert!(!root.0.join("doctor-lsp-executed-marker").exists());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), bytes);
+}
+
+#[test]
+fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_no_requests() {
+    let root = TempRoot::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut missing = root.command();
+    missing.args(["--doctor", "--no-tools"]);
+    let output = bounded_output(missing);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("missing; compiled defaults shown"));
+    assert!(text.contains("fingerprint:") && text.contains("credential source:"));
+    assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+
+    // Seed through the ordinary private writer, including the native Windows
+    // ACL; doctor itself must never create or repair this file.
+    let mut seed = root.command();
+    seed.args(["--print-config", "--no-tools"]);
+    assert!(bounded_output(seed).status.success());
+    let config = root.0.join("config.toml");
+    std::fs::write(&config, format!(
+        "provider = 'doctor-local'\nmodel = 'test'\n[custom_providers.doctor-local]\nprovider_type = 'openai'\napi_style = 'completions'\nbase_url = 'http://{}/v1'\napi_key_env = 'DOCTOR_GATEWAY_KEY'\n[api_keys]\ndoctor-local = 'DOCTOR_PRIVATE_CONFIG_VALUE'\n",
+        listener.local_addr().unwrap(),
+    )).unwrap();
+    fn files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| (entry.path(), std::fs::read(entry.path()).unwrap()))
+            })
+            .collect()
+    }
+    let before = files(&root.0);
+    let mut configured = root.command();
+    configured
+        .args(["--doctor"])
+        .env("DOCTOR_GATEWAY_KEY", "DOCTOR_PRIVATE_ENV_VALUE");
+    let output = bounded_output(configured);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("environment DOCTOR_GATEWAY_KEY (value omitted)"),
+        "{text}"
+    );
+    assert!(text.contains("not probed; this command does not run preflight"));
+    assert!(text.contains("global status: loaded"));
+    assert!(
+        !text.contains("DOCTOR_PRIVATE_ENV_VALUE") && !text.contains("DOCTOR_PRIVATE_CONFIG_VALUE")
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("DOCTOR_PRIVATE"));
+    assert_eq!(files(&root.0), before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    std::fs::write(&config, "model = 'DOCTOR_PRIVATE_PARSE_VALUE' invalid\n").unwrap();
+    let before = files(&root.0);
+    let mut invalid = root.command();
+    invalid.arg("--doctor");
+    let output = bounded_output(invalid);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("invalid; defaults shown"));
+    assert!(!text.contains("DOCTOR_PRIVATE_PARSE_VALUE"));
+    assert_eq!(files(&root.0), before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 #[cfg(feature = "acp")]
 #[test]
 fn acp_permission_reply_is_routed_without_unhandled_dispatch_warning() {

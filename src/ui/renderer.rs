@@ -662,6 +662,14 @@ impl Renderer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn capture_bytes(&self) -> Arc<std::sync::Mutex<Vec<u8>>> {
+        self.test_output
+            .as_ref()
+            .expect("test capture configured")
+            .clone()
+    }
+
     #[cfg(not(test))]
     fn writer(&self) -> io::Stdout {
         io::stdout()

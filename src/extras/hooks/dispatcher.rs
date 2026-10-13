@@ -195,7 +195,25 @@ pub(crate) struct HookDispatcher {
     content_pins: Option<HashMap<HookHandler, Arc<HookContentPins>>>,
 }
 
+pub(crate) type HookDiagnosticMetadata = (usize, usize, Option<usize>);
+
 impl HookDispatcher {
+    /// Counts from the captured dispatcher; no handler data or pin checks.
+    pub(crate) fn diagnostic_metadata(&self) -> HookDiagnosticMetadata {
+        let handlers = self
+            .events
+            .values()
+            .flat_map(|groups| groups.iter())
+            .fold(0usize, |count, group| {
+                count.saturating_add(group.handlers.len())
+            });
+        (
+            self.events.len(),
+            handlers,
+            self.once_ran.try_lock().ok().map(|once| once.len()),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn from_config(config: &HooksConfig) -> Result<Self, String> {
         let backend = if cfg!(target_os = "macos") {
@@ -1165,6 +1183,17 @@ fn apply_redactions(tool_response: &mut String, value: &serde_json::Value) -> bo
 #[cfg(test)]
 mod tests {
     use super::apply_redactions;
+
+    #[test]
+    fn doctor_hook_metadata_uses_captured_counts_and_does_not_wait_for_once_lock() {
+        let config: crate::extras::hooks::settings::HooksConfig = serde_json::from_value(
+            serde_json::json!({"PreToolUse": [{"hooks": [{"type": "command", "command": "PRIVATE_NEVER_EXECUTED"}]}]})
+        ).unwrap();
+        let dispatcher = super::HookDispatcher::from_config(&config).unwrap();
+        assert_eq!(dispatcher.diagnostic_metadata(), (1, 1, Some(0)));
+        let _held = dispatcher.once_ran.lock().unwrap();
+        assert_eq!(dispatcher.diagnostic_metadata(), (1, 1, None));
+    }
 
     #[test]
     fn redactions_replace_only_requested_non_empty_literals() {

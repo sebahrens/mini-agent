@@ -871,8 +871,9 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker/Git and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 2, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git/plan and ordinary-event tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 3, "NON-PROCESS"),
+    ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
@@ -1641,6 +1642,26 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/ui/app.rs",
         "assert!(!output.contains(\"CAPTURED_\") && !output.contains(\"PRIVATE_USER_CONTENT\"));",
+        2,
+        "NON-PROCESS",
+    ),
+    // Doctor assertions inspect captured text; complete macro digests below
+    // also bind these exact terminal-looking string methods.
+    (
+        "src/ui/app.rs",
+        "output.contains(\"price source: captured session rates\")",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "&& output.contains(\"Terminal attachment:\")",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(\"Directories:\") && output.contains(\"Provider and model:\"));",
         1,
         "NON-PROCESS",
     ),
@@ -3769,6 +3790,15 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "039c1c846af0d5772694e02ae88965b6fec2b6260b55bd0f961fd55c057ae21f",
+                2,
+            ),
+            // Doctor rendering/privacy assertions on captured text only.
+            (
+                "2d2a09c6cb4d23527ecc393eb213bac6a3faf7ee00578202ae0a8c126edca8b6",
+                1,
+            ),
+            (
+                "2dae43810c104e80c5c03f6253a24be7e5560718dddc8a2764e87b9420292bec",
                 1,
             ),
             (
@@ -4212,8 +4242,9 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker/Git and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 2, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git/plan and ordinary-event tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 3, "NON-PROCESS"),
+    ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (

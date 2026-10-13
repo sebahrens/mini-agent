@@ -2,7 +2,7 @@ pub(crate) mod keys;
 pub mod load;
 pub mod types;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,19 @@ impl PreservedConfig {
 pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
+
+/// Captured layer participation for diagnostics. Only catalogue key names
+/// are retained; neither values nor unknown user-authored names are copied.
+/// A table can have contributions from both layers after a deep merge.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigProvenance {
+    pub(crate) global_file: Option<std::path::PathBuf>,
+    pub(crate) global_status: Option<&'static str>,
+    pub(crate) global_keys: BTreeSet<&'static str>,
+    pub(crate) project_file: Option<std::path::PathBuf>,
+    pub(crate) project_keys: BTreeSet<&'static str>,
+    pub(crate) project_trust: Option<&'static str>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -499,6 +512,9 @@ pub struct Config {
     /// from or written to a config file.
     #[serde(skip)]
     pub load_warnings: Vec<String>,
+    /// Load-time metadata, never persisted or sent to a model.
+    #[serde(skip)]
+    pub provenance: ConfigProvenance,
     /// Interactive startup presentation only; never persisted or sent to a model.
     #[serde(skip)]
     pub update_notice: Option<String>,

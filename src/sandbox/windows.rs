@@ -721,6 +721,10 @@ pub(crate) fn is_available() -> bool {
     general_sandbox_preflight().is_ok()
 }
 
+pub(crate) fn cached_is_available() -> Option<bool> {
+    GENERAL_SANDBOX_AVAILABLE.get().map(Result::is_ok)
+}
+
 fn general_sandbox_preflight() -> &'static Result<(), String> {
     cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
         let started = Instant::now();

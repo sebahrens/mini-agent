@@ -84,6 +84,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  /provider [name]       show or switch provider");
     emit(
         false,
+        "  /doctor                show bounded configuration and runtime diagnostics",
+    );
+    emit(
+        false,
         "  /model [alias|id]      show or switch model (quick alias, else raw id)",
     );
     emit(

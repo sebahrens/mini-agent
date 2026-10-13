@@ -66,14 +66,15 @@ class WindowsGhCiTests(unittest.TestCase):
         self.assertEqual(set(re.findall(r"async fn (windows_native_pr_\w+)\(", native)), CASES)
         self.assertEqual(native.count('#[ignore = "requires guarded native Windows GH fixture discovery"]'), 5)
 
-    def test_stack_lane_requires_exact_three_actual_portable_consumers(self):
+    def test_stack_lane_requires_exact_four_actual_portable_consumers(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         body = job_body(workflow, "windows-default-compile").split("- name: Test native one MiB App event loops", 1)[1].split("- name: " + STEP, 1)[0]
-        self.assertIn("$actual.Count -ne 3", body)
+        self.assertIn("$actual.Count -ne 4", body)
         self.assertIn("Compare-Object -ReferenceObject $expected -DifferenceObject $actual", body)
         self.assertIn("ui::app::git_confirmation_stack_tests::actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack: test", body)
+        self.assertIn("ui::app::plan_approval_tests::actual_plan_confirmation_event_loop_runs_on_one_mib_stack: test", body)
         self.assertIn("-- @filters --test-threads=1", body)
-        source = (ROOT / "src/ui/app.rs").read_text().split("mod git_confirmation_stack_tests", 1)[1]
+        source = (ROOT / "src/ui/app.rs").read_text().split("mod git_confirmation_stack_tests", 1)[1].split("mod plan_approval_tests", 1)[0]
         self.assertIn(".stack_size(1024 * 1024)", source)
         self.assertIn('root.path().join(".git").exists()', source)
         self.assertNotIn("Repo::", source)

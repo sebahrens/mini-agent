@@ -24,11 +24,90 @@ impl ProviderKind {
     }
 }
 
+#[cfg(test)]
+mod diagnostic_source_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_credential_sources_share_actual_precedence_without_secret_metadata() {
+        let resolver =
+            AuthResolver::new(ProviderKind::Anthropic).with_cli_key(Some("PRIVATE_CLI_VALUE"));
+        assert_eq!(
+            resolver
+                .credential_source_with_env(|_| panic!("CLI must not consult env"))
+                .unwrap(),
+            CredentialSource::Cli
+        );
+        let resolver = AuthResolver::new(ProviderKind::Anthropic).with_config_keys(Some(
+            &[("anthropic".into(), "PRIVATE_CONFIG_VALUE".into())].into(),
+        ));
+        let env = |name: &str| match name {
+            "ANTHROPIC_AUTH_TOKEN" => Ok("PRIVATE_TOKEN_VALUE".into()),
+            _ => Err(VarError::NotPresent),
+        };
+        let source = resolver.credential_source_with_env(env).unwrap();
+        assert_eq!(
+            source,
+            CredentialSource::Environment("ANTHROPIC_AUTH_TOKEN".into())
+        );
+        assert!(!format!("{source:?}").contains("PRIVATE_TOKEN_VALUE"));
+        assert!(matches!(
+            resolver.resolve_credential_with_env(env).unwrap(),
+            ResolvedCredential::Bearer(_)
+        ));
+        assert_eq!(
+            resolver
+                .credential_source_with_env(|_| Err(VarError::NotPresent))
+                .unwrap(),
+            CredentialSource::Config("anthropic".into())
+        );
+        assert_eq!(
+            AuthResolver::new(ProviderKind::Ollama)
+                .credential_source_with_env(|_| Err(VarError::NotPresent))
+                .unwrap(),
+            CredentialSource::NotRequired
+        );
+    }
+
+    #[test]
+    fn doctor_custom_route_cannot_borrow_vendor_credentials_or_ignored_token() {
+        let resolver = AuthResolver::new(ProviderKind::Anthropic)
+            .with_custom_provider_name(Some("anthropic"))
+            .with_credential_isolation(Some(true))
+            .with_config_keys(Some(
+                &[("anthropic".into(), "PRIVATE_VENDOR_VALUE".into())].into(),
+            ));
+        assert!(
+            resolver
+                .credential_source_with_env(|_| Ok("PRIVATE_VENDOR_ENV".into()))
+                .is_err()
+        );
+        let own = resolver.with_env_override(Some("MY_GATEWAY_KEY"));
+        assert_eq!(
+            own.credential_source_with_env(|name| {
+                assert_eq!(name, "MY_GATEWAY_KEY");
+                Ok("PRIVATE_GATEWAY_VALUE".into())
+            })
+            .unwrap(),
+            CredentialSource::Environment("MY_GATEWAY_KEY".into())
+        );
+    }
+}
+
 /// Credential kind is determined by its source, never by inspecting the secret.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedCredential {
     ApiKey(String),
     Bearer(String),
+}
+
+/// The selected credential's origin, containing no credential bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    Cli,
+    Environment(String),
+    Config(String),
+    NotRequired,
 }
 
 impl ResolvedCredential {
@@ -129,6 +208,16 @@ impl AuthResolver {
         get_env: F,
     ) -> anyhow::Result<ResolvedCredential> {
         self.resolve_credential_from_sources(get_env)
+            .map(|(credential, _)| credential)
+    }
+
+    /// Uses the identical isolation and precedence policy as actual requests.
+    pub fn credential_source_with_env<F: Fn(&str) -> Result<String, VarError>>(
+        &self,
+        get_env: F,
+    ) -> anyhow::Result<CredentialSource> {
+        self.resolve_credential_from_sources(get_env)
+            .map(|(_, source)| source)
     }
 
     pub fn resolve_with_env<F: Fn(&str) -> Result<String, VarError>>(
@@ -142,7 +231,7 @@ impl AuthResolver {
     fn resolve_credential_from_sources<F: Fn(&str) -> Result<String, VarError>>(
         &self,
         get_env: F,
-    ) -> anyhow::Result<ResolvedCredential> {
+    ) -> anyhow::Result<(ResolvedCredential, CredentialSource)> {
         let custom = self.custom_provider();
 
         // Priority 1: CLI argument
@@ -154,7 +243,10 @@ impl AuthResolver {
                     .as_deref()
                     .unwrap_or_else(|| self.env_var_name())
             );
-            return Ok(ResolvedCredential::ApiKey(key.clone()));
+            return Ok((
+                ResolvedCredential::ApiKey(key.clone()),
+                CredentialSource::Cli,
+            ));
         }
 
         // Priority 2: Environment variable. Custom providers only ever read
@@ -168,7 +260,10 @@ impl AuthResolver {
             && let Ok(key) = get_env(env_var)
             && !key.is_empty()
         {
-            return Ok(ResolvedCredential::ApiKey(key));
+            return Ok((
+                ResolvedCredential::ApiKey(key),
+                CredentialSource::Environment(env_var.into()),
+            ));
         }
 
         // Anthropic's native token is a second environment credential, after
@@ -180,7 +275,10 @@ impl AuthResolver {
             && let Ok(token) = get_env("ANTHROPIC_AUTH_TOKEN")
             && !token.is_empty()
         {
-            return Ok(ResolvedCredential::Bearer(token));
+            return Ok((
+                ResolvedCredential::Bearer(token),
+                CredentialSource::Environment("ANTHROPIC_AUTH_TOKEN".into()),
+            ));
         }
 
         // Priority 3: Config file. Built-ins use their slug (and, for
@@ -196,17 +294,26 @@ impl AuthResolver {
                     if let Some(name) = own_config_slot
                         && let Some(key) = lookup(name)
                     {
-                        return Ok(ResolvedCredential::ApiKey(key));
+                        return Ok((
+                            ResolvedCredential::ApiKey(key),
+                            CredentialSource::Config(name.into()),
+                        ));
                     }
                 }
                 None => {
                     if let Some(key) = lookup(self.provider_slug()) {
-                        return Ok(ResolvedCredential::ApiKey(key));
+                        return Ok((
+                            ResolvedCredential::ApiKey(key),
+                            CredentialSource::Config(self.provider_slug().into()),
+                        ));
                     }
                     if let Some(name) = self.custom_provider_name.as_deref()
                         && let Some(key) = lookup(name)
                     {
-                        return Ok(ResolvedCredential::ApiKey(key));
+                        return Ok((
+                            ResolvedCredential::ApiKey(key),
+                            CredentialSource::Config(name.into()),
+                        ));
                     }
                 }
             }
@@ -214,7 +321,10 @@ impl AuthResolver {
 
         // Ollama doesn't require an API key
         if self.provider_kind == ProviderKind::Ollama {
-            return Ok(ResolvedCredential::ApiKey(String::new()));
+            return Ok((
+                ResolvedCredential::ApiKey(String::new()),
+                CredentialSource::NotRequired,
+            ));
         }
 
         match custom {

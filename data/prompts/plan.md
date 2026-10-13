@@ -1,4 +1,5 @@
 %%mode=planwrite
+%%next=code
 
 ## Planning-Only Mode
 

@@ -6,6 +6,7 @@ mod auth;
 mod cli;
 mod config;
 mod context;
+mod diagnostics;
 mod docs;
 mod event;
 mod extras;
@@ -192,6 +193,26 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
+    if cli.doctor {
+        let cfg = config::load_for_diagnostics(&app_paths);
+        let mut report =
+            diagnostics::DoctorReport::capture(&cli, &cfg, &app_paths, None, None, true);
+        report.section("Terminal");
+        use std::io::{IsTerminal as _, Write as _};
+        report.row(
+            "stdout terminal",
+            std::io::stdout().is_terminal().to_string(),
+        );
+        report.row("keyboard and bracketed paste", "not queried or enabled");
+        report.row(
+            "true color",
+            "not negotiated; environment hints are not capability proof",
+        );
+        std::io::stdout()
+            .lock()
+            .write_all(report.render().as_bytes())?;
+        return Ok(());
+    }
     paths::prepare_storage_roots(&app_paths)?;
     if cli.no_session {
         paths::disable_session_artifacts();

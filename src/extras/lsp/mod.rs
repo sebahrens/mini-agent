@@ -40,6 +40,41 @@ pub struct LspManager {
     inner: Arc<Inner>,
 }
 
+const HEALTH_MAX_NAMES: usize = 32;
+const HEALTH_MAX_NAME_CHARS: usize = 128;
+
+/// Existing manager metadata only. Missing cache fields mean their lock was
+/// busy or poisoned; they never mean an empty/healthy runtime.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct LspHealthSnapshot {
+    pub configured_count: usize,
+    pub configured_names: Vec<String>,
+    pub live_count: Option<usize>,
+    pub live_names: Option<Vec<String>>,
+    pub failure_count: Option<usize>,
+    pub failures: Option<Vec<LspFailureSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct LspFailureSnapshot {
+    pub name: String,
+    pub consecutive: u32,
+    pub retry_in_ms: u64,
+}
+
+fn health_name(name: &str) -> String {
+    name.chars()
+        .take(HEALTH_MAX_NAME_CHARS)
+        .map(|ch| {
+            if ch.is_whitespace() || crate::ui::events::needs_terminal_sanitizing(ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 pub(crate) enum LspWorkspace {
     Binding(Arc<crate::paths::WorkspaceBinding>),
     Path(PathBuf),
@@ -171,6 +206,57 @@ impl DiagnosticSnapshot {
 }
 
 impl LspManager {
+    /// Never opens a file, starts a server, requests diagnostics or waits for
+    /// a runtime lock. Retained cache entries are not a new health probe.
+    pub(crate) fn diagnostic_snapshot(&self) -> LspHealthSnapshot {
+        let live = self.inner.clients.try_lock().ok();
+        let failures = self.inner.failures.try_lock().ok();
+        let now = Instant::now();
+        LspHealthSnapshot {
+            configured_count: self.inner.servers.len(),
+            configured_names: self
+                .inner
+                .servers
+                .iter()
+                .take(HEALTH_MAX_NAMES)
+                .map(|(name, _)| health_name(name))
+                .collect(),
+            live_count: live.as_ref().map(|clients| clients.len()),
+            live_names: live.as_ref().map(|clients| {
+                let mut names: Vec<_> = clients
+                    .keys()
+                    .take(HEALTH_MAX_NAMES)
+                    .map(|name| health_name(name))
+                    .collect();
+                names.sort();
+                names
+            }),
+            failure_count: failures.as_ref().map(|entries| entries.len()),
+            failures: failures.as_ref().map(|entries| {
+                let mut rows: Vec<_> = entries
+                    .iter()
+                    .take(HEALTH_MAX_NAMES)
+                    .map(|(name, state)| LspFailureSnapshot {
+                        name: health_name(name),
+                        consecutive: state.consecutive,
+                        retry_in_ms: state
+                            .retry_after
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    })
+                    .collect();
+                rows.sort_by(|left, right| left.name.cmp(&right.name));
+                rows
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_manager(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub(crate) fn new(cfg: &LspConfig, workspace: impl Into<LspWorkspace>) -> Self {
         let workspace = match workspace.into() {
             LspWorkspace::Binding(workspace) => workspace,
@@ -782,6 +868,101 @@ impl LspManager {
             identity,
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod health_snapshot_tests {
+    use super::*;
+
+    fn manager(root: &crate::tests::OwnedTestDirectory) -> LspManager {
+        LspManager::new(&LspConfig::default(), root.path().to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn lsp_health_cached_failures_and_busy_locks_are_read_only() {
+        let root = crate::tests::OwnedTestDirectory::new("lsp-health-cached");
+        let manager = manager(&root);
+        let cold = manager.diagnostic_snapshot();
+        assert!(cold.configured_count > 0);
+        assert_eq!(cold.live_count, Some(0));
+        assert_eq!(cold.failure_count, Some(0));
+        manager.inner.failures.lock().unwrap().insert(
+            "rust".into(),
+            ServerFailureState {
+                consecutive: 3,
+                retry_after: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        manager.inner.failures.lock().unwrap().insert(
+            "expired".into(),
+            ServerFailureState {
+                consecutive: 1,
+                retry_after: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        let snapshot = manager.diagnostic_snapshot();
+        let rows = snapshot.failures.unwrap();
+        assert_eq!(snapshot.failure_count, Some(2));
+        assert_eq!(rows[0].retry_in_ms, 0);
+        assert_eq!(rows[1].consecutive, 3);
+        assert!(rows[1].retry_in_ms > 0 && rows[1].retry_in_ms <= 30_000);
+        let live_guard = manager.inner.clients.lock().await;
+        let failure_guard = manager.inner.failures.lock().unwrap();
+        let busy = manager.diagnostic_snapshot();
+        assert_eq!(busy.configured_names, cold.configured_names);
+        assert_eq!(busy.live_count, None);
+        assert_eq!(busy.live_names, None);
+        assert_eq!(busy.failure_count, None);
+        assert_eq!(busy.failures, None);
+        assert!(live_guard.is_empty());
+        assert_eq!(failure_guard.len(), 2);
+        drop(failure_guard);
+        drop(live_guard);
+        assert_eq!(manager.diagnostic_snapshot().failure_count, Some(2));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lsp_health_bounds_untrusted_names_and_does_not_validate_workspace() {
+        let root = crate::tests::OwnedTestDirectory::new("lsp-health-names");
+        let mut cfg = LspConfig::default();
+        for index in 0..64 {
+            cfg.servers.insert(
+                format!("{index:03}\n\u{1b}\u{202e}{}", "界".repeat(200)),
+                crate::config::types::LspServerConfig {
+                    command: "DO_NOT_RUN_SECRET_ARGV".into(),
+                    env: [("KEY".into(), "DO_NOT_SHOW_SECRET_ENV".into())].into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let manager = LspManager::new(&cfg, root.path().to_path_buf());
+        for (name, _) in &manager.inner.servers {
+            manager.record_server_failure(name);
+        }
+        // A diagnostic snapshot needs no path authority revalidation or file reads.
+        std::fs::remove_dir(root.path()).unwrap();
+        let snapshot = manager.diagnostic_snapshot();
+        assert!(snapshot.configured_count > HEALTH_MAX_NAMES);
+        assert_eq!(snapshot.configured_names.len(), HEALTH_MAX_NAMES);
+        assert_eq!(snapshot.failure_count, Some(snapshot.configured_count));
+        assert_eq!(snapshot.failures.as_ref().unwrap().len(), HEALTH_MAX_NAMES);
+        for name in snapshot.configured_names.iter().chain(
+            snapshot
+                .failures
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|row| &row.name),
+        ) {
+            assert!(name.chars().count() <= HEALTH_MAX_NAME_CHARS);
+            assert!(!name.chars().any(|ch| ch.is_control() || ch == '\u{202e}'));
+        }
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("DO_NOT_RUN_SECRET_ARGV"));
+        assert!(!encoded.contains("DO_NOT_SHOW_SECRET_ENV"));
+        assert!(encoded.len() < 64 * 1024);
     }
 }
 

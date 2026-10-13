@@ -516,3 +516,60 @@ They establish native argv/result/cancellation authority, alongside the unchange
 standard-user AppContainer and worker-containment witnesses. The Windows proof
 remains pending until the exact hosted step passes; macOS execution and pure
 argument-encoder tests are separate evidence.
+
+### Cached LSP diagnostic metadata
+
+When `lsp` is compiled, the built `AnyAgent` retains the same `LspManager`
+used by its registered LSP, edit and write tools. Its diagnostic snapshot reads
+only configured names, retained client names and cached failure cooldowns.
+It never opens documents, starts or reconnects a server, or sends an RPC.
+Retained client entries describe cached state rather than a fresh health probe.
+Both runtime caches use `try_lock`; an unavailable cache is reported separately
+from an empty cache. Total counts remain visible while each name list is capped
+at 32 entries and names at 128 Unicode characters with terminal controls removed.
+Commands, arguments, environment values and diagnostic/document contents are
+excluded. Tool-less or ineligible builds retain no LSP manager.
+
+### Planning approval ownership
+
+`src/ui/plan.rs` holds ephemeral planning-run capture and literal approval
+state, owned by the App's `ChainState`. The planning prompt must explicitly
+carry `%%mode=planwrite` and trusted `%%next=code` directives. Actual successful
+`Done` handling settles its exact runner before offering approval. A response
+larger than 64 KiB or relevant serialized history larger than 1 MiB is refused
+rather than truncated. Approval binds the session ID, captured workspace object
+and its validation, prompt/persona selection, plan and code prompt contents,
+operator ceiling, and the relevant visible turn/compaction revision. Titles
+and auxiliary charges are excluded from that revision.
+
+Y selects the code prompt through the ordinary prompt/model path and submits
+the exact approved text through ordinary main-turn admission. It never grants
+permissions, bypasses spending limits, rereads a plan file, or accepts model
+text as a user decision. N/cancel stay in planning; E edits bounded text and
+requires a fresh Y after preview. Pending tool permission, unsettled native
+work, or an unfinished goal blocks execution. Interrupted/failed turns clear
+capture; imported/replayed sessions cannot reconstruct approval state. Other
+chain and Git confirmation ownership and their heap-construction boundaries
+remain separate. The headless and ACP surfaces keep their existing explicit
+prompt submission semantics and do not acquire an implicit approval path.
+
+### Operator diagnostics
+
+`src/diagnostics.rs` assembles a 64 KiB report from captured state, with labels
+limited to 192 Unicode characters and terminal controls removed.
+`src/ui/slash/doctor.rs` reads the current session and retained managers. Its
+read-only routing shares `/context`'s busy admission and bypasses ordinary
+post-command settlement, cache warming, goal kickstart and session persistence.
+Cached sandbox availability uses `OnceLock::get`, worker status uses `try_read`,
+and hook/manager counters use nonblocking cache locks. Unknown or busy state is
+reported explicitly, including the distinction between enabled protocols and
+confirmed terminal support. No diagnostic getter launches a process or RPC.
+
+The CLI branch runs before storage preparation and ordinary configuration
+initialization. Its pure loader preserves the usual config candidate order,
+benign project settings and content-bound trust while declining to create or
+repair private files. Provenance stores only catalogue key names and layer
+paths, is excluded from serialization, and never stores secret values. Actual
+`AuthResolver` precedence chooses the reported source, including isolated custom
+routes and typed Anthropic token handling. Optional bounded immediate-directory
+and LSP executable metadata checks are CLI-only; the TUI performs neither.

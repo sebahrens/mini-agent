@@ -533,6 +533,11 @@ The audit currently resolves as follows:
 The fixed-1-MiB App session-picker event-loop regression owns and joins one
 `std::thread::Builder` thread. Its exact `.spawn(|| {` expression is
 `NON-PROCESS`; no process constructor or process-terminal exemption is added.
+The planning-approval fixture adds one more owned and joined fixed-stack Rust
+thread and one `task.spawn(async move {` actor on a test-only Tokio `JoinSet`
+for its bounded loopback HTTP server. Both exact occurrences are classified
+`NON-PROCESS` in both owning tables; the actor owns no subprocess and is
+joined on normal completion or aborted by its retained JoinSet on unwind.
 
 ## Review and change rules
 
@@ -570,3 +575,12 @@ assertion data contexts inspect the returned `CommandOutput` fields, with exact
 source fingerprints and full macro-token identities classified `NON-PROCESS`.
 They do not waive constructors or terminal launch syntax, and the inventory's
 existing unknown-context and cross-family negative controls remain enforced.
+
+Doctor App regressions inspect captured renderer strings for pricing, report
+sections and redacted content. Those additional terminal-looking string
+methods have exact `NON-PROCESS` line entries and complete macro digests/counts
+in the checked inventory. The doctor itself launches no process; its CLI LSP
+fixture checks executable metadata against an owned marker script and never
+executes it. All constructor, macro-identity and cross-family negatives remain
+enforced. The existing combined 1 MiB App consumer also submits `/doctor`
+before its declined Git confirmation without creating an agent or repository.

@@ -2628,7 +2628,7 @@ provide the same functionality at runtime.
 ## Prompt directives
 
 Custom prompt `.md` files may start with a contiguous directive header. The
-recognized lines are `%%mode=<mode>` and `%%agent=<name>` (built-in prompts
+recognized lines are `%%mode=<mode>`, `%%agent=<name>`, and `%%next=code` (built-in prompts
 may also use `%%grant=`, see Built-in scoped grants); they may appear in
 any order and are stripped before the prompt reaches the model. The first
 selects the security mode and the second composes the prompt with a main-agent
@@ -2653,7 +2653,7 @@ ignored and the current mode is kept. Ranking from least to most permissive:
 Prompts are loaded from three sources and the source decides whether directives
 are honored at all. Embedded prompts and the user's own prompts
 directory are trusted like the global config. Prompts from the project's
-`.zerostack/prompts/` are repository content: their `%%mode=` and `%%agent=`
+`.zerostack/prompts/` are repository content: their `%%mode=`, `%%agent=`, and `%%next=`
 directives are dropped (with a warning) unless the project's
 `.zerostack/config.toml` has
 been explicitly trusted through the project-config trust store described
@@ -2665,6 +2665,18 @@ set explicitly via `/mode`, Shift+Tab, or startup config — useful when a promp
 to avoid overriding the user's chosen mode. The built-in `autoconfig`
 prompt uses it, so a `yolo` or `guarded` session keeps its mode while
 configuring and a `readonly` session stays read-only.
+
+`%%next=code` opts a `%%mode=planwrite` prompt into interactive plan approval.
+Only `code` is accepted. A successful, nonempty planning turn offers Y/N/E;
+editing previews again and still requires Y. Approval restores the operator's
+permission ceiling, activates the code prompt through its usual model mapping,
+and submits the literal approved plan as an ordinary user turn. It grants no
+tool permissions. Read-only and explicit denies remain effective. Failed,
+interrupted, oversized, or stale plans cannot start execution. Plans are capped
+at 64 KiB and their relevant history revision at 1 MiB; they are never silently
+truncated for approval. The built-in plan prompt includes this header. If an
+older copy exists in your prompts directory, add the header or regenerate the
+built-in prompts to enable this flow. `[chain].plan-to-code = false` disables it.
 
 ### Prompt path variables
 
@@ -2785,7 +2797,7 @@ The model switch writes a line to chat:
 
 ## Chain-of-Prompts
 
-When enabled, after the agent finishes responding with a `brainstorm`, `plan`,
+When enabled, after the agent finishes responding with a `brainstorm`
 or `code` prompt, the status bar shows `Continue to <next>? [Yes/But/No]`.
 The user's next input is interpreted as a chain decision:
 
@@ -2796,6 +2808,14 @@ The user's next input is interpreted as a chain decision:
 
 Typing anything that doesn't match these patterns clears the chain and
 processes the input as a normal message.
+
+Planning uses the separate explicit approval flow described under Prompt
+directives: Y executes, N keeps planning, and E edits the literal plan before
+another confirmation. It is offered only for a successfully settled planning
+turn in this session/workspace, including `.plan <task>`, and remains pending
+while unrelated title/accounting updates complete. It is not reconstructed
+from imported or resumed history. Shift+Tab does not answer it; changing the
+operator ceiling makes the old approval stale.
 
 ### Phases
 

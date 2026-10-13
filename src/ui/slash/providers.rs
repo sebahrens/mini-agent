@@ -303,18 +303,56 @@ fn resolve_model_pricing_from_listing(
     cfg: &Config,
     listing: Option<&[ModelEntry]>,
 ) -> Option<(f64, f64)> {
+    resolve_model_pricing_with_source_from_listing(provider, model_id, cfg, listing).0
+}
+
+pub(crate) fn diagnostic_model_pricing(
+    provider: &str,
+    model_id: &str,
+    cfg: &Config,
+) -> (Option<(f64, f64)>, &'static str) {
+    let Ok(cache) = MODEL_CACHE.try_lock() else {
+        return (None, "model listing cache busy or unavailable");
+    };
+    resolve_model_pricing_with_source_from_listing(
+        provider,
+        model_id,
+        cfg,
+        cache.get(provider).map(AsRef::as_ref),
+    )
+}
+
+fn resolve_model_pricing_with_source_from_listing(
+    provider: &str,
+    model_id: &str,
+    cfg: &Config,
+    listing: Option<&[ModelEntry]>,
+) -> (Option<(f64, f64)>, &'static str) {
     let live = listing
         .and_then(|models| models.iter().find(|model| model.id == model_id))
         .and_then(|model| model.input_price.zip(model.output_price));
-    live.or_else(|| Config::catalog_input_output_cost(provider, model_id))
-        .or_else(|| {
-            config::quick_models_map(cfg)
-                .into_iter()
-                .filter(|(_, quick)| quick.provider == provider && quick.model == model_id)
-                // Multiple aliases for one raw id resolve deterministically.
-                .min_by(|(a, _), (b, _)| a.cmp(b))
-                .and_then(|(_, quick)| quick.resolved_prices())
-        })
+    if let Some(prices) = live {
+        return (Some(prices), "cached live listing");
+    }
+    if let Some(prices) = Config::catalog_input_output_cost(provider, model_id) {
+        return (Some(prices), "embedded catalogue");
+    }
+    let quick = {
+        config::quick_models_map(cfg)
+            .into_iter()
+            .filter(|(_, quick)| quick.provider == provider && quick.model == model_id)
+            // Multiple aliases for one raw id resolve deterministically.
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .and_then(|(_, quick)| quick.resolved_prices())
+    };
+    (
+        quick,
+        if quick.is_some() {
+            "configured alias fallback"
+        } else {
+            "unknown"
+        },
+    )
 }
 
 fn apply_model_pricing(

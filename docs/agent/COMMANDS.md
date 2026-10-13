@@ -102,7 +102,7 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode` | Pick a security mode. In the TUI, accepting `/mode` from completion (Tab, or Enter on the full name) opens a picker listing every mode with a one-line description, the current mode highlighted and marked `(current)`; choosing one inserts `/mode <name>` for Enter to apply. Submitting a bare `/mode` (or running without a permission system) prints the current mode and the same described list as text. |
 | `/mode standard` | Allow path tools within CWD, ask for external paths and for writes to `.git/config` or `.git/hooks`. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
-| `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. |
+| `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. Approving a plan preserves this read-only ceiling. |
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
 | `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
@@ -175,6 +175,7 @@ files are skipped with a warning containing their path and read error.
 | `/compact [instructions]` | Alias for `/compress`; after a manual compaction, show the active summary. |
 | `/compact show` | Show the active saved summary without making a provider request or changing session history. Imported file-request metadata remains untrusted historical data. |
 | `/context` | Inspect the captured preamble, conversation and retained tool-result estimates, registered tool metadata, compaction state and next-request pruning projection. Works during a turn; makes no model request and does not change or save the session. |
+| `/doctor` | Show bounded build, config/key source, provider/pricing, cached sandbox/JS/integration and terminal metadata. Works during a turn, without starting an agent or saving history. |
 | `/editsys` | Show the current edit system mode (similarity or hashedit). |
 | `/editsys similarity` | Use SEARCH/REPLACE with exact/whitespace matching and explicit fuzzy opt-in (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |

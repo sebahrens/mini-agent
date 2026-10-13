@@ -1,6 +1,37 @@
 #[cfg(not(windows))]
 use std::path::Path;
 
+/// Existing-file access without permission repair. Append never creates,
+/// truncates, replaces or widens an existing file's permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivateFileAccess {
+    Read,
+    Append,
+}
+
+fn private_file_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "private file must be owned, private, singly linked and regular",
+    )
+}
+
+#[cfg(any(windows, test))]
+fn closed_private_dacl(sddl: &str, owner_sid: &str) -> bool {
+    let Some(body) = sddl.strip_prefix("D:") else {
+        return false;
+    };
+    let Some((flags, aces)) = body.split_once('(') else {
+        return false;
+    };
+    if !matches!(flags, "P" | "PAI" | "PAR" | "PAIAR" | "PARAI") {
+        return false;
+    }
+    let user = format!("A;;FA;;;{owner_sid})");
+    let system = "A;;FA;;;SY)";
+    aces == format!("{user}({system}") || aces == format!("{system}({user}")
+}
+
 #[cfg(not(any(unix, windows)))]
 fn unsupported() -> std::io::Error {
     std::io::Error::new(
@@ -232,6 +263,60 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(unix)]
+pub(crate) fn validate_checked(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(private_file_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn open_checked(
+    path: &Path,
+    access: PrivateFileAccess,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let private = |metadata: &std::fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o077 == 0
+    };
+    let before = std::fs::symlink_metadata(path)?;
+    if !private(&before) || before.file_type().is_symlink() {
+        return Err(private_file_error());
+    }
+    #[cfg(test)]
+    run_open_test_hook("checked_before_initial_open");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(access == PrivateFileAccess::Append)
+        .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !private(&opened) {
+        return Err(private_file_error());
+    }
+    #[cfg(test)]
+    run_open_test_hook("checked_before_revalidation_open");
+    let current = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let after = current.metadata()?;
+    if !private(&after) || !same_open_file_identity(&file, &opened, &current, &after)? {
+        return Err(private_file_error());
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     prepare_write(path).map_err(|error| stage_error("write_prepare", error))?;
     super::atomic_write_sync(path, bytes)
@@ -336,7 +421,9 @@ pub(crate) fn current_uid() -> u32 {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{atomic_create, atomic_write, ensure_directory, open_existing};
+pub(crate) use windows::{
+    atomic_create, atomic_write, ensure_directory, open_checked, open_existing, validate_checked,
+};
 
 #[cfg(all(windows, feature = "skills"))]
 pub(crate) use windows::{atomic_create_export, ensure_export_directory};
@@ -361,6 +448,19 @@ pub(crate) fn atomic_create_export(_path: &Path, _bytes: &[u8]) -> std::io::Resu
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn open_existing(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn validate_checked(_file: &std::fs::File) -> std::io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_checked(
+    _path: &Path,
+    _access: PrivateFileAccess,
+) -> std::io::Result<std::fs::File> {
     Err(unsupported())
 }
 
@@ -965,6 +1065,109 @@ mod windows {
         Ok(file)
     }
 
+    pub(crate) fn validate_checked(file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = file.as_raw_handle();
+        let information = information(handle)?;
+        if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+            != 0
+            || information._number_of_links != 1
+        {
+            return Err(super::private_file_error());
+        }
+        ensure_current_owner(handle)?;
+        struct LocalAllocation(*mut c_void);
+        impl Drop for LocalAllocation {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        let mut descriptor = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = LocalAllocation(descriptor);
+        let mut sddl = null_mut();
+        let mut length = 0;
+        if unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _sddl = LocalAllocation(sddl.cast());
+        if sddl.is_null() || length == 0 || length > 2048 {
+            return Err(super::private_file_error());
+        }
+        // Win32 reports allocation size, which may exceed string length.
+        // Read initialized characters only, stopping at NUL within that bound.
+        let mut units = Vec::new();
+        let mut terminated = false;
+        for offset in 0..length as usize {
+            let unit = unsafe { *sddl.add(offset) };
+            if unit == 0 {
+                terminated = true;
+                break;
+            }
+            units.push(unit);
+        }
+        if !terminated {
+            return Err(super::private_file_error());
+        }
+        let value = String::from_utf16(&units).map_err(|_| super::private_file_error())?;
+        if !super::closed_private_dacl(&value, &current_user_sid_string()?) {
+            return Err(super::private_file_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_checked(
+        path: &Path,
+        access: super::PrivateFileAccess,
+    ) -> std::io::Result<std::fs::File> {
+        let before = std::fs::symlink_metadata(path)?;
+        if !before.is_file() || before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(super::private_file_error());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(access == super::PrivateFileAccess::Append)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        validate_checked(&file)?;
+        let current = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        validate_checked(&current)?;
+        let opened = super::super::checked_file_metadata(&file)?;
+        let after = super::super::checked_file_metadata(&current)?;
+        super::super::ensure_same_file(path, &opened, &after)?;
+        Ok(file)
+    }
+
     pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         atomic_write_mode(path, bytes, false)
     }
@@ -1048,6 +1251,77 @@ mod windows {
         result
     }
 
+    #[test]
+    fn usd_budget_native_windows_checked_open_refuses_public_dacl_and_hardlinks_without_repair() {
+        use std::os::windows::io::FromRawHandle;
+        let root = crate::tests::OwnedTestDirectory::new("cost-private-dacl");
+        let path = root.path().join("public");
+        atomic_create(&path, b"unchanged").unwrap();
+        let user = current_user_sid_string().unwrap();
+        let text = wide(OsStr::new(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;WD)"
+        )));
+        let mut descriptor = null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = SecurityDescriptor(descriptor);
+        let handle = open_handle(
+            &path,
+            READ_CONTROL | WRITE_DAC,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .unwrap();
+        // File owns the native handle even if a later assertion unwinds.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    descriptor.dacl().unwrap(),
+                    null_mut(),
+                )
+            },
+            0
+        );
+        drop(file);
+        let before = dacl_sddl(&path, false).unwrap();
+        for access in [
+            super::PrivateFileAccess::Read,
+            super::PrivateFileAccess::Append,
+        ] {
+            assert!(open_checked(&path, access).is_err());
+            assert_eq!(dacl_sddl(&path, false).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+        }
+        let private = root.path().join("linked");
+        atomic_create(&private, b"linked unchanged").unwrap();
+        let before = dacl_sddl(&private, false).unwrap();
+        std::fs::hard_link(&private, root.path().join("alias")).unwrap();
+        for access in [
+            super::PrivateFileAccess::Read,
+            super::PrivateFileAccess::Append,
+        ] {
+            assert!(open_checked(&private, access).is_err());
+            assert_eq!(dacl_sddl(&private, false).unwrap(), before);
+            assert_eq!(std::fs::read(&private).unwrap(), b"linked unchanged");
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn dacl_sddl(path: &Path, directory: bool) -> std::io::Result<String> {
         let flags = FILE_FLAG_OPEN_REPARSE_POINT
@@ -1110,5 +1384,106 @@ mod windows {
         })();
         let _ = unsafe { CloseHandle(handle) };
         result
+    }
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use super::*;
+    #[test]
+    fn spend_private_dacl_requires_closed_current_user_system_protected_access() {
+        let user = "S-1-5-21-111-222-333-1001";
+        assert!(closed_private_dacl(
+            &format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})"),
+            user
+        ));
+        assert!(closed_private_dacl(
+            &format!("D:PAI(A;;FA;;;{user})(A;;FA;;;SY)"),
+            user
+        ));
+        for bad in [
+            format!("D:(A;;FA;;;SY)(A;;FA;;;{user})"),
+            format!("D:P(A;;FA;;;WD)(A;;FA;;;{user})"),
+            format!("D:P(A;ID;FA;;;SY)(A;;FA;;;{user})"),
+            format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;BU)"),
+            "D:P".to_owned(),
+        ] {
+            assert!(!closed_private_dacl(&bad, user), "{bad}");
+        }
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn spend_checked_private_file_read_and_append_preserve_existing_security() {
+        use std::io::{Read, Write};
+        let root = crate::tests::OwnedTestDirectory::new("spend-private-file");
+        let path = root.path().join("private");
+        atomic_create(&path, b"one").unwrap();
+        let mut reader = open_checked(&path, PrivateFileAccess::Read).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one");
+        let mut writer = open_checked(&path, PrivateFileAccess::Append).unwrap();
+        writer.write_all(b"two").unwrap();
+        validate_checked(&writer).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"onetwo");
+        #[cfg(windows)]
+        assert!(dacl_sddl(&path, false).unwrap().contains("D:P"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn spend_checked_private_file_refuses_public_mode_and_hardlinks_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("spend-private-refusal");
+        let path = root.path().join("public");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for access in [PrivateFileAccess::Read, PrivateFileAccess::Append] {
+            assert!(open_checked(&path, access).is_err());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        assert!(open_checked(&path, PrivateFileAccess::Append).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod checked_private_race_tests {
+    use super::*;
+    #[test]
+    fn usd_budget_private_checked_open_rejects_replacements_without_permission_repair() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for stage in [
+            "checked_before_initial_open",
+            "checked_before_revalidation_open",
+        ] {
+            for access in [PrivateFileAccess::Read, PrivateFileAccess::Append] {
+                let root = crate::tests::OwnedTestDirectory::new("private-ledger-race");
+                let path = root.path().join("usage.jsonl");
+                let target = root.path().join("public-victim");
+                atomic_create(&path, b"trusted\n").unwrap();
+                std::fs::write(&target, b"victim\n").unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let attack_path = path.clone();
+                let attack_target = target.clone();
+                let outcome = with_open_test_hook(
+                    move |point| {
+                        if point == stage {
+                            std::fs::remove_file(&attack_path).unwrap();
+                            symlink(&attack_target, &attack_path).unwrap();
+                        }
+                    },
+                    || open_checked(&path, access),
+                );
+                assert!(outcome.is_err());
+                assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+            }
+        }
     }
 }

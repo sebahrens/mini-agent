@@ -257,6 +257,20 @@ Prompts change *how* the agent behaves. Type `.` at the start of a message to on
 | `debug` | Systematic debugging |
 | `refactor` | Restructuring existing code |
 
+Try `.plan add a flag`. After a successful planning turn, mini-agent asks
+`Execute this plan?`: **Y** selects the code prompt and starts an ordinary
+turn with the exact approved plan; **N** keeps the plan prompt active;
+**E** puts the plan in the editor. Enter previews an edited plan, and **Y**
+is still required to execute it. Escape or Ctrl-C cancels approval. Planning
+errors and interrupted turns never offer execution.
+
+Approval preserves your last selected permission mode and configured deny
+rules. In a read-only session, approving a plan keeps execution read-only.
+Any tool approval and spending limit still apply. Queued follow-ups are held
+while approval is pending and discarded with a visible notice when you decide;
+typed drafts remain recoverable through Ctrl-Y. Approval is local to the
+current session and workspace and is never restored from a saved session.
+
 This is the short list; run `/prompt` in the agent for the full set of built-in prompts,
 including `frontend-design`, `review-security`, `simplify`, `write-prompt`,
 `autoconfig`, `orchestrator`, and `write-text`.
@@ -543,6 +557,29 @@ with parsing or aggregation in one call. Return strings, primitives, or accessor
 objects/arrays. For Date, Map, Set, class instances, accessors, sparse arrays, or objects containing
 `undefined` or non-finite numbers, return `JSON.stringify(value)` (or another explicit string) so
 result conversion stays predictable and does not implicitly execute object hooks.
+
+For a support report, run `mini-agent --doctor` or enter `/doctor` in the TUI.
+The report includes build identity, captured config-layer key sources (values
+omitted), credential source, provider/model/context and pricing source, cached
+sandbox/worker/integration status, application paths and terminal metadata.
+`--doctor` works with missing or invalid configuration and requires no API key;
+it creates no default config, repairs no permissions, makes no network request,
+and runs no sandbox or worker preflight. Invalid configuration is reported by
+error class without parser excerpts. `/doctor` also works during an agent turn
+without queuing input, warming a model cache, or saving session history.
+
+Fresh CLI status is explicitly unprobed. The TUI shows recorded manager state,
+including cached LSP failures, rather than making liveness requests. CLI disk
+sizes include only up to 128 immediate entries per directory, so nested files
+or unreadable entries make them partial; the TUI does not scan disk. When LSP
+is enabled, the CLI checks executable metadata for at most 32 effective servers
+through 128 absolute PATH entries, without launching them or showing arguments
+and environment values. Terminal protocol emission is reported separately from
+confirmed terminal support. The embedded model snapshot currently carries no
+catalogue date; the report identifies that limitation and its build fingerprint.
+Review local paths and custom server/model names before sharing the report.
+For build identity alone, `mini-agent --version` prints the version, fingerprint
+and compilation target without initializing application storage.
 
 `--print-config` displays JavaScript worker status as `not probed` when the tool is eligible;
 it starts no worker and advertises no worker capabilities. This speeds up configuration display,

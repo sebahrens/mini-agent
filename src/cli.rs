@@ -145,6 +145,10 @@ pub struct Cli {
     #[arg(long = "print-config", help = "Print resolved configuration and exit")]
     pub print_config: bool,
 
+    #[arg(long, conflicts_with_all = ["print", "print_config", "setup"],
+        help = "Inspect config and cached runtime health without network or permission repair")]
+    pub doctor: bool,
+
     #[arg(
         long = "config-preservation-check",
         help = "Verify config saves preserve unavailable and unknown fields, then exit"

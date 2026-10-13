@@ -1,6 +1,7 @@
 pub(crate) mod add;
 mod content;
 pub(crate) mod context;
+mod doctor;
 mod features;
 #[cfg(feature = "git-worktree")]
 pub(crate) mod git;
@@ -13,7 +14,7 @@ mod memory;
 pub(crate) use memory::edit_memory_file;
 #[cfg(unix)]
 pub(crate) use memory::verify_memory_editor_preservation;
-mod providers;
+pub(crate) mod providers;
 pub(crate) mod review;
 mod session;
 pub(crate) use session::{is_persistence_restart_required, rewind_selected_turn};
@@ -669,6 +670,13 @@ where
     Ok((first_kept_index, tokens_before, usage))
 }
 
+pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
+    matches!(
+        split_command(text).first().copied(),
+        Some("/context" | "/doctor")
+    )
+}
+
 /// Split a slash command into at most three fields: the command, its first
 /// argument and the rest of the line. Runs of whitespace separate fields, so
 /// `/cmd  arg` never yields an empty argument; the rest keeps its inner
@@ -861,6 +869,7 @@ pub(crate) async fn handle_slash(
         #[cfg(feature = "export")]
         "/share" => session::handle(&parts, &mut ctx).await,
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
+        "/doctor" => doctor::handle(&parts, &mut ctx),
         "/help" => {
             help::handle(&parts, &mut ctx);
             Ok(())

@@ -2065,9 +2065,13 @@ mod windows_native_pr_tests {
             std::fs::write(directory.path().join("gh-mode"), mode).unwrap();
             let workspace =
                 Arc::new(crate::paths::WorkspaceBinding::capture(directory.path()).unwrap());
-            let shell =
-                crate::sandbox::ShellCapability::resolve("powershell.exe", workspace.root(), None)
-                    .expect("native Windows PowerShell must be installed");
+            let search_path = std::env::var_os("PATH");
+            let shell = crate::sandbox::ShellCapability::resolve(
+                "powershell.exe",
+                workspace.root(),
+                search_path.as_deref(),
+            )
+            .expect("native Windows PowerShell must be installed");
             assert_eq!(shell.dialect(), crate::sandbox::ShellDialect::PowerShell);
             // This explicitly tests the supported trusted Shell bypass. There
             // is no Git repository or Git execution here, and no fallback from

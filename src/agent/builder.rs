@@ -772,8 +772,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> Agent<M> {
     let mut snapshot = None;
+    #[cfg(feature = "lsp")]
+    let mut lsp_manager = None;
     build_agent_inner_with_snapshot(
         &mut snapshot,
+        #[cfg(feature = "lsp")]
+        &mut lsp_manager,
         model,
         cli,
         cfg,
@@ -806,6 +810,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static>(
     context_snapshot: &mut Option<PreambleSnapshot>,
+    #[cfg(feature = "lsp")] diagnostic_lsp: &mut Option<crate::extras::lsp::LspManager>,
     model: M,
     cli: &Cli,
     cfg: &Config,
@@ -854,6 +859,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         cfg.resolve_lsp()
             .map(|c| crate::extras::lsp::LspManager::new(c, workspace.clone()))
     };
+
+    #[cfg(feature = "lsp")]
+    {
+        *diagnostic_lsp = lsp_manager.clone();
+    }
 
     let all_tools = if !tools_enabled {
         None

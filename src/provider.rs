@@ -1759,6 +1759,8 @@ pub struct AnyAgent {
     turn_token_budget: Option<u64>,
     completion_verification: Option<runner::CompletionVerification>,
     context_snapshot: Option<builder::PreambleSnapshot>,
+    #[cfg(feature = "lsp")]
+    diagnostic_lsp: Option<crate::extras::lsp::LspManager>,
     #[cfg(feature = "skills")]
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
@@ -1772,6 +1774,8 @@ impl AnyAgent {
             turn_token_budget: None,
             completion_verification: None,
             context_snapshot: None,
+            #[cfg(feature = "lsp")]
+            diagnostic_lsp: None,
             #[cfg(feature = "skills")]
             skills: None,
             #[cfg(feature = "skills")]
@@ -1786,6 +1790,17 @@ impl AnyAgent {
 
     pub(crate) fn context_snapshot(&self) -> Option<&builder::PreambleSnapshot> {
         self.context_snapshot.as_ref()
+    }
+
+    #[cfg(feature = "lsp")]
+    fn with_lsp_manager(mut self, manager: Option<crate::extras::lsp::LspManager>) -> Self {
+        self.diagnostic_lsp = manager;
+        self
+    }
+
+    #[cfg(feature = "lsp")]
+    pub(crate) fn lsp_manager(&self) -> Option<&crate::extras::lsp::LspManager> {
+        self.diagnostic_lsp.as_ref()
     }
 
     #[cfg(test)]
@@ -1846,6 +1861,8 @@ impl AnyAgent {
             turn_token_budget: None,
             completion_verification: None,
             context_snapshot: None,
+            #[cfg(feature = "lsp")]
+            diagnostic_lsp: None,
             #[cfg(feature = "skills")]
             skills,
             #[cfg(feature = "skills")]
@@ -2759,6 +2776,7 @@ fn build_openrouter_client(
 #[allow(clippy::too_many_arguments)]
 async fn build_openai_agent(
     context_snapshot: &mut Option<builder::PreambleSnapshot>,
+    #[cfg(feature = "lsp")] diagnostic_lsp: &mut Option<crate::extras::lsp::LspManager>,
     model: OpenAiModel,
     cli: &Cli,
     cfg: &Config,
@@ -2787,6 +2805,8 @@ async fn build_openai_agent(
         OpenAiModel::Responses(m) => OpenAiAgent::Responses(
             builder::build_agent_inner_with_snapshot(
                 context_snapshot,
+                #[cfg(feature = "lsp")]
+                diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -2822,6 +2842,8 @@ async fn build_openai_agent(
         OpenAiModel::Completions(m) => OpenAiAgent::Completions(
             builder::build_agent_inner_with_snapshot(
                 context_snapshot,
+                #[cfg(feature = "lsp")]
+                diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -2924,10 +2946,14 @@ pub async fn build_agent_in_workspace(
     };
 
     let mut context_snapshot = None;
+    #[cfg(feature = "lsp")]
+    let mut diagnostic_lsp = None;
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             builder::build_agent_inner_with_snapshot(
                 &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -2959,6 +2985,8 @@ pub async fn build_agent_in_workspace(
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(
             build_openai_agent(
                 &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -2990,6 +3018,8 @@ pub async fn build_agent_in_workspace(
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
             builder::build_agent_inner_with_snapshot(
                 &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -3021,6 +3051,8 @@ pub async fn build_agent_in_workspace(
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(
             builder::build_agent_inner_with_snapshot(
                 &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -3052,6 +3084,8 @@ pub async fn build_agent_in_workspace(
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(
             builder::build_agent_inner_with_snapshot(
                 &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
                 m,
                 cli,
                 cfg,
@@ -3081,14 +3115,17 @@ pub async fn build_agent_in_workspace(
             .await,
         ),
     };
-    AnyAgent::with_runtime(
+    let agent = AnyAgent::with_runtime(
         inner,
         #[cfg(feature = "skills")]
         skills,
     )
     .with_context_snapshot(context_snapshot)
     .with_turn_token_budget(cfg.resolve_turn_token_budget())
-    .with_completion_verification(completion_verification)
+    .with_completion_verification(completion_verification);
+    #[cfg(feature = "lsp")]
+    let agent = agent.with_lsp_manager(diagnostic_lsp);
+    agent
 }
 
 /// A task-outcome recorder for the goal driver.
@@ -3212,6 +3249,14 @@ pub fn js_runtime_report() -> JsRuntimeReport {
         },
         Err(_) => JsRuntimeReport::unreported(),
     }
+}
+
+/// A nonblocking view of the last build's report; it never starts preflight.
+pub(crate) fn diagnostic_js_runtime_report() -> Option<JsRuntimeReport> {
+    JS_RUNTIME_REPORT
+        .try_read()
+        .ok()
+        .map(|guard| guard.clone().unwrap_or_else(JsRuntimeReport::unreported))
 }
 
 /// Only the `js` build resolves containment, so only it has anything to record.
@@ -4386,5 +4431,134 @@ mod git_proposal_wire_tests {
         let usage = ledger.take();
         assert_eq!((usage.input_tokens, usage.output_tokens), (21, 7));
         assert!(!ledger.take().has_values());
+    }
+}
+
+#[cfg(all(test, feature = "lsp"))]
+mod lsp_health_agent_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lsp_health_actual_agent_keeps_registered_tool_manager_identity() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-agent-lsp");
+        let file = root.path().join("main.doctor");
+        std::fs::write(&file, "private document contents").unwrap();
+        let cli = Cli {
+            tools: vec!["lsp_diagnostics".into()],
+            ..Default::default()
+        };
+        let mut lsp = crate::config::types::LspConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        lsp.servers.insert(
+            "fixture".into(),
+            crate::config::types::LspServerConfig {
+                command: format!("mini-agent-doctor-missing-server-{}", uuid::Uuid::new_v4())
+                    .into(),
+                extensions: vec![".doctor".into()],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            lsp: Some(lsp),
+            ..Default::default()
+        };
+        let context = ContextFiles {
+            workspace_root: root.path().to_path_buf(),
+            agents: None,
+            prompts: HashMap::new(),
+            current_prompt: None,
+            current_prompt_name: None,
+            agent_definitions: HashMap::new(),
+            current_agent_name: None,
+            current_agent_explicit: false,
+            themes: HashMap::new(),
+            current_theme_name: None,
+            extra_files: Vec::new(),
+            extra_file_contents: HashMap::new(),
+            one_shot_restore: None,
+            chain_declined: Vec::new(),
+            #[cfg(feature = "memory")]
+            memory: None,
+            #[cfg(feature = "archmd")]
+            architecture: None,
+        };
+        let client = create_client("ollama", None, &HashMap::new(), None).unwrap();
+        let agent = build_agent_in_workspace(
+            client.completion_model("offline-unused"),
+            &cli,
+            &cfg,
+            &context,
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap()),
+            None,
+            None,
+            Sandbox::new(false, "none"),
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
+            "doctor-lsp-agent",
+            None,
+            false,
+            None,
+            None,
+            #[cfg(feature = "js")]
+            crate::extras::js::session::JsSessionStateOwner::default(),
+            #[cfg(feature = "skills")]
+            std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await;
+        let manager = agent.lsp_manager().expect("existing builder manager");
+        assert_eq!(manager.diagnostic_snapshot().live_count, Some(0));
+        assert_eq!(manager.diagnostic_snapshot().failure_count, Some(0));
+        let cloned = agent.clone();
+        assert!(manager.same_manager(cloned.lsp_manager().unwrap()));
+        let AnyAgentInner::Ollama(inner) = &agent.inner else {
+            panic!("wrong fixture provider")
+        };
+        assert!(
+            inner
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|definition| definition.name == "lsp_diagnostics")
+        );
+        let result = inner
+            .tool_server_handle
+            .call_tool(
+                "lsp_diagnostics",
+                &serde_json::json!({"path": file}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("No diagnostics"), "{result}");
+        let snapshot = manager.diagnostic_snapshot();
+        assert_eq!(snapshot.failure_count, Some(1));
+        let failures = snapshot.failures.unwrap();
+        assert_eq!(failures[0].name, "fixture");
+        assert_eq!(failures[0].consecutive, 1);
+        assert_eq!(
+            cloned
+                .lsp_manager()
+                .unwrap()
+                .diagnostic_snapshot()
+                .failure_count,
+            Some(1)
+        );
+        // No extra server is built/probed by repeated snapshot reads.
+        assert_eq!(
+            manager.diagnostic_snapshot().failures.unwrap()[0].consecutive,
+            1
+        );
+        assert!(
+            !serde_json::to_string(&manager.diagnostic_snapshot())
+                .unwrap()
+                .contains("private document contents")
+        );
     }
 }

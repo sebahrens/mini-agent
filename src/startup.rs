@@ -34,8 +34,21 @@ fn resolve_startup_model_pricing(
     model: &str,
     openrouter_model: Option<&str>,
 ) -> Option<(f64, f64)> {
-    if let Some(quick) = cli.resolve_quick_model(cfg) {
+    if let Some(quick) = selected_startup_quick_model(cli, cfg, provider, model, openrouter_model) {
         return quick.resolved_prices();
+    }
+    crate::ui::slash::resolve_model_pricing(provider, model, cfg)
+}
+
+fn selected_startup_quick_model(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+    openrouter_model: Option<&str>,
+) -> Option<config::QuickModelConfig> {
+    if let Some(quick) = cli.resolve_quick_model(cfg) {
+        return Some(quick.clone());
     }
     // A selected config alias carries operator pricing, just like /models or
     // /provider. A CLI/raw environment override selects raw-id pricing even
@@ -48,10 +61,35 @@ fn resolve_startup_model_pricing(
             && quick.provider == provider
             && quick.model == model
         {
-            return quick.resolved_prices();
+            return Some(quick.clone());
         }
     }
-    crate::ui::slash::resolve_model_pricing(provider, model, cfg)
+    None
+}
+
+pub(crate) fn diagnostic_startup_pricing(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+) -> (Option<(f64, f64)>, &'static str) {
+    if let Some(quick) = selected_startup_quick_model(
+        cli,
+        cfg,
+        provider,
+        model,
+        std::env::var("OPENROUTER_MODEL").ok().as_deref(),
+    ) {
+        return (
+            quick.resolved_prices(),
+            if cli.quick_model.is_some() {
+                "selected quick-model configuration"
+            } else {
+                "selected config alias"
+            },
+        );
+    }
+    crate::ui::slash::providers::diagnostic_model_pricing(provider, model, cfg)
 }
 
 fn resolve_startup_cache_prices(

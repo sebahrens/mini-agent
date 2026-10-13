@@ -1490,6 +1490,49 @@ impl Sandbox {
         self.capability_matrix_for_policy(self.policy())
     }
 
+    /// Inspect completed preflight results without starting or waiting for a
+    /// probe. None means the requested backend has not completed a probe.
+    pub(crate) fn cached_capability_matrix(&self) -> Option<SandboxCapabilityMatrix> {
+        if !self.enabled {
+            return Some(self.capability_matrix_for_policy(SandboxPolicy::Disabled));
+        }
+        let available = match self.backend.as_str() {
+            "bwrap" => {
+                #[cfg(target_os = "linux")]
+                {
+                    BWRAP_AVAILABLE.get().copied()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Some(false)
+                }
+            }
+            "seatbelt" => {
+                #[cfg(target_os = "macos")]
+                {
+                    SEATBELT_AVAILABLE.get().copied()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Some(false)
+                }
+            }
+            "zerobox" => ZEROBOX_PATH.get().map(Option::is_some),
+            #[cfg(target_os = "windows")]
+            "appcontainer" => windows::cached_is_available(),
+            _ => Some(false),
+        }?;
+        Some(self.capability_matrix_for_policy(self.policy_from_backend_availability(available)))
+    }
+
+    pub(crate) fn cached_unavailable_diagnostic(&self) -> Option<&'static str> {
+        #[cfg(target_os = "linux")]
+        if self.backend == "bwrap" && BWRAP_AVAILABLE.get() == Some(&false) {
+            return BWRAP_DIAGNOSTIC.get().copied();
+        }
+        None
+    }
+
     fn capability_matrix_for_policy(&self, policy: SandboxPolicy) -> SandboxCapabilityMatrix {
         match policy {
             SandboxPolicy::Disabled => SandboxCapabilityMatrix {

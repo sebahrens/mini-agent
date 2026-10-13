@@ -285,7 +285,7 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 }
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => toml::from_str(content).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -306,7 +306,37 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
             };
             io::Error::new(io::ErrorKind::InvalidData, message)
         }),
-    }
+    }?;
+    cfg.provenance.global_file = Some(path.to_path_buf());
+    cfg.provenance.global_status = Some("loaded");
+    let spellings: Vec<String> =
+        if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+            toml::from_str::<toml::Value>(content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_table()
+                        .map(|table| table.keys().cloned().collect())
+                })
+                .unwrap_or_default()
+        } else {
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
+                .ok()
+                .and_then(|value| {
+                    value.as_mapping().map(|table| {
+                        table
+                            .keys()
+                            .filter_map(|key| key.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        };
+    cfg.provenance.global_keys = spellings
+        .iter()
+        .filter_map(|spelling| keys::lookup(spelling).map(|key| key.name))
+        .collect();
+    Ok(cfg)
 }
 
 pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<String> {
@@ -671,6 +701,246 @@ pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     )
 }
 
+/// Inspect configuration without creating files, repairing permissions,
+/// prompting for trust, or exiting on errors. Diagnostics contain only fixed
+/// error classes: parser excerpts and credential values must not escape.
+pub(crate) fn load_for_diagnostics(paths: &AppPaths) -> Config {
+    let path = pick_existing(&paths.config_dir);
+    let mut cfg = match read_private_content_mode(&path, MAX_PRIVATE_CONFIG_BYTES, true, false) {
+        Ok(content) => match parse_config_content(&path, &content) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                let mut cfg = Config::default();
+                cfg.provenance.global_status = Some("invalid; defaults shown");
+                cfg.load_warnings
+                    .push("global config could not be parsed (values omitted)".into());
+                cfg
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut cfg = rich_default_config();
+            cfg.provenance.global_status = Some("missing; compiled defaults shown");
+            cfg
+        }
+        Err(_) => {
+            let mut cfg = Config::default();
+            cfg.provenance.global_status = Some("unreadable or not private; defaults shown");
+            cfg.load_warnings
+                .push("global config cannot be inspected without permission repair".into());
+            cfg
+        }
+    };
+    cfg.provenance.global_file = Some(path);
+    let unknown = keys::unknown_key_warnings("global config", cfg.preserved.keys());
+    cfg.load_warnings.extend(std::iter::repeat_n(
+        "global config has an unknown or unavailable key (name/value omitted)".into(),
+        unknown.len(),
+    ));
+    let clamped = cfg.retry.clamp_to_limits();
+    cfg.load_warnings.extend(
+        clamped
+            .into_iter()
+            .map(|_| "global retry policy was clamped".into()),
+    );
+    let user_retry = cfg.retry.clone();
+    if let Some(project) = paths.project_config_file() {
+        match std::fs::symlink_metadata(&project) {
+            Ok(_) => {
+                if apply_local_override_with_confirmation_mode(
+                    &mut cfg,
+                    &project,
+                    &paths.project_config_trust_file(),
+                    false,
+                    &|_| false,
+                    false,
+                )
+                .is_err()
+                {
+                    cfg.provenance.project_file = Some(project);
+                    cfg.provenance.project_trust = Some("unreadable or invalid; inactive");
+                    cfg.load_warnings
+                        .push("project config could not be inspected (values omitted)".into());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => cfg
+                .load_warnings
+                .push("project config path is unavailable".into()),
+        }
+    }
+    let capped = cfg.retry.cap_at(&user_retry);
+    cfg.load_warnings.extend(
+        capped
+            .into_iter()
+            .map(|_| "project retry policy was capped".into()),
+    );
+    let shell_warnings = cfg.shell_exact_allow_warnings();
+    cfg.load_warnings.extend(std::iter::repeat_n(
+        "exact shell allow rule requires review (pattern omitted)".into(),
+        shell_warnings.len(),
+    ));
+    #[cfg(feature = "mcp")]
+    inject_mcp_defaults(&mut cfg);
+    match validate_extra_body(&mut cfg) {
+        Ok(warnings) => cfg.load_warnings.extend(std::iter::repeat_n(
+            "provider request setting was ignored (name/value omitted)".into(),
+            warnings.len(),
+        )),
+        Err(_) => cfg
+            .load_warnings
+            .push("provider request settings are invalid (values omitted)".into()),
+    }
+    cfg
+}
+
+#[cfg(test)]
+mod doctor_config_tests {
+    use super::*;
+
+    fn paths(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: Some(root.join("workspace/.zerostack")),
+        }
+    }
+
+    #[test]
+    fn doctor_missing_configuration_does_not_create_paths_or_default_files() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-config-missing");
+        let cfg = load_for_diagnostics(&paths(root.path()));
+        assert_eq!(
+            cfg.provenance.global_status,
+            Some("missing; compiled defaults shown")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(cfg.provenance.global_keys.is_empty());
+    }
+
+    #[test]
+    fn doctor_config_warning_count_matches_real_loading_without_disclosing_authored_keys() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-config-warnings");
+        let paths = paths(root.path());
+        let path = paths.config_dir.join("config.toml");
+        crate::fs::private_atomic_create_sync(&path, b"provider = 'ollama'\nPRIVATE_UNKNOWN_KEY = 'PRIVATE_VALUE'\n[retry]\nmax_attempts = 1000\n").unwrap();
+        let diagnosed = load_for_diagnostics(&paths);
+        let normal = load_with_paths(&paths, false).0;
+        assert_eq!(diagnosed.load_warnings.len(), normal.load_warnings.len());
+        assert_eq!(diagnosed.load_warnings.len(), 2);
+        assert_eq!(
+            diagnosed.retry.max_attempts,
+            crate::retry::MAX_RETRY_ATTEMPTS
+        );
+        assert!(!format!("{:?}", diagnosed.load_warnings).contains("PRIVATE_"));
+        let project = paths.project_config_file().unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            "context_window=10000\nPRIVATE_PROJECT_UNKNOWN='PRIVATE_PROJECT_VALUE'\n",
+        )
+        .unwrap();
+        let diagnosed = load_for_diagnostics(&paths);
+        let normal = load_with_paths(&paths, false).0;
+        assert_eq!(diagnosed.load_warnings.len(), normal.load_warnings.len());
+        assert_eq!(diagnosed.load_warnings.len(), 3);
+        assert!(!format!("{:?}", diagnosed.load_warnings).contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn doctor_invalid_config_omits_parser_values_and_preserves_bytes() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-config-invalid");
+        let paths = paths(root.path());
+        let path = paths.config_dir.join("config.toml");
+        let bytes = b"model = 'PRIVATE_PARSE_VALUE' trailing invalid\n";
+        crate::fs::private_atomic_create_sync(&path, bytes).unwrap();
+        let cfg = load_for_diagnostics(&paths);
+        assert_eq!(
+            cfg.provenance.global_status,
+            Some("invalid; defaults shown")
+        );
+        assert!(!format!("{:?}", cfg.load_warnings).contains("PRIVATE_PARSE_VALUE"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&paths.config_dir).unwrap().count(), 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_private_permission_refusal_does_not_repair_file_or_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = crate::tests::OwnedTestDirectory::new("doctor-config-mode");
+        let paths = paths(root.path());
+        let path = paths.config_dir.join("config.toml");
+        crate::fs::private_atomic_create_sync(&path, b"model = 'PRIVATE_MODEL'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&paths.config_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let cfg = load_for_diagnostics(&paths);
+        assert_eq!(
+            cfg.provenance.global_status,
+            Some("unreadable or not private; defaults shown")
+        );
+        assert!(cfg.model.is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&paths.config_dir).unwrap().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn doctor_project_layers_preserve_actual_trust_and_omit_unknown_names() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-config-trust");
+        let paths = paths(root.path());
+        let global = paths.config_dir.join("config.toml");
+        crate::fs::private_atomic_create_sync(
+            &global,
+            b"provider = 'anthropic'\nmodel = 'global-model'\n",
+        )
+        .unwrap();
+        let project = paths.project_config_file().unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "model = 'project-model'\nprovider = 'ollama'\nPRIVATE_UNKNOWN_NAME = 'PRIVATE_UNKNOWN_VALUE'\n").unwrap();
+        let trust = paths.project_config_trust_file();
+        let untrusted = load_for_diagnostics(&paths);
+        assert_eq!(untrusted.provider.as_deref(), Some("anthropic"));
+        assert_eq!(untrusted.model.as_deref(), Some("project-model"));
+        assert!(untrusted.provenance.project_keys.contains("model"));
+        assert!(!untrusted.provenance.project_keys.contains("provider"));
+        assert!(!trust.exists());
+        let mut normal = parse_config_content(&global, "provider = 'anthropic'\n").unwrap();
+        apply_local_override_with_confirmation(&mut normal, &project, &trust, true, &|_| true)
+            .unwrap();
+        let before = std::fs::read(&trust).unwrap();
+        let trusted = load_for_diagnostics(&paths);
+        assert_eq!(trusted.provider.as_deref(), Some("ollama"));
+        assert_eq!(
+            trusted.provenance.project_trust,
+            Some("content-bound trusted")
+        );
+        assert!(trusted.provenance.project_keys.contains("provider"));
+        assert!(!format!("{:?}", trusted.provenance).contains("PRIVATE_UNKNOWN_NAME"));
+        assert_eq!(std::fs::read(&trust).unwrap(), before);
+        let serializable = Config {
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
+            ..trusted.clone()
+        };
+        let encoded = serde_json::to_string(&serializable).unwrap();
+        assert!(!encoded.contains("provenance") && !encoded.contains("global_status"));
+        std::fs::write(&project, "model = 'revision'\nprovider = 'openai'\n").unwrap();
+        assert_eq!(
+            load_for_diagnostics(&paths).provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(std::fs::read(&trust).unwrap(), before);
+    }
+}
+
 fn fatal_config_load(message: String) -> ! {
     #[cfg(test)]
     panic!("{message}");
@@ -734,6 +1004,16 @@ fn load_from_path(
             ))
         })
     };
+    if is_first_startup {
+        cfg.provenance.global_file = Some(path.clone());
+        cfg.provenance.global_status = Some(
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                "initialized from compiled defaults"
+            } else {
+                "missing; compiled defaults shown"
+            },
+        );
+    }
 
     tracing::debug!(
         "config loaded from {}: {} quick_models, {} custom_providers",
@@ -885,6 +1165,15 @@ fn read_private_content(
     max_bytes: usize,
     require_private_mode: bool,
 ) -> io::Result<String> {
+    read_private_content_mode(path, max_bytes, require_private_mode, true)
+}
+
+fn read_private_content_mode(
+    path: &Path,
+    max_bytes: usize,
+    require_private_mode: bool,
+    repair: bool,
+) -> io::Result<String> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("private file has no parent"))?;
@@ -894,7 +1183,9 @@ fn read_private_content(
             "private directory is a link",
         ));
     }
-    crate::fs::ensure_private_directory(parent)?;
+    if repair {
+        crate::fs::ensure_private_directory(parent)?;
+    }
     let directory = crate::paths::WorkspaceBinding::capture(parent)?;
     let name = Path::new(
         path.file_name()
@@ -925,7 +1216,14 @@ fn read_private_content(
             "private file is hardlinked",
         ));
     }
-    let private = crate::fs::open_private_file(path)?;
+    let private = if repair {
+        crate::fs::open_private_file(path)?
+    } else {
+        crate::fs::open_private_file_checked(path, crate::fs::PrivateFileAccess::Read)?
+    };
+    if !repair {
+        crate::fs::validate_private_file(&private)?;
+    }
     crate::fs::ensure_same_file(
         path,
         &crate::fs::checked_file_metadata(&file)?,
@@ -1052,7 +1350,14 @@ fn read_project_config(path: &Path) -> io::Result<(String, ProjectConfigTrustBin
 }
 
 fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustStore> {
-    let content = match read_private_content(path, MAX_PROJECT_TRUST_BYTES, true) {
+    load_project_config_trust_mode(path, true)
+}
+
+fn load_project_config_trust_mode(
+    path: &Path,
+    repair: bool,
+) -> std::io::Result<ProjectConfigTrustStore> {
+    let content = match read_private_content_mode(path, MAX_PROJECT_TRUST_BYTES, true, repair) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ProjectConfigTrustStore {
@@ -1153,12 +1458,31 @@ fn split_project_override(
 }
 
 fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, String> {
+    let mut provenance = base.provenance.clone();
+    if let Some(table) = local.as_table() {
+        provenance.project_keys.extend(
+            table
+                .iter()
+                .filter(|(_, value)| !value.as_table().is_some_and(|table| table.is_empty()))
+                .filter_map(|(spelling, _)| keys::lookup(spelling).map(|key| key.name)),
+        );
+        for (spelling, value) in table {
+            if !value.is_table()
+                && let Some(key) = keys::lookup(spelling)
+            {
+                provenance.global_keys.remove(key.name);
+            }
+        }
+    }
     let mut base_toml = toml::Value::try_from(base)
         .map_err(|_| "base config could not be normalized".to_string())?;
     deep_merge_toml(&mut base_toml, local);
-    base_toml
+    let mut merged: Config = base_toml
         .try_into()
-        .map_err(|_| "merged project config has an invalid value".to_string())
+        .map_err(|_| "merged project config has an invalid value".to_string())?;
+    merged.provenance = provenance;
+    merged.load_warnings = base.load_warnings.clone();
+    Ok(merged)
 }
 
 fn redact_sensitive_value(value: &toml::Value, redact_scalar: bool) -> toml::Value {
@@ -1204,12 +1528,47 @@ fn apply_local_override_with_confirmation(
     interactive: bool,
     confirm: &dyn Fn(&str) -> bool,
 ) -> Result<ProjectConfigTrustOutcome, String> {
+    apply_local_override_with_confirmation_mode(
+        cfg,
+        path,
+        trust_store_path,
+        interactive,
+        confirm,
+        true,
+    )
+}
+
+fn apply_local_override_with_confirmation_mode(
+    cfg: &mut Config,
+    path: &Path,
+    trust_store_path: &Path,
+    interactive: bool,
+    confirm: &dyn Fn(&str) -> bool,
+    repair: bool,
+) -> Result<ProjectConfigTrustOutcome, String> {
     let (workspace, relative, content) = captured_project_config_content(path)
         .map_err(|error| format!("failed to read project config: {error}"))?;
+    cfg.provenance.project_file = Some(path.to_path_buf());
+    cfg.provenance.project_trust = Some("sensitive keys inactive");
     let (benign, sensitive, sensitive_keys) = split_project_override(&content)?;
+    if !repair {
+        let local = parse_project_toml(&content)?;
+        let warnings = keys::unknown_key_warnings(
+            "project config",
+            local
+                .as_table()
+                .into_iter()
+                .flat_map(|table| table.keys().map(String::as_str)),
+        );
+        cfg.load_warnings.extend(std::iter::repeat_n(
+            "project config has an unknown or unavailable key (name/value omitted)".into(),
+            warnings.len(),
+        ));
+    }
     let benign_cfg = merge_config_value(cfg, benign)?;
     if sensitive_keys.is_empty() {
         *cfg = benign_cfg;
+        cfg.provenance.project_trust = Some("benign keys only");
         return Ok(ProjectConfigTrustOutcome::NoSensitiveKeys);
     }
 
@@ -1223,7 +1582,7 @@ fn apply_local_override_with_confirmation(
             return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
         }
     };
-    let mut store = match load_project_config_trust(trust_store_path) {
+    let mut store = match load_project_config_trust_mode(trust_store_path, repair) {
         Ok(store) => store,
         Err(error) => {
             *cfg = benign_cfg;
@@ -1236,6 +1595,7 @@ fn apply_local_override_with_confirmation(
 
     if store.bindings.contains(&binding) {
         *cfg = merge_config_value(&benign_cfg, sensitive)?;
+        cfg.provenance.project_trust = Some("content-bound trusted");
         return Ok(ProjectConfigTrustOutcome::AlreadyTrusted);
     }
 
@@ -1282,6 +1642,7 @@ fn apply_local_override_with_confirmation(
         return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
     }
     *cfg = trusted_cfg;
+    cfg.provenance.project_trust = Some("content-bound approved");
     Ok(ProjectConfigTrustOutcome::Approved)
 }
 

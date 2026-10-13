@@ -2133,6 +2133,9 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        if crate::startup::heap_future(|| self.handle_plan_event(&ev)).await? {
+            return Ok(ControlFlow::Continue(()));
+        }
         #[cfg(feature = "git-worktree")]
         if self.chain.git.pending.is_some() {
             if matches!(&ev,UserEvent::Key(key) if matches!(key.code,KeyCode::Char('c'|'d'))&&key.modifiers.contains(KeyModifiers::CONTROL))
@@ -2730,8 +2733,7 @@ impl<'a> App<'a> {
             }
 
             if !one_shot
-                && (text.starts_with('/')
-                    || crate::ui::slash::split_command(&text).first() == Some(&"/context"))
+                && (text.starts_with('/') || crate::ui::slash::is_readonly_diagnostic(&text))
             {
                 self.run_slash_command(&text).await?;
             } else if !one_shot && text.starts_with('!') {
@@ -2768,6 +2770,19 @@ impl<'a> App<'a> {
                 _ => {}
             }
         }
+        let completed_plan = match &event {
+            AgentEvent::Done { response, .. } => self
+                .chain
+                .plan
+                .run
+                .take()
+                .map(|captured| (captured, response.clone())),
+            AgentEvent::Error { .. } => {
+                self.chain.plan = Default::default();
+                None
+            }
+            _ => None,
+        };
         let terminal_error = matches!(&event, AgentEvent::Error { .. });
         if terminal_error {
             self.discard_interrupted_queue();
@@ -2925,6 +2940,26 @@ impl<'a> App<'a> {
         }
 
         if terminal_success {
+            if let Some((captured, response)) = completed_plan
+                && !self.plan_execution_busy()
+            {
+                match captured.complete(
+                    &response,
+                    self.ui.session,
+                    self.ui.context,
+                    &self.ui.workspace,
+                    &self.ui.permission,
+                ) {
+                    Ok(proposal) => {
+                        self.chain.plan.pending = Some(proposal);
+                        self.chain.plan.editing = false;
+                        self.chain.pending = None;
+                        self.chain.label_msg = None;
+                        self.show_plan_approval()?;
+                    }
+                    Err(message) => self.renderer.write_line(message, C_ERROR)?,
+                }
+            }
             self.request_session_title();
         }
 
@@ -3030,6 +3065,9 @@ impl<'a> App<'a> {
         if !self.run.is_running {
             self.settle_success_transaction();
         }
+        if self.chain.plan.pending.is_some() {
+            return Ok(());
+        }
 
         if !self.run.is_running
             && let Some(selection) = self.chain.dot_prompt_restore.take()
@@ -3047,6 +3085,7 @@ impl<'a> App<'a> {
             && let Some(ref name) = self.ui.context.current_prompt_name
             && !self.ui.context.chain_declined.contains(name)
             && let Some(phase) = crate::extras::chain::ChainPhase::from_prompt_name(name)
+            && phase != crate::extras::chain::ChainPhase::Plan
             && let Some(ref chain_cfg) = self.ui.cfg.chain
             && phase.is_enabled(chain_cfg)
         {
@@ -3103,6 +3142,7 @@ impl<'a> App<'a> {
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
     async fn fail_pending_main_turn(&mut self) {
+        self.chain.plan = Default::default();
         self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
@@ -3143,6 +3183,7 @@ impl<'a> App<'a> {
     }
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        self.chain.plan = Default::default();
         self.renderer.feed_mut().finish_reasoning();
         #[cfg(feature = "git-worktree")]
         {
@@ -3618,6 +3659,214 @@ impl<'a> App<'a> {
         Ok(true)
     }
 
+    fn plan_execution_busy(&self) -> bool {
+        if self.run.is_running
+            || self.run.agent_rx.is_some()
+            || self.run.main_abort.is_some()
+            || self.permission_prompt.is_some()
+            || self.run.validation_active()
+        {
+            return true;
+        }
+        #[cfg(feature = "git-worktree")]
+        if self.chain.git.work.is_some() || self.chain.git.pending.is_some() {
+            return true;
+        }
+        #[cfg(feature = "goal")]
+        if self
+            .ui
+            .session
+            .goal_store
+            .snapshot()
+            .is_some_and(|goal| !goal.status.is_terminal())
+        {
+            return true;
+        }
+        false
+    }
+
+    fn show_plan_approval(&mut self) -> anyhow::Result<()> {
+        self.renderer.chain_but_mode = false;
+        self.renderer.chain_prompt = Some(ChainPrompt {
+            question: compact_str::CompactString::from(crate::ui::plan::QUESTION),
+        });
+        self.renderer
+            .write_line(crate::ui::plan::QUESTION, C_AGENT)?;
+        self.refresh()?;
+        Ok(())
+    }
+
+    async fn handle_plan_event(&mut self, event: &UserEvent) -> anyhow::Result<bool> {
+        if self.chain.plan.pending.is_none() {
+            return Ok(false);
+        }
+        if matches!(event, UserEvent::Quit) {
+            self.chain.plan = Default::default();
+            self.renderer.chain_prompt = None;
+            self.renderer.chain_but_mode = false;
+            return Ok(false);
+        }
+        let key = match event {
+            UserEvent::Paste(text) => {
+                if self.chain.plan.editing {
+                    self.input.handle_paste(text.clone());
+                    self.refresh()?;
+                }
+                return Ok(true);
+            }
+            UserEvent::Key(key) => *key,
+            _ => return Ok(false),
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return Ok(true);
+        }
+        // Display-only controls remain available while approval owns input.
+        if (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            || (self.renderer.selection_active
+                && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
+        {
+            return Ok(false);
+        }
+        if matches!(key.code, KeyCode::Char('c' | 'd'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if self.chain.plan.editing {
+                self.input.discard_draft();
+            }
+            self.chain.plan = Default::default();
+            self.chain.dot_prompt_restore = None;
+            self.renderer.chain_prompt = None;
+            self.renderer.chain_but_mode = false;
+            self.discard_interrupted_queue();
+            self.renderer
+                .write_line("Plan approval cancelled; still planning", C_AGENT)?;
+            self.refresh()?;
+            return Ok(true);
+        }
+        // Cycling never answers approval; its ceiling change makes the old
+        // capture stale, which is checked again before any continuation.
+        if key.code == KeyCode::BackTab
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            return Ok(false);
+        }
+        if self.chain.plan.editing {
+            if key.code == KeyCode::Esc {
+                self.input.discard_draft();
+                self.chain.plan.editing = false;
+                self.show_plan_approval()?;
+            } else if let Some(text) = self.input.handle_key(key) {
+                if let Err(message) = self.chain.plan.pending.as_mut().unwrap().edit(&text) {
+                    self.input.load_text(&text);
+                    self.renderer.write_line(message, C_ERROR)?;
+                } else {
+                    self.chain.plan.editing = false;
+                    self.renderer
+                        .write_line("Edited plan (awaiting approval):", C_AGENT)?;
+                    self.renderer.write_line(&sanitize_output(&text), C_AGENT)?;
+                    self.show_plan_approval()?;
+                }
+            }
+            self.refresh()?;
+            return Ok(true);
+        }
+        if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+            return Ok(true);
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                if self.plan_execution_busy() || self.run.pending_turn.is_some() {
+                    self.renderer.write_line(
+                        "Finish or stop the active work before approving execution",
+                        C_ERROR,
+                    )?;
+                    return Ok(true);
+                }
+                let proposal = self.chain.plan.pending.take().unwrap();
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = false;
+                self.chain.dot_prompt_restore = None;
+                if !proposal.valid(
+                    self.ui.session,
+                    self.ui.context,
+                    &self.ui.workspace,
+                    &self.ui.permission,
+                ) {
+                    self.discard_interrupted_queue();
+                    self.renderer
+                        .write_line("Plan approval is stale; no execution started", C_ERROR)?;
+                    self.refresh()?;
+                    return Ok(true);
+                }
+                let text = proposal.continuation();
+                self.discard_interrupted_queue();
+                self.input.discard_draft();
+                self.ui.invalidate_prebuild();
+                if let Some(permission) = &self.ui.permission {
+                    permission
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .restore_user_mode();
+                }
+                apply_prompt_mode("code", self.ui.context, &self.ui.permission);
+                apply_prompt_model(
+                    "code",
+                    &mut self.ui,
+                    &mut self.run.agent,
+                    self.slash.reasoning_enabled,
+                    &mut self.renderer,
+                )
+                .await;
+                self.run.agent = None;
+                self.echo_main_submission(&text)?;
+                // This is an ordinary user turn: fresh request profile and
+                // budget admission, then ordinary per-tool Ask/deny checks.
+                let result = crate::startup::heap_future(|| self.start_main_run(&text)).await;
+                if !self.run.is_running {
+                    self.input.load_text(&text);
+                    if let Err(error) = result {
+                        self.renderer.write_line(
+                            &format!(
+                                "Approved continuation not started: {}",
+                                sanitize_output(&error.to_string())
+                            ),
+                            C_ERROR,
+                        )?;
+                    } else {
+                        self.renderer.write_line(
+                            "Approved continuation not started; recoverable text is in the editor",
+                            C_ERROR,
+                        )?;
+                    }
+                } else {
+                    result?;
+                }
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.chain.plan = Default::default();
+                self.chain.dot_prompt_restore = None;
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = false;
+                self.discard_interrupted_queue();
+                self.renderer
+                    .write_line("Plan not executed; still planning", C_AGENT)?;
+            }
+            KeyCode::Char('e' | 'E') => {
+                self.input.discard_draft();
+                self.input
+                    .load_text(&self.chain.plan.pending.as_ref().unwrap().plan);
+                self.chain.plan.editing = true;
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = true;
+                self.renderer.write_line("Edit the plan; Enter previews it for approval, Esc returns to the original plan", C_AGENT)?;
+            }
+            _ => {}
+        }
+        self.refresh()?;
+        Ok(true)
+    }
+
     async fn start_main_run(&mut self, text: &str) -> anyhow::Result<()> {
         #[cfg(feature = "git-worktree")]
         anyhow::ensure!(
@@ -3665,6 +3914,14 @@ impl<'a> App<'a> {
             );
             return Ok(());
         }
+        let planning = crate::ui::plan::PlanRun::capture(
+            self.ui.session,
+            self.ui.context,
+            &self.ui.workspace,
+            &self.ui.permission,
+            self.ui.cfg,
+        );
+        self.chain.plan = Default::default();
         start_main_run(
             text,
             true,
@@ -3673,7 +3930,11 @@ impl<'a> App<'a> {
             &self.slash,
             &mut self.prebuild,
         )
-        .await
+        .await?;
+        if self.run.is_running && self.run.pending_turn.is_some() {
+            self.chain.plan.run = planning;
+        }
+        Ok(())
     }
 
     async fn start_internal_main_run(&mut self, text: &str) -> anyhow::Result<()> {
@@ -4005,7 +4266,7 @@ impl<'a> App<'a> {
 
         // The provider may have changed: warm its model list in the
         // background (never blocking the command) and show what is cached.
-        let context_diagnostic = crate::ui::slash::split_command(text).first() == Some(&"/context");
+        let context_diagnostic = crate::ui::slash::is_readonly_diagnostic(text);
         // Successful diagnostics cannot enter the generic success settlement:
         // that saves history and may auto-start a pending first goal round.
         if context_diagnostic && result.is_ok() {
@@ -9410,7 +9671,7 @@ mod context_diagnostic_tests {
     }
 
     #[tokio::test]
-    async fn actual_context_command_is_pure_cold_and_built_without_provider_requests() {
+    async fn actual_context_and_doctor_are_pure_cold_busy_and_built_without_provider_requests() {
         let root = crate::tests::OwnedTestDirectory::new("context-diagnostic-app");
         let environment = [
             "ZS_CONFIG_DIR",
@@ -9531,6 +9792,21 @@ mod context_diagnostic_tests {
         let output = app.renderer.captured_output();
         assert!(output.contains("Context composition:") && output.contains("agent not built"));
         assert!(!output.contains("PRIVATE_USER_CONTENT"));
+        app.input.load_text(" \t/doctor");
+        crate::startup::heap_future(|| {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        })
+        .await
+        .unwrap();
+        let output = app.renderer.captured_output();
+        assert!(
+            output.contains("price source: captured session rates")
+                && output.contains("Terminal attachment:")
+        );
+        assert!(app.run.agent.is_none() && app.run.main_abort.is_none());
+        assert!(app.run.pending_inputs.is_empty() && app.run.is_running);
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert_eq!(saved_files(&paths.sessions_dir()), stored_before);
         app.run.is_running = false;
         let built = {
             let build_context = app.ui.agent_build_ctx();
@@ -9628,6 +9904,30 @@ mod context_diagnostic_tests {
         );
         assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
         assert!(saved_files(&paths.sessions_dir()) == stored_before);
+        crate::startup::heap_future(|| app.run_slash_command("/doctor"))
+            .await
+            .unwrap();
+        // Traverse the actual report scrollback; rich feature reports are
+        // intentionally longer than one viewport.
+        for _ in 0..4 {
+            crate::startup::heap_future(|| {
+                app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            })
+            .await
+            .unwrap();
+            app.renderer.render_viewport().unwrap();
+        }
+        let output = app.renderer.captured_output();
+        assert!(output.contains("Directories:") && output.contains("Provider and model:"));
+        assert!(!output.contains("CAPTURED_") && !output.contains("PRIVATE_USER_CONTENT"));
+        assert!(app.run.main_abort.is_none() && !app.run.is_running);
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert_eq!(saved_files(&paths.sessions_dir()), stored_before);
+        app.renderer.scroll_to_bottom().unwrap();
+        crate::startup::heap_future(|| app.run_slash_command("/doctor unexpected"))
+            .await
+            .unwrap();
+        assert!(app.renderer.captured_output().contains("usage: /doctor"));
         crate::startup::heap_future(|| app.run_slash_command("/context unexpected"))
             .await
             .unwrap();
@@ -9738,6 +10038,8 @@ mod git_confirmation_stack_tests {
                             for event in [
                                 UserEvent::Paste("  /context  ".into()),
                                 UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Paste("/doctor".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
                                 UserEvent::Paste("/commit ONE_MIB_DECLINED".into()),
                                 UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
                                 UserEvent::Key(KeyEvent::new(
@@ -9764,6 +10066,7 @@ mod git_confirmation_stack_tests {
                         .unwrap();
                         let rendered = app.renderer.captured_output();
                         assert!(rendered.contains("Context composition:"));
+                        assert!(rendered.contains("Terminal attachment:"));
                         assert!(rendered.contains("ONE_MIB_DECLINED"));
                         assert!(rendered.contains("Git proposal declined"));
                         assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), initialized);
@@ -9793,6 +10096,964 @@ mod git_confirmation_stack_tests {
                             !root.path().join(".git").exists(),
                             "fixture never executes Git"
                         );
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod plan_approval_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode};
+    use crate::session::MessageRole;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PLAN: &str = "Plan雪: update only the selected flag.\nVerify its test. $(literal)";
+
+    struct OwnedApp<'a>(App<'a>);
+    impl<'a> std::ops::Deref for OwnedApp<'a> {
+        type Target = App<'a>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for OwnedApp<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for OwnedApp<'_> {
+        fn drop(&mut self) {
+            self.0.cancel_pending_permissions();
+            self.0.run.cancel_validation();
+            if let Some(abort) = self.0.run.main_abort.take() {
+                abort.abort();
+            }
+            self.0.ui.sandbox.kill_active();
+        }
+    }
+    fn owned_app(ui: UiContext<'_>) -> OwnedApp<'_> {
+        OwnedApp(fixture_app(ui))
+    }
+
+    struct Provider {
+        address: std::net::SocketAddr,
+        requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        task: tokio::task::JoinSet<()>,
+    }
+    impl Provider {
+        async fn new(responses: Vec<&'static str>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let mut task = tokio::task::JoinSet::new();
+            task.spawn(async move {
+                for text in responses {
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let (header, length) = loop {
+                            let mut chunk = [0; 4096];
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert_ne!(count, 0, "owned provider header closed");
+                            bytes.extend_from_slice(&chunk[..count]);
+                            assert!(bytes.len() <= 256 * 1024);
+                            if let Some(header) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let header_text = String::from_utf8_lossy(&bytes[..header]);
+                                let length = header_text.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap();
+                                break (header + 4, length);
+                            }
+                        };
+                        assert!(length <= 256 * 1024);
+                        while bytes.len() < header + length {
+                            let mut chunk = [0; 4096];
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert_ne!(count, 0, "owned provider body closed");
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        captured.lock().unwrap().push(serde_json::from_slice(&bytes[header..header+length]).unwrap());
+                        if text == "hold" {
+                            std::future::pending::<()>().await;
+                        }
+                        let (status, body, kind) = if text == "error" {
+                            ("400 Bad Request", "{\"error\":{\"message\":\"owned planning failure\"}}".into(), "application/json")
+                        } else {
+                            let delta = if text == "ask-read" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
+                            } else { serde_json::json!({"role":"assistant","content":text}) };
+                            let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if text=="ask-read" {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}});
+                            ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
+                        };
+                        let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                        stream.write_all(wire.as_bytes()).await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }).await.expect("owned local provider must be bounded");
+                }
+            });
+            Self {
+                address,
+                requests,
+                task,
+            }
+        }
+        fn config(&self) -> config::Config {
+            serde_json::from_value(serde_json::json!({
+                "session_title_model":"off", "compact":false,
+                "custom_providers":{"plan80":{"provider_type":"openai","base_url":format!("http://{}/v1",self.address),"api_style":"completions"}}
+            })).unwrap()
+        }
+        fn calls(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().unwrap().clone()
+        }
+        async fn finish(mut self) {
+            while let Some(result) = self.task.join_next().await {
+                result.unwrap();
+            }
+        }
+        async fn cancel(mut self) {
+            self.task.shutdown().await;
+        }
+    }
+
+    struct Roots {
+        directory: crate::tests::OwnedTestDirectory,
+        _environment: crate::tests::ScopedProcessEnv,
+    }
+    impl Roots {
+        fn new() -> Self {
+            let directory = crate::tests::OwnedTestDirectory::new("actual-plan-approval");
+            let bindings = [
+                "ZS_CONFIG_DIR",
+                "ZS_DATA_DIR",
+                "ZS_LOCAL_DATA_DIR",
+                "ZS_STATE_DIR",
+                "ZS_CACHE_DIR",
+                "ZS_CREDENTIALS_DIR",
+            ]
+            .map(|name| (name, Some(directory.path().join(name).into_os_string())));
+            let environment = crate::tests::ScopedProcessEnv::set(&bindings);
+            Self {
+                directory,
+                _environment: environment,
+            }
+        }
+        fn workspace(&self) -> Arc<crate::paths::WorkspaceBinding> {
+            Arc::new(crate::paths::WorkspaceBinding::capture(self.directory.path()).unwrap())
+        }
+    }
+    fn ui<'a>(
+        cli: &'a crate::cli::Cli,
+        cfg: &'a config::Config,
+        session: &'a mut Session,
+        context: &'a mut crate::context::ContextFiles,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+        mode: SecurityMode,
+    ) -> UiContext<'a> {
+        let policy = PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Deny),
+            ..Default::default()
+        });
+        let checker = crate::permission::checker::PermissionChecker::new(
+            &policy,
+            mode,
+            Some(workspace.root().to_owned()),
+            None,
+        )
+        .unwrap();
+        let client = crate::provider::create_client(
+            "plan80",
+            Some("unused-local-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        UiContext::new(
+            cli,
+            cfg,
+            session,
+            context,
+            workspace.clone(),
+            client,
+            Some(Arc::new(std::sync::Mutex::new(checker))),
+            None,
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace),
+            None,
+        )
+    }
+    async fn user(app: &mut App<'_>, event: UserEvent) {
+        app.user_tx.send(event).await.unwrap();
+        let delivered = app.user_rx.recv().await.unwrap();
+        assert!(matches!(
+            crate::startup::heap_future(|| app.handle_user_event(delivered))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+    }
+    async fn key(app: &mut App<'_>, code: KeyCode) {
+        user(app, UserEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))).await;
+    }
+    async fn begin(app: &mut App<'_>) {
+        user(app, UserEvent::Paste(".plan add the selected flag".into())).await;
+        key(app, KeyCode::Enter).await;
+        assert!(app.run.is_running && app.chain.plan.run.is_some());
+        assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+    }
+    async fn finish_turn(app: &mut App<'_>) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                let success = matches!(event, AgentEvent::Done { .. });
+                let terminal = success || matches!(event, AgentEvent::Error { .. });
+                crate::startup::heap_future(|| app.handle_agent_event(event))
+                    .await
+                    .unwrap();
+                if terminal {
+                    assert!(app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+                    return success;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn actual_plan_turn_asks_before_second_request_and_restores_exact_operator_ceiling() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for mode in [SecurityMode::Standard, SecurityMode::ReadOnly] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec![PLAN, "IMPLEMENTED"]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(&cli, &cfg, &mut session, &mut context, workspace, mode));
+            begin(&mut app).await;
+            app.input.load_text("typed follow-up雪");
+            app.run
+                .pending_inputs
+                .extend(["stale queued one".into(), "stale queued two".into()]);
+            assert!(finish_turn(&mut app).await);
+            assert_eq!(provider.calls().len(), 1);
+            assert!(
+                app.renderer
+                    .captured_output()
+                    .contains(crate::ui::plan::QUESTION)
+            );
+            assert_eq!(app.chain.plan.pending.as_ref().unwrap().plan, PLAN);
+            assert_eq!(app.input.buffer, "typed follow-up雪");
+            assert_eq!(app.run.pending_inputs.len(), 2);
+            let granted = serde_json::to_value(&app.ui.session.permission_allowlist).unwrap();
+            let approved = if mode == SecurityMode::ReadOnly {
+                key(&mut app, KeyCode::Char('e')).await;
+                app.input
+                    .load_text("Edited approved plan雪\n.plan !literal");
+                key(&mut app, KeyCode::Enter).await;
+                assert_eq!(provider.calls().len(), 1);
+                "Edited approved plan雪\n.plan !literal"
+            } else {
+                PLAN
+            };
+            key(&mut app, KeyCode::Char('y')).await;
+            assert!(app.run.is_running);
+            assert!(app.run.pending_inputs.is_empty());
+            assert_eq!(
+                app.ui.permission.as_ref().unwrap().lock().unwrap().mode(),
+                mode
+            );
+            assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("code"));
+            assert!(finish_turn(&mut app).await);
+            assert_eq!(
+                serde_json::to_value(&app.ui.session.permission_allowlist).unwrap(),
+                granted
+            );
+            assert!(
+                crate::agent::tools::check_perm(&app.ui.permission, &None, "write", "selected.txt")
+                    .await
+                    .is_err()
+            );
+            let calls = provider.calls();
+            assert_eq!(calls.len(), 2);
+            assert!(calls[0].to_string().contains("Planning-Only Mode"));
+            assert!(calls[1].to_string().contains("Coding Mode"));
+            let submitted = app
+                .ui
+                .session
+                .messages
+                .iter()
+                .rfind(|message| message.role == MessageRole::User)
+                .unwrap()
+                .content
+                .to_string();
+            assert!(submitted.starts_with("Execute this approved plan"));
+            assert!(submitted.ends_with(approved));
+            assert_eq!(
+                calls[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str(),
+                Some(submitted.as_str())
+            );
+            assert!(
+                calls[1]
+                    .to_string()
+                    .contains("Approved plan (literal text)")
+            );
+            assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+            app.input.clear_buffer();
+            key(&mut app, KeyCode::Char('y')).await;
+            assert_eq!(
+                provider.calls().len(),
+                2,
+                "duplicate Y cannot admit a new turn"
+            );
+            provider.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_plan_edit_requires_reapproval_and_decline_preserves_planning_and_draft() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        let before = serde_json::to_vec(app.ui.session).unwrap();
+        let display = app.renderer.feed().reasoning_display();
+        user(
+            &mut app,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        )
+        .await;
+        assert_eq!(app.renderer.feed().reasoning_display(), display.next());
+        assert!(app.chain.plan.pending.is_some());
+        assert_eq!(provider.calls().len(), 1);
+        app.input.load_text("follow-up preserved in kill ring");
+        key(&mut app, KeyCode::Char('e')).await;
+        assert_eq!(app.input.buffer, PLAN);
+        app.input
+            .load_text("Edited literal plan雪\n.plan !never execute");
+        key(&mut app, KeyCode::Enter).await;
+        assert_eq!(provider.calls().len(), 1);
+        assert!(!app.run.is_running);
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("Edited plan (awaiting approval)")
+        );
+        assert_eq!(
+            app.chain.plan.pending.as_ref().unwrap().plan,
+            "Edited literal plan雪\n.plan !never execute"
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        key(&mut app, KeyCode::Char('n')).await;
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+        assert_eq!(
+            app.ui.permission.as_ref().unwrap().lock().unwrap().mode(),
+            SecurityMode::PlanWrite
+        );
+        user(
+            &mut app,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+        )
+        .await;
+        assert_eq!(app.input.buffer, "follow-up preserved in kill ring");
+        assert!(app.chain.plan.pending.is_none());
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn actual_plan_error_empty_and_caller_cancel_never_offer_execution() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for response in ["error", " \n", "hold"] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec![response]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            begin(&mut app).await;
+            if response == "hold" {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while provider.calls().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                app.input.load_text("typed follow-up");
+                app.run.pending_inputs.push_back("must not continue".into());
+                user(
+                    &mut app,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                )
+                .await;
+                assert!(app.run.pending_inputs.is_empty());
+                assert!(app.run.agent_rx.is_none());
+                assert_eq!(app.input.buffer, "add the selected flag");
+                provider.cancel().await;
+            } else {
+                assert_eq!(finish_turn(&mut app).await, response != "error");
+                assert_eq!(provider.calls().len(), 1);
+                provider.finish().await;
+            }
+            assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+            assert!(
+                !app.renderer
+                    .captured_output()
+                    .contains(crate::ui::plan::QUESTION)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_plan_stale_revision_workspace_prompt_and_modified_keys_cannot_execute() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for stale in [
+            "revision",
+            "workspace",
+            "prompt",
+            "mode",
+            "session",
+            "cancel",
+        ] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec![PLAN]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            begin(&mut app).await;
+            assert!(finish_turn(&mut app).await);
+            let grants = serde_json::to_value(&app.ui.session.permission_allowlist).unwrap();
+            for mut key_event in [
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            ] {
+                if key_event.modifiers.is_empty() {
+                    key_event.kind = crossterm::event::KeyEventKind::Release;
+                }
+                user(&mut app, UserEvent::Key(key_event)).await;
+                assert!(app.chain.plan.pending.is_some());
+                assert_eq!(provider.calls().len(), 1);
+            }
+            match stale {
+                "revision" => {
+                    app.ui.session.messages.last_mut().unwrap().content =
+                        "different same-session plan".into()
+                }
+                "workspace" => app.ui.workspace = roots.workspace(),
+                "prompt" => {
+                    app.ui
+                        .context
+                        .prompts
+                        .insert("code".into(), "changed code prompt".into());
+                }
+                "mode" => {
+                    user(
+                        &mut app,
+                        UserEvent::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+                    )
+                    .await
+                }
+                "session" => app.ui.session.id = "different-session".into(),
+                "cancel" => {}
+                _ => unreachable!(),
+            }
+            app.run
+                .pending_inputs
+                .push_back("stale queued instruction".into());
+            if stale == "cancel" {
+                user(
+                    &mut app,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                )
+                .await;
+            } else {
+                key(&mut app, KeyCode::Char('y')).await;
+            }
+            assert!(app.chain.plan.pending.is_none());
+            assert!(!app.run.is_running && app.run.agent_rx.is_none());
+            assert!(app.run.pending_inputs.is_empty());
+            assert_eq!(provider.calls().len(), 1);
+            assert_eq!(
+                serde_json::to_value(&app.ui.session.permission_allowlist).unwrap(),
+                grants
+            );
+            provider.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_approved_plan_permission_stop_settles_run_without_queued_followup_or_grants() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        std::fs::write(
+            roots.directory.path().join("held.txt"),
+            "PRIVATE_READ_MUST_NOT_COMPLETE",
+        )
+        .unwrap();
+        let provider = Provider::new(vec![PLAN, "ask-read"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        );
+        let policy = PermissionConfigs::from(PermissionConfig {
+            read: Some(crate::permission::ToolPerm::Simple(Action::Ask)),
+            ..Default::default()
+        });
+        ui.permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &policy,
+                SecurityMode::Standard,
+                Some(ui.workspace.root().to_owned()),
+                None,
+            )
+            .unwrap(),
+        )));
+        let (ask, requests) = mpsc::channel(4);
+        ui.ask_tx = Some(ask);
+        let mut app = owned_app(ui);
+        app.ask_rx = Some(requests);
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        key(&mut app, KeyCode::Char('y')).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let app = &mut app.0;
+            loop {
+                tokio::select! {
+                    Some(request) = async {app.ask_rx.as_mut().unwrap().recv().await} => {
+                        assert_eq!(request.tool,"read");
+                        app.begin_permission_request(request).unwrap();
+                        break;
+                    }
+                    Some(event) = async {app.run.agent_rx.as_mut().unwrap().recv().await} => {
+                        assert!(!matches!(event,AgentEvent::Done {..}|AgentEvent::Error {..}));
+                        crate::startup::heap_future(||app.handle_agent_event(event)).await.unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.permission_prompt.is_some());
+        assert_eq!(provider.calls().len(), 2);
+        app.input.load_text("typed follow-up before stop");
+        app.run
+            .pending_inputs
+            .push_back("must never be admitted".into());
+        key(&mut app, KeyCode::Esc).await;
+        assert!(app.permission_prompt.is_none());
+        assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.run.pending_inputs.is_empty());
+        assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert!(
+            !app.ui
+                .session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::ToolResult
+                    && message.content.contains("PRIVATE_READ_MUST_NOT_COMPLETE"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(roots.directory.path().join("held.txt")).unwrap(),
+            "PRIVATE_READ_MUST_NOT_COMPLETE"
+        );
+        assert_eq!(provider.calls().len(), 2);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn actual_plan_failed_local_admission_retains_literal_draft_and_replay_cannot_arm_approval()
+     {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        let saved = serde_json::to_vec(app.ui.session).unwrap();
+        let count = app.ui.session.messages.len();
+        app.ui.session.context_window = 32;
+        key(&mut app, KeyCode::Char('y')).await;
+        assert!(!app.run.is_running && app.run.agent_rx.is_none());
+        assert!(app.input.buffer.starts_with("Execute this approved plan"));
+        assert!(app.input.buffer.ends_with(PLAN));
+        assert_eq!(app.ui.session.messages.len(), count);
+        assert_eq!(provider.calls().len(), 1);
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("recoverable text is in the editor")
+        );
+        drop(app);
+        session = serde_json::from_slice(&saved).unwrap();
+        let workspace = roots.workspace();
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        let permission = app.ui.permission.clone();
+        crate::ui::apply_prompt_mode("plan", app.ui.context, &permission);
+        app.finalize_turn().await.unwrap();
+        assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+        assert!(!app.run.is_running);
+        assert_eq!(provider.calls().len(), 1);
+        provider.finish().await;
+    }
+
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn actual_plan_approval_does_not_take_over_unfinished_goal() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        let goal = crate::extras::goal::Goal::new(
+            "unfinished unrelated goal",
+            vec!["retained criteria".into()],
+        )
+        .unwrap();
+        let id = goal.id.clone();
+        app.ui.session.goal_store.set(goal, false).unwrap();
+        key(&mut app, KeyCode::Char('y')).await;
+        assert!(app.chain.plan.pending.is_some());
+        assert!(!app.run.is_running);
+        assert_eq!(provider.calls().len(), 1);
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("Finish or stop the active work")
+        );
+        assert_eq!(app.ui.session.goal_store.snapshot().unwrap().id, id);
+        key(&mut app, KeyCode::Char('n')).await;
+        assert_eq!(app.ui.session.goal_store.snapshot().unwrap().id, id);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn actual_plan_unsettled_terminal_receiver_cannot_offer_execution() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                if matches!(event, AgentEvent::Done { .. }) {
+                    break event;
+                }
+                crate::startup::heap_future(|| app.handle_agent_event(event))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // Hold the retirement boundary open after the genuine provider's Done;
+        // a terminal payload alone must not confer execution authority.
+        let (retained, receiver) = mpsc::channel(1);
+        app.run.agent_rx = Some(receiver);
+        tokio::time::pause();
+        let advance = async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(6)).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(6)).await;
+        };
+        let (result, ()) = tokio::join!(
+            crate::startup::heap_future(|| app.handle_agent_event(done)),
+            advance
+        );
+        tokio::time::resume();
+        assert!(result.unwrap_err().to_string().contains("settling"));
+        assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+        assert!(
+            !app.renderer
+                .captured_output()
+                .contains(crate::ui::plan::QUESTION)
+        );
+        drop(retained);
+        app.run.retire(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(provider.calls().len(), 1);
+        provider.finish().await;
+    }
+
+    #[test]
+    fn actual_plan_confirmation_event_loop_runs_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .name("plan-approval-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        #[cfg(feature = "hooks")]
+                        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+                        let roots = Roots::new();
+                        let provider = Provider::new(vec![PLAN]).await;
+                        let cfg = provider.config();
+                        let cli = crate::cli::Cli {
+                            no_session: true,
+                            no_tools: true,
+                            ..Default::default()
+                        };
+                        let workspace = roots.workspace();
+                        let mut context =
+                            crate::context::load(true).for_workspace_binding(true, &workspace);
+                        let mut session = Session::new(
+                            "plan80",
+                            "owned-model",
+                            128_000,
+                            workspace.root().to_str().unwrap(),
+                        );
+                        let mut app = owned_app(ui(
+                            &cli,
+                            &cfg,
+                            &mut session,
+                            &mut context,
+                            workspace,
+                            SecurityMode::Standard,
+                        ));
+                        let capture = app.renderer.capture_bytes();
+                        let tx = app.user_tx.clone();
+                        let calls = provider.requests.clone();
+                        let driver = async move {
+                            tx.send(UserEvent::Paste(".plan add the selected flag".into()))
+                                .await
+                                .unwrap();
+                            tx.send(UserEvent::Key(KeyEvent::new(
+                                KeyCode::Enter,
+                                KeyModifiers::NONE,
+                            )))
+                            .await
+                            .unwrap();
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                loop {
+                                    let shown = String::from_utf8_lossy(&capture.lock().unwrap())
+                                        .into_owned();
+                                    if shown.contains(crate::ui::plan::QUESTION) {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            assert_eq!(calls.lock().unwrap().len(), 1);
+                            tx.send(UserEvent::Key(KeyEvent::new(
+                                KeyCode::Char('n'),
+                                KeyModifiers::NONE,
+                            )))
+                            .await
+                            .unwrap();
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                loop {
+                                    if String::from_utf8_lossy(&capture.lock().unwrap())
+                                        .contains("Plan not executed; still planning")
+                                    {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            tx.send(UserEvent::Quit).await.unwrap();
+                        };
+                        let ((), result) = tokio::time::timeout(Duration::from_secs(10), async {
+                            tokio::join!(driver, crate::startup::heap_future(|| app.run_inner()))
+                        })
+                        .await
+                        .unwrap();
+                        result.unwrap();
+                        assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+                        assert!(!app.run.is_running && app.run.agent_rx.is_none());
+                        assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+                        assert_eq!(
+                            app.ui
+                                .session
+                                .messages
+                                .iter()
+                                .filter(|message| message.role == MessageRole::User)
+                                .count(),
+                            1
+                        );
+                        assert_eq!(provider.calls().len(), 1);
+                        provider.finish().await;
                     }));
             })
             .unwrap()

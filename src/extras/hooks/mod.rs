@@ -208,6 +208,18 @@ pub(crate) fn get_dispatcher() -> Option<std::sync::Arc<dispatcher::HookDispatch
     DISPATCHER.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Nonblocking metadata from the existing dispatcher, without constructing,
+/// dispatching or revalidating executable hooks. None means not initialized.
+pub(crate) fn diagnostic_hook_metadata()
+-> Result<Option<dispatcher::HookDiagnosticMetadata>, &'static str> {
+    let dispatcher = DISPATCHER
+        .try_lock()
+        .map_err(|_| "dispatcher metadata busy or unavailable")?;
+    Ok(dispatcher
+        .as_ref()
+        .map(|dispatcher| dispatcher.diagnostic_metadata()))
+}
+
 /// Workspace-relative paths of the hook files the installed dispatcher has
 /// content-bound. File tools refuse to modify them: a rewrite would only make
 /// the hook fail closed until restart.

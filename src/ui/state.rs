@@ -490,6 +490,7 @@ impl AgentRunState {
 
 #[derive(Default)]
 pub(crate) struct ChainState {
+    pub plan: crate::ui::plan::PlanState,
     #[cfg(feature = "git-worktree")]
     pub git: crate::ui::slash::git::ControlState,
     pub pending: Option<crate::extras::chain::ChainPhase>,
