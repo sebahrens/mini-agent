@@ -332,6 +332,7 @@ win where applicable. Windows environment names are case-insensitive.
 | `PATH`, `PATHEXT`, `CARGO_HOME` | Executable lookup, Windows executable suffixes, and Windows worker installed/development executable discovery. Selected executable identities are still checked by their launch boundary. |
 | `USER`, `USERNAME`, `HOSTNAME`, `HOST` | User/host statusline labels; the first available name in each pair is used. |
 | `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, `NO_COLOR` | Non-credential platform/terminal inputs preserved only by the relevant subprocess allow-list; terminal libraries can also consult them. |
+| `COLORFGBG` | Optional terminal background hint for the TUI's default foreground palette. The final ANSI index selects a light or dark fallback when no explicit background or OSC 11 reply is available; invalid or oversized hints are ignored. This does not add a subprocess environment allowance. |
 | `TMPDIR`, `TMP`, `TEMP` | Platform temporary-directory inputs. Sandboxed children receive the boundary's private temporary paths. |
 | `SYSTEMROOT`, `SystemRoot`, `WINDIR`, `COMSPEC`, `SYSTEMDRIVE`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` | Windows runtime/executable roots and explicitly permitted non-credential child environment inputs. |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy` | reqwest's standard proxy environment inputs. |
