@@ -1325,5 +1325,66 @@ class WindowsMcpPrivateTemporaryCiTests(unittest.TestCase):
             self.validate(original.replace(name, "Removed native ownership proof"))
 
 
+class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
+    """Experiments can reject a candidate; they never establish production mutation."""
+
+    @staticmethod
+    def validate(workflow: str) -> str:
+        job = job_body(workflow, "platform-paths")
+        name = "Falsify native Windows MCP operator config lease assumptions"
+        if job.count("- name: " + name) != 1:
+            raise AssertionError("one bounded native lease experiment step required")
+        step = job.split("- name: " + name, 1)[1].split("- name:", 1)[0]
+        for fragment in [
+            "if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "shell: pwsh",
+            "$filter = 'fs::private::windows::operator_config_lease_probe::'",
+            "cargo test --locked --bin mini-agent $filter -- --list 2>&1",
+            "$actual.Count -ne 3", "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
+            "'^fs::private::windows::operator_config_lease_probe::.*: test$'",
+            "cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1",
+            "if ($LASTEXITCODE -ne 0)", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
+            r"'^test result: ok\. 3 passed; 0 failed; 0 ignored;'",
+        ]:
+            if fragment not in step:
+                raise AssertionError("missing exact experiment guard: " + fragment)
+        expected = {
+            "exact_relative_lease_surviving_mapping_and_data_conflicts",
+            "namespace_alias_and_private_metadata_are_observed_before_any_candidate_write",
+            "reader_lease_precedes_marker_and_late_marker_refuses_admission",
+        }
+        names = re.findall(r"'fs::private::windows::operator_config_lease_probe::(\w+): test'", step)
+        if len(names) != 3 or set(names) != expected:
+            raise AssertionError("exact three experiments required")
+        if step.count("cargo test ") != 2 or step.count("throw ") != 4:
+            raise AssertionError("discovery/result failures must stay closed")
+        if any(value in step for value in ["--ignored", "--no-run", "continue-on-error", "cargo build"]):
+            raise AssertionError("native experiments cannot be replaced or waived")
+        return step
+
+    def test_existing_native_job_runs_exact_lease_experiments(self) -> None:
+        self.validate(WORKFLOW.read_text())
+
+    def test_missing_or_weakened_experiment_guards_fail_closed(self) -> None:
+        original = WORKFLOW.read_text()
+        name = "Falsify native Windows MCP operator config lease assumptions"
+        prefix, suffix = original.split("- name: " + name, 1)
+        step, rest = suffix.split("- name:", 1)
+        for before, after in [
+            ("$actual.Count -ne 3", "$actual.Count -lt 0"),
+            ("Compare-Object -ReferenceObject $expected -DifferenceObject $actual", "$null"),
+            ("--bin mini-agent $filter -- --list", "--bin mini-agent $filter -- --no-run"),
+            ("reader_lease_precedes_marker_and_late_marker_refuses_admission: test", "other: test"),
+            ("if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "if: matrix.os == 'windows-latest'"),
+            ("--bin mini-agent $filter -- --nocapture", "--bin mini-agent -- --nocapture"),
+            ("$nativeExit = $LASTEXITCODE", "$nativeExit = 0"),
+            ("if ($nativeExit -ne 0)", "if ($nativeExit -lt 0)"),
+            ("3 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 3 ignored;"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
+        with self.assertRaises(AssertionError):
+            self.validate(original.replace(name, "Removed native experiment"))
+
+
 if __name__ == "__main__":
     unittest.main()

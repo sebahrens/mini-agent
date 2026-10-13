@@ -106,3 +106,12 @@ the retained workspace writer does not support atomic compare-and-replace.
 Creating a new private configuration is supported. Existing-file add/remove
 support remains pending under `mini-agent-i7ro6.57.1`; the native temporary-file
 ownership test does not establish a Windows add/remove round trip.
+
+The Windows-only `fs::private::windows::operator_config_lease_probe` tests are
+finite falsification experiments on private owned inert files. They measure
+retained-relative exclusive opens, surviving mapped views, name/link/private
+metadata races and reader-before-marker ordering. An experiment can pass by
+observing a bypass and explicitly rejecting the candidate protocol before any
+candidate write. These results do not implement configuration transactions,
+crash recovery, trust approval or Windows existing-file add/remove support.
+The ordinary workspace compare-and-replace restriction remains unchanged.

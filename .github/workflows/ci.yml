@@ -2226,6 +2226,30 @@ jobs:
             throw 'Native Windows MCP private temporary proof did not execute exactly one passing test'
           }
 
+      - name: Falsify native Windows MCP operator config lease assumptions
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $filter = 'fs::private::windows::operator_config_lease_probe::'
+          $expected = @(
+            'fs::private::windows::operator_config_lease_probe::exact_relative_lease_surviving_mapping_and_data_conflicts: test',
+            'fs::private::windows::operator_config_lease_probe::namespace_alias_and_private_metadata_are_observed_before_any_candidate_write: test',
+            'fs::private::windows::operator_config_lease_probe::reader_lease_precedes_marker_and_late_marker_refuses_admission: test'
+          )
+          $discovered = @(cargo test --locked --bin mini-agent $filter -- --list 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Windows MCP lease experiment discovery failed' }
+          $actual = @($discovered | Where-Object { $_ -match '^fs::private::windows::operator_config_lease_probe::.*: test$' })
+          if ($actual.Count -ne 3 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Exact three native Windows MCP lease experiments were not discovered'
+          }
+          $native = @(cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1)
+          $nativeExit = $LASTEXITCODE
+          $native | Write-Output
+          if ($nativeExit -ne 0) { throw 'Native Windows MCP lease experiment failed' }
+          if (-not ($native -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) {
+            throw 'Native Windows MCP lease experiment did not execute exactly three passing tests'
+          }
+
       - name: Test MCP OAuth credential storage
         if: matrix.feature.mcp
         shell: bash

@@ -2220,7 +2220,9 @@ fn atomic_write_platform(
         FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
         FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,

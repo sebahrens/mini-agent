@@ -843,8 +843,9 @@ mod windows {
             return Err(super::private_file_error());
         }
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
-        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, ReOpenFile};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, READ_CONTROL, ReOpenFile, WRITE_DAC, WRITE_OWNER,
+        };
         // SAFETY: the live File owns this regular temporary image. ReOpenFile
         // retains that exact object rather than resolving an ambient path;
         // the new handle is transferred exactly once into File for cleanup.
@@ -1310,6 +1311,546 @@ mod windows {
             let _ = std::fs::remove_file(&temp);
         }
         result
+    }
+
+    /// Native falsification experiments, not a production publication protocol.
+    #[cfg(all(test, feature = "mcp"))]
+    mod operator_config_lease_probe {
+        use super::*;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        };
+        use windows_sys::Win32::Foundation::{
+            OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        const LEAF: &str = "inert-owned-record";
+        const OLD: &[u8] = b"{\"future\":\"keep\",\"servers\":{}}";
+        const ALL_SHARES: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+        struct Fixture {
+            // Directory handle closes before the owning root is removed.
+            directory: std::fs::File,
+            root: crate::tests::OwnedTestDirectory,
+            expected: crate::fs::CheckedMetadata,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let root = crate::tests::OwnedTestDirectory::new("mcp-operator-lease-native");
+                let directory = std::fs::OpenOptions::new()
+                    .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(root.path())
+                    .unwrap();
+                crate::fs::ensure_same_file(
+                    root.path(),
+                    &crate::fs::checked_path_metadata(root.path()).unwrap(),
+                    &crate::fs::checked_file_metadata(&directory).unwrap(),
+                )
+                .unwrap();
+                let mut file = create_private_file(&root.path().join(LEAF)).unwrap();
+                prepare_new_private_file(&file).unwrap();
+                validate_checked(&file).unwrap();
+                file.write_all(OLD).unwrap();
+                file.sync_all().unwrap();
+                let expected = crate::fs::checked_file_metadata(&file).unwrap();
+                drop(file);
+                Self {
+                    directory,
+                    root,
+                    expected,
+                }
+            }
+            fn open(&self, access: u32, sharing: u32) -> std::io::Result<std::fs::File> {
+                relative_open(&self.directory, LEAF, access, sharing)
+            }
+            fn lease(&self) -> std::io::Result<std::fs::File> {
+                self.open(GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL, 0)
+            }
+            fn validate(&self, file: &std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+                validate_checked(file)?;
+                crate::fs::ensure_same_file(
+                    Path::new(LEAF),
+                    &self.expected,
+                    &crate::fs::checked_file_metadata(file)?,
+                )?;
+                if held_bytes(file)? != bytes {
+                    return Err(std::io::Error::other("inert content conflict"));
+                }
+                Ok(())
+            }
+        }
+        fn held_bytes(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+            let mut file = file.try_clone()?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            file.take(4097).read_to_end(&mut bytes)?;
+            if bytes.len() > 4096 {
+                return Err(std::io::Error::other("inert probe bounds"));
+            }
+            Ok(bytes)
+        }
+        fn relative_open(
+            directory: &std::fs::File,
+            leaf: &str,
+            access: u32,
+            sharing: u32,
+        ) -> std::io::Result<std::fs::File> {
+            if leaf.is_empty()
+                || leaf.len() > 64
+                || matches!(leaf, "." | "..")
+                || leaf.contains(['\\', '/', ':', '\0'])
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "inert leaf invalid",
+                ));
+            }
+            let mut name: Vec<u16> = leaf.encode_utf16().collect();
+            let unicode = UNICODE_STRING {
+                Length: (name.len() * 2) as u16,
+                MaximumLength: (name.len() * 2) as u16,
+                Buffer: name.as_mut_ptr(),
+            };
+            let attrs = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: directory.as_raw_handle().cast(),
+                ObjectName: &unicode,
+                Attributes: OBJ_CASE_INSENSITIVE,
+                SecurityDescriptor: null_mut(),
+                SecurityQualityOfService: null_mut(),
+            };
+            let mut handle = null_mut();
+            let mut status = IO_STATUS_BLOCK::default();
+            // SAFETY: both retained handles and initialized leaf/buffers live through FILE_OPEN;
+            // no create/truncate disposition or ambient path is admitted by this test helper.
+            let code = unsafe {
+                NtCreateFile(
+                    &mut handle,
+                    access | SYNCHRONIZE,
+                    &attrs,
+                    &mut status,
+                    null_mut(),
+                    FILE_ATTRIBUTE_NORMAL,
+                    sharing,
+                    FILE_OPEN,
+                    FILE_NON_DIRECTORY_FILE
+                        | FILE_OPEN_REPARSE_POINT
+                        | FILE_SYNCHRONOUS_IO_NONALERT,
+                    null_mut(),
+                    0,
+                )
+            };
+            if code < 0 {
+                return Err(std::io::Error::from_raw_os_error(
+                    unsafe { RtlNtStatusToDosError(code) } as i32,
+                ));
+            }
+            Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+        }
+        fn expect_sharing_conflict(result: std::io::Result<std::fs::File>) {
+            match result {
+                Err(error) => assert_eq!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION as i32),
+                    "{error}"
+                ),
+                Ok(file) => {
+                    drop(file);
+                    panic!("native candidate rejected: conflicting data access admitted");
+                }
+            }
+        }
+        fn observe_writable_view(fixture: &Fixture) {
+            let observed = match fixture.lease() {
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+                    CandidateObservation::WritableViewExcluded
+                }
+                Ok(lease) => {
+                    fixture.validate(&lease, OLD).unwrap();
+                    drop(lease);
+                    // A retained PAGE_READWRITE/FILE_MAP_WRITE capability on
+                    // this exact object refutes universal writer exclusion.
+                    // No candidate data write is attempted in this branch.
+                    CandidateObservation::WritableViewAdmittedRejectCandidate
+                }
+            };
+            eprintln!("MCP57_1_WRITABLE_VIEW={observed:?}");
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileMappingW(
+                file: Handle,
+                attrs: *const SecurityAttributes,
+                protection: Dword,
+                high: Dword,
+                low: Dword,
+                name: *const u16,
+            ) -> Handle;
+            fn MapViewOfFile(
+                mapping: Handle,
+                access: Dword,
+                high: Dword,
+                low: Dword,
+                bytes: usize,
+            ) -> *mut c_void;
+            fn UnmapViewOfFile(view: *const c_void) -> Bool;
+        }
+        struct Mapping {
+            view: *mut c_void,
+            handle: Option<Handle>,
+        }
+        impl Mapping {
+            fn new(file: &std::fs::File, writable: bool) -> Self {
+                // SAFETY: fresh owned regular inert file; view length is four initialized bytes.
+                let handle = unsafe {
+                    CreateFileMappingW(
+                        file.as_raw_handle().cast(),
+                        null(),
+                        if writable { 4 } else { 2 },
+                        0,
+                        0,
+                        null(),
+                    )
+                };
+                assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+                let mut owned = Self {
+                    view: null_mut(),
+                    handle: Some(handle),
+                };
+                owned.view =
+                    unsafe { MapViewOfFile(handle, if writable { 2 } else { 4 }, 0, 0, 4) };
+                assert!(!owned.view.is_null(), "{}", std::io::Error::last_os_error());
+                owned
+            }
+            fn close_mapping_handle(&mut self) {
+                let handle = self.handle.take().unwrap();
+                assert_ne!(unsafe { CloseHandle(handle) }, 0);
+            }
+            fn first_four(&self) -> Vec<u8> {
+                unsafe { std::slice::from_raw_parts(self.view.cast::<u8>(), 4) }.to_vec()
+            }
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                if !self.view.is_null() {
+                    assert_ne!(unsafe { UnmapViewOfFile(self.view) }, 0);
+                }
+                if let Some(handle) = self.handle.take() {
+                    assert_ne!(unsafe { CloseHandle(handle) }, 0);
+                }
+            }
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        enum CandidateObservation {
+            ReadViewExcluded,
+            ReadViewSurvivesRejectUniversalAtomicity,
+            AliasExcluded,
+            AliasAdmittedRejectCandidate,
+            NameAdmittedRejectCandidate,
+            MetadataMutableRejectUnvalidatedCandidate,
+            WritableViewExcluded,
+            WritableViewAdmittedRejectCandidate,
+        }
+
+        #[test]
+        fn exact_relative_lease_surviving_mapping_and_data_conflicts() {
+            let fixture = Fixture::new();
+            for access in [GENERIC_READ, GENERIC_WRITE] {
+                let held = fixture.open(access, ALL_SHARES).unwrap();
+                expect_sharing_conflict(fixture.lease());
+                drop(held);
+                let lease = fixture.lease().unwrap();
+                fixture.validate(&lease, OLD).unwrap();
+                drop(lease);
+            }
+            let file = fixture
+                .open(GENERIC_READ | GENERIC_WRITE, ALL_SHARES)
+                .unwrap();
+            let mut mapping = Mapping::new(&file, true);
+            drop(file);
+            assert_eq!(mapping.first_four(), OLD[..4]);
+            observe_writable_view(&fixture);
+            mapping.close_mapping_handle();
+            observe_writable_view(&fixture);
+            drop(mapping);
+            let mut lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            // Stable owned positive only: same descriptor grows, shrinks, syncs and validates.
+            lease.seek(SeekFrom::Start(0)).unwrap();
+            let new = b"{\"future\":\"keep\",\"servers\":{\"inert\":1}}";
+            lease.write_all(new).unwrap();
+            lease.set_len(1024).unwrap();
+            lease.set_len(new.len() as u64).unwrap();
+            lease.sync_all().unwrap();
+            fixture.validate(&lease, new).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&held_bytes(&lease).unwrap()).unwrap()
+                    ["future"],
+                "keep"
+            );
+            crate::fs::ensure_same_file(
+                Path::new(LEAF),
+                &fixture.expected,
+                &crate::fs::checked_file_metadata(&lease).unwrap(),
+            )
+            .unwrap();
+            lease.seek(SeekFrom::Start(0)).unwrap();
+            lease.write_all(OLD).unwrap();
+            lease.set_len(OLD.len() as u64).unwrap();
+            lease.sync_all().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            drop(lease);
+            let file = fixture.open(GENERIC_READ, ALL_SHARES).unwrap();
+            let mapping = Mapping::new(&file, false);
+            drop(file);
+            let observed = match fixture.lease() {
+                Ok(lease) => {
+                    fixture.validate(&lease, OLD).unwrap();
+                    drop(lease);
+                    CandidateObservation::ReadViewSurvivesRejectUniversalAtomicity
+                }
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+                    CandidateObservation::ReadViewExcluded
+                }
+            };
+            assert_eq!(mapping.first_four(), OLD[..4]);
+            drop(mapping);
+            eprintln!("MCP57_1_READ_VIEW={observed:?}");
+            let lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            drop(lease);
+            std::fs::write(fixture.root.path().join(LEAF), b"inert concurrent content").unwrap();
+            let lease = fixture.lease().unwrap();
+            assert!(fixture.validate(&lease, OLD).is_err());
+            assert_eq!(held_bytes(&lease).unwrap(), b"inert concurrent content");
+        }
+
+        #[test]
+        fn namespace_alias_and_private_metadata_are_observed_before_any_candidate_write() {
+            let fixture = Fixture::new();
+            let lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            expect_sharing_conflict(fixture.open(DELETE, ALL_SHARES));
+            let mut replacement =
+                create_private_file(&fixture.root.path().join("replacement")).unwrap();
+            prepare_new_private_file(&replacement).unwrap();
+            validate_checked(&replacement).unwrap();
+            replacement.write_all(b"inert replacement").unwrap();
+            replacement.sync_all().unwrap();
+            drop(replacement);
+            let replacement = unsafe {
+                std::fs::File::from_raw_handle(
+                    open_handle(
+                        &fixture.root.path().join("replacement"),
+                        DELETE | READ_CONTROL,
+                        OPEN_EXISTING,
+                        FILE_FLAG_OPEN_REPARSE_POINT,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let attempt = crate::fs::windows_rename_open_file_relative(
+                &fixture.directory,
+                &replacement,
+                std::ffi::OsStr::new(LEAF),
+                true,
+            );
+            match attempt {
+                Ok(()) => {
+                    // The retained old object remains intact, but its name now
+                    // identifies the replacement. Classify/reject this protocol;
+                    // never write through either object to make the test green.
+                    assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                    let named = relative_open(
+                        &fixture.directory,
+                        LEAF,
+                        GENERIC_READ | READ_CONTROL,
+                        ALL_SHARES,
+                    )
+                    .unwrap();
+                    assert!(
+                        crate::fs::ensure_same_file(
+                            Path::new(LEAF),
+                            &fixture.expected,
+                            &crate::fs::checked_file_metadata(&named).unwrap()
+                        )
+                        .is_err()
+                    );
+                    eprintln!(
+                        "MCP57_1_NAME={:?}",
+                        CandidateObservation::NameAdmittedRejectCandidate
+                    );
+                    drop(named);
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32 | 33)),
+                        "unexpected replacement result: {error}"
+                    );
+                    fixture.validate(&lease, OLD).unwrap();
+                    eprintln!("MCP57_1_NAME=Excluded");
+                }
+            }
+            // The identical source handle/directory must support a native
+            // no-replace rename to a free inert name, ruling out a vacuous
+            // target rejection caused by invalid helper access or ABI.
+            crate::fs::windows_rename_open_file_relative(
+                &fixture.directory,
+                &replacement,
+                std::ffi::OsStr::new("renamed-inert"),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(fixture.root.path().join("renamed-inert")).unwrap(),
+                b"inert replacement"
+            );
+            drop(replacement);
+            drop(lease);
+            drop(fixture);
+            let fixture = Fixture::new();
+            let lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            let alias = fixture.root.path().join("alias");
+            let observation = match std::fs::hard_link(fixture.root.path().join(LEAF), &alias) {
+                Ok(()) => {
+                    assert_eq!(
+                        fixture.validate(&lease, OLD).unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                    CandidateObservation::AliasAdmittedRejectCandidate
+                }
+                Err(error) => {
+                    assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+                    CandidateObservation::AliasExcluded
+                }
+            };
+            eprintln!("MCP57_1_ALIAS={observation:?}");
+            drop(lease);
+            if alias.exists() {
+                std::fs::remove_file(alias).unwrap();
+            }
+            let lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+            let metadata = fixture
+                .open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, ALL_SHARES)
+                .unwrap();
+            let user = current_user_sid_string().unwrap();
+            let text = wide(OsStr::new(&format!(
+                "D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;WD)"
+            )));
+            let mut raw = null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        text.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut raw,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            let descriptor = SecurityDescriptor(raw);
+            assert_eq!(
+                unsafe {
+                    SetSecurityInfo(
+                        metadata.as_raw_handle().cast(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        descriptor.dacl().unwrap(),
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                validate_checked(&lease).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(held_bytes(&lease).unwrap(), OLD);
+            let observed = CandidateObservation::MetadataMutableRejectUnvalidatedCandidate;
+            eprintln!("MCP57_1_PRIVATE_METADATA={observed:?}");
+            // Restore only this deliberately changed owned inert image for cleanup.
+            apply_private_dacl(metadata.as_raw_handle().cast(), false).unwrap();
+            drop(metadata);
+            fixture.validate(&lease, OLD).unwrap();
+            drop(lease);
+            let other = Fixture::new();
+            let other_lease = other.lease().unwrap();
+            assert!(fixture.validate(&other_lease, OLD).is_err());
+            assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+        }
+
+        #[test]
+        fn reader_lease_precedes_marker_and_late_marker_refuses_admission() {
+            let fixture = Fixture::new();
+            let marker = fixture.root.path().join("inert-unresolved-marker");
+            let reader = fixture
+                .open(GENERIC_READ | READ_CONTROL, FILE_SHARE_READ)
+                .unwrap();
+            assert!(!marker.exists());
+            expect_sharing_conflict(fixture.lease());
+            drop(reader);
+            // This old observation would be unsafe if reused after a later open.
+            let marker_checked_before_open = marker.exists();
+            let writer = fixture.lease().unwrap();
+            let mut pending = create_private_file(&marker).unwrap();
+            prepare_new_private_file(&pending).unwrap();
+            validate_checked(&pending).unwrap();
+            pending.write_all(b"INERT_UNRESOLVED").unwrap();
+            pending.sync_all().unwrap();
+            drop(pending);
+            expect_sharing_conflict(fixture.open(GENERIC_READ | READ_CONTROL, FILE_SHARE_READ));
+            drop(writer);
+            let reader = fixture
+                .open(GENERIC_READ | READ_CONTROL, FILE_SHARE_READ)
+                .unwrap();
+            fixture.validate(&reader, OLD).unwrap();
+            assert!(
+                !marker_checked_before_open && marker.exists(),
+                "late marker must falsify check-before-open admission"
+            );
+            let retained_marker = relative_open(
+                &fixture.directory,
+                "inert-unresolved-marker",
+                GENERIC_READ | READ_CONTROL,
+                FILE_SHARE_READ,
+            )
+            .unwrap();
+            validate_checked(&retained_marker).unwrap();
+            assert_eq!(held_bytes(&retained_marker).unwrap(), b"INERT_UNRESOLVED");
+            // The late-reader gate returns a terminal conflict; it never parses config/defaults.
+            let admission: Result<(), &str> =
+                if held_bytes(&retained_marker).unwrap() == b"INERT_UNRESOLVED" {
+                    Err("unresolved operator transaction")
+                } else {
+                    panic!("unexpected owned marker")
+                };
+            assert_eq!(admission, Err("unresolved operator transaction"));
+            assert_eq!(held_bytes(&reader).unwrap(), OLD);
+            drop(retained_marker);
+            drop(reader);
+            std::fs::remove_file(marker).unwrap();
+            let lease = fixture.lease().unwrap();
+            fixture.validate(&lease, OLD).unwrap();
+        }
     }
 
     #[cfg(feature = "mcp")]
