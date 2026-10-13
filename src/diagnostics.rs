@@ -68,6 +68,22 @@ impl DoctorReport {
         sandbox: Option<&Sandbox>,
         scan_storage: bool,
     ) -> Self {
+        Self::capture_with_mcp_count(cli, cfg, paths, session, sandbox, scan_storage, None)
+    }
+
+    /// A live frontend can supply its retained effective MCP catalogue count.
+    /// This changes only diagnostic metadata, not the captured config authority.
+    pub(crate) fn capture_with_mcp_count(
+        cli: &Cli,
+        cfg: &Config,
+        paths: &AppPaths,
+        session: Option<&Session>,
+        sandbox: Option<&Sandbox>,
+        scan_storage: bool,
+        mcp_configured_count: Option<usize>,
+    ) -> Self {
+        #[cfg(not(feature = "mcp"))]
+        let _ = mcp_configured_count;
         let mut report = Self::default();
         report.text.push_str("mini-agent doctor\n");
         report.section("Build");
@@ -230,9 +246,8 @@ impl DoctorReport {
         #[cfg(feature = "mcp")]
         report.row(
             "MCP configured servers",
-            cfg.mcp_servers
-                .as_ref()
-                .map_or(0, |servers| servers.len())
+            mcp_configured_count
+                .unwrap_or_else(|| cfg.mcp_servers.as_ref().map_or(0, |servers| servers.len()))
                 .to_string(),
         );
         report.row("LSP compiled", cfg!(feature = "lsp").to_string());

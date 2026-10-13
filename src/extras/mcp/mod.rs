@@ -2,7 +2,9 @@ mod bounded_http;
 pub mod client;
 pub mod config;
 mod egress;
+pub(crate) mod health;
 pub mod oauth;
+pub(crate) mod project;
 pub mod tool;
 
 use std::collections::HashMap;
@@ -69,27 +71,122 @@ pub struct McpClientManager {
     /// manager. MCP calls do not own a durable mini-agent Session, so their
     /// oversized result artifacts use a process-manager scope instead.
     spill_scope: CompactString,
+    health: health::Health,
+    origins: std::collections::BTreeMap<String, Vec<project::ServerOrigin>>,
+    origins_omitted: bool,
+    /// Exact count from the last captured effective catalogue, independent of
+    /// retained live handles and bounded diagnostic origin rows.
+    configured_count: Option<usize>,
 }
 
 impl McpClientManager {
     /// Wrap already-connected handles. Handles should be sorted by server name
     /// so tool ordering and collision handling stay deterministic.
     pub fn from_handles(handles: Vec<client::McpClientHandle>) -> Self {
+        let health = health::Health::default();
+        for handle in &handles {
+            health
+                .begin(&handle.server_name, health::AttemptKind::Connection)
+                .finish(health::AttemptOutcome::Succeeded);
+        }
         Self {
             handles,
             notices: Vec::new(),
             tool_notices: Mutex::new(Vec::new()),
             spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
+            health,
+            origins: Default::default(),
+            origins_omitted: false,
+            configured_count: None,
         }
     }
 
-    fn with_notices(handles: Vec<client::McpClientHandle>, notices: Vec<CompactString>) -> Self {
-        Self {
-            handles,
-            notices,
-            tool_notices: Mutex::new(Vec::new()),
-            spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
+    pub(crate) fn health_snapshot(&self) -> health::HealthSnapshot {
+        self.health.snapshot()
+    }
+    pub(crate) fn configured_count(&self) -> Option<usize> {
+        self.configured_count
+    }
+    pub(crate) fn capture_config(&mut self, cfg: &crate::config::Config) {
+        self.configured_count = Some(cfg.mcp_servers.as_ref().map_or(0, HashMap::len));
+        self.capture_origins(&cfg.mcp_origins);
+    }
+    /// Diagnostic-only source catalogue. It is never consulted for grants,
+    /// launch identity, workspace authority or content-bound trust.
+    pub(crate) fn capture_origins(
+        &mut self,
+        origins: &HashMap<String, Vec<project::ServerOrigin>>,
+    ) {
+        self.origins.clear();
+        self.origins_omitted = false;
+        for (name, layers) in origins {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                self.origins_omitted = true;
+                continue;
+            }
+            let mut captured = Vec::new();
+            for layer in layers.iter().take(4) {
+                if layer.source.len() > 1024
+                    || layer.source.chars().any(char::is_control)
+                    || layer.inactive.as_ref().is_some_and(|reason| {
+                        reason.len() > 256 || reason.chars().any(char::is_control)
+                    })
+                    || layer.digest.as_ref().is_some_and(|digest| {
+                        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    self.origins_omitted = true;
+                    continue;
+                }
+                captured.push(layer.clone());
+            }
+            self.origins_omitted |= layers.len() > 4;
+            self.origins.insert(name.clone(), captured);
+            if self.origins.len() > 128 {
+                self.origins.pop_last();
+                self.origins_omitted = true;
+            }
         }
+    }
+    pub(crate) fn origins_snapshot(
+        &self,
+    ) -> (
+        &std::collections::BTreeMap<String, Vec<project::ServerOrigin>>,
+        bool,
+    ) {
+        (&self.origins, self.origins_omitted)
+    }
+    pub(crate) async fn connect_config_in_binding(
+        cfg: &crate::config::Config,
+        workspace: &Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        let mut manager = if let Some(servers) = &cfg.mcp_servers {
+            Self::connect_all_with_binding(
+                servers,
+                workspace.root(),
+                Some(workspace.clone()),
+                Some(&cfg.mcp_origins),
+            )
+            .await
+        } else {
+            Self::from_handles(Vec::new())
+        };
+        manager.capture_config(cfg);
+        manager
+    }
+    pub(crate) fn begin_connection_attempt(&self, name: &str) -> health::AttemptGuard {
+        self.health.begin(name, health::AttemptKind::Connection)
+    }
+
+    pub(crate) fn record_removed(&self, name: &str) {
+        self.begin_connection_attempt(name)
+            .finish(health::AttemptOutcome::Removed);
+    }
+
+    fn with_notices(handles: Vec<client::McpClientHandle>, notices: Vec<CompactString>) -> Self {
+        let mut manager = Self::from_handles(handles);
+        manager.notices = notices;
+        manager
     }
 
     pub(crate) fn push_tool_notice(&self, notice: String) {
@@ -101,6 +198,7 @@ impl McpClientManager {
             .push(CompactString::new(notice));
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect_all_in_binding(
         configs: &HashMap<String, config::McpServerConfig>,
         workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
@@ -113,12 +211,23 @@ impl McpClientManager {
                 ))],
             );
         }
-        Self::connect_all_in(configs, workspace.root()).await
+        Self::connect_all_with_binding(configs, workspace.root(), Some(workspace.clone()), None)
+            .await
     }
 
+    #[cfg(test)]
     async fn connect_all_in(
         configs: &HashMap<String, config::McpServerConfig>,
         workspace: &std::path::Path,
+    ) -> Self {
+        Self::connect_all_with_binding(configs, workspace, None, None).await
+    }
+
+    async fn connect_all_with_binding(
+        configs: &HashMap<String, config::McpServerConfig>,
+        workspace: &std::path::Path,
+        binding: Option<Arc<crate::paths::WorkspaceBinding>>,
+        origins: Option<&HashMap<String, Vec<project::ServerOrigin>>>,
     ) -> Self {
         tracing::debug!("MCP connecting to {} servers", configs.len());
         if configs.is_empty() {
@@ -135,6 +244,7 @@ impl McpClientManager {
 
         let workspace_path = workspace.to_path_buf();
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECT_CONCURRENCY));
+        let health = health::Health::default();
 
         // Build futures in sorted order so join_all returns results in the
         // same order, giving stable handle position regardless of which
@@ -144,14 +254,44 @@ impl McpClientManager {
             .map(|(name, cfg)| {
                 let sem = sem.clone();
                 let workspace = workspace_path.clone();
+                let binding = binding.clone();
+                let declared_source = origins.is_some_and(|origins| origins.contains_key(&name));
+                let origin = origins
+                    .and_then(|origins| origins.get(&name))
+                    .and_then(|layers| layers.iter().find(|origin| origin.selected))
+                    .cloned();
+                let attempt = health.begin(&name, health::AttemptKind::Connection);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let result = client::McpClientHandle::connect_in(
-                        CompactString::new(name.clone()),
-                        &cfg,
-                        &workspace,
-                    )
-                    .await;
+                    let result = if let Some(binding) = binding {
+                        client::McpClientHandle::connect_in_binding_guarded(
+                            CompactString::new(name.clone()),
+                            &cfg,
+                            &binding,
+                            &|| {
+                                (!declared_source || origin.is_some())
+                                    && project::server_source_is_current(
+                                        &binding,
+                                        &name,
+                                        Some(&cfg),
+                                        origin.as_ref(),
+                                    )
+                            },
+                        )
+                        .await
+                    } else {
+                        client::McpClientHandle::connect_in(
+                            CompactString::new(name.clone()),
+                            &cfg,
+                            &workspace,
+                        )
+                        .await
+                    };
+                    attempt.finish(if result.is_ok() {
+                        health::AttemptOutcome::Succeeded
+                    } else {
+                        health::AttemptOutcome::Failed
+                    });
                     (name, result)
                 }
             })
@@ -167,15 +307,19 @@ impl McpClientManager {
                     tracing::info!("Connected to MCP server '{}'", name);
                     handles.push(handle);
                 }
-                Err(e) => {
-                    tracing::debug!("Failed to connect to MCP server '{}': {e}", name);
+                Err(_) => {
+                    // Transport errors may contain an expanded URL or header
+                    // credential. Health retains the typed outcome separately.
+                    tracing::debug!("Failed to connect to MCP server '{}'", name);
                     notices.push(CompactString::new(format!(
-                        "MCP server '{name}' not connected: {e}"
+                        "MCP server '{name}' not connected (credential values omitted)"
                     )));
                 }
             }
         }
-        Self::with_notices(handles, notices)
+        let mut manager = Self::with_notices(handles, notices);
+        manager.health = health;
+        manager
     }
 
     /// Drain and return any pending connection and tool-collection notices.
@@ -226,9 +370,18 @@ impl McpClientManager {
                 let peer = handle.peer();
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;
+                let attempt = self
+                    .health
+                    .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let result = client::list_all_tools_bounded(&peer, timeouts.list).await;
+                    let outcome = match &result {
+                        Ok(_) => health::AttemptOutcome::Succeeded,
+                        Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,
+                        Err(_) => health::AttemptOutcome::Failed,
+                    };
+                    attempt.finish(outcome);
                     (server_name, trusted_identity, peer, result)
                 }
             })
@@ -353,23 +506,43 @@ impl McpClientManager {
     /// (Re)connect a single server, replacing any existing handle for it.
     /// Used after an interactive OAuth login so the server's tools become
     /// available without restarting the session.
+    #[cfg(test)]
     async fn reconnect_in(
         &mut self,
         name: &str,
         cfg: &config::McpServerConfig,
-        workspace: &std::path::Path,
+        workspace: &Arc<crate::paths::WorkspaceBinding>,
     ) -> anyhow::Result<()> {
         tracing::info!("MCP reconnecting server '{}'", name);
         // Connect first. A failed replacement must leave the currently usable
         // connection installed; callers can retry without restarting the app.
-        let handle =
-            client::McpClientHandle::connect_in(CompactString::new(name), cfg, workspace).await?;
+        let attempt = self.begin_connection_attempt(name);
+        let handle = match client::McpClientHandle::connect_in_binding(
+            CompactString::new(name),
+            cfg,
+            workspace,
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                attempt.finish(health::AttemptOutcome::Failed);
+                return Err(error);
+            }
+        };
+        if let Err(error) = workspace.validate() {
+            let mut stale = handle;
+            stale.running_service.close().await?;
+            attempt.finish(health::AttemptOutcome::Cancelled);
+            return Err(anyhow::Error::msg(error));
+        }
         let previous = self
             .handles
             .iter()
             .position(|existing| existing.server_name == name)
             .map(|index| self.handles.remove(index));
         self.handles.push(handle);
+        attempt.finish(health::AttemptOutcome::Succeeded);
         self.handles
             .sort_unstable_by(|left, right| left.server_name.cmp(&right.server_name));
         if let Some(mut previous) = previous {
@@ -378,6 +551,7 @@ impl McpClientManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconnect_in_binding(
         &mut self,
         name: &str,
@@ -385,7 +559,7 @@ impl McpClientManager {
         workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
     ) -> anyhow::Result<()> {
         workspace.validate().map_err(anyhow::Error::msg)?;
-        self.reconnect_in(name, cfg, workspace.root()).await
+        self.reconnect_in(name, cfg, workspace).await
     }
 
     pub async fn shutdown(self) {
@@ -499,6 +673,56 @@ mod tests {
 
     use super::*;
     use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+
+    #[test]
+    fn diagnostic_origins_are_bounded_captured_and_never_imply_connection() {
+        let origin = project::ServerOrigin {
+            source: ".mcp.json".into(),
+            selected: true,
+            inactive: None,
+            digest: Some("a".repeat(64)),
+        };
+        let mut origins: HashMap<_, _> = (0..140)
+            .map(|index| (format!("server{index:03}"), vec![origin.clone()]))
+            .collect();
+        origins.insert("bad\u{1b}".into(), vec![origin.clone()]);
+        origins.insert(
+            "bad-fields".into(),
+            vec![project::ServerOrigin {
+                source: "x".repeat(1025),
+                ..origin.clone()
+            }],
+        );
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        manager.capture_origins(&origins);
+        let (captured, omitted) = manager.origins_snapshot();
+        assert!(omitted);
+        assert_eq!(captured.len(), 128);
+        assert!(!captured.contains_key("bad\u{1b}"));
+        assert!(captured["bad-fields"].is_empty());
+        assert_eq!(captured["server000"][0].source, ".mcp.json");
+        assert!(manager.handles.is_empty() && manager.health_snapshot().servers.is_empty());
+        // A later adopted catalogue changes only diagnostic source metadata.
+        let attempt = manager.begin_connection_attempt("owned");
+        manager.capture_origins(&HashMap::from([("owned".into(), vec![origin])]));
+        assert_eq!(manager.origins_snapshot().0.len(), 1);
+        assert!(!manager.origins_snapshot().1);
+        assert_eq!(
+            manager.health_snapshot().servers["owned"]
+                .connection
+                .unwrap()
+                .outcome,
+            health::AttemptOutcome::Pending
+        );
+        attempt.finish(health::AttemptOutcome::Failed);
+        assert_eq!(
+            manager.health_snapshot().servers["owned"]
+                .connection
+                .unwrap()
+                .outcome,
+            health::AttemptOutcome::Failed
+        );
+    }
 
     /// Returns a Command config pointing at a binary that exits immediately
     /// with a non-zero code (simulates a server that refuses to connect).

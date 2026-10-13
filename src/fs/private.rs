@@ -837,6 +837,67 @@ mod windows {
         }
     }
 
+    #[cfg(feature = "mcp")]
+    pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<()> {
+        if file.metadata()?.len() != 0 {
+            return Err(super::private_file_error());
+        }
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, ReOpenFile};
+        // SAFETY: the live File owns this regular temporary image. ReOpenFile
+        // retains that exact object rather than resolving an ambient path;
+        // the new handle is transferred exactly once into File for cleanup.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle() as Handle,
+                READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let reopened = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        let information = information(handle)?;
+        if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+            != 0
+            || information._number_of_links != 1
+            || information._file_size_high != 0
+            || information._file_size_low != 0
+        {
+            return Err(super::private_file_error());
+        }
+        // Only this newly created, empty, single-link temporary image may be
+        // initialized. Elevated tokens can default its owner to Administrators;
+        // install the explicit user owner before writing any private bytes.
+        // Existing destination readers/validators still reject foreign owners.
+        let descriptor = SecurityDescriptor::private()?;
+        with_current_user_sid(|owner| {
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    owner,
+                    null_mut(),
+                    descriptor.dacl()?,
+                    null_mut(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(status as i32))
+            }
+        })?;
+        // Recheck the same object, including its explicit owner, after setup.
+        apply_private_dacl(reopened.as_raw_handle() as Handle, false)
+    }
+
     fn apply_private_dacl(handle: Handle, expect_directory: bool) -> std::io::Result<()> {
         let information = information(handle)?;
         if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -1251,6 +1312,55 @@ mod windows {
         result
     }
 
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_native_windows_new_temp_is_user_owned_private_and_nonempty_or_linked_files_are_unchanged()
+     {
+        use std::os::windows::io::AsRawHandle;
+        let root = crate::tests::OwnedTestDirectory::new("mcp-new-private-owner");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        workspace
+            .create_relative_private_atomic(Path::new("published.json"), b"{}")
+            .unwrap();
+        let published = open_checked(
+            &root.path().join("published.json"),
+            super::PrivateFileAccess::Read,
+        )
+        .unwrap();
+        ensure_current_owner(published.as_raw_handle() as Handle).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("published.json")).unwrap(),
+            b"{}"
+        );
+        drop(published);
+        let fresh = root.path().join("fresh");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&fresh)
+            .unwrap();
+        prepare_new_private_file(&file).unwrap();
+        ensure_current_owner(file.as_raw_handle() as Handle).unwrap();
+        super::validate_checked(&file).unwrap();
+        file.write_all(b"private bytes").unwrap();
+        let before = dacl_sddl(&fresh, false).unwrap();
+        assert!(prepare_new_private_file(&file).is_err());
+        assert_eq!(dacl_sddl(&fresh, false).unwrap(), before);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"private bytes");
+        drop(file);
+        let linked = root.path().join("linked");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&linked)
+            .unwrap();
+        let before = dacl_sddl(&linked, false).unwrap();
+        std::fs::hard_link(&linked, root.path().join("alias")).unwrap();
+        assert!(prepare_new_private_file(&file).is_err());
+        assert_eq!(dacl_sddl(&linked, false).unwrap(), before);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
     #[test]
     fn usd_budget_native_windows_checked_open_refuses_public_dacl_and_hardlinks_without_repair() {
         use std::os::windows::io::FromRawHandle;
@@ -1487,3 +1597,27 @@ mod checked_private_race_tests {
         }
     }
 }
+
+/// Restrict an exclusively created, still-empty owned temporary file before
+/// writing secret config bytes. This never repairs an existing destination.
+#[cfg(all(feature = "mcp", unix))]
+pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+    {
+        return Err(private_file_error());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(all(feature = "mcp", not(any(unix, windows))))]
+pub(crate) fn prepare_new_private_file(_: &std::fs::File) -> std::io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(all(feature = "mcp", windows))]
+pub(crate) use windows::prepare_new_private_file;

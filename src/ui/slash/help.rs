@@ -142,7 +142,18 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  /toggle todo [on|off]  toggle todo-list tools");
     #[cfg(feature = "mcp")]
     {
-        emit(false, "  /mcp                   list MCP servers and tools");
+        emit(
+            false,
+            "  /mcp                   show origins, retained peers and observed attempts",
+        );
+        emit(
+            false,
+            "  /mcp add <name> <command|url> [args...] [--project] [--allow-local]",
+        );
+        emit(
+            false,
+            "  /mcp remove <name> [--project]   remove the selected owning definition",
+        );
         emit(
             false,
             "  /mcp <server>          list tools of an MCP server",
@@ -425,6 +436,15 @@ mod tests {
         names
     }
 
+    #[test]
+    fn mcp_live_admin_help_matches_compiled_feature() {
+        let mut lines = Vec::new();
+        help_lines(&mut |_, line| lines.push(line.to_owned()));
+        let text = lines.join("\n");
+        for command in ["/mcp add <name>", "/mcp remove <name>", "--allow-local"] {
+            assert_eq!(text.contains(command), cfg!(feature = "mcp"), "{command}");
+        }
+    }
     #[test]
     fn every_command_in_help_is_offered_by_the_slash_picker() {
         let offered = available_commands();

@@ -5117,6 +5117,7 @@ mod protocol_tests {
             mcp_servers: Some(HashMap::from([(
                 "editor-tools".to_string(),
                 McpServerConfig::Url {
+                    allow_local: false,
                     url: "https://configured.example/mcp".to_string(),
                     headers: HashMap::new(),
                     oauth: None,

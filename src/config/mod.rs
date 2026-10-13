@@ -58,6 +58,10 @@ pub struct ConfigProvenance {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Runtime-only MCP source records; never configuration or launch trust.
+    #[cfg(feature = "mcp")]
+    #[serde(skip)]
+    pub(crate) mcp_origins: HashMap<String, Vec<crate::extras::mcp::project::ServerOrigin>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]

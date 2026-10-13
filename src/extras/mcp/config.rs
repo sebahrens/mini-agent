@@ -78,6 +78,9 @@ pub enum McpServerConfig {
     },
     Url {
         url: String,
+        /// Explicitly permit only pinned loopback endpoints, never private LANs.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_local: bool,
         #[serde(default)]
         headers: HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,4 +174,8 @@ impl OAuthSettings {
     pub fn redirect_uri(&self) -> String {
         format!("http://127.0.0.1:{}/callback", self.redirect_port())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }

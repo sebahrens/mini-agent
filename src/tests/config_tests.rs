@@ -753,6 +753,7 @@ fn local_override_merges_mcp_servers() {
     servers.insert(
         "global-srv".to_string(),
         McpServerConfig::Url {
+            allow_local: false,
             url: "https://global.example.com/mcp".to_string(),
             headers: HashMap::new(),
             oauth: None,

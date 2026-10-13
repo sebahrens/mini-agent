@@ -433,7 +433,7 @@ pub(crate) async fn connect_headless_mcp(
         return None;
     }
     let mut manager =
-        crate::extras::mcp::McpClientManager::connect_all_in_binding(servers, workspace).await;
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(cfg, workspace).await;
     if !crate::agent::runner::current_work_scope_is_cancelled() {
         report_headless_mcp_notices(Some(&mut manager), |notice| eprintln!("{notice}"));
     }

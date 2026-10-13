@@ -261,10 +261,14 @@ accessible via `/memory read` and `memory_search`.
 
 | Command | Description |
 | ------- | ----------- |
-| `/mcp` | List connected MCP servers and their tool counts. |
+| `/mcp` | Show configured origins, inactive definitions, retained peers and observed connection/catalogue attempts; no probe. |
+| `/mcp add <name> <command|url> [args…] [--project] [--allow-local]` | Save a named definition and reconnect. Project JSON requires explicit whole-file trust review. Arguments are literal, not shell expressions. |
+| `/mcp remove <name> [--project]` | Remove the selected owning definition and close its retained peer. |
 | `/mcp <server>` | List tools of a specific MCP server. |
 | `/mcp login <server>` | Run the OAuth 2.0 login flow for a URL server, then reconnect it. |
 | `/mcp logout <server>` | Remove a server's stored OAuth token. |
+
+See [MCP configuration and live operations](MCP_CONFIGURATION.md) for source precedence, reviewed project trust, literal quoting and explicit loopback policy.
 
 ## Advisor (feature-gated)
 

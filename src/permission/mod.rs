@@ -1020,7 +1020,7 @@ mod execution_authority_tests {
                     );
                     assert_eq!(authority.sandbox, sandbox, "{}", case.name);
 
-                    let (interactive, interactive_ask, interactive_receiver) =
+                    let (interactive, interactive_ask, mut interactive_receiver) =
                         build_interactive_permission_at(&case.cfg, authority, None).unwrap();
                     assert_eq!(
                         interactive.is_some(),
@@ -1030,14 +1030,14 @@ mod execution_authority_tests {
                     );
                     assert_eq!(
                         interactive_ask.is_some(),
-                        case.permission_checks_enabled,
-                        "{} interactive approval sender",
+                        case.tools_enabled,
+                        "{} interactive user-request sender",
                         case.name
                     );
                     assert_eq!(
                         interactive_receiver.is_some(),
-                        case.permission_checks_enabled,
-                        "{} interactive approval receiver",
+                        case.tools_enabled,
+                        "{} interactive user-request receiver",
                         case.name
                     );
 
@@ -1054,6 +1054,28 @@ mod execution_authority_tests {
                         "{} noninteractive Ask",
                         case.name
                     );
+                    // Shared clarification transport is not evidence of permission checks.
+                    // Compare actual policy outcomes; neither frontend may fabricate an Ask
+                    // merely because a Question sender exists in dangerous-bypass mode.
+                    if let (Some(interactive), Some(noninteractive)) =
+                        (&interactive, &noninteractive)
+                    {
+                        for script in ["pwd", "rm -rf /", "__mini_agent_unmatched_command__"] {
+                            assert_eq!(
+                                interactive.lock().unwrap().check("shell", script),
+                                noninteractive.lock().unwrap().check("shell", script),
+                                "{} actual shell policy for {script}",
+                                case.name,
+                            );
+                        }
+                    }
+                    if let Some(receiver) = &mut interactive_receiver {
+                        assert!(
+                            receiver.try_recv().is_err(),
+                            "{} policy construction/queries must not mint approval requests",
+                            case.name
+                        );
+                    }
                 }
                 Err(message) => assert_eq!(
                     result.expect_err(case.name).to_string(),

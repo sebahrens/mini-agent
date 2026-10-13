@@ -20,6 +20,8 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod git_metadata;
+#[cfg(any(windows, test))]
+mod profile_journal;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 
@@ -5504,13 +5506,47 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn appcontainer_storage_path").next())
             .expect("AppContainer profile creation missing");
-        let journal_sync = profile_creation
-            .find("sync_all()")
-            .expect("journal durability sync missing");
-        let journal_publish = profile_creation
+        let intent_publish = profile_creation
+            .find("create_profile_intent(")
+            .expect("durable intent creation missing");
+        let profile_effect = profile_creation
+            .find("CreateAppContainerProfile(")
+            .expect("profile creation effect missing");
+        assert!(intent_publish < profile_effect);
+        let full_publish = profile_creation
+            .find("publish_profile_record(\n            &journal_root,\n            RecordKind::Journal,")
+            .expect("complete cleanup journal publication missing");
+        let journal_install = profile_creation
             .find("profile.journal_path =")
-            .expect("journal publication missing");
-        assert!(journal_sync < journal_publish);
+            .expect("journal lease installation missing");
+        assert!(full_publish < journal_install);
+        let publication = source
+            .split("fn publish_profile_record(")
+            .nth(1)
+            .and_then(|source| source.split("fn attest_private_control_file(").next())
+            .expect("control record publication implementation missing");
+        let bounds = publication
+            .find("validate_payload(payload)")
+            .expect("precreation payload bound missing");
+        assert!(publication.contains("private_control_file_security()?"));
+        assert!(publication.contains("&attributes,"));
+        let create = publication
+            .find("CreateFileW(")
+            .expect("staging object creation missing");
+        let write = publication
+            .find(".write_all(payload)")
+            .expect("staged record write missing");
+        let sync = publication
+            .find("lease.sync_all()")
+            .expect("staged record durability missing");
+        let rename = publication
+            .find("windows_rename_open_file_relative(")
+            .expect("retained handle publication missing");
+        assert!(bounds < create && create < write && write < sync && sync < rename);
+        assert!(publication.contains("OsStr::new(&final_leaf),\n            false,"));
+        assert!(publication.contains(
+            "GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL,\n            0,"
+        ));
 
         let stale_sweep = source
             .split("fn sweep_stale_profiles_until_locked(")
@@ -5663,7 +5699,7 @@ mod sandbox_tests {
         let journal_root = source
             .split("fn profile_journal_root(")
             .nth(1)
-            .and_then(|source| source.split("fn create_profile_journal").next())
+            .and_then(|source| source.split("fn publish_profile_record").next())
             .expect("profile journal root implementation missing");
         assert!(journal_root.contains("private_control_root_candidate(cache)?"));
         assert!(source.contains("struct ProfileJournalRootAuthority("));

@@ -408,6 +408,35 @@ refusing a new launch solely because more recovery work remains. Uncertain Job s
 non-timeout revoke/delete failure retains the journal, and malformed or aliased cleanup state fails
 closed.
 
+Intent and full cleanup records publish through a private staging leaf: the bounded, nonempty
+payload (at most 64 KiB) is written and synced before a create-only native rename relative to the
+retained control-directory handle. The staging file is created with an explicit current-user owner and protected single owner-only
+ACE, including under elevated tokens; there is no post-creation ACL/ownership repair window.
+The same exclusive file handle, with no sharing, remains the
+cleanup lease across publication. Profile creation follows published intent; returning the full
+profile for ACL grants follows published SID/root/Job journal. A killed publisher therefore leaves
+either complete final authority or a non-authority staging object, never a partial final record.
+The existing atomic writer shares only the native single rename attempt; its replacement,
+sharing-violation retry, cancellation and probe policy remain separate.
+
+`src/sandbox/profile_journal.rs` owns the pure payload limit and exact staging namespace:
+`<32 lowercase hexadecimal digits>.{intent|json}.staged-v1`. Recovery retains its original control
+mutex, private retained root, deadline and 64-entry bound. Only that exact namespace may be
+reclaimed without parsing bytes, and only after an exclusive lease confirms a current-user-owned,
+owner-only regular non-reparse file with one link and at most 64 KiB. Live leases remain untouched;
+invalid names, aliases, DACLs and bounds fail closed. Final JSON/intent parsing and SID/root/Job
+recovery stay strict; malformed final authority is never ignored or deleted to restore service.
+Sync-before-rename establishes complete records across publisher process death; this is not a new
+claim of arbitrary filesystem or power-loss durability.
+
+The native publication regression terminates an actual profile-creation child at stage creation,
+after sync, and after publication for both record kinds, then exercises bounded recovery and exact
+profile storage cleanup. `MINI_AGENT_TEST_PROFILE_PUBLICATION` selects these phases only in the
+libtest image; production cannot consume the fixture control. Hosted Windows discovery requires
+this matrix, live-lease/bounds, malformed-authority/private-stage and no-replacement regressions;
+three repeated cargo-installed runtime probes remain the production acceptance gate. Portable
+name/payload tests and cross-compilation alone do not establish native recovery behavior.
+
 | Capability | Enforced Windows policy |
 |------------|-------------------------|
 | Filesystem reads | The sandbox adds access only for the canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`; ambient `PATH`, home, Cargo, and Rustup roots are not inferred. Standard Windows system resources and any pre-existing host object readable to `ALL APPLICATION PACKAGES` remain readable, so read confidentiality is not claimed. |

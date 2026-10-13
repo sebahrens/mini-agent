@@ -1509,9 +1509,9 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        ".spawn()",
-        7,
-        "TC-INTERNAL-VERIFICATION",
+        "let mut command = Command::new(std::env::current_exe().expect(\"test image\"));",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/sandbox/windows.rs",
@@ -1634,6 +1634,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Exact async-only MCP HTTP fixture and HTTP response status tuple.
+    (
+        "src/ui/mcp_admin_app_tests.rs",
+        "clients.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/mcp_admin_app_tests.rs",
+        "let (status, body) = if redirect.is_some() { (\"307 Temporary Redirect\", String::new()) }",
+        1,
+        "NON-PROCESS",
+    ),
     // Pressure continuation assertion inspects SDK ToolResult output text.
     (
         "src/ui/app.rs",
@@ -2869,6 +2882,13 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
+        "src/ui/mcp_admin_app_tests.rs",
+        &[(
+            "dd69c6b89052734579579921e28102c3dac9c938b6f28a5806d62b767428e1d8",
+            1,
+        )],
+    ),
+    (
         "src/spend/request_tests.rs",
         &[
             (
@@ -4011,6 +4031,20 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/windows.rs",
+        ".spawn()",
+        &[
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TEST-ONLY",
+        ],
+    ),
+    (
+        "src/sandbox/windows.rs",
         ".output()",
         &[
             "TC-INTERNAL-VERIFICATION",
@@ -4672,9 +4706,9 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        ".spawn()",
-        7,
-        "TC-INTERNAL-VERIFICATION",
+        "let mut command = Command::new(std::env::current_exe().expect(\"test image\"));",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/sandbox/windows.rs",
@@ -4739,6 +4773,20 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox/windows.rs",
+        ".spawn()",
+        &[
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TEST-ONLY",
+        ],
+    ),
     (
         "src/sandbox/windows.rs",
         ".output()",

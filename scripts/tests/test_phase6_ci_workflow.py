@@ -190,6 +190,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("$suite = 'sandbox::windows::tests::'", native_step)
         self.assertIn("general_preflight_cache_retains_success_and_failure_without_reprobing", native_step)
         self.assertIn("next_process_recovers_a_preserved_profile_job_acls_and_root", native_step)
+        for regression in (
+            "profile_record_publication_process_death_never_exposes_partial_final_authority",
+            "profile_record_publication_preserves_live_lease_and_rejects_oversized_payload",
+            "profile_record_publication_corrupt_final_and_invalid_staging_remain_fail_closed",
+            "profile_record_publication_create_only_rename_cannot_replace_authority",
+        ):
+            self.assertIn(regression, native_step)
         self.assertIn("timed_out_general_preflight_reaps_tree_and_removes_recovery_state", native_step)
         self.assertIn("-- --list", native_step)
         self.assertIn(".Count -ne 1", native_step)
@@ -1255,6 +1262,67 @@ class WindowsBoundedProjectTrustCiTests(unittest.TestCase):
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
+
+
+class WindowsMcpPrivateTemporaryCiTests(unittest.TestCase):
+    """The new retained-handle owner initialization requires a native Windows proof."""
+
+    @staticmethod
+    def validate(workflow: str) -> str:
+        job = job_body(workflow, "platform-paths")
+        name = "Test native Windows MCP private temporary ownership"
+        if job.count("- name: " + name) != 1:
+            raise AssertionError("one owning native MCP private temporary step is required")
+        step = job.split("- name: " + name, 1)[1].split("- name:", 1)[0]
+        required = [
+            "if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'",
+            "shell: pwsh",
+            "$test = 'fs::private::windows::mcp_native_windows_new_temp_is_user_owned_private_and_nonempty_or_linked_files_are_unchanged'",
+            "$discovered = @(cargo test --locked --bin mini-agent $test -- --exact --list 2>&1)",
+            '$_ -ceq "${test}: test"',
+            "$actual.Count -ne 1",
+            "$native = @(cargo test --locked --bin mini-agent $test -- --exact --nocapture --test-threads=1 2>&1)",
+            "$nativeExit = $LASTEXITCODE",
+            "$native | Write-Output",
+            "if ($LASTEXITCODE -ne 0) { throw 'Windows MCP private temporary discovery failed' }",
+            "if ($nativeExit -ne 0) { throw 'Native Windows MCP private temporary proof failed' }",
+            "if (-not ($native -match '^test result: ok\\. 1 passed; 0 failed; 0 ignored;'))",
+            "throw 'Native Windows MCP private temporary proof did not execute exactly one passing test'",
+        ]
+        for fragment in required:
+            if fragment not in step:
+                raise AssertionError("missing native MCP ownership guard: " + fragment)
+        if step.count("cargo test ") != 2 or step.count("throw ") != 4:
+            raise AssertionError("exact discovery and real execution must both fail closed")
+        if any(fragment in step for fragment in ("--ignored", "--no-run", "continue-on-error", "cargo build")):
+            raise AssertionError("native ownership execution cannot be replaced or waived")
+        return step
+
+    def test_existing_windows_default_job_executes_exact_new_private_owner_control(self) -> None:
+        self.validate(WORKFLOW.read_text())
+
+    def test_missing_or_weakened_native_owner_step_is_rejected(self) -> None:
+        original = WORKFLOW.read_text()
+        name = "Test native Windows MCP private temporary ownership"
+        prefix, suffix = original.split("- name: " + name, 1)
+        step, rest = suffix.split("- name:", 1)
+        for before, after in [
+            ("if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "if: matrix.os == 'windows-latest'"),
+            ("$actual.Count -ne 1", "$actual.Count -lt 0"),
+            ('$_ -ceq "${test}: test"', '$_ -match "test"'),
+            ("--exact --list", "--list"),
+            ("--exact --nocapture", "--nocapture"),
+            ("$nativeExit = $LASTEXITCODE", "$nativeExit = 0"),
+            ("if ($nativeExit -ne 0)", "if ($nativeExit -lt 0)"),
+            ("if ($LASTEXITCODE -ne 0)", "if ($LASTEXITCODE -lt 0)"),
+            ("1 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 1 ignored;"),
+            ("--nocapture --test-threads=1", "--ignored --nocapture --test-threads=1"),
+            ("throw 'Native Windows MCP private temporary proof failed'", "Write-Host 'Native Windows MCP private temporary proof failed'"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
+        with self.assertRaises(AssertionError):
+            self.validate(original.replace(name, "Removed native ownership proof"))
 
 
 if __name__ == "__main__":

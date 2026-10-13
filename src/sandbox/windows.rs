@@ -8,6 +8,9 @@
 //! The request never appears in a command line, environment variable, or temporary file. The
 //! AppContainer receives no capabilities: in particular, network access is denied by default.
 
+use super::profile_journal::{
+    MAX_CONTROL_RECORD_BYTES, RecordKind, is_staging_leaf, validate_payload,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, c_void};
@@ -47,18 +50,19 @@ use windows_sys::Win32::Security::{
     DuplicateTokenEx, EqualSid, FreeSid, GENERIC_MAPPING, GetTokenInformation,
     ImpersonateLoggedOnUser, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-    RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
-    SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenImpersonation, TokenIsAppContainer, TokenUser,
+    RevertToSelf, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenImpersonation,
+    TokenIsAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetDriveTypeW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
-    WRITE_OWNER,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, GetDriveTypeW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
@@ -3324,24 +3328,12 @@ fn create_appcontainer_profile(
         };
         let payload = serde_json::to_vec(&journal)
             .map_err(|error| format!("sandbox: encode AppContainer cleanup journal: {error}"))?;
-        let (journal_path, mut lease) = create_profile_journal(&journal_root, "json")?;
-        let durable = lease
-            .write_all(&payload)
-            .map_err(|error| format!("sandbox: write AppContainer cleanup journal: {error}"))
-            .and_then(|_| {
-                lease
-                    .sync_all()
-                    .map_err(|error| format!("sandbox: sync AppContainer cleanup journal: {error}"))
-            });
-        if let Err(error) = durable {
-            drop(lease);
-            let _ = journal_root.remove_file(
-                &journal_path,
-                "remove incomplete AppContainer cleanup journal",
-            );
-            return Err(error);
-        }
-        Ok((journal_path, lease))
+        publish_profile_record(
+            &journal_root,
+            RecordKind::Journal,
+            &payload,
+            &profile_control,
+        )
     })();
     match setup {
         Ok((journal_path, lease)) => {
@@ -3386,15 +3378,7 @@ fn create_profile_intent(
         profile_name: profile_name.to_string(),
     })
     .map_err(|error| format!("sandbox: encode AppContainer profile intent: {error}"))?;
-    let (path, mut lease) = create_profile_journal(journal_root, PROFILE_INTENT_EXTENSION)?;
-    if let Err(error) = lease.write_all(&payload).and_then(|()| lease.sync_all()) {
-        drop(lease);
-        let _ = journal_root.remove_file(&path, "remove incomplete AppContainer profile intent");
-        return Err(format!(
-            "sandbox: persist AppContainer profile intent: {error}"
-        ));
-    }
-    Ok((path, lease))
+    publish_profile_record(journal_root, RecordKind::Intent, &payload, _profile_control)
 }
 
 fn remove_profile_intent(
@@ -3506,7 +3490,12 @@ fn protect_and_attest_control_root(root: &Path) -> Result<File, String> {
     let directory = open_stable_path(
         root,
         true,
-        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        READ_CONTROL
+            | WRITE_DAC
+            | WRITE_OWNER
+            | FILE_LIST_DIRECTORY
+            | FILE_TRAVERSE
+            | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let user = current_user_sid_buffer()?;
@@ -3605,31 +3594,129 @@ fn attest_control_root_dacl(directory: &File, user_sid: PSID) -> Result<(), Stri
     Ok(())
 }
 
-fn create_profile_journal(
+fn private_control_file_security() -> Result<OwnerOnlyKernelSecurity, String> {
+    // Explicit owner at creation is required even for elevated tokens whose default owner
+    // is Administrators. Protect the single current-user ACE from inherited duplicate ACEs.
+    let mut security = OwnerOnlyKernelSecurity::new(FILE_ALL_ACCESS, "control-file")?;
+    if unsafe {
+        SetSecurityDescriptorControl(
+            (&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED,
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "protect AppContainer control-file security descriptor",
+        ));
+    }
+    Ok(security)
+}
+
+fn publish_profile_record(
     journal_root: &ProfileJournalRootAuthority,
-    extension: &str,
+    kind: RecordKind,
+    payload: &[u8],
+    _profile_control: &ProfileControlGuard,
 ) -> Result<(PathBuf, File), String> {
-    journal_root.revalidate()?;
-    let path = journal_root
-        .path()
-        .join(format!("{}.{}", uuid::Uuid::new_v4().simple(), extension));
-    journal_root.validate_child(&path)?;
-    let wide = wide_null(path.as_os_str())?;
+    validate_payload(payload).map_err(str::to_string)?;
+    let (staging_leaf, final_leaf) = kind.leaves(uuid::Uuid::new_v4());
+    let staging = journal_root.path().join(staging_leaf);
+    let final_path = journal_root.path().join(&final_leaf);
+    journal_root.validate_child(&staging)?;
+    journal_root.validate_child(&final_path)?;
+    let wide = wide_null(staging.as_os_str())?;
+    let mut security = private_control_file_security()?;
+    let attributes = security.attributes();
     let raw = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | FILE_GENERIC_WRITE,
+            GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL,
             0,
-            null(),
+            &attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
         )
     };
-    let handle = Handle::created(raw, "create exclusive AppContainer cleanup journal")?;
-    Ok((path, unsafe {
-        File::from_raw_handle(handle.0.into_raw_handle())
-    }))
+    let handle = Handle::created(raw, "create exclusive AppContainer control staging file")?;
+    let mut lease = unsafe { File::from_raw_handle(handle.0.into_raw_handle()) };
+    let publication = (|| {
+        attest_private_control_file(&lease)?;
+        profile_record_publication_probe(kind, "created", journal_root.path());
+        lease
+            .write_all(payload)
+            .and_then(|()| lease.sync_all())
+            .map_err(|error| {
+                format!("sandbox: persist staged AppContainer control record: {error}")
+            })?;
+        profile_record_publication_probe(kind, "synced", journal_root.path());
+        journal_root.revalidate()?;
+        // Retain the same ShareMode=0 handle across native create-only publication. There is no
+        // final name while bytes are partial, and no close/reopen window in the cleanup lease.
+        crate::fs::windows_rename_open_file_relative(
+            &journal_root.0._directory,
+            &lease,
+            OsStr::new(&final_leaf),
+            false,
+        )
+        .map_err(|error| format!("sandbox: publish AppContainer control record: {error}"))?;
+        profile_record_publication_probe(kind, "published", journal_root.path());
+        Ok(())
+    })();
+    if let Err(error) = publication {
+        drop(lease);
+        // Only the staging name is removable here. A successful publication is authority even
+        // if a later operation fails; never erase the final record on an uncertain outcome.
+        let _ = journal_root.remove_file(
+            &staging,
+            "remove unpublished AppContainer control staging file",
+        );
+        return Err(error);
+    }
+    Ok((final_path, lease))
+}
+
+fn attest_private_control_file(file: &File) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("sandbox: inspect staged AppContainer control record: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > MAX_CONTROL_RECORD_BYTES as u64
+        || crate::fs::windows_file_link_count(file)
+            .map_err(|error| format!("sandbox: inspect control-record links: {error}"))?
+            != 1
+    {
+        return Err("sandbox: invalid staged AppContainer control record object".into());
+    }
+    // Creation installs a protected current-user-only ACE and owner. Reuse the root's exact
+    // authority attestation, without repairing ACLs or accepting unrelated private DACLs.
+    let user = current_user_sid_buffer()?;
+    attest_control_root_dacl(file, token_user_sid(&user))
+}
+
+#[cfg(not(test))]
+fn profile_record_publication_probe(_kind: RecordKind, _point: &str, _root: &Path) {}
+
+#[cfg(test)]
+fn profile_record_publication_probe(kind: RecordKind, point: &str, root: &Path) {
+    if let Some((expected_kind, expected_point, ready)) =
+        PROFILE_PUBLICATION_PROBE.with(|slot| slot.borrow().clone())
+        && kind == expected_kind
+        && point == expected_point
+    {
+        std::fs::write(ready, root.as_os_str().to_string_lossy().as_bytes())
+            .expect("publish crash-stage readiness");
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROFILE_PUBLICATION_PROBE: std::cell::RefCell<Option<(RecordKind, String, PathBuf)>> = const { std::cell::RefCell::new(None) };
 }
 
 fn open_stale_profile_journal(
@@ -3641,7 +3728,7 @@ fn open_stale_profile_journal(
     let raw = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | FILE_READ_ATTRIBUTES,
+            GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
             0,
             null(),
             OPEN_EXISTING,
@@ -3691,10 +3778,19 @@ fn sweep_stale_profiles_until_locked(
     entries.sort();
     let mut journals = Vec::new();
     let mut intents = Vec::new();
+    let mut stages = Vec::new();
     for path in entries {
         match path.extension().and_then(OsStr::to_str) {
             Some("json") => journals.push(path),
             Some(PROFILE_INTENT_EXTENSION) => intents.push(path),
+            Some("staged-v1")
+                if path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(is_staging_leaf) =>
+            {
+                stages.push(path)
+            }
             _ => {
                 return Err(
                     "sandbox: unexpected entry in AppContainer cleanup journal root".into(),
@@ -3726,6 +3822,19 @@ fn sweep_stale_profiles_until_locked(
             return Err(error);
         }
     }
+    // No profile creation or ACL grant occurs before the corresponding final publication.
+    // Exact staging leaves are therefore non-authority, including empty or partially written
+    // bytes left by a killed owner. Never extend this rule to final JSON/intent records.
+    for path in stages {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(lease) = open_stale_profile_journal(journal_root, &path)? {
+            attest_private_control_file(&lease)?;
+            drop(lease);
+            journal_root.remove_file(&path, "remove stale AppContainer control staging file")?;
+        }
+    }
     Ok(())
 }
 
@@ -3744,7 +3853,7 @@ fn read_stale_control_file(
         || crate::fs::windows_file_link_count(&lease)
             .map_err(|error| format!("sandbox: inspect cleanup-journal links: {error}"))?
             != 1
-        || metadata.len() > 64 * 1024
+        || metadata.len() > MAX_CONTROL_RECORD_BYTES as u64
     {
         return Err("sandbox: invalid AppContainer cleanup journal object".into());
     }
@@ -6032,6 +6141,389 @@ mod tests {
         drop(restored);
         drop(authority);
         std::fs::remove_dir_all(base).expect("remove DACL-test tree");
+    }
+
+    struct PublicationFixture {
+        base: PathBuf,
+        root: Option<ProfileJournalRootAuthority>,
+    }
+
+    impl PublicationFixture {
+        fn new() -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "mini-agent-publication-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let cache = base.join("cache");
+            std::fs::create_dir_all(&cache).expect("create publication cache");
+            let root = profile_journal_root(&cache, &[], &[]).expect("bind publication root");
+            Self {
+                base,
+                root: Some(root),
+            }
+        }
+
+        fn root(&self) -> &ProfileJournalRootAuthority {
+            self.root.as_ref().unwrap()
+        }
+    }
+
+    impl Drop for PublicationFixture {
+        fn drop(&mut self) {
+            if let Some(root) = self.root.take() {
+                let recovered =
+                    sweep_stale_profiles_until(&root, Instant::now() + Duration::from_secs(5));
+                drop(root);
+                if recovered.is_err() {
+                    return;
+                } // Preserve uncertain profile authority on test failure.
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn write_private_staging_fixture(
+        root: &ProfileJournalRootAuthority,
+        path: &Path,
+        bytes: &[u8],
+    ) {
+        root.validate_child(path).unwrap();
+        let mut security = private_control_file_security().unwrap();
+        let attributes = security.attributes();
+        let wide = wide_null(path.as_os_str()).unwrap();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let handle = Handle::created(raw, "create private test staging file").unwrap();
+        let mut file = unsafe { File::from_raw_handle(handle.0.into_raw_handle()) };
+        attest_private_control_file(&file).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    struct PublicationChild(Child);
+    impl Drop for PublicationChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn profile_record_publication_crash_child() {
+        let Ok(encoded) = std::env::var("MINI_AGENT_TEST_PROFILE_PUBLICATION") else {
+            return;
+        };
+        let (base, extension, point): (PathBuf, String, String) =
+            serde_json::from_str(&encoded).expect("decode private crash fixture");
+        let kind = match extension.as_str() {
+            "intent" => RecordKind::Intent,
+            "json" => RecordKind::Journal,
+            _ => panic!("invalid fixture kind"),
+        };
+        let ready = base.join("ready");
+        PROFILE_PUBLICATION_PROBE.with(|slot| *slot.borrow_mut() = Some((kind, point, ready)));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create crash workspace");
+        let _profile = create_appcontainer_profile(
+            &base.join("cache"),
+            &[workspace],
+            &[],
+            &format!("{JOB_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+        )
+        .expect("create real profile through publication stages");
+        panic!("crash-stage probe was not reached");
+    }
+
+    #[test]
+    fn profile_record_publication_process_death_never_exposes_partial_final_authority() {
+        for kind in [RecordKind::Intent, RecordKind::Journal] {
+            for point in ["created", "synced", "published"] {
+                let fixture = PublicationFixture::new();
+                let encoded =
+                    serde_json::to_string(&(fixture.base.clone(), kind.extension(), point))
+                        .unwrap();
+                let mut command = Command::new(std::env::current_exe().expect("test image"));
+                command
+                    .args([
+                        "--exact",
+                        "sandbox::windows::tests::profile_record_publication_crash_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("MINI_AGENT_TEST_PROFILE_PUBLICATION", encoded)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = PublicationChild(
+                    command
+                        .spawn_guarded()
+                        .expect("start actual crash-stage child"),
+                );
+                let ready = fixture.base.join("ready");
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "stage {kind:?}/{point} did not become ready"
+                    );
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "crash child exited before stage"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let mut storage = None;
+                let entries: Vec<_> = std::fs::read_dir(fixture.root().path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                assert_eq!(
+                    entries.len(),
+                    if kind == RecordKind::Journal { 2 } else { 1 }
+                );
+                let publication = entries
+                    .iter()
+                    .find(|path| {
+                        let name = path.file_name().unwrap().to_str().unwrap();
+                        name.ends_with(&format!(".{}", kind.extension()))
+                            || name.ends_with(&format!(".{}.staged-v1", kind.extension()))
+                    })
+                    .expect("exact current publication object");
+                assert_eq!(
+                    is_staging_leaf(publication.file_name().unwrap().to_str().unwrap()),
+                    point != "published"
+                );
+                assert!(
+                    open_stale_profile_journal(fixture.root(), publication)
+                        .unwrap()
+                        .is_none(),
+                    "live publication must retain its exclusive lease"
+                );
+                // Killing the OS process (not unwinding a Result/Drop) releases both the file
+                // lease and abandoned control mutex. The actual profile exists only in json stages.
+                child
+                    .0
+                    .kill()
+                    .expect("terminate at exact publication stage");
+                child.0.wait().expect("reap publication owner");
+                for path in &entries {
+                    if path.extension().and_then(OsStr::to_str) == Some(PROFILE_INTENT_EXTENSION) {
+                        let bytes = std::fs::read(path).unwrap();
+                        let intent: ProfileIntent =
+                            serde_json::from_slice(&bytes).expect("complete durable intent");
+                        if kind == RecordKind::Journal {
+                            let mut sid = null_mut();
+                            assert!(
+                                unsafe {
+                                    DeriveAppContainerSidFromAppContainerName(
+                                        wide_string(&intent.profile_name).as_ptr(),
+                                        &mut sid,
+                                    )
+                                } >= 0
+                            );
+                            storage =
+                                Some(appcontainer_storage_path(&sid_text(sid).unwrap()).unwrap());
+                            unsafe {
+                                FreeSid(sid);
+                            }
+                        }
+                    }
+                    if !is_staging_leaf(path.file_name().unwrap().to_str().unwrap()) {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(path).unwrap())
+                                .expect("final authority must always be complete JSON");
+                        assert_eq!(value["version"], 1);
+                    }
+                }
+                if let Some(storage) = &storage {
+                    assert!(
+                        storage.exists(),
+                        "real crash-stale profile must exist before recovery"
+                    );
+                }
+                sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                    .expect("bounded real crash recovery");
+                assert_eq!(std::fs::read_dir(fixture.root().path()).unwrap().count(), 0);
+                if let Some(storage) = storage {
+                    assert!(
+                        !storage.exists(),
+                        "intent/full recovery must remove exact private profile storage"
+                    );
+                }
+                assert!(!fixture.base.join("workspace/effect.txt").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn profile_record_publication_preserves_live_lease_and_rejects_oversized_payload() {
+        let fixture = PublicationFixture::new();
+        let control =
+            ProfileControlGuard::acquire_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        let oversized = vec![b'x'; MAX_CONTROL_RECORD_BYTES + 1];
+        assert!(
+            publish_profile_record(fixture.root(), RecordKind::Intent, &oversized, &control)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(fixture.root().path()).unwrap().count(), 0);
+        let payload = serde_json::to_vec(&ProfileIntent {
+            version: PROFILE_INTENT_VERSION,
+            profile_name: format!(
+                "{APPCONTAINER_PROFILE_PREFIX}{}",
+                uuid::Uuid::new_v4().simple()
+            ),
+        })
+        .unwrap();
+        let (path, lease) =
+            publish_profile_record(fixture.root(), RecordKind::Intent, &payload, &control).unwrap();
+        assert!(
+            open_stale_profile_journal(fixture.root(), &path)
+                .unwrap()
+                .is_none()
+        );
+        drop(lease);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        sweep_stale_profiles_until_locked(
+            fixture.root(),
+            Instant::now() + Duration::from_secs(5),
+            &control,
+        )
+        .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn profile_record_publication_corrupt_final_and_invalid_staging_remain_fail_closed() {
+        let fixture = PublicationFixture::new();
+        let corrupt = fixture
+            .root()
+            .path()
+            .join(format!("{}.json", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&corrupt, b"").unwrap();
+        assert!(
+            sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                .unwrap_err()
+                .contains("decode")
+        );
+        assert!(
+            corrupt.exists(),
+            "malformed authority must never be discarded"
+        );
+        std::fs::remove_file(&corrupt).unwrap();
+        let (name, _) = RecordKind::Journal.leaves(uuid::Uuid::new_v4());
+        let stage = fixture.root().path().join(name);
+        write_private_staging_fixture(fixture.root(), &stage, b"{partial");
+        let alias = fixture.base.join("alias");
+        std::fs::hard_link(&stage, &alias).unwrap();
+        assert!(
+            sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&stage).unwrap(), b"{partial");
+        std::fs::remove_file(alias).unwrap();
+        sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !stage.exists(),
+            "verified abandoned staging is not authority"
+        );
+        let unknown = fixture.root().path().join("not-a-uuid.json.staged-v1");
+        std::fs::write(&unknown, b"").unwrap();
+        assert!(
+            sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert!(unknown.exists());
+        std::fs::remove_file(unknown).unwrap();
+
+        let (name, _) = RecordKind::Journal.leaves(uuid::Uuid::new_v4());
+        let oversized_stage = fixture.root().path().join(name);
+        write_private_staging_fixture(
+            fixture.root(),
+            &oversized_stage,
+            &vec![b'x'; MAX_CONTROL_RECORD_BYTES + 1],
+        );
+        assert!(
+            sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&oversized_stage).unwrap().len(),
+            (MAX_CONTROL_RECORD_BYTES + 1) as u64
+        );
+        std::fs::remove_file(oversized_stage).unwrap();
+
+        let (name, _) = RecordKind::Journal.leaves(uuid::Uuid::new_v4());
+        let private_stage = fixture.root().path().join(name);
+        write_private_staging_fixture(fixture.root(), &private_stage, b"partial");
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .open(&private_stage)
+            .unwrap();
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            },
+            0
+        );
+        drop(file);
+        assert!(
+            sweep_stale_profiles_until(fixture.root(), Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&private_stage).unwrap(), b"partial");
+        std::fs::remove_file(private_stage).unwrap();
+    }
+
+    #[test]
+    fn profile_record_publication_create_only_rename_cannot_replace_authority() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = PublicationFixture::new();
+        let target = fixture.root().path().join("existing.json");
+        std::fs::write(&target, b"original authority").unwrap();
+        let (stage, _) = RecordKind::Journal.leaves(uuid::Uuid::new_v4());
+        let stage = fixture.root().path().join(stage);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+            .share_mode(0)
+            .open(&stage)
+            .unwrap();
+        file.write_all(b"new complete bytes").unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            crate::fs::windows_rename_open_file_relative(
+                &fixture.root().0._directory,
+                &file,
+                OsStr::new("existing.json"),
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original authority");
+        drop(file);
+        assert_eq!(std::fs::read(&stage).unwrap(), b"new complete bytes");
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_file(stage).unwrap();
     }
 
     #[test]

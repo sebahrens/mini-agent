@@ -2439,7 +2439,7 @@ mod windows_native_pr_tests {
                         pending = requests.recv() => pending.expect("literal preflight needs ordinary Ask"),
                         result = &mut work => panic!("literal preflight completed before Ask: {result:?}"),
                     }
-                }).await.expect("literal preflight Ask delivery must be bounded");
+                }).await.expect("literal preflight Ask delivery must be bounded").into_permission();
                 assert_eq!(pending.tool, "shell");
                 assert_eq!(pending.input, command);
                 pending.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
@@ -2536,7 +2536,8 @@ mod windows_native_pr_tests {
         let request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
             .await
             .unwrap()
-            .expect("normal Shell Ask must be delivered");
+            .expect("normal Shell Ask must be delivered")
+            .into_permission();
         assert_eq!(request.tool, "shell");
         assert_eq!(
             request.input,
@@ -2749,7 +2750,7 @@ mod windows_native_pr_tests {
                         pending = requests.recv() => pending.expect("normal Shell Ask must be delivered"),
                         result = &mut work => panic!("typed Shell completed before normal Ask: {result:?}"),
                     }
-                }).await.expect("typed Shell Ask delivery must be bounded");
+                }).await.expect("typed Shell Ask delivery must be bounded").into_permission();
                 assert_eq!(pending.tool, "shell");
                 assert_eq!(pending.input, command);
                 assert!(!fixture.path("gh-argv.json").exists());

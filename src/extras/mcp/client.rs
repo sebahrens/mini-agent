@@ -307,10 +307,74 @@ impl McpClientHandle {
         initialize_timeout: Duration,
         workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
+        Self::connect_bound_with_timeout_in(
+            server_name,
+            config,
+            initialize_timeout,
+            workspace,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_in_binding(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        workspace: &Arc<crate::paths::WorkspaceBinding>,
+    ) -> anyhow::Result<Self> {
+        Self::connect_bound_with_timeout_in(
+            server_name,
+            config,
+            MCP_INITIALIZE_TIMEOUT,
+            workspace.root(),
+            Some(workspace),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_in_binding_guarded(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        workspace: &Arc<crate::paths::WorkspaceBinding>,
+        admission: &(dyn Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<Self> {
+        Self::connect_bound_with_timeout_in(
+            server_name,
+            config,
+            MCP_INITIALIZE_TIMEOUT,
+            workspace.root(),
+            Some(workspace),
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn connect_bound_with_timeout_in(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        initialize_timeout: Duration,
+        workspace: &std::path::Path,
+        binding: Option<&Arc<crate::paths::WorkspaceBinding>>,
+        admission: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> anyhow::Result<Self> {
+        let validate = || -> anyhow::Result<()> {
+            if let Some(binding) = binding {
+                binding.validate().map_err(anyhow::Error::msg)?;
+            }
+            anyhow::ensure!(
+                admission.is_none_or(|check| check()),
+                "MCP launch source changed"
+            );
+            Ok(())
+        };
+        validate()?;
         if crate::agent::runner::current_work_scope_is_cancelled() {
             anyhow::bail!("MCP connection cancelled");
         }
-        match config {
+        let result: anyhow::Result<Self> = match config {
             McpServerConfig::Command {
                 command,
                 args,
@@ -344,6 +408,7 @@ impl McpClientHandle {
                         "",
                     )
                 })?;
+                validate()?;
                 let (transport, cleanup_complete, stderr) =
                     spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES).map_err(|error| {
                         bounded_stdio_error(
@@ -404,14 +469,16 @@ impl McpClientHandle {
             }
             McpServerConfig::Url {
                 url,
+                allow_local,
                 headers,
                 oauth,
             } => {
                 let endpoint = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
-                    result = validate_mcp_server_url(url) => result?,
+                    result = validate_mcp_server_url_policy(url, *allow_local) => result?,
                 };
+                validate()?;
                 let mut handle = Self::connect_http_with_timeout(
                     server_name,
                     url,
@@ -425,6 +492,7 @@ impl McpClientHandle {
                 Ok(handle)
             }
             McpServerConfig::BuiltIn { identity, headers } => {
+                validate()?;
                 let mut handle = Self::connect_http_with_timeout(
                     server_name,
                     identity.endpoint(),
@@ -437,7 +505,15 @@ impl McpClientHandle {
                 handle.trusted_identity = config.trusted_identity();
                 Ok(handle)
             }
+        };
+        let mut handle = result?;
+        if validate().is_err() || crate::agent::runner::current_work_scope_is_cancelled() {
+            // A completed handshake cannot confer authority after its retained
+            // workspace changed. Join this exact candidate before rejecting it.
+            handle.running_service.close().await?;
+            anyhow::bail!("MCP workspace changed or connection was cancelled");
         }
+        Ok(handle)
     }
 
     /// Connect a streamable-HTTP server with every network step bounded by
@@ -460,8 +536,7 @@ impl McpClientHandle {
         initialize_timeout: Duration,
     ) -> anyhow::Result<Self> {
         tracing::debug!(
-            "MCP HTTP transport: {} ({} headers, OAuth: {})",
-            url,
+            "MCP HTTP transport configured ({} headers, OAuth: {})",
             headers.len(),
             oauth.is_some(),
         );
@@ -821,15 +896,32 @@ fn parse_headers(
 
 /// Validates a URL MCP server and returns its host with the addresses that
 /// passed, for the HTTP clients to pin (see [`super::egress`]).
+#[cfg(test)]
 pub(crate) async fn validate_mcp_server_url(value: &str) -> anyhow::Result<ValidatedEndpoint> {
-    validate_mcp_server_url_with(value, &super::egress::system_lookup()).await
+    validate_mcp_server_url_policy(value, false).await
 }
 
+pub(crate) async fn validate_mcp_server_url_policy(
+    value: &str,
+    allow_local: bool,
+) -> anyhow::Result<ValidatedEndpoint> {
+    validate_mcp_server_url_policy_with(value, allow_local, &super::egress::system_lookup()).await
+}
+
+#[cfg(test)]
 pub(super) async fn validate_mcp_server_url_with(
     value: &str,
     lookup: &super::egress::Lookup,
 ) -> anyhow::Result<ValidatedEndpoint> {
-    let (host, _port, literal_ip) = parse_mcp_server_url(value)?;
+    validate_mcp_server_url_policy_with(value, false, lookup).await
+}
+
+pub(super) async fn validate_mcp_server_url_policy_with(
+    value: &str,
+    allow_local: bool,
+    lookup: &super::egress::Lookup,
+) -> anyhow::Result<ValidatedEndpoint> {
+    let (host, _port, literal_ip) = parse_mcp_server_url_policy(value, allow_local)?;
     let addresses = if let Some(address) = literal_ip {
         vec![address]
     } else {
@@ -838,15 +930,26 @@ pub(super) async fn validate_mcp_server_url_with(
         })?
     };
 
-    validate_resolved_addresses(&addresses)?;
-    Ok(ValidatedEndpoint::new(
-        host,
-        &addresses,
-        literal_ip.is_some(),
-    ))
+    let local =
+        allow_local && !addresses.is_empty() && addresses.iter().all(|ip| is_loopback_ip(*ip));
+    if !local {
+        validate_resolved_addresses(&addresses)?;
+    }
+    let mut endpoint = ValidatedEndpoint::new(host, &addresses, literal_ip.is_some());
+    if local {
+        endpoint.allow_local_origin(reqwest::Url::parse(value)?);
+    }
+    Ok(endpoint)
 }
 
 pub(super) fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAddr>)> {
+    parse_mcp_server_url_policy(value, false)
+}
+
+fn parse_mcp_server_url_policy(
+    value: &str,
+    allow_local: bool,
+) -> anyhow::Result<(String, u16, Option<IpAddr>)> {
     let url = reqwest::Url::parse(value)
         .map_err(|error| anyhow::anyhow!("invalid MCP server URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -864,11 +967,12 @@ pub(super) fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, 
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host)
         .to_owned();
-    if host.eq_ignore_ascii_case("localhost")
-        || host
-            .to_ascii_lowercase()
-            .strip_suffix(".localhost")
-            .is_some()
+    if !allow_local
+        && (host.eq_ignore_ascii_case("localhost")
+            || host
+                .to_ascii_lowercase()
+                .strip_suffix(".localhost")
+                .is_some())
     {
         anyhow::bail!("MCP server URL host is local; use a publicly routable HTTP(S) API endpoint");
     }
@@ -893,6 +997,15 @@ pub(super) fn validate_resolved_addresses(addresses: &[IpAddr]) -> anyhow::Resul
         }
     }
     Ok(())
+}
+
+fn is_loopback_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
 }
 
 fn is_restricted_ip(address: IpAddr) -> bool {
@@ -1181,5 +1294,91 @@ mod tests {
         assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
         assert!(super::extend_tools_capped(&mut tools, vec![tool()]));
         assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
+    }
+}
+
+#[cfg(test)]
+mod local_policy_tests {
+    use super::*;
+    fn lookup(addresses: Vec<IpAddr>) -> super::super::egress::Lookup {
+        Arc::new(move |_| {
+            let addresses = addresses.clone();
+            Box::pin(async move { Ok(addresses) })
+        })
+    }
+    #[tokio::test]
+    async fn explicit_local_policy_accepts_only_pinned_loopback_and_does_not_widen_private_networks()
+     {
+        let local = lookup(vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()]);
+        for url in [
+            "http://localhost:3000/mcp",
+            "https://dev.example:3000/mcp",
+            "http://127.0.0.2/mcp",
+            "http://[::1]/mcp",
+            "http://[::ffff:127.0.0.1]/mcp",
+        ] {
+            let endpoint = validate_mcp_server_url_policy_with(url, true, &local)
+                .await
+                .unwrap();
+            assert!(!endpoint.addresses().is_empty());
+            assert!(
+                validate_mcp_server_url_policy_with(url, false, &local)
+                    .await
+                    .is_err()
+            );
+        }
+        for ip in [
+            "10.0.0.1",
+            "192.168.1.2",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::",
+            "fc00::1",
+            "::ffff:192.168.1.2",
+        ] {
+            let dns = lookup(vec![ip.parse().unwrap()]);
+            assert!(
+                validate_mcp_server_url_policy_with("http://alias.example/mcp", true, &dns)
+                    .await
+                    .is_err()
+            );
+        }
+        for addresses in [
+            vec!["127.0.0.1", "93.184.216.34"],
+            vec!["127.0.0.1", "10.0.0.1"],
+        ] {
+            let dns = lookup(
+                addresses
+                    .into_iter()
+                    .map(|ip| ip.parse().unwrap())
+                    .collect(),
+            );
+            assert!(
+                validate_mcp_server_url_policy_with("http://alias.example/mcp", true, &dns)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            validate_mcp_server_url_policy_with("http://user:password@localhost/mcp", true, &local)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_mcp_server_url_policy_with("http://empty.example", true, &lookup(vec![]))
+                .await
+                .is_err()
+        );
+        let public = lookup(vec!["93.184.216.34".parse().unwrap()]);
+        assert!(
+            validate_mcp_server_url_policy_with("https://public.example", false, &public)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_mcp_server_url_policy_with("https://public.example", true, &public)
+                .await
+                .is_ok()
+        );
     }
 }

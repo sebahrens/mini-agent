@@ -1035,6 +1035,43 @@ fn load_from_path(
         &mut warnings,
         clamped_retry_warnings(&cfg, clamped, "global config", &path),
     );
+    #[cfg(feature = "mcp")]
+    {
+        if let Some(servers) = &cfg.mcp_servers {
+            for name in servers.keys() {
+                cfg.mcp_origins.entry(name.clone()).or_default().push(
+                    crate::extras::mcp::project::ServerOrigin {
+                        source: path.display().to_string(),
+                        selected: true,
+                        inactive: None,
+                        digest: None,
+                    },
+                );
+            }
+        }
+        if let Some(root) = local_config_path
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        {
+            match crate::paths::WorkspaceBinding::capture(root) {
+                Ok(workspace) => {
+                    if let Err(error) = crate::extras::mcp::project::load_in_workspace(
+                        &mut cfg,
+                        &workspace,
+                        project_trust_path,
+                        interactive,
+                        &confirm_project_config_trust,
+                    ) {
+                        emit_config_warnings(&mut warnings, vec![error]);
+                    }
+                }
+                Err(_) => emit_config_warnings(
+                    &mut warnings,
+                    vec!["project MCP workspace identity is unavailable".into()],
+                ),
+            }
+        }
+    }
     if let Some(local_config_path) = local_config_path {
         if local_config_path.exists() {
             emit_config_warnings(
@@ -1127,6 +1164,7 @@ fn confirm_project_config_trust(description: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+#[cfg(test)]
 fn project_config_binding(path: &Path, content: &str) -> Result<ProjectConfigTrustBinding, String> {
     let project_root = path
         .parent()
@@ -1293,7 +1331,22 @@ fn checked_project_config_binding(
     relative: &Path,
     content: &str,
 ) -> Result<ProjectConfigTrustBinding, String> {
-    let binding = project_config_binding(&workspace.root().join(relative), content)?;
+    let path = workspace.root().join(relative);
+    let canonical_config = path
+        .canonicalize()
+        .map_err(|_| "project file is unavailable")?;
+    let binding = ProjectConfigTrustBinding {
+        canonical_project: workspace
+            .root()
+            .to_str()
+            .ok_or("project path is not UTF-8")?
+            .to_owned(),
+        canonical_config: canonical_config
+            .to_str()
+            .ok_or("project file path is not UTF-8")?
+            .to_owned(),
+        config_sha256: crate::hex::encode_lower(Sha256::digest(content.as_bytes())),
+    };
     workspace.validate()?;
     if Path::new(&binding.canonical_project) != workspace.root()
         || Path::new(&binding.canonical_config) != workspace.root().join(relative)
@@ -1349,6 +1402,7 @@ fn read_project_config(path: &Path) -> io::Result<(String, ProjectConfigTrustBin
     read_project_config_in_workspace(&workspace, &relative)
 }
 
+#[cfg(any(test, feature = "mcp"))]
 fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustStore> {
     load_project_config_trust_mode(path, true)
 }
@@ -1487,6 +1541,10 @@ fn merge_config_value(base: &Config, mut local: toml::Value) -> Result<Config, S
         .map_err(|_| "merged project config has an invalid value".to_string())?;
     merged.provenance = provenance;
     merged.load_warnings = base.load_warnings.clone();
+    #[cfg(feature = "mcp")]
+    {
+        merged.mcp_origins = base.mcp_origins.clone();
+    }
     Ok(merged)
 }
 
@@ -1524,6 +1582,39 @@ fn sensitive_settings_summary(value: &toml::Value) -> String {
     let redacted = redact_sensitive_value(value, false);
     toml::to_string_pretty(&redacted)
         .unwrap_or_else(|_| "<settings could not be rendered>".to_string())
+}
+
+#[cfg(feature = "mcp")]
+fn record_project_mcp_origins(
+    cfg: &mut Config,
+    value: &toml::Value,
+    relative: &Path,
+    digest: &str,
+    trusted: bool,
+) {
+    let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return;
+    };
+    let source = relative
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    for name in servers.keys() {
+        let origins = cfg.mcp_origins.entry(name.clone()).or_default();
+        origins.retain(|origin| origin.source != source);
+        if trusted {
+            for origin in origins.iter_mut() {
+                origin.selected = false;
+            }
+        }
+        origins.push(crate::extras::mcp::project::ServerOrigin {
+            source: source.clone(),
+            selected: trusted,
+            inactive: (!trusted).then(|| "project content is not trusted".into()),
+            digest: Some(digest.into()),
+        });
+    }
 }
 
 fn apply_local_override_with_confirmation(
@@ -1570,7 +1661,16 @@ fn apply_local_override_with_confirmation_mode(
             warnings.len(),
         ));
     }
-    let benign_cfg = merge_config_value(cfg, benign)?;
+    #[allow(unused_mut)]
+    let mut benign_cfg = merge_config_value(cfg, benign)?;
+    #[cfg(feature = "mcp")]
+    record_project_mcp_origins(
+        &mut benign_cfg,
+        &sensitive,
+        &relative,
+        &crate::extras::mcp::project::digest(&content),
+        false,
+    );
     if sensitive_keys.is_empty() {
         *cfg = benign_cfg;
         cfg.provenance.project_trust = Some("benign keys only");
@@ -1599,7 +1699,17 @@ fn apply_local_override_with_confirmation_mode(
     };
 
     if store.bindings.contains(&binding) {
-        *cfg = merge_config_value(&benign_cfg, sensitive)?;
+        #[allow(unused_mut)]
+        let mut trusted = merge_config_value(&benign_cfg, sensitive.clone())?;
+        #[cfg(feature = "mcp")]
+        record_project_mcp_origins(
+            &mut trusted,
+            &sensitive,
+            &relative,
+            &binding.config_sha256,
+            true,
+        );
+        *cfg = trusted;
         cfg.provenance.project_trust = Some("content-bound trusted");
         return Ok(ProjectConfigTrustOutcome::AlreadyTrusted);
     }
@@ -1633,7 +1743,16 @@ fn apply_local_override_with_confirmation_mode(
         return Ok(ProjectConfigTrustOutcome::Declined);
     }
 
-    let trusted_cfg = merge_config_value(&benign_cfg, sensitive)?;
+    #[allow(unused_mut)]
+    let mut trusted_cfg = merge_config_value(&benign_cfg, sensitive.clone())?;
+    #[cfg(feature = "mcp")]
+    record_project_mcp_origins(
+        &mut trusted_cfg,
+        &sensitive,
+        &relative,
+        &binding.config_sha256,
+        true,
+    );
     store.bindings.retain(|existing| {
         existing.canonical_project != binding.canonical_project
             || existing.canonical_config != binding.canonical_config
@@ -1675,12 +1794,29 @@ pub(crate) fn project_config_is_trusted_in_workspace(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
 ) -> bool {
+    project_config_is_trusted_in_workspace_mode(paths, workspace, true)
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn project_config_is_trusted_in_workspace_readonly(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    project_config_is_trusted_in_workspace_mode(paths, workspace, false)
+}
+
+fn project_config_is_trusted_in_workspace_mode(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    repair: bool,
+) -> bool {
     let Ok((_, binding)) =
         read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml"))
     else {
         return false;
     };
-    let Ok(store) = load_project_config_trust(&paths.project_config_trust_file()) else {
+    let Ok(store) = load_project_config_trust_mode(&paths.project_config_trust_file(), repair)
+    else {
         return false;
     };
     workspace.validate().is_ok() && store.bindings.contains(&binding)
@@ -1843,6 +1979,21 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
         remove_built_in(&mut servers, "Grep.app");
     }
 
+    for (name, server) in &servers {
+        if server.trusted_identity().is_some() {
+            let origins = cfg.mcp_origins.entry(name.clone()).or_default();
+            origins.retain(|origin| origin.source != "built-in");
+            for origin in origins.iter_mut() {
+                origin.selected = false;
+            }
+            origins.push(crate::extras::mcp::project::ServerOrigin {
+                source: "built-in".into(),
+                selected: true,
+                inactive: None,
+                digest: None,
+            });
+        }
+    }
     cfg.mcp_servers = Some(servers);
 }
 
@@ -3774,4 +3925,301 @@ pub(crate) mod bounded_project_trust_tests {
         drop(crate::tests::process_gate::ProcessGate::new(&store).unwrap());
         assert!(load_project_config_trust(&store).is_err());
     }
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn read_project_mcp_text(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> io::Result<String> {
+    crate::extras::mcp::project::FileSnapshot::read(workspace, Path::new(".mcp.json")).and_then(
+        |snapshot| {
+            if !snapshot.exists() {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "project MCP file is absent or empty",
+                ))
+            } else {
+                Ok(snapshot.content)
+            }
+        },
+    )
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn project_mcp_is_trusted(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    content: &str,
+) -> bool {
+    project_mcp_is_trusted_at(&paths.project_config_trust_file(), workspace, content)
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn project_mcp_is_trusted_at(
+    trust_path: &Path,
+    workspace: &crate::paths::WorkspaceBinding,
+    content: &str,
+) -> bool {
+    let Ok(binding) = checked_project_config_binding(workspace, Path::new(".mcp.json"), content)
+    else {
+        return false;
+    };
+    let Ok(store) = load_project_config_trust_mode(trust_path, false) else {
+        return false;
+    };
+    workspace.validate().is_ok() && store.bindings.contains(&binding)
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn approve_project_mcp(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    expected_digest: &str,
+) -> io::Result<()> {
+    approve_project_mcp_at(
+        &paths.project_config_trust_file(),
+        workspace,
+        expected_digest,
+    )
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn approve_project_mcp_at(
+    trust_path: &Path,
+    workspace: &crate::paths::WorkspaceBinding,
+    expected_digest: &str,
+) -> io::Result<()> {
+    let content = read_project_mcp_text(workspace)?;
+    let binding = checked_project_config_binding(workspace, Path::new(".mcp.json"), &content)
+        .map_err(io::Error::other)?;
+    if binding.config_sha256 != expected_digest {
+        return Err(io::Error::other(
+            "project MCP definitions changed during approval",
+        ));
+    }
+    let mut store = load_project_config_trust(trust_path)?;
+    store.bindings.retain(|old| {
+        old.canonical_project != binding.canonical_project
+            || old.canonical_config != binding.canonical_config
+    });
+    store.bindings.push(binding);
+    workspace.validate().map_err(io::Error::other)?;
+    save_project_config_trust(trust_path, &store)
+}
+
+/// Persist one explicit MCP edit as a private structural file delta. Runtime
+/// project/default values and unavailable feature keys never get serialized.
+#[cfg(feature = "mcp")]
+pub(crate) fn save_mcp_server_at(
+    path: &Path,
+    name: &str,
+    server: Option<&crate::extras::mcp::config::McpServerConfig>,
+) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("global config has no parent"))?;
+    let workspace = crate::paths::WorkspaceBinding::capture(parent).map_err(io::Error::other)?;
+    let relative = Path::new(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("global config has no name"))?,
+    );
+    let snapshot = crate::extras::mcp::project::FileSnapshot::read_private(&workspace, relative)?;
+    if snapshot.exists() {
+        // Validate, never repair, the exact existing private global file before
+        // trusting it as the basis of a changed-only structural publication.
+        let file = crate::fs::open_private_file_checked(path, crate::fs::PrivateFileAccess::Read)?;
+        crate::fs::validate_private_file(&file)?;
+        parse_config_content(path, &snapshot.content)?;
+    }
+    let changed = if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        let mut document: toml::Value = if snapshot.exists() {
+            toml::from_str(&snapshot.content).map_err(io::Error::other)?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+        let object = document
+            .as_table_mut()
+            .ok_or_else(|| io::Error::other("global config is not a table"))?;
+        // Parsing above validates aliases on a copy. A structural MCP edit
+        // must retain every unrelated key's original spelling and value.
+        let servers = object
+            .entry("mcp_servers")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| io::Error::other("mcp_servers is not a table"))?;
+        if let Some(server) = server {
+            if servers.contains_key(name) {
+                return Err(io::Error::other("MCP name already exists in global config"));
+            }
+            servers.insert(
+                name.to_owned(),
+                toml::Value::try_from(server).map_err(io::Error::other)?,
+            );
+        } else if servers.remove(name).is_none() {
+            return Err(io::Error::other("MCP name is not in global config"));
+        }
+        toml::to_string(&document).map_err(io::Error::other)?
+    } else {
+        let mut document: serde_yaml_ng::Value = if snapshot.exists() {
+            serde_yaml_ng::from_str(&snapshot.content).map_err(io::Error::other)?
+        } else {
+            serde_yaml_ng::Value::Mapping(Default::default())
+        };
+        let object = document
+            .as_mapping_mut()
+            .ok_or_else(|| io::Error::other("global config is not an object"))?;
+        let servers = object
+            .entry(serde_yaml_ng::Value::String("mcp_servers".into()))
+            .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()))
+            .as_mapping_mut()
+            .ok_or_else(|| io::Error::other("mcp_servers is not an object"))?;
+        let key = serde_yaml_ng::Value::String(name.into());
+        if let Some(server) = server {
+            if servers.contains_key(&key) {
+                return Err(io::Error::other("MCP name already exists in global config"));
+            }
+            servers.insert(
+                key,
+                serde_yaml_ng::to_value(server).map_err(io::Error::other)?,
+            );
+        } else if servers.remove(&key).is_none() {
+            return Err(io::Error::other("MCP name is not in global config"));
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            serde_json::to_string_pretty(&document).map_err(io::Error::other)?
+        } else {
+            serde_yaml_ng::to_string(&document).map_err(io::Error::other)?
+        }
+    };
+    parse_config_content(path, &changed)?;
+    snapshot.publish(&workspace, &changed)?;
+    Ok(path.to_owned())
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_delta_tests {
+    use super::*;
+    #[test]
+    fn mcp_add_remove_preserves_unavailable_fields_unknown_nested_keys_and_no_project_copy() {
+        let root = crate::tests::OwnedTestDirectory::new("mcp-global-delta");
+        for (file, original) in [
+            (
+                "config.toml",
+                "model='original'\nauto_update_prompts=false\nfuture_feature={keep=['unknown', '雪']}\n[mcp_servers.existing]\ncommand='runner'\nfuture_server_key=17\n",
+            ),
+            (
+                "config.json",
+                r#"{"model":"original","auto_update_prompts":false,"future_feature":{"keep":["unknown","雪"]},"mcp_servers":{"existing":{"command":"runner","future_server_key":17}}}"#,
+            ),
+            (
+                "config.yaml",
+                "model: original\nauto_update_prompts: false\nfuture_feature: {keep: [unknown, 雪]}\nmcp_servers:\n  existing:\n    command: runner\n    future_server_key: 17\n",
+            ),
+        ] {
+            let path = root.path().join(file);
+            crate::fs::private_atomic_create_sync(&path, original.as_bytes()).unwrap();
+            let server = crate::extras::mcp::config::McpServerConfig::Url {
+                url: "http://127.0.0.1:3000/mcp".into(),
+                allow_local: true,
+                headers: Default::default(),
+                oauth: None,
+            };
+            save_mcp_server_at(&path, "local", Some(&server)).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("future_feature")
+                    && text.contains("future_server_key")
+                    && text.contains("original")
+                    && text.contains("unknown")
+            );
+            let cfg = parse_config_content(&path, &text).unwrap();
+            assert!(text.contains("auto_update_prompts"));
+            assert!(!text.contains("auto-update-prompts"));
+            if file == "config.json" {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                    "a structural JSON edit must preserve JSON format"
+                );
+            }
+            assert!(cfg.mcp_servers.unwrap().contains_key("local"));
+            assert!(save_mcp_server_at(&path, "local", Some(&server)).is_err());
+            save_mcp_server_at(&path, "local", None).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("auto_update_prompts"));
+            assert!(!text.contains("auto-update-prompts"));
+            assert!(!text.contains("127.0.0.1") && text.contains("future_server_key"));
+            assert_eq!(
+                parse_config_content(&path, &text).unwrap().model.as_deref(),
+                Some("original")
+            );
+            assert!(save_mcp_server_at(&path, "missing", None).is_err());
+        }
+    }
+}
+
+/// Side-effect-free MCP catalogue refresh for an explicit UI operation. It
+/// never prompts, writes defaults, starts services, or reloads provider policy.
+#[cfg(feature = "mcp")]
+pub(crate) fn mcp_config_in_workspace_at(
+    workspace: &crate::paths::WorkspaceBinding,
+    path: &Path,
+) -> io::Result<Config> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("global config has no parent"))?;
+    let binding = crate::paths::WorkspaceBinding::capture(parent).map_err(io::Error::other)?;
+    let relative = Path::new(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("global config has no name"))?,
+    );
+    let snapshot = crate::extras::mcp::project::FileSnapshot::read_private(&binding, relative)?;
+    let mut cfg = if snapshot.exists() {
+        parse_config_content(path, &snapshot.content)?
+    } else {
+        Config::default()
+    };
+    if let Some(servers) = &cfg.mcp_servers {
+        for name in servers.keys() {
+            cfg.mcp_origins.entry(name.clone()).or_default().push(
+                crate::extras::mcp::project::ServerOrigin {
+                    source: path.display().to_string(),
+                    selected: true,
+                    inactive: None,
+                    digest: None,
+                },
+            );
+        }
+    }
+    let paths =
+        AppPaths::from_process(Some(workspace.root().to_path_buf())).map_err(io::Error::other)?;
+    let trust = paths.project_config_trust_file();
+    crate::extras::mcp::project::load_in_workspace(&mut cfg, workspace, &trust, false, &|_| false)
+        .map_err(io::Error::other)?;
+    match read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml")) {
+        Ok((content, binding)) => {
+            let local = parse_project_toml(&content).map_err(io::Error::other)?;
+            let trusted = load_project_config_trust_mode(&trust, false)?
+                .bindings
+                .contains(&binding);
+            if trusted {
+                cfg = merge_config_value(&cfg, local.clone()).map_err(io::Error::other)?;
+            }
+            record_project_mcp_origins(
+                &mut cfg,
+                &local,
+                Path::new(".zerostack/config.toml"),
+                &binding.config_sha256,
+                trusted,
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(io::Error::other(
+                "project TOML MCP authority is unavailable",
+            ));
+        }
+    }
+    inject_mcp_defaults(&mut cfg);
+    workspace.validate().map_err(io::Error::other)?;
+    Ok(cfg)
 }

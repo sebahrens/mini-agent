@@ -10,6 +10,8 @@ pub(crate) mod events;
 pub(crate) mod feed;
 pub(crate) mod input;
 pub(crate) mod markdown;
+#[cfg(feature = "mcp")]
+mod mcp_admin;
 mod permission_handler;
 pub(crate) mod pickers;
 mod plan;
@@ -617,10 +619,8 @@ pub(crate) async fn ensure_mcp_manager<'a>(
     cfg: &'a Config,
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) -> Option<&'a McpClientManager> {
-    if mcp.is_none()
-        && let Some(servers) = &cfg.mcp_servers
-    {
-        *mcp = Some(McpClientManager::connect_all_in_binding(servers, workspace).await);
+    if mcp.is_none() && cfg.mcp_servers.is_some() {
+        *mcp = Some(McpClientManager::connect_config_in_binding(cfg, workspace).await);
     }
     mcp.as_ref()
 }
@@ -634,8 +634,8 @@ pub(crate) async fn rebind_mcp_manager(
     if let Some(previous) = mcp.take() {
         previous.shutdown().await;
     }
-    if let Some(servers) = &cfg.mcp_servers {
-        *mcp = Some(McpClientManager::connect_all_in_binding(servers, workspace).await);
+    if cfg.mcp_servers.is_some() {
+        *mcp = Some(McpClientManager::connect_config_in_binding(cfg, workspace).await);
     }
 }
 

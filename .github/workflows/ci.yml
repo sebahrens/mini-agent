@@ -1305,6 +1305,10 @@ jobs:
             'general_preflight_cache_retains_success_and_failure_without_reprobing',
             'control_root_authority_denies_ancestor_swap_after_attestation',
             'profile_intent_transition_excludes_a_concurrent_sweeper',
+            'profile_record_publication_process_death_never_exposes_partial_final_authority',
+            'profile_record_publication_preserves_live_lease_and_rejects_oversized_payload',
+            'profile_record_publication_corrupt_final_and_invalid_staging_remain_fail_closed',
+            'profile_record_publication_create_only_rename_cannot_replace_authority',
             'next_process_recovers_a_preserved_profile_job_acls_and_root',
             'changed_preflight_root_dacl_is_rejected_without_cleanup',
             'malformed_preflight_schema_is_preserved_without_mutation',
@@ -2204,6 +2208,23 @@ jobs:
           }
           cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native Windows bounded project trust proof failed' }
+
+      - name: Test native Windows MCP private temporary ownership
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $test = 'fs::private::windows::mcp_native_windows_new_temp_is_user_owned_private_and_nonempty_or_linked_files_are_unchanged'
+          $discovered = @(cargo test --locked --bin mini-agent $test -- --exact --list 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Windows MCP private temporary discovery failed' }
+          $actual = @($discovered | Where-Object { $_ -ceq "${test}: test" })
+          if ($actual.Count -ne 1) { throw 'Exact Windows MCP private temporary test was not discovered' }
+          $native = @(cargo test --locked --bin mini-agent $test -- --exact --nocapture --test-threads=1 2>&1)
+          $nativeExit = $LASTEXITCODE
+          $native | Write-Output
+          if ($nativeExit -ne 0) { throw 'Native Windows MCP private temporary proof failed' }
+          if (-not ($native -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
+            throw 'Native Windows MCP private temporary proof did not execute exactly one passing test'
+          }
 
       - name: Test MCP OAuth credential storage
         if: matrix.feature.mcp

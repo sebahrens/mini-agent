@@ -73,6 +73,7 @@ pub(crate) struct ValidatedEndpoint {
     host: String,
     addresses: Vec<SocketAddr>,
     literal: bool,
+    local_origin: Option<reqwest::Url>,
 }
 
 impl ValidatedEndpoint {
@@ -85,7 +86,18 @@ impl ValidatedEndpoint {
                 .map(|address| SocketAddr::new(*address, 0))
                 .collect(),
             literal,
+            local_origin: None,
         }
+    }
+
+    pub(super) fn allow_local_origin(&mut self, url: reqwest::Url) {
+        self.local_origin = Some(url);
+    }
+
+    fn accepts_local_origin(&self, url: &reqwest::Url) -> bool {
+        self.local_origin
+            .as_ref()
+            .is_some_and(|origin| origin.origin() == url.origin())
     }
 
     /// The addresses the server host is pinned to.
@@ -101,7 +113,23 @@ impl ValidatedEndpoint {
     }
 
     fn pin_with(&self, builder: reqwest::ClientBuilder, lookup: Lookup) -> reqwest::ClientBuilder {
-        let builder = builder.dns_resolver(PublicOnlyResolver::new(lookup));
+        self.pin_with_source(builder, lookup, None)
+    }
+
+    fn pin_with_source(
+        &self,
+        builder: reqwest::ClientBuilder,
+        lookup: Lookup,
+        source: Option<SourceValidator>,
+    ) -> reqwest::ClientBuilder {
+        let builder = if self.local_origin.is_some() {
+            builder.no_proxy()
+        } else {
+            builder
+        };
+        let mut resolver = PublicOnlyResolver::new(lookup);
+        resolver.source = source;
+        let builder = builder.dns_resolver(resolver);
         if self.literal {
             builder
         } else {
@@ -116,11 +144,23 @@ impl ValidatedEndpoint {
 #[derive(Clone)]
 pub(crate) struct PublicOnlyResolver {
     lookup: Lookup,
+    source: Option<SourceValidator>,
+}
+
+/// An owned source check for an explicit login; never a permission grant.
+/// Failures are static so raw definitions and credentials cannot enter errors.
+pub(crate) type SourceValidator = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn source_is_current(source: &Option<SourceValidator>) -> bool {
+    source.as_ref().is_none_or(|validate| validate())
 }
 
 impl PublicOnlyResolver {
     pub(crate) fn new(lookup: Lookup) -> Self {
-        Self { lookup }
+        Self {
+            lookup,
+            source: None,
+        }
     }
 }
 
@@ -128,8 +168,23 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let lookup = self.lookup.clone();
         let host = name.as_str().to_owned();
+        let source = self.source.clone();
         Box::pin(async move {
+            if !source_is_current(&source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "MCP OAuth source changed",
+                )
+                .into());
+            }
             let addresses = lookup(host.clone()).await?;
+            if !source_is_current(&source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "MCP OAuth source changed",
+                )
+                .into());
+            }
             validate_resolved_addresses(&addresses).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -161,6 +216,8 @@ fn check_url_host(url: &reqwest::Url) -> Result<(), String> {
 pub(crate) struct GuardedOAuthHttpClient {
     follow_redirects: reqwest::Client,
     stop_redirects: reqwest::Client,
+    endpoint: ValidatedEndpoint,
+    source: Option<SourceValidator>,
 }
 
 impl GuardedOAuthHttpClient {
@@ -168,10 +225,25 @@ impl GuardedOAuthHttpClient {
         Self::with_lookup(endpoint, system_lookup())
     }
 
+    pub(crate) fn with_source_validator(
+        endpoint: &ValidatedEndpoint,
+        source: SourceValidator,
+    ) -> anyhow::Result<Self> {
+        Self::with_lookup_and_source(endpoint, system_lookup(), Some(source))
+    }
+
     fn with_lookup(endpoint: &ValidatedEndpoint, lookup: Lookup) -> anyhow::Result<Self> {
+        Self::with_lookup_and_source(endpoint, lookup, None)
+    }
+
+    fn with_lookup_and_source(
+        endpoint: &ValidatedEndpoint,
+        lookup: Lookup,
+        source: Option<SourceValidator>,
+    ) -> anyhow::Result<Self> {
         let build = |policy: reqwest::redirect::Policy| {
             endpoint
-                .pin_with(reqwest::Client::builder(), lookup.clone())
+                .pin_with_source(reqwest::Client::builder(), lookup.clone(), source.clone())
                 .timeout(OAUTH_HTTP_TIMEOUT)
                 .redirect(policy)
                 .build()
@@ -179,7 +251,11 @@ impl GuardedOAuthHttpClient {
                     anyhow::anyhow!("MCP OAuth HTTP client construction failed: {error}")
                 })
         };
-        let follow = reqwest::redirect::Policy::custom(|attempt| {
+        let redirect_source = source.clone();
+        let follow = reqwest::redirect::Policy::custom(move |attempt| {
+            if !source_is_current(&redirect_source) {
+                return attempt.error("MCP OAuth source changed");
+            }
             if attempt.previous().len() >= OAUTH_HTTP_MAX_REDIRECTS {
                 return attempt.error("too many redirects");
             }
@@ -189,8 +265,14 @@ impl GuardedOAuthHttpClient {
             }
         });
         Ok(Self {
-            follow_redirects: build(follow)?,
+            follow_redirects: build(if endpoint.local_origin.is_some() {
+                reqwest::redirect::Policy::none()
+            } else {
+                follow
+            })?,
             stop_redirects: build(reqwest::redirect::Policy::none())?,
+            endpoint: endpoint.clone(),
+            source,
         })
     }
 }
@@ -202,6 +284,9 @@ impl GuardedOAuthHttpClient {
         follow_redirects: bool,
         timeout: Option<Duration>,
     ) -> Result<http::Response<Vec<u8>>, OAuthHttpClientError> {
+        if !source_is_current(&self.source) {
+            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+        }
         let client = if follow_redirects {
             &self.follow_redirects
         } else {
@@ -209,7 +294,13 @@ impl GuardedOAuthHttpClient {
         };
         let mut request = reqwest::Request::try_from(request)
             .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
-        check_url_host(request.url()).map_err(OAuthHttpClientError::new)?;
+        if !self.endpoint.accepts_local_origin(request.url()) {
+            check_url_host(request.url()).map_err(OAuthHttpClientError::new)?;
+        } else if !request.url().username().is_empty() || request.url().password().is_some() {
+            return Err(OAuthHttpClientError::new(
+                "MCP URL must not contain credentials",
+            ));
+        }
         if let Some(timeout) = timeout {
             *request.timeout_mut() = Some(timeout);
         }
@@ -217,6 +308,9 @@ impl GuardedOAuthHttpClient {
             .execute(request)
             .await
             .map_err(|error| OAuthHttpClientError::new(error_chain(&error)))?;
+        if !source_is_current(&self.source) {
+            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+        }
 
         let mut builder = http::Response::builder()
             .status(response.status())
@@ -234,6 +328,9 @@ impl GuardedOAuthHttpClient {
                 )));
             }
             body.extend_from_slice(&chunk);
+        }
+        if !source_is_current(&self.source) {
+            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
         }
         builder
             .body(body)
@@ -425,5 +522,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::FOUND);
+    }
+}
+
+#[cfg(test)]
+mod source_revision_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    struct OwnedHttp {
+        url: String,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl OwnedHttp {
+        async fn new(revoke: Option<std::path::PathBuf>) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = requests.clone();
+            let (stop, mut stopping) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! { biased; _ = &mut stopping => break, accepted = listener.accept() => accepted.unwrap() };
+                    let (mut stream, _) = accepted;
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !bytes.windows(4).any(|row| row == b"\r\n\r\n") {
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            if count == 0 { return; }
+                            bytes.extend_from_slice(&chunk[..count]);
+                            assert!(bytes.len() <= 4096);
+                        }
+                        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        if let Some(path) = &revoke {
+                            crate::fs::private_atomic_write_sync(path, b"{\"mcpServers\":{},\"revision\":2}").unwrap();
+                        }
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                    }).await.expect("owned HTTP socket must be bounded");
+                }
+            });
+            Self {
+                url: format!("http://{address}"),
+                requests,
+                stop: Some(stop),
+                task: Some(task),
+            }
+        }
+        async fn finish(mut self) {
+            self.stop.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), self.task.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    impl Drop for OwnedHttp {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_source_changed_during_metadata_refuses_registration_and_keeps_wire_positive() {
+        for revoke in [false, true] {
+            let root = crate::tests::OwnedTestDirectory::new("mcp-oauth-source-wire");
+            let path = root.path().join(".mcp.json");
+            crate::fs::private_atomic_create_sync(&path, b"{\"mcpServers\":{}}").unwrap();
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let before = super::super::project::FileSnapshot::read(
+                &workspace,
+                std::path::Path::new(".mcp.json"),
+            )
+            .unwrap()
+            .content;
+            let source = workspace.clone();
+            let guard: SourceValidator = Arc::new(move || {
+                super::super::project::FileSnapshot::read(
+                    &source,
+                    std::path::Path::new(".mcp.json"),
+                )
+                .is_ok_and(|snapshot| snapshot.content == before)
+            });
+            let server = OwnedHttp::new(revoke.then_some(path.clone())).await;
+            let endpoint = super::super::client::validate_mcp_server_url_policy(&server.url, true)
+                .await
+                .unwrap();
+            let client = GuardedOAuthHttpClient::with_source_validator(&endpoint, guard).unwrap();
+            let metadata = client
+                .send(
+                    http::Request::builder()
+                        .uri(format!("{}/metadata", server.url))
+                        .body(Vec::new())
+                        .unwrap(),
+                    false,
+                    Some(Duration::from_secs(2)),
+                )
+                .await;
+            assert_eq!(
+                metadata.is_err(),
+                revoke,
+                "metadata response must not advance a stale source"
+            );
+            assert_eq!(
+                server.requests.load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+            if !revoke {
+                crate::fs::private_atomic_write_sync(&path, b"{\"mcpServers\":{},\"revision\":2}")
+                    .unwrap();
+            }
+            let registration = client
+                .send(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri(format!("{}/register", server.url))
+                        .body(Vec::new())
+                        .unwrap(),
+                    false,
+                    Some(Duration::from_secs(2)),
+                )
+                .await;
+            assert!(registration.is_err());
+            assert_eq!(
+                server.requests.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "no stale registration socket may be created"
+            );
+            drop(client);
+            server.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_source_revalidation_after_owned_dns_answer_rejects_the_addresses() {
+        use reqwest::dns::Resolve as _;
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let changed = current.clone();
+        let lookup: Lookup = Arc::new(move |_| {
+            changed.store(false, std::sync::atomic::Ordering::Release);
+            Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+        });
+        let mut resolver = PublicOnlyResolver::new(lookup);
+        resolver.source = Some(Arc::new(move || {
+            current.load(std::sync::atomic::Ordering::Acquire)
+        }));
+        let result = resolver.resolve("owned.example".parse().unwrap()).await;
+        assert!(
+            result.is_err(),
+            "a lookup result cannot authorize a changed source"
+        );
+        // The resolver alone is called: no socket or external request exists.
     }
 }

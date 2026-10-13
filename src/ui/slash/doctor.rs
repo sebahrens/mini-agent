@@ -10,13 +10,20 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         super::write_error(ctx.renderer, "application paths are unavailable");
         return Ok(());
     };
-    let mut report = crate::diagnostics::DoctorReport::capture(
+    #[cfg(feature = "mcp")]
+    let mcp_configured_count = ctx
+        .mcp_manager
+        .and_then(|manager| manager.configured_count());
+    #[cfg(not(feature = "mcp"))]
+    let mcp_configured_count = None;
+    let mut report = crate::diagnostics::DoctorReport::capture_with_mcp_count(
         ctx.cli,
         ctx.cfg,
         &paths,
         Some(ctx.session),
         Some(ctx.sandbox),
         false,
+        mcp_configured_count,
     );
     #[cfg(feature = "lsp")]
     {
@@ -78,6 +85,42 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 "pending connection notices",
                 manager.notices.len().to_string(),
             );
+            let observed = manager.health_snapshot();
+            for (name, health) in observed.servers.iter().take(32) {
+                for (label, attempt) in [
+                    ("observed connection", health.connection),
+                    ("observed catalogue", health.catalogue),
+                ] {
+                    if let Some(attempt) = attempt {
+                        report.row(
+                            label,
+                            format!("{name}: {:?} (attempt {})", attempt.outcome, attempt.id),
+                        );
+                    }
+                }
+            }
+            if observed.omitted || observed.servers.len() > 32 {
+                report.row("observations", "additional server observations omitted");
+            }
+            let (origins, omitted) = manager.origins_snapshot();
+            for (name, layers) in origins.iter().take(32) {
+                for layer in layers {
+                    let state = if layer.inactive.is_some() {
+                        "inactive"
+                    } else if layer.selected {
+                        "selected"
+                    } else {
+                        "shadowed"
+                    };
+                    report.row(
+                        "captured MCP origin",
+                        format!("{name}: {state}; {}", layer.source),
+                    );
+                }
+            }
+            if omitted || origins.len() > 32 {
+                report.row("origins", "additional source metadata omitted");
+            }
         } else {
             report.row("status", "not initialized");
         }

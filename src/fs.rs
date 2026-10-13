@@ -2108,6 +2108,94 @@ fn atomic_write_platform(
     Ok(())
 }
 
+/// One native, handle-relative rename attempt. Callers retain their own retry/cancellation
+/// policy and directory identity authority. `replace=false` never overwrites an existing leaf.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn windows_rename_open_file_relative(
+    directory: &std::fs::File,
+    file: &std::fs::File,
+    name: &std::ffi::OsStr,
+    replace: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+        FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let name: Vec<u16> = name.encode_wide().collect();
+    // A leaf only: callers must not turn a retained-directory operation into a path traversal.
+    if name.is_empty()
+        || name == [46]
+        || name == [46, 46]
+        || name.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid rename leaf",
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename name overflow")
+        })?;
+    let required = std::mem::size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes)
+        .filter(|size| *size <= u32::MAX as usize)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "rename buffer overflow")
+        })?;
+    let mut storage = vec![0usize; required.div_ceil(std::mem::size_of::<usize>())];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // The native RootDirectory contract is necessary; Win32's wrapper does not preserve it
+    // consistently. POSIX replacement keeps existing readers, while create-only uses the ordinary
+    // information class. The aligned buffer and both retained handles live through this call.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    unsafe {
+        (*information).Anonymous.Flags = if replace {
+            FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
+        } else {
+            0
+        };
+        (*information).RootDirectory = directory.as_raw_handle().cast();
+        (*information).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            name.len(),
+        );
+    }
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: live DELETE-access file, directory, initialized native buffer and writable status.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle().cast(),
+            &mut io_status,
+            information.cast(),
+            required as u32,
+            if replace {
+                FileRenameInformationEx
+            } else {
+                FileRenameInformation
+            },
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        // SAFETY: accepts the NTSTATUS returned by the native operation.
+        Err(std::io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
+    }
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments, unsafe_code)]
 fn atomic_write_platform(
@@ -2129,13 +2217,10 @@ fn atomic_write_platform(
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-        FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
-        FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
-    use windows_sys::Win32::Foundation::{
-        GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
-    };
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
@@ -2167,77 +2252,16 @@ fn atomic_write_platform(
         replace: bool,
         cancellation: &AtomicWriteCancellation,
     ) -> std::io::Result<()> {
-        let name: Vec<u16> = name.encode_wide().collect();
-        if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "atomic write target has an invalid file name",
-            ));
-        }
-        let name_bytes = name.len() * std::mem::size_of::<u16>();
-        let required = std::mem::size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
-        let words = required.div_ceil(std::mem::size_of::<usize>());
-        let mut storage = vec![0usize; words];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // Extended POSIX replacement preserves existing readers of the old
-        // object, including the handles retained by LSP identity tracking.
-        // Ordinary FileRenameInformation rejects those open targets even when
-        // they share deletion. Create-only publication keeps the ordinary class.
-        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
-        // The native API
-        // accepts a relative leaf together with the same retained,
-        // identity-verified directory handle used for temp creation. The Win32
-        // SetFileInformationByHandle wrapper does not preserve this native
-        // RootDirectory contract consistently.
-        // SAFETY: `storage` is aligned and large enough for the header and UTF-16
-        // name. Both handles and the buffer remain live across every bounded
-        // retry of the same final publication call.
-        unsafe {
-            (*information).Anonymous.Flags = if replace {
-                FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
-            } else {
-                0
-            };
-            (*information).RootDirectory = directory.as_raw_handle().cast();
-            (*information).FileNameLength = name_bytes as u32;
-            std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
-                (*information).FileName.as_mut_ptr(),
-                name.len(),
-            );
-        }
         let operation = || {
-            let mut io_status = IO_STATUS_BLOCK::default();
-            // SAFETY: the retained file and directory handles, initialized
-            // rename buffer, and writable status block are valid for this
-            // synchronous call.
-            let status = unsafe {
-                NtSetInformationFile(
-                    file.as_raw_handle().cast(),
-                    &mut io_status,
-                    information.cast(),
-                    required as u32,
-                    if replace {
-                        FileRenameInformationEx
-                    } else {
-                        FileRenameInformation
-                    },
-                )
-            };
-            if status >= 0 {
-                return Ok(());
-            }
-            // SAFETY: the conversion accepts any NTSTATUS returned by
-            // NtSetInformationFile.
-            let code = unsafe { RtlNtStatusToDosError(status) } as i32;
+            let result = windows_rename_open_file_relative(directory, file, name, replace);
             #[cfg(test)]
-            if matches!(code, 32 | 33)
+            if result.as_ref().err().is_some_and(is_windows_lock_violation)
                 && let Some(probe) = &cancellation.0.publication_probe
                 && probe.point == AtomicWriteProbePoint::AfterRetry
             {
                 probe.pause();
             }
-            Err(std::io::Error::from_raw_os_error(code))
+            result
         };
         #[cfg(test)]
         if cancellation
@@ -2711,6 +2735,9 @@ fn expand_home_relative(home: &Path, relative: &str) -> PathBuf {
 
     expanded
 }
+
+#[cfg(feature = "mcp")]
+pub(crate) use private::prepare_new_private_file;
 
 #[cfg(test)]
 mod tests {

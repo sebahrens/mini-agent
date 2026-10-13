@@ -219,6 +219,10 @@ pub(crate) struct GoalVerificationEvent {
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
+    #[cfg(feature = "mcp")]
+    McpAdminDone {
+        id: u64,
+    },
     Key(crossterm::event::KeyEvent),
     ScrollUp,
     ScrollDown,
@@ -246,11 +250,4 @@ pub enum UserEvent {
     /// Leave the TUI in an orderly way (termination signal, lost terminal):
     /// stop any run, save the session and restore the terminal.
     Quit,
-    /// An interactive MCP OAuth login finished in a background task. `error` is
-    /// `None` on success. Handled by the TUI loop to reconnect the server.
-    #[cfg(feature = "mcp")]
-    McpLoginDone {
-        server: CompactString,
-        error: Option<CompactString>,
-    },
 }

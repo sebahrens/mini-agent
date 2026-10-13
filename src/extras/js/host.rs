@@ -6721,7 +6721,11 @@ mod tests {
             let result = broker.dispatch(request, PermCancellation::new()).await;
             (result, broker)
         });
-        let prompt = ask_rx.recv().await.expect("read should request permission");
+        let prompt = ask_rx
+            .recv()
+            .await
+            .expect("read should request permission")
+            .into_permission();
         std::fs::rename(&source, &original).unwrap();
         symlink(&denied_target, &source).unwrap();
         prompt.reply.send(UserDecision::AllowOnce).unwrap();
@@ -6928,6 +6932,7 @@ mod tests {
         let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
         let approvals = tokio::spawn(async move {
             while let Some(prompt) = ask_rx.recv().await {
+                let prompt = prompt.into_permission();
                 let _ = prompt.reply.send(UserDecision::AllowOnce);
             }
         });
@@ -7088,7 +7093,11 @@ mod tests {
             let result = broker.dispatch(request, PermCancellation::new()).await;
             (result, broker)
         });
-        let prompt = ask_rx.recv().await.expect("spawn should block at Ask");
+        let prompt = ask_rx
+            .recv()
+            .await
+            .expect("spawn should block at Ask")
+            .into_permission();
         // The canonical broker order authorizes the bounded raw argv before opening the target.
         // Bytes replaced while Ask is pending therefore become the post-authorization snapshot;
         // execution must use that sealed snapshot rather than reopening the path later.

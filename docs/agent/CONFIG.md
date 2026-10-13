@@ -360,7 +360,7 @@ so fixture names remain visible without advertising them as product configuratio
 |---|---|
 | Private worker dispatch | `MINI_AGENT_INTERNAL_JS_WORKER`, `MINI_AGENT_INTERNAL_JS_GUARDIAN`: parent-owned broker/guardian dispatch. |
 | macOS containment fixtures | `MINI_AGENT_INTERNAL_MACOS_CONTAINMENT_PROBE`, `MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`, `MINI_AGENT_INTERNAL_MACOS_PARENT_DEATH_CANARY`, `MINI_AGENT_CONTAINMENT_EVIDENCE`, `MINI_AGENT_MACOS_CREDENTIAL_SENTINEL`, `MINI_AGENT_MACOS_DESCRIPTOR_BOUND`, `MINI_AGENT_MACOS_GUARDIAN_PGID`, `MINI_AGENT_MACOS_ONE_TIME_IMAGE`, `MINI_AGENT_MACOS_ORIGINAL_EXECUTABLE`, `MINI_AGENT_MACOS_SKILL_SENTINEL`, `MINI_AGENT_MACOS_WORKSPACE_SENTINEL`: hosted containment evidence and canaries. |
-| Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `ZS_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
+| Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `MINI_AGENT_TEST_PROFILE_PUBLICATION`, `ZS_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
 | Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_COMPLETION_ENV`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
 | Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
 | Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
@@ -2128,8 +2128,14 @@ permission:
     "git status": allow
 ```
 
-When compiled with MCP support, `mcp_servers` accepts local stdio and remote
-URL-based servers. A local stdio entry launches `command` directly and passes
+When compiled with MCP support, `/mcp add` and `/mcp remove` update the captured
+global configuration or, with `--project`, the captured workspace's `.mcp.json`.
+Project JSON requires explicit whole-file, content-bound trust review before
+launch; existing trusted project TOML remains supported and takes precedence
+over JSON. See [MCP configuration and live operations](MCP_CONFIGURATION.md)
+for literal arguments, environment placeholders, trust and connection ownership.
+
+`mcp_servers` accepts local stdio and remote URL-based servers. A local stdio entry launches `command` directly and passes
 `args` without shell parsing. `command` may be a bare executable name or an
 absolute executable path; mini-agent resolves platform shims such as Windows
 `.cmd`/`.exe` launchers to an absolute identity before spawn. Bare names are
@@ -2243,9 +2249,11 @@ Servers can also be added per project via `.zerostack/config.toml` (see
 ```
 
 URL servers must use HTTP(S), must not embed user information, and must resolve
-exclusively to public IP addresses. `localhost`, loopback, private, link-local,
-metadata, multicast, documentation, reserved, and other non-public destinations
-are rejected before the connection is created. The addresses that passed this
+exclusively to public IP addresses by default. Explicit `allow_local=true` also
+permits loopback-only literal addresses or DNS results; mixed public/loopback
+sets remain forbidden. Private LAN, link-local, metadata, multicast,
+documentation, reserved, wildcard and other non-public destinations remain
+rejected before the connection is created. The addresses that passed this
 check are pinned for the life of the connection: the HTTP transport (including
 every SSE reconnect) and the OAuth client connect only to them and never
 resolve the server's host again, so a DNS answer that changes to an internal
@@ -2254,8 +2262,10 @@ OAuth client reaches (an authorization server on another domain, a redirect
 target) is held to the same public-address rule on every lookup and hop, and
 `/mcp login` validates the server URL the same way. A configured HTTP(S)
 proxy resolves names itself, so this pinning does not apply to proxied
-requests. Use a stdio server for a local service; the OAuth redirect listener
-is a separate product-owned loopback flow.
+public requests. Explicit loopback clients bypass proxies and still refuse MCP
+redirects; OAuth may use only the captured local server origin, with other
+authorization hosts retaining the public-address rule. The OAuth redirect
+listener remains a separate product-owned loopback flow.
 
 ### OAuth for URL servers
 

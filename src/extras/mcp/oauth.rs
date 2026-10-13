@@ -6,7 +6,9 @@
 //! stored refresh token lets startup reconnect without a browser.
 
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -1367,9 +1369,22 @@ async fn authorization_manager(
     url: &str,
     endpoint: Option<&super::egress::ValidatedEndpoint>,
 ) -> anyhow::Result<AuthorizationManager> {
+    authorization_manager_bound(url, endpoint, None).await
+}
+
+async fn authorization_manager_bound(
+    url: &str,
+    endpoint: Option<&super::egress::ValidatedEndpoint>,
+    source: Option<super::egress::SourceValidator>,
+) -> anyhow::Result<AuthorizationManager> {
     let manager = match endpoint {
         Some(endpoint) => {
-            let client = super::egress::GuardedOAuthHttpClient::new(endpoint)?;
+            let client = match source {
+                Some(source) => {
+                    super::egress::GuardedOAuthHttpClient::with_source_validator(endpoint, source)?
+                }
+                None => super::egress::GuardedOAuthHttpClient::new(endpoint)?,
+            };
             AuthorizationManager::new_with_oauth_http_client(url, std::sync::Arc::new(client)).await
         }
         None => AuthorizationManager::new(url).await,
@@ -1386,17 +1401,22 @@ pub struct LoginSession {
 }
 
 /// Begin an interactive OAuth login: discover metadata, register/authorize, and
-/// return the URL the user must open. Call [`LoginSession::wait_for_callback`]
+/// return the URL the user must open. Call [`LoginSession::wait_for_callback_owned`]
 /// to complete the flow.
-pub async fn begin_login(
+pub(crate) async fn begin_login_bound(
     server_name: &str,
     url: &str,
     settings: &OAuthSettings,
+    allow_local: bool,
+    source: super::egress::SourceValidator,
 ) -> anyhow::Result<LoginSession> {
+    anyhow::ensure!(source(), "MCP OAuth source changed");
     // The login talks to the same server (and its authorization server) as
     // the transport, so it is held to the same public-address policy.
-    let endpoint = super::client::validate_mcp_server_url(url).await?;
-    let mut manager = authorization_manager(url, Some(&endpoint)).await?;
+    let endpoint = super::client::validate_mcp_server_url_policy(url, allow_local).await?;
+    anyhow::ensure!(source(), "MCP OAuth source changed");
+    let mut manager =
+        authorization_manager_bound(url, Some(&endpoint), Some(source.clone())).await?;
     manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let metadata = manager
@@ -1413,6 +1433,7 @@ pub async fn begin_login(
             .await
             .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))?;
 
+    anyhow::ensure!(source(), "MCP OAuth source changed");
     let auth_url = session.get_authorization_url().to_string();
     let expected_state = reqwest::Url::parse(&auth_url)
         .ok()
@@ -1431,22 +1452,185 @@ pub async fn begin_login(
 }
 
 impl LoginSession {
-    /// Run a one-shot loopback listener to catch the redirect, then exchange the
-    /// code for a token (persisted via the credential store). Times out after
-    /// `timeout`.
-    pub async fn wait_for_callback(self, timeout: Duration) -> anyhow::Result<()> {
-        let port = self.redirect_port;
-        let expected_state = self.expected_state.clone();
-        let captured = tokio::task::spawn_blocking(move || {
-            listen_for_callback(port, timeout, &expected_state)
-        })
-        .await??;
-
-        self.session
-            .handle_callback(&captured.code, &captured.state)
-            .await
-            .map_err(|e| anyhow::anyhow!("OAuth token exchange failed: {e}"))?;
+    /// The App owns this listener/future directly. Cancellation drops both the
+    /// accepted socket and listener; there is no detached blocking accept task.
+    pub(crate) async fn wait_for_callback_owned(
+        self,
+        timeout: Duration,
+        validate: impl Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        validate()?;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.redirect_port)).await?;
+        let captured = capture_callback_owned(listener, timeout, &self.expected_state).await?;
+        validate()?;
+        tokio::select! {
+            biased;
+            _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP login cancelled"),
+            result = self.session.handle_callback(&captured.code, &captured.state) => {
+                result.map_err(|_| anyhow::anyhow!("OAuth token exchange failed (credential values omitted)"))?;
+            }
+        }
+        validate()?;
         Ok(())
+    }
+}
+
+async fn capture_callback_owned(
+    listener: tokio::net::TcpListener,
+    timeout: Duration,
+    expected_state: &str,
+) -> anyhow::Result<CapturedCode> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let wait = async {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let read = async {
+                let mut bytes = Vec::with_capacity(512);
+                let mut chunk = [0u8; 512];
+                while bytes.len() < MAX_REDIRECT_REQUEST_LINE_BYTES {
+                    let count = stream
+                        .read(&mut chunk[..512.min(MAX_REDIRECT_REQUEST_LINE_BYTES - bytes.len())])
+                        .await?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.contains(&b'\n') {
+                        break;
+                    }
+                }
+                anyhow::ensure!(bytes.contains(&b'\n'), "invalid redirect request line");
+                let line = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                matching_callback(&line, expected_state)
+            };
+            let (captured, denied) = match tokio::time::timeout(Duration::from_secs(5), read).await
+            {
+                Ok(Ok(captured)) => (Some(captured), false),
+                Ok(Err(error)) if error.is::<AuthorizationDenied>() => (None, true),
+                _ => (None, false),
+            };
+            let (status, body) = if denied {
+                ("200 OK", authorization_denied_body())
+            } else if captured.is_some() {
+                ("200 OK", authorization_complete_body())
+            } else {
+                (
+                    "400 Bad Request",
+                    "Invalid or unrelated OAuth callback; waiting for authorization.".into(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            // A browser that stops reading cannot retain the owning actor.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                stream.write_all(response.as_bytes()),
+            )
+            .await;
+            if denied {
+                anyhow::bail!("OAuth authorization was denied");
+            }
+            if let Some(captured) = captured {
+                return Ok(captured);
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP login cancelled"),
+        result = tokio::time::timeout(timeout, wait) => result.map_err(|_| anyhow::anyhow!("OAuth callback wait timed out"))?,
+    }
+}
+
+#[cfg(test)]
+mod owned_callback_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn owned_callback_rejects_unrelated_state_then_accepts_fragmented_exact_response() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = async {
+            for (state, expected) in [("wrong", "400 Bad Request"), ("owned-state", "200 OK")] {
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                stream
+                    .write_all(b"GET /callback?code=literal%20%E9%9B%AA&state=")
+                    .await
+                    .unwrap();
+                stream
+                    .write_all(format!("{state} HTTP/1.1\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains(expected));
+            }
+        };
+        let (captured, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                capture_callback_owned(listener, Duration::from_secs(2), "owned-state"),
+                client
+            )
+        })
+        .await
+        .unwrap();
+        let captured = captured.unwrap();
+        assert_eq!(captured.code, "literal 雪");
+        assert_eq!(captured.state, "owned-state");
+        assert!(
+            tokio::net::TcpListener::bind(address).await.is_ok(),
+            "owned listener must be released after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_callback_cancellation_releases_listener_and_partial_browser_socket() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cancel = scope.cancellation_handle();
+        let captured = scope
+            .run(async {
+                let browser = async {
+                    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                    stream
+                        .write_all(b"GET /callback?state=unfinished")
+                        .await
+                        .unwrap();
+                    cancel.cancel();
+                    let mut response = Vec::new();
+                    let _ = stream.read_to_end(&mut response).await;
+                };
+                let (captured, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(
+                        capture_callback_owned(listener, Duration::from_secs(180), "owned-state"),
+                        browser
+                    )
+                })
+                .await
+                .unwrap();
+                captured
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_idle())
+            .await
+            .unwrap();
+        assert!(matches!(captured, Err(error) if error.to_string().contains("cancelled")));
+        assert!(
+            tokio::net::TcpListener::bind(address).await.is_ok(),
+            "no detached accept task may retain the cancelled listener"
+        );
     }
 }
 
@@ -1463,16 +1647,7 @@ fn authorization_complete_body() -> String {
 }
 
 /// Blocking single-request loopback HTTP listener for the OAuth redirect.
-fn listen_for_callback(
-    port: u16,
-    timeout: Duration,
-    expected_state: &str,
-) -> anyhow::Result<CapturedCode> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port} for OAuth redirect: {e}"))?;
-    listen_on_callback_listener(listener, timeout, expected_state)
-}
-
+#[cfg(test)]
 fn listen_on_callback_listener(
     listener: std::net::TcpListener,
     timeout: Duration,
@@ -1622,6 +1797,7 @@ fn denied_callback(request_line: &str, expected_state: &str) -> Option<Authoriza
 /// shorter; anything longer is rejected as unrelated.
 const MAX_REDIRECT_REQUEST_LINE_BYTES: usize = 4096;
 
+#[cfg(test)]
 fn read_request_line(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
     // A browser may deliver the request line in more than one segment, so keep
     // reading until a line terminator (or EOF) arrives, bounded in size.

@@ -1,3 +1,7 @@
+#[cfg(feature = "mcp")]
+#[path = "mcp_admin_app.rs"]
+mod mcp_admin_app;
+
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -131,6 +135,8 @@ pub(super) mod test_support {
             event_handle: None,
             prebuild: None,
             terminal_guard: TerminalGuard::detached_for_test(),
+            #[cfg(feature = "mcp")]
+            mcp_admin: None,
             model_cache_generation: 0,
         }
     }
@@ -1166,6 +1172,8 @@ pub(crate) struct App<'a> {
     prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
     /// Last model-cache generation handed to the model picker.
+    #[cfg(feature = "mcp")]
+    mcp_admin: Option<Box<crate::ui::mcp_admin::State>>,
     model_cache_generation: u64,
 }
 
@@ -1663,8 +1671,11 @@ impl<'a> App<'a> {
                     } else if let Some(ref servers) = cfg_clone.mcp_servers {
                         if !servers.is_empty() {
                             Some(
-                                McpClientManager::connect_all_in_binding(servers, &workspace_clone)
-                                    .await,
+                                McpClientManager::connect_config_in_binding(
+                                    &cfg_clone,
+                                    &workspace_clone,
+                                )
+                                .await,
                             )
                         } else {
                             None
@@ -1760,6 +1771,8 @@ impl<'a> App<'a> {
             event_handle,
             prebuild,
             terminal_guard,
+            #[cfg(feature = "mcp")]
+            mcp_admin: None,
             model_cache_generation: crate::ui::slash::model_cache_generation(),
         };
         app.request_git_status_refresh();
@@ -1787,13 +1800,22 @@ impl<'a> App<'a> {
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         let result = self.run_inner().await;
+        #[cfg(feature = "mcp")]
+        let mcp_retirement = self.retire_mcp_work().await;
         if result.is_err() {
             self.cancel_pending_permissions();
             if self.run.pending_turn.is_some() {
                 self.fail_pending_main_turn().await;
             }
         }
-        result
+        #[cfg(feature = "mcp")]
+        {
+            result.and(mcp_retirement)
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            result
+        }
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
@@ -1957,6 +1979,12 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn teardown(mut self) {
+        // The owning actor must retire before its manager/services are closed,
+        // including callers that leave without entering the normal run wrapper.
+        #[cfg(feature = "mcp")]
+        if let Err(error) = self.retire_mcp_work().await {
+            tracing::warn!(%error, "TUI MCP operation cleanup failed");
+        }
         if let Err(error) = self.retire_session_title().await {
             tracing::warn!(%error,"session title cleanup failed");
         }
@@ -2227,6 +2255,10 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        #[cfg(feature = "mcp")]
+        if crate::startup::heap_future(|| self.handle_mcp_user_event(&ev)).await? {
+            return Ok(ControlFlow::Continue(()));
+        }
         if crate::startup::heap_future(|| self.handle_plan_event(&ev)).await? {
             return Ok(ControlFlow::Continue(()));
         }
@@ -2299,6 +2331,8 @@ impl<'a> App<'a> {
             return Ok(ControlFlow::Continue(()));
         }
         match ev {
+            #[cfg(feature = "mcp")]
+            UserEvent::McpAdminDone { .. } => {}
             UserEvent::Resize => {
                 self.renderer.resize();
             }
@@ -2399,10 +2433,6 @@ impl<'a> App<'a> {
             #[cfg(feature = "goal")]
             UserEvent::GoalVerificationDone(event) => {
                 self.handle_goal_verification_event(event).await?;
-            }
-            #[cfg(feature = "mcp")]
-            UserEvent::McpLoginDone { server, error } => {
-                self.handle_mcp_login_done(server, error).await?;
             }
             UserEvent::Key(key) => {
                 match clipboard_shortcut(key, cfg!(windows)) {
@@ -3997,6 +4027,16 @@ impl<'a> App<'a> {
         text: &str,
         question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "mcp")]
+        if self
+            .mcp_admin
+            .as_ref()
+            .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+        {
+            self.input.load_text(text);
+            self.renderer.write_line("Finish or cancel the MCP operation before starting a model turn; input remains in the editor", C_ERROR)?;
+            return Ok(());
+        }
         #[cfg(feature = "git-worktree")]
         anyhow::ensure!(
             self.chain.git.work.is_none(),
@@ -4072,6 +4112,16 @@ impl<'a> App<'a> {
     }
 
     async fn start_internal_main_run(&mut self, text: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "mcp")]
+        if self
+            .mcp_admin
+            .as_ref()
+            .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+        {
+            self.input.load_text(text);
+            self.renderer.write_line("Finish or cancel the MCP operation before starting a model turn; input remains in the editor",C_ERROR)?;
+            return Ok(());
+        }
         if self.budget_admission_notice()? {
             return Ok(());
         }
@@ -4345,6 +4395,10 @@ impl<'a> App<'a> {
     }
 
     async fn run_slash_command(&mut self, text: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "mcp")]
+        if crate::startup::heap_future(|| self.handle_mcp_command(text)).await? {
+            return Ok(());
+        }
         // The ordinary wrapper previously duplicated the measured large
         // selected-command future in the key-handler polling chain.
         crate::startup::heap_future(|| self.run_slash_command_selected(text, None)).await
@@ -4377,6 +4431,18 @@ impl<'a> App<'a> {
             || name == Some("/sessions")
                 && argument.is_some_and(|arg| arg != "--all" && arg != "delete")
         {
+            #[cfg(feature = "mcp")]
+            if self
+                .mcp_admin
+                .as_ref()
+                .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+            {
+                self.renderer.write_line(
+                    "Finish or cancel the MCP operation before changing sessions or workspaces",
+                    C_ERROR,
+                )?;
+                return Ok(());
+            }
             self.retire_session_title().await?;
         }
 
@@ -4654,88 +4720,7 @@ impl<'a> App<'a> {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let resolved = self
-                    .ui
-                    .cfg
-                    .mcp_servers
-                    .as_ref()
-                    .and_then(|m| m.get(&server))
-                    .and_then(|s| {
-                        if let crate::extras::mcp::config::McpServerConfig::Url {
-                            url, oauth, ..
-                        } = s
-                        {
-                            oauth
-                                .as_ref()
-                                .and_then(|o| o.settings())
-                                .map(|set| (url.clone(), set))
-                        } else {
-                            None
-                        }
-                    });
-                match resolved {
-                    Some((url, settings)) => {
-                        self.renderer.write_line(
-                            &format!("starting OAuth login for '{}'...", server),
-                            C_AGENT,
-                        )?;
-                        match crate::extras::mcp::oauth::begin_login(&server, &url, &settings).await
-                        {
-                            Ok(login) => {
-                                let copy_status = match copy_to_clipboard(&login.auth_url).await {
-                                    Ok(ClipboardCopyOutcome::Confirmed) => {
-                                        "open this URL to authorize (copied to clipboard):"
-                                    }
-                                    Ok(ClipboardCopyOutcome::FallbackRequested) => {
-                                        "open this URL to authorize (terminal copy requested):"
-                                    }
-                                    Err(_) => {
-                                        "open this URL to authorize (could not copy to clipboard):"
-                                    }
-                                };
-                                self.renderer.write_line(copy_status, C_AGENT)?;
-                                self.renderer.write_line(&login.auth_url, Color::Cyan)?;
-                                self.renderer.write_line(
-                                    &format!(
-                                        "waiting for authorization on 127.0.0.1:{} in the background...",
-                                        settings.redirect_port()
-                                    ),
-                                    Color::DarkGrey,
-                                )?;
-                                let tx = self.user_tx.clone();
-                                let sname = compact_str::CompactString::new(&server);
-                                tokio::spawn(async move {
-                                    let error = login
-                                        .wait_for_callback(Duration::from_secs(180))
-                                        .await
-                                        .err()
-                                        .map(|e| compact_str::CompactString::new(e.to_string()));
-                                    let _ = tx
-                                        .send(UserEvent::McpLoginDone {
-                                            server: sname,
-                                            error,
-                                        })
-                                        .await;
-                                });
-                            }
-                            Err(err) => {
-                                self.renderer.write_line(
-                                    &format!("login setup failed for '{}': {}", server, err),
-                                    C_ERROR,
-                                )?;
-                            }
-                        }
-                    }
-                    None => {
-                        self.renderer.write_line(
-                            &format!(
-                                "cannot start login for '{}' (not an OAuth URL server)",
-                                server
-                            ),
-                            C_ERROR,
-                        )?;
-                    }
-                }
+                crate::startup::heap_future(|| self.start_mcp_login(server)).await?;
             }
             #[cfg(feature = "git-worktree")]
             Err(e)
@@ -5313,58 +5298,6 @@ impl<'a> App<'a> {
             self.slash.reasoning_enabled,
         )
         .await;
-    }
-
-    #[cfg(feature = "mcp")]
-    async fn handle_mcp_login_done(
-        &mut self,
-        server: compact_str::CompactString,
-        error: Option<compact_str::CompactString>,
-    ) -> anyhow::Result<()> {
-        if let Some(err) = error {
-            self.renderer
-                .write_line(&format!("login failed for '{}': {}", server, err), C_ERROR)?;
-        } else {
-            let server = server.to_string();
-            let server_cfg = self
-                .ui
-                .cfg
-                .mcp_servers
-                .as_ref()
-                .and_then(|m| m.get(&server).cloned());
-            match (self.ui.mcp_manager.as_mut(), server_cfg) {
-                (Some(mgr), Some(scfg)) => match mgr
-                    .reconnect_in_binding(&server, &scfg, &self.ui.workspace)
-                    .await
-                {
-                    Ok(()) => {
-                        let new_agent = self
-                            .ui
-                            .agent_build_ctx()
-                            .rebuild_agent(&self.ui.session.model, self.slash.reasoning_enabled)
-                            .await;
-                        self.run.agent = Some(new_agent);
-                        self.renderer.write_line(
-                            &format!("authorized and connected '{}'", server),
-                            C_AGENT,
-                        )?;
-                    }
-                    Err(err) => {
-                        self.renderer.write_line(
-                            &format!("authorized '{}' but reconnect failed: {}", server, err),
-                            C_ERROR,
-                        )?;
-                    }
-                },
-                _ => {
-                    self.renderer.write_line(
-                        &format!("authorized '{}' (will connect on next start)", server),
-                        C_AGENT,
-                    )?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Stop and join the crossterm event thread so a synchronous stdin

@@ -343,6 +343,26 @@ impl WorkspaceBinding {
     }
 
     pub(crate) fn create_relative_atomic(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+        self.create_relative_atomic_policy(path, content, false)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn create_relative_private_atomic(
+        &self,
+        path: &Path,
+        content: &[u8],
+    ) -> io::Result<()> {
+        self.validate().map_err(io::Error::other)?;
+        self.create_relative_atomic_policy(path, content, true)?;
+        self.validate().map_err(io::Error::other)
+    }
+
+    fn create_relative_atomic_policy(
+        &self,
+        path: &Path,
+        content: &[u8],
+        private: bool,
+    ) -> io::Result<()> {
         let path = self.normalize_relative(path)?;
         let (parent, name) = self.open_parent(&path, true)?;
         let temp = sibling_temp_name(&name);
@@ -358,6 +378,12 @@ impl WorkspaceBinding {
                 options.mode(0o666);
             }
             let mut file = parent.open_with(&temp, &options)?;
+            #[cfg(feature = "mcp")]
+            if private {
+                crate::fs::prepare_new_private_file(&file.try_clone()?.into_std())?;
+            }
+            #[cfg(not(feature = "mcp"))]
+            let _ = private;
             file.write_all(content)?;
             file.flush()?;
             parent.hard_link(&temp, &parent, &name)?;
@@ -405,9 +431,31 @@ impl WorkspaceBinding {
             content,
             expected,
             base,
+            false,
             before_final_identity_check,
             None,
         )
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn replace_relative_private_atomic_expecting(
+        &self,
+        path: &Path,
+        content: &[u8],
+        expected: &crate::fs::CheckedMetadata,
+        base: &crate::fs::ContentDigest,
+    ) -> io::Result<()> {
+        self.validate().map_err(io::Error::other)?;
+        self.replace_relative_atomic_with_hook_and_cancellation(
+            path,
+            content,
+            expected,
+            Some(base),
+            true,
+            || {},
+            None,
+        )?;
+        self.validate().map_err(io::Error::other)
     }
 
     pub(crate) fn replace_relative_atomic_expecting_cancellable(
@@ -423,17 +471,22 @@ impl WorkspaceBinding {
             content,
             expected,
             Some(base),
+            false,
             || {},
             Some(cancellation),
         )
     }
 
+    // Private config publication shares the existing identity/content exchange
+    // while ordinary notebook publication retains its cancellation decision.
+    #[allow(clippy::too_many_arguments)]
     fn replace_relative_atomic_with_hook_and_cancellation(
         &self,
         path: &Path,
         content: &[u8],
         expected: &crate::fs::CheckedMetadata,
         base: Option<&crate::fs::ContentDigest>,
+        private: bool,
         before_final_identity_check: impl FnOnce(),
         cancellation: Option<&crate::fs::AtomicWriteCancellation>,
     ) -> io::Result<()> {
@@ -470,10 +523,16 @@ impl WorkspaceBinding {
                 options.mode(0o600);
             }
             let mut file = parent.open_with(&temp, &options)?;
+            #[cfg(feature = "mcp")]
+            if private {
+                crate::fs::prepare_new_private_file(&file.try_clone()?.into_std())?;
+            }
             file.write_all(content)?;
             file.flush()?;
             let file = file.into_std();
-            file.set_permissions(expected.permissions())?;
+            if !private {
+                file.set_permissions(expected.permissions())?;
+            }
             let replacement_metadata = crate::fs::checked_file_metadata(&file)?;
             drop(file);
             let current = open_file_no_follow(&parent, &name)?;

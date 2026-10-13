@@ -11,6 +11,15 @@ controls how mini-agent selects a subprocess boundary and records the authority 
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
 
+## Windows journal-publication regression inventory
+
+The source-gated publication matrix launches the current libtest image through
+`spawn_guarded`, then kills and exactly reaps its owned child at six publication phases.
+Its exact `Command::new` constructor and eighth normalized `.spawn()` occurrence in
+`src/sandbox/windows.rs` are `TEST-ONLY`; they introduce no production dispatch route.
+The test-only phase selector cannot authorize a profile, ACL grant, or worker in a
+production binary. Existing native installed-probe launches retain their original trust classes.
+
 ## Cost-accounting regression inventory
 
 The concurrent private-ledger receipt regression in `src/spend/ledger.rs` uses
@@ -476,6 +485,12 @@ The pricing metadata assertions in `startup.rs` and `session/title.rs` compare
 numeric `output` values. The setup renderer's price-pair closure also binds
 `output` as a numeric rate inside its formatting macro. Their exact expressions
 and full macro-context digests are classified `NON-PROCESS`.
+The owned MCP live-operation HTTP fixture uses a Tokio `JoinSet::spawn` for
+accepted sockets and a string `status` tuple for its HTTP response. Neither
+creates a native process. Its exact source expressions, occurrence counts and
+full enclosing `tokio::select!` token-context digest are `NON-PROCESS`; the
+fixture owns and joins its socket tasks, including cancellation. No scanner
+rules or production subprocess classifications are relaxed.
 The task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
 `NON-PROCESS`. The ACP cancellation test uses the state-aware process helper;
