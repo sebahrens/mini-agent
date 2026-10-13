@@ -94,3 +94,23 @@ and [cache usage fields](https://platform.claude.com/docs/en/build-with-claude/p
 Production consumer tests in `src/provider_cache_tests.rs` cover initial cache
 counts with output-only delta, cumulative updates/explicit zero/missing split,
 invalid and overflowing metrics, and blocking split preservation.
+
+### Native completed assistant projection (mini-agent-i7ro6.46)
+
+`streaming::StreamingCompletionResponse::native_anthropic_stream` selects a
+private native policy: reasoning deltas remain display events but do not create
+unsigned replay placeholders. Completed signed/text and redacted blocks retain
+their arrival order. `anthropic::streaming::GenericCompletionModel::stream`
+selects this policy; other provider constructors retain existing aggregation.
+`agent::run::streamed::StreamedTurnAssembler::finish_native_anthropic` keeps the
+existing tool validation/identity bookkeeping and commits the normalized native
+choice without generic reasoning/text/tool regrouping. The streaming driver
+uses it only for unrecovered native turns; repaired calls keep their existing
+canonical behavior and cannot claim the original provider sequence.
+
+Actual loopback probes in `src/provider_effort_replay_probe.rs` compare the
+next SDK HTTP body against canonical thinking-first/redacted and adversarial
+interleaved source blocks. They also prove nonempty thinking is not duplicated,
+interrupted signatures do not complete, and generic delta-only aggregation is
+unchanged. This backport does not deliver application Session replay/frontier,
+mutable memory placement, or effort/session controls by itself.

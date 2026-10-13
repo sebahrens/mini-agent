@@ -1277,9 +1277,17 @@ where
             }
 
             self.last_message_id = stream.message_id.clone();
-            let streamed_turn = assembler.finish(stream.message_id.clone(), &final_turn_content);
-            // The canonical (committed) assistant content: `finish` normalizes
-            // reasoning/text/tool ordering, so this can differ from the raw
+            let streamed_turn = if stream.native_anthropic_completed_content && !turn_recovered {
+                assembler.finish_native_anthropic(stream.message_id.clone(), &final_turn_content)
+            } else {
+                // Repaired calls have changed provider content and cannot claim
+                // the original native replay projection. Generic order stays
+                // unchanged for every other provider.
+                assembler.finish(stream.message_id.clone(), &final_turn_content)
+            };
+            // The canonical (committed) assistant content: generic `finish`
+            // normalizes reasoning/text/tool ordering, while the explicit native
+            // completed projection retains original block order. It can differ from the raw
             // `stream.choice` aggregate. `ModelTurnFinished` — the normalized
             // per-turn event — carries this, matching what is recorded into run
             // history; the raw `stream.choice` is kept in `last_final_choice` for

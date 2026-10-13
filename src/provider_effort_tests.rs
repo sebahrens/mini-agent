@@ -1,5 +1,8 @@
 //! Native wire probes for effort/output-format composition and opaque thinking.
 
+#[path = "provider_effort_replay_probe.rs"]
+mod replay_probe;
+
 #[path = "provider_cache_tests.rs"]
 mod cache_tests;
 

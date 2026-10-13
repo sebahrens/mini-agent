@@ -421,7 +421,7 @@ where
             }))
         }.instrument(span));
 
-        Ok(streaming::StreamingCompletionResponse::stream(stream))
+        Ok(streaming::StreamingCompletionResponse::native_anthropic_stream(stream))
     }
 }
 

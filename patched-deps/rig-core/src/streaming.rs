@@ -259,6 +259,9 @@ where
     pub final_response_yielded: AtomicBool,
     /// Provider-assigned message ID (e.g. OpenAI Responses API `msg_` ID).
     pub message_id: Option<String>,
+    /// Native Anthropic replay requires completed blocks in provider order.
+    /// Generic providers keep the historical delta aggregation policy.
+    pub(crate) native_anthropic_completed_content: bool,
 }
 
 impl<R> StreamingCompletionResponse<R>
@@ -281,7 +284,16 @@ where
             response: None,
             final_response_yielded: AtomicBool::new(false),
             message_id: None,
+            native_anthropic_completed_content: false,
         }
+    }
+
+    /// Native Anthropic deltas are display-only; signed/redacted completed
+    /// blocks are emitted separately at their actual block boundaries.
+    pub(crate) fn native_anthropic_stream(inner: StreamingResult<R>) -> Self {
+        let mut stream = Self::stream(inner);
+        stream.native_anthropic_completed_content = true;
+        stream
     }
 
     /// Cancel the stream. Cancellation is surfaced as normal stream termination.
@@ -505,7 +517,9 @@ where
                 }
                 RawStreamingChoice::ReasoningDelta { id, reasoning } => {
                     stream.text_item_index = None;
-                    stream.append_reasoning_chunk(&id, &reasoning);
+                    if !stream.native_anthropic_completed_content {
+                        stream.append_reasoning_chunk(&id, &reasoning);
+                    }
                     Poll::Ready(Some(Ok(StreamedAssistantContent::ReasoningDelta {
                         id,
                         reasoning,

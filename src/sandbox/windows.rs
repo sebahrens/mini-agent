@@ -6340,7 +6340,14 @@ mod tests {
                         let value: serde_json::Value =
                             serde_json::from_slice(&std::fs::read(path).unwrap())
                                 .expect("final authority must always be complete JSON");
-                        assert_eq!(value["version"], 1);
+                        let expected_version = match path.extension().and_then(OsStr::to_str) {
+                            Some(PROFILE_INTENT_EXTENSION) => PROFILE_INTENT_VERSION,
+                            Some(extension) if extension == RecordKind::Journal.extension() => {
+                                PROFILE_JOURNAL_VERSION
+                            }
+                            _ => panic!("unexpected final authority record kind"),
+                        };
+                        assert_eq!(value["version"], expected_version);
                     }
                 }
                 if let Some(storage) = &storage {

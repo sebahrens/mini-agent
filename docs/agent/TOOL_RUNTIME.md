@@ -708,3 +708,10 @@ provider-reported data; it is never inferred from the requested cache TTL.
 This transport correction does not enable a one-hour configuration or change
 memory placement. Application tier pricing and durable receipt compatibility
 are reviewed separately before that option is exposed.
+
+`src/provider_effort_replay_probe.rs` owns the native completed-content order
+fixtures. Actual SDK follow-up requests preserve completed native thinking,
+redacted, text, and tool block order; partial thinking remains display-only.
+Other provider aggregation and tool-batch validation remain unchanged. The
+fixture also records the application's current history conversion separately;
+SDK projection support alone does not imply saved-history replay support.

@@ -625,6 +625,19 @@ impl StreamedTurnAssembler {
         }
     }
 
+    /// Preserve the normalized completed native Anthropic block projection.
+    /// `finish` still owns tool validation/identity bookkeeping; only the
+    /// committed replay content uses the provider's original completed order.
+    pub fn finish_native_anthropic(
+        self,
+        message_id: Option<String>,
+        final_choice: &OneOrMany<AssistantContent>,
+    ) -> StreamedTurn {
+        let mut turn = self.finish(message_id, final_choice);
+        turn.choice = final_choice.clone();
+        turn
+    }
+
     fn name_delta_diagnostic_tool_call(
         &self,
         id: &str,
