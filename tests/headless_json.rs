@@ -259,6 +259,10 @@ impl TempRoot {
                     | "second_wait"
                     | "verification"
                     | "verification_without_shell"
+                    | "permission_allow"
+                    | "permission_deny"
+                    | "permission_ask"
+                    | "permission_readonly"
                     // A goal runs its bounded round, then the wrap-up round.
                     | "goal_rounds"
                     | "tool_completed"
@@ -329,7 +333,11 @@ impl TempRoot {
                     // driven by its validator.
                     "validation_no_tools" => Some(&[]),
                     "validation_read_only" => Some(&["read", "goal_report"]),
-                    "verification_without_shell" => Some(&["write"]),
+                    "verification_without_shell"
+                    | "permission_allow"
+                    | "permission_deny"
+                    | "permission_ask"
+                    | "permission_readonly" => Some(&["write"]),
                     _ => None,
                 };
                 if let Some(expected) = expected_tools {
@@ -385,17 +393,19 @@ impl TempRoot {
                 let (status, content_type, body) = if failed {
                     (if outcome == "gated_transient_failure" { "500 Internal Server Error" } else { "400 Bad Request" }, "application/json", r#"{"error":{"message":"local provider failure","type":"invalid_request_error"}}"#.to_owned())
                 } else {
-                    let partial = matches!(
-                        outcome,
-                        "partial_failure" | "partial_wait" | "active_command"
-                    ) || (matches!(
-                        outcome,
-                        "tool_completed"
-                            | "flood_after_tool"
-                            | "flood_reasoning_after_tool"
-                            | "gated_partial_failure"
-                            | "gated_transient_failure"
-                    ) && index == 0)
+                    let partial = (outcome.starts_with("permission_") && index == 0)
+                        || matches!(
+                            outcome,
+                            "partial_failure" | "partial_wait" | "active_command"
+                        )
+                        || (matches!(
+                            outcome,
+                            "tool_completed"
+                                | "flood_after_tool"
+                                | "flood_reasoning_after_tool"
+                                | "gated_partial_failure"
+                                | "gated_transient_failure"
+                        ) && index == 0)
                         || (matches!(outcome, "verification" | "verification_without_shell")
                             && index == 0);
                     let shell = outcome == "active_command" && index == 1;
@@ -441,7 +451,7 @@ impl TempRoot {
                                 "arguments": if shell {
                                     serde_json::json!({"command":"trap '' TERM; echo $$ > command.pid; exec /bin/sleep 30"}).to_string()
                                 } else {
-                                    serde_json::json!({"path":"effect.txt", "content":"written\n"}).to_string()
+                                    serde_json::json!({"path":if outcome.starts_with("permission_") { "tmp/effect.txt" } else { "effect.txt" }, "content":"written\n"}).to_string()
                                 }
                             }}]}),
                             serde_json::Value::Null,
@@ -3377,4 +3387,167 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             Err(error) => panic!("{mode}: provider fixture: {error}"),
         }
     }
+}
+
+#[test]
+fn cli_permission_seeds_allow_exact_effects_deny_and_fail_closed_without_saved_grants() {
+    struct ProviderOwner(Option<std::thread::JoinHandle<std::io::Result<()>>>);
+    impl ProviderOwner {
+        fn join(&mut self) {
+            assert!(self.0.take().unwrap().join().unwrap().is_ok());
+        }
+    }
+    impl Drop for ProviderOwner {
+        fn drop(&mut self) {
+            // Every listener accept/read/write already has a finite deadline.
+            if let Some(thread) = self.0.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    for outcome in [
+        "permission_allow",
+        "permission_deny",
+        "permission_ask",
+        "permission_readonly",
+    ] {
+        let root = TempRoot::new();
+        std::fs::create_dir(root.0.join("tmp")).unwrap();
+        let mut server = ProviderOwner(Some(root.local_provider(outcome)));
+        let mut command = root.command();
+        command
+            .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args([
+                "--no-sandbox",
+                "--no-context-files",
+                "--tools",
+                "write",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "-p",
+                "--output",
+                "json",
+                "write the file",
+            ]);
+        command.arg(if outcome == "permission_readonly" {
+            "--read-only"
+        } else {
+            "--guarded"
+        });
+        if outcome != "permission_ask" {
+            command.args(["--allow", "write:tmp/**"]);
+        }
+        if outcome == "permission_deny" {
+            command.args(["--deny", "write:**/effect.txt"]);
+        }
+        let output = bounded_output(command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{outcome}: {stderr}");
+        server.join();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["result"], "finished", "{result}");
+        let effect = root.0.join("tmp/effect.txt");
+        assert_eq!(
+            effect.exists(),
+            outcome == "permission_allow",
+            "{outcome}: {result}"
+        );
+        if effect.exists() {
+            assert_eq!(std::fs::read_to_string(&effect).unwrap(), "written\n");
+        }
+        let session = root.saved_session();
+        assert!(
+            session["permission_allowlist"]
+                .as_array()
+                .is_none_or(|entries| entries.is_empty()),
+            "CLI seeds must not be session AllowAlways grants: {session}"
+        );
+        let config = std::fs::read_to_string(root.0.join("config.toml")).unwrap();
+        assert!(
+            !config.contains("tmp/**") && !config.contains("**/effect.txt"),
+            "CLI seeds must not be saved: {config}"
+        );
+        if outcome != "permission_allow" {
+            assert!(
+                session["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("Permission denied"))),
+                "blocked result must be recorded: {session}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_permission_seed_validation_precedes_provider_and_omits_sensitive_values() {
+    for flag in ["--allow", "--deny", "--allow-prefix"] {
+        let root = TempRoot::new();
+        let mut command = root.command();
+        command.args([
+            flag,
+            "PRIVATE_RULE_CANARY:nope",
+            "--provider",
+            "does-not-exist",
+            "-p",
+            "hello",
+        ]);
+        let output = bounded_output(command);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(flag) && stderr.contains("rule 1"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("PRIVATE_RULE_CANARY") && !stderr.contains("mini-agent --setup"),
+            "{stderr}"
+        );
+        assert!(!root.0.join("sessions").exists());
+    }
+}
+
+#[test]
+fn cli_permission_seed_print_config_lists_effective_rules_without_shell_secrets() {
+    let root = TempRoot::new();
+    let mut command = root.command();
+    command.args([
+        "--print-config",
+        "--allow",
+        "shell:echo PRIVATE_RULE_CANARY",
+        "--allow",
+        "write:tmp/**",
+        "--deny",
+        "write:**/*.env",
+        "--allow-prefix",
+        "bash:git status",
+    ]);
+    let output = bounded_output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for required in [
+        "Permission rule inventory",
+        "permission-allow",
+        "shell: 1 entries",
+        "write: 1 entries",
+        "permission-allow-prefix",
+        "sha256:",
+        "invocation only",
+    ] {
+        assert!(stdout.contains(required), "{stdout}");
+    }
+    assert!(!stdout.contains("PRIVATE_RULE_CANARY"), "{stdout}");
+    assert!(!root.0.join("sessions").exists());
 }

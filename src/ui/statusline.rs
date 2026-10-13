@@ -407,10 +407,7 @@ fn resolve_item(
         "cost" => (session.total_cost > 0.0 || session.show_cost_always || always)
             .then(|| format!("${:.4}", session.total_cost)),
         "prompt" => ctx.prompt_name.map(|s| format!("prompt:{s}")),
-        "mode" => ctx
-            .perm_mode
-            .filter(|m| *m != "standard")
-            .map(|m| format!("mode:{m}")),
+        "mode" => ctx.perm_mode.map(|m| format!("mode:{m}")),
         "sandbox" => ctx.sandbox_label.map(str::to_string),
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
         "goal" => ctx.goal_label.map(|s| format!("[{s}]")),

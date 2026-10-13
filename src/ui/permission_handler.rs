@@ -19,6 +19,8 @@ enum PromptInput {
     AllowSession,
     /// Allow read, edit and list_dir on the request's folder for the session.
     AllowFolder,
+    /// Only native write/edit under the captured workspace, for this session.
+    AllowWorkspaceEdits,
     Deny,
     /// Esc / Ctrl+C / Ctrl+D: deny and stop the current run.
     Abort,
@@ -63,6 +65,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('y' | 'Y') if plain => PromptInput::AllowOnce,
         KeyCode::Char('a' | 'A') if plain => PromptInput::AllowSession,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
+        KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
         KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
         KeyCode::Char('e' | 'E') if plain => PromptInput::ToggleFull,
@@ -130,6 +133,7 @@ pub(crate) struct PermissionState {
     request: Option<crate::permission::ask::AskRequest>,
     offer: Option<PromptGrantOffer>,
     folder: Option<std::path::PathBuf>,
+    workspace_edits: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     was_at_bottom: bool,
     instruction: Option<String>,
 }
@@ -171,10 +175,18 @@ impl PermissionState {
                 guard.folder_grant_scope(&request.tool, &request.input),
             )
         });
+        let workspace_edits = ui.permission.as_ref().and_then(|permission| {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .can_offer_workspace_edits(&request.tool, &request.input, &ui.workspace)
+                .then(|| ui.workspace.clone())
+        });
         let state = Self {
             request: Some(request),
             offer,
             folder,
+            workspace_edits,
             was_at_bottom: !renderer.is_scrolling(),
             instruction: None,
         };
@@ -189,6 +201,7 @@ impl PermissionState {
             request: None,
             offer: None,
             folder: None,
+            workspace_edits: None,
             was_at_bottom: !renderer.is_scrolling(),
             instruction: Some(String::new()),
         };
@@ -223,19 +236,26 @@ impl PermissionState {
 
     fn show(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
         let request = self.request.as_ref().expect("approval owns its request");
-        let (header, options) = match &self.offer {
+        let (header, mut options) = match &self.offer {
             Some(offer) => (prompt_grant_header(offer), PROMPT_GRANT_OPTIONS.to_string()),
             None => (
                 format!("[permission] {}: {}", request.tool, request.input),
                 permission_options(self.folder.as_deref()),
             ),
         };
+        if let Some(workspace) = &self.workspace_edits {
+            options.push_str(&format!(
+                "  (w) allow writes/edits in {} for this session",
+                workspace.root().display()
+            ));
+        }
         let header = sanitize_for_review(&header);
+        let options = sanitize_for_review(&options);
         renderer.write_line(&header, C_PERM)?;
         renderer.write_line(&options, C_PERM)?;
         renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
             tool: header,
-            options: options.into(),
+            options,
             expanded: false,
         });
         draw_prompt(renderer)?;
@@ -331,10 +351,44 @@ impl PermissionState {
         }
         if input == PromptInput::Ignore
             || (input == PromptInput::AllowFolder && self.folder.is_none())
+            || (input == PromptInput::AllowWorkspaceEdits && self.workspace_edits.is_none())
             || (self.offer.is_some()
                 && matches!(input, PromptInput::AllowSession | PromptInput::AllowFolder))
         {
             return Ok(PermissionEvent::Waiting);
+        }
+        if input == PromptInput::AllowWorkspaceEdits {
+            // A stale request or replaced workspace cannot change session state.
+            let request = self.request.take().expect("approval owns its request");
+            let entries = match (&self.workspace_edits, &ui.permission) {
+                (Some(workspace), Some(permission)) => {
+                    let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+                    if run.is_running
+                        && !request.reply.is_closed()
+                        && checker.can_offer_workspace_edits(
+                            &request.tool,
+                            &request.input,
+                            workspace,
+                        )
+                    {
+                        if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                            checker.add_workspace_edit_grant(workspace)?
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        let _ = request.reply.send(UserDecision::Deny);
+                        Vec::new()
+                    }
+                }
+                _ => {
+                    let _ = request.reply.send(UserDecision::Deny);
+                    Vec::new()
+                }
+            };
+            self.finish(renderer)?;
+            record_session_grants(entries, renderer, ui, run)?;
+            return Ok(PermissionEvent::Finished);
         }
         if matches!(input, PromptInput::Abort | PromptInput::StopWithInstruction) {
             if self.offer.is_some()
@@ -543,6 +597,17 @@ mod tests {
                 .contains("(f) allow read+edit+list in /home/me/.config/mini for this session")
         );
         assert!(with_folder.contains("(a) allow for this session"));
+    }
+
+    #[test]
+    fn workspace_edit_answer_requires_plain_w() {
+        let key = |c| classify_prompt_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        assert_eq!(key('w'), PromptInput::AllowWorkspaceEdits);
+        assert_eq!(key('W'), PromptInput::AllowWorkspaceEdits);
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            PromptInput::Ignore
+        );
     }
 
     #[test]

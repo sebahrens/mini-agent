@@ -1864,6 +1864,20 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        // A pending approval is never answered by mode cycling. Pickers keep
+        // their own BackTab navigation, and modified shortcuts remain ignored.
+        if matches!(&ev, UserEvent::Key(key) if key.code == KeyCode::BackTab
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT))
+            && !self
+                .input
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.active())
+        {
+            self.cycle_permission_mode()?;
+            self.refresh()?;
+            return Ok(ControlFlow::Continue(()));
+        }
         if self.handle_permission_event(&ev).await? {
             return Ok(ControlFlow::Continue(()));
         }
@@ -2071,6 +2085,25 @@ impl<'a> App<'a> {
                 self.renderer.clear_selection();
             }
         }
+        Ok(())
+    }
+
+    fn cycle_permission_mode(&mut self) -> anyhow::Result<()> {
+        let Some(permission) = &self.ui.permission else {
+            self.renderer
+                .show_notice("permission system not active", C_ERROR);
+            return Ok(());
+        };
+        let ring =
+            crate::permission::permission_mode_cycle(self.ui.cfg.permission_mode_cycle.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+        let index = ring.iter().position(|mode| *mode == checker.mode());
+        let mode = ring[index.map_or(0, |index| (index + 1) % ring.len())];
+        checker.set_mode(mode);
+        drop(checker);
+        self.renderer
+            .show_notice(&format!("security mode: {mode}"), Color::Green);
         Ok(())
     }
 
@@ -6072,6 +6105,404 @@ mod permission_loop_tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn actual_mode_cycle_preserves_drafts_queue_and_unanswered_permission() {
+        use crate::permission::{SecurityMode, checker::PermissionChecker};
+        let root = crate::tests::OwnedTestDirectory::new("mode-cycle-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let permission = Arc::new(std::sync::Mutex::new(
+            PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(root.path().into()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        ui.permission = Some(permission.clone());
+        let mut app = fixture_app(ui);
+        app.input.buffer = "typed follow-up".into();
+        app.input.cursor = app.input.buffer.len();
+        let cycle = || UserEvent::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        for mode in [
+            SecurityMode::Guarded,
+            SecurityMode::Yolo,
+            SecurityMode::Standard,
+        ] {
+            let _ = app.handle_user_event(cycle()).await.unwrap();
+            assert_eq!(permission.lock().unwrap().mode(), mode);
+            assert_eq!(
+                app.renderer.notice_text(),
+                Some(format!("security mode: {mode}").as_str())
+            );
+            assert!(
+                app.renderer
+                    .captured_output()
+                    .contains(&format!("mode:{mode}"))
+            );
+        }
+        let mut empty_picker = crate::ui::pickers::list::ListPicker::new();
+        empty_picker.activate();
+        app.input.picker = Some(crate::ui::input::Picker::Bang(empty_picker));
+        let _ = app.handle_user_event(cycle()).await.unwrap();
+        assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Standard);
+        app.input.picker = None;
+        app.input.start_command_picker();
+        if let Some(crate::ui::input::Picker::Command(picker)) = app.input.picker.as_mut() {
+            picker.selected = 1;
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        if let Some(crate::ui::input::Picker::Command(picker)) = app.input.picker.as_ref() {
+            assert_eq!(picker.selected, 0);
+        } else {
+            panic!("picker was closed by mode shortcut");
+        }
+        assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Standard);
+        app.input.picker = None;
+        let pending = PendingMainTurn::capture(app.ui.session, "original active prompt");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        app.run.pending_inputs.push_back("queued follow-up".into());
+        let (ask, mut decision) = request("pending exact shell request");
+        app.begin_permission_request(ask).unwrap();
+        let _ = app.handle_user_event(cycle()).await.unwrap();
+        assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Guarded);
+        assert!(matches!(
+            decision.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(app.permission_prompt.is_some());
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(app.input.buffer, "typed follow-up");
+        assert_eq!(app.run.pending_inputs.len(), 1);
+        let modified = UserEvent::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let _ = app.handle_user_event(modified).await.unwrap();
+        assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Guarded);
+        permission
+            .lock()
+            .unwrap()
+            .set_prompt_mode(SecurityMode::ReadOnly);
+        permission.lock().unwrap().restore_user_mode();
+        assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Guarded);
+        let _ = app
+            .handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(replied(decision).await, UserDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn actual_mode_cycle_uses_custom_order_and_enters_ring_from_other_modes() {
+        use crate::permission::{SecurityMode, checker::PermissionChecker};
+        let root = crate::tests::OwnedTestDirectory::new("mode-cycle-custom-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        for (ring, current, expected) in [
+            (None, SecurityMode::ReadOnly, vec![SecurityMode::Standard]),
+            (
+                Some(vec!["readonly", "planwrite", "guarded"]),
+                SecurityMode::Standard,
+                vec![
+                    SecurityMode::ReadOnly,
+                    SecurityMode::PlanWrite,
+                    SecurityMode::Guarded,
+                    SecurityMode::ReadOnly,
+                ],
+            ),
+            (
+                Some(vec!["readonly"]),
+                SecurityMode::Guarded,
+                vec![SecurityMode::ReadOnly, SecurityMode::ReadOnly],
+            ),
+        ] {
+            let mut cfg = fixture_config();
+            cfg.permission_mode_cycle =
+                ring.map(|ring| ring.into_iter().map(str::to_owned).collect());
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+            let permission = Arc::new(std::sync::Mutex::new(
+                PermissionChecker::new(
+                    &crate::permission::PermissionConfigs::default(),
+                    current,
+                    Some(root.path().into()),
+                    None,
+                )
+                .unwrap(),
+            ));
+            let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+            ui.permission = Some(permission.clone());
+            let mut app = fixture_app(ui);
+            for mode in expected {
+                let _ = app
+                    .handle_user_event(UserEvent::Key(KeyEvent::new(
+                        KeyCode::BackTab,
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                assert_eq!(permission.lock().unwrap().mode(), mode);
+                permission.lock().unwrap().restore_user_mode();
+                assert_eq!(permission.lock().unwrap().mode(), mode);
+                assert_eq!(
+                    app.renderer.notice_text(),
+                    Some(format!("security mode: {mode}").as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_workspace_edit_answer_grants_only_native_mutations_and_rejects_stale_requests()
+    {
+        use crate::permission::{
+            SecurityMode,
+            checker::{CheckResult, PermissionChecker, PromptGrantOffer},
+        };
+        let root = crate::tests::OwnedTestDirectory::new("workspace-edit-answer-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        for kind in [
+            "write",
+            "edit",
+            "read",
+            "external",
+            "stale",
+            "retired",
+            "prompt-offer",
+        ] {
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+            let target = workspace
+                .root()
+                .join("new.txt")
+                .to_string_lossy()
+                .into_owned();
+            let mut checker = PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                SecurityMode::Restrictive,
+                Some(root.path().into()),
+                None,
+            )
+            .unwrap();
+            if kind == "prompt-offer" {
+                checker.set_prompt_grant_offer(Some(PromptGrantOffer {
+                    prompt: "review".into(),
+                    dir: workspace.root().into(),
+                    tools: vec!["read", "edit"],
+                }));
+            }
+            let permission = Arc::new(std::sync::Mutex::new(checker));
+            let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+            ui.permission = Some(permission.clone());
+            let mut app = fixture_app(ui);
+            let pending = PendingMainTurn::capture(app.ui.session, "grant mutation request");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            app.run.is_running = true;
+            let outside = root
+                .path()
+                .parent()
+                .unwrap()
+                .join("ungranted-neighbor.txt")
+                .to_string_lossy()
+                .into_owned();
+            let (mut ask, mut decision) = request(if kind == "external" {
+                &outside
+            } else {
+                &target
+            });
+            ask.tool = if kind == "read" {
+                "read"
+            } else if kind == "write" {
+                "write"
+            } else {
+                "edit"
+            }
+            .into();
+            let (asks, receiver) = mpsc::channel(4);
+            app.ask_rx = Some(receiver);
+            sent(&asks, ask).await;
+            drain(&mut app).await;
+            let eligible = !matches!(kind, "read" | "external");
+            assert_eq!(
+                app.renderer
+                    .captured_output()
+                    .contains("(w) allow writes/edits"),
+                eligible
+            );
+            if kind == "stale" {
+                drop(decision);
+                let _ = app
+                    .handle_user_event(UserEvent::Key(KeyEvent::new(
+                        KeyCode::Char('w'),
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                assert!(app.ui.session.permission_allowlist.is_empty());
+                continue;
+            }
+            if kind == "retired" {
+                app.run.is_running = false;
+            }
+            sent(
+                &app.user_tx,
+                UserEvent::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            )
+            .await;
+            drain(&mut app).await;
+            if !eligible {
+                assert!(matches!(
+                    decision.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(app.ui.session.permission_allowlist.is_empty());
+                let _ = app
+                    .handle_user_event(UserEvent::Key(KeyEvent::new(
+                        KeyCode::Char('n'),
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                assert!(matches!(replied(decision).await, UserDecision::Deny));
+            } else if kind == "retired" {
+                assert!(matches!(replied(decision).await, UserDecision::Deny));
+                assert!(app.ui.session.permission_allowlist.is_empty());
+            } else {
+                assert!(matches!(replied(decision).await, UserDecision::AllowOnce));
+                assert_eq!(app.ui.session.permission_allowlist.len(), 4);
+                assert!(
+                    app.ui
+                        .session
+                        .permission_allowlist
+                        .iter()
+                        .all(|entry| matches!(entry.tool.as_str(), "write" | "edit"))
+                );
+                for tool in ["write", "edit"] {
+                    assert_eq!(
+                        permission.lock().unwrap().check_path(tool, &target),
+                        CheckResult::Allowed
+                    );
+                }
+                for tool in ["read", "js/write_file"] {
+                    assert_eq!(
+                        permission.lock().unwrap().check_path(tool, &target),
+                        CheckResult::Ask
+                    );
+                }
+                assert_eq!(permission.lock().unwrap().mode(), SecurityMode::Restrictive);
+                if kind == "prompt-offer" {
+                    assert!(
+                        permission
+                            .lock()
+                            .unwrap()
+                            .prompt_grant_offer_for("read", &target)
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actual_workspace_edit_answer_rejects_binding_replaced_while_prompt_waits() {
+        use crate::permission::{
+            SecurityMode,
+            checker::{CheckResult, PermissionChecker},
+        };
+        let root = crate::tests::OwnedTestDirectory::new("workspace-edit-replaced-app");
+        let _environment = environment(&root);
+        let directory = root.path().join("workspace");
+        std::fs::create_dir(&directory).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&directory).unwrap());
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let permission = Arc::new(std::sync::Mutex::new(
+            PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                SecurityMode::Restrictive,
+                Some(directory.clone()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let target = workspace
+            .root()
+            .join("new.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        ui.permission = Some(permission.clone());
+        let mut app = fixture_app(ui);
+        let pending = PendingMainTurn::capture(app.ui.session, "approve retained workspace");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        let (mut ask, decision) = request(&target);
+        ask.tool = "write".into();
+        app.begin_permission_request(ask).unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("(w) allow writes/edits")
+        );
+        std::fs::rename(&directory, root.path().join("retained")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(replied(decision).await, UserDecision::Deny));
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(
+            permission.lock().unwrap().check_path("write", &target),
+            CheckResult::Ask
+        );
+        assert!(!directory.join("new.txt").exists());
+        assert!(app.permission_prompt.is_none());
     }
 
     #[tokio::test]

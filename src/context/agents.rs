@@ -8,6 +8,14 @@ const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_AGENT_DESCRIPTION_CHARS: usize = 160;
 const MAX_AGENT_MODEL_CHARS: usize = 256;
 const MAX_PROJECT_NOTES_BYTES: usize = 64 * 1024;
+const MAX_PROJECT_AGENT_ENTRIES: usize = 1_024;
+const MAX_PROJECT_AGENT_FILES: usize = 128;
+// Low to high priority: retain the legacy directory's override precedence.
+const PROJECT_AGENT_LAYERS: [&str; 3] =
+    [".claude/agents", ".mini-agent/agents", ".zerostack/agents"];
+const MAX_DECLARED_TOOLS: usize = 128;
+const MAX_TOOL_NAME_CHARS: usize = 64;
+const MAX_NOTICE_NAMES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentTool {
@@ -62,6 +70,7 @@ struct AgentMetadata {
     mode: Option<String>,
     description: Option<String>,
     tools: Option<Vec<AgentTool>>,
+    tool_narrowing_notice: Option<String>,
     model: Option<String>,
     turn_budget: Option<AgentTurnBudget>,
     /// The turn budget came from the deprecated `effort` alias.
@@ -161,10 +170,14 @@ fn normalize_agent_definition(
             Ok(description)
         })
         .transpose()?;
-    let tools = mapping
+    let parsed_tools = mapping
         .get(serde_yaml_ng::Value::String("tools".into()))
         .map(parse_agent_tools)
         .transpose()?;
+    let (tools, tool_narrowing_notice) = match parsed_tools {
+        Some((tools, notice)) => (Some(tools), notice),
+        None => (None, None),
+    };
     let model = mapping
         .get(serde_yaml_ng::Value::String("model".into()))
         .map(|value| {
@@ -238,6 +251,7 @@ fn normalize_agent_definition(
                     mode,
                     description,
                     tools,
+                    tool_narrowing_notice,
                     model,
                     turn_budget,
                     deprecated_effort_alias,
@@ -248,7 +262,9 @@ fn normalize_agent_definition(
         .ok_or("prompt body is empty")
 }
 
-fn parse_agent_tools(value: &serde_yaml_ng::Value) -> Result<Vec<AgentTool>, &'static str> {
+fn parse_agent_tools(
+    value: &serde_yaml_ng::Value,
+) -> Result<(Vec<AgentTool>, Option<String>), &'static str> {
     let names = if let Some(list) = value.as_sequence() {
         list.iter()
             .map(|value| {
@@ -264,18 +280,48 @@ fn parse_agent_tools(value: &serde_yaml_ng::Value) -> Result<Vec<AgentTool>, &'s
         return Err("frontmatter tools must be a comma-separated string or string list");
     };
 
-    let mut tools = Vec::with_capacity(names.len());
+    if names.len() > MAX_DECLARED_TOOLS {
+        return Err("frontmatter tools exceeds the 128 entry limit");
+    }
+    let mut tools = Vec::new();
+    let mut ignored = Vec::new();
     for name in names {
         if name.is_empty() {
             return Err("frontmatter tools contains an empty tool name");
         }
-        let tool = AgentTool::parse(name)
-            .ok_or("frontmatter tools contains a tool outside the read-only subagent set")?;
-        if !tools.contains(&tool) {
-            tools.push(tool);
+        if name.chars().count() > MAX_TOOL_NAME_CHARS
+            || !name.is_ascii()
+            || name.chars().any(char::is_control)
+        {
+            return Err("frontmatter tool names must be printable ASCII and at most 64 characters");
+        }
+        if let Some(tool) = AgentTool::parse(name) {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        } else if !ignored.contains(&name) {
+            ignored.push(name);
         }
     }
-    Ok(tools)
+    let notice = (!ignored.is_empty()).then(|| {
+        let names = ignored.iter().take(MAX_NOTICE_NAMES).copied().collect::<Vec<_>>().join(", ");
+        let more = if ignored.len() > MAX_NOTICE_NAMES {
+            format!(" (and {} more)", ignored.len() - MAX_NOTICE_NAMES)
+        } else { String::new() };
+        format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools")
+    });
+    Ok((tools, notice))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_for_test(name: &str, content: &str) -> AgentDefinition {
+    let mut definitions = HashMap::new();
+    merge_definitions(
+        &mut definitions,
+        [normalize_agent_definition(name.to_string(), content.to_string()).unwrap()],
+        AgentDefinitionSource::Embedded,
+    );
+    definitions.remove(name).unwrap()
 }
 
 fn normalize_agent_definitions(
@@ -320,6 +366,7 @@ fn merge_definitions(
 ) {
     for (name, prompt, metadata) in definitions {
         warn_metadata(&name, &source, &metadata);
+        let notices = metadata_notices(&metadata);
         agents.insert(
             name,
             AgentDefinition {
@@ -331,13 +378,24 @@ fn merge_definitions(
                 turn_budget: metadata.turn_budget,
                 source: source.clone(),
                 project_notes_path: None,
-                ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
+                ignored_definition_notices: notices,
             },
         );
     }
 }
 
 impl AgentDefinition {
+    pub(crate) fn list_entry(&self, name: &str) -> String {
+        let notice = self
+            .ignored_definition_notices
+            .iter()
+            .find(|notice| notice.starts_with("[specialist metadata: tools "));
+        match notice {
+            Some(notice) => format!("  {name} — {notice}"),
+            None => format!("  {name}"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(prompt: &str, mode: Option<&str>) -> Self {
         Self {
@@ -427,6 +485,14 @@ impl AgentDefinition {
     }
 }
 
+fn metadata_notices(metadata: &AgentMetadata) -> Vec<String> {
+    let mut notices = unknown_key_notices(&metadata.unknown_keys);
+    if let Some(notice) = &metadata.tool_narrowing_notice {
+        notices.push(format!("[specialist metadata: {notice}]"));
+    }
+    notices
+}
+
 fn unknown_key_notices(keys: &[String]) -> Vec<String> {
     if keys.is_empty() {
         Vec::new()
@@ -439,6 +505,13 @@ fn unknown_key_notices(keys: &[String]) -> Vec<String> {
 }
 
 fn warn_metadata(name: &str, source: &AgentDefinitionSource, metadata: &AgentMetadata) {
+    if let Some(notice) = &metadata.tool_narrowing_notice {
+        tracing::warn!(
+            agent_type = name,
+            notice,
+            "narrowing specialist tools to supported read-only set"
+        );
+    }
     if metadata.unknown_keys.is_empty() && !metadata.deprecated_effort_alias {
         return;
     }
@@ -581,6 +654,7 @@ fn merge_external_definitions(
         match normalized {
             Ok((name, prompt, metadata)) => {
                 warn_metadata(&name, &source, &metadata);
+                let notices = metadata_notices(&metadata);
                 agents.insert(
                     name,
                     AgentDefinition {
@@ -592,7 +666,7 @@ fn merge_external_definitions(
                         turn_budget: metadata.turn_budget,
                         source: source.clone(),
                         project_notes_path: None,
-                        ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
+                        ignored_definition_notices: notices,
                     },
                 );
             }
@@ -638,27 +712,17 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
 }
 
 /// Load all agent type definitions. Priority (highest wins):
-///   project override (.zerostack/agents/<name>.md)
+///   project override (.zerostack/agents → .mini-agent/agents → .claude/agents)
 ///   → user global (data_dir/agents/<name>.md)
 ///   → compiled-in default (data/agents/<name>.md)
 pub fn load() -> HashMap<String, AgentDefinition> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    let mut agents = load_base(&paths);
-    if project_definitions_trusted(&paths)
-        && let Some(project_dir) = paths.project_agents_dir()
+    if let Some(root) = paths.project_dir.as_deref().and_then(Path::parent)
+        && let Ok(workspace) = crate::paths::WorkspaceBinding::capture(root)
     {
-        merge_project_definitions(
-            &mut agents,
-            crate::context::load_dir_files_bounded_status(
-                &project_dir,
-                "md",
-                MAX_AGENT_PROMPT_BYTES,
-            ),
-            project_dir,
-            true,
-        );
+        return load_for_paths_and_workspace(&paths, &workspace);
     }
-    agents
+    load_base(&paths)
 }
 
 /// Load agent definitions while resolving project overrides through the same
@@ -677,19 +741,43 @@ fn load_for_paths_and_workspace(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> HashMap<String, AgentDefinition> {
     let mut agents = load_base(paths);
-    let project_dir = workspace.root().join(".zerostack/agents");
     let trusted = paths
         .with_workspace_root(workspace.root())
         .map(|paths| project_definitions_trusted(&paths))
         .unwrap_or(false);
-    if trusted
-        && let Ok(definitions) = workspace.read_relative_dir_files_bounded_status(
-            Path::new(".zerostack/agents"),
-            "md",
-            MAX_AGENT_PROMPT_BYTES,
-        )
-    {
-        merge_project_definitions(&mut agents, definitions, project_dir, true);
+    if trusted {
+        for layer in PROJECT_AGENT_LAYERS {
+            let definitions = workspace.read_relative_definition_layer(
+                Path::new(layer),
+                "md",
+                MAX_AGENT_PROMPT_BYTES,
+                MAX_PROJECT_AGENT_ENTRIES,
+                MAX_PROJECT_AGENT_FILES,
+            );
+            match definitions {
+                Ok(definitions) if layer == ".zerostack/agents" => {
+                    merge_project_definitions(
+                        &mut agents,
+                        definitions,
+                        workspace.root().join(layer),
+                        true,
+                    );
+                }
+                Ok(definitions) => merge_external_definitions(
+                    &mut agents,
+                    definitions.into_iter().filter(|(name, _)| name != ".notes"),
+                    &workspace.root().join(layer),
+                    AgentDefinitionSource::ProjectOverride {
+                        directory: workspace.root().join(layer),
+                    },
+                    "project",
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(layer, %error, "ignoring unavailable project specialist layer")
+                }
+            }
+        }
     }
     agents
 }
@@ -751,17 +839,24 @@ pub(crate) fn source_hint_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> String {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    if !valid_agent_name(name) {
+        return "unresolved agent type".to_string();
+    }
     if let Some(workspace) = workspace {
         let trusted = paths
             .with_workspace_root(workspace.root())
             .map(|paths| project_definitions_trusted(&paths))
             .unwrap_or(false);
-        let path = workspace
-            .root()
-            .join(".zerostack/agents")
-            .join(format!("{name}.md"));
-        if trusted && path.is_file() {
-            return format!("trusted project override {}", path.display());
+        if trusted {
+            for layer in PROJECT_AGENT_LAYERS.into_iter().rev() {
+                let relative = Path::new(layer).join(format!("{name}.md"));
+                if workspace.has_relative_regular_file(&relative) {
+                    return format!(
+                        "trusted project override {}",
+                        workspace.root().join(relative).display()
+                    );
+                }
+            }
         }
     }
     let user_path = paths.agents_dir().join(format!("{name}.md"));
@@ -777,6 +872,232 @@ pub(crate) fn source_hint_for_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_paths(root: &Path) -> crate::paths::AppPaths {
+        crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: Some(root.join(".zerostack")),
+        }
+    }
+
+    #[test]
+    fn project_agent_layers_require_current_trust_and_preserve_legacy_precedence() {
+        let fixture = crate::tests::OwnedTestDirectory::new("project-agent-layers");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(paths.agents_dir()).unwrap();
+        std::fs::write(paths.agents_dir().join("review.md"), "user-global fallback").unwrap();
+        for layer in PROJECT_AGENT_LAYERS {
+            std::fs::create_dir_all(root.join(layer)).unwrap();
+            std::fs::write(
+                root.join(layer).join("review.md"),
+                format!("persona {layer}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join(".claude/agents/claude-only.md"), "Claude persona").unwrap();
+        std::fs::write(root.join(".mini-agent/agents/mini-only.md"), "mini persona").unwrap();
+        std::fs::write(
+            root.join(".zerostack/agents/.notes.md"),
+            "legacy shared notes",
+        )
+        .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        let untrusted = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(untrusted["review"].prompt, "user-global fallback");
+        assert!(!untrusted.contains_key("claude-only"));
+        assert!(!untrusted.contains_key("mini-only"));
+        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let trusted = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(
+            trusted["review"]
+                .prompt
+                .starts_with("persona .zerostack/agents")
+        );
+        assert_eq!(
+            trusted["review"].project_override_path("review"),
+            Some(root.join(".zerostack/agents/review.md"))
+        );
+        for name in ["claude-only", "mini-only", "review"] {
+            assert!(trusted[name].prompt.ends_with("legacy shared notes"));
+        }
+        std::fs::remove_file(root.join(".zerostack/agents/review.md")).unwrap();
+        let next = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(
+            next["review"]
+                .prompt
+                .starts_with("persona .mini-agent/agents")
+        );
+        std::fs::write(
+            root.join(".mini-agent/agents/review.md"),
+            "---\nname: wrong\n---\ninvalid",
+        )
+        .unwrap();
+        let fallback = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(
+            fallback["review"]
+                .prompt
+                .starts_with("persona .claude/agents")
+        );
+        assert!(
+            fallback["review"]
+                .result_notice("review")
+                .unwrap()
+                .contains("definition ignored")
+        );
+        // Trust remains bound to exactly the original config bytes.
+        std::fs::write(&config, "default_prompt = \"review\"\n").unwrap();
+        assert_eq!(
+            load_for_paths_and_workspace(&paths, &workspace)["review"].prompt,
+            "user-global fallback"
+        );
+    }
+
+    #[test]
+    fn imported_agent_tools_keep_persona_with_a_bounded_visible_notice() {
+        let definition = parse_for_test(
+            "review",
+            "---\nname: review\ntools: [Read, Edit, Bash, Read, Glob, Write]\n---\nPERSONA",
+        );
+        assert_eq!(definition.prompt, "PERSONA");
+        assert_eq!(
+            definition.tools,
+            Some(vec![AgentTool::Read, AgentTool::FindFiles])
+        );
+        let entry = definition.list_entry("review");
+        assert!(entry.contains("Edit, Bash, Write ignored"), "{entry}");
+        assert!(
+            definition
+                .result_notice("review")
+                .unwrap()
+                .contains("subagents are read-only")
+        );
+        let all_ignored = parse_for_test(
+            "review",
+            "---\ntools: [Bash, Edit, Write, Task, Fetch, mcp_tool]\n---\nPERSONA",
+        );
+        assert_eq!(all_ignored.tools, Some(Vec::new()));
+        let many = (0..MAX_DECLARED_TOOLS)
+            .map(|n| format!("{n:03}{}", "x".repeat(61)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let many = parse_for_test("review", &format!("---\ntools: {many}\n---\nPERSONA"));
+        let notice = many.list_entry("review");
+        assert!(notice.contains("and 120 more"));
+        assert!(!notice.contains("008xxxxxxxx"));
+        assert!(notice.len() < 700);
+        assert_eq!(notice.lines().count(), 1);
+        for invalid in [
+            "[Read, 123]".to_string(),
+            "Read,,Write".to_string(),
+            format!("[{}]", "X".repeat(65)),
+            format!("[{}]", vec!["Read"; 129].join(",")),
+            "[\"Bash\\nWrite\"]".to_string(),
+            "[工具]".to_string(),
+        ] {
+            assert!(
+                normalize_agent_definition(
+                    "review".into(),
+                    format!("---\ntools: {invalid}\n---\nBODY")
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
+        #[cfg(not(feature = "js"))]
+        assert_eq!(
+            parse_for_test("review", "---\ntools: [JavaScript]\n---\nBODY").tools,
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn project_agent_layer_limits_fail_closed_before_any_partial_merge() {
+        let fixture = crate::tests::OwnedTestDirectory::new("project-agent-layer-limits");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::write(root.join(".claude/agents/review.md"), "valid lower layer").unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent/agents")).unwrap();
+        for n in 0..=MAX_PROJECT_AGENT_FILES {
+            std::fs::write(
+                root.join(".mini-agent/agents")
+                    .join(format!("agent-{n}.md")),
+                "BODY",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        let resolved = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(resolved["review"].prompt, "valid lower layer");
+        assert!(!resolved.keys().any(|name| name.starts_with("agent-")));
+        assert!(
+            workspace
+                .read_relative_definition_layer(Path::new(".claude/agents"), "md", 8, 0, 1)
+                .is_err()
+        );
+        let bounded = workspace
+            .read_relative_definition_layer(Path::new(".claude/agents"), "md", 8, 1, 1)
+            .unwrap();
+        assert!(bounded[0].1.as_ref().unwrap_err().contains("8-byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_agent_layers_never_follow_private_file_or_directory_links() {
+        use std::os::unix::fs::symlink;
+        let fixture = crate::tests::OwnedTestDirectory::new("project-agent-layer-links");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::create_dir_all(root.join("private-personas")).unwrap();
+        std::fs::write(root.join("private-personas/review.md"), "PRIVATE PERSONA").unwrap();
+        symlink(
+            root.join("private-personas/review.md"),
+            root.join(".claude/agents/review.md"),
+        )
+        .unwrap();
+        symlink(root.join("private-personas"), root.join(".mini-agent")).unwrap();
+        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        let agents = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(!agents.contains_key("review"));
+        assert!(!workspace.has_relative_regular_file(Path::new(".claude/agents/review.md")));
+        assert!(
+            workspace
+                .read_relative_definition_layer(Path::new(".mini-agent/agents"), "md", 100, 10, 10)
+                .is_err()
+        );
+        let fifo = root.join(".claude/agents/fifo.md");
+        // Drop both release-channel handles: a blocking read-open would now hang.
+        drop(crate::tests::process_gate::ProcessGate::new(&fifo).unwrap());
+        assert!(!workspace.has_relative_regular_file(Path::new(".claude/agents/fifo.md")));
+        let entries = workspace
+            .read_relative_definition_layer(Path::new(".claude/agents"), "md", 100, 10, 10)
+            .unwrap();
+        assert!(entries.iter().all(|(_, result)| result.is_err()));
+    }
 
     #[test]
     fn real_project_trust_binding_controls_persona_override_round_trip() {
@@ -809,6 +1130,7 @@ mod tests {
             "trusted project persona"
         );
 
+        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -930,12 +1252,18 @@ mod tests {
             .tools,
             Some(vec![AgentTool::Js])
         );
+        let imported = normalize_agent_definition(
+            "review".into(),
+            "---\nname: review\ntools: Read, Bash\n---\nbody".into(),
+        )
+        .unwrap();
+        assert_eq!(imported.2.tools, Some(vec![AgentTool::Read]));
         assert!(
-            normalize_agent_definition(
-                "review".into(),
-                "---\nname: review\ntools: Read, Bash\n---\nbody".into(),
-            )
-            .is_err()
+            imported
+                .2
+                .tool_narrowing_notice
+                .unwrap()
+                .contains("Bash ignored")
         );
         assert!(
             normalize_agent_definition(

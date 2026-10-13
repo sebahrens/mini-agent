@@ -772,6 +772,59 @@ mod tests {
         assert!(!second.contains("FIRST_SESSION_ARCHITECTURE"));
     }
 
+    #[tokio::test]
+    async fn imported_persona_tools_reach_actual_child_definitions_without_write_authority() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        for (declared, expected) in [
+            ("Read, Edit, Bash, Glob, Write", vec!["find_files", "read"]),
+            ("Edit, Bash, Write, Task, Fetch, mcp_tool", vec![]),
+            ("Read, Grep, Glob", vec!["find_files", "grep", "read"]),
+        ] {
+            let persona = crate::context::agents::parse_for_test(
+                "review",
+                &format!(
+                    "---\nname: review\ntools: {declared}\n---\nImported investigation persona"
+                ),
+            );
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            let fixture = crate::tests::OwnedTestDirectory::new("imported-persona-child-tools");
+            let authorization = parent_authorization(fixture.path(), None);
+            let child = super::build_explore_agent_inner(
+                model,
+                2,
+                1024 * 1024,
+                100,
+                100,
+                100,
+                Some(100),
+                &authorization,
+                None,
+                #[cfg(feature = "archmd")]
+                None,
+                Some(&persona.prompt),
+                &super::PersonaExecution {
+                    tools: persona.tools,
+                    ..Default::default()
+                },
+                #[cfg(feature = "skills")]
+                None,
+            );
+            let mut names = child
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            assert_eq!(names, expected, "declared: {declared}");
+        }
+    }
+
     #[test]
     fn specialization_is_the_only_authoritative_persona() {
         let preamble = build_explore_preamble(

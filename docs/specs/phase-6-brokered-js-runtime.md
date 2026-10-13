@@ -260,6 +260,14 @@ and build script when present; the lockfile alone has no checksum for its local
 contents. Generated dependency build caches are excluded. Controlled native tests
 prove that a same-length, mtime-preserving SDK edit changes identity, while identical
 source copies at different paths have the same input digest.
+Embedded user guides (`docs/agent` and `docs/vscode-acp-setup.md`), persona/prompt/theme
+directories, and seed skill packages (`assets/learned-skills`) also contribute their
+bytes. Embedded directories retain every regular file, even cache-named files that
+`include_dir!` would include; uncompiled source caches and maintainer documentation
+remain excluded. Controlled changes to each embedded guide/package input alter the
+identity without broadening the worker's authority.
+Directory traversal rejects symbolic-link inputs instead of silently omitting bytes
+that the Rust compiler or an embedding macro could otherwise read.
 
 Protocol version 11 adds a closed `full`/`read_only` model-effect profile to every `RunStep`.
 The read-only profile installs exactly `read_file`, `list_dir`, and `grep`; the parent separately

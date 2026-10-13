@@ -159,7 +159,7 @@ fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result
         crate::sandbox::SandboxPolicy::Disabled,
         "disabled",
     )?;
-    crate::permission::build_noninteractive_permission(cfg, authority)?;
+    crate::permission::build_noninteractive_permission_with_cli(cli, cfg, authority)?;
     Ok(())
 }
 
@@ -1099,11 +1099,13 @@ impl Startup {
             self.status_signals = self.cli.status_socket.clone().map(StatusSignals::new);
         }
 
-        let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_at(
-            &self.cfg,
-            authority,
-            Some(self.workspace.root().to_path_buf()),
-        )?;
+        let (permission, ask_tx, ask_rx) =
+            crate::permission::build_interactive_permission_with_cli_at(
+                &self.cli,
+                &self.cfg,
+                authority,
+                Some(self.workspace.root().to_path_buf()),
+            )?;
         self.permission = permission;
         self.ask_tx = ask_tx;
         self.ask_rx = ask_rx;
@@ -1542,7 +1544,7 @@ impl Startup {
         let cli = self.cli.clone();
         let root = self.workspace.root().to_path_buf();
         let identity = (self.session.id.to_string(), self.session.name.to_string());
-        let result = Box::pin(self.dispatch_print_inner()).await;
+        let result = heap_future(|| self.dispatch_print_inner()).await;
         if let Err(error) = &result
             && cli.output_format() == OutputFormat::StreamJson
             && !crate::print::headless_result_emitted()
@@ -1754,23 +1756,25 @@ impl Startup {
                 )
                 .await,
             );
-            // Boxed: this future is inlined into `run_inner`'s, which the
-            // startup path builds on the stack before pinning it. A regression
-            // test runs the binary under the 1 MiB Windows default stack.
-            let response_result = Box::pin(run_headless_goal_rounds(
-                &agent,
-                &mut self.session,
-                &self.cli,
-                &self.cfg,
-                &self.sandbox,
-                &self.client,
-                &msg,
-                history,
-                json_output,
-                compaction_usage,
-                #[cfg(feature = "hooks")]
-                false,
-            ))
+            // Construct the child in heap_future's short frame; Box::pin alone
+            // still reserves its temporary in this parent poll frame. The
+            // regression consumer uses the unchanged 1 MiB default stack.
+            let response_result = heap_future(|| {
+                run_headless_goal_rounds(
+                    &agent,
+                    &mut self.session,
+                    &self.cli,
+                    &self.cfg,
+                    &self.sandbox,
+                    &self.client,
+                    &msg,
+                    history,
+                    json_output,
+                    compaction_usage,
+                    #[cfg(feature = "hooks")]
+                    false,
+                )
+            })
             .await;
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
@@ -2205,20 +2209,22 @@ pub(crate) async fn run_goal_rounds_for_loop(
         cfg.resolve_keep_recent_tool_results(),
     );
 
-    let rounds = Box::pin(run_headless_goal_rounds(
-        agent,
-        session,
-        cli,
-        cfg,
-        sandbox,
-        client,
-        &first_prompt,
-        history,
-        false,
-        crate::event::UsageDelta::default(),
-        #[cfg(feature = "hooks")]
-        true,
-    ))
+    let rounds = heap_future(|| {
+        run_headless_goal_rounds(
+            agent,
+            session,
+            cli,
+            cfg,
+            sandbox,
+            client,
+            &first_prompt,
+            history,
+            false,
+            crate::event::UsageDelta::default(),
+            #[cfg(feature = "hooks")]
+            true,
+        )
+    })
     .await;
     if let Some(failure) = rounds.turn.failure {
         return Err(failure);

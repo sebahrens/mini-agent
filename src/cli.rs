@@ -668,6 +668,27 @@ pub struct Cli {
     )]
     pub tools: Vec<String>,
 
+    #[arg(
+        long,
+        value_name = "TOOL:PATTERN",
+        help = "Add an invocation-only allow rule (repeatable); shell scripts match exactly, other tools use globs"
+    )]
+    pub allow: Vec<crate::permission::cli_rules::CliPermissionRule>,
+
+    #[arg(
+        long,
+        value_name = "TOOL:PATTERN",
+        help = "Add an invocation-only deny rule (repeatable); deny rules win in every permission mode"
+    )]
+    pub deny: Vec<crate::permission::cli_rules::CliPermissionRule>,
+
+    #[arg(
+        long = "allow-prefix",
+        value_name = "SHELL:ARGV",
+        help = "Add an invocation-only simple shell argv-prefix allow (repeatable); rejects quoting, operators and expansion"
+    )]
+    pub allow_prefix: Vec<crate::permission::cli_rules::CliPermissionRule>,
+
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,
 

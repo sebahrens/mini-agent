@@ -26,6 +26,7 @@ fn main() {
     for directory in build_inputs::SOURCE_DIRECTORIES
         .iter()
         .copied()
+        .chain(build_inputs::EMBEDDED_DIRECTORIES.iter().copied())
         .chain(std::iter::once(build_inputs::PATCHED_RIG))
     {
         println!("cargo:rerun-if-changed={}", root.join(directory).display());

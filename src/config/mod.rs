@@ -352,6 +352,12 @@ pub struct Config {
         alias = "permission_modes"
     )]
     pub permission_modes: Option<Vec<String>>,
+    /// Explicit-user Shift+Tab cycle, independent of the rule-application modes.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_permission_mode_cycle"
+    )]
+    pub permission_mode_cycle: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_details: Option<ShowToolDetails>,
     /// Context rows in successful edit/write previews (hard maximum 20).
@@ -986,6 +992,8 @@ impl Config {
     }
 
     pub fn build_permission_config(&self) -> anyhow::Result<PermissionConfigs> {
+        crate::permission::permission_mode_cycle(self.permission_mode_cycle.as_deref())
+            .map_err(anyhow::Error::msg)?;
         fn parse_field(
             field: &str,
             value: Option<&serde_json::Value>,
@@ -1103,6 +1111,18 @@ impl Config {
 
         Ok(perm_configs)
     }
+}
+
+fn deserialize_permission_mode_cycle<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let configured = Option::<Vec<String>>::deserialize(deserializer)?;
+    crate::permission::permission_mode_cycle(configured.as_deref())
+        .map_err(serde::de::Error::custom)?;
+    Ok(configured)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

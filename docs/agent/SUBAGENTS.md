@@ -143,7 +143,9 @@ Definitions are markdown resolved by `src/context/agents.rs`, highest priority
 first among eligible layers:
 
 ```
-.zerostack/agents/<name>.md      # trusted project override
+.zerostack/agents/<name>.md      # trusted legacy project override (highest)
+.mini-agent/agents/<name>.md     # trusted mini-agent project definition
+.claude/agents/<name>.md         # trusted Claude-style project definition
 data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
@@ -162,7 +164,18 @@ ignored with a warning and a visible task-result notice.
 
 Project definitions participate only when the exact current
 `.zerostack/config.toml` is bound in the private project-config trust store.
-Project notes use the same gate. An untrusted checkout cannot add, replace, or
+All three project directories use this existing gate, even when the definitions
+live under `.claude` or `.mini-agent`; those directories do not create an
+independent trust grant. Project notes use the same gate and remain supported
+only at `.zerostack/agents/.notes.md`. Persona files themselves are not part of
+the config fingerprint: an approved checkout may change its persona content.
+Project reads use the session's captured workspace capability and refuse
+symlinks (including linked directory components), reparse points, and nonregular
+files. Each layer is enumerated before reading, with at most 1,024 directory
+entries and 128 Markdown files; an over-limit layer is ignored in full rather
+than selecting files in filesystem order. Each file remains capped at 256 KiB,
+so all three project layers read at most 96 MiB plus one sentinel byte per file
+per resolution. An untrusted checkout cannot add, replace, or
 extend agent types; resolution falls back to user-global or compiled-in
 definitions. Changing the project config content or copying the checkout
 invalidates that content-and-path-bound trust.
@@ -172,7 +185,7 @@ requested `agent_type` and the highest-precedence source path that would be
 loaded, without embedding or parsing the specialist prompt body. Once approved,
 the resolved provider/model, turn-budget tier, and tool subset are applied. When a trusted
 project definition wins, the host also prefixes the task result with its
-`.zerostack/agents/<name>.md` source. This makes a repository-controlled
+winning project directory's `<name>.md` source. This makes a repository-controlled
 replacement visible to the calling agent instead of silently presenting it as
 the compiled-in specialist. `SubagentStart` and `SubagentStop` hook envelopes
 carry that resolved `agent_type` and definition source; unspecialized children
@@ -208,8 +221,14 @@ mode: review
   `list_dir`, `js` when JS support is compiled, and `skills_search` when skills support is compiled, plus
   `memory_read` and `memory_search` when memory support is compiled.
   Claude-style `Read`, `Grep`, and `Glob` spellings are accepted.
-  Empty lists create a tool-free child; mutating or unknown tools reject the
-  definition rather than widening authority.
+  Empty lists create a tool-free child. Mutating, unknown, and feature-disabled
+  tools are ignored while preserving the persona and its supported declared
+  read tools. An all-unsupported list also creates a tool-free child; it never
+  falls back to the default tools. `/agent` lists and task results include a
+  one-line narrowing notice (up to eight ignored names, then an omitted count).
+  Declarations accept at most 128 entries with nonempty printable ASCII names
+  of at most 64 characters; malformed lists or names still reject the definition.
+  Write-capable subagents remain separate work tracked by mini-agent-i7ro6.55.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task

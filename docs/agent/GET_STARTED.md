@@ -307,6 +307,8 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--restrictive` | Ask for every operation. |
 | `--read-only` | Only reads files |
 | `--guarded` | Allow reads and ask for other operations. |
+| `--allow TOOL:PATTERN` / `--deny TOOL:PATTERN` | Repeatable invocation-only permission seeds. Denies win; modes and external-directory safeguards still apply. Shell allows are exact scripts; other tools use permission globs. |
+| `--allow-prefix SHELL:ARGV` | Repeatable simple shell argv-prefix grants, with the same restricted syntax as `permission-allow-prefix`. |
 | `--accept-all` | Auto-allow operations inside the workspace while retaining the permission system. |
 | `--yolo` | Allow operations except destructive shell commands, which still ask. |
 | `--dangerously-skip-permissions` | Disable permission checks entirely. This is strictly broader than `--yolo`. |

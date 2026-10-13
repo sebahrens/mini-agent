@@ -3469,23 +3469,27 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     H: Into<Arc<[Message]>>,
 {
-    // This large streaming state must not be copied into the enclosing
-    // provider and cancellation futures on small native main-thread stacks.
+    // Construct the large streaming state inside heap_future's short frame.
+    // Box::pin(child()) still reserves the child temporary in this poll frame,
+    // stacked below startup, provider, task-local and cancellation wrappers.
+    // The actual startup consumer exercises the unchanged 1 MiB stack budget.
     let mutations = crate::print::HeadlessMutationEvents::new(output);
     crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), async {
-        let mut turn = Box::pin(run_print_with_stream_policy_and_verification(
-            agent,
-            prompt,
-            output,
-            Some(&mutations),
-            retry_config,
-            turn_token_budget,
-            history.into(),
-            RunnerStreamPolicy::default(),
-            completion_verification,
-            #[cfg(feature = "hooks")]
-            loop_info,
-        ))
+        let mut turn = crate::startup::heap_future(|| {
+            run_print_with_stream_policy_and_verification(
+                agent,
+                prompt,
+                output,
+                Some(&mutations),
+                retry_config,
+                turn_token_budget,
+                history.into(),
+                RunnerStreamPolicy::default(),
+                completion_verification,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            )
+        })
         .await;
         // A sibling/tool-result hook can fail the SDK batch after a mutation
         // committed. Such callbacks remain truthful without a stream result.
@@ -3676,7 +3680,9 @@ where
     }
     macro_rules! await_turn {
         ($work:expr) => {
-            match await_headless_work($work).await {
+            // Stop-hook work has a large future even when no hook runs.
+            // Construct it outside the runner/cancellation poll frames.
+            match await_headless_work(crate::startup::heap_future(|| $work)).await {
                 Ok(result) => result,
                 Err(error) => fail_turn!(error),
             }

@@ -33,7 +33,10 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             format!("available main-agent personas (current: {current}):"),
         );
         for name in names {
-            write_result(ctx.renderer, format!("  {name}"));
+            write_result(
+                ctx.renderer,
+                ctx.context.agent_definitions[&name].list_entry(&name),
+            );
         }
         write_result(ctx.renderer, "usage: /agent <name>  |  /agent default");
         return Ok(());
@@ -56,7 +59,10 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         if !names.is_empty() {
             write_ok(ctx.renderer, "available main-agent personas:");
             for name in names {
-                write_result(ctx.renderer, format!("  {name}"));
+                write_result(
+                    ctx.renderer,
+                    ctx.context.agent_definitions[&name].list_entry(&name),
+                );
             }
         }
         return Ok(());

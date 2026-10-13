@@ -1469,9 +1469,10 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
-        // Keep the turn on the heap before layering cancellation and task-local
-        // scopes around it, so those scopes do not copy its state onto the stack.
-        crate::print::run_headless_turn(Box::pin(async {
+        // Construct the aggregate provider future in a short heap_future frame
+        // before layering cancellation and task-local scopes around it.
+        // Box::pin(async { ... }) still reserves its temporary in this poll.
+        crate::print::run_headless_turn(crate::startup::heap_future(|| async {
             let history = history.into();
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
@@ -1497,89 +1498,101 @@ impl AnyAgent {
             let prompt = prompt.to_string();
             match &self.inner {
                 AnyAgentInner::OpenRouter(a) => {
-                    runner::run_print_with_output_and_verification(
-                        a,
-                        &prompt,
-                        output,
-                        retry_config,
-                        self.turn_token_budget,
-                        history,
-                        self.completion_verification.clone(),
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                    )
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
                     .await
                 }
                 AnyAgentInner::OpenAI(a) => match a {
                     OpenAiAgent::Responses(a) => {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
                         .await
                     }
                     OpenAiAgent::Completions(a) => {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
                         .await
                     }
                 },
                 AnyAgentInner::Anthropic(a) => {
-                    runner::run_print_with_output_and_verification(
-                        a,
-                        &prompt,
-                        output,
-                        retry_config,
-                        self.turn_token_budget,
-                        history,
-                        self.completion_verification.clone(),
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                    )
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
                     .await
                 }
                 AnyAgentInner::Gemini(a) => {
-                    runner::run_print_with_output_and_verification(
-                        a,
-                        &prompt,
-                        output,
-                        retry_config,
-                        self.turn_token_budget,
-                        history,
-                        self.completion_verification.clone(),
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                    )
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
                     .await
                 }
                 AnyAgentInner::Ollama(a) => {
-                    runner::run_print_with_output_and_verification(
-                        a,
-                        &prompt,
-                        output,
-                        retry_config,
-                        self.turn_token_budget,
-                        history,
-                        self.completion_verification.clone(),
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                    )
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
                     .await
                 }
             }

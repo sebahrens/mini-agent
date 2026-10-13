@@ -975,8 +975,7 @@ mod tests {
                 .unwrap()
                 .content_unchanged
         );
-        // Track the older excerpt behavior separately from the new metadata:
-        // explicit read denial must suppress the typed preimage snapshot.
+        // Read denial suppresses both typed snapshots and ordinary excerpts.
         std::fs::write(
             root.path().join("private-edit.txt"),
             "LEGACY_PRIVATE_NEIGHBOR\nold\n",
@@ -1003,9 +1002,9 @@ mod tests {
         .await
         .unwrap();
         assert!(private_edit.extensions.get::<MutationDiff>().is_none());
-        // This is a reproduction of an existing result-payload disclosure,
-        // not a claim that it is safe: its repair has a separate tracked bead.
-        assert!(private_edit.output.contains("LEGACY_PRIVATE_NEIGHBOR"));
+        assert!(!private_edit.output.contains("LEGACY_PRIVATE_NEIGHBOR"));
+        assert!(private_edit.output.contains("new"));
+        assert!(private_edit.output.starts_with("Applied 1 edit(s)"));
         // Legacy direct callers get the original string shape, not serialized metadata.
         let text = write
             .call(WriteArgs {
@@ -1017,6 +1016,486 @@ mod tests {
             .unwrap();
         assert!(text.starts_with("Written"));
         assert!(!text.contains("sha256"));
+    }
+
+    fn edit_block(search: &str, replacement: &str) -> crate::agent::tools::EditArgs {
+        crate::agent::tools::EditArgs {
+            path: "target.txt".into(),
+            replace_all: false,
+            fuzzy: false,
+            block: Some(format!(
+                "<<<<<<< SEARCH\n{search}\n=======\n{replacement}\n>>>>>>> REPLACE"
+            )),
+            file_crc: None,
+            edits: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_edit_results_disclose_source_only_with_existing_read_authority() {
+        use crate::agent::tools::{EditOp, EditTool, ReadTracker};
+        use crate::permission::Action;
+        use rig::tool::{Tool, ToolCallExtensions};
+        for action in [Action::Deny, Action::Ask, Action::Allow] {
+            let root = crate::tests::OwnedTestDirectory::new("edit-source-authority");
+            let checker = permission(action, root.path());
+            let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(8);
+            let tool = EditTool::new_with_tracker(
+                Some(checker),
+                Some(ask_tx),
+                None,
+                ReadTracker::new(true),
+            )
+            .with_workspace(root.path());
+            let allowed = action == Action::Allow;
+            // Context-free line rendering is unsafe too: unchanged text on the
+            // edited line and the surviving line after deletion are private.
+            for (case, (source, search, replacement, fuzzy, replace_all, expected)) in [
+                (
+                    "PRIVATE_NEIGHBOR\nold\n",
+                    "old",
+                    "new",
+                    false,
+                    false,
+                    "PRIVATE_NEIGHBOR\nnew\n",
+                ),
+                (
+                    "PRIVATE_PREFIX old PRIVATE_SUFFIX\n",
+                    "old",
+                    "new",
+                    false,
+                    false,
+                    "PRIVATE_PREFIX new PRIVATE_SUFFIX\n",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\nold\n",
+                    "old",
+                    "",
+                    false,
+                    false,
+                    "PRIVATE_NEIGHBOR\n\n",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\n\tvalue = 100;\n",
+                    "    value = 100;",
+                    "new",
+                    false,
+                    false,
+                    "PRIVATE_NEIGHBOR\nnew\n",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\n    value = 100;\n",
+                    "    value = 101;",
+                    "new",
+                    true,
+                    false,
+                    "PRIVATE_NEIGHBOR\nnew\n",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\nold\nold\n",
+                    "old",
+                    "new",
+                    false,
+                    true,
+                    "PRIVATE_NEIGHBOR\nnew\nnew\n",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = format!("target-{case}.txt");
+                std::fs::write(root.path().join(&path), source).unwrap();
+                let mut args = edit_block(search, replacement);
+                args.path = path.clone();
+                args.fuzzy = fuzzy;
+                args.replace_all = replace_all;
+                let result = tool
+                    .call_structured(args, &ToolCallExtensions::new())
+                    .await
+                    .unwrap();
+                assert!(result.output.starts_with("Applied "), "{}", result.output);
+                assert_eq!(result.extensions.get::<MutationDiff>().is_some(), allowed);
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join(&path)).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    result.output.contains("PRIVATE_"),
+                    allowed,
+                    "{}",
+                    result.output
+                );
+                if !replacement.is_empty() {
+                    assert!(result.output.contains(replacement));
+                }
+                if !allowed {
+                    assert!(!result.output.contains("value = 100;"), "{}", result.output);
+                    assert!(!result.output.contains("Resulting excerpt"));
+                    assert!(result.output.contains("Replacement text"));
+                }
+            }
+            let source = "PRIVATE_NEIGHBOR\nold\n";
+            std::fs::write(root.path().join("target.txt"), source).unwrap();
+            let result = tool
+                .call_structured(
+                    crate::agent::tools::EditArgs {
+                        block: None,
+                        file_crc: Some(crate::agent::tools::crc::crc32_hex(source.as_bytes())),
+                        edits: Some(vec![EditOp {
+                            line: Some(format!(
+                                "2|{} old",
+                                crate::agent::tools::crc::crc32_hex(b"old")
+                            )),
+                            lines: None,
+                            text: "new".into(),
+                        }]),
+                        ..edit_block("old", "new")
+                    },
+                    &ToolCallExtensions::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.output.contains("PRIVATE_NEIGHBOR"), allowed);
+            assert_eq!(result.extensions.get::<MutationDiff>().is_some(), allowed);
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("target.txt")).unwrap(),
+                "PRIVATE_NEIGHBOR\nnew\n"
+            );
+            assert!(
+                matches!(
+                    ask_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "preview must never request read access"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_edit_excerpt_authority_is_independent_of_diff_limits_and_prior_reads() {
+        use crate::agent::tools::{EditTool, ReadArgs, ReadTool, ReadTracker};
+        use crate::permission::Action;
+        use rig::tool::{Tool, ToolCallExtensions};
+        for (action, session_grant, disclose) in [
+            (Action::Deny, true, false),
+            (Action::Ask, false, false),
+            (Action::Ask, true, true),
+            (Action::Allow, false, true),
+        ] {
+            let root = crate::tests::OwnedTestDirectory::new("edit-preview-diff-limit");
+            std::fs::write(root.path().join("target.txt"), "PRIVATE_NEIGHBOR\nold\n").unwrap();
+            let tracker = ReadTracker::new(true);
+            ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+                .with_workspace(root.path())
+                .call(ReadArgs {
+                    path: "target.txt".into(),
+                    offset: None,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            let checker = permission(action, root.path());
+            if session_grant {
+                checker
+                    .lock()
+                    .unwrap()
+                    .add_session_allowlist("read".into(), "target.txt");
+            }
+            let result = EditTool::new_with_tracker(Some(checker), None, None, tracker)
+                .with_workspace(root.path())
+                .with_diff_options(DiffOptions {
+                    context: 3,
+                    max_lines: 0,
+                })
+                .call_structured(edit_block("old", "new"), &ToolCallExtensions::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.output.contains("PRIVATE_NEIGHBOR"),
+                disclose,
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains("new"));
+            assert!(
+                result.extensions.get::<MutationDiff>().is_none(),
+                "row limit disables metadata independently of string disclosure"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("target.txt")).unwrap(),
+                "PRIVATE_NEIGHBOR\nnew\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_edit_failures_hide_source_candidates_and_current_checksums() {
+        use crate::agent::tools::{EditOp, EditTool};
+        use crate::permission::Action;
+        use rig::tool::Tool;
+        for action in [Action::Deny, Action::Ask, Action::Allow] {
+            let root = crate::tests::OwnedTestDirectory::new("edit-failure-authority");
+            let tool = EditTool::new(Some(permission(action, root.path())), None)
+                .with_workspace(root.path());
+            let allowed = action == Action::Allow;
+            for (source, search, revealed, reason) in [
+                (
+                    "PRIVATE_A old\nPRIVATE_B old\n",
+                    "old",
+                    "PRIVATE_A",
+                    "matched",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\n    value = 100;\n",
+                    "    value = 101;",
+                    "value = 100;",
+                    "match",
+                ),
+                (
+                    "PRIVATE_A\n    value = 100;\nPRIVATE_B\n    value = 100;\n",
+                    "    value = 101;",
+                    "value = 100;",
+                    "fuzzy matches",
+                ),
+                (
+                    "PRIVATE_NEIGHBOR\n    value = 100;\nPRIVATE_TAIL\n",
+                    "    value = 99999;",
+                    "PRIVATE_TAIL",
+                    "not found",
+                ),
+            ] {
+                std::fs::write(root.path().join("target.txt"), source).unwrap();
+                let message = tool
+                    .call(edit_block(search, "new"))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(message.contains(reason), "{message}");
+                assert_eq!(message.contains(revealed), allowed, "{message}");
+                if !allowed {
+                    assert!(!message.contains("PRIVATE_"), "{message}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("target.txt")).unwrap(),
+                    source
+                );
+            }
+            let source = "PRIVATE_NEIGHBOR\nold\n";
+            std::fs::write(root.path().join("target.txt"), source).unwrap();
+            let crc = crate::agent::tools::crc::crc32_hex(source.as_bytes());
+            let tag = crate::agent::tools::crc::crc32_hex(b"old");
+            for (file_crc, supplied_tag, reason, current) in [
+                (
+                    "00000000".to_string(),
+                    tag.clone(),
+                    "File CRC mismatch",
+                    crc.clone(),
+                ),
+                (crc.clone(), "00000000".to_string(), "Tag mismatch", tag),
+            ] {
+                let message = tool
+                    .call(crate::agent::tools::EditArgs {
+                        block: None,
+                        file_crc: Some(file_crc),
+                        edits: Some(vec![EditOp {
+                            line: Some(format!("2|{supplied_tag} old")),
+                            lines: None,
+                            text: "new".into(),
+                        }]),
+                        ..edit_block("old", "new")
+                    })
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(message.contains(reason), "{message}");
+                assert_eq!(message.contains(&current), allowed, "{message}");
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("target.txt")).unwrap(),
+                    source
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_sdk_edit_results_preserve_read_privacy_and_exact_metadata() {
+        use crate::agent::tools::EditTool;
+        use crate::permission::Action;
+        use futures::StreamExt;
+        use rig::agent::{
+            AgentBuilder, AgentHook, Flow, HookContext, MultiTurnStreamItem, StepEvent,
+        };
+        use rig::completion::CompletionModel;
+        use rig::streaming::{StreamedUserContent, StreamingChat};
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+        impl<M: CompletionModel> AgentHook<M> for Seen {
+            async fn on_event(&self, _: &HookContext, event: StepEvent<'_, M>) -> Flow {
+                if let StepEvent::ToolResult {
+                    internal_call_id,
+                    result,
+                    ..
+                } = event
+                {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((internal_call_id.into(), result.into()));
+                }
+                Flow::cont()
+            }
+        }
+        for action in [Action::Deny, Action::Ask, Action::Allow] {
+            let root = crate::tests::OwnedTestDirectory::new("edit-sdk-authority");
+            std::fs::write(root.path().join("target.txt"), "PRIVATE_NEIGHBOR\nold\n").unwrap();
+            #[cfg(not(all(feature = "hooks", unix)))]
+            let checker = permission(action, root.path());
+            #[cfg(all(feature = "hooks", unix))]
+            let checker = {
+                use crate::permission::{
+                    PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
+                };
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::permission::checker::PermissionChecker::new(
+                        &PermissionConfigs::from(PermissionConfig {
+                            default: Some(Action::Allow),
+                            read: Some(ToolPerm::Simple(action)),
+                            edit: Some(ToolPerm::Simple(Action::Ask)),
+                            ..Default::default()
+                        }),
+                        SecurityMode::Standard,
+                        Some(root.path().to_path_buf()),
+                        None,
+                    )
+                    .unwrap(),
+                ))
+            };
+            let tools = crate::agent::tools::memoize::definitions(vec![Box::new(
+                EditTool::new(Some(checker.clone()), None).with_workspace(root.path()),
+            )]);
+            #[cfg(all(feature = "hooks", unix))]
+            let tools = {
+                use crate::extras::hooks::{
+                    dispatcher::HookDispatcher,
+                    settings::{HookGroup, HookHandler, HookTrust},
+                };
+                let dispatcher = std::sync::Arc::new(
+                    HookDispatcher::from_config(&std::collections::HashMap::from([(
+                        "PreToolUse".into(),
+                        vec![HookGroup {
+                            matcher: None,
+                            hooks: vec![HookHandler {
+                                kind: "command".into(),
+                                command: Some("sh".into()),
+                                args: Some(vec![
+                                    "-c".into(),
+                                    r#"printf '%s\n' '{"permissionDecision":"allow"}'"#.into(),
+                                ]),
+                                timeout: Some(2),
+                                is_async: false,
+                                condition: None,
+                                once: false,
+                                trust: HookTrust::Trusted,
+                                env: Default::default(),
+                            }],
+                        }],
+                    )]))
+                    .unwrap(),
+                );
+                crate::extras::hooks::decorator::wrap_all(tools, dispatcher, Some(checker), None)
+            };
+            let model = MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "provider-edit",
+                        "edit",
+                        serde_json::json!({"path":"target.txt","block":"<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("done"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ]);
+            let seen = Seen::default();
+            let agent = AgentBuilder::new(model)
+                .tools(tools)
+                .add_hook(seen.clone())
+                .add_hook(MutationDiffHook)
+                .build();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            let mut returned = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                scope_events(sender, async {
+                    let mut stream = agent
+                        .stream_chat("edit", Vec::<rig::completion::Message>::new())
+                        .max_turns(2)
+                        .await;
+                    while let Some(item) = stream.next().await {
+                        if let MultiTurnStreamItem::StreamUserItem(
+                            StreamedUserContent::ToolResult {
+                                tool_result,
+                                internal_call_id,
+                            },
+                        ) = item.unwrap()
+                        {
+                            assert_eq!(tool_result.id, "provider-edit");
+                            let text = tool_result
+                                .content
+                                .iter()
+                                .map(|content| match content {
+                                    rig::completion::message::ToolResultContent::Text(text) => {
+                                        text.text.as_str()
+                                    }
+                                    _ => panic!("edit returns text"),
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            returned.push((internal_call_id, text));
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                returned, *seen,
+                "streamed model-visible result must match the exact SDK result"
+            );
+            assert!(seen[0].1.starts_with("Applied 1 edit(s)"));
+            assert_eq!(
+                seen[0].1.contains("PRIVATE_NEIGHBOR"),
+                action == Action::Allow
+            );
+            let event = receiver.try_recv();
+            if action == Action::Allow {
+                let crate::event::AgentEvent::FileMutation { id, name, diff } = event.unwrap()
+                else {
+                    panic!("expected exact mutation metadata")
+                };
+                assert_eq!(id, seen[0].0);
+                assert_eq!(name, "edit");
+                assert_eq!(
+                    diff.before_sha256.as_deref(),
+                    Some(digest("PRIVATE_NEIGHBOR\nold\n").as_str())
+                );
+                assert_eq!(diff.after_sha256, digest("PRIVATE_NEIGHBOR\nnew\n"));
+            } else {
+                assert!(
+                    event.is_err(),
+                    "no typed source metadata without read authority"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("target.txt")).unwrap(),
+                "PRIVATE_NEIGHBOR\nnew\n"
+            );
+        }
     }
 
     #[tokio::test]

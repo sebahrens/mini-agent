@@ -582,6 +582,79 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
 }
 
 #[tokio::test]
+async fn edit_diagnostics_require_existing_read_authority() {
+    use crate::agent::tools::{EditArgs, EditTool};
+    for action in [Action::Deny, Action::Ask, Action::Allow] {
+        let root = crate::tests::OwnedTestDirectory::new("edit-diagnostic-authority");
+        let file = root.path().join("main.guarded");
+        std::fs::write(&file, "PRIVATE_NEIGHBOR\nold\n").unwrap();
+        let mut cfg = LspConfig::default();
+        cfg.servers.insert(
+            "guarded".into(),
+            custom("definitely-not-a-real-language-server", &[".guarded"]),
+        );
+        let manager = LspManager::new(&cfg, root.path().to_path_buf());
+        let uri = crate::extras::lsp::client::file_uri(&file).unwrap();
+        let checker = permission(
+            root.path(),
+            PermissionConfig {
+                default: Some(Action::Allow),
+                read: Some(ToolPerm::Simple(action)),
+                ..Default::default()
+            },
+        );
+        let tool = EditTool::new(Some(checker), None)
+            .with_workspace(root.path())
+            .with_lsp(Some(manager.clone()));
+        let publisher = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if std::fs::read_to_string(&file).unwrap() == "PRIVATE_NEIGHBOR\nnew\n" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // A fresh publish follows the actual atomic replacement identity.
+            manager.inject_diagnostics(
+                &uri,
+                "guarded",
+                vec![diag(
+                    lsp_types::DiagnosticSeverity::ERROR,
+                    0,
+                    0,
+                    "PRIVATE_DIAGNOSTIC_SOURCE",
+                )],
+            );
+        };
+        let (result, ()) = tokio::join!(
+            tool.call(EditArgs {
+                path: "main.guarded".into(),
+                replace_all: false,
+                fuzzy: false,
+                block: Some("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE".into()),
+                file_crc: None,
+                edits: None,
+            }),
+            publisher
+        );
+        let result = result.unwrap();
+        assert_eq!(
+            result.contains("PRIVATE_DIAGNOSTIC_SOURCE"),
+            action == Action::Allow,
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "PRIVATE_NEIGHBOR\nnew\n"
+        );
+        manager.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
     let root = TempRoot::new("atomic-edit-fresh-publish");
     let file = root.path().join("main.guarded");

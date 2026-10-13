@@ -2657,3 +2657,518 @@ fn glob_question_mark_never_matches_a_path_separator() {
     assert!(!Pattern::new("a*b").matches("a/y/b"));
     assert!(Pattern::new("a**b").matches("a/y/b"));
 }
+
+fn cli_seed_checker(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    workspace: &std::path::Path,
+) -> crate::permission::checker::PermCheck {
+    let authority = crate::permission::resolve_execution_authority(
+        cli,
+        cfg,
+        crate::sandbox::SandboxPolicy::Disabled,
+        "disabled",
+    )
+    .unwrap();
+    crate::permission::build_interactive_permission_with_cli_at(
+        cli,
+        cfg,
+        authority,
+        Some(workspace.to_path_buf()),
+    )
+    .unwrap()
+    .0
+    .unwrap()
+}
+
+fn cli_seed(value: &str) -> crate::permission::cli_rules::CliPermissionRule {
+    value.parse().unwrap()
+}
+
+#[test]
+fn cli_seeds_preserve_modes_deny_baselines_and_saved_session_grants() {
+    use crate::cli::Cli;
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("cli-seed-precedence");
+    let cfg = Config {
+        permission: Some(serde_json::json!({"write":"ask"})),
+        ..Default::default()
+    };
+    let cli = Cli {
+        guarded: true,
+        allow: vec![cli_seed("write:tmp/**")],
+        deny: vec![cli_seed("write:**/*.env")],
+        ..Default::default()
+    };
+    let checker = cli_seed_checker(&cli, &cfg, root.path());
+    let mut checker = checker.lock().unwrap();
+    assert_eq!(checker.mode(), SecurityMode::Guarded);
+    assert_eq!(
+        checker.check_bound_path("write", &root.path().join("tmp/app.txt").to_string_lossy()),
+        CheckResult::Allowed
+    );
+    checker.load_session_allowlist(&[("write".into(), "**".into())]);
+    assert!(matches!(
+        checker.check_bound_path(
+            "write",
+            &root.path().join("tmp/private.env").to_string_lossy()
+        ),
+        CheckResult::Denied(_)
+    ));
+    drop(checker);
+    let cfg = Config {
+        permission: Some(serde_json::json!({"write":"deny"})),
+        ..Default::default()
+    };
+    for flags in [
+        Cli {
+            guarded: true,
+            ..Default::default()
+        },
+        Cli {
+            yolo: true,
+            ..Default::default()
+        },
+        Cli {
+            read_only: true,
+            ..Default::default()
+        },
+    ] {
+        let cli = Cli {
+            allow: vec![cli_seed("write:**")],
+            ..flags
+        };
+        assert!(matches!(
+            cli_seed_checker(&cli, &cfg, root.path())
+                .lock()
+                .unwrap()
+                .check_bound_path("write", &root.path().join("file.txt").to_string_lossy()),
+            CheckResult::Denied(_)
+        ));
+    }
+    let readonly = Cli {
+        read_only: true,
+        allow: vec![cli_seed("write:**")],
+        ..Default::default()
+    };
+    let checker = cli_seed_checker(&readonly, &Config::default(), root.path());
+    assert!(matches!(
+        checker
+            .lock()
+            .unwrap()
+            .check_bound_path("write", &root.path().join("file.txt").to_string_lossy()),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn cli_seeds_keep_external_directory_baseline_and_raw_mcp_aliases() {
+    use crate::cli::Cli;
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("cli-seed-external");
+    let outside = crate::tests::OwnedTestDirectory::new("cli-seed-external-deny");
+    let cli = Cli {
+        guarded: true,
+        allow: vec![
+            cli_seed("read:**"),
+            cli_seed("write:**"),
+            cli_seed("mcp_tool:mcp_tool:Server.A:Raw-Tool"),
+            cli_seed("fetch:https://trusted.test/*"),
+        ],
+        deny: vec![cli_seed("write_todo_list:*")],
+        ..Default::default()
+    };
+    let checker = cli_seed_checker(&cli, &Config::default(), root.path());
+    let mut checker = checker.lock().unwrap();
+    assert_eq!(
+        checker.check_path("write", &outside.path().join("file.txt").to_string_lossy()),
+        CheckResult::Ask
+    );
+    assert_eq!(
+        checker.check("mcp_tool", "mcp_tool:Server.A:Raw-Tool"),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check("mcp_tool", "mcp_tool:server.a:raw-tool"),
+        CheckResult::Ask
+    );
+    assert_eq!(
+        checker.check("mcp_tool", "Server_A__Raw_Tool"),
+        CheckResult::Ask
+    );
+    assert_eq!(
+        checker.check("js/fetch", "https://trusted.test/path"),
+        CheckResult::Allowed
+    );
+    assert!(matches!(
+        checker.check("todo_write", "[]"),
+        CheckResult::Denied(_)
+    ));
+    drop(checker);
+    let standard = Cli {
+        allow: vec![cli_seed("read:**")],
+        ..Default::default()
+    };
+    assert_eq!(
+        cli_seed_checker(&standard, &Config::default(), root.path())
+            .lock()
+            .unwrap()
+            .check_path("read", &outside.path().join("file.txt").to_string_lossy()),
+        CheckResult::Ask
+    );
+    let external = outside
+        .path()
+        .join("file.txt")
+        .to_string_lossy()
+        .into_owned();
+    let cli = Cli {
+        guarded: true,
+        allow: vec![cli_seed(&format!("write:{external}"))],
+        ..Default::default()
+    };
+    let cfg = Config {
+        permission: Some(serde_json::json!({"external_directory":{"**":"deny"}})),
+        ..Default::default()
+    };
+    assert!(matches!(
+        cli_seed_checker(&cli, &cfg, root.path())
+            .lock()
+            .unwrap()
+            .check_path("write", &external),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn cli_seeds_preserve_shell_defaults_and_distinguish_exact_from_argv_prefix() {
+    use crate::cli::Cli;
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("cli-seed-shell-prefix");
+    let cfg = Config::default();
+    let base = Cli {
+        guarded: true,
+        ..Default::default()
+    };
+    let plain = cli_seed_checker(&base, &cfg, root.path());
+    let cli = Cli {
+        allow: vec![cli_seed("bash:mybuild test*")],
+        allow_prefix: vec![cli_seed("shell:mybuild status")],
+        deny: vec![cli_seed("bash:*FORBIDDEN*")],
+        ..base
+    };
+    let seeded = cli_seed_checker(&cli, &cfg, root.path());
+    let mut seeded = seeded.lock().unwrap();
+    for command in ["pwd", "git status", "git diff", "unlisted-command"] {
+        assert_eq!(
+            seeded.check("shell", command),
+            plain.lock().unwrap().check("shell", command),
+            "CLI seeds changed unrelated default {command}"
+        );
+    }
+    assert_eq!(seeded.check("shell", "mybuild test*"), CheckResult::Allowed);
+    assert_eq!(seeded.check("bash", "mybuild test-extra"), CheckResult::Ask);
+    assert_eq!(
+        seeded.check("bash", "mybuild status --porcelain=v1"),
+        CheckResult::Allowed
+    );
+    for command in [
+        "mybuild status; echo x",
+        "mybuild status && echo x",
+        "mybuild status $(echo x)",
+        "mybuild status 'quoted'",
+    ] {
+        assert_eq!(seeded.check("bash", command), CheckResult::Ask, "{command}");
+    }
+    assert!(matches!(
+        seeded.check("shell", "mybuild status FORBIDDEN"),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[tokio::test]
+async fn cli_seeds_reach_actual_file_effects_without_prompt_and_do_not_persist() {
+    use crate::agent::tools::{WriteArgs, WriteTool};
+    use crate::cli::Cli;
+    use crate::config::Config;
+    use rig::tool::Tool;
+    let root = crate::tests::OwnedTestDirectory::new("cli-seed-write-effect");
+    std::fs::create_dir(root.path().join("tmp")).unwrap();
+    let cfg = Config {
+        permission: Some(serde_json::json!({"write":"ask"})),
+        ..Default::default()
+    };
+    let original_cfg = serde_json::to_value(&cfg).unwrap();
+    let cli = Cli {
+        guarded: true,
+        allow: vec![cli_seed("write:tmp/**")],
+        deny: vec![cli_seed("write:**/*.env")],
+        ..Default::default()
+    };
+    let checker = cli_seed_checker(&cli, &cfg, root.path());
+    let tool = WriteTool::new(Some(checker.clone()), None, None).with_workspace(root.path());
+    let allowed = tool
+        .call(WriteArgs {
+            path: "tmp/app.txt".into(),
+            content: "actual effect".into(),
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    assert!(allowed.contains("app.txt"), "{allowed}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("tmp/app.txt")).unwrap(),
+        "actual effect"
+    );
+    let denied = tool
+        .call(WriteArgs {
+            path: "tmp/private.env".into(),
+            content: "must-not-write".into(),
+            overwrite: false,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(denied.contains("denied"), "{denied}");
+    assert!(!root.path().join("tmp/private.env").exists());
+    assert_eq!(serde_json::to_value(&cfg).unwrap(), original_cfg);
+    let clean = cli_seed_checker(
+        &Cli {
+            guarded: true,
+            ..Default::default()
+        },
+        &cfg,
+        root.path(),
+    );
+    assert_eq!(
+        clean
+            .lock()
+            .unwrap()
+            .check_bound_path("write", &root.path().join("tmp/new.txt").to_string_lossy()),
+        CheckResult::Ask,
+        "a later invocation must not inherit the seed"
+    );
+    let session = crate::session::Session::new("test", "test", 128_000, "");
+    assert!(session.permission_allowlist.is_empty());
+    assert!(!serde_json::to_string(&session).unwrap().contains("tmp/**"));
+}
+
+fn config_alias_checker(
+    cfg: &crate::config::Config,
+    mode: SecurityMode,
+    root: &std::path::Path,
+) -> PermissionChecker {
+    PermissionChecker::new(
+        &cfg.build_permission_config().unwrap(),
+        mode,
+        Some(root.to_path_buf()),
+        cfg.permission_modes.clone(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn configured_alias_maps_match_nested_schema_for_all_actions_and_modes() {
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("permission-config-alias-parity");
+    for (alias, canonical, input) in [
+        ("fetch", "js/fetch", "https://example.test/path"),
+        ("write_todo_list", "todo_write", ""),
+    ] {
+        for action in ["allow", "ask", "deny"] {
+            for mode in [
+                SecurityMode::Standard,
+                SecurityMode::Guarded,
+                SecurityMode::Yolo,
+                SecurityMode::ReadOnly,
+                SecurityMode::Restrictive,
+            ] {
+                for enable_rules in [false, true] {
+                    let modes = enable_rules.then(|| vec![mode.to_string()]);
+                    let field = format!("permission-{action}");
+                    let top_alias: Config = serde_json::from_value(
+                        serde_json::json!({field.clone():{alias:["**"]}, "permission-modes":modes}),
+                    )
+                    .unwrap();
+                    let top_canonical: Config = serde_json::from_value(
+                        serde_json::json!({field:{canonical:["**"]}, "permission-modes":modes}),
+                    )
+                    .unwrap();
+                    let nested_alias: Config = serde_json::from_value(serde_json::json!({"permission":{alias:{"**":action}}, "permission-modes":modes})).unwrap();
+                    let nested_canonical: Config = serde_json::from_value(serde_json::json!({"permission":{canonical:{"**":action}}, "permission-modes":modes})).unwrap();
+                    let expected = config_alias_checker(&nested_canonical, mode, root.path())
+                        .check(canonical, input);
+                    for cfg in [&top_alias, &top_canonical, &nested_alias] {
+                        let actual =
+                            config_alias_checker(cfg, mode, root.path()).check(canonical, input);
+                        assert_eq!(
+                            actual, expected,
+                            "{alias} {action} {mode} enabled={enable_rules}"
+                        );
+                        if action == "deny" {
+                            assert!(matches!(actual, CheckResult::Denied(_)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_alias_conflicts_deny_before_allow_and_restored_grants() {
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("permission-config-alias-conflict");
+    for (alias, canonical, input) in [
+        ("fetch", "js/fetch", "https://example.test/path"),
+        ("write_todo_list", "todo_write", ""),
+    ] {
+        for (allow_key, deny_key) in [(alias, canonical), (canonical, alias)] {
+            let cfg: Config = serde_json::from_value(serde_json::json!({
+                "permission-allow":{allow_key:["**"]}, "permission-deny":{deny_key:["**"]},
+            }))
+            .unwrap();
+            for mode in [
+                SecurityMode::Standard,
+                SecurityMode::Guarded,
+                SecurityMode::Yolo,
+                SecurityMode::ReadOnly,
+            ] {
+                let mut checker = config_alias_checker(&cfg, mode, root.path());
+                checker.load_session_allowlist(&[(canonical.into(), input.into())]);
+                assert!(
+                    matches!(checker.check(canonical, input), CheckResult::Denied(_)),
+                    "{allow_key}/{deny_key} {mode}"
+                );
+            }
+        }
+        let cfg: Config = serde_json::from_value(
+            serde_json::json!({"permission-allow":{alias:["**"], canonical:["**"]}}),
+        )
+        .unwrap();
+        let mut checker = config_alias_checker(&cfg, SecurityMode::Guarded, root.path());
+        assert_eq!(checker.check(canonical, input), CheckResult::Allowed);
+    }
+}
+
+#[test]
+fn configured_aliases_preserve_authored_serialization_and_reject_unknown_keys() {
+    use crate::config::Config;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "permission_allow":{"fetch":["https://example.test/**"]},
+        "permission_ask":{"write_todo_list":["**"]},
+        "permission_deny":{"fetch":["https://blocked.test/**"]},
+    }))
+    .unwrap();
+    cfg.build_permission_config().unwrap();
+    let saved = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(
+        saved["permission-allow"]["fetch"][0],
+        "https://example.test/**"
+    );
+    assert_eq!(saved["permission-ask"]["write_todo_list"][0], "**");
+    assert!(saved["permission-allow"].get("js/fetch").is_none());
+    let reloaded: Config = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reloaded).unwrap(), saved);
+    for field in ["permission-allow", "permission-ask", "permission-deny"] {
+        let cfg: Config =
+            serde_json::from_value(serde_json::json!({field:{"unknown_tool":["**"]}})).unwrap();
+        let error = cfg.build_permission_config().unwrap_err().to_string();
+        assert!(error.contains("unsupported permission tool"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn configured_todo_alias_deny_leaves_the_actual_store_unchanged() {
+    use crate::agent::tools::todo::{TodoItem, TodoWriteArgs};
+    use crate::agent::tools::{TodoStore, WriteTodoList};
+    use crate::config::Config;
+    use rig::tool::Tool;
+    use std::sync::{Arc, Mutex};
+    let root = crate::tests::OwnedTestDirectory::new("permission-config-alias-todo-effect");
+    let original = TodoItem {
+        content: "keep the existing task".into(),
+        status: "pending".into(),
+        priority: "medium".into(),
+    };
+    for key in ["write_todo_list", "todo_write"] {
+        for mode in [
+            SecurityMode::Standard,
+            SecurityMode::Guarded,
+            SecurityMode::Yolo,
+            SecurityMode::ReadOnly,
+        ] {
+            let cfg: Config =
+                serde_json::from_value(serde_json::json!({"permission-deny":{key:["**"]}}))
+                    .unwrap();
+            let store = TodoStore::default();
+            store.replace(vec![original.clone()]);
+            let permission = Arc::new(Mutex::new(config_alias_checker(&cfg, mode, root.path())));
+            permission
+                .lock()
+                .unwrap()
+                .load_session_allowlist(&[("todo_write".into(), "".into())]);
+            let tool = WriteTodoList::new_with_store(Some(permission), None, store.clone());
+            let error = tool
+                .call(TodoWriteArgs {
+                    todos: vec![TodoItem {
+                        content: "must not replace".into(),
+                        status: "completed".into(),
+                        priority: "high".into(),
+                    }],
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Permission denied"), "{key} {mode}: {error}");
+            assert_eq!(
+                store.snapshot().as_slice(),
+                std::slice::from_ref(&original),
+                "{key} {mode}"
+            );
+        }
+    }
+    let store = TodoStore::default();
+    let permission = Arc::new(Mutex::new(config_alias_checker(
+        &Config::default(),
+        SecurityMode::ReadOnly,
+        root.path(),
+    )));
+    WriteTodoList::new_with_store(Some(permission), None, store.clone())
+        .call(TodoWriteArgs {
+            todos: vec![original.clone()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.snapshot(),
+        [original],
+        "existing todo convenience semantics stay intact"
+    );
+}
+
+#[test]
+fn configured_alias_mapping_keeps_raw_mcp_inputs_and_stored_alias_grants_unmodified() {
+    use crate::config::Config;
+    let root = crate::tests::OwnedTestDirectory::new("permission-config-alias-identities");
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "permission-allow":{"mcp_tool":["mcp_tool:fetch:write_todo_list"]},
+    }))
+    .unwrap();
+    let mut checker = config_alias_checker(&cfg, SecurityMode::Guarded, root.path());
+    assert_eq!(
+        checker.check("mcp_tool", "mcp_tool:fetch:write_todo_list"),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check("mcp_tool", "mcp_tool:js/fetch:todo_write"),
+        CheckResult::Ask
+    );
+    let mut checker = config_alias_checker(&Config::default(), SecurityMode::Standard, root.path());
+    let input = "https://example.test/path destinations=[93.184.216.34:443]";
+    checker.load_session_allowlist(&[("fetch".into(), input.into())]);
+    assert_eq!(
+        checker.check("js/fetch", input),
+        CheckResult::Ask,
+        "canonicalizing config keys must not revive an ignored persisted runtime alias grant"
+    );
+}

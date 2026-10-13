@@ -7928,6 +7928,72 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     #[tokio::test]
+    async fn configured_fetch_alias_deny_prevents_actual_executor_dispatch() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-config-alias-fetch-effect");
+        for key in ["fetch", "js/fetch"] {
+            let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+                "permission-allow":{"js/fetch":["**"]},
+                "permission-deny":{key:["https://example.com/**"]},
+            }))
+            .unwrap();
+            let permission = Arc::new(Mutex::new(
+                PermissionChecker::new(
+                    &cfg.build_permission_config().unwrap(),
+                    SecurityMode::Yolo,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            ));
+            let (result, sender) = run_fake_fetch(
+                FetchPolicy::from_settings(None, false),
+                vec![Ok(vec![public_address()])],
+                vec![Ok(completed_fetch())],
+                permission,
+                None,
+                STEP_TIMEOUT,
+                "https://example.com/",
+            )
+            .await;
+            assert!(
+                matches!(result, Err(FetchError::Permission(_))),
+                "{key}: {result:?}"
+            );
+            assert_eq!(sender.call_count(), 0, "{key}: deny must precede any send");
+        }
+        let cfg: crate::config::Config = serde_json::from_value(
+            serde_json::json!({"permission-allow":{"fetch":["https://example.com/**"]}}),
+        )
+        .unwrap();
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &cfg.build_permission_config().unwrap(),
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let (result, sender) = run_fake_fetch(
+            FetchPolicy::from_settings(None, false),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            permission,
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result.unwrap().status, 200);
+        assert_eq!(
+            sender.call_count(),
+            1,
+            "positive alias must reach the same checked dispatch boundary"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
     async fn js_fetch_ssrf_policy_denies_private_mixed_permission_and_rebinding_before_io() {
         let policy = FetchPolicy::from_settings(None, false);
         let private = "127.0.0.1:443".parse().unwrap();

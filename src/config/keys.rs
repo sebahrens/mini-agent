@@ -141,6 +141,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated_aliased("mcp", "enable-grepapp-mcp", &["enable_grepapp_mcp"]),
     aliased("default_permission_mode", &["default-permission-mode"]),
     aliased("permission-modes", &["permission_modes"]),
+    key("permission_mode_cycle"),
     key("show_tool_details"),
     key("diff_context_lines"),
     key("max_diff_lines"),

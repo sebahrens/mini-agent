@@ -1816,6 +1816,8 @@ pub(crate) fn print_sessions() {
 }
 
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
+    let rules_cfg =
+        crate::permission::cli_rules::report_config(cli, cfg).map_err(io::Error::other)?;
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let config_dir = paths.config_dir.clone();
     let data_dir = paths.data_dir.clone();
@@ -2041,9 +2043,94 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         );
     }
 
+    append_section(
+        &mut output,
+        "Permission rule inventory (pattern contents redacted)",
+        &permission_rule_entries(&rules_cfg),
+    );
+
     append_config_warnings(&mut output, &cfg.load_warnings);
 
     write_output(io::stdout().lock(), &output)
+}
+
+fn permission_rule_entries(cfg: &config::Config) -> Vec<(&'static str, String)> {
+    use sha2::{Digest, Sha256};
+    let show = |rules: &Option<HashMap<String, Vec<String>>>| {
+        let Some(rules) = rules else {
+            return "none".into();
+        };
+        let mut tools: Vec<_> = rules.iter().collect();
+        tools.sort_unstable_by_key(|(tool, _)| *tool);
+        tools
+            .into_iter()
+            .map(|(tool, patterns)| {
+                let ids = patterns
+                    .iter()
+                    .take(32)
+                    .map(|pattern| {
+                        let fingerprint: String = Sha256::digest(pattern.as_bytes())
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                        format!("{}B sha256:{fingerprint}", pattern.len())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let omitted = if patterns.len() > 32 {
+                    format!("; {} further entries omitted", patterns.len() - 32)
+                } else {
+                    String::new()
+                };
+                format!("{tool}: {} entries [{ids}]{omitted}", patterns.len())
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let legacy = |value: &Option<serde_json::Value>| {
+        value.as_ref().map_or_else(
+            || "none".into(),
+            |value| {
+                let bytes = serde_json::to_vec(value).expect("JSON values serialize");
+                let hash: String = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                format!(
+                    "configured JSON policy, {}B sha256:{hash}; contents redacted",
+                    bytes.len()
+                )
+            },
+        )
+    };
+    vec![
+        ("permission", legacy(&cfg.permission)),
+        ("permission-regex", legacy(&cfg.permission_regex)),
+        ("base policy", "configured policy and applicable built-in defaults retained before CLI seeds".into()),
+        ("permission-allow", show(&cfg.permission_allow)),
+        ("permission-ask", show(&cfg.permission_ask)),
+        ("permission-deny", show(&cfg.permission_deny)),
+        (
+            "permission-allow-prefix",
+            show(&cfg.permission_allow_prefix),
+        ),
+        (
+            "CLI seed persistence",
+            "invocation only; not saved or restored".into(),
+        ),
+        (
+            "rule modes",
+            cfg.permission_modes.as_ref().map_or_else(
+                || "guarded, standard, yolo (allow/ask); denies apply in every mode when checks are enabled".into(),
+                |modes| {
+                    format!(
+                        "{} (allow/ask); denies apply in every mode when checks are enabled",
+                        modes.join(", ")
+                    )
+                },
+            ),
+        ),
+    ]
 }
 
 fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
@@ -2075,6 +2162,41 @@ mod tests {
         chat_history_path_policy_entry, emit_headless, installed_build_entry,
         javascript_worker_compiled_entry, parse_git_status, render_headless_json, write_output,
     };
+
+    #[test]
+    fn cli_seed_rule_inventory_reports_effective_maps_without_plaintext() {
+        let cli = crate::cli::Cli {
+            allow: vec![
+                "shell:echo PRIVATE_RULE_CANARY".parse().unwrap(),
+                "write:src/**".parse().unwrap(),
+            ],
+            deny: vec!["write:**/*.env".parse().unwrap()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config {
+            permission: Some(serde_json::json!({"bash":{"PRIVATE_RULE_CANARY":"deny"}})),
+            permission_regex: Some(serde_json::json!({"read":{"PRIVATE_RULE_CANARY":"ask"}})),
+            permission_allow: Some(std::collections::HashMap::from([(
+                "read".into(),
+                vec!["docs/**".into()],
+            )])),
+            ..Default::default()
+        };
+        let report_cfg = crate::permission::cli_rules::report_config(&cli, &cfg).unwrap();
+        let entries = super::permission_rule_entries(&report_cfg);
+        let text = format!("{entries:?}");
+        assert!(!text.contains("PRIVATE_RULE_CANARY"), "{text}");
+        for required in [
+            "shell: 1 entries",
+            "read: 1 entries",
+            "write: 1 entries",
+            "sha256:",
+            "invocation only",
+        ] {
+            assert!(text.contains(required), "{text}");
+        }
+        assert_eq!(cfg.permission_allow.as_ref().unwrap().len(), 1);
+    }
 
     #[test]
     fn print_config_repeats_load_warnings_and_omits_an_empty_section() {

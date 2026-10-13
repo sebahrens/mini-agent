@@ -169,6 +169,8 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
 }
 
 async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
+    // Reject malformed seeds before provider/operator execution or session paths.
+    permission::cli_rules::config(&cli)?;
     #[cfg(all(feature = "loop", unix))]
     if cli.loop_verification_policy_check {
         extras::r#loop::verify_workflow_only_headless_relevance()?;

@@ -354,6 +354,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_COMPLETION_ENV`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
 | Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
 | Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
+| Update-cache fixtures | `MINI_AGENT_TEST_UPDATE_ADMISSION`, `MINI_AGENT_TEST_UPDATE_NOW`: test-only child cache path and controlled timestamp for cross-process release-check admission; never read by production update checks. |
 | MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
@@ -642,6 +643,7 @@ Accepted top-level keys:
 | `accept_all`              | boolean | Select standard permission mode with auto-allow within CWD (equivalent to `default_permission_mode = "standard"`). Overridden by `yolo` if true.                            |
 | `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive shell commands).                                                                                                           |
 | `permission-modes`        | array   | List of mode names that apply configured `allow` and `ask` rules. Default: `["guarded", "standard", "yolo"]`. Configured `deny` and `external_directory` deny rules are security baselines and remain active in every mode. |
+| `permission_mode_cycle` | array | Global-only Shift+Tab ring; defaults to `["standard", "guarded", "yolo"]`. One to six unique names from `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`; empty, duplicate, and unknown modes are rejected when loading config, even with tools disabled. Project overrides are ignored, including trusted projects. This changes neither startup mode nor which modes apply rules. |
 | `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `true`. Precedence is `--no-sandbox` (disable) > `--sandbox` (explicitly require) > this config value > the default. On non-Windows hosts, an unavailable backend inherited only from the default warns and runs unsandboxed. While sandboxing remains enabled, `--sandbox`, `sandbox = true`, or selecting a backend through the CLI/config fails closed if that backend is unavailable. This setting never disables the mandatory broker-only JS worker containment. |
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight. Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by interrupted earlier preflights. The new run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
@@ -1589,7 +1591,7 @@ Available items:
 | `context_percentage`  | Context used as a percentage of the max. |
 | `cost`                | Session cost (hidden at `$0.0000` unless `show_cost_always` is set). |
 | `prompt`              | Active prompt (`prompt:<name>`). |
-| `mode`                | Security mode when not `standard` (`mode:<name>`). |
+| `mode`                | Current security mode (`mode:<name>`), including `standard`. |
 | `sandbox`             | Red `sandbox:off` while shell commands run unsandboxed because the default sandbox backend was unavailable (hidden otherwise, including under an explicit `--no-sandbox`). In the default layout; a custom layout that omits it still gets it appended to the first line while degraded. |
 | `loop`                | Active loop label. |
 | `goal`                | Active goal: its round and status, in brackets. Hidden when there is no goal or it has finished. |
@@ -1669,8 +1671,8 @@ Example:
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
-permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, `read`, `write`, `edit`, `grep`,
-`find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
+permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch` (`fetch` alias), `read`, `write`, `edit`, `grep`,
+`find_files`, `list_dir`, `todo_write` (`write_todo_list` alias), `git/status`, `git/diff`, `git/log`,
 `git/show`, `git/stage`, `git/unstage`, `git/commit`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
 `mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the
@@ -1939,7 +1941,12 @@ approval keys retain their displayed scopes.
 
 As a TOML-friendly alternative to the nested `permission` object, you can use
 `permission-allow`, `permission-ask`, and `permission-deny` at the top level.
-Each is a map from tool name to a list of glob patterns. These work side by
+Each is a map from tool name to a list of glob patterns. All three maps use
+the same tool-key aliases as nested `permission`: `bash` → `shell`, `fetch` →
+`js/fetch`, and `write_todo_list` → `todo_write`. Alias and canonical entries
+combine; a matching deny wins even if an allow uses the other spelling. This
+canonicalizes only authored tool keys, leaving patterns and raw MCP identities
+unchanged. Saved configuration keeps the authored spelling. These work side by
 side with the `permission` field and are especially convenient in TOML configs:
 
 ```toml
@@ -1974,6 +1981,43 @@ permission-regex:
 Shell/bash allow entries containing `*`, `?`, or `[` emit one load warning per
 authored entry, because these characters are literal in an exact-script allow.
 Warnings identify the config field and entry without echoing the script.
+
+The CLI accepts the same tool keys through repeatable invocation-only seeds:
+
+```bash
+mini-agent --guarded --allow 'write:tmp/**' --deny 'write:**/*.env' -p 'update the fixture'
+mini-agent --allow 'bash:cargo test' --allow-prefix 'shell:git status' -p 'check the change'
+```
+
+`--allow TOOL:PATTERN` and `--deny TOOL:PATTERN` split at the first colon; all
+remaining characters belong to the pattern. For MCP, the complete raw input
+remains `mcp_tool:SERVER:TOOL`, so a seed is
+`--allow 'mcp_tool:mcp_tool:MyServer:raw-tool'`; model aliases and hook matcher
+labels are not permission identities. `shell`/`bash`, `fetch`/`js/fetch`, and
+`todo_write`/`write_todo_list` retain their configured aliases.
+
+Seeds merge into the ordinary checker after the configured policy and its built-in
+defaults compile. Denies win over configured allows, CLI allows, and restored
+AllowAlways grants in every mode while permission checks are enabled. Allows keep
+normal specificity and `permission-modes` behavior: flags do not select a different
+mode, and a default `--read-only` run still denies writes. Relative or wildcard
+file allows do not replace external-directory approval where the selected mode
+requires it; an `external_directory`
+deny still wins over an explicit absolute-path allow. Configure that baseline in
+`permission.external_directory`, rather than using it as a CLI tool key.
+`--dangerously-skip-permissions` retains its existing complete bypass semantics.
+
+CLI seeds apply to headless, interactive, and ACP checker construction for this
+process. They never enter saved configuration or session `permission_allowlist`,
+and must be supplied again on resume. Unmatched headless Ask decisions still fail
+closed. `--tools`/`--no-tools` still control registration independently of grants.
+`--print-config` inventories effective allow/ask/deny/prefix entries by tool, count,
+byte length, and SHA-256 fingerprint; legacy nested glob/regex policies have
+whole-JSON fingerprints. Pattern contents are omitted because scripts
+may contain credentials. At most 32 fingerprints per tool are shown. Diagnostics
+and Debug also omit rule contents. There are at most 256 CLI seeds per invocation,
+with at most 8192 UTF-8 bytes per `TOOL:PATTERN`; empty patterns, unknown tool keys,
+and invalid prefixes fail before provider or session initialization.
 
 An explicit argv-prefix scope is available separately:
 
@@ -2593,7 +2637,7 @@ in the prompt body are kept as prompt content.
 Valid modes: `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.
 
 A directive can only narrow the mode. The user's own selection (a CLI flag,
-`default_permission_mode`, or `/mode`) is the ceiling: a prompt asking for a
+`default_permission_mode`, `/mode`, or Shift+Tab) is the ceiling: a prompt asking for a
 more permissive mode (for example `%%mode=yolo` while running `--guarded`) is
 ignored and the current mode is kept. Ranking from least to most permissive:
 `readonly`, `planwrite`, `restrictive`, `guarded`, `standard`, `yolo`.
@@ -2609,7 +2653,7 @@ under Trust model; `%%mode=last_user_mode` is always kept because it can
 only restore the user's selection.
 
 Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
-set explicitly via `/mode` or startup config — useful when a prompt wants
+set explicitly via `/mode`, Shift+Tab, or startup config — useful when a prompt wants
 to avoid overriding the user's chosen mode. The built-in `autoconfig`
 prompt uses it, so a `yolo` or `guarded` session keeps its mode while
 configuring and a `readonly` session stays read-only.
@@ -2680,8 +2724,10 @@ Review the requested Rust change for exploitable security defects.
 ```
 
 The mode change is applied when the prompt is activated and persists
-until changed again by `/mode`, another prompt directive, or a restart.
-The status bar shows `| mode:<name>` when the mode is not `standard`.
+until changed again by `/mode`, Shift+Tab, another prompt directive, or a restart.
+The `mode` status-bar item shows `mode:<name>`, including `standard`.
+Shift+Tab also flashes the selected mode in the status bar, even when a custom
+layout omits the `mode` item. It never answers an already displayed approval.
 
 Use `/agent` to list the personas resolved for the current workspace,
 `/agent <name>` to apply one to the main loop, and `/agent default` to clear it.

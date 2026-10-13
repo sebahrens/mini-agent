@@ -12,6 +12,14 @@ whose features are disabled. The reserved-name policy and its test matrix compil
 with `mcp`, independently of `js`. The JS directory-discovery adapter compiles
 with `js`; ordinary `find_files` and `list_dir` retain their shared directory access.
 
+`src/permission/cli_rules.rs` parses and bounds invocation-only `--allow`, `--deny`,
+and `--allow-prefix` seeds, with redacted diagnostics and Debug values. Frontends
+compile the ordinary configured checker before merging this transient layer, so
+new shell keys preserve built-in defaults. The layer never mutates the saved Config
+or Session allowlist; no-check/no-tools modes still validate input. Headless, TUI,
+and ACP use the same merge and retain their existing approval transports. See
+[CLI seed precedence](CONFIG.md#rule-precedence) for mode and external-directory rules.
+
 `/editsys` rebuilds the agent immediately after changing the edit system, so the memoized
 `read`/`edit` definitions and their runtime behavior always switch together.
 
@@ -316,7 +324,19 @@ external-directory limits still apply, and an invocation's edit/write hook grant
 cannot supply read authority. Failed, denied, oversized, and read-unapproved
 mutations provide no extension.
 
-The native tools return Rig typed result extensions alongside their unchanged
+
+Edit result disclosure uses existing read authority independently of edit permission.
+An allowed edit with denied or unchecked `ask` read access still performs full matching
+and compare-and-swap publication, but returns the applied-edit summary and bounded
+caller-supplied replacement text instead of file excerpts. Unchanged neighboring lines,
+unchanged portions of an edited line, approximate-match candidates, current checksum
+values, and language-server diagnostic text are omitted. This display check never asks
+for read access or consumes a one-shot read grant; an edit approval does not authorize
+reading. Existing allowed read access retains the normal excerpts and typed mutation
+metadata. An explicit read deny overrides earlier reads and session grants.
+
+
+The native tools return Rig typed result extensions alongside their
 model-visible strings. Definition memoization, hook decorators (including output
 redaction), and concurrency wrappers forward these extensions. `MutationDiffHook`
 observes successful results and transports a bounded snapshot with Rig's exact

@@ -1256,7 +1256,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'name == "__pycache__"',
             'extension == "pyc" || extension == "pyo"',
             'PATCHED_RIG: &str = "patched-deps/rig-core"',
-            'collect_directory(&rig.join("src"), &mut files)',
+            'collect_directory(&rig.join("src"), &mut files, true)',
+            '"docs/agent"',
+            '"docs/vscode-acp-setup.md"',
+            '"assets/learned-skills"',
         ),
         "scripts/update-release-checksums.sh": (
             CANONICAL_REPOSITORY_URL,

@@ -942,6 +942,10 @@ fn split_project_override(
     let mut sensitive = toml::map::Map::new();
     let mut sensitive_keys = BTreeSet::new();
     for (key, value) in table {
+        if key == "permission_mode_cycle" {
+            tracing::warn!("project config: permission_mode_cycle is global-only and was ignored");
+            continue;
+        }
         if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str())
             || (key == "statusline" && statusline_value_needs_git_status(value))
         {
@@ -1761,6 +1765,34 @@ mod project_config_trust_tests {
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
+    }
+
+    #[test]
+    fn permission_mode_cycle_is_global_only_even_for_approved_project_config() {
+        let root = crate::tests::OwnedTestDirectory::new("project-mode-cycle-global-only");
+        let path = root.path().join("project/.zerostack/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "permission_mode_cycle = [\"yolo\"]\nyolo = true\n").unwrap();
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        let mut cfg = Config {
+            permission_mode_cycle: Some(vec!["readonly".into(), "guarded".into()]),
+            ..Default::default()
+        };
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(cfg.yolo, Some(true));
+        assert_eq!(
+            cfg.permission_mode_cycle,
+            Some(vec!["readonly".into(), "guarded".into()])
+        );
+        let (benign, sensitive, keys) =
+            split_project_override("permission_mode_cycle = []\n").unwrap();
+        assert!(
+            benign.as_table().unwrap().is_empty()
+                && sensitive.as_table().unwrap().is_empty()
+                && keys.is_empty()
+        );
     }
 
     #[test]

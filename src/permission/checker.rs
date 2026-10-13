@@ -291,6 +291,8 @@ pub struct PermissionChecker {
 /// existing files in one directory tree, but never to create files (`write`),
 /// run commands, or reach other directories.
 pub const FOLDER_GRANT_TOOLS: [&str; 3] = ["read", "edit", "list_dir"];
+/// Workspace mutation approval never supplies read, shell, JS, or MCP access.
+pub(crate) const WORKSPACE_EDIT_GRANT_TOOLS: [&str; 2] = ["edit", "write"];
 
 /// A folder grant requested by an embedded built-in prompt's `%%grant=`
 /// directive. It is offered to the user once, the first time the prompt's
@@ -521,36 +523,9 @@ impl PermissionChecker {
             entry.extend(entries);
         }
 
-        fn merge_entries(
-            rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
-            entries: &Option<HashMap<String, Vec<String>>>,
-            action: Action,
-        ) {
-            if let Some(map) = entries {
-                for (tool, patterns) in map {
-                    for alias in std::iter::once(tool.as_str())
-                        .chain(permission_tool_aliases(tool).iter().copied())
-                    {
-                        let entry = rules.entry(alias.to_string()).or_default();
-                        for pat in patterns {
-                            let pattern = if is_path_tool_name(alias) {
-                                if let Some(canonical) = canonical_tool_path_pattern(pat) {
-                                    entry.push((Pattern::new_path(&canonical), action));
-                                }
-                                Pattern::new_path(pat)
-                            } else {
-                                Pattern::new(pat)
-                            };
-                            entry.push((pattern, action));
-                        }
-                    }
-                }
-            }
-        }
-
-        merge_entries(&mut rules, &configs.glob.allow_entries, Action::Allow);
-        merge_entries(&mut rules, &configs.glob.ask_entries, Action::Ask);
-        merge_entries(&mut rules, &configs.glob.deny_entries, Action::Deny);
+        Self::merge_entries(&mut rules, &configs.glob.allow_entries, Action::Allow);
+        Self::merge_entries(&mut rules, &configs.glob.ask_entries, Action::Ask);
+        Self::merge_entries(&mut rules, &configs.glob.deny_entries, Action::Deny);
 
         if !rules.contains_key("shell") {
             let mut defaults = Vec::new();
@@ -652,6 +627,55 @@ impl PermissionChecker {
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_permission_mode(mode);
         Ok(checker)
+    }
+
+    /// Merge an already-validated transient CLI layer after normal policy
+    /// compilation. Do not use session grants: those bypass mode constraints
+    /// and are persisted by interactive approval paths.
+    pub(crate) fn apply_ephemeral_cli_rules(
+        &mut self,
+        config: &crate::permission::PermissionConfig,
+    ) -> anyhow::Result<()> {
+        let mut prefixes = Vec::new();
+        if let Some(entries) = &config.allow_prefix_entries {
+            for scripts in entries.values() {
+                for script in scripts {
+                    prefixes.push(crate::permission::shell_prefix::ShellPrefix::parse(script)?);
+                }
+            }
+        }
+        Self::merge_entries(&mut self.rules, &config.allow_entries, Action::Allow);
+        Self::merge_entries(&mut self.rules, &config.deny_entries, Action::Deny);
+        self.shell_allow_prefixes.extend(prefixes);
+        Ok(())
+    }
+
+    fn merge_entries(
+        rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
+        entries: &Option<HashMap<String, Vec<String>>>,
+        action: Action,
+    ) {
+        if let Some(map) = entries {
+            for (tool, patterns) in map {
+                let tool = crate::permission::canonical_rule_tool_name(tool);
+                for alias in
+                    std::iter::once(tool).chain(permission_tool_aliases(tool).iter().copied())
+                {
+                    let entry = rules.entry(alias.to_string()).or_default();
+                    for pat in patterns {
+                        let pattern = if is_path_tool_name(alias) {
+                            if let Some(canonical) = canonical_tool_path_pattern(pat) {
+                                entry.push((Pattern::new_path(&canonical), action));
+                            }
+                            Pattern::new_path(pat)
+                        } else {
+                            Pattern::new(pat)
+                        };
+                        entry.push((pattern, action));
+                    }
+                }
+            }
+        }
     }
 
     /// Suppresses the interactive prompt for the next `check`/`check_path`
@@ -1578,6 +1602,38 @@ impl PermissionChecker {
             }
         }
         entries
+    }
+
+    /// An actual native file approval in the captured workspace. Absolute
+    /// path requests exclude hook requests, whose input is tool-argument JSON.
+    /// Checking the offer consumes neither a hook decision nor a policy grant.
+    pub(crate) fn can_offer_workspace_edits(
+        &self,
+        tool: &str,
+        input: &str,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> bool {
+        if !WORKSPACE_EDIT_GRANT_TOOLS.contains(&tool)
+            || !Path::new(input).is_absolute()
+            || Path::new(&self.working_dir) != workspace.root()
+            || workspace.validate().is_err()
+        {
+            return false;
+        }
+        resolve_path_allow_missing(Path::new(input))
+            .is_some_and(|target| target.starts_with(workspace.root()))
+    }
+
+    pub(crate) fn add_workspace_edit_grant(
+        &mut self,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        workspace.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            Path::new(&self.working_dir) == workspace.root(),
+            "permission workspace changed"
+        );
+        Ok(self.add_session_folder_grant(workspace.root(), &WORKSPACE_EDIT_GRANT_TOOLS))
     }
 
     /// Arm (or clear) the scoped grant the active prompt requested. Called on
@@ -3955,6 +4011,72 @@ mod mutation_preimage_policy_tests {
         assert!(checker.hook_decision_is_pending(123));
     }
 
+    #[tokio::test]
+    async fn native_edit_preview_keeps_read_prompts_and_repeat_state_inert() {
+        use rig::tool::{Tool, ToolCallExtensions};
+        for action in [Action::Ask, Action::Deny] {
+            let root = crate::tests::OwnedTestDirectory::new("edit-preview-inert");
+            let path = root
+                .path()
+                .join("target.txt")
+                .to_string_lossy()
+                .into_owned();
+            std::fs::write(&path, "PRIVATE_NEIGHBOR\nold\n").unwrap();
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    default: Some(Action::Allow),
+                    read: Some(ToolPerm::Simple(action)),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            checker.last_call = Some(("edit".into(), path.clone()));
+            checker.consecutive_repeat_count = 1;
+            #[cfg(feature = "hooks")]
+            checker.allow_once_scoped("read".into(), 123);
+            let checker = std::sync::Arc::new(std::sync::Mutex::new(checker));
+            let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(8);
+            let tool = crate::agent::tools::EditTool::new(Some(checker.clone()), Some(ask_tx))
+                .with_workspace(root.path());
+            let result = tool
+                .call_structured(
+                    crate::agent::tools::EditArgs {
+                        path: "target.txt".into(),
+                        replace_all: false,
+                        fuzzy: false,
+                        block: Some("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE".into()),
+                        file_crc: None,
+                        edits: None,
+                    },
+                    &ToolCallExtensions::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!result.output.contains("PRIVATE_NEIGHBOR"));
+            assert!(
+                result
+                    .extensions
+                    .get::<crate::agent::tools::mutation_diff::MutationDiff>()
+                    .is_none()
+            );
+            assert!(matches!(
+                ask_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let checker = checker.lock().unwrap();
+            assert_eq!(checker.last_call, Some(("edit".into(), path)));
+            assert_eq!(
+                checker.consecutive_repeat_count, 2,
+                "only the real edit invocation advances repeat detection"
+            );
+            #[cfg(feature = "hooks")]
+            assert!(checker.hook_decision_is_pending(123));
+        }
+    }
+
     #[test]
     fn external_directory_denial_precedes_broad_read_and_session_grants() {
         let root = crate::tests::OwnedTestDirectory::new("preimage-external-policy");
@@ -4010,5 +4132,154 @@ mod mutation_preimage_policy_tests {
             })
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_edit_grant_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_edit_grant_preserves_denies_scope_and_resume_policy() {
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-edit-grant");
+        let workspace = owned.path().join("workspace");
+        let sibling = owned.path().join("workspace-sibling");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let config = PermissionConfigs::from(PermissionConfig {
+            edit: Some(ToolPerm::Granular(HashMap::from([(
+                "private/**".into(),
+                Action::Deny,
+            )]))),
+            write: Some(ToolPerm::Granular(HashMap::from([(
+                "private/**".into(),
+                Action::Deny,
+            )]))),
+            ..Default::default()
+        });
+        let make = || {
+            PermissionChecker::new(
+                &config,
+                SecurityMode::Restrictive,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let mut checker = make();
+        let target = binding
+            .root()
+            .join("src/new.txt")
+            .to_string_lossy()
+            .into_owned();
+        for tool in ["write", "edit"] {
+            assert!(checker.can_offer_workspace_edits(tool, &target, &binding));
+        }
+        for tool in ["read", "shell", "js/write_file", "mcp_tool"] {
+            assert!(!checker.can_offer_workspace_edits(tool, &target, &binding));
+        }
+        assert!(!checker.can_offer_workspace_edits("write", "relative.txt", &binding));
+        assert!(!checker.can_offer_workspace_edits("write", r#"{"path":"outside"}"#, &binding));
+        let sibling_target = sibling.join("new.txt").to_string_lossy().into_owned();
+        assert!(!checker.can_offer_workspace_edits("write", &sibling_target, &binding));
+        let entries = checker.add_workspace_edit_grant(&binding).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(
+            entries
+                .iter()
+                .all(|(tool, _)| WORKSPACE_EDIT_GRANT_TOOLS.contains(&tool.as_str()))
+        );
+        let mut restored = make();
+        restored.load_session_allowlist(&entries);
+        for policy in [&mut checker, &mut restored] {
+            for tool in ["write", "edit"] {
+                assert_eq!(policy.check_path(tool, &target), CheckResult::Allowed);
+                let denied = binding
+                    .root()
+                    .join("private/secret.txt")
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(matches!(
+                    policy.check_path(tool, &denied),
+                    CheckResult::Denied(_)
+                ));
+                assert_eq!(policy.check_path(tool, &sibling_target), CheckResult::Ask);
+            }
+            for tool in ["read", "js/write_file"] {
+                assert_eq!(policy.check_path(tool, &target), CheckResult::Ask);
+            }
+            for tool in ["shell", "mcp_tool"] {
+                assert_eq!(
+                    policy.check(tool, "unique unrelated request"),
+                    CheckResult::Ask
+                );
+            }
+            assert_eq!(policy.mode(), SecurityMode::Restrictive);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_edit_offer_rejects_symlink_escape_and_replaced_workspace() {
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-edit-grant-binding");
+        let workspace = owned.path().join("workspace");
+        let outside = owned.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        let target = workspace
+            .join("escape/new.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!checker.can_offer_workspace_edits("write", &target, &binding));
+        std::fs::rename(&workspace, owned.path().join("retained")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        assert!(!checker.can_offer_workspace_edits(
+            "write",
+            &workspace.join("new.txt").to_string_lossy(),
+            &binding
+        ));
+        assert!(checker.add_workspace_edit_grant(&binding).is_err());
+        assert!(checker.session_allowlist.is_empty());
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn workspace_edit_grant_does_not_consume_invocation_tokens_or_bypass_hook_denies() {
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-edit-hook-token");
+        let binding = crate::paths::WorkspaceBinding::capture(owned.path()).unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(owned.path().into()),
+            None,
+        )
+        .unwrap();
+        checker.allow_once_scoped("write".into(), 17);
+        checker.allow_once_scoped("edit".into(), 18);
+        let pinned = binding.root().join("hook.sh");
+        std::fs::write(&pinned, "fixture").unwrap();
+        checker.set_pinned_hook_files_for_test(vec![PathBuf::from("hook.sh")]);
+        assert!(checker.can_offer_workspace_edits(
+            "write",
+            &binding.root().join("new.txt").to_string_lossy(),
+            &binding
+        ));
+        checker.add_workspace_edit_grant(&binding).unwrap();
+        assert!(checker.hook_decision_is_pending(17) && checker.hook_decision_is_pending(18));
+        assert!(matches!(
+            checker.check_path("write", &pinned.to_string_lossy()),
+            CheckResult::Denied(_)
+        ));
+        assert!(checker.hook_decision_is_pending(17) && checker.hook_decision_is_pending(18));
     }
 }

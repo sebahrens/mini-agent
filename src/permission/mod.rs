@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod checker;
+pub(crate) mod cli_rules;
 pub mod pattern;
 pub(crate) mod shell_prefix;
 
@@ -70,11 +71,21 @@ pub struct PermissionConfigs {
     pub regex: PermissionConfig,
 }
 
+/// Canonicalize authored permission-map keys only. Match input, MCP identity,
+/// runtime tool names and persisted approval scopes are never rewritten here.
+pub(crate) fn canonical_rule_tool_name(tool: &str) -> &str {
+    match tool {
+        "bash" => "shell",
+        "fetch" => "js/fetch",
+        "write_todo_list" => "todo_write",
+        other => other,
+    }
+}
+
 pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
     matches!(
-        tool,
-        "bash"
-            | "shell"
+        canonical_rule_tool_name(tool),
+        "shell"
             | "git/status"
             | "git/diff"
             | "git/log"
@@ -83,7 +94,6 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "git/unstage"
             | "git/commit"
             | "js/fetch"
-            | "fetch"
             | "read"
             | "write"
             | "edit"
@@ -91,7 +101,6 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "find_files"
             | "list_dir"
             | "todo_write"
-            | "write_todo_list"
             | "mcp_tool"
     )
 }
@@ -130,6 +139,8 @@ pub(crate) enum ExecutionAuthorityError {
         "invalid `default_permission_mode` value `{value}`: expected one of {accepted} (or `accept` as an alias for `standard`)"
     )]
     InvalidDefaultPermissionMode { value: String, accepted: String },
+    #[error("{reason}")]
+    InvalidPermissionModeCycle { reason: String },
 }
 
 /// Resolve every user/config input that changes model execution authority.
@@ -143,6 +154,8 @@ pub(crate) fn resolve_execution_authority(
     sandbox_policy: crate::sandbox::SandboxPolicy,
     sandbox_backend: &str,
 ) -> Result<ResolvedExecutionAuthority, ExecutionAuthorityError> {
+    permission_mode_cycle(cfg.permission_mode_cycle.as_deref())
+        .map_err(|reason| ExecutionAuthorityError::InvalidPermissionModeCycle { reason })?;
     // Validate the configured default before any flag can mask a typo: an
     // unknown mode name must never silently degrade to `standard`.
     let configured_default = match cfg.default_permission_mode.as_deref() {
@@ -301,6 +314,45 @@ pub(crate) fn build_noninteractive_permission_at(
     ))
 }
 
+/// Construct the ordinary checker with invocation-only seeds. Approval
+/// transport is selected by the frontend and remains independent of the rules.
+pub(crate) fn build_interactive_permission_with_cli_at(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+    working_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<(
+    Option<checker::PermCheck>,
+    Option<ask::AskSender>,
+    Option<ask::AskReceiver>,
+)> {
+    let seeds = cli_rules::config(cli)?;
+    let result = build_interactive_permission_at(cfg, authority, working_dir)?;
+    if let Some(permission) = &result.0 {
+        permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_ephemeral_cli_rules(&seeds)?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn build_noninteractive_permission_with_cli(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+) -> anyhow::Result<(Option<checker::PermCheck>, Option<ask::AskSender>)> {
+    let seeds = cli_rules::config(cli)?;
+    let result = build_noninteractive_permission(cfg, authority)?;
+    if let Some(permission) = &result.0 {
+        permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_ephemeral_cli_rules(&seeds)?;
+    }
+    Ok(result)
+}
+
 fn build_permission_checker_at(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
@@ -364,6 +416,41 @@ pub enum SecurityMode {
     PlanWrite,
     Guarded,
     Yolo,
+}
+
+/// The user's shortcut ring is distinct from `permission_modes`, which decides
+/// whether configured non-deny rules apply. Invalid settings never fall back.
+pub(crate) fn permission_mode_cycle(
+    configured: Option<&[String]>,
+) -> Result<Vec<SecurityMode>, String> {
+    let Some(names) = configured else {
+        return Ok(vec![
+            SecurityMode::Standard,
+            SecurityMode::Guarded,
+            SecurityMode::Yolo,
+        ]);
+    };
+    if names.is_empty() || names.len() > SecurityMode::NAMES.len() {
+        return Err(
+            "invalid `permission_mode_cycle`: expected one to six unique mode names".into(),
+        );
+    }
+    let mut modes = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(mode) = SecurityMode::from_str(name) else {
+            return Err(format!(
+                "invalid `permission_mode_cycle` mode `{name}`: expected {}",
+                SecurityMode::NAMES.join(", ")
+            ));
+        };
+        if modes.contains(&mode) {
+            return Err(format!(
+                "invalid `permission_mode_cycle`: duplicate mode `{name}`"
+            ));
+        }
+        modes.push(mode);
+    }
+    Ok(modes)
 }
 
 impl SecurityMode {
@@ -1454,5 +1541,70 @@ mod acp_permission_policy_tests {
                 Some("Permission denied (non-interactive mode)")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mode_cycle_tests {
+    use super::*;
+
+    #[test]
+    fn cycle_config_is_validated_before_permission_flags_can_mask_it() {
+        assert_eq!(
+            permission_mode_cycle(None).unwrap(),
+            vec![
+                SecurityMode::Standard,
+                SecurityMode::Guarded,
+                SecurityMode::Yolo
+            ]
+        );
+        let configured = vec!["readonly".into(), "planwrite".into(), "standard".into()];
+        assert_eq!(
+            permission_mode_cycle(Some(&configured)).unwrap(),
+            vec![
+                SecurityMode::ReadOnly,
+                SecurityMode::PlanWrite,
+                SecurityMode::Standard
+            ]
+        );
+        for names in [
+            vec![],
+            vec!["standard", "standard"],
+            vec!["accept"],
+            vec!["bogus"],
+            vec!["standard"; 7],
+        ] {
+            let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+            assert!(permission_mode_cycle(Some(&names)).is_err());
+            let encoded = serde_json::json!({"permission_mode_cycle":names});
+            assert!(serde_json::from_value::<crate::config::Config>(encoded).is_err());
+            let cfg = crate::config::Config {
+                permission_mode_cycle: Some(names),
+                ..Default::default()
+            };
+            let cli = crate::cli::Cli {
+                no_tools: true,
+                dangerously_skip_permissions: true,
+                yolo: true,
+                ..Default::default()
+            };
+            assert!(matches!(
+                resolve_execution_authority(
+                    &cli,
+                    &cfg,
+                    crate::sandbox::SandboxPolicy::Disabled,
+                    "none"
+                ),
+                Err(ExecutionAuthorityError::InvalidPermissionModeCycle { .. })
+            ));
+            assert!(cfg.build_permission_config().is_err());
+        }
+        let cfg: crate::config::Config =
+            toml::from_str("permission_mode_cycle = [\"readonly\", \"guarded\"]").unwrap();
+        assert_eq!(cfg.preserved.keys().count(), 0);
+        assert_eq!(
+            cfg.permission_mode_cycle.unwrap(),
+            vec!["readonly", "guarded"]
+        );
     }
 }

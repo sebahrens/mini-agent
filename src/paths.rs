@@ -205,6 +205,7 @@ impl WorkspaceBinding {
         Ok(files)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_relative_dir_files_bounded_status(
         &self,
         path: &Path,
@@ -237,6 +238,78 @@ impl WorkspaceBinding {
             files.push((stem.to_string(), content));
         }
         Ok(files)
+    }
+
+    /// Probe a definition's existence without reading content or following links.
+    #[cfg(any(test, feature = "subagents"))]
+    pub(crate) fn has_relative_regular_file(&self, path: &Path) -> bool {
+        let Ok(path) = self.normalize_relative(path) else {
+            return false;
+        };
+        let Ok((parent, name)) = self.open_parent(&path, false) else {
+            return false;
+        };
+        open_file_no_follow_impl(&parent, &name, true).is_ok()
+    }
+
+    /// Enumerate a bounded project definition layer before reading any files.
+    /// Oversized layers fail closed; directory order cannot select a partial layer.
+    pub(crate) fn read_relative_definition_layer(
+        &self,
+        path: &Path,
+        extension: &str,
+        max_bytes: usize,
+        max_entries: usize,
+        max_files: usize,
+    ) -> io::Result<Vec<(String, Result<String, String>)>> {
+        let directory = self.open_dir_relative(path)?;
+        let mut names = Vec::new();
+        for (index, entry) in directory.read_dir(".")?.enumerate() {
+            if index >= max_entries {
+                return Err(io::Error::other(
+                    "project definition directory exceeds entry limit",
+                ));
+            }
+            let name = entry?.file_name();
+            let candidate = Path::new(&name);
+            if candidate
+                .extension()
+                .is_some_and(|value| value == extension)
+                && candidate
+                    .file_stem()
+                    .is_some_and(|value| value.to_str().is_some())
+            {
+                if names.len() >= max_files {
+                    return Err(io::Error::other(
+                        "project definition directory exceeds file limit",
+                    ));
+                }
+                names.push(name);
+            }
+        }
+        names.sort_unstable();
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let stem = Path::new(&name)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let content = open_file_no_follow_impl(&directory, &name, true)
+                    .and_then(|file| read_utf8_bounded_status(file, max_bytes))
+                    .map_err(|error| format!("could not be read: {error}"))
+                    .and_then(|content| match content {
+                        BoundedUtf8Read::Content(content) => Ok(content),
+                        BoundedUtf8Read::Oversized => {
+                            Err(format!("exceeds the {max_bytes}-byte limit"))
+                        }
+                        BoundedUtf8Read::InvalidUtf8 => Err("is not valid UTF-8".to_string()),
+                    });
+                (stem, content)
+            })
+            .collect())
     }
 
     /// Each named context file in the workspace, read up to `max_bytes`:
@@ -702,12 +775,21 @@ fn entry_matches_regular_file(
 }
 
 fn open_file_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result<std::fs::File> {
+    open_file_no_follow_impl(directory, name, false)
+}
+
+fn open_file_no_follow_impl(
+    directory: &cap_std::fs::Dir,
+    name: &OsStr,
+    regular_only: bool,
+) -> io::Result<std::fs::File> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // Nonblocking open avoids hanging on a FIFO swapped into a definition path.
+        options.custom_flags(libc::O_NOFOLLOW | if regular_only { libc::O_NONBLOCK } else { 0 });
     }
     #[cfg(windows)]
     {
@@ -731,6 +813,9 @@ fn open_file_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result
     let file = directory.open_with(name, &options)?.into_std();
     #[cfg(windows)]
     reject_windows_reparse_point(&file)?;
+    if regular_only && !file.metadata()?.is_file() {
+        return Err(io::Error::other("project definition is not a regular file"));
+    }
     Ok(file)
 }
 
@@ -1653,12 +1738,6 @@ impl AppPaths {
 
     pub fn agents_dir(&self) -> PathBuf {
         self.data_dir.join("agents")
-    }
-
-    pub fn project_agents_dir(&self) -> Option<PathBuf> {
-        self.project_dir
-            .as_ref()
-            .map(|directory| directory.join("agents"))
     }
 
     #[cfg(test)]

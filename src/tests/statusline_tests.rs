@@ -569,3 +569,25 @@ fn degraded_sandbox_sets_a_persistent_red_status_segment() {
         statusline::cache_key(&session, &off)
     );
 }
+
+#[test]
+fn mode_cycle_status_item_shows_standard_guarded_and_yolo_and_invalidates_cache() {
+    let session = Session::new("provider", "model", 128_000, "");
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("mode")],
+        }],
+    };
+    let mut context = ctx();
+    let mut previous = None;
+    for mode in ["standard", "guarded", "yolo"] {
+        context.perm_mode = Some(mode);
+        assert_eq!(
+            line_text(&statusline::build_lines(&spec, &session, &context)[0]),
+            format!("mode:{mode}")
+        );
+        let key = statusline::cache_key(&session, &context);
+        assert_ne!(Some(key), previous);
+        previous = Some(key);
+    }
+}

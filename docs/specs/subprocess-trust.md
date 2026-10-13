@@ -72,7 +72,11 @@ a more privileged profile.
 ## Explicit shell prefix permission scope
 
 `src/permission/shell_prefix.rs` implements the opt-in `permission-allow-prefix`
-scope. It validates the entire script as a restricted ASCII argv form before
+scope, also available through invocation-only `--allow-prefix` seeds from
+`src/permission/cli_rules.rs`. CLI overlays compile after base policy, preserve
+built-in defaults, never become persisted session grants, and do not change mode
+or external-directory deny baselines. Exact `--allow shell:SCRIPT` seeds remain
+complete-script grants. The prefix matcher validates the entire script as a restricted ASCII argv form before
 matching a complete word prefix. Quoting, expansion, globbing, shell operators,
 redirection, comments, control characters, leading assignments and reserved control words
 cannot enter this scope. The original complete script remains the permission/audit

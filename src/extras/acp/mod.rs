@@ -971,7 +971,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
     // Keep direct callers fail-closed too. The normal binary path has already
     // validated in `Startup::init`, before provider/client construction.
     let (authority, _) = crate::permission::resolve_configured_execution_authority(&cli, &cfg)?;
-    crate::permission::build_noninteractive_permission(&cfg, authority)?;
+    crate::permission::build_noninteractive_permission_with_cli(&cli, &cfg, authority)?;
 
     let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
     let is_tcp = tcp_settings.is_some();
@@ -2396,7 +2396,8 @@ async fn execute_prompt(
             }
         }
         .0;
-    let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_at(
+    let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_with_cli_at(
+        &state.cli,
         &state.cfg,
         authority,
         Some(workspace_root.to_path_buf()),

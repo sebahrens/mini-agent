@@ -408,6 +408,7 @@ async fn handle_similarity(
     content: &str,
     replace_all: bool,
     fuzzy: bool,
+    disclose_source: bool,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     let blocks = parse_blocks(block)?;
     let line_ending = dominant_line_ending(content);
@@ -460,6 +461,8 @@ async fn handle_similarity(
                 for (start, end) in all {
                     let note = if exact.binary_search(&(start, end)).is_ok() {
                         String::new()
+                    } else if !disclose_source {
+                        "matched after whitespace normalization".to_string()
                     } else {
                         format!(
                             "matched after whitespace normalization; replaced region:\n{}",
@@ -480,6 +483,11 @@ async fn handle_similarity(
             MatchResult::Exact(pos) => {
                 let count = overlapping_match_indices(content, &search).count();
                 if count > 1 {
+                    if !disclose_source {
+                        return Err(ToolError::Msg(format!(
+                            "{label}search text matched more than once in {path}. Add more surrounding context to the SEARCH block to make it unique. Source previews require read permission."
+                        )));
+                    }
                     const MAX_MATCH_PREVIEWS: usize = 10;
                     let line_starts: Vec<usize> = std::iter::once(0)
                         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
@@ -528,10 +536,14 @@ async fn handle_similarity(
                     byte_start: start,
                     byte_end: end,
                     replace: replace.clone(),
-                    note: format!(
-                        "matched after whitespace normalization; replaced region:\n{}",
-                        bounded_match_excerpt(content, start, end)
-                    ),
+                    note: if disclose_source {
+                        format!(
+                            "matched after whitespace normalization; replaced region:\n{}",
+                            bounded_match_excerpt(content, start, end)
+                        )
+                    } else {
+                        "matched after whitespace normalization".to_string()
+                    },
                 });
             }
             MatchResult::AmbiguousNormalized(first_line, second_line) => {
@@ -541,6 +553,11 @@ async fn handle_similarity(
                 )));
             }
             MatchResult::FuzzyApply(start, end, sim) => {
+                if !fuzzy && !disclose_source {
+                    return Err(ToolError::Msg(format!(
+                        "{label}SEARCH text did not match exactly or after whitespace normalization in '{path}'. Read the file with permission and copy the exact text, or explicitly opt into a unique approximate match with fuzzy: true. No edits were applied."
+                    )));
+                }
                 if !fuzzy {
                     let line = content[..start].matches('\n').count() + 1;
                     return Err(ToolError::Msg(format!(
@@ -553,14 +570,23 @@ async fn handle_similarity(
                     byte_start: start,
                     byte_end: end,
                     replace: replace.clone(),
-                    note: format!(
-                        "fuzzy match, {:.0}% similarity; replaced region:\n{}",
-                        sim * 100.0,
-                        bounded_match_excerpt(content, start, end)
-                    ),
+                    note: if disclose_source {
+                        format!(
+                            "fuzzy match, {:.0}% similarity; replaced region:\n{}",
+                            sim * 100.0,
+                            bounded_match_excerpt(content, start, end)
+                        )
+                    } else {
+                        "applied unique fuzzy match".to_string()
+                    },
                 });
             }
             MatchResult::AmbiguousFuzzy(first, second) => {
+                if !disclose_source {
+                    return Err(ToolError::Msg(format!(
+                        "{label}search text had multiple fuzzy matches; fuzzy opt-in never chooses among ambiguous candidates in '{path}'. Source previews require read permission. No edits were applied."
+                    )));
+                }
                 let spans = line_spans(content);
                 let first_span = spans[first.0 - 1];
                 let preview =
@@ -576,6 +602,11 @@ async fn handle_similarity(
                 )));
             }
             MatchResult::FuzzySuggest(line, sim, preview) => {
+                if !disclose_source {
+                    return Err(ToolError::Msg(format!(
+                        "{label}search text not found; read the file with permission and copy the exact text in '{path}'. Source previews require read permission. No edits were applied."
+                    )));
+                }
                 return Err(ToolError::Msg(format!(
                     "{label}search text not found in '{}'. Closest match at line {}, {:.0}% similar:\n  {}\n\nRead the file around that area, copy the exact text, and retry the edit.",
                     path,
@@ -697,6 +728,29 @@ fn resulting_excerpts(content: &str, edits: &[(usize, usize)]) -> String {
     rendered
 }
 
+// A bounded preview of caller-supplied replacements, never file contents.
+fn replacement_excerpts(ranges: &[(usize, usize, String)]) -> String {
+    let mut rendered =
+        String::from("\n\nReplacement text (source excerpts require read permission):");
+    for (_, _, replacement) in ranges.iter().rev().take(3) {
+        if replacement.is_empty() {
+            rendered.push_str("\n(deleted selected text)");
+        } else {
+            for line in replacement.lines().take(12) {
+                rendered.push('\n');
+                rendered.push_str(&clipped_result_line(line));
+            }
+            if replacement.lines().count() > 12 {
+                rendered.push_str("\n… replacement truncated …");
+            }
+        }
+    }
+    if ranges.len() > 3 {
+        rendered.push_str("\n… additional replacements omitted …");
+    }
+    rendered
+}
+
 // ── V2: Hashedit (tag-based) ────────────────────────────────────────────
 
 fn parse_tagged_line(raw: &str) -> Option<(usize, String)> {
@@ -735,7 +789,12 @@ fn extract_line_info(lines_raw: &str) -> Result<Vec<(usize, String)>, ToolError>
     Ok(result)
 }
 
-fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<(), ToolError> {
+fn validate_tag(
+    content_lines: &[&str],
+    line_num: usize,
+    tag: &str,
+    disclose_source: bool,
+) -> Result<(), ToolError> {
     if line_num == 0 {
         return Err(ToolError::Msg(
             "Line 0 is invalid: tagged lines are numbered from 1. Copy the line number from the read output.".to_string(),
@@ -751,6 +810,11 @@ fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<()
     })?;
     let expected = crc32_hex(actual.as_bytes());
     if expected != tag {
+        if !disclose_source {
+            return Err(ToolError::Msg(format!(
+                "Tag mismatch at line {line_num}. The file may have changed. Re-read with permission and retry."
+            )));
+        }
         return Err(ToolError::Msg(format!(
             "Tag mismatch at line {}: expected {} but line content has tag {}. The file may have changed. Re-read and retry.",
             line_num, tag, expected
@@ -784,10 +848,16 @@ async fn handle_hashedit(
     file_crc: &str,
     edits: &[EditOp],
     content: &str,
+    disclose_source: bool,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     // Validate file-level CRC
     let actual_crc = crc32_hex(content.replace("\r\n", "\n").as_bytes());
     if actual_crc != file_crc {
+        if !disclose_source {
+            return Err(ToolError::Msg(format!(
+                "File CRC mismatch for '{path}'. The file has changed since the read. Re-read with permission and retry."
+            )));
+        }
         return Err(ToolError::Msg(format!(
             "File CRC mismatch for '{}': expected {} but file now has {}. The file has changed since the read. Re-read and retry.",
             path, file_crc, actual_crc
@@ -815,7 +885,7 @@ async fn handle_hashedit(
                         label, single_line
                     ))
                 })?;
-                validate_tag(&content_lines, line_num, &tag)
+                validate_tag(&content_lines, line_num, &tag, disclose_source)
                     .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
 
                 let (byte_start, byte_end) =
@@ -829,7 +899,7 @@ async fn handle_hashedit(
             (None, Some(multi_lines)) => {
                 let entries = extract_line_info(multi_lines)?;
                 for &(line_num, ref tag) in &entries {
-                    validate_tag(&content_lines, line_num, tag)
+                    validate_tag(&content_lines, line_num, tag, disclose_source)
                         .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
                 }
                 // The range is `first..=last`, so the entries must describe
@@ -937,8 +1007,8 @@ impl Tool for EditTool {
 
     fn description(&self) -> String {
         match edit_system() {
-            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Markers must start at column 0. Use the 11-character literal-safe markers when the content itself contains <<<<<<< SEARCH, =======, or >>>>>>> REPLACE lines. Each block finds exact text and replaces it; multiple blocks are atomic. Exact and whitespace-normalized matches apply automatically. Set replace_all to replace all exact occurrences and disjoint whitespace-normalized variants. Approximate matches only suggest a preview unless fuzzy=true explicitly opts into one unique match at >=85% similarity. fuzzy and replace_all cannot be combined.".to_string(),
-            EditSystem::Hashedit => "Edit a file using tag-based line references. Copy tagged lines from read output. Edit is CAS-guarded via file-level CRC-32 hash. All edits in one call are applied atomically.".to_string(),
+            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Markers must start at column 0. Use the 11-character literal-safe markers when the content itself contains <<<<<<< SEARCH, =======, or >>>>>>> REPLACE lines. Each block finds exact text and replaces it; multiple blocks are atomic. Exact and whitespace-normalized matches apply automatically. Set replace_all to replace all exact occurrences and disjoint whitespace-normalized variants. Source excerpts and approximate-match previews require existing read permission. Approximate matches only suggest a preview unless fuzzy=true explicitly opts into one unique match at >=85% similarity. fuzzy and replace_all cannot be combined.".to_string(),
+            EditSystem::Hashedit => "Edit a file using tag-based line references. Source excerpts and current checksum diagnostics require existing read permission. Copy tagged lines from read output. Edit is CAS-guarded via file-level CRC-32 hash. All edits in one call are applied atomically.".to_string(),
         }
     }
 
@@ -950,7 +1020,7 @@ impl Tool for EditTool {
                     "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
                     "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks. Markers must begin at column 0. Standard form:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nIf searched or replacement content contains any standard marker as a full line, use literal-safe markers instead:\n<<<<<<<<<<< SEARCH\ncontent including <<<<<<< SEARCH or =======\n===========\nreplacement including >>>>>>> REPLACE\n>>>>>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file." },
                     "replace_all": { "type": "boolean", "default": false, "description": "Replace all exact non-overlapping occurrences and disjoint whitespace-normalized variants of each SEARCH block. Overlapping normalized ranges are rejected. Cannot combine with fuzzy. When false, each SEARCH block must identify one unique target." },
-                    "fuzzy": { "type": "boolean", "default": false, "description": "Explicitly allow one unique approximate match at >=85% similarity when exact and whitespace-normalized matching fail. Otherwise return a preview and copy exact text. Cannot combine with replace_all; lower-confidence and ambiguous matches still fail." }
+                    "fuzzy": { "type": "boolean", "default": false, "description": "Explicitly allow one unique approximate match at >=85% similarity when exact and whitespace-normalized matching fail. Otherwise return a failure; with existing read permission, include a preview so exact text can be copied. Cannot combine with replace_all; lower-confidence and ambiguous matches still fail." }
                 },
                 "required": ["path", "block"]
             }),
@@ -1112,16 +1182,34 @@ impl EditTool {
             }
         };
 
+        // Disclosure is independent of mutation authority and diff limits. This
+        // inert query neither prompts for read access nor consumes a one-shot
+        // grant or advances repeat detection. Use the same checked identity as
+        // the mutation, including retained workspace containment.
+        let disclose_source = super::mutation_diff::preimage_allowed(
+            &self.permission,
+            &path,
+            capability_metadata.is_some(),
+        );
+
         // Determine mode: V1 (block) or V2 (edits)
         let (notes, mut ranges) = if let Some(ref block) = args.block {
-            handle_similarity(&path, block, &content, args.replace_all, args.fuzzy).await?
+            handle_similarity(
+                &path,
+                block,
+                &content,
+                args.replace_all,
+                args.fuzzy,
+                disclose_source,
+            )
+            .await?
         } else if let (Some(file_crc), Some(edits)) = (&args.file_crc, &args.edits) {
             if args.replace_all {
                 return Err(ToolError::Msg(
                     "'replace_all' is only supported with SEARCH/REPLACE blocks.".to_string(),
                 ));
             }
-            handle_hashedit(&path, file_crc, edits, &content).await?
+            handle_hashedit(&path, file_crc, edits, &content, disclose_source).await?
         } else {
             return Err(ToolError::Msg(
                 "Provide either 'block' (SEARCH/REPLACE) or 'file_crc'+'edits' (hashedit). Inspect the edit tool schema and the latest read output to choose the active format."
@@ -1142,12 +1230,8 @@ impl EditTool {
         let preview_before = (self.diff_options.max_lines > 0
             && ranges.len() <= super::mutation_diff::MAX_RANGES
             && content.len() <= super::mutation_diff::MAX_INPUT_BYTES
-            && super::mutation_diff::preimage_allowed(
-                &self.permission,
-                &path,
-                capability_metadata.is_some(),
-            ))
-        .then(|| content.clone());
+            && disclose_source)
+            .then(|| content.clone());
         let applied_ranges = if preview_before.is_some() {
             let mut ordered_ranges: Vec<_> = ranges.iter().collect();
             ordered_ranges.sort_by_key(|(start, _, _)| *start);
@@ -1187,7 +1271,13 @@ impl EditTool {
                 "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_text_file_size."
             )));
         }
-        let excerpts = resulting_excerpts(&output, &resulting_spans);
+        let excerpts = if disclose_source {
+            resulting_excerpts(&output, &resulting_spans)
+        } else {
+            // Never slice the postimage: even a zero-context partial-line edit
+            // or deletion could reveal unchanged bytes. These are input bytes.
+            replacement_excerpts(&ranges)
+        };
 
         if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
             workspace.replace_relative_atomic_expecting(
@@ -1249,7 +1339,11 @@ impl EditTool {
             } else {
                 lsp.notify_changed(file).await
             };
-            let diagnostics = if capability_metadata.is_some() {
+            let diagnostics = if !disclose_source {
+                // Keep the server synchronized, but its messages may quote
+                // unchanged private source. Do not append unchecked content.
+                None
+            } else if capability_metadata.is_some() {
                 lsp.diagnostics_block_for_relative_edit(relative, baseline)
                     .await
             } else {
@@ -1306,6 +1400,29 @@ mod matching_tests {
         assert_eq!(excerpt.chars().count(), 241);
         assert!(excerpt.ends_with('…'));
         assert_eq!(excerpt.trim_end_matches('…'), "é".repeat(240));
+    }
+
+    #[test]
+    fn replacement_preview_bounds_lines_regions_and_unicode() {
+        let long = format!("{}\n", "é".repeat(400)).repeat(20);
+        let ranges = vec![
+            (0, 0, "FOURTH_REPLACEMENT".into()),
+            (0, 0, long.clone()),
+            (0, 0, long.clone()),
+            (0, 0, long),
+        ];
+        let preview = super::replacement_excerpts(&ranges);
+        assert!(!preview.contains("FOURTH_REPLACEMENT"));
+        assert!(!preview.contains(&"é".repeat(301)));
+        assert_eq!(
+            preview.matches(&format!("{}…", "é".repeat(300))).count(),
+            36
+        );
+        assert_eq!(preview.matches("replacement truncated").count(), 3);
+        assert!(preview.contains("additional replacements omitted"));
+        assert!(
+            super::replacement_excerpts(&[(0, 1, String::new())]).contains("deleted selected text")
+        );
     }
 
     #[test]
