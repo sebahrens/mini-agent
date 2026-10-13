@@ -357,7 +357,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  Ctrl+V                 paste Unicode clipboard text",
     );
-    emit(false, "  Ctrl+R                 toggle reasoning");
+    emit(
+        false,
+        "  Ctrl+R                 cycle reasoning: collapsed/full/off",
+    );
     emit(false, "  Ctrl+G                 edit input in $EDITOR");
     emit(false, "  Ctrl+O                 launch lazygit");
     emit(

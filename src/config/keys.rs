@@ -146,6 +146,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("diff_context_lines"),
     key("max_diff_lines"),
     key("show_reasoning"),
+    key("reasoning_display"),
     key("statusline"),
     key("chat_left_margin"),
     key("mouse_capture"),

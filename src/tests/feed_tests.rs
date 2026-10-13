@@ -35,6 +35,118 @@ fn block_style_color_mapping() {
 }
 
 #[test]
+fn reasoning_display_keeps_one_live_header_and_reveals_only_on_demand() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    feed.append_reasoning("private 🙂\nsecond");
+    feed.push_line(BlockStyle::System, "interleaved notice");
+    feed.append_reasoning("界");
+    assert_eq!(feed.block_count(), 2, "a notice must not become reasoning");
+    let collapsed = feed.lines(80);
+    assert_eq!(collapsed.len(), 2);
+    assert!(collapsed[0].text.starts_with("▸ thinking… (17 chars, "));
+    assert_eq!(collapsed[1].text, "interleaved notice");
+    assert!(!feed.toggle_reasoning_at_row(80, 1));
+    assert!(feed.toggle_reasoning_at_row(80, 0));
+    let full = feed.lines(80);
+    assert_eq!(full.len(), 4);
+    assert!(full[0].text.starts_with("▾ thinking…"));
+    assert_eq!(full[1].text, "private 🙂");
+    assert_eq!(full[2].text, "second界");
+    assert!(
+        !feed.toggle_reasoning_at_row(80, 1),
+        "body stays selectable"
+    );
+    feed.set_reasoning_display(ReasoningDisplay::Off);
+    assert_eq!(feed.lines(80).len(), 1);
+    assert_eq!(feed.lines(80)[0].text, "interleaved notice");
+    assert!(!feed.toggle_reasoning_at_row(80, 0));
+    feed.set_reasoning_display(ReasoningDisplay::Full);
+    assert!(feed.lines(80)[1].text.contains("private"));
+    feed.finish_reasoning();
+    let completed = feed.lines(80);
+    assert!(completed[0].text.starts_with("▾ thought"));
+    feed.tick_reasoning_at(std::time::Instant::now() + std::time::Duration::from_secs(20));
+    assert!(
+        Arc::ptr_eq(&completed, &feed.lines(80)),
+        "completed duration is frozen"
+    );
+}
+
+#[test]
+fn reasoning_clock_invalidates_only_the_live_header_once_per_second() {
+    let mut feed = Feed::new();
+    feed.push_line(BlockStyle::Plain, "stable row");
+    feed.append_reasoning("private reasoning");
+    let first = feed.lines(80);
+    let future = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    feed.tick_reasoning_at(future);
+    let later = feed.lines(80);
+    assert_eq!(first[0].text, later[0].text);
+    assert_ne!(first[1].text, later[1].text);
+    assert_eq!(
+        first.segment_ptrs_for_test()[0],
+        later.segment_ptrs_for_test()[0]
+    );
+    let generation = feed.generation();
+    feed.tick_reasoning_at(future);
+    assert_eq!(feed.generation(), generation);
+    assert!(Arc::ptr_eq(&later, &feed.lines(80)));
+}
+
+#[test]
+fn reasoning_disclosure_is_per_block_and_respects_narrow_and_pruned_rows() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    feed.push_line(BlockStyle::Plain, "padding");
+    feed.push_block(BlockStyle::Reasoning, "first thought\nmore");
+    feed.push_block(BlockStyle::Reasoning, "second thought");
+    assert_eq!(feed.lines(80).len(), 3);
+    assert!(feed.toggle_reasoning_at_row(80, 2));
+    assert_eq!(feed.lines(80).len(), 4);
+    assert!(feed.lines(80)[1].text.starts_with("▸"));
+    assert_eq!(feed.lines(80)[3].text, "second thought");
+    feed.set_reasoning_display(ReasoningDisplay::Collapsed);
+    for width in [0, 1, 2, 4, 12] {
+        // Text wrapping changes padding height, but each hidden body has one row.
+        let mut narrow = Feed::new();
+        narrow.push_block(BlockStyle::Reasoning, "long\nprivate\nbody");
+        let lines = narrow.lines(width);
+        assert_eq!(lines.len(), 1);
+        assert!(unicode_width::UnicodeWidthStr::width(lines[0].text.as_str()) <= width);
+    }
+    let (blocks, _, _) = Feed::retention_limits_for_test();
+    for _ in 0..blocks {
+        feed.push_line(BlockStyle::Plain, "old");
+    }
+    feed.push_block(BlockStyle::Reasoning, "retained reasoning");
+    let last = feed.lines(80).len() - 1;
+    assert!(feed.lines(80)[0].text.contains("omitted"));
+    assert!(feed.toggle_reasoning_at_row(80, last));
+    assert_eq!(feed.lines(80)[last + 1].text, "retained reasoning");
+}
+
+#[test]
+fn reasoning_stream_stays_bounded_and_inert_when_hidden() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    feed.set_reasoning_display(ReasoningDisplay::Off);
+    feed.append_reasoning("\u{1b}[31munsafe\u{7}\u{202e}界");
+    assert_eq!(feed.lines(80).len(), 0);
+    let (_, _, limit) = Feed::retention_limits_for_test();
+    feed.append_reasoning(&"x".repeat(limit + 1));
+    assert!(feed.block_text(0).unwrap().len() <= limit);
+    assert!(!feed.block_text(0).unwrap().contains('\u{1b}'));
+    feed.set_reasoning_display(ReasoningDisplay::Full);
+    let lines = feed.lines(80);
+    assert!(
+        indexed_rows(&lines)
+            .all(|line| !line.text.contains('\u{1b}') && !line.text.contains('\u{202e}'))
+    );
+    assert!(indexed_rows(&lines).any(|line| line.text.contains("omitted")));
+}
+
+#[test]
 fn lines_wrap_plain_block() {
     let mut feed = Feed::new();
     feed.push_line(BlockStyle::Plain, "hello world");

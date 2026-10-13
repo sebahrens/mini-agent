@@ -67,7 +67,12 @@ pub fn render_session(
         }
         feed.push_line(BlockStyle::Plain, "");
     }
-    push_session_messages(feed, &session.messages, cfg);
+    push_session_records(
+        feed,
+        &session.messages,
+        cfg,
+        Some(&session.tool_call_provenance),
+    );
     if session.messages.is_empty() {
         feed.push_line(
             BlockStyle::Welcome,
@@ -174,11 +179,24 @@ pub(crate) fn push_mutation_diff(
 /// response that issued several calls before any result replays as
 /// call/result pairs instead of all calls followed by all results. Results
 /// without a retained call are appended in stored order.
+#[cfg(test)]
 pub(crate) fn push_session_messages(
     feed: &mut crate::ui::feed::Feed,
     messages: &[crate::session::SessionMessage],
     cfg: &Config,
 ) {
+    push_session_records(feed, messages, cfg, None);
+}
+
+fn push_session_records(
+    feed: &mut crate::ui::feed::Feed,
+    messages: &[crate::session::SessionMessage],
+    cfg: &Config,
+    provenance: Option<
+        &std::collections::BTreeMap<CompactString, crate::session::PersistedCallProvenance>,
+    >,
+) {
+    let mut shown_reasoning = std::collections::BTreeSet::new();
     for msg in messages {
         match msg.role {
             // Stored text is raw (the live view sanitised only what it
@@ -197,6 +215,48 @@ pub(crate) fn push_session_messages(
                 }
             }
             MessageRole::ToolCall => {
+                if let Some(recorded) = msg.tool_call_id.as_ref().and_then(|id| provenance?.get(id))
+                {
+                    for item in &recorded.reasoning {
+                        if item
+                            .id
+                            .as_deref()
+                            .is_some_and(|id| shown_reasoning.contains(id))
+                        {
+                            continue;
+                        }
+                        // Only human-readable recorded text is presentation.
+                        // Signatures, encrypted and redacted payloads stay opaque.
+                        let mut text = String::new();
+                        for block in &item.blocks {
+                            let content = match block {
+                                crate::session::PersistedReasoningBlock::Text { text, .. }
+                                | crate::session::PersistedReasoningBlock::Summary { text } => {
+                                    text.as_str()
+                                }
+                                _ => continue,
+                            };
+                            let remaining = (2 * 1024 * 1024usize).saturating_sub(text.len());
+                            if remaining == 0 {
+                                break;
+                            }
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            let mut end = content.len().min(remaining.saturating_sub(1));
+                            while !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            text.push_str(&content[..end]);
+                        }
+                        if !text.is_empty() {
+                            if let Some(id) = item.id.as_deref() {
+                                shown_reasoning.insert(id);
+                            }
+                            feed.push_block(BlockStyle::Reasoning, text);
+                        }
+                    }
+                }
                 feed.push_anchored_block(
                     msg.tool_call_id.as_deref().unwrap_or(""),
                     BlockStyle::Tool,
@@ -648,6 +708,75 @@ mod sanitize_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replay_reasoning_shows_recorded_text_once_without_opaque_payloads_or_fake_duration() {
+        use crate::config::ReasoningDisplay;
+        use crate::session::{
+            PersistedCallProvenance, PersistedReasoning, PersistedReasoningBlock,
+        };
+        let mut session = crate::session::Session::new("openai", "test", 128_000, "");
+        let recorded = PersistedCallProvenance {
+            reasoning: vec![PersistedReasoning {
+                id: Some("recorded-reasoning".into()),
+                blocks: vec![
+                    PersistedReasoningBlock::Summary {
+                        text: "recorded summary 界".into(),
+                    },
+                    PersistedReasoningBlock::Text {
+                        text: "readable \u{1b}[31mtext".into(),
+                        signature: Some("SECRET_SIGNATURE".into()),
+                    },
+                    PersistedReasoningBlock::Encrypted {
+                        data: "SECRET_ENCRYPTED".into(),
+                    },
+                    PersistedReasoningBlock::Redacted {
+                        data: "SECRET_REDACTED".into(),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        for id in ["call-a", "call-b"] {
+            session.add_tool_call_with_id(id, "read", &serde_json::json!({"path":"file"}));
+            session
+                .tool_call_provenance
+                .insert(id.into(), recorded.clone());
+        }
+        let before = serde_json::to_value(&session).unwrap();
+        let mut feed = crate::ui::feed::Feed::new();
+        super::push_session_records(
+            &mut feed,
+            &session.messages,
+            &crate::config::Config::default(),
+            Some(&session.tool_call_provenance),
+        );
+        let collapsed = feed.lines(100);
+        assert_eq!(
+            (0..collapsed.len())
+                .filter(|i| collapsed[*i].text.starts_with("▸ thought"))
+                .count(),
+            1
+        );
+        assert!(
+            !collapsed[0].text.contains(" s)"),
+            "duration was not persisted"
+        );
+        feed.set_reasoning_display(ReasoningDisplay::Full);
+        let rows = feed.lines(100);
+        let shown = (0..rows.len())
+            .map(|i| rows[i].text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("recorded summary 界") && shown.contains("readable"));
+        assert!(!shown.contains("SECRET_") && !shown.contains('\u{1b}'));
+        feed.set_reasoning_display(ReasoningDisplay::Off);
+        let hidden = feed.lines(100);
+        assert!(
+            (0..hidden.len()).all(|i| !hidden[i].text.contains("recorded summary")
+                && !hidden[i].text.contains("thought"))
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    }
     use super::push_runtime_availability;
     use crate::provider::{JsRuntimeReport, RuntimeAvailability};
     use crate::ui::feed::Feed;

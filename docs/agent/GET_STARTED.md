@@ -273,7 +273,7 @@ Here is some keybindings to speed up your coding experience:
 
 | Keys | Action |
 | ---- | ------ |
-| `Ctrl+R` | Toggle reasoning/thinking |
+| `Ctrl+R` | Cycle collapsed / full / off reasoning display; click a header to expand one block |
 | `Ctrl+G` | Open input in `$EDITOR` |
 | `Ctrl+O` | Launch `lazygit` |
 | `Ctrl+P` / `Ctrl+N` | Move up/down in input; at its boundaries, navigate command history |

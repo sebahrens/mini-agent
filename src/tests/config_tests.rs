@@ -95,8 +95,12 @@ fn compact_enabled_default_false() {
 }
 
 #[test]
-fn show_reasoning_defaults_off() {
-    assert!(!Config::default().resolve_show_reasoning());
+fn show_reasoning_defaults_collapsed() {
+    assert!(Config::default().resolve_show_reasoning());
+    assert_eq!(
+        Config::default().resolve_reasoning_display(),
+        crate::config::ReasoningDisplay::Collapsed
+    );
 }
 
 #[test]
@@ -106,6 +110,35 @@ fn show_reasoning_can_be_disabled() {
         ..Config::default()
     };
     assert!(!cfg.resolve_show_reasoning());
+}
+
+#[test]
+fn reasoning_display_preserves_legacy_preferences_and_roundtrips_explicit_modes() {
+    use crate::config::ReasoningDisplay;
+    let legacy: Config = toml::from_str("show_reasoning = true").unwrap();
+    assert_eq!(legacy.resolve_reasoning_display(), ReasoningDisplay::Full);
+    for mode in [
+        ReasoningDisplay::Off,
+        ReasoningDisplay::Collapsed,
+        ReasoningDisplay::Full,
+    ] {
+        let cfg = Config {
+            show_reasoning: Some(false),
+            reasoning_display: Some(mode),
+            ..Config::default()
+        };
+        let restored: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.resolve_reasoning_display(), mode);
+        assert_eq!(
+            restored.resolve_show_reasoning(),
+            mode != ReasoningDisplay::Off
+        );
+    }
+    assert_eq!(
+        ReasoningDisplay::Off.next().next().next(),
+        ReasoningDisplay::Off
+    );
+    assert!(toml::from_str::<Config>("reasoning_display = 'arbitrary'").is_err());
 }
 
 #[test]

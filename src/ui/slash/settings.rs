@@ -64,7 +64,8 @@ async fn handle_reasoning(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Res
         return Ok(());
     }
     *ctx.reasoning_enabled = target;
-    *ctx.show_reasoning = *ctx.reasoning_enabled;
+    *ctx.show_reasoning =
+        ctx.renderer.feed().reasoning_display() != crate::config::ReasoningDisplay::Off;
     ctx.rebuild_agent().await;
     write_ok(
         ctx.renderer,

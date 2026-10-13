@@ -52,6 +52,7 @@ const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "retry",
     "show_cost_always",
     "show_reasoning",
+    "reasoning_display",
     "show_tool_details",
     "diff_context_lines",
     "max_diff_lines",
@@ -1834,6 +1835,52 @@ fn save_config_at(path: &Path, cfg: &Config) -> io::Result<()> {
 mod config_delta_tests {
     use super::{parse_config_content, save_config_changes_at};
     use crate::config::Config;
+
+    #[test]
+    fn reasoning_preference_cycles_persist_without_copying_effective_project_values() {
+        use crate::config::ReasoningDisplay;
+        let root = crate::tests::OwnedTestDirectory::new("reasoning-preference-delta");
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "model = 'global-model'\n# preserved comment\nfuture_key = 7\n",
+        )
+        .unwrap();
+        let startup = Config {
+            model: Some("project-model".into()),
+            chat_left_margin: Some(7),
+            ..Config::default()
+        };
+        let mut current = startup.resolve_reasoning_display();
+        for _ in 0..6 {
+            let mut before = startup.clone();
+            before.reasoning_display = Some(current);
+            let mut after = before.clone();
+            current = current.next();
+            after.reasoning_display = Some(current);
+            save_config_changes_at(&path, &before, &after).unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let saved = parse_config_content(&path, &raw).unwrap();
+            assert_eq!(saved.resolve_reasoning_display(), current);
+            assert_eq!(saved.model.as_deref(), Some("global-model"));
+            assert_eq!(saved.chat_left_margin, None);
+            let values: toml::Value = toml::from_str(&raw).unwrap();
+            assert_eq!(values["future_key"].as_integer(), Some(7));
+        }
+        assert_eq!(current, ReasoningDisplay::Collapsed);
+        // A failed persistence attempt cannot be mistaken for a durable preference.
+        assert!(
+            save_config_changes_at(
+                root.path(),
+                &startup,
+                &Config {
+                    reasoning_display: Some(ReasoningDisplay::Full),
+                    ..startup.clone()
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn saving_effective_config_changes_does_not_copy_project_overrides_globally() {

@@ -24,6 +24,14 @@ keywords = ["ai", "cli", "dev"]
 [package.metadata.release]
 canonical-binary = "mini-agent"
 
+# Test-only native image used by the guarded Windows PR argv proof. It is never
+# installed or packaged as a production binary, and a normal test run is inert.
+[[test]]
+name = "windows_gh_fixture"
+path = "tests/fixtures/windows_gh_fixture.rs"
+harness = false
+required-features = ["git-worktree", "sandbox"]
+
 [features]
 default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory']
 status-signals = []

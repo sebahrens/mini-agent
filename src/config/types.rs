@@ -3,6 +3,34 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// Presentation of retained reasoning; this does not change model requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningDisplay {
+    Off,
+    #[default]
+    Collapsed,
+    Full,
+}
+
+impl ReasoningDisplay {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Collapsed,
+            Self::Collapsed => Self::Full,
+            Self::Full => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Collapsed => "collapsed",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Which backend the skill library uses to produce embedding vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

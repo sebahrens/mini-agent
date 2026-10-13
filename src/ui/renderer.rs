@@ -11,7 +11,6 @@ use crossterm::style::{
 };
 use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
-use smallvec::SmallVec;
 
 use super::events::sanitize_output;
 use super::feed::{BlockStyle, Feed, FeedLines, style_from_color};
@@ -1093,6 +1092,17 @@ impl Renderer {
         self.selection_word = false;
     }
 
+    pub(crate) fn toggle_reasoning_at_line(&mut self, line: usize) -> bool {
+        let width = self.max_line_width();
+        if self.feed.toggle_reasoning_at_row(width, line) {
+            self.clear_selection();
+            self.chat_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record a transcript press at `(row, col)` and report whether it
     /// completes a double-click. A double-click is consumed, so a third
     /// press starts over.
@@ -1445,33 +1455,6 @@ impl Renderer {
         self.commit_partial();
         let style = style_from_color(color);
         self.feed.place_after_anchor(anchor, style, text);
-        self.chat_dirty = true;
-        if self.scroll_offset == 0 {
-            self.render_viewport()?;
-        }
-        Ok(())
-    }
-
-    pub fn write(&mut self, text: &str, color: Color) -> io::Result<()> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let style = style_from_color(color);
-        let parts: SmallVec<[&str; 4]> = text.split('\n').collect();
-        let last = parts.len() - 1;
-        for (i, segment) in parts.iter().enumerate() {
-            if i < last {
-                // Complete line segment: finalize any partial and push it.
-                if !self.partial.is_empty() {
-                    self.commit_partial();
-                }
-                self.feed.push_block(style, *segment);
-            } else {
-                // Last segment may still be incomplete; accumulate in partial.
-                self.partial_style = style;
-                self.partial.push_str(segment);
-            }
-        }
         self.chat_dirty = true;
         if self.scroll_offset == 0 {
             self.render_viewport()?;

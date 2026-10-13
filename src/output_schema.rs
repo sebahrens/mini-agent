@@ -644,6 +644,9 @@ mod tests {
                     Err(error) => panic!("mock accept: {error}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode. Timeouts do
+            // not make a nonblocking socket wait for HTTP headers to arrive.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

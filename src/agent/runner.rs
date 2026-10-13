@@ -739,7 +739,10 @@ impl AgentWorkScope {
 
     /// Binds hook dispatch inside this scope to `root`. The first binding
     /// wins; a scope's hook root never changes once set.
-    #[cfg(all(feature = "hooks", any(feature = "acp", test)))]
+    #[cfg(all(
+        feature = "hooks",
+        any(feature = "acp", feature = "git-worktree", test)
+    ))]
     pub(crate) fn set_hook_execution_root(&self, root: &std::path::Path) {
         let _ = self.hook_execution_root.set(root.to_path_buf());
     }

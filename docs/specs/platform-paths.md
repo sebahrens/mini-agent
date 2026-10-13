@@ -110,7 +110,7 @@ configuration. Before trust, startup may merge only this exhaustive benign top-l
 `context_window`, `default_prompt`, `edit_system`, `keep_recent_tokens`, `max_agent_turns`,
 `max_bash_output_lines`, `max_find_results`, `max_grep_results`, `max_list_dir_entries`,
 `max_read_lines`, `max_text_file_size`, `max_tokens`, `mid_turn_compact_threshold`, `model`,
-`reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `show_tool_details`, `statusline`,
+`reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `reasoning_display`, `show_tool_details`, `statusline`,
 the four `subagent_max_*` result/read limits, and `temperature`.
 
 `retry` is admitted only as a tightening of the user's policy: after the benign merge, each project

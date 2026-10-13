@@ -177,6 +177,9 @@ jobs:
             scripts.tests.test_smoke_package_compliance \
             scripts.tests.test_verify_release_ci
 
+      - name: Test native Windows GH proof CI policy
+        run: python3 -m unittest scripts.tests.test_windows_gh_ci
+
       - name: Test Windows MSI policy
         run: |
           python3 -m unittest scripts.tests.test_check_windows_msi
@@ -628,16 +631,53 @@ jobs:
       - name: Test native one MiB App event loops
         shell: pwsh
         run: |
-          $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack')
+          $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack', 'actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack')
           $listing = @(& cargo test --locked --bin mini-agent -- @filters --list)
           if ($LASTEXITCODE -ne 0) { throw 'App stack test discovery failed' }
-          foreach ($name in $filters) {
-            if ($listing -notcontains "ui::app::workspace_session_picker_tests::${name}: test") {
-              throw "Missing native App stack test: $name"
-            }
-          }
+          $expected = @(
+            'ui::app::workspace_session_picker_tests::actual_standard_app_event_loop_runs_on_one_mib_stack: test'
+            'ui::app::workspace_session_picker_tests::actual_session_picker_event_loop_runs_on_one_mib_stack: test'
+            'ui::app::git_confirmation_stack_tests::actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack: test'
+          ) | Sort-Object
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^ui::app::.*one_mib_stack: test$' } | Sort-Object)
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 3 -or $difference.Count -ne 0) { throw 'Expected the exact three native App stack consumers' }
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native one MiB App event loop failed' }
+
+      - name: Test native Windows GH argv and actual foreground authority
+        shell: pwsh
+        run: |
+          $features = 'git-worktree,sandbox,hooks'
+          $messages = @(& cargo test --locked --no-default-features --features $features --test windows_gh_fixture --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw 'Native GH test fixture compilation failed' }
+          $images = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'windows_gh_fixture' -and $_.target.kind -contains 'test' -and $_.executable })
+          if ($images.Count -ne 1) { throw 'Expected exactly one Cargo-discovered native GH test image' }
+          $fixture = $images[0].executable
+          if (-not (Test-Path -LiteralPath $fixture -PathType Leaf) -or [IO.Path]::GetExtension($fixture) -ne '.exe') { throw 'Native GH test image is missing or not an executable' }
+          & $fixture --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Native GH fixture protocol self-test failed' }
+          $filter = 'ui::slash::git::windows_native_pr_tests::'
+          $listing = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $filter -- --ignored --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows PR test discovery failed' }
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^ui::slash::git::windows_native_pr_tests::.*: test$' } | Sort-Object)
+          $expected = @(
+            'ui::slash::git::windows_native_pr_tests::windows_native_pr_cancel_settles_job_before_releasing_late_effect: test'
+            'ui::slash::git::windows_native_pr_tests::windows_native_pr_nonzero_ambiguous_incomplete_stdout_remain_errors: test'
+            'ui::slash::git::windows_native_pr_tests::windows_native_pr_posthook_text_cannot_spoof_actual_result: test'
+            'ui::slash::git::windows_native_pr_tests::windows_native_pr_powershell_args_wait_for_normal_ask_and_use_actual_stdout: test'
+            'ui::slash::git::windows_native_pr_tests::windows_native_pr_typed_foreground_observes_real_exit_and_bounded_completeness: test'
+          ) | Sort-Object
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 5 -or $difference.Count -ne 0) { throw 'Native Windows PR exact discovery differs from the five required cases' }
+          $previous = $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE
+          try {
+            $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE = $fixture
+            & cargo test --locked --no-default-features --features $features --bin mini-agent $filter -- --ignored --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw 'Native Windows GH argv/result/Job proof failed' }
+          } finally {
+            if ($null -eq $previous) { Remove-Item Env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE -ErrorAction SilentlyContinue } else { $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE = $previous }
+          }
 
   # `hooks` is opt-in, so the default-feature compile above never builds the
   # hook launcher or its Windows process-tree code. A Windows-only duplicate

@@ -92,23 +92,30 @@ pub async fn handle_agent_event(
     }
     match event {
         AgentEvent::Reasoning(text) => {
-            if !slash.show_reasoning {
+            if text.is_empty() {
                 return Ok(());
             }
-            if !run.agent_line_started {
-                renderer.write("< ", Color::DarkMagenta)?;
-                run.agent_line_started = true;
+            if !run.was_reasoning {
+                finalize_response_segment(renderer, run)?;
+            }
+            if !slash.show_reasoning {
+                renderer.feed_mut().set_reasoning_display(crate::config::ReasoningDisplay::Off);
             }
             let safe = sanitize_output(&text);
-            renderer.write(&safe, Color::DarkMagenta)?;
+            renderer.feed_mut().append_reasoning(&safe);
             run.was_reasoning = true;
+            let now = std::time::Instant::now();
+            renderer.feed_mut().tick_reasoning_at(now);
+            if stream_repaint_due(safe.len(), safe.contains('\n'), run.last_stream_paint.map(|last| now.duration_since(last))) {
+                renderer.render_viewport()?;
+                run.last_stream_paint = Some(now);
+            }
         }
         AgentEvent::Token(text) => {
             if run.was_reasoning {
-                renderer.write_line("", Color::White)?;
+                renderer.feed_mut().finish_reasoning();
                 run.agent_line_started = false;
                 run.was_reasoning = false;
-                run.response_buf.clear();
                 run.response_start_block = None;
             }
             let safe = sanitize_output(&text);
@@ -968,7 +975,9 @@ fn finalize_response_segment(
     renderer: &mut Renderer,
     run: &mut AgentRunState,
 ) -> anyhow::Result<()> {
+    renderer.feed_mut().finish_reasoning();
     if run.response_buf.is_empty() {
+        renderer.render_viewport()?;
         return Ok(());
     }
 

@@ -2016,3 +2016,420 @@ mod native_pr_tests {
         }
     }
 }
+
+#[cfg(all(test, windows, feature = "sandbox"))]
+mod windows_native_pr_tests {
+    use super::*;
+    use crate::event::AgentEvent;
+    use crate::permission::{Action, PermissionConfig, ToolPerm};
+    use std::time::Duration;
+
+    const URL: &str = "https://example.invalid/pull/32";
+    const ROLE: &str = "native32";
+
+    struct Fixture {
+        directory: crate::tests::OwnedTestDirectory,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+        sandbox: crate::sandbox::Sandbox,
+        _environment: crate::tests::ScopedProcessEnv,
+    }
+    impl Fixture {
+        fn new(mode: &str) -> Self {
+            let image = std::env::var_os("MINI_AGENT_WINDOWS_GH_FIXTURE_EXE")
+                .expect("guarded CI must discover the test-only native GH image");
+            let image = std::path::PathBuf::from(image);
+            assert!(image.is_file() && image.extension().is_some_and(|ext| ext == "exe"));
+            let directory = crate::tests::OwnedTestDirectory::new("windows-gh native 雪");
+            let bin = directory.path().join("fixture bin 雪");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::copy(&image, bin.join("gh.exe")).unwrap();
+            let mut search = vec![bin];
+            search.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let mut bindings = vec![
+                ("PATH", Some(std::env::join_paths(search).unwrap())),
+                ("MINI_AGENT_TEST_GH_ROLE", Some(ROLE.into())),
+            ];
+            for name in [
+                "ZS_CONFIG_DIR",
+                "ZS_DATA_DIR",
+                "ZS_LOCAL_DATA_DIR",
+                "ZS_STATE_DIR",
+                "ZS_CACHE_DIR",
+                "ZS_CREDENTIALS_DIR",
+            ] {
+                bindings.push((name, Some(directory.path().join(name).into_os_string())));
+            }
+            let environment = crate::tests::ScopedProcessEnv::set(&bindings);
+            std::fs::write(directory.path().join("gh-mode"), mode).unwrap();
+            let workspace =
+                Arc::new(crate::paths::WorkspaceBinding::capture(directory.path()).unwrap());
+            let shell =
+                crate::sandbox::ShellCapability::resolve("powershell.exe", workspace.root(), None)
+                    .expect("native Windows PowerShell must be installed");
+            assert_eq!(shell.dialect(), crate::sandbox::ShellDialect::PowerShell);
+            // This explicitly tests the supported trusted Shell bypass. There
+            // is no Git repository or Git execution here, and no fallback from
+            // a required AppContainer boundary. All other containment gates stay.
+            let sandbox = crate::sandbox::Sandbox::new(false, "none")
+                .with_workspace_binding(workspace.clone())
+                .with_bound_resolved_shell(Some(shell), &workspace);
+            Self {
+                directory,
+                workspace,
+                sandbox,
+                _environment: environment,
+            }
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.directory.path().join(name)
+        }
+        fn checker(&self, action: Action) -> crate::permission::checker::PermCheck {
+            let config = crate::permission::PermissionConfigs::from(PermissionConfig {
+                default: Some(Action::Allow),
+                bash: Some(ToolPerm::Simple(action)),
+                ..Default::default()
+            });
+            Arc::new(Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &config,
+                    crate::permission::SecurityMode::Standard,
+                    Some(self.workspace.root().to_owned()),
+                    None,
+                )
+                .unwrap(),
+            ))
+        }
+        fn actor(&self, action: Action, ask: crate::permission::ask::AskSender) -> Actor {
+            let (runner, observations) = spawn_native(
+                NativeAction::Execute(proposal()),
+                self.workspace.clone(),
+                self.sandbox.clone(),
+                Some(self.checker(action)),
+                Some(ask),
+                60,
+            );
+            Actor {
+                runner,
+                observations,
+                sandbox: self.sandbox.clone(),
+            }
+        }
+        fn recorded_argv(&self) -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(self.path("gh-argv.json")).unwrap()).unwrap()
+        }
+    }
+
+    struct Actor {
+        runner: crate::agent::runner::AgentRunner,
+        observations: tokio::sync::mpsc::Receiver<Observation>,
+        sandbox: crate::sandbox::Sandbox,
+    }
+    impl Actor {
+        async fn terminal(&mut self) -> AgentEvent {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    tokio::select! {
+                        Some(_) = self.observations.recv() => {},
+                        event = self.runner.event_rx.recv() => {
+                            let event = event.expect("owned native actor closed before its terminal event");
+                            if matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+                                while self.runner.event_rx.recv().await.is_some() {}
+                                return event;
+                            }
+                        }
+                    }
+                }
+            }).await.expect("native actor settlement must be bounded")
+        }
+        async fn cancel_and_settle(&mut self) {
+            self.runner.abort_handle.abort();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.runner.event_rx.recv().await.is_some() {}
+            })
+            .await
+            .expect("cancelled native actor must settle its exact process family");
+        }
+    }
+    impl Drop for Actor {
+        fn drop(&mut self) {
+            self.runner.abort_handle.abort();
+            self.sandbox.kill_active();
+        }
+    }
+    fn proposal() -> PreparedAction {
+        PreparedAction::PullRequest {
+            title: "雪 literal 'single' \"double\" $(NEVER_EXECUTE) \\".into(),
+            body: "first\r\nsecond; $(New-Item NEVER_EXECUTE) & | % ! ` \"quoted\" \\tail\\".into(),
+        }
+    }
+    async fn request(
+        requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>,
+    ) -> crate::permission::ask::AskRequest {
+        tokio::time::timeout(Duration::from_secs(10), requests.recv())
+            .await
+            .unwrap()
+            .expect("normal Shell Ask must be delivered")
+    }
+    async fn wait_for_file(path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("controlled native helper readiness deadline");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires guarded native Windows GH fixture discovery"]
+    async fn windows_native_pr_powershell_args_wait_for_normal_ask_and_use_actual_stdout() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let fixture = Fixture::new("success");
+        let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+        let mut actor = fixture.actor(Action::Ask, ask);
+        let pending = request(&mut requests).await;
+        assert_eq!(pending.tool, "shell");
+        assert!(!fixture.path("gh-argv.json").exists());
+        pending
+            .reply
+            .send(crate::permission::ask::UserDecision::AllowOnce)
+            .unwrap();
+        let AgentEvent::Done { response, .. } = actor.terminal().await else {
+            panic!("actual successful GH must return its URL")
+        };
+        assert_eq!(response, URL);
+        let PreparedAction::PullRequest { title, body } = proposal() else {
+            unreachable!()
+        };
+        assert_eq!(
+            fixture.recorded_argv()["argv"],
+            serde_json::json!(["pr", "create", "--title", title, "--body", body])
+        );
+        assert!(!fixture.path("NEVER_EXECUTE").exists());
+        assert!(!fixture.path(".git").exists());
+        // Deny a second actual request: no fixture invocation or result may occur.
+        std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
+        let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+        let mut denied = fixture.actor(Action::Ask, ask);
+        request(&mut requests)
+            .await
+            .reply
+            .send(crate::permission::ask::UserDecision::Deny)
+            .unwrap();
+        assert!(matches!(denied.terminal().await, AgentEvent::Error { .. }));
+        assert!(!fixture.path("gh-argv.json").exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires guarded native Windows GH fixture discovery"]
+    async fn windows_native_pr_nonzero_ambiguous_incomplete_stdout_remain_errors() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let fixture = Fixture::new("nonzero");
+        for mode in ["nonzero", "ambiguous", "incomplete"] {
+            if fixture.path("gh-argv.json").exists() {
+                std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
+            }
+            std::fs::write(fixture.path("gh-mode"), mode).unwrap();
+            let (ask, _requests) = tokio::sync::mpsc::channel(4);
+            let mut actor = fixture.actor(Action::Allow, ask);
+            let AgentEvent::Error { message, .. } = actor.terminal().await else {
+                panic!("invalid actual GH stdout must fail")
+            };
+            assert!(message.contains("gh"), "{mode}: {message}");
+            assert_eq!(fixture.recorded_argv()["argv"].as_array().unwrap().len(), 6);
+        }
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    #[ignore = "requires guarded native Windows GH fixture discovery"]
+    async fn windows_native_pr_posthook_text_cannot_spoof_actual_result() {
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let fixture = Fixture::new("success");
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+        let mut config = HooksConfig::new();
+        config.insert(
+            "PostToolUse".into(),
+            vec![HookGroup {
+                matcher: Some("Shell".into()),
+                hooks: vec![HookHandler {
+                    kind: "command".into(),
+                    command: Some(
+                        fixture
+                            .path("fixture bin 雪/gh.exe")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    args: Some(vec!["--posthook-redact".into()]),
+                    timeout: Some(5),
+                    is_async: false,
+                    condition: None,
+                    once: false,
+                    trust: HookTrust::Trusted,
+                    env: Default::default(),
+                }],
+            }],
+        );
+        let dispatcher =
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&config).unwrap();
+        dispatcher
+            .rebind_execution_root(fixture.workspace.root())
+            .unwrap();
+        crate::extras::hooks::init_dispatcher(dispatcher);
+        for failed in [false, true] {
+            if fixture.path("gh-posthook").exists() {
+                std::fs::remove_file(fixture.path("gh-posthook")).unwrap();
+            }
+            std::fs::write(
+                fixture.path("gh-mode"),
+                if failed { "nonzero" } else { "success" },
+            )
+            .unwrap();
+            let (ask, _requests) = tokio::sync::mpsc::channel(4);
+            let mut actor = fixture.actor(Action::Allow, ask);
+            match actor.terminal().await {
+                AgentEvent::Done { response, .. } => {
+                    assert!(!failed);
+                    assert_eq!(response, URL);
+                }
+                AgentEvent::Error { .. } => assert!(failed),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                std::fs::read_to_string(fixture.path("gh-posthook")).unwrap(),
+                "HOOK_RAN"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires guarded native Windows GH fixture discovery"]
+    async fn windows_native_pr_typed_foreground_observes_real_exit_and_bounded_completeness() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        use crate::agent::tools::bash::{ForegroundResult, ShellTool};
+        use rig::tool::Tool;
+        let fixture = Fixture::new("success");
+        let tool = ShellTool::new(
+            Some(fixture.checker(Action::Allow)),
+            None,
+            fixture.sandbox.clone(),
+            Some(1),
+        )
+        .with_foreground_timeout_secs(15);
+        let command = pr_command(&proposal(), crate::sandbox::ShellDialect::PowerShell).unwrap();
+        for (mode, expected_code, complete) in [
+            ("success", 0, true),
+            ("nonzero", 3, true),
+            ("incomplete", 0, false),
+        ] {
+            std::fs::write(fixture.path("gh-mode"), mode).unwrap();
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let result = scope
+                .run(async {
+                    tool.call_structured(
+                        crate::agent::tools::BashArgs {
+                            command: command.clone(),
+                            timeout: None,
+                            background: false,
+                        },
+                        &ToolCallExtensions::default(),
+                    )
+                    .await
+                })
+                .await
+                .unwrap();
+            let actual = result
+                .extensions
+                .get::<ForegroundResult>()
+                .expect("actual native foreground extension");
+            let ForegroundResult {
+                status: completion,
+                exit_code,
+                descendants_escaped,
+                stdout,
+                stdout_complete,
+            } = actual.clone();
+            assert_eq!(completion, crate::sandbox::CommandStatus::Completed);
+            assert_eq!(exit_code, Some(expected_code));
+            assert!(!descendants_escaped);
+            assert_eq!(stdout_complete, complete);
+            assert!(stdout.starts_with(URL.as_bytes()) && stdout.len() <= 65_536);
+            assert_eq!(foreground_pr_url(actual).is_ok(), mode == "success");
+        }
+    }
+
+    struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+    impl ProcessHandle {
+        fn capture(pid: u32) -> Self {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                PROCESS_TERMINATE,
+            };
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                    0,
+                    pid,
+                )
+            };
+            assert!(
+                !handle.is_null(),
+                "retain exact ready native process handle"
+            );
+            Self(handle)
+        }
+        fn exited(&self) -> bool {
+            unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 0)
+                    == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+            }
+        }
+    }
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.exited() {
+                    // Assertion failures still clean the exact retained child;
+                    // normal proof asserts termination before this fallback.
+                    windows_sys::Win32::System::Threading::TerminateProcess(self.0, 77);
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 2_000);
+                }
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires guarded native Windows GH fixture discovery"]
+    async fn windows_native_pr_cancel_settles_job_before_releasing_late_effect() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let fixture = Fixture::new("wait");
+        let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+        let mut actor = fixture.actor(Action::Ask, ask);
+        request(&mut requests)
+            .await
+            .reply
+            .send(crate::permission::ask::UserDecision::AllowOnce)
+            .unwrap();
+        wait_for_file(&fixture.path("gh-ready.json")).await;
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.path("gh-ready.json")).unwrap()).unwrap();
+        let pid = u32::try_from(record["pid"].as_u64().unwrap()).unwrap();
+        let exact_child = ProcessHandle::capture(pid);
+        assert!(!exact_child.exited());
+        actor.cancel_and_settle().await;
+        assert!(
+            exact_child.exited(),
+            "receiver settlement must include the actual descendant Job"
+        );
+        std::fs::write(fixture.path("gh-release"), "release after retirement").unwrap();
+        assert!(!fixture.path("gh-late").exists());
+        assert!(!fixture.path(".git").exists());
+    }
+}

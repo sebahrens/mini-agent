@@ -1164,6 +1164,168 @@ pub(crate) struct App<'a> {
     model_cache_generation: u64,
 }
 
+#[cfg(test)]
+mod reasoning_display_tests {
+    use super::*;
+    use crate::config::ReasoningDisplay;
+
+    #[tokio::test]
+    async fn actual_reasoning_controls_preserve_the_turn_and_persist_every_cycle() {
+        let root = crate::tests::OwnedTestDirectory::new("reasoning-app-controls");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            crate::session::Session::new("openrouter", "unused-test-model", 128_000, "");
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            client,
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        );
+        let mut app = test_support::fixture_app(ui);
+        app.slash.show_reasoning = true;
+        app.run.is_running = true;
+        app.input.buffer = "unsent draft".into();
+        app.input.cursor = app.input.buffer.len();
+        app.run.pending_inputs.push_back("queued request".into());
+        let before = serde_json::to_value(&*app.ui.session).unwrap();
+        for text in ["REASONING_PRIVATE_界", "🙂"] {
+            app.handle_agent_event(AgentEvent::Reasoning(text.into()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.renderer.feed().block_count(), 1);
+        assert!(
+            !app.renderer.feed().lines(100)[0]
+                .text
+                .contains("REASONING_PRIVATE")
+        );
+        let row = (0..app.renderer.visible_lines() as u16)
+            .find(|row| app.renderer.buffer_line_at_row(*row) == Some(0))
+            .unwrap();
+        assert!(matches!(
+            app.handle_user_event(UserEvent::MouseDown { row, col: 0 })
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert!(
+            app.renderer.feed().lines(100)[1]
+                .text
+                .contains("REASONING_PRIVATE")
+        );
+        assert!(!app.renderer.selection_active);
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        for expected in [
+            ReasoningDisplay::Full,
+            ReasoningDisplay::Off,
+            ReasoningDisplay::Collapsed,
+            ReasoningDisplay::Full,
+        ] {
+            app.handle_key_event(key).await.unwrap();
+            assert_eq!(app.renderer.feed().reasoning_display(), expected);
+            let saved: crate::config::Config = toml::from_str(
+                &std::fs::read_to_string(crate::config::config_file_path()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.resolve_reasoning_display(), expected);
+        }
+        assert!(app.run.agent.is_none());
+        assert_eq!(serde_json::to_value(&*app.ui.session).unwrap(), before);
+        assert_eq!(app.input.buffer, "unsent draft");
+        assert_eq!(
+            app.run.pending_inputs.front().map(String::as_str),
+            Some("queued request")
+        );
+        assert!(app.run.is_running);
+        app.handle_agent_event(AgentEvent::Token("earlier answer ".into()))
+            .await
+            .unwrap();
+        app.handle_agent_event(AgentEvent::Reasoning("SECOND_THOUGHT".into()))
+            .await
+            .unwrap();
+        // A malformed concurrently edited config leaves live preference and
+        // transcript untouched, instead of reporting a successful save.
+        std::fs::write(crate::config::config_file_path(), "broken = [").unwrap();
+        app.handle_key_event(key).await.unwrap();
+        assert_eq!(
+            app.renderer.feed().reasoning_display(),
+            ReasoningDisplay::Full
+        );
+        assert!(app.renderer.feed().lines(100).len() > 1);
+        app.handle_agent_event(AgentEvent::Token("visible answer".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.run.response_buf, "earlier answer visible answer");
+        assert!(
+            (0..app.renderer.feed().block_count())
+                .filter(|index| app.renderer.feed().is_streaming(*index))
+                .count()
+                <= 1
+        );
+        assert!(
+            app.renderer.feed().lines(100)[0]
+                .text
+                .starts_with("▾ thought")
+        );
+        app.abort_main_run().await.unwrap();
+        let complete = app.renderer.feed().lines(100);
+        app.renderer
+            .feed_mut()
+            .tick_reasoning_at(std::time::Instant::now() + Duration::from_secs(10));
+        assert!(Arc::ptr_eq(&complete, &app.renderer.feed().lines(100)));
+        // Changing provider reasoning policy cannot reset the live display to
+        // the immutable startup config after a saved Ctrl+R transition.
+        app.slash.reasoning_enabled = true;
+        for command in ["/reasoning off", "/reasoning on"] {
+            app.run_slash_command(command).await.unwrap();
+            assert_eq!(
+                app.renderer.feed().reasoning_display(),
+                ReasoningDisplay::Full
+            );
+            assert!(app.slash.show_reasoning);
+        }
+    }
+}
+
 impl<'a> App<'a> {
     pub(crate) async fn new(
         mut ui: UiContext<'a>,
@@ -1236,6 +1398,9 @@ impl<'a> App<'a> {
             reasoning_enabled: true,
             todo_tools_enabled: false,
         };
+        renderer
+            .feed_mut()
+            .set_reasoning_display(ui.cfg.resolve_reasoning_display());
         ui.session.reasoning_enabled = slash.reasoning_enabled;
         #[cfg(feature = "goal")]
         let goal_block =
@@ -1693,6 +1858,7 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
+                    self.renderer.feed_mut().tick_reasoning_at(std::time::Instant::now());
                     if self.renderer.paint_pending_chat()?
                         && self.input.picker.as_ref().is_some_and(|picker| picker.active())
                     {
@@ -2060,7 +2226,9 @@ impl<'a> App<'a> {
                 } else if row < self.renderer.visible_lines() as u16
                     && let Some(idx) = self.renderer.buffer_line_at_row(row)
                 {
-                    if let Some(url) = self.renderer.link_url_at(idx, col) {
+                    if self.renderer.toggle_reasoning_at_line(idx) {
+                        self.renderer.clear_selection();
+                    } else if let Some(url) = self.renderer.link_url_at(idx, col) {
                         let tx = self.user_tx.clone();
                         tokio::spawn(async move {
                             if let Err(error) = renderer_mod::open_url(&url).await {
@@ -2341,18 +2509,30 @@ impl<'a> App<'a> {
         let ctrl_r =
             key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl_r {
-            self.slash.show_reasoning = !self.slash.show_reasoning;
-            self.renderer.write_line(
-                &format!(
-                    "reasoning visibility: {}",
-                    if self.slash.show_reasoning {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ),
-                Color::White,
-            )?;
+            let current = self.renderer.feed().reasoning_display();
+            let display = current.next();
+            let mut before = self.ui.cfg.clone();
+            // The startup config is immutable. Compare this key with its
+            // effective live value so repeated cycles persist every transition.
+            before.reasoning_display = Some(current);
+            let mut after = before.clone();
+            after.reasoning_display = Some(display);
+            match crate::config::save_config_changes(&before, &after) {
+                Ok(()) => {
+                    self.slash.show_reasoning = display != crate::config::ReasoningDisplay::Off;
+                    self.renderer.clear_selection();
+                    self.renderer.feed_mut().set_reasoning_display(display);
+                    self.renderer.show_notice(
+                        &format!("reasoning visibility: {}", display.label()),
+                        Color::White,
+                    );
+                    self.refresh()?;
+                }
+                Err(error) => self.renderer.write_line(
+                    &format!("cannot save reasoning preference: {error}"),
+                    C_ERROR,
+                )?,
+            }
             return Ok(());
         }
 
@@ -2923,6 +3103,7 @@ impl<'a> App<'a> {
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
     async fn fail_pending_main_turn(&mut self) {
+        self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
@@ -2962,6 +3143,7 @@ impl<'a> App<'a> {
     }
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        self.renderer.feed_mut().finish_reasoning();
         #[cfg(feature = "git-worktree")]
         {
             self.chain.git.pending = None;
@@ -8546,98 +8728,6 @@ mod git_command_consumer_tests {
         assert!(app.run.agent_rx.is_none());
         assert!(app.chain.git.work.is_none());
     }
-    #[test]
-    fn actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack() {
-        std::thread::Builder::new()
-            .name("combined-context-git-one-mib".into())
-            .stack_size(1024 * 1024)
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(crate::startup::heap_future(|| async {
-                        #[cfg(feature = "hooks")]
-                        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
-                        let repo = Repo::seeded().await;
-                        let head = repo.git(&["rev-parse", "HEAD"]).await;
-                        let cli = crate::cli::Cli {
-                            no_session: true,
-                            no_tools: true,
-                            ..Default::default()
-                        };
-                        let cfg = config();
-                        let mut session = history(&repo);
-                        let before = serde_json::to_vec(&session).unwrap();
-                        let mut files =
-                            crate::context::load(true).for_workspace_binding(true, &repo.workspace);
-                        let mut app =
-                            fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
-                        let captured = app.ui.workspace.clone();
-                        // App initialization captures runtime overhead, so snapshot afterwards.
-                        let initialized = serde_json::to_vec(app.ui.session).unwrap();
-                        let sender = app.user_tx.clone();
-                        let producer = async move {
-                            for event in [
-                                UserEvent::Paste("  /context  ".into()),
-                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                                UserEvent::Paste("/commit ONE_MIB_DECLINED".into()),
-                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                                UserEvent::Key(KeyEvent::new(
-                                    KeyCode::Char('n'),
-                                    KeyModifiers::NONE,
-                                )),
-                                UserEvent::Paste("/context".into()),
-                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                                UserEvent::Paste("/quit".into()),
-                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                            ] {
-                                sender.send(event).await.unwrap();
-                            }
-                        };
-                        tokio::time::timeout(Duration::from_secs(5), async {
-                            let (_, result) = tokio::join!(
-                                producer,
-                                crate::startup::heap_future(|| app.run_inner())
-                            );
-                            result
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap();
-                        let rendered = app.renderer.captured_output();
-                        assert!(rendered.contains("Context composition:"));
-                        assert!(rendered.contains("ONE_MIB_DECLINED"));
-                        assert!(rendered.contains("Git proposal declined"));
-                        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), initialized);
-                        assert_eq!(
-                            app.ui.session.messages.len(),
-                            serde_json::from_slice::<Session>(&before)
-                                .unwrap()
-                                .messages
-                                .len()
-                        );
-                        assert!(Arc::ptr_eq(&app.ui.workspace, &captured));
-                        assert!(
-                            app.run.agent.is_none()
-                                && app.run.agent_rx.is_none()
-                                && app.run.main_abort.is_none()
-                        );
-                        assert!(app.chain.git.pending.is_none() && app.chain.git.work.is_none());
-                        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, head);
-                        assert!(
-                            repo.git(&["diff", "--cached", "--name-only"])
-                                .await
-                                .trim()
-                                .is_empty()
-                        );
-                    }));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn actual_app_commit_confirmation_decline_edit_and_modified_keys_cannot_execute() {
         #[cfg(feature = "hooks")]
@@ -9549,5 +9639,164 @@ mod context_diagnostic_tests {
                 .is_err(),
             "diagnostic must not warm provider cache or make a model request"
         );
+    }
+}
+
+#[cfg(all(test, feature = "git-worktree"))]
+mod git_confirmation_stack_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    #[test]
+    fn actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .name("combined-context-git-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        #[cfg(feature = "hooks")]
+                        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+                        let root = crate::tests::OwnedTestDirectory::new("combined-git-one-mib");
+                        let bindings = [
+                            "ZS_CONFIG_DIR",
+                            "ZS_DATA_DIR",
+                            "ZS_LOCAL_DATA_DIR",
+                            "ZS_STATE_DIR",
+                            "ZS_CACHE_DIR",
+                            "ZS_CREDENTIALS_DIR",
+                        ]
+                        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+                        let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
+                        let workspace =
+                            Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                        std::fs::write(root.path().join("selected.txt"), "selected changed雪\n")
+                            .unwrap();
+                        std::fs::write(root.path().join("unrelated.txt"), "unrelated unchanged\n")
+                            .unwrap();
+                        let cli = crate::cli::Cli {
+                            no_session: true,
+                            no_tools: true,
+                            ..Default::default()
+                        };
+                        let cfg: config::Config = serde_json::from_value(serde_json::json!({
+                            "session_title_model":"off", "custom_providers":{"git32-fixture":{
+                                "provider_type":"openai", "base_url":"http://127.0.0.1:9/v1", "api_style":"completions"
+                            }}
+                        })).unwrap();
+                        let mut session = Session::new(
+                            "git32-fixture",
+                            "unused-stack-fixture",
+                            128_000,
+                            root.path().to_str().unwrap(),
+                        );
+                        session.add_message(
+                            crate::session::MessageRole::User,
+                            "edit only selected file",
+                        );
+                        session.add_tool_call_with_id(
+                            "native-selected-write",
+                            "write",
+                            &serde_json::json!({"path":"selected.txt"}),
+                        );
+                        session.add_tool_result_with_id(
+                            "native-selected-write",
+                            "write",
+                            "saved selected file",
+                        );
+                        let before = serde_json::to_vec(&session).unwrap();
+                        let mut files =
+                            crate::context::load(true).for_workspace_binding(true, &workspace);
+                        let client = crate::provider::create_client(
+                            "git32-fixture",
+                            Some("unused-local-key"),
+                            &cfg.custom_providers_map(),
+                            cfg.api_keys.as_ref(),
+                        )
+                        .unwrap();
+                        let ui = UiContext::new(
+                            &cli,
+                            &cfg,
+                            &mut session,
+                            &mut files,
+                            workspace.clone(),
+                            client,
+                            None,
+                            None,
+                            crate::sandbox::Sandbox::new(false, "none")
+                                .with_workspace_binding(workspace),
+                            None,
+                        );
+                        let mut app = fixture_app(ui);
+                        let captured = app.ui.workspace.clone();
+                        // App initialization captures runtime overhead, so snapshot afterwards.
+                        let initialized = serde_json::to_vec(app.ui.session).unwrap();
+                        let sender = app.user_tx.clone();
+                        let producer = async move {
+                            for event in [
+                                UserEvent::Paste("  /context  ".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Paste("/commit ONE_MIB_DECLINED".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Key(KeyEvent::new(
+                                    KeyCode::Char('n'),
+                                    KeyModifiers::NONE,
+                                )),
+                                UserEvent::Paste("/context".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Paste("/quit".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            ] {
+                                sender.send(event).await.unwrap();
+                            }
+                        };
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let (_, result) = tokio::join!(
+                                producer,
+                                crate::startup::heap_future(|| app.run_inner())
+                            );
+                            result
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let rendered = app.renderer.captured_output();
+                        assert!(rendered.contains("Context composition:"));
+                        assert!(rendered.contains("ONE_MIB_DECLINED"));
+                        assert!(rendered.contains("Git proposal declined"));
+                        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), initialized);
+                        assert_eq!(
+                            app.ui.session.messages.len(),
+                            serde_json::from_slice::<Session>(&before)
+                                .unwrap()
+                                .messages
+                                .len()
+                        );
+                        assert!(Arc::ptr_eq(&app.ui.workspace, &captured));
+                        assert!(
+                            app.run.agent.is_none()
+                                && app.run.agent_rx.is_none()
+                                && app.run.main_abort.is_none()
+                        );
+                        assert!(app.chain.git.pending.is_none() && app.chain.git.work.is_none());
+                        assert_eq!(
+                            std::fs::read_to_string(root.path().join("selected.txt")).unwrap(),
+                            "selected changed雪\n"
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(root.path().join("unrelated.txt")).unwrap(),
+                            "unrelated unchanged\n"
+                        );
+                        assert!(
+                            !root.path().join(".git").exists(),
+                            "fixture never executes Git"
+                        );
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -496,3 +496,23 @@ IDs. A signed adjustment reconciles per-section local estimates with the
 existing effective-context total. The command changes no history, calibration,
 costs, permissions, pruning or persistence and bypasses the ordinary slash
 command model-cache warming and session-save steps.
+
+### Native Windows PR acceptance fixture
+
+The guarded `windows-default-compile` CI step builds the test-only
+`tests/fixtures/windows_gh_fixture.rs` image through Cargo's test target and exact
+JSON artifact discovery. It never installs another production binary or contacts
+GitHub. Ordinary test execution is inert; the native image acts as GH only under
+an explicit owned fixture role. Five ignored Windows cases exercise literal
+Unicode/quotes/metacharacters through the retained Windows PowerShell
+`ProcessStartInfo` path, normal Shell Ask/deny, immutable foreground status and
+bounded completeness, post-hook display redaction, and exact descendant Job
+retirement before a controlled late effect is released. Fixture roots and actors
+are owned and bounded.
+
+These cases explicitly select the supported trusted `--no-sandbox` Shell policy;
+there is no Git execution and no fallback from a required AppContainer boundary.
+They establish native argv/result/cancellation authority, alongside the unchanged
+standard-user AppContainer and worker-containment witnesses. The Windows proof
+remains pending until the exact hosted step passes; macOS execution and pure
+argument-encoder tests are separate evidence.

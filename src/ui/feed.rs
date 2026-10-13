@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::Index;
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::config::ReasoningDisplay;
 use compact_str::CompactString;
 use crossterm::style::Color;
 
@@ -100,6 +102,15 @@ pub struct Block {
     /// The anchor this block was inserted after, keeping several blocks
     /// inserted for one anchor in insertion order.
     attached_to: Option<CompactString>,
+    reasoning: Option<ReasoningBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct ReasoningBlock {
+    chars: usize,
+    started: Option<Instant>,
+    elapsed_secs: Option<u64>,
+    expanded: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +185,12 @@ struct OpenFence {
 impl Block {
     pub fn new(style: BlockStyle, text: impl Into<String>) -> Self {
         let mut text = terminal_safe(text.into());
+        let reasoning = (style == BlockStyle::Reasoning).then(|| ReasoningBlock {
+            chars: text.chars().count(),
+            started: None,
+            elapsed_secs: None,
+            expanded: None,
+        });
         compact_oversized_block(&mut text);
         Self {
             style,
@@ -184,6 +201,7 @@ impl Block {
             render_cache: RefCell::new(None),
             anchor: None,
             attached_to: None,
+            reasoning,
         }
     }
 }
@@ -256,6 +274,7 @@ pub struct Feed {
     /// know whether the chat viewport needs a redraw, which also catches
     /// mutations made through `Renderer::feed_mut()`.
     generation: u64,
+    reasoning_display: ReasoningDisplay,
     /// Pre-wrapped visual rows for the last requested width. Scroll and
     /// selection queries reuse these rows instead of re-laying out the whole
     /// feed each time; invalidated by any content mutation (generation bump)
@@ -291,6 +310,7 @@ impl Feed {
             pruned_blocks: 0,
             retention_generation: 0,
             generation: 0,
+            reasoning_display: ReasoningDisplay::Collapsed,
             layout_cache: RefCell::new(None),
             #[cfg(test)]
             layout_computes: std::cell::Cell::new(0),
@@ -304,6 +324,112 @@ impl Feed {
     /// Monotonic counter bumped on every content mutation.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn reasoning_display(&self) -> ReasoningDisplay {
+        self.reasoning_display
+    }
+
+    pub(crate) fn set_reasoning_display(&mut self, display: ReasoningDisplay) {
+        if self.reasoning_display == display {
+            return;
+        }
+        self.reasoning_display = display;
+        self.generation = self.generation.wrapping_add(1);
+        for block in &mut self.blocks {
+            if let Some(reasoning) = block.reasoning.as_mut() {
+                reasoning.expanded = None;
+                *block.render_cache.borrow_mut() = None;
+            }
+        }
+    }
+
+    /// Toggle only the reasoning header occupying this visual row. Body rows
+    /// remain selectable, including URLs, instead of acting as disclosure controls.
+    pub(crate) fn toggle_reasoning_at_row(&mut self, width: usize, row: usize) -> bool {
+        if self.reasoning_display == ReasoningDisplay::Off {
+            return false;
+        }
+        let mut start = if self.pruned_blocks > 0 {
+            plain_block_lines(
+                &Block::new(
+                    BlockStyle::System,
+                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
+                ),
+                width,
+            )
+            .len()
+        } else {
+            0
+        };
+        let position = self.blocks.iter().enumerate().find_map(|(index, block)| {
+            let len = block_segments(self, block, width)
+                .iter()
+                .map(|segment| segment.len())
+                .sum::<usize>();
+            let hit = block.reasoning.is_some() && row == start && len > 0;
+            start = start.saturating_add(len);
+            hit.then_some(index)
+        });
+        let Some(index) = position else {
+            return false;
+        };
+        let block = &mut self.blocks[index];
+        let reasoning = block.reasoning.as_mut().expect("reasoning header");
+        let expanded = reasoning
+            .expanded
+            .unwrap_or(self.reasoning_display == ReasoningDisplay::Full);
+        reasoning.expanded = Some(!expanded);
+        *block.render_cache.borrow_mut() = None;
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
+    /// Update live headers at most once per elapsed second. Completed durations
+    /// are frozen, and unchanged blocks retain their layout allocations.
+    pub(crate) fn tick_reasoning_at(&mut self, now: Instant) {
+        for block in &mut self.blocks {
+            if !block.running {
+                continue;
+            }
+            let Some(reasoning) = block.reasoning.as_mut() else {
+                continue;
+            };
+            let Some(started) = reasoning.started else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(started).as_secs();
+            if reasoning.elapsed_secs != Some(elapsed) {
+                reasoning.elapsed_secs = Some(elapsed);
+                *block.render_cache.borrow_mut() = None;
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn append_reasoning(&mut self, text: &str) {
+        let index = match self
+            .blocks
+            .iter()
+            .rposition(|block| block.running && block.reasoning.is_some())
+        {
+            Some(index) => index,
+            None => {
+                self.push_streaming_block(BlockStyle::Reasoning);
+                self.blocks.len() - 1
+            }
+        };
+        self.append_to(index, text);
+    }
+
+    pub(crate) fn finish_reasoning(&mut self) {
+        if let Some(index) = self
+            .blocks
+            .iter()
+            .rposition(|block| block.running && block.reasoning.is_some())
+        {
+            self.finalize_block(index);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -420,6 +546,10 @@ impl Feed {
         self.generation += 1;
         let mut block = Block::new(style, "");
         block.running = true;
+        if let Some(reasoning) = block.reasoning.as_mut() {
+            reasoning.started = Some(Instant::now());
+            reasoning.elapsed_secs = Some(0);
+        }
         self.blocks.push_back(block);
     }
 
@@ -443,6 +573,11 @@ impl Feed {
         {
             self.generation += 1;
             block.running = false;
+            if let Some(reasoning) = block.reasoning.as_mut()
+                && let Some(started) = reasoning.started.take()
+            {
+                reasoning.elapsed_secs = Some(started.elapsed().as_secs());
+            }
             // Force one full re-parse now that the text is complete.
             *block.md_cache.borrow_mut() = None;
             *block.render_cache.borrow_mut() = None;
@@ -484,8 +619,15 @@ impl Feed {
             let old_len = block.text.len();
             let text = text.as_ref();
             if has_terminal_control(text) {
-                block.text.push_str(&sanitize_output(text));
+                let safe = sanitize_output(text);
+                if let Some(reasoning) = block.reasoning.as_mut() {
+                    reasoning.chars = reasoning.chars.saturating_add(safe.chars().count());
+                }
+                block.text.push_str(&safe);
             } else {
+                if let Some(reasoning) = block.reasoning.as_mut() {
+                    reasoning.chars = reasoning.chars.saturating_add(text.chars().count());
+                }
                 block.text.push_str(text);
             }
             let compacted = compact_oversized_block(&mut block.text);
@@ -514,6 +656,12 @@ impl Feed {
             self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
             last.style = style;
             last.text = terminal_safe(text.into());
+            last.reasoning = (style == BlockStyle::Reasoning).then(|| ReasoningBlock {
+                chars: last.text.chars().count(),
+                started: None,
+                elapsed_secs: None,
+                expanded: None,
+            });
             compact_oversized_block(&mut last.text);
             self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
@@ -810,6 +958,7 @@ fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineE
     feed.block_renders.set(feed.block_renders.get() + 1);
     let segments = match block.style {
         BlockStyle::Agent => agent_block_segments(feed, block, width),
+        BlockStyle::Reasoning => vec![Arc::new(reasoning_block_lines(feed, block, width))],
         _ => vec![Arc::new(plain_block_lines(block, width))],
     };
     *block.render_cache.borrow_mut() = Some(BlockRenderCache {
@@ -818,6 +967,50 @@ fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineE
         segments: segments.clone(),
     });
     segments
+}
+
+fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry> {
+    if feed.reasoning_display == ReasoningDisplay::Off {
+        return Vec::new();
+    }
+    let Some(reasoning) = &block.reasoning else {
+        return plain_block_lines(block, width);
+    };
+    let expanded = reasoning
+        .expanded
+        .unwrap_or(feed.reasoning_display == ReasoningDisplay::Full);
+    let elapsed = reasoning
+        .elapsed_secs
+        .map(|seconds| format!(", {seconds} s"))
+        .unwrap_or_default();
+    let header = format!(
+        "{} {} ({} chars{})",
+        if expanded { "▾" } else { "▸" },
+        if block.running {
+            "thinking…"
+        } else {
+            "thought"
+        },
+        reasoning.chars,
+        elapsed
+    );
+    // A disclosure occupies exactly one visual row at every terminal width.
+    let clipped: String = header
+        .chars()
+        .scan(0usize, |columns, ch| {
+            *columns =
+                columns.saturating_add(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0));
+            (*columns <= width).then_some(ch)
+        })
+        .collect();
+    let mut lines = vec![LineEntry {
+        text: CompactString::from(clipped),
+        color: BlockStyle::Reasoning.color(),
+    }];
+    if expanded {
+        lines.extend(plain_block_lines(block, width));
+    }
+    lines
 }
 
 fn plain_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {

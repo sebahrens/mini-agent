@@ -368,6 +368,8 @@ pub struct Config {
     pub max_diff_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_display: Option<ReasoningDisplay>,
     /// Configurable status-bar (up to 3 lines). When absent, a built-in
     /// default layout is used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -907,7 +909,15 @@ impl Config {
     }
 
     pub fn resolve_show_reasoning(&self) -> bool {
-        self.show_reasoning.unwrap_or(false)
+        self.resolve_reasoning_display() != ReasoningDisplay::Off
+    }
+
+    pub fn resolve_reasoning_display(&self) -> ReasoningDisplay {
+        self.reasoning_display.unwrap_or(match self.show_reasoning {
+            Some(false) => ReasoningDisplay::Off,
+            Some(true) => ReasoningDisplay::Full,
+            None => ReasoningDisplay::Collapsed,
+        })
     }
 
     pub fn resolve_auto_update_prompts(&self) -> Option<bool> {
