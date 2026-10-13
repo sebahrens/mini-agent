@@ -31,3 +31,6 @@ __pycache__/
 
 # Preserve the verified upstream manifest beside the maintained Rig patch.
 !patched-deps/rig-core/Cargo.toml.orig
+
+# Large research datasets downloaded from external sources
+/research/operational-risk-datasets/downloads/
