@@ -399,13 +399,25 @@ conversation, so focus your question on the specific decision you need help with
 
             let model = client.completion_model(cfg.advisor_model.clone());
             let messages = current_messages();
-            run_advisor_completion(
-                model,
-                &args.question,
-                &messages,
-                cfg.kilobytes_limit,
-                &cfg.advisor_model,
-                &cfg.request_config,
+            let spend = crate::spend::run::Run::current().map(|run| {
+                run.for_model(
+                    &cfg.advisor_provider,
+                    &cfg.advisor_model,
+                    &cfg.request_config,
+                    None,
+                    crate::spend::RequestKind::Advisor,
+                )
+            });
+            crate::spend::run::scope(
+                spend,
+                run_advisor_completion(
+                    model,
+                    &args.question,
+                    &messages,
+                    cfg.kilobytes_limit,
+                    &cfg.advisor_model,
+                    &cfg.request_config,
+                ),
             )
             .await
             .map_err(|e| ToolError::Msg(format!("Advisor call failed: {e}")))
@@ -413,7 +425,7 @@ conversation, so focus your question on the specific decision you need help with
     }
 }
 
-async fn run_advisor_completion(
+pub(crate) async fn run_advisor_completion(
     model: AnyModel,
     question: &str,
     messages: &[SessionMessage],
@@ -603,18 +615,36 @@ where
     use futures::StreamExt;
     let _history: Vec<rig::completion::Message> = vec![];
     let agent_ref = &agent;
+    let observed = crate::spend::run::Run::current()
+        .map_or_else(Default::default, crate::spend::run::UsageObserver::with_run);
+    let admission = observed.clone();
     let mut stream = retry::retry_stream_chat(retry, move || {
         let p = prompt.clone();
         let h: Vec<rig::completion::Message> = vec![];
-        async move { agent_ref.stream_chat(p, h).max_turns(1).await }
+        let observed = admission.clone();
+        async move {
+            agent_ref
+                .stream_chat(p, h)
+                .max_turns(1)
+                .add_hook(observed.hook())
+                .await
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("Advisor call failed: {e}"))?;
 
     let mut response = String::new();
+    let mut request_usage = crate::agent::runner::UsageLedger::default();
     while let Some(item) = stream.next().await {
         match item {
+            Ok(rig::agent::MultiTurnStreamItem::CompletionCall(call)) => {
+                observed.record(request_usage.record(call.usage));
+            }
             Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
+                let delta = request_usage.reconcile_terminal(res.usage());
+                if delta.has_values() {
+                    observed.record(delta);
+                }
                 response = res.output.to_string();
                 break;
             }

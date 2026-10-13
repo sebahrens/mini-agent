@@ -59,6 +59,10 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
 /// Every line `/help` prints, in order; `true` marks a section heading.
 pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "commands:");
+    emit(
+        false,
+        "  /cost                 session by model and UTC daily/all-time usage estimates",
+    );
     emit(false, "  /add [path...]         add file(s) to context");
     emit(
         false,

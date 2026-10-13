@@ -28,6 +28,7 @@ mod retry;
 mod sandbox;
 mod session;
 mod setup;
+mod spend;
 mod startup;
 mod ui;
 mod update;

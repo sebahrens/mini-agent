@@ -637,6 +637,8 @@ async fn start_goal_verification(
         &ui.session.model,
     );
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
+    let spend =
+        crate::spend::run::Run::for_session(ui.session, ui.cfg, crate::spend::RequestKind::Judge);
     let client = ui.client.clone();
     let session_prices = (ui.session.input_token_cost, ui.session.output_token_cost);
     let session_cache_prices = ui.session.cache_prices();
@@ -661,15 +663,17 @@ async fn start_goal_verification(
         let cancelled = futures::FutureExt::shared(async move {
             let _ = cancelled.await;
         });
-        let (checks, mut interrupted) =
+        let (checks, mut interrupted) = crate::spend::run::scope(
+            Some(spend.clone()),
             crate::extras::goal::checks::run_with_interrupt(&goal, &request, &sandbox, &cfg, {
                 let cancelled = cancelled.clone();
                 async move {
                     cancelled.await;
                     Ok(())
                 }
-            })
-            .await;
+            }),
+        )
+        .await;
         // A failing check already decides the claim, and the gate returns
         // before it looks at the judge: asking anyway spends a model call on
         // an answer nobody reads.
@@ -681,8 +685,10 @@ async fn start_goal_verification(
                 // `/goal pause` while it waits on its provider abandons the
                 // request rather than letting it run to an ignored verdict
                 // (mini-agent-4teup).
+                let observed =
+                    crate::spend::run::UsageObserver::with_run(spend.for_judge(&resolved, &cfg));
                 let verdict = crate::extras::goal::driver::unless_interrupted(
-                    crate::extras::goal::judge::ask_with_transcript(
+                    crate::extras::goal::judge::ask_with_transcript_observed(
                         &goal,
                         &request,
                         &resolved,
@@ -690,6 +696,7 @@ async fn start_goal_verification(
                         &transcript,
                         &cfg,
                         checks.as_ref(),
+                        observed.clone(),
                     ),
                     async move {
                         cancelled.await;
@@ -698,6 +705,13 @@ async fn start_goal_verification(
                 )
                 .await;
                 interrupted = verdict.is_none();
+                let verdict = Some(verdict.unwrap_or_else(|| {
+                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
+                        &cfg,
+                        &resolved.provider,
+                        &observed,
+                    )
+                }));
                 judge_charge = verdict.as_ref().and_then(|call| {
                     call.charge(
                         &resolved,
@@ -950,6 +964,7 @@ async fn finish_goal_round(
                 None => rebuilt.clone(),
             };
             let runner = round_agent
+                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .spawn_runner(
                     relaunch.prompt,
                     history,

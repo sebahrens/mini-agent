@@ -1102,10 +1102,12 @@ struct SessionTitleWork {
     provider: compact_str::CompactString,
     pricing: crate::session::title::TitlePricing,
     ledger: crate::session::title::UsageLedger,
+    work_scope: Arc<crate::agent::runner::AgentWorkScope>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Drop for SessionTitleWork {
     fn drop(&mut self) {
+        self.work_scope.cancellation_handle().cancel();
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -1587,6 +1589,7 @@ impl<'a> App<'a> {
                 .as_ref()
                 .unwrap()
                 .clone()
+                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .spawn_runner(
                     prompt,
                     history,
@@ -3099,6 +3102,11 @@ impl<'a> App<'a> {
 
         if !self.run.is_running {
             self.run.main_abort = None;
+            if !self.run.pending_inputs.is_empty() && self.budget_admission_notice()? {
+                // Keep queued input visible for the owner to remove/resubmit;
+                // cap exhaustion must never dequeue or start a request.
+                return Ok(());
+            }
             if let Some(next) = self.run.pending_inputs.pop_front() {
                 self.renderer.chain_prompt = None;
                 self.renderer.chain_but_mode = false;
@@ -3423,6 +3431,13 @@ impl<'a> App<'a> {
             }
             Command::PullRequest => ProposalKind::PullRequest,
         };
+        let spend = crate::spend::run::Run::for_session(
+            self.ui.session,
+            self.ui.cfg,
+            crate::spend::RequestKind::GitProposal,
+        );
+        spend.prepare_owned().await?;
+        let usage = git::UsageLedger::with_spend(spend);
         self.renderer.write_line(
             "Drafting a Git proposal; review and confirm before any commit or PR runs.",
             C_TOOL,
@@ -3873,6 +3888,10 @@ impl<'a> App<'a> {
             self.chain.git.work.is_none(),
             "Git command cleanup is still pending; no next turn admitted"
         );
+        if self.budget_admission_notice()? {
+            self.restore_interrupted_prompt(text);
+            return Ok(());
+        }
         // Preflight: if the pending payload is irreducibly too large, reject
         // locally before any provider I/O or session mutation.
         let text_tokens = crate::session::Session::estimate_tokens(text);
@@ -3938,6 +3957,9 @@ impl<'a> App<'a> {
     }
 
     async fn start_internal_main_run(&mut self, text: &str) -> anyhow::Result<()> {
+        if self.budget_admission_notice()? {
+            return Ok(());
+        }
         start_main_run(
             text,
             false,
@@ -3947,6 +3969,24 @@ impl<'a> App<'a> {
             &mut self.prebuild,
         )
         .await
+    }
+
+    fn budget_admission_notice(&mut self) -> anyhow::Result<bool> {
+        if self.ui.cli.resolve_max_budget_usd(self.ui.cfg)?.is_none() {
+            return Ok(false);
+        }
+        let run = crate::spend::run::Run::for_session(
+            self.ui.session,
+            self.ui.cfg,
+            crate::spend::RequestKind::Turn,
+        );
+        if run.admit().is_ok() {
+            return Ok(false);
+        }
+        if self.ui.session.spend_account.take_budget_notice() {
+            self.renderer.write_line("USD budget: further model requests/effects stopped; queued input is retained. Use /cost to inspect recorded estimates.", C_ERROR)?;
+        }
+        Ok(true)
     }
 
     async fn ensure_agent(&mut self) {
@@ -4170,13 +4210,15 @@ impl<'a> App<'a> {
             temperature,
             extra_body,
         );
-        let runner = btw_agent.spawn_btw(
-            btw_text.to_string(),
-            snapshot,
-            self.btw_tx.clone(),
-            id,
-            self.ui.cfg.retry.clone(),
-        );
+        let runner = btw_agent
+            .with_spend_for_session(self.ui.session, self.ui.cfg, crate::spend::RequestKind::Btw)
+            .spawn_btw(
+                btw_text.to_string(),
+                snapshot,
+                self.btw_tx.clone(),
+                id,
+                self.ui.cfg.retry.clone(),
+            );
         self.btw_abort
             .push((id, runner.abort_handle, runner.task, runner.work_scope));
         self.btw_inflight += 1;
@@ -4261,6 +4303,11 @@ impl<'a> App<'a> {
                 .downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
                 .is_some()
         }) {
+            return result;
+        }
+
+        // /cost is a read-only query, including while a turn is live.
+        if name == Some("/cost") {
             return result;
         }
 
@@ -4662,6 +4709,11 @@ impl<'a> App<'a> {
                     .as_ref()
                     .unwrap()
                     .clone()
+                    .with_spend_for_session(
+                        self.ui.session,
+                        self.ui.cfg,
+                        crate::spend::RequestKind::Turn,
+                    )
                     .spawn_runner(
                         prompt,
                         history,
@@ -4769,6 +4821,11 @@ impl<'a> App<'a> {
                         .as_ref()
                         .unwrap()
                         .clone()
+                        .with_spend_for_session(
+                            self.ui.session,
+                            self.ui.cfg,
+                            crate::spend::RequestKind::Turn,
+                        )
                         .spawn_runner(
                             prompt,
                             Vec::new(),
@@ -4928,19 +4985,54 @@ impl<'a> App<'a> {
         };
         let pricing =
             crate::session::title::TitlePricing::capture(self.ui.cfg, self.ui.session, &request);
-        let ledger = crate::session::title::UsageLedger::default();
+        let spend = crate::spend::run::Run::for_session(
+            self.ui.session,
+            self.ui.cfg,
+            crate::spend::RequestKind::Title,
+        )
+        .with_captured_profile(
+            &request.provider,
+            &request.model,
+            crate::spend::PriceSnapshot::capture(
+                pricing.known_prices(),
+                pricing.cache,
+                pricing.anthropic_native,
+            ),
+            self.ui.cfg,
+            crate::spend::RequestKind::Title,
+        );
+        if spend.admit().is_err() {
+            let _ = self.renderer.write_line(
+                "USD budget: optional title skipped; completed answer retained",
+                C_ERROR,
+            );
+            return;
+        }
+        let ledger = crate::session::title::UsageLedger::with_spend(spend.clone());
         let observed = ledger.clone();
         let cfg = self.ui.cfg.clone();
         let tx = self.title_tx.clone();
         let id = request.session_id.clone();
         let provider = request.provider.clone();
+        let work_scope = crate::agent::runner::AgentWorkScope::new();
+        let task_scope = work_scope.clone();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(work_scope.clone());
         let task = tokio::spawn(async move {
-            let title = match client {
-                Ok(client) => {
-                    crate::session::title::generate(&request, &client, &cfg, observed).await
-                }
-                Err(error) => Err(error),
-            };
+            let title = task_scope
+                .run(async {
+                    match client {
+                        Ok(client) => {
+                            crate::spend::run::scope(
+                                Some(spend),
+                                crate::session::title::generate(&request, &client, &cfg, observed),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+                .await;
+            cleanup.settle().await;
             let _ = tx
                 .send(SessionTitleResult {
                     generation,
@@ -4956,6 +5048,7 @@ impl<'a> App<'a> {
             provider,
             pricing,
             ledger,
+            work_scope,
             task: Some(task),
         });
     }
@@ -4968,8 +5061,8 @@ impl<'a> App<'a> {
             if cancel {
                 task.abort();
             }
-            // The owned title future has no child jobs. Aborting and awaiting
-            // its handle cancels the provider request before publication.
+            // Abort stops publication; its retained scope still owns any
+            // in-flight ledger writer and must settle before retirement.
             if tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
                 .is_err()
@@ -4978,6 +5071,9 @@ impl<'a> App<'a> {
                 let _ = task.await;
             }
         }
+        work.work_scope.cancellation_handle().cancel();
+        // Financial usage is projected before cleanup: a stalled disk cannot
+        // erase an already-observed title charge or keep input unresponsive.
         anyhow::ensure!(
             work.session_id == self.ui.session.id
                 && Arc::ptr_eq(&work.workspace, &self.ui.workspace),
@@ -4991,6 +5087,9 @@ impl<'a> App<'a> {
         if usage.has_values() {
             self.save_session()?;
         }
+        tokio::time::timeout(Duration::from_secs(5), work.work_scope.wait_idle())
+            .await
+            .map_err(|_| anyhow::anyhow!("title ledger writer is still settling"))?;
         Ok(())
     }
 
@@ -8883,6 +8982,7 @@ mod workspace_session_picker_tests {
                 anthropic_native: true,
             },
             ledger,
+            work_scope: crate::agent::runner::AgentWorkScope::new(),
             task: Some(task),
         });
         tokio::time::timeout(Duration::from_secs(2), started)
@@ -8908,6 +9008,260 @@ mod workspace_session_picker_tests {
         assert!(app.ui.session.generated_title.is_none());
         app.retire_session_title().await.unwrap();
         assert_eq!(app.ui.session.total_input_tokens, 100);
+    }
+}
+
+#[cfg(test)]
+mod usd_budget_app_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    #[cfg(feature = "git-worktree")]
+    #[tokio::test]
+    async fn usd_budget_actual_app_git_proposal_is_denied_before_context_actor_or_request() {
+        for case in ["zero", "ledger-only", "corrupt"] {
+            let root = crate::tests::OwnedTestDirectory::new("cost-git-proposal-app");
+            let bindings = [
+                "ZS_CONFIG_DIR",
+                "ZS_DATA_DIR",
+                "ZS_LOCAL_DATA_DIR",
+                "ZS_STATE_DIR",
+                "ZS_CACHE_DIR",
+                "ZS_CREDENTIALS_DIR",
+            ]
+            .map(|name| (name, Some(root.path().join(name).into_os_string())));
+            let _env = crate::tests::ScopedProcessEnv::set(&bindings);
+            let cli = crate::cli::Cli {
+                no_sandbox: true,
+                no_session: true,
+                ..Default::default()
+            };
+            let mut cfg:crate::config::Config = serde_json::from_value(serde_json::json!({"max_budget_usd":0.0,"custom_providers":{"local-test":{"provider_type":"openai","base_url":"http://127.0.0.1:9/v1","api_style":"completions"}}})).unwrap();
+            cfg.max_budget_usd = Some(if case == "zero" { 0.0 } else { 1.0 });
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "local-test",
+                "fixture",
+                128000,
+                root.path().to_str().unwrap(),
+            );
+            session.set_input_output_prices(Some((1.0, 2.0)));
+            session.initialize_spend_account(None).unwrap();
+            let checkpoint = serde_json::to_vec(&session).unwrap();
+            let ledger =
+                crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+            if case == "ledger-only" {
+                session
+                    .spend_account
+                    .observe(&crate::spend::Receipt::new(
+                        &session.id,
+                        "local-test",
+                        "fixture",
+                        crate::spend::RequestKind::Turn,
+                        crate::event::UsageDelta {
+                            input_tokens: 2_000_000,
+                            total_tokens: 2_000_000,
+                            ..Default::default()
+                        },
+                        crate::spend::PriceSnapshot::capture(
+                            Some((1.0, 2.0)),
+                            Default::default(),
+                            false,
+                        ),
+                    ))
+                    .unwrap();
+                ledger.flush(&session.spend_account).unwrap();
+            } else if case == "corrupt" {
+                let path = crate::paths::process_paths()
+                    .unwrap()
+                    .state_dir
+                    .join("usage.jsonl");
+                crate::fs::private_atomic_create_sync(&path, b"{\"crash\":").unwrap();
+            }
+            let bytes_before = std::fs::read(
+                crate::paths::process_paths()
+                    .unwrap()
+                    .state_dir
+                    .join("usage.jsonl"),
+            )
+            .ok();
+            session = serde_json::from_slice(&checkpoint).unwrap();
+            assert!(!session.spend_account.ledger_ready());
+            assert_eq!(session.spend_account.snapshot().recorded_spend(), 0.0);
+
+            let ui = UiContext {
+                cli: &cli,
+                cfg: &cfg,
+                session: &mut session,
+                context: &mut context,
+                workspace,
+                client: crate::provider::create_client(
+                    "local-test",
+                    Some("unused-key"),
+                    &cfg.custom_providers_map(),
+                    None,
+                )
+                .unwrap(),
+                permission: None,
+                ask_tx: None,
+                sandbox: crate::sandbox::Sandbox::new(false, "none"),
+                prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+                status_signals: None,
+                #[cfg(feature = "skills")]
+                skill_services: Arc::new(
+                    crate::extras::js::skills::session::SkillServiceOwner::new(),
+                ),
+                #[cfg(feature = "mcp")]
+                mcp_manager: None,
+            };
+            let mut app = fixture_app(ui);
+            let error = app.begin_git_command("/pr").await.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::spend::run::BudgetStopped>()
+                    .is_some()
+            );
+            assert!(
+                app.chain.git.work.is_none()
+                    && app.run.main_abort.is_none()
+                    && app.run.agent_rx.is_none()
+            );
+            assert!(!app.run.is_running && app.ui.session.messages.is_empty());
+            assert_eq!(
+                std::fs::read(
+                    crate::paths::process_paths()
+                        .unwrap()
+                        .state_dir
+                        .join("usage.jsonl")
+                )
+                .ok(),
+                bytes_before
+            );
+            assert_eq!(
+                app.ui.session.spend_account.snapshot().tracking_error,
+                case == "corrupt"
+            );
+            if case == "ledger-only" {
+                assert_eq!(app.ui.session.recorded_total_cost(), 2.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn usd_budget_actual_app_cost_query_is_readonly_and_queue_stays_visible() {
+        let root = crate::tests::OwnedTestDirectory::new("cost-query-app");
+        let bindings = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _env = crate::tests::ScopedProcessEnv::set(&bindings);
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg:crate::config::Config=serde_json::from_value(serde_json::json!({"max_budget_usd":2.0,"custom_providers":{"local-test":{"provider_type":"openai","base_url":"http://127.0.0.1:9/v1","api_style":"completions"}}})).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            Session::new("local-test", "test", 128_000, root.path().to_str().unwrap());
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        session.total_cost = 10.0;
+        let paths = crate::paths::process_paths().unwrap();
+        let ledger = crate::spend::Ledger::new(&paths.state_dir);
+        session.configure_spend(Some(2.0), &ledger).unwrap();
+        let receipt = crate::spend::Receipt::new(
+            &session.id,
+            "openai",
+            "model\x1b]52;c;ZXZpbA==\x07",
+            crate::spend::RequestKind::Turn,
+            crate::event::UsageDelta {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            },
+            crate::spend::PriceSnapshot::capture(Some((2.0, 4.0)), Default::default(), false),
+        );
+        session.spend_account.observe(&receipt).unwrap();
+        ledger.flush(&session.spend_account).unwrap();
+        let ledger_before = std::fs::read(paths.state_dir.join("usage.jsonl")).unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace: workspace.clone(),
+            client: crate::provider::create_client(
+                "local-test",
+                Some("unused-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        app.run.is_running = true;
+        app.input.load_text(" \t/cost");
+        crate::startup::heap_future(|| {
+            app.handle_key_event(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        })
+        .await
+        .unwrap();
+        assert!(app.run.is_running);
+        assert!(app.run.agent.is_none() && app.run.main_abort.is_none());
+        assert!(app.run.pending_inputs.is_empty());
+        app.run.is_running = false;
+        let text = app.renderer.captured_output();
+        for expected in [
+            "Session recorded spend: $12.000000",
+            "Legacy/imported estimate: $10.000000",
+            "openai/model",
+            "Today (UTC): $2.000000",
+            "All time: $2.000000",
+            "input 1000000",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("\x1b]52"));
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert_eq!(
+            std::fs::read(paths.state_dir.join("usage.jsonl")).unwrap(),
+            ledger_before
+        );
+        assert!(!paths.data_dir.join("sessions").exists());
+        app.run.pending_inputs.push_back("queued follow-up".into());
+        app.finalize_turn().await.unwrap();
+        assert_eq!(
+            app.run.pending_inputs.front().map(|s| s.as_str()),
+            Some("queued follow-up")
+        );
+        assert!(!app.run.is_running && app.run.agent.is_none() && app.run.main_abort.is_none());
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("queued input is retained")
+        );
+        assert_eq!(
+            app.ui.session.spend_account.snapshot().recorded_spend(),
+            12.0
+        );
     }
 }
 
@@ -10180,14 +10534,26 @@ mod plan_approval_tests {
                         if text == "hold" {
                             std::future::pending::<()>().await;
                         }
+                        if text == "hold-open" {
+                            let chunk = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"STREAM_WITHOUT_FINAL"},"finish_reason":null}]});
+                            let body = format!("data: {chunk}\n\n");
+                            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+                            std::future::pending::<()>().await;
+                        }
                         let (status, body, kind) = if text == "error" {
                             ("400 Bad Request", "{\"error\":{\"message\":\"owned planning failure\"}}".into(), "application/json")
                         } else {
-                            let delta = if text == "ask-read" {
+                            let delta = if text == "unknown-tool" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"unknown-cost-initial","type":"function","function":{"name":"unknown_unregistered_cost_tool","arguments":"{}"}}]})
+                            } else if text == "cap-write" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"write-cost-initial","type":"function","function":{"name":"write","arguments":"{\"path\":\"effect.txt\",\"content\":\"ACTUAL_OWNED_EFFECT\"}"}}]})
+                            } else if text == "pressure-read" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-cost-compact","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
+                            } else if text == "ask-read" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
                             } else { serde_json::json!({"role":"assistant","content":text}) };
                             let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
-                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if text=="ask-read" {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if text=="ask-read" || text=="cap-write" || text=="unknown-tool" || text=="pressure-read" {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
                             ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
                         };
                         let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -10423,6 +10789,601 @@ mod plan_approval_tests {
                 "duplicate Y cannot admit a new turn"
             );
             provider.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn usd_budget_actual_approved_plan_retains_literal_draft_without_second_request() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN]).await;
+        let mut cfg = provider.config();
+        // The owned provider reports 9 input and 4 output tokens. This is a
+        // real exhausted paid cap, rather than an unknown-price refusal.
+        cfg.max_budget_usd = Some(34.0 / 1_000_000.0);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(app.chain.plan.pending.as_ref().unwrap().plan, PLAN);
+        let before = serde_json::to_vec(app.ui.session).unwrap();
+        assert!(
+            (app.ui.session.spend_account.snapshot().recorded_spend()
+                - cfg.max_budget_usd.unwrap())
+            .abs()
+                < 1e-12
+        );
+        key(&mut app, KeyCode::Char('y')).await;
+        assert_eq!(provider.calls().len(), 1);
+        assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.chain.plan.pending.is_none() && app.chain.plan.run.is_none());
+        assert!(app.run.pending_inputs.is_empty());
+        assert!(
+            app.input.buffer.starts_with("Execute this approved plan")
+                && app.input.buffer.ends_with(PLAN)
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        drop(app);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn usd_budget_initial_interactive_terminal_persists_receipt_before_another_turn() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![PLAN, "IMPLEMENTED"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        begin(&mut app).await;
+        assert!(finish_turn(&mut app).await);
+        let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+        let first = ledger.summary_for_session(&app.ui.session.id).unwrap();
+        assert_eq!(
+            first.session.records, 1,
+            "terminal settlement must persist this turn without a future request"
+        );
+        assert_eq!(first.session.input_tokens, 9);
+        assert_eq!(first.session.output_tokens, 4);
+        assert!((first.session.known_cost - 0.000034).abs() < 1e-12);
+        assert!(!app.ui.session.spend_account.has_pending());
+        assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+        key(&mut app, KeyCode::Char('y')).await;
+        assert!(finish_turn(&mut app).await);
+        let second = ledger.summary_for_session(&app.ui.session.id).unwrap();
+        assert_eq!(second.session.records, 2);
+        assert_eq!(second.session.input_tokens, 18);
+        assert_eq!(second.session.output_tokens, 8);
+        assert!((second.session.known_cost - 0.000068).abs() < 1e-12);
+        assert!(
+            (app.ui.session.spend_account.snapshot().recorded_spend() - second.session.known_cost)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(provider.calls().len(), 2);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        crate::session::storage::save_session(app.ui.session).unwrap();
+        let saved = crate::session::storage::load_session_exact(&app.ui.session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (saved.total_input_tokens, saved.total_output_tokens),
+            (18, 8)
+        );
+        assert!((saved.total_cost - 0.000068).abs() < 1e-12);
+        assert!(!saved.spend_account.snapshot().tracking_error);
+        drop(app);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn usd_budget_initial_interactive_write_has_same_policy_positive_and_cap_negative() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for capped in [false, true] {
+            let roots = Roots::new();
+            let provider = Provider::new(if capped {
+                vec!["cap-write"]
+            } else {
+                vec!["cap-write", "WRITE_COMPLETED"]
+            })
+            .await;
+            let mut cfg = provider.config();
+            cfg.max_budget_usd = capped.then_some(0.000034);
+            let cli = crate::cli::Cli {
+                no_session: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let effect = workspace.root().join("effect.txt");
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            session.set_input_output_prices(Some((2.0, 4.0)));
+            let mut ui = ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace.clone(),
+                SecurityMode::Standard,
+            );
+            // Both cases grant the same single owned write path; the ceiling
+            // alone decides whether the actual registered WriteTool runs.
+            let policy = PermissionConfigs::from(PermissionConfig {
+                default: Some(Action::Deny),
+                write: Some(crate::permission::ToolPerm::Granular(
+                    std::collections::HashMap::from([(
+                        effect.to_string_lossy().into_owned(),
+                        Action::Allow,
+                    )]),
+                )),
+                ..Default::default()
+            });
+            ui.permission = Some(Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &policy,
+                    SecurityMode::Standard,
+                    Some(workspace.root().to_owned()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            let mut app = owned_app(ui);
+            user(
+                &mut app,
+                UserEvent::Paste("write the selected owned file".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            assert_eq!(finish_turn(&mut app).await, !capped);
+            assert_eq!(effect.exists(), !capped);
+            if !capped {
+                assert_eq!(
+                    std::fs::read_to_string(&effect).unwrap(),
+                    "ACTUAL_OWNED_EFFECT"
+                );
+            }
+            assert_eq!(provider.calls().len(), if capped { 1 } else { 2 });
+            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            let totals = ledger
+                .summary_for_session(&app.ui.session.id)
+                .unwrap()
+                .session;
+            assert_eq!(totals.records, if capped { 1 } else { 2 });
+            assert!((totals.known_cost - if capped { 0.000034 } else { 0.000068 }).abs() < 1e-12);
+            assert_eq!(
+                app.ui.session.total_input_tokens,
+                if capped { 9 } else { 18 }
+            );
+            assert!(app.ui.session.permission_allowlist.is_empty());
+            assert!(!app.ui.session.spend_account.has_pending());
+            assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+            drop(app);
+            provider.finish().await;
+        }
+    }
+
+    #[test]
+    fn usd_budget_actual_midturn_compaction_reuses_account_and_prices_before_http_and_write() {
+        std::thread::Builder::new()
+            .name("midcompact-budget-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| {
+                        midturn_compaction_budget_matrix()
+                    }))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn midturn_compaction_budget_matrix() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for capped in [true, false] {
+            let roots = Roots::new();
+            let provider =
+                Provider::new(vec!["pressure-read", "cap-write", "WRITE_COMPLETED"]).await;
+            let mut cfg = provider.config();
+            cfg.compact_enabled = Some(true);
+            cfg.mid_turn_compact_threshold = Some(0.75);
+            cfg.max_budget_usd = Some(if capped { 0.200030 } else { 1.0 });
+            let cli = crate::cli::Cli::default();
+            let workspace = roots.workspace();
+            let effect = workspace.root().join("effect.txt");
+            let read = workspace.root().join("held.txt");
+            std::fs::write(&read, "owned context retained through restart").unwrap();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            // Known prior context explains the provider's pressure; without
+            // it calibration correctly classifies 100k unexplained tokens as
+            // an irreducible prompt floor and never requests compaction.
+            session.add_message(MessageRole::User, &"x".repeat(80_000));
+            session.add_message(MessageRole::Assistant, &"y".repeat(80_000));
+            session.set_input_output_prices(Some((2.0, 4.0)));
+            let id = session.id.clone();
+            let mut ui = ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace.clone(),
+                SecurityMode::Standard,
+            );
+            let policy = PermissionConfigs::from(PermissionConfig {
+                default: Some(Action::Deny),
+                read: Some(crate::permission::ToolPerm::Granular(
+                    std::collections::HashMap::from([(
+                        read.to_string_lossy().into_owned(),
+                        Action::Allow,
+                    )]),
+                )),
+                write: Some(crate::permission::ToolPerm::Granular(
+                    std::collections::HashMap::from([(
+                        effect.to_string_lossy().into_owned(),
+                        Action::Allow,
+                    )]),
+                )),
+                ..Default::default()
+            });
+            ui.permission = Some(Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &policy,
+                    SecurityMode::Standard,
+                    Some(workspace.root().to_owned()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            let mut app = owned_app(ui);
+            user(
+                &mut app,
+                UserEvent::Paste("read held.txt then write effect.txt".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            let mut boundaries = 0;
+            let mut read_succeeded = false;
+            let succeeded = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                    let success = matches!(event, AgentEvent::Done { .. });
+                    let terminal = success || matches!(event, AgentEvent::Error { .. });
+                    if matches!(&event, AgentEvent::ToolResult { name, is_error, .. } if name.as_str() == "read" && !*is_error) {
+                        read_succeeded = true;
+                    }
+                    if matches!(event, AgentEvent::CompactionBoundary { .. }) {
+                        assert!(read_succeeded, "the real allowed read completed before restart");
+                        boundaries += 1;
+                        let first = ledger.summary_for_session(&id).unwrap().session;
+                        assert_eq!(
+                            (first.records, first.input_tokens, first.output_tokens),
+                            (1, 100000, 4)
+                        );
+                        assert!((first.known_cost - 0.200016).abs() < 1e-12);
+                        assert_eq!(provider.calls().len(), 1);
+                        assert!(!app.ui.session.spend_account.has_pending());
+                        assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+                    }
+                    crate::startup::heap_future(|| app.handle_agent_event(event))
+                        .await
+                        .unwrap();
+                    if terminal {
+                        break success;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                boundaries,
+                1,
+                "the actual SDK tool result must reach the requested restart boundary; rendered={}",
+                app.renderer.captured_output()
+            );
+            eprintln!(
+                "midcompact witness: capped={capped} boundaries={boundaries} succeeded={succeeded} posts={} effect={} rows={} account_spend={:.6} session_spend={:.6}",
+                provider.calls().len(),
+                effect.exists(),
+                ledger.summary_for_session(&id).unwrap().session.records,
+                app.ui.session.spend_account.snapshot().recorded_spend(),
+                app.ui.session.total_cost
+            );
+            assert_eq!(succeeded, !capped);
+            assert_eq!(
+                provider.calls().len(),
+                if capped { 2 } else { 3 },
+                "the admitted restarted response crosses the cap before a write or a third HTTP request"
+            );
+            assert_eq!(
+                effect.exists(),
+                !capped,
+                "the same ordinary allowed write must only run with admitted spend"
+            );
+            if !capped {
+                assert_eq!(
+                    std::fs::read_to_string(&effect).unwrap(),
+                    "ACTUAL_OWNED_EFFECT"
+                );
+            }
+            for body in provider.calls() {
+                assert_eq!(body["model"], "owned-model");
+            }
+            assert_eq!(app.ui.session.id, id);
+            assert!(app.ui.session.permission_allowlist.is_empty());
+            let totals = ledger.summary_for_session(&id).unwrap().session;
+            assert_eq!(totals.records, if capped { 2 } else { 3 });
+            assert_eq!(
+                (totals.input_tokens, totals.output_tokens),
+                if capped { (100009, 8) } else { (100018, 12) }
+            );
+            assert!((totals.known_cost - if capped { 0.200050 } else { 0.200084 }).abs() < 1e-12);
+            assert!(
+                (app.ui.session.spend_account.snapshot().recorded_spend() - totals.known_cost)
+                    .abs()
+                    < 1e-12
+            );
+            assert_eq!(app.ui.session.total_input_tokens, totals.input_tokens);
+            assert!(!app.ui.session.spend_account.has_pending());
+            assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+            for line in
+                std::fs::read_to_string(roots.directory.path().join("ZS_STATE_DIR/usage.jsonl"))
+                    .unwrap()
+                    .lines()
+            {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(row["session_id"], id.as_str());
+                assert_eq!(row["provider"], "plan80");
+                assert_eq!(row["model"], "owned-model");
+                assert_eq!(row["prices"]["input"], 2.0);
+                assert_eq!(row["prices"]["output"], 4.0);
+                assert_eq!(row["kind"], "turn");
+            }
+            drop(app);
+            if capped {
+                provider.cancel().await;
+            } else {
+                provider.finish().await;
+            }
+        }
+    }
+
+    /// Direct consumer seam control: the existing account is already at its
+    /// ceiling, so the restart must refuse HTTP even before another response.
+    #[tokio::test]
+    async fn usd_budget_midcompact_direct_entry_exhausted_account_refuses_http() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["cap-write", "WRITE_COMPLETED"]).await;
+        let mut cfg = provider.config();
+        cfg.max_budget_usd = Some(0.000034);
+        let cli = crate::cli::Cli::default();
+        let workspace = roots.workspace();
+        let effect = workspace.root().join("effect.txt");
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.set_input_output_prices(Some((2.0, 4.0)));
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Yolo,
+        ));
+        user(
+            &mut app,
+            UserEvent::Paste("write the selected owned file".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(!finish_turn(&mut app).await);
+        let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+        assert_eq!(
+            ledger
+                .summary_for_session(&app.ui.session.id)
+                .unwrap()
+                .session
+                .records,
+            1
+        );
+        assert_eq!(provider.calls().len(), 1);
+        assert!(app.ui.session.spend_account.snapshot().exhausted());
+        assert!(!app.ui.session.spend_account.has_pending());
+        // This is the actual UI function with a known exhausted checkpoint;
+        // it does not pretend the preceding actor emitted a pressure event.
+        let core = &mut app.0;
+        crate::startup::heap_future(|| {
+            mid_turn_compact_and_respawn(
+                0.7,
+                &[],
+                &mut core.renderer,
+                &mut core.run,
+                &mut core.ui,
+                &core.slash,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(!finish_turn(&mut app).await);
+        assert_eq!(provider.calls().len(), 1);
+        let totals = ledger
+            .summary_for_session(&app.ui.session.id)
+            .unwrap()
+            .session;
+        assert_eq!(
+            (totals.records, totals.input_tokens, totals.output_tokens),
+            (1, 9, 4)
+        );
+        assert!((totals.known_cost - 0.000034).abs() < 1e-12);
+        assert!(
+            (app.ui.session.spend_account.snapshot().recorded_spend() - 0.000034).abs() < 1e-12
+        );
+        assert!(!app.ui.session.spend_account.has_pending());
+        assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert!(!effect.exists());
+        drop(app);
+        provider.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn usd_budget_initial_interactive_invalid_tool_and_cancel_retain_incomplete_without_fabricated_receipt()
+     {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for response in ["unknown-tool", "hold-open"] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec![response]).await;
+            let mut cfg = provider.config();
+            cfg.max_budget_usd = Some(1.0);
+            let cli = crate::cli::Cli {
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            session.set_input_output_prices(Some((2.0, 4.0)));
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            begin(&mut app).await;
+            if response == "hold-open" {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !app
+                        .renderer
+                        .captured_output()
+                        .contains("STREAM_WITHOUT_FINAL")
+                    {
+                        let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                        assert!(!matches!(
+                            event,
+                            AgentEvent::Done { .. } | AgentEvent::Error { .. }
+                        ));
+                        crate::startup::heap_future(|| app.handle_agent_event(event))
+                            .await
+                            .unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                app.run.pending_inputs.push_back("never dispatched".into());
+                user(
+                    &mut app,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                )
+                .await;
+                assert!(app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+                assert!(app.run.pending_inputs.is_empty());
+            } else {
+                assert!(!finish_turn(&mut app).await);
+            }
+            assert_eq!(provider.calls().len(), 1);
+            assert!(app.ui.session.spend_account.snapshot().tracking_error);
+            assert!(!app.ui.session.spend_account.has_pending());
+            assert_eq!(app.ui.session.total_cost, 0.0);
+            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            assert_eq!(
+                ledger
+                    .summary_for_session(&app.ui.session.id)
+                    .unwrap()
+                    .session
+                    .records,
+                0
+            );
+            assert!(app.ui.session.permission_allowlist.is_empty());
+            assert!(app.chain.plan.pending.is_none());
+            crate::session::storage::save_session(app.ui.session).unwrap();
+            let saved = crate::session::storage::load_session_exact(&app.ui.session.id)
+                .unwrap()
+                .unwrap();
+            assert!(saved.spend_account.snapshot().tracking_error);
+            assert_eq!(saved.total_cost, 0.0);
+            key(&mut app, KeyCode::Char('y')).await;
+            assert_eq!(provider.calls().len(), 1);
+            assert!(!app.run.is_running);
+            drop(app);
+            if response == "hold-open" {
+                provider.cancel().await;
+            } else {
+                provider.finish().await;
+            }
         }
     }
 

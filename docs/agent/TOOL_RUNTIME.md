@@ -573,3 +573,17 @@ paths, is excluded from serialization, and never stores secret values. Actual
 `AuthResolver` precedence chooses the reported source, including isolated custom
 routes and typed Anthropic token handling. Optional bounded immediate-directory
 and LSP executable metadata checks are CLI-only; the TUI performs neither.
+## Recorded-spend admission
+
+`spend::run::Run` is parent-owned request provenance carried through exact SDK
+tool extensions and owned tasks. The ordinary concurrency wrapper checks the
+logical-session USD ceiling after lane acquisition, and the shared permission
+helper checks again after a reply before installing a session grant. A refusal
+executes no tool and forwards no successful mutation extension. The JS broker
+rechecks before preparation and after approval/audit-lock waits, before durable
+intent. No worker financial authority or Phase 6 containment invariant changes.
+Already dispatched work keeps its existing cancellation/reaping ownership;
+completion and observed usage are retained. See [COST_TRACKING.md](COST_TRACKING.md)
+for pricing, private-ledger bounds, failure handling and the reported-estimate
+limit. Existing command classes, deadlines, URL policy and permission precedence
+are preserved.

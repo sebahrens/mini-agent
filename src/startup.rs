@@ -563,6 +563,76 @@ fn headless_compaction_plan(
     })
 }
 
+#[derive(Debug)]
+struct HeadlessCompactionUsage(crate::event::UsageDelta);
+impl std::fmt::Display for HeadlessCompactionUsage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("headless auto-compaction failed")
+    }
+}
+
+/// Preparation may have completed paid compaction requests before refusing
+/// another request. Settle that observed accounting without creating a model
+/// prompt turn or connecting its tools/MCP servers.
+async fn settle_headless_preparation_failure(
+    session: &Session,
+    cfg: &Config,
+    cli: &Cli,
+    workspace: &crate::paths::WorkspaceBinding,
+    failure: anyhow::Error,
+) -> anyhow::Error {
+    let persistence = if cli.no_session {
+        Ok(())
+    } else {
+        session::storage::save_session(session)
+    };
+    if cli.output_format() != OutputFormat::Text {
+        let usage = failure
+            .downcast_ref::<HeadlessCompactionUsage>()
+            .map_or(Default::default(), |observed| observed.0);
+        let reason = if failure
+            .downcast_ref::<crate::spend::run::BudgetStopped>()
+            .is_some()
+        {
+            crate::print::HeadlessStopReason::Budget
+        } else {
+            crate::print::HeadlessStopReason::Failed
+        };
+        let rendered = crate::print::render_headless_json(
+            workspace.root(),
+            &failure.to_string(),
+            &[],
+            usage.into(),
+            Vec::new(),
+            crate::print::HeadlessPricing::from_session(session, cfg),
+            reason,
+            #[cfg(feature = "goal")]
+            None,
+        );
+        let emitted = match rendered {
+            Ok(rendered) => {
+                crate::print::emit_headless_result(
+                    &rendered,
+                    cli.output_format(),
+                    Some((&session.id, &session.name)),
+                    !cli.no_session && persistence.is_ok(),
+                )
+                .await
+            }
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = emitted {
+            return failure.context(format!("preparation accounting output failed: {error}"));
+        }
+    }
+    match persistence {
+        Ok(()) => failure,
+        Err(error) => failure.context(format!(
+            "preparation accounting could not be saved: {error}"
+        )),
+    }
+}
+
 async fn compact_headless_session_if_needed(
     session: &mut Session,
     client: &AnyClient,
@@ -573,6 +643,10 @@ async fn compact_headless_session_if_needed(
 ) -> anyhow::Result<crate::event::UsageDelta> {
     #[cfg(not(feature = "memory"))]
     let _ = context;
+    let spend =
+        crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Compaction);
+    let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
+    let request_observer = observed.clone();
     let compacted = compact_headless_session_with(
         session,
         cfg,
@@ -581,7 +655,7 @@ async fn compact_headless_session_if_needed(
         context.memory.as_deref(),
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
             client
-                .compress_messages(
+                .compress_messages_observed(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
@@ -589,12 +663,25 @@ async fn compact_headless_session_if_needed(
                     input_token_budget,
                     response_token_budget,
                     &cfg.retry,
+                    request_observer,
                 )
                 .await
         },
     )
-    .await
-    .map_err(|error| anyhow::anyhow!("headless auto-compaction failed: {error}"))?;
+    .await;
+    let compacted = match compacted {
+        Ok(compacted) => compacted,
+        Err(error) => {
+            let usage = cfg.normalize_usage(&session.provider, observed.take());
+            session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
+            let failure = if spend.was_refused() {
+                crate::spend::run::BudgetStopped.into()
+            } else {
+                error
+            };
+            return Err(failure.context(HeadlessCompactionUsage(usage)));
+        }
+    };
 
     #[cfg(feature = "memory")]
     if let Some(compacted) = &compacted {
@@ -793,7 +880,7 @@ fn apply_openrouter_pricing_refresh_result(
         return;
     };
     if refresh.need_pricing && session.known_input_output_prices().is_none() {
-        session.set_input_output_prices(Some((info.input_cost, info.output_cost)));
+        session.set_input_output_prices(info.known_prices());
     }
     if refresh.need_context
         && session.context_window == refresh.initial_context_window
@@ -818,7 +905,7 @@ impl Startup {
     /// creation/resolution, client creation.
     pub(crate) async fn init(
         mut cli: Cli,
-        cfg: Config,
+        mut cfg: Config,
         paths: AppPaths,
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
         is_first_startup: bool,
@@ -853,6 +940,8 @@ impl Startup {
             )];
         }
 
+        let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
+        cfg.max_budget_usd = max_budget_usd;
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early.
@@ -998,6 +1087,44 @@ impl Startup {
                 }
                 apply_resume_provider_decision(&mut session, decision, &cfg);
             }
+        }
+
+        session.initialize_spend_account(max_budget_usd)?;
+        let account = session.spend_account.clone();
+        let session_id = session.id.to_string();
+        let ledger = account.runtime_ledger(std::sync::Arc::new(crate::spend::Ledger::new(
+            &paths.state_dir,
+        )));
+        if let Err(error) = crate::agent::runner::spawn_blocking_scoped(move || {
+            let result = ledger
+                .summary_for_session(&session_id)
+                .and_then(|summary| account.reconcile(max_budget_usd, &summary.session));
+            if result.is_err() {
+                account.tracking_failed();
+            }
+            if max_budget_usd.is_none() {
+                Ok(())
+            } else {
+                result
+            }
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.into()))
+        {
+            if max_budget_usd.is_none() {
+                return Err(error);
+            }
+            let error = anyhow::Error::from(crate::spend::run::BudgetStopped)
+                .context("cost cap cannot safely initialize private usage tracking");
+            if cli.print {
+                crate::print::emit_headless_budget_failure(
+                    &cli,
+                    workspace.root(),
+                    &error.to_string(),
+                )
+                .await?;
+            }
+            return Err(error);
         }
 
         // A resumed session persisted its context_window when first saved, which can
@@ -1749,15 +1876,41 @@ impl Startup {
             }
             // Already charged to the session; kept to report in the JSON
             // usage and cost and to count toward a goal's first round.
-            let compaction_usage = compact_headless_session_if_needed(
+            let admission = crate::spend::run::Run::for_session(
                 &mut self.session,
-                &self.client,
                 &self.cfg,
-                &self.context,
-                pending_tokens,
-                self.cli.compact_instructions.as_deref(),
+                crate::spend::RequestKind::Turn,
             )
-            .await?;
+            .admit();
+            let prepared = match admission {
+                Ok(()) => {
+                    compact_headless_session_if_needed(
+                        &mut self.session,
+                        &self.client,
+                        &self.cfg,
+                        &self.context,
+                        pending_tokens,
+                        self.cli.compact_instructions.as_deref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let compaction_usage = match prepared {
+                Ok(usage) => usage,
+                Err(error) => {
+                    return Err(heap_future(|| {
+                        settle_headless_preparation_failure(
+                            &self.session,
+                            &self.cfg,
+                            &self.cli,
+                            &self.workspace,
+                            error,
+                        )
+                    })
+                    .await);
+                }
+            };
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
             let extra_body = provider::merge_extra_body(
                 config::resolve_extra_body(&self.cfg, &self.model),
@@ -1943,11 +2096,15 @@ impl Startup {
                     // adds observed usage at its captured model prices.
                     if failure.is_none() {
                         let cost_before = session.total_cost;
-                        let (title_usage, interrupted) = session::title::generate_for_session(
-                            &mut session,
-                            &self.cfg,
-                            &self.client,
-                        )
+                        // This measured large title child must not add its
+                        // construction copies to the primary request's poll.
+                        let (title_usage, interrupted) = heap_future(|| {
+                            session::title::generate_for_session(
+                                &mut session,
+                                &self.cfg,
+                                &self.client,
+                            )
+                        })
                         .await;
                         if title_usage.has_values() {
                             title_accounting = Some(
@@ -1971,7 +2128,13 @@ impl Startup {
                 }
             }
             if let Some((files_changed, pricing)) = json_context {
-                let stop_reason = if failure.is_some() || persistence_failure.is_some() {
+                let stop_reason = if failure.as_ref().is_some_and(|error| {
+                    error
+                        .downcast_ref::<crate::spend::run::BudgetStopped>()
+                        .is_some()
+                }) {
+                    crate::print::HeadlessStopReason::Budget
+                } else if failure.is_some() || persistence_failure.is_some() {
                     crate::print::HeadlessStopReason::Failed
                 } else if schema_outcome.exhausted {
                     crate::print::HeadlessStopReason::SchemaFailed
@@ -2433,6 +2596,8 @@ async fn run_headless_goal_rounds(
     let mut round_started = std::time::Instant::now();
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut turn = agent
+        .clone()
+        .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
         .run_print_with_output(
             message,
             output,
@@ -2525,6 +2690,8 @@ async fn run_headless_goal_rounds(
             // A blocked diagnostic must not hold up their settlement.
             let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let check_notices = notices.clone();
+            let spend =
+                crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Judge);
             let session_prices = (session.input_token_cost, session.output_token_cost);
             let session_cache_prices = session.cache_prices();
             let outcome =
@@ -2535,12 +2702,15 @@ async fn run_headless_goal_rounds(
                     // the checks and the judge is not lost.
                     let interrupt = crate::print::headless_interrupt();
                     tokio::pin!(interrupt);
-                    let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
-                        &goal_for_checks,
-                        &request,
-                        &sandbox_for_checks,
-                        &cfg_for_checks,
-                        interrupt.as_mut(),
+                    let (checks, interrupted) = crate::spend::run::scope(
+                        Some(spend.clone()),
+                        crate::extras::goal::checks::run_with_interrupt(
+                            &goal_for_checks,
+                            &request,
+                            &sandbox_for_checks,
+                            &cfg_for_checks,
+                            interrupt.as_mut(),
+                        ),
                     )
                     .await;
                     if interrupted {
@@ -2576,8 +2746,11 @@ async fn run_headless_goal_rounds(
                             // as the retry policy allows. An interrupt drops it:
                             // a verdict arriving after the operator stopped the
                             // run must not decide the goal.
+                            let observed = crate::spend::run::UsageObserver::with_run(
+                                spend.for_judge(&resolved, &cfg_for_judge),
+                            );
                             let verdict = driver::unless_interrupted(
-                                crate::extras::goal::judge::ask_with_transcript(
+                                crate::extras::goal::judge::ask_with_transcript_observed(
                                     &goal_for_checks,
                                     &request,
                                     &resolved,
@@ -2585,11 +2758,32 @@ async fn run_headless_goal_rounds(
                                     &transcript,
                                     &cfg_for_judge,
                                     checks.as_ref(),
+                                    observed.clone(),
                                 ),
                                 interrupt.as_mut(),
                             )
                             .await;
                             let Some(verdict) = verdict else {
+                                let cancelled_call =
+                                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
+                                        &cfg_for_judge,
+                                        &resolved.provider,
+                                        &observed,
+                                    );
+                                *judge_charge_out
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    cancelled_call.charge(
+                                        &resolved,
+                                        &cfg_for_judge,
+                                        crate::extras::goal::judge::judge_prices_with_cache_prices(
+                                            &resolved,
+                                            &cfg_for_judge,
+                                            session_prices,
+                                            session_cache_prices,
+                                        ),
+                                        session_cache_prices,
+                                    );
                                 interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return driver::Verification {
                                     interrupted: true,
@@ -2736,6 +2930,8 @@ async fn run_headless_goal_rounds(
             persisted = false;
             round_started = std::time::Instant::now();
             let next = round_agent
+                .clone()
+                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                 .run_print_with_output(
                     &relaunch.prompt,
                     output,
@@ -3746,6 +3942,9 @@ mod tests {
             {"id":"overflow","pricing":{"prompt":"1e308","completion":"0.000002"}},
             {"id":"malformed","pricing":{"prompt":"invalid","completion":"0.000002"}},
             {"id":"free","pricing":{"prompt":"0","completion":"0"},"context_length":16000},
+            {"id":"free-no-context","pricing":{"prompt":"0","completion":"0"}},
+            {"id":"missing-output","pricing":{"prompt":"0.000001"},"context_length":24000},
+            {"id":"numeric-rates","pricing":{"prompt":0,"completion":0},"context_length":12000},
             {"id":"context-only","context_length":8000},
             {"id":"zero-context","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":0},
             {"id":"no-metadata"},
@@ -3771,6 +3970,9 @@ mod tests {
             ("overflow", 0.0, 2.0, None),
             ("malformed", 0.0, 2.0, None),
             ("free", 0.0, 0.0, Some(16_000)),
+            ("free-no-context", 0.0, 0.0, None),
+            ("missing-output", 1.0, 0.0, Some(24_000)),
+            ("numeric-rates", 0.0, 0.0, Some(12_000)),
             ("context-only", 0.0, 0.0, Some(8_000)),
             ("zero-context", 1.0, 2.0, None),
         ] {
@@ -3778,6 +3980,12 @@ mod tests {
             assert_eq!(info.input_cost, input, "{model} input");
             assert_eq!(info.output_cost, output, "{model} output");
             assert_eq!(info.context_length, context, "{model} context");
+            let prices = matches!(
+                model,
+                "test/model" | "zero-context" | "free" | "free-no-context"
+            )
+            .then_some((input, output));
+            assert_eq!(info.known_prices(), prices, "{model} price presence");
             refresh.model = model.into();
             let mut session = Session::new("openrouter", model, 128_000, "");
             apply_openrouter_pricing_refresh_result(
@@ -3785,8 +3993,17 @@ mod tests {
                 &refresh,
                 Some(Ok(infos.clone())),
             );
-            assert_eq!(session.input_token_cost, input, "{model}");
-            assert_eq!(session.output_token_cost, output, "{model}");
+            assert_eq!(session.known_input_output_prices(), prices, "{model}");
+            let (expected_input, expected_output) = prices.unwrap_or((0.0, 0.0));
+            assert_eq!(session.input_token_cost, expected_input, "{model}");
+            assert_eq!(session.output_token_cost, expected_output, "{model}");
+            let account = crate::spend::Account::new(&session.id, Some(1.0), 0.0).unwrap();
+            let snapshot = crate::spend::PriceSnapshot::from_session(&session, &Config::default());
+            assert_eq!(
+                account.admit(snapshot).is_ok(),
+                prices.is_some(),
+                "{model} capped admission"
+            );
             assert_eq!(
                 session.context_window,
                 context.unwrap_or(128_000),
@@ -3794,13 +4011,18 @@ mod tests {
             );
             let persisted = serde_json::to_string(&session).unwrap();
             let restored: Session = serde_json::from_str(&persisted).unwrap();
-            assert_eq!(restored.input_token_cost, input, "{model}");
-            assert_eq!(restored.output_token_cost, output, "{model}");
+            assert_eq!(
+                restored.known_input_output_prices(),
+                prices,
+                "{model} persisted presence"
+            );
+            assert_eq!(restored.input_token_cost, expected_input, "{model}");
+            assert_eq!(restored.output_token_cost, expected_output, "{model}");
             assert_eq!(restored.context_window, session.context_window, "{model}");
         }
         assert_eq!(
             infos.len(),
-            9,
+            12,
             "entries without usable metadata must be omitted"
         );
     }

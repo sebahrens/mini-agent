@@ -11,6 +11,20 @@ controls how mini-agent selects a subprocess boundary and records the authority 
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
 
+## Cost-accounting regression inventory
+
+The concurrent private-ledger receipt regression in `src/spend/ledger.rs` uses
+`std::thread::scope` and its exact `scope.spawn(move || ...)` site. Those owned
+Rust threads join before fixture teardown and are classified as non-process
+operations in both checked catalogues. Cost admission and ledger validation add
+no production subprocess launch. Live-price assertions now inspect optional
+pricing pairs; their removed scalar `output_token_cost` assertion sites are
+removed from the non-process macro inventory.
+
+The actual App compaction budget matrix also runs on an owned 1 MiB Rust
+thread and joins it before fixture teardown. Its exact `.spawn(|| ...)` site
+is classified as a non-process operation in both checked catalogues.
+
 ## App thread regression inventory
 
 The fixed 1 MiB App picker and ordinary-event regressions create owned Rust
@@ -481,6 +495,12 @@ response-status reads and HTTP response-builder status methods are `NON-PROCESS`
 fixtures run futures in one bounded scope without detached task or subprocess creation. The
 maintained dependency snapshot in `patched-deps/rig-core` remains third-party SDK source, outside
 the application launch inventory; its patch only inspects typed error sources.
+
+The owned held-ledger cancellation fixture re-executes the current unit-test
+binary under an exact test selector and private fixture root. Its constructor
+and terminal launch are `TEST-ONLY`; captured SDK output-string and child
+ExitStatus assertions are exact `NON-PROCESS` token contexts. These classifications
+add no production self-exec authority.
 
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
 as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. Native Git metadata alias-refusal assertions inspect captured

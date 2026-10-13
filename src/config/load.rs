@@ -1457,7 +1457,12 @@ fn split_project_override(
     ))
 }
 
-fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, String> {
+fn merge_config_value(base: &Config, mut local: toml::Value) -> Result<Config, String> {
+    // Only the owner CLI/global config sets financial policy. Strip
+    // ignored project caps before recording diagnostic provenance.
+    if let Some(table) = local.as_table_mut() {
+        table.remove("max_budget_usd");
+    }
     let mut provenance = base.provenance.clone();
     if let Some(table) = local.as_table() {
         provenance.project_keys.extend(
@@ -2359,6 +2364,38 @@ mod project_config_trust_tests {
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
+    }
+
+    #[test]
+    fn usd_budget_project_layers_cannot_raise_lower_or_set_global_cap_even_when_trusted() {
+        let root = crate::tests::OwnedTestDirectory::new("project-budget-global-only");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for global in [None, Some(0.5)] {
+            for project in ["max_budget_usd = 0", "max_budget_usd = 1000"] {
+                for interactive in [false, true] {
+                    std::fs::write(&path, format!("{project}\nchat_left_margin=7\nyolo=true\n"))
+                        .unwrap();
+                    let mut cfg = Config {
+                        max_budget_usd: global,
+                        ..Default::default()
+                    };
+                    apply_local_override_with_confirmation(
+                        &mut cfg,
+                        &path,
+                        &trust,
+                        interactive,
+                        &|_| true,
+                    )
+                    .unwrap();
+                    assert_eq!(cfg.max_budget_usd, global);
+                    assert_eq!(cfg.chat_left_margin, Some(7));
+                }
+            }
+        }
     }
 
     #[test]

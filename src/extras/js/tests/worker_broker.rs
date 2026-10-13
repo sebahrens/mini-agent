@@ -3463,3 +3463,170 @@ fn js_effect_audit_storage_required_path_and_sync_failures_are_typed() {
         assert!(!outside.join("js-effects").exists());
     }
 }
+
+/// The real broker waits on an owned permission reply while a sibling model
+/// receipt exhausts the same parent account. No worker financial data is used.
+struct BudgetApprovalService {
+    inner: RecordingService,
+    entered: Arc<tokio::sync::Notify>,
+    reply: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+impl ParentEffectService for BudgetApprovalService {
+    fn discard_prepared(&mut self) {
+        self.inner.discard_prepared();
+    }
+    fn validate_target(
+        &mut self,
+        authorized: &AuthorizedEffect,
+        operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.inner.validate_target(authorized, operation)
+    }
+    fn ensure_backend(
+        &mut self,
+        authorized: &AuthorizedEffect,
+        operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.inner.ensure_backend(authorized, operation)
+    }
+    fn preauthorize<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<(), HostEffectError>> {
+        self.inner.preauthorize(authorized, operation, cancellation)
+    }
+    fn normalize_target<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        self.inner
+            .normalize_target(authorized, operation, cancellation)
+    }
+    fn authorize<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
+        let reply = self.reply.take().unwrap();
+        let entered = self.entered.clone();
+        let authorization = self.inner.authorize(authorized, operation, cancellation);
+        Box::pin(async move {
+            entered.notify_one();
+            reply
+                .await
+                .map_err(|_| HostEffectError::InvocationCancelled)?;
+            authorization.await
+        })
+    }
+    fn execute<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<EffectResult, HostEffectError>> {
+        self.inner.execute(authorized, operation, cancellation)
+    }
+}
+
+#[tokio::test]
+async fn usd_budget_js_broker_denies_before_preparation_and_after_late_approval_without_intent() {
+    for late in [false, true] {
+        let ledger_root = crate::tests::OwnedTestDirectory::new("cost-js-broker");
+        let account = crate::spend::Account::new(
+            "cost-js-session",
+            Some(if late { 0.00001 } else { 0.0 }),
+            0.0,
+        )
+        .unwrap();
+        let prices =
+            crate::spend::PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false);
+        let run = crate::spend::run::Run::fixture(
+            account,
+            Arc::new(crate::spend::Ledger::new(ledger_root.path())),
+            "cost-js-session",
+            prices,
+        );
+        if late {
+            run.prepare().await.unwrap();
+        } else {
+            assert!(run.prepare().await.is_err());
+        }
+        let invocation_id = invocation("cost-js-invocation");
+        let case = OperationCase {
+            name: "write_file",
+            operation: EffectOperation::WriteFile {
+                path: "tmp/NEVER".into(),
+                content: "not-authorized".into(),
+            },
+            capability: HostCapability::WriteFile,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "cost-js-call".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        };
+        let grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let request = request(&case, &grant);
+        let record = Arc::new(Mutex::new(ServiceRecord::default()));
+        let (approved, reply) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let service = BudgetApprovalService {
+            inner: RecordingService {
+                failures: Default::default(),
+                normalized_target: None,
+                pending_permission: false,
+                permission_delay_until: None,
+                record: record.clone(),
+            },
+            entered: entered.clone(),
+            reply: Some(reply),
+        };
+        let audit_root = AuditTempRoot::new("cost-denial");
+        let audit = EffectAudit::open(audit_root.owner()).unwrap();
+        let mut broker = crate::spend::run::scope_sync(Some(run.clone()), || {
+            InvocationBroker::new(
+                invocation_id,
+                vec![grant],
+                HostCapability::all(),
+                service,
+                Arc::new(Mutex::new(audit)),
+            )
+            .unwrap()
+        });
+        let result = {
+            let dispatch = broker.dispatch(request, PermCancellation::new());
+            tokio::pin!(dispatch);
+            if late {
+                tokio::select! {
+                    result = &mut dispatch => panic!("approval was not held: {result:?}"),
+                    _ = entered.notified() => {}
+                }
+                run.observe(crate::event::UsageDelta {
+                    input_tokens: 50,
+                    output_tokens: 10,
+                    total_tokens: 60,
+                    ..Default::default()
+                });
+                run.flush().await;
+                approved.send(()).unwrap();
+            }
+            dispatch.await
+        };
+        assert_eq!(result, Err(HostEffectError::SessionDenied));
+        let record = record.lock().unwrap();
+        assert_eq!(record.authorizations, usize::from(late));
+        assert_eq!(record.execute_calls, 0);
+        assert_eq!(record.executions, 0);
+        assert_eq!(record.discards, 1);
+        assert_single_denial_record(&broker);
+        assert!(!ledger_root.path().join("tmp/NEVER").exists());
+    }
+}

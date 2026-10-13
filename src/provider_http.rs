@@ -135,13 +135,25 @@ impl HttpClientExt for ProviderHttpClient {
             .version(parts.version)
             .headers(parts.headers)
             .body(body.into());
+        let budget_guard = crate::spend::run::Run::current().and_then(|run| run.sdk_stream_guard());
         async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(guard) = &budget_guard {
+                        guard.finished();
+                    }
+                    return Err(http_client::Error::Instance(Box::new(error)));
+                }
+            };
             if !response.status().is_success() {
+                if let Some(guard) = &budget_guard {
+                    guard.finished();
+                }
                 return Err(response_error(response).await);
+            }
+            if let Some(guard) = budget_guard {
+                guard.opened();
             }
             let mut builder = Response::builder()
                 .status(response.status())

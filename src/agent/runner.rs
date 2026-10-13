@@ -662,11 +662,6 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    #[cfg(any(
-        feature = "hooks",
-        feature = "git-worktree",
-        all(test, feature = "acp")
-    ))]
     pub(crate) fn without_compaction(
         event_rx: mpsc::Receiver<AgentEvent>,
         abort_handle: tokio::task::AbortHandle,
@@ -864,6 +859,7 @@ pub(crate) struct AgentRunCleanupGuard {
     scope: Arc<AgentWorkScope>,
     lifecycle_tx: Option<mpsc::Sender<AgentEvent>>,
     runtime: tokio::runtime::Handle,
+    armed: bool,
 }
 
 impl AgentRunCleanupGuard {
@@ -872,6 +868,17 @@ impl AgentRunCleanupGuard {
             scope,
             lifecycle_tx: Some(lifecycle_tx),
             runtime: tokio::runtime::Handle::current(),
+            armed: true,
+        }
+    }
+
+    /// Auxiliary work has the same retirement owner without a model event channel.
+    pub(crate) fn auxiliary(scope: Arc<AgentWorkScope>) -> Self {
+        Self {
+            scope,
+            lifecycle_tx: None,
+            runtime: tokio::runtime::Handle::current(),
+            armed: true,
         }
     }
 
@@ -879,14 +886,16 @@ impl AgentRunCleanupGuard {
         self.scope.cancellation_handle().cancel();
         self.scope.wait_idle().await;
         self.lifecycle_tx.take();
+        self.armed = false;
     }
 }
 
 impl Drop for AgentRunCleanupGuard {
     fn drop(&mut self) {
-        let Some(lifecycle_tx) = self.lifecycle_tx.take() else {
+        if !self.armed {
             return;
-        };
+        }
+        let lifecycle_tx = self.lifecycle_tx.take();
         self.scope.cancellation_handle().cancel();
         let scope = Arc::clone(&self.scope);
         std::mem::drop(self.runtime.spawn(async move {
@@ -944,6 +953,7 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    let future = crate::spend::run::scope(crate::spend::run::Run::current(), future);
     if let Ok(scope) = AGENT_WORK_SCOPE.try_with(Arc::clone) {
         let guard = scope.register();
         tokio::spawn(async move {
@@ -1466,13 +1476,13 @@ impl From<UsageDelta> for Usage {
 }
 
 #[derive(Default)]
-struct UsageLedger {
+pub(crate) struct UsageLedger {
     total: Usage,
     stream_observed: Usage,
 }
 
 impl UsageLedger {
-    fn record(&mut self, usage: Usage) -> UsageDelta {
+    pub(crate) fn record(&mut self, usage: Usage) -> UsageDelta {
         self.total = usage_saturating_add(self.total, usage);
         self.stream_observed = usage_saturating_add(self.stream_observed, usage);
         usage.into()
@@ -1482,7 +1492,7 @@ impl UsageLedger {
         self.stream_observed = Usage::new();
     }
 
-    fn reconcile_terminal(&mut self, aggregate: Usage) -> UsageDelta {
+    pub(crate) fn reconcile_terminal(&mut self, aggregate: Usage) -> UsageDelta {
         let delta = usage_nonnegative_difference(aggregate, self.stream_observed, true);
         self.total = usage_saturating_add(self.total, delta);
         delta.into()
@@ -1502,17 +1512,23 @@ pub(crate) struct SharedUsageLedger {
 #[cfg(feature = "subagents")]
 impl SharedUsageLedger {
     pub(crate) fn record_completion(&self, usage: Usage) {
-        self.inner
+        let delta = self
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(usage);
+        crate::spend::run::observe_current(delta);
     }
 
     fn reconcile_terminal(&self, usage: Usage) {
-        self.inner
+        let delta = self
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .reconcile_terminal(usage);
+        if delta.has_values() {
+            crate::spend::run::observe_current(delta);
+        }
     }
 
     pub(crate) fn total(&self) -> Usage {
@@ -1835,6 +1851,7 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let spend = crate::spend::run::Run::current();
     let btw_future = async move {
         let stream_result = {
             let agent_ref = &agent;
@@ -1847,6 +1864,10 @@ where
                         .tool_concurrency(
                             crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
                         )
+                        .add_hook(crate::spend::run::AdmissionHook(
+                            crate::spend::run::Run::current(),
+                        ))
+                        .tool_extensions(crate::spend::run::current_extensions())
                         .await
                 }
             })
@@ -1866,14 +1887,22 @@ where
         };
 
         let mut acc = String::new();
+        let mut usage_ledger = UsageLedger::default();
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
                     text,
                 ))) => acc.push_str(&text.text),
+                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    crate::spend::run::observe_current(usage_ledger.record(call.usage));
+                }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
-                    let usage = res.usage();
+                    let delta = usage_ledger.reconcile_terminal(res.usage());
+                    if delta.has_values() {
+                        crate::spend::run::observe_current(delta);
+                    }
+                    let usage = usage_ledger.total;
                     let response_text = res.output;
                     let response = if response_text.is_empty() {
                         CompactString::from(acc.as_str())
@@ -1893,10 +1922,16 @@ where
                     return;
                 }
                 Err(e) => {
+                    let message =
+                        if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) {
+                            crate::spend::run::BUDGET_STOP.to_string()
+                        } else {
+                            e.to_string()
+                        };
                     let _ = event_tx
                         .send(BtwEvent::Error {
                             id,
-                            message: CompactString::new(e.to_string()),
+                            message: CompactString::new(message),
                         })
                         .await;
                     return;
@@ -1912,6 +1947,7 @@ where
             })
             .await;
     };
+    let btw_future = crate::spend::run::scope(spend, btw_future);
     let work_scope = AgentWorkScope::new();
     let task_scope = Arc::clone(&work_scope);
     let join = tokio::spawn(async move {
@@ -2413,6 +2449,10 @@ where
         .stream_chat(current_prompt.clone(), new_history)
         .max_turns(max_turns)
         .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+        .add_hook(crate::spend::run::AdmissionHook(
+            crate::spend::run::Run::current(),
+        ))
+        .tool_extensions(crate::spend::run::current_extensions())
         .await
 }
 
@@ -2637,6 +2677,7 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let spend_run = crate::spend::run::Run::current();
     let retry_config = retry_config.bounded();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
     let (compaction_decision_tx, mut compaction_decision_rx) =
@@ -2753,6 +2794,10 @@ where
                             .tool_concurrency(
                                 crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
                             )
+                            .add_hook(crate::spend::run::AdmissionHook(
+                                crate::spend::run::Run::current(),
+                            ))
+                            .tool_extensions(crate::spend::run::current_extensions())
                             .await
                     }
                 },
@@ -3001,6 +3046,9 @@ where
                         let context_complete = !usage_ledger.stream_has_observed_usage();
                         let terminal_delta = usage_ledger.reconcile_terminal(usage);
                         if terminal_delta.has_values() {
+                            crate::spend::run::observe_current(terminal_delta);
+                        }
+                        if terminal_delta.has_values() {
                             let _ = event_tx
                                 .send(AgentEvent::UsageDelta {
                                     usage: terminal_delta,
@@ -3057,6 +3105,16 @@ where
                             if verification_ran
                                 && let Some(verification) = completion_verification.as_ref()
                             {
+                                if let Err(error) = crate::spend::run::admit_current_effect().await
+                                {
+                                    let _ = event_tx
+                                        .send(AgentEvent::error_with(
+                                            error.to_string(),
+                                            completed_so_far!(),
+                                        ))
+                                        .await;
+                                    return;
+                                }
                                 verification_attempt = verification_attempt.saturating_add(1);
                                 let result = verification.run().await;
                                 let passed = result.succeeded();
@@ -3149,6 +3207,7 @@ where
                         turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
                         let delta = usage_ledger.record(usage);
+                        crate::spend::run::observe_current(delta);
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
@@ -3375,6 +3434,7 @@ where
     #[cfg(feature = "acp")]
     let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
 
+    let agent_future = crate::spend::run::scope(spend_run, agent_future);
     let join = tokio::spawn(agent_future);
 
     (
@@ -3626,6 +3686,10 @@ where
                 .stream_chat(p, h)
                 .max_turns(max_turns)
                 .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                .add_hook(crate::spend::run::AdmissionHook(
+                    crate::spend::run::Run::current(),
+                ))
+                .tool_extensions(crate::spend::run::current_extensions())
                 .await
         }
     }))
@@ -3819,6 +3883,7 @@ where
                     completion_retry.reset(retry_config);
                     turns_used = turns_used.saturating_add(1);
                     let delta = usage_ledger.record(call.usage);
+                    crate::spend::run::observe_current(delta);
                     if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                         fail_turn!(error);
                     }
@@ -3844,6 +3909,9 @@ where
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     terminal_response_seen = true;
                     let delta = usage_ledger.reconcile_terminal(res.usage());
+                    if delta.has_values() {
+                        crate::spend::run::observe_current(delta);
+                    }
                     if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                         fail_turn!(error);
                     }
@@ -3889,6 +3957,9 @@ where
                             .is_some_and(CompletionVerification::has_command);
                     if verification_ran && let Some(verification) = completion_verification.as_ref()
                     {
+                        if let Err(error) = crate::spend::run::admit_current_effect().await {
+                            fail_turn!(error);
+                        }
                         verification_attempt = verification_attempt.saturating_add(1);
                         let result = await_turn!(verification.run());
                         let passed = result.succeeded();
@@ -4132,12 +4203,22 @@ where
                 .stream_chat(p, Vec::<Message>::new())
                 .max_turns(max_turns)
                 .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                .add_hook(crate::spend::run::AdmissionHook(
+                    crate::spend::run::Run::current(),
+                ))
+                .tool_extensions(crate::spend::run::current_extensions())
                 .await
         }
     })
     .await;
     let mut stream = match stream {
         Ok(stream) => stream,
+        Err(_) if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) => {
+            return SubagentRunOutput {
+                response: Err(crate::spend::run::BUDGET_STOP.into()),
+                usage: usage_ledger.total(),
+            };
+        }
         Err(error) if is_subagent_turn_budget_error(&error) => {
             return SubagentRunOutput {
                 response: Ok(SUBAGENT_TURN_BUDGET_PARTIAL.to_string()),
@@ -4180,6 +4261,12 @@ where
                 usage_ledger.record_completion(call.usage);
             }
             Ok(_) => {}
+            Err(_) if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) => {
+                return SubagentRunOutput {
+                    response: Err(crate::spend::run::BUDGET_STOP.into()),
+                    usage: usage_ledger.total(),
+                };
+            }
             Err(error) if is_subagent_turn_budget_error(&error) => {
                 append_subagent_turn_budget_partial(&mut full_response);
                 break;
@@ -5908,6 +5995,106 @@ mod tests {
             run.response.unwrap(),
             "preliminary finding\n[partial: turn budget exhausted]"
         );
+    }
+
+    #[tokio::test]
+    async fn usd_budget_actual_btw_and_subagent_sdk_stop_before_effects_and_account_once() {
+        for child in [false, true] {
+            #[cfg(not(feature = "subagents"))]
+            if child {
+                continue;
+            }
+            let root = crate::tests::OwnedTestDirectory::new("cost-child-sdk");
+            let ledger = Arc::new(crate::spend::Ledger::new(root.path()));
+            let account = crate::spend::Account::new("cost-child", Some(0.00001), 0.0).unwrap();
+            let prices =
+                crate::spend::PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false);
+            let run =
+                crate::spend::run::Run::fixture(account, ledger.clone(), "cost-child", prices);
+            let run = run.with_captured_profile(
+                "openai",
+                "fixture",
+                prices,
+                &crate::config::Config::default(),
+                if child {
+                    crate::spend::RequestKind::Subagent
+                } else {
+                    crate::spend::RequestKind::Btw
+                },
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model = MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "never-effect",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response(Usage {
+                        input_tokens: 50,
+                        output_tokens: 10,
+                        total_tokens: 60,
+                        ..Default::default()
+                    }),
+                ],
+                vec![
+                    MockStreamEvent::text("NEVER_CONTINUE"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ]);
+            let agent = AgentBuilder::new(model.clone())
+                .tool(CountingTool(calls.clone()))
+                .build();
+            if child {
+                #[cfg(feature = "subagents")]
+                {
+                    let outcome = crate::spend::run::scope(
+                        Some(run.clone()),
+                        super::run_subagent(
+                            &agent,
+                            "investigate",
+                            5,
+                            None,
+                            &crate::retry::RetryConfig::default(),
+                            super::SharedUsageLedger::default(),
+                        ),
+                    )
+                    .await;
+                    assert!(
+                        outcome
+                            .response
+                            .unwrap_err()
+                            .contains(crate::spend::run::BUDGET_STOP)
+                    );
+                    assert_eq!(outcome.usage.input_tokens, 50);
+                }
+            } else {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let runner = crate::spend::run::scope_sync(Some(run.clone()), || {
+                    super::spawn_btw(
+                        agent,
+                        "side question".into(),
+                        Vec::new(),
+                        tx,
+                        42,
+                        crate::retry::RetryConfig::default(),
+                    )
+                });
+                let event = rx.recv().await.unwrap();
+                assert!(
+                    matches!(&event,crate::event::BtwEvent::Error{id:42,message} if message.contains(crate::spend::run::BUDGET_STOP)),
+                    "actual BTW outcome: {event:?}"
+                );
+                runner.task.await.unwrap();
+            }
+            assert_eq!(model.requests().len(), 1);
+            assert_eq!(calls.load(Ordering::Acquire), 0);
+            assert!((run.account.snapshot().recorded_spend() - 0.00007).abs() < 1e-12);
+            let summary = ledger.summary_for_session("cost-child").unwrap();
+            assert_eq!(summary.session.records, 1);
+            assert_eq!(summary.session.input_tokens, 50);
+            assert_eq!(summary.session.output_tokens, 10);
+        }
     }
 
     #[cfg(feature = "subagents")]

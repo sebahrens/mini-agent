@@ -116,7 +116,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     session.total_cached_input_tokens.hash(&mut state);
     session.total_cache_creation_input_tokens.hash(&mut state);
     session.total_real_input_tokens.hash(&mut state);
-    session.total_cost.to_bits().hash(&mut state);
+    session.recorded_total_cost().to_bits().hash(&mut state);
     session.effective_context_tokens().hash(&mut state);
     session.context_window.hash(&mut state);
     session.model.hash(&mut state);
@@ -404,8 +404,8 @@ fn resolve_item(
         }
         "context_max" => Some(fmt_tokens(session.context_window)),
         "context_percentage" => Some(format!("{}%", context_percentage(session).unwrap_or(0))),
-        "cost" => (session.total_cost > 0.0 || session.show_cost_always || always)
-            .then(|| format!("${:.4}", session.total_cost)),
+        "cost" => (session.recorded_total_cost() > 0.0 || session.show_cost_always || always)
+            .then(|| format!("${:.4}", session.recorded_total_cost())),
         "prompt" => ctx.prompt_name.map(|s| format!("prompt:{s}")),
         "mode" => ctx.perm_mode.map(|m| format!("mode:{m}")),
         "sandbox" => ctx.sandbox_label.map(str::to_string),

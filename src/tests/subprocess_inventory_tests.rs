@@ -871,8 +871,8 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker/Git/plan and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 3, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 4, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
@@ -1101,6 +1101,26 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/tool.rs",
         "let check = scope.spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    // Native held-ledger fixture re-executes only this owned test binary.
+    (
+        "src/spend/request_tests.rs",
+        "let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/spend/request_tests.rs",
+        ".env(CHILD_ENV, root.path()).stdout(stdout).stderr(stderr).spawn().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
+    // Owned concurrent ledger fixture: std::thread::Scope, never an OS process.
+    (
+        "src/spend/ledger.rs",
+        "scope.spawn(move || {",
         1,
         "NON-PROCESS",
     ),
@@ -1614,6 +1634,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Captured native SDK output text and child ExitStatus assertions are data.
+    (
+        "src/spend/request_tests.rs",
+        r#"!output.contains("[failed:") && !output.contains("[partial:"),"#,
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/spend/request_tests.rs",
+        "status.code(),",
+        1,
+        "NON-PROCESS",
+    ),
     // Context diagnostics inspect captured renderer String values.
     (
         "src/ui/app.rs",
@@ -1961,18 +1994,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/startup.rs",
         "assert_eq!(info.output_cost, output, \"{model} output\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/startup.rs",
-        "assert_eq!(session.output_token_cost, output, \"{model}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/startup.rs",
-        "assert_eq!(restored.output_token_cost, output, \"{model}\");",
         1,
         "NON-PROCESS",
     ),
@@ -2816,6 +2837,19 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
+        "src/spend/request_tests.rs",
+        &[
+            (
+                "e9734110377c90391506e62dc9ed02c26ee2d870c7cac01670c869822ee8ddfe",
+                1,
+            ),
+            (
+                "191ab31a485b54bcd750b0c704dc914c2207449933cf7674f42d7d7bb348cb73",
+                1,
+            ),
+        ],
+    ),
+    (
         "src/context/commands.rs",
         &[
             (
@@ -3008,20 +3042,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/startup.rs",
-        &[
-            (
-                "bfb649801945731a3401da523cb736f42d1932c761cff088e24a3a1c15bfeea9",
-                1,
-            ),
-            (
-                "0ae11b241928081bfb8db123dffe1b53471dad319b8f52d56fd8ea4ff1332289",
-                1,
-            ),
-            (
-                "4736207eeb0e55e37222f1373542a05ee9ae4a12a6adce3b4ab5d164513899aa",
-                1,
-            ),
-        ],
+        &[(
+            "bfb649801945731a3401da523cb736f42d1932c761cff088e24a3a1c15bfeea9",
+            1,
+        )],
     ),
     (
         "src/permission/ask.rs",
@@ -4242,8 +4266,8 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker/Git/plan and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 3, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 4, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
@@ -4409,6 +4433,26 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/tool.rs",
         "let check = scope.spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    // Native held-ledger fixture re-executes only this owned test binary.
+    (
+        "src/spend/request_tests.rs",
+        "let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/spend/request_tests.rs",
+        ".env(CHILD_ENV, root.path()).stdout(stdout).stderr(stderr).spawn().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
+    // Owned concurrent ledger fixture: std::thread::Scope, never an OS process.
+    (
+        "src/spend/ledger.rs",
+        "scope.spawn(move || {",
         1,
         "NON-PROCESS",
     ),

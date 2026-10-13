@@ -292,24 +292,28 @@ pub(crate) enum ProposalKind {
     PullRequest,
 }
 #[derive(Default, Clone)]
-pub(crate) struct UsageLedger(Arc<Mutex<crate::event::UsageDelta>>);
+pub(crate) struct UsageLedger(crate::session::title::UsageLedger);
 impl UsageLedger {
+    pub(crate) fn with_spend(run: crate::spend::run::Run) -> Self {
+        Self(crate::session::title::UsageLedger::with_spend(run))
+    }
+    pub(crate) async fn admit(&self) -> anyhow::Result<()> {
+        self.0.admit().await
+    }
+    pub(crate) async fn flush(&self) {
+        self.0.flush().await;
+    }
+    pub(crate) fn stream_guard(&self) -> Arc<crate::spend::run::StreamGuard> {
+        self.0.stream_guard()
+    }
     pub(crate) fn observe(&self, usage: rig::completion::Usage) {
-        let usage: crate::event::UsageDelta = usage.into();
-        let mut total = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        total.input_tokens = total.input_tokens.max(usage.input_tokens);
-        total.output_tokens = total.output_tokens.max(usage.output_tokens);
-        total.total_tokens = total.total_tokens.max(usage.total_tokens);
-        total.cached_input_tokens = total.cached_input_tokens.max(usage.cached_input_tokens);
-        total.cache_creation_input_tokens = total
-            .cache_creation_input_tokens
-            .max(usage.cache_creation_input_tokens);
-        total.reasoning_tokens = total.reasoning_tokens.max(usage.reasoning_tokens);
+        self.0.aggregate(usage);
     }
     pub(crate) fn take(&self) -> crate::event::UsageDelta {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+        self.0.take()
     }
 }
+
 pub(crate) enum Command {
     Diff(Vec<String>),
     Commit(Option<String>),
@@ -490,6 +494,13 @@ async fn execute_native(
     } = channels;
     use crate::git::tool::{GitArgs, GitOperation, GitTool};
     workspace.validate()?;
+    if let NativeAction::Prepare(generation) = &action {
+        generation
+            .usage
+            .admit()
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     #[cfg(feature = "hooks")]
     if crate::agent::runner::current_hook_execution_root()
         .is_some_and(|root| root != workspace.root())
@@ -990,6 +1001,22 @@ fn bounded_event_output(value: &impl serde::Serialize) -> Result<String, String>
         "notice":"Large native command result omitted from the transcript (64 KiB limit)"
     });
     serde_json::to_string(&reduced).map_err(|_| "Git command result could not be encoded".into())
+}
+
+// Assertions may unwind while a real native command is waiting. Retire its
+// exact event owner before resuming the panic, while the Tokio runtime is live.
+#[cfg(all(test, feature = "sandbox", any(windows, target_os = "macos")))]
+macro_rules! settled_actor {
+    ($actor:ident, $body:block) => {{
+        let result: Result<(), _> = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async $body)).await;
+        $actor.runner.abort_handle.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while $actor.runner.event_rx.recv().await.is_some() {}
+        }).await.expect("failed fixture must settle its exact native process family");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }};
 }
 
 #[cfg(test)]
@@ -1980,6 +2007,77 @@ mod native_pr_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!repo.workspace.root().join("gh-late").exists());
     }
+    #[tokio::test]
+    async fn actual_native_pr_assertion_unwind_settles_child_before_late_effect() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        use futures::FutureExt;
+        let repo = Repo::seeded().await;
+        let mut gate = crate::tests::process_gate::ProcessGate::new(
+            &repo.workspace.root().join("release.fifo"),
+        )
+        .unwrap();
+        stub(
+            &repo,
+            "printf READY > gh-ready; IFS= read -r release < release.fifo; printf LATE_EFFECT > gh-late",
+        );
+        let checker = repo.checker(PermissionConfig {
+            bash: Some(ToolPerm::Simple(Action::Ask)),
+            ..Default::default()
+        });
+        let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+        let mut actor = Actor::new(
+            &repo,
+            repo.sandbox(),
+            NativeAction::Execute(proposal()),
+            Some(checker),
+            Some(ask),
+        );
+        let assertion = std::panic::AssertUnwindSafe(async {
+            settled_actor!(actor, {
+                let pending =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            let mut events = Vec::new();
+                            while let Ok(event) = actor.runner.event_rx.try_recv() {
+                                events.push(event);
+                            }
+                            panic!("native fixture closed before Ask: {events:?}")
+                        });
+                assert_eq!(pending.tool, "shell");
+                assert!(!repo.workspace.root().join("gh-ready").exists());
+                pending
+                    .reply
+                    .send(crate::permission::ask::UserDecision::AllowOnce)
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !repo.workspace.root().join("gh-ready").exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("controlled foreground readiness");
+                panic!("controlled assertion after actual native child readiness");
+            });
+        })
+        .catch_unwind()
+        .await
+        .expect_err("controlled assertion must unwind");
+        assert_eq!(
+            assertion.downcast_ref::<&str>().copied(),
+            Some("controlled assertion after actual native child readiness")
+        );
+        assert!(repo.workspace.root().join("gh-ready").exists());
+        assert!(matches!(
+            actor.runner.event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        gate.release().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!repo.workspace.root().join("gh-late").exists());
+    }
     #[test]
     fn foreground_url_needs_complete_success_and_unescaped_descendants() {
         use crate::agent::tools::bash::ForegroundResult;
@@ -2022,16 +2120,18 @@ mod windows_native_pr_tests {
     use super::*;
     use crate::event::AgentEvent;
     use crate::permission::{Action, PermissionConfig, ToolPerm};
+    use futures::FutureExt;
     use std::time::Duration;
 
     const URL: &str = "https://example.invalid/pull/32";
-    const ROLE: &str = "native32";
 
     struct Fixture {
-        directory: crate::tests::OwnedTestDirectory,
+        // Rust drops fields in declaration order. Release every retained
+        // workspace capability before attempting recursive directory deletion.
         workspace: Arc<crate::paths::WorkspaceBinding>,
         sandbox: crate::sandbox::Sandbox,
         _environment: crate::tests::ScopedProcessEnv,
+        directory: crate::tests::OwnedTestDirectory,
     }
     impl Fixture {
         fn new(mode: &str) -> Self {
@@ -2049,7 +2149,9 @@ mod windows_native_pr_tests {
             ));
             let mut bindings = vec![
                 ("PATH", Some(std::env::join_paths(search).unwrap())),
-                ("MINI_AGENT_TEST_GH_ROLE", Some(ROLE.into())),
+                // This arbitrary canary must be scrubbed by ordinary Shell.
+                // The test-only native helper is armed by its owned marker.
+                ("MINI_AGENT_TEST_GH_ROLE", Some("must-be-scrubbed".into())),
             ];
             for name in [
                 "ZS_CONFIG_DIR",
@@ -2063,6 +2165,7 @@ mod windows_native_pr_tests {
             }
             let environment = crate::tests::ScopedProcessEnv::set(&bindings);
             std::fs::write(directory.path().join("gh-mode"), mode).unwrap();
+            std::fs::write(directory.path().join("gh-role"), "native32").unwrap();
             let workspace =
                 Arc::new(crate::paths::WorkspaceBinding::capture(directory.path()).unwrap());
             let search_path = std::env::var_os("PATH");
@@ -2080,10 +2183,10 @@ mod windows_native_pr_tests {
                 .with_workspace_binding(workspace.clone())
                 .with_bound_resolved_shell(Some(shell), &workspace);
             Self {
-                directory,
                 workspace,
                 sandbox,
                 _environment: environment,
+                directory,
             }
         }
         fn path(&self, name: &str) -> std::path::PathBuf {
@@ -2121,7 +2224,13 @@ mod windows_native_pr_tests {
             }
         }
         fn recorded_argv(&self) -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(self.path("gh-argv.json")).unwrap()).unwrap()
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(self.path("gh-argv.json")).unwrap()).unwrap();
+            assert_eq!(
+                record["role_env_present"], false,
+                "ordinary Shell must preserve environment scrubbing"
+            );
+            record
         }
     }
 
@@ -2162,6 +2271,7 @@ mod windows_native_pr_tests {
             self.sandbox.kill_active();
         }
     }
+
     fn proposal() -> PreparedAction {
         PreparedAction::PullRequest {
             title: "雪 literal 'single' \"double\" $(NEVER_EXECUTE) \\".into(),
@@ -2171,10 +2281,16 @@ mod windows_native_pr_tests {
     async fn request(
         requests: &mut tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>,
     ) -> crate::permission::ask::AskRequest {
-        tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        let request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
             .await
             .unwrap()
-            .expect("normal Shell Ask must be delivered")
+            .expect("normal Shell Ask must be delivered");
+        assert_eq!(request.tool, "shell");
+        assert_eq!(
+            request.input,
+            pr_command(&proposal(), crate::sandbox::ShellDialect::PowerShell).unwrap()
+        );
+        request
     }
     async fn wait_for_file(path: &std::path::Path) {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2194,37 +2310,42 @@ mod windows_native_pr_tests {
         let fixture = Fixture::new("success");
         let (ask, mut requests) = tokio::sync::mpsc::channel(4);
         let mut actor = fixture.actor(Action::Ask, ask);
-        let pending = request(&mut requests).await;
-        assert_eq!(pending.tool, "shell");
-        assert!(!fixture.path("gh-argv.json").exists());
-        pending
-            .reply
-            .send(crate::permission::ask::UserDecision::AllowOnce)
-            .unwrap();
-        let AgentEvent::Done { response, .. } = actor.terminal().await else {
-            panic!("actual successful GH must return its URL")
-        };
-        assert_eq!(response, URL);
-        let PreparedAction::PullRequest { title, body } = proposal() else {
-            unreachable!()
-        };
-        assert_eq!(
-            fixture.recorded_argv()["argv"],
-            serde_json::json!(["pr", "create", "--title", title, "--body", body])
-        );
-        assert!(!fixture.path("NEVER_EXECUTE").exists());
-        assert!(!fixture.path(".git").exists());
+        settled_actor!(actor, {
+            let pending = request(&mut requests).await;
+            assert_eq!(pending.tool, "shell");
+            assert!(!fixture.path("gh-argv.json").exists());
+            pending
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+            let terminal = actor.terminal().await;
+            let AgentEvent::Done { response, .. } = terminal else {
+                panic!("actual successful GH must return its URL: {terminal:?}")
+            };
+            assert_eq!(response, URL);
+            let PreparedAction::PullRequest { title, body } = proposal() else {
+                unreachable!()
+            };
+            assert_eq!(
+                fixture.recorded_argv()["argv"],
+                serde_json::json!(["pr", "create", "--title", title, "--body", body])
+            );
+            assert!(!fixture.path("NEVER_EXECUTE").exists());
+            assert!(!fixture.path(".git").exists());
+        });
         // Deny a second actual request: no fixture invocation or result may occur.
         std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
         let (ask, mut requests) = tokio::sync::mpsc::channel(4);
         let mut denied = fixture.actor(Action::Ask, ask);
-        request(&mut requests)
-            .await
-            .reply
-            .send(crate::permission::ask::UserDecision::Deny)
-            .unwrap();
-        assert!(matches!(denied.terminal().await, AgentEvent::Error { .. }));
-        assert!(!fixture.path("gh-argv.json").exists());
+        settled_actor!(denied, {
+            request(&mut requests)
+                .await
+                .reply
+                .send(crate::permission::ask::UserDecision::Deny)
+                .unwrap();
+            assert!(matches!(denied.terminal().await, AgentEvent::Error { .. }));
+            assert!(!fixture.path("gh-argv.json").exists());
+        });
     }
 
     #[tokio::test]
@@ -2238,13 +2359,22 @@ mod windows_native_pr_tests {
                 std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
             }
             std::fs::write(fixture.path("gh-mode"), mode).unwrap();
-            let (ask, _requests) = tokio::sync::mpsc::channel(4);
-            let mut actor = fixture.actor(Action::Allow, ask);
-            let AgentEvent::Error { message, .. } = actor.terminal().await else {
-                panic!("invalid actual GH stdout must fail")
-            };
-            assert!(message.contains("gh"), "{mode}: {message}");
-            assert_eq!(fixture.recorded_argv()["argv"].as_array().unwrap().len(), 6);
+            let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+            let mut actor = fixture.actor(Action::Ask, ask);
+            settled_actor!(actor, {
+                let pending = request(&mut requests).await;
+                assert_eq!(pending.tool, "shell");
+                assert!(!fixture.path("gh-argv.json").exists());
+                pending
+                    .reply
+                    .send(crate::permission::ask::UserDecision::AllowOnce)
+                    .unwrap();
+                let AgentEvent::Error { message, .. } = actor.terminal().await else {
+                    panic!("invalid actual GH stdout must fail")
+                };
+                assert!(message.contains("gh"), "{mode}: {message}");
+                assert_eq!(fixture.recorded_argv()["argv"].as_array().unwrap().len(), 6);
+            });
         }
     }
 
@@ -2285,6 +2415,9 @@ mod windows_native_pr_tests {
             .unwrap();
         crate::extras::hooks::init_dispatcher(dispatcher);
         for failed in [false, true] {
+            if fixture.path("gh-argv.json").exists() {
+                std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
+            }
             if fixture.path("gh-posthook").exists() {
                 std::fs::remove_file(fixture.path("gh-posthook")).unwrap();
             }
@@ -2293,20 +2426,29 @@ mod windows_native_pr_tests {
                 if failed { "nonzero" } else { "success" },
             )
             .unwrap();
-            let (ask, _requests) = tokio::sync::mpsc::channel(4);
-            let mut actor = fixture.actor(Action::Allow, ask);
-            match actor.terminal().await {
-                AgentEvent::Done { response, .. } => {
-                    assert!(!failed);
-                    assert_eq!(response, URL);
+            let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+            let mut actor = fixture.actor(Action::Ask, ask);
+            settled_actor!(actor, {
+                let pending = request(&mut requests).await;
+                assert_eq!(pending.tool, "shell");
+                assert!(!fixture.path("gh-argv.json").exists());
+                pending
+                    .reply
+                    .send(crate::permission::ask::UserDecision::AllowOnce)
+                    .unwrap();
+                match actor.terminal().await {
+                    AgentEvent::Done { response, .. } => {
+                        assert!(!failed);
+                        assert_eq!(response, URL);
+                    }
+                    AgentEvent::Error { .. } => assert!(failed),
+                    _ => unreachable!(),
                 }
-                AgentEvent::Error { .. } => assert!(failed),
-                _ => unreachable!(),
-            }
-            assert_eq!(
-                std::fs::read_to_string(fixture.path("gh-posthook")).unwrap(),
-                "HOOK_RAN"
-            );
+                assert_eq!(
+                    std::fs::read_to_string(fixture.path("gh-posthook")).unwrap(),
+                    "HOOK_RAN"
+                );
+            });
         }
     }
 
@@ -2317,23 +2459,27 @@ mod windows_native_pr_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         use crate::agent::tools::bash::{ForegroundResult, ShellTool};
         let fixture = Fixture::new("success");
-        let tool = ShellTool::new(
-            Some(fixture.checker(Action::Allow)),
-            None,
-            fixture.sandbox.clone(),
-            Some(1),
-        )
-        .with_foreground_timeout_secs(15);
         let command = pr_command(&proposal(), crate::sandbox::ShellDialect::PowerShell).unwrap();
         for (mode, expected_code, complete) in [
             ("success", 0, true),
             ("nonzero", 3, true),
             ("incomplete", 0, false),
         ] {
+            if fixture.path("gh-argv.json").exists() {
+                std::fs::remove_file(fixture.path("gh-argv.json")).unwrap();
+            }
             std::fs::write(fixture.path("gh-mode"), mode).unwrap();
+            let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+            let tool = ShellTool::new(
+                Some(fixture.checker(Action::Ask)),
+                Some(ask),
+                fixture.sandbox.clone(),
+                Some(1),
+            )
+            .with_foreground_timeout_secs(15);
             let scope = crate::agent::runner::AgentWorkScope::new();
-            let result = scope
-                .run(async {
+            let assertions = std::panic::AssertUnwindSafe(async {
+                let work = scope.run(async {
                     rig::tool::Tool::call_structured(
                         &tool,
                         crate::agent::tools::BashArgs {
@@ -2342,28 +2488,43 @@ mod windows_native_pr_tests {
                             background: false,
                         },
                         &ToolCallExtensions::default(),
-                    )
-                    .await
-                })
+                    ).await
+                });
+                tokio::pin!(work);
+                let pending = tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        pending = requests.recv() => pending.expect("normal Shell Ask must be delivered"),
+                        result = &mut work => panic!("typed Shell completed before normal Ask: {result:?}"),
+                    }
+                }).await.expect("typed Shell Ask delivery must be bounded");
+                assert_eq!(pending.tool, "shell");
+                assert_eq!(pending.input, command);
+                assert!(!fixture.path("gh-argv.json").exists());
+                pending.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(20), work)
+                    .await.expect("typed Shell result must be bounded").unwrap();
+                let actual = result.extensions.get::<ForegroundResult>()
+                    .expect("actual native foreground extension");
+                let ForegroundResult {
+                    status: completion, exit_code, descendants_escaped, stdout, stdout_complete,
+                } = actual.clone();
+                assert_eq!(completion, crate::sandbox::CommandStatus::Completed);
+                assert_eq!(exit_code, Some(expected_code));
+                assert!(!descendants_escaped);
+                assert_eq!(stdout_complete, complete);
+                assert!(stdout.starts_with(URL.as_bytes()) && stdout.len() <= 65_536);
+                assert_eq!(foreground_pr_url(actual).is_ok(), mode == "success");
+                assert_eq!(fixture.recorded_argv()["argv"].as_array().unwrap().len(), 6);
+            }).catch_unwind().await;
+            // Settle the exact scoped process owner while its runtime is still
+            // alive, including after a failed assertion or request deadline.
+            scope.cancellation_handle().cancel();
+            tokio::time::timeout(Duration::from_secs(10), scope.wait_idle())
                 .await
-                .unwrap();
-            let actual = result
-                .extensions
-                .get::<ForegroundResult>()
-                .expect("actual native foreground extension");
-            let ForegroundResult {
-                status: completion,
-                exit_code,
-                descendants_escaped,
-                stdout,
-                stdout_complete,
-            } = actual.clone();
-            assert_eq!(completion, crate::sandbox::CommandStatus::Completed);
-            assert_eq!(exit_code, Some(expected_code));
-            assert!(!descendants_escaped);
-            assert_eq!(stdout_complete, complete);
-            assert!(stdout.starts_with(URL.as_bytes()) && stdout.len() <= 65_536);
-            assert_eq!(foreground_pr_url(actual).is_ok(), mode == "success");
+                .expect("typed Shell process cleanup must be bounded");
+            if let Err(panic) = assertions {
+                std::panic::resume_unwind(panic);
+            }
         }
     }
 
@@ -2425,24 +2586,30 @@ mod windows_native_pr_tests {
         let fixture = Fixture::new("wait");
         let (ask, mut requests) = tokio::sync::mpsc::channel(4);
         let mut actor = fixture.actor(Action::Ask, ask);
-        request(&mut requests)
-            .await
-            .reply
-            .send(crate::permission::ask::UserDecision::AllowOnce)
-            .unwrap();
-        wait_for_file(&fixture.path("gh-ready.json")).await;
-        let record: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(fixture.path("gh-ready.json")).unwrap()).unwrap();
-        let pid = u32::try_from(record["pid"].as_u64().unwrap()).unwrap();
-        let exact_child = ProcessHandle::capture(pid);
-        assert!(!exact_child.exited());
-        actor.cancel_and_settle().await;
-        assert!(
-            exact_child.exited(),
-            "receiver settlement must include the actual descendant Job"
-        );
-        std::fs::write(fixture.path("gh-release"), "release after retirement").unwrap();
-        assert!(!fixture.path("gh-late").exists());
-        assert!(!fixture.path(".git").exists());
+        settled_actor!(actor, {
+            let pending = request(&mut requests).await;
+            assert_eq!(pending.tool, "shell");
+            assert!(!fixture.path("gh-ready.json").exists());
+            pending
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+            wait_for_file(&fixture.path("gh-ready.json")).await;
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(fixture.path("gh-ready.json")).unwrap())
+                    .unwrap();
+            assert_eq!(record["role_env_present"], false);
+            let pid = u32::try_from(record["pid"].as_u64().unwrap()).unwrap();
+            let exact_child = ProcessHandle::capture(pid);
+            assert!(!exact_child.exited());
+            actor.cancel_and_settle().await;
+            assert!(
+                exact_child.exited(),
+                "receiver settlement must include the actual descendant Job"
+            );
+            std::fs::write(fixture.path("gh-release"), "release after retirement").unwrap();
+            assert!(!fixture.path("gh-late").exists());
+            assert!(!fixture.path(".git").exists());
+        });
     }
 }

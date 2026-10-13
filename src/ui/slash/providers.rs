@@ -222,9 +222,9 @@ async fn fetch_uncached(
         {
             Ok(prices) => {
                 for m in &mut models {
-                    if let Some(info) = prices.get(&m.id) {
-                        m.input_price = Some(info.input_cost);
-                        m.output_price = Some(info.output_cost);
+                    if let Some(prices) = prices.get(&m.id).and_then(|info| info.known_prices()) {
+                        m.input_price = Some(prices.0);
+                        m.output_price = Some(prices.1);
                     }
                 }
             }
@@ -391,7 +391,7 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
         .await
         && let Some(info) = prices.get(model_id)
     {
-        pricing = Some((info.input_cost, info.output_cost));
+        pricing = info.known_prices();
         if ctx.cfg.context_window.is_none()
             && crate::config::Config::catalog_context_window("openrouter", model_id).is_none()
             && let Some(cw) = info.context_length

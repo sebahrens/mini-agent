@@ -5,6 +5,34 @@ use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
+        "/cost" => {
+            if parts.len() != 1 {
+                write_error(ctx.renderer, "usage: /cost");
+                return Ok(());
+            }
+            let result = match crate::paths::process_paths() {
+                Ok(paths) => {
+                    crate::spend::cost_lines(
+                        ctx.session,
+                        crate::spend::Ledger::new(&paths.state_dir),
+                    )
+                    .await
+                }
+                Err(error) => Err(error.into()),
+            };
+            match result {
+                Ok(lines) => {
+                    for line in lines {
+                        write_result(ctx.renderer, line);
+                    }
+                }
+                Err(_) => write_error(
+                    ctx.renderer,
+                    "Cost tracking unavailable: private ledger could not be safely read",
+                ),
+            }
+            Ok(())
+        }
         "/reasoning" | "/thinking" => handle_reasoning(parts, ctx).await,
         "/mode" => handle_mode(parts, ctx).await,
         "/toggle" => handle_toggle(parts, ctx).await,

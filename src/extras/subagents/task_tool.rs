@@ -732,6 +732,15 @@ editing in a known location, grepping for a literal you will act on immediately.
             input_price,
         )
         .multipliers(input_price);
+        let spend_profile = crate::spend::run::Run::current().map(|run| {
+            run.for_model(
+                &runtime.provider_name,
+                &runtime.model_name,
+                &config,
+                selected_alias,
+                crate::spend::RequestKind::Subagent,
+            )
+        });
         let specialization = specialization.map(|resolved| resolved.prompt);
         let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
         let reasoning_exclusive =
@@ -770,6 +779,9 @@ editing in a known location, grepping for a literal you will act on immediately.
             authorization
         };
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
+            let spend_profile = spend_profile
+                .as_ref()
+                .map(crate::spend::run::Run::for_invocation);
             let client = runtime.client.clone();
             let model_name = runtime.model_name.clone();
             let max_turns = runtime.max_turns;
@@ -814,6 +826,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
             });
             let future = Box::pin(async move {
+                if let Some(spend) = &spend_profile
+                    && let Err(error) = spend.admit()
+                {
+                    return ChildExecution {
+                        output: Err(error.to_string()),
+                        cost_units: 0,
+                    };
+                }
                 let display_prompt = prompt_text.clone();
                 #[cfg(feature = "hooks")]
                 let execution_prompt = match crate::extras::hooks::dispatch_subagent_start(
@@ -841,7 +861,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                     #[cfg(feature = "skills")]
                     skill_services,
                 )
-                .await;
+                .await
+                .with_spend(spend_profile);
                 let result = agent
                     .run_subagent(
                         &execution_prompt,

@@ -138,16 +138,42 @@ pub async fn generate(
 /// Usage is published by the provider stream observer before any title
 /// parsing or cancellation boundary. Taking the ledger makes charging once-only.
 #[derive(Clone, Default)]
-pub(crate) struct UsageLedger(std::sync::Arc<std::sync::Mutex<crate::event::UsageDelta>>);
+pub(crate) struct UsageLedger(
+    std::sync::Arc<std::sync::Mutex<crate::event::UsageDelta>>,
+    Option<std::sync::Arc<crate::spend::run::Run>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 impl UsageLedger {
+    pub(crate) fn with_spend(run: crate::spend::run::Run) -> Self {
+        Self(
+            Default::default(),
+            Some(std::sync::Arc::new(run)),
+            Default::default(),
+        )
+    }
     #[cfg(test)]
     pub(crate) fn observe(&self, usage: rig::completion::Usage) {
         let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         *total = total.saturating_add(usage.into());
     }
+    pub(crate) async fn admit(&self) -> anyhow::Result<()> {
+        match &self.1 {
+            Some(run) => run.prepare().await,
+            None => Ok(()),
+        }
+    }
+    pub(crate) async fn flush(&self) {
+        if let Some(run) = &self.1 {
+            run.flush().await;
+        }
+    }
+    pub(crate) fn stream_guard(&self) -> std::sync::Arc<crate::spend::run::StreamGuard> {
+        crate::spend::run::StreamGuard::new(self.1.as_deref().cloned())
+    }
     pub(crate) fn aggregate(&self, usage: rig::completion::Usage) {
         let usage: crate::event::UsageDelta = usage.into();
         let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let before = *total;
         total.input_tokens = total.input_tokens.max(usage.input_tokens);
         total.output_tokens = total.output_tokens.max(usage.output_tokens);
         total.total_tokens = total.total_tokens.max(usage.total_tokens);
@@ -159,6 +185,14 @@ impl UsageLedger {
             .tool_use_prompt_tokens
             .max(usage.tool_use_prompt_tokens);
         total.reasoning_tokens = total.reasoning_tokens.max(usage.reasoning_tokens);
+        let delta = total.nonnegative_difference(before);
+        let first = !self.2.swap(true, std::sync::atomic::Ordering::AcqRel);
+        drop(total);
+        if let Some(run) = &self.1
+            && (first || delta.has_values())
+        {
+            run.observe(delta);
+        }
     }
     pub(crate) fn take(&self) -> crate::event::UsageDelta {
         std::mem::take(&mut *self.0.lock().unwrap_or_else(|poison| poison.into_inner()))
@@ -234,6 +268,24 @@ pub(crate) async fn generate_for_session(
         return (Default::default(), false);
     };
     let pricing = TitlePricing::capture(cfg, session, &request);
+    let spend = crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Title)
+        .with_captured_profile(
+            &request.provider,
+            &request.model,
+            crate::spend::PriceSnapshot::capture(
+                pricing.known_prices(),
+                pricing.cache,
+                pricing.anthropic_native,
+            ),
+            cfg,
+            crate::spend::RequestKind::Title,
+        );
+    if spend.admit().is_err() {
+        crate::print::headless_stderr(format_args!(
+            "USD budget: optional session title skipped; the completed answer is retained\n"
+        ));
+        return (Default::default(), false);
+    }
     let title_client = if request.provider == session.provider {
         Ok(client.clone())
     } else {
@@ -244,16 +296,22 @@ pub(crate) async fn generate_for_session(
             cfg.api_keys.as_ref(),
         )
     };
-    let ledger = UsageLedger::default();
-    let mut interrupts = crate::print::HeadlessInterrupts::os();
-    let mut interrupted = false;
-    let result = match title_client {
-        Ok(client) => tokio::select! {
-            result=generate(&request,&client,cfg,ledger.clone())=>result,
-            _=interrupts.recv()=>{interrupted=true;Err(anyhow::anyhow!("title generation interrupted"))},
-        },
-        Err(error) => Err(error),
-    };
+    let ledger = UsageLedger::with_spend(spend.clone());
+    let result = crate::print::run_headless_command(async {
+        match title_client {
+            Ok(client) => crate::spend::run::scope(
+                Some(spend),
+                generate(&request, &client, cfg, ledger.clone()),
+            )
+            .await
+            .map_err(std::io::Error::other),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    })
+    .await;
+    let interrupted = result.as_ref().err().is_some_and(|error| {
+        error.kind() == std::io::ErrorKind::Interrupted || crate::print::headless_force_stopped()
+    });
     let usage = cfg.normalize_usage(&request.provider, ledger.take());
     pricing.charge(session, usage);
     match result {

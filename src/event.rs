@@ -5,7 +5,8 @@ use compact_str::CompactString;
 /// Runners reconcile a terminal aggregate against usage already observed for
 /// the stream before constructing this value. Consumers can therefore add each
 /// delta exactly once; terminal events never carry a second copy of usage.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsageDelta {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -17,6 +18,26 @@ pub struct UsageDelta {
 }
 
 impl UsageDelta {
+    pub(crate) fn nonnegative_difference(self, previous: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            total_tokens: self.total_tokens.saturating_sub(previous.total_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(previous.cached_input_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_sub(previous.cache_creation_input_tokens),
+            tool_use_prompt_tokens: self
+                .tool_use_prompt_tokens
+                .saturating_sub(previous.tool_use_prompt_tokens),
+            reasoning_tokens: self
+                .reasoning_tokens
+                .saturating_sub(previous.reasoning_tokens),
+        }
+    }
+
     pub fn has_values(self) -> bool {
         self != Self::default()
     }
@@ -131,15 +152,6 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
-    /// A terminal failure with no completed work to retain.
-    #[cfg(feature = "hooks")]
-    pub fn error(message: impl Into<CompactString>) -> Self {
-        Self::Error {
-            message: message.into(),
-            interactions: Vec::new(),
-        }
-    }
-
     /// A terminal failure that happened after `interactions` already completed.
     pub fn error_with(
         message: impl Into<CompactString>,

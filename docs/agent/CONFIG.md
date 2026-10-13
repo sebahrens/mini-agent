@@ -355,7 +355,8 @@ so fixture names remain visible without advertising them as product configuratio
 | Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
 | Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
 | Update-cache fixtures | `MINI_AGENT_TEST_UPDATE_ADMISSION`, `MINI_AGENT_TEST_UPDATE_NOW`: test-only child cache path and controlled timestamp for cross-process release-check admission; never read by production update checks. |
-| Native Windows PR fixtures | `MINI_AGENT_WINDOWS_GH_FIXTURE_EXE`: exact Cargo-discovered test image; `MINI_AGENT_TEST_GH_ROLE`: test-only native helper role, never read by the production CLI or tool implementations. |
+| Native Windows PR fixtures | `MINI_AGENT_WINDOWS_GH_FIXTURE_EXE`: exact Cargo-discovered test image; `MINI_AGENT_TEST_GH_ROLE`: scrubbed environment canary, not helper authorization. The test-only native helper requires an exact owned `gh-role` marker inside its workspace and the copied `fixture bin 雪/gh.exe` identity; arbitrary environment variables remain scrubbed by ordinary Shell execution. |
+| Cost ledger fixture | `MINI_AGENT_TEST_COST_LEDGER_IO_GATE`: unit-test child only; holds the real regular-file ledger writer before fsync for CLI SIGINT and cleanup ownership witnesses. |
 | Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
@@ -595,6 +596,7 @@ Accepted top-level keys:
 | `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-pro`.                                                                                                                            |
 | `max_tokens`              | integer | Maximum tokens for a single model response (the per-request output cap sent to the provider). Default: `16384`. This never limits a whole turn; see `turn_token_budget`.     |
 | `turn_token_budget`       | integer | Optional cumulative fail-closed cap for one agentic turn: the sum of input+output tokens across every completion call the turn makes. Unset by default (no cap; turns are still bounded by `max_agent_turns`). Deliberately separate from `max_tokens` — a multi-tool-call turn legitimately accumulates many responses' worth of prompt tokens. |
+| `max_budget_usd`          | number | Optional finite nonnegative USD ceiling for recorded logical-session spend, including auxiliary models. CLI `--max-budget-usd` overrides this global-only setting; project layers cannot change it. Unknown prices or incomplete tracking block capped continuation. Already admitted work can exceed it; this is not a vendor billing limit. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `200`.                                                                                                                           |
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
@@ -1145,9 +1147,10 @@ the compaction was automatic (between turns, mid-turn, or before a headless
 includes the compaction that ran before its turn in `usage` and `cost`. When a
 goal is running, compaction during a round counts toward that round's tokens
 and the goal's `max_tokens` bound (TUI, headless, and ACP); a manual
-`/compress` between rounds is charged to the session only. ACP keeps no session
-cost ledger, so there it counts toward a goal only. A compaction that fails is
-not charged for the requests it completed before failing. Session-title requests
+`/compress` between rounds is charged to the session only. ACP's process-local
+logical session uses the same financial account and private daily usage ledger.
+Requests completed before failed or cancelled compaction retain their observed
+usage and captured-price receipts. Session-title requests
 also charge their observed usage at the title model's
 captured prices, including failed or cancelled requests. Headless JSON reports
 this auxiliary work in `session_title_usage`, separately from the main turn's
@@ -1345,11 +1348,13 @@ boundary is cancelled, and the existing session/catalog values are kept. The
 foreground abort join has a 100 ms ceiling; a runtime reaper retains ownership
 of any task still cancelling until it completes. A refresh that finishes in
 time updates only fields that are still missing.
-Catalog prices must be finite and nonnegative after conversion to the
-per-million-token unit. Invalid prices use the existing zero-cost fallback;
-valid prices and context metadata from the same entry remain usable. A zero
-catalog context limit is treated as missing, preserving the session's existing
-limit.
+Catalog prices must be present, finite and nonnegative after conversion to the
+per-million-token unit. Missing, malformed, negative or non-finite tiers remain
+unpriced; they cannot invent a free pair. An explicit zero pair is known free,
+even without context metadata. Useful context metadata remains available when
+pricing is incomplete. A zero catalog context limit is treated as missing,
+preserving the session's existing limit. Capped requests require complete known
+pricing; uncapped cost reports identify incomplete tracking.
 `custom_providers.openrouter.timeout_secs` continues to govern the request
 while it is live. If a custom provider shadows `openrouter`, its pricing catalog
 is fetched from `{base_url}/models`, using that provider's credentials and

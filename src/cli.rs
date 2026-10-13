@@ -698,6 +698,10 @@ pub struct Cli {
     #[arg(long = "max-tokens", help = "Maximum tokens in response")]
     pub max_tokens: Option<u64>,
 
+    #[arg(long, value_name = "USD", value_parser = parse_usd_budget,
+        help = "Stop new model requests/effects once recorded session spend reaches this USD estimate")]
+    pub max_budget_usd: Option<f64>,
+
     #[arg(long = "max-agent-turns", help = "Maximum agent turns")]
     pub max_agent_turns: Option<usize>,
 
@@ -1185,6 +1189,13 @@ impl Cli {
             return (qm.provider.clone(), qm.model.clone());
         }
         (self.resolve_provider(cfg), self.resolve_model(cfg))
+    }
+
+    pub(crate) fn resolve_max_budget_usd(
+        &self,
+        cfg: &config::Config,
+    ) -> anyhow::Result<Option<f64>> {
+        crate::spend::validate_cap(self.max_budget_usd.or(cfg.max_budget_usd))
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
@@ -2530,5 +2541,45 @@ mod session_picker_cli_tests {
         assert!(cli.resume_selection.is_none());
         assert!(Cli::try_parse_from(["mini-agent", "--resume-all"]).is_err());
         assert!(Cli::try_parse_from(["mini-agent", "--resume", "--continue"]).is_err());
+    }
+}
+
+fn parse_usd_budget(value: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "USD budget must be finite and nonnegative".to_owned())?;
+    crate::spend::validate_cap(Some(value))
+        .map(|_| value)
+        .map_err(|_| "USD budget must be finite and nonnegative".to_owned())
+}
+
+#[cfg(test)]
+mod usd_budget_cli_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn usd_budget_cli_validation_and_precedence() {
+        for bad in ["NaN", "inf", "-1", "text"] {
+            assert!(Cli::try_parse_from(["mini-agent", "--max-budget-usd", bad]).is_err());
+        }
+        let cfg: config::Config =
+            serde_json::from_value(serde_json::json!({"max_budget_usd":2.0})).unwrap();
+        assert_eq!(
+            Cli::parse_from(["mini-agent"])
+                .resolve_max_budget_usd(&cfg)
+                .unwrap(),
+            Some(2.0)
+        );
+        assert_eq!(
+            Cli::parse_from(["mini-agent", "--max-budget-usd", "0"])
+                .resolve_max_budget_usd(&cfg)
+                .unwrap(),
+            Some(0.0)
+        );
+        assert!(
+            serde_json::from_value::<config::Config>(serde_json::json!({"max_budget_usd":-1.0}))
+                .is_err()
+        );
+        assert!(toml::from_str::<config::Config>("max_budget_usd = nan").is_err());
     }
 }

@@ -290,6 +290,7 @@ fn acp_protocol_version() -> ProtocolVersion {
 }
 
 struct SessionState {
+    spend: crate::spend::run::Run,
     history: Arc<Mutex<SessionHistory>>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
@@ -310,6 +311,7 @@ struct SessionState {
 }
 
 struct PromptSessionSnapshot {
+    spend: crate::spend::run::Run,
     history: Arc<Mutex<SessionHistory>>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
@@ -968,7 +970,8 @@ fn init_acp_subagents(cli: &Cli, cfg: &Config) {
 
 // --- Server Entry Point ---
 
-pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
+pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
+    cfg.max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
     // Keep direct callers fail-closed too. The normal binary path has already
     // validated in `Startup::init`, before provider/client construction.
     let (authority, _) = crate::permission::resolve_configured_execution_authority(&cli, &cfg)?;
@@ -1203,10 +1206,20 @@ async fn handle_new_session(
         ));
     }
 
+    let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
+    let spend = crate::spend::run::Run::for_new_session(
+        &session_id.to_string(),
+        &provider,
+        &model,
+        &state.cfg,
+        Some(state.cli.resolve_model(&state.cfg).as_str()),
+    )
+    .map_err(|_| agent_client_protocol::Error::new(-32602, "invalid USD budget configuration"))?;
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
     sessions.insert(
         session_id.clone(),
         SessionState {
+            spend,
             history: Arc::new(Mutex::new(SessionHistory::default())),
             workspace,
             context: Arc::new(context),
@@ -1616,6 +1629,7 @@ async fn handle_prompt(
             generation
         };
         PromptSessionSnapshot {
+            spend: sess.spend.clone(),
             history: sess.history.clone(),
             workspace: sess.workspace.clone(),
             context: sess.context.clone(),
@@ -1638,6 +1652,7 @@ async fn handle_prompt(
         }
     };
     let PromptSessionSnapshot {
+        spend,
         history,
         workspace,
         context,
@@ -1697,26 +1712,31 @@ async fn handle_prompt(
                     return Ok(());
                 }
                 let history = history.lock_owned().await;
-                let result = run_prompt(
-                    &state,
-                    &prompt_text,
-                    session_id,
-                    history,
-                    workspace,
-                    context,
-                    read_tracker,
-                    todo_store,
-                    #[cfg(feature = "goal")]
-                    goal_store,
-                    sandbox,
-                    #[cfg(feature = "js")]
-                    js_session_state,
-                    #[cfg(feature = "skills")]
-                    skill_services,
-                    responder,
-                    cx,
-                    control,
-                    &registration,
+                let result = crate::spend::run::scope(
+                    Some(spend),
+                    crate::startup::heap_future(|| {
+                        run_prompt(
+                            &state,
+                            &prompt_text,
+                            session_id,
+                            history,
+                            workspace,
+                            context,
+                            read_tracker,
+                            todo_store,
+                            #[cfg(feature = "goal")]
+                            goal_store,
+                            sandbox,
+                            #[cfg(feature = "js")]
+                            js_session_state,
+                            #[cfg(feature = "skills")]
+                            skill_services,
+                            responder,
+                            cx,
+                            control,
+                            &registration,
+                        )
+                    }),
                 )
                 .await;
                 #[cfg(test)]
@@ -2214,7 +2234,7 @@ async fn settle_acp_goal_round(
                     cfg.api_keys.as_ref(),
                 ) {
                     Ok(client) => Some(
-                        crate::extras::goal::judge::ask_with_transcript(
+                        crate::extras::goal::judge::ask_with_transcript_observed(
                             &goal,
                             &request,
                             &resolved,
@@ -2222,6 +2242,14 @@ async fn settle_acp_goal_round(
                             &transcript,
                             cfg,
                             checks.as_ref(),
+                            crate::spend::run::Run::current().map_or_else(
+                                Default::default,
+                                |run| {
+                                    crate::spend::run::UsageObserver::with_run(
+                                        run.for_judge(&resolved, cfg),
+                                    )
+                                },
+                            ),
                         )
                         .await,
                     ),
@@ -2328,6 +2356,11 @@ async fn execute_prompt(
     if let Err(error) = workspace.validate() {
         return Ok(PromptOutcome::failed(error.to_string()));
     }
+    if let Some(run) = crate::spend::run::Run::current()
+        && run.admit().is_err()
+    {
+        return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
+    }
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
@@ -2431,8 +2464,8 @@ async fn execute_prompt(
         }
     };
 
-    // What this turn's compaction spent, for the goal round's token count.
-    // ACP keeps no session cost ledger, so there is nothing else to charge.
+    // Goal calibration uses the compaction's usage too. Financial receipts
+    // belong to this ACP logical session and survive prompt cancellation.
     #[cfg(feature = "goal")]
     let mut compaction_usage = crate::event::UsageDelta::default();
     if history.needs_compaction() {
@@ -2449,23 +2482,36 @@ async fn execute_prompt(
         let goal_store_for_compaction = goal_store.clone();
         let compaction_model = &model_str;
         let compaction_retry = &state.cfg.retry;
+        let observed = crate::spend::run::Run::current().map_or_else(Default::default, |run| {
+            crate::spend::run::UsageObserver::with_run(run.with_captured_profile(
+                &provider_str,
+                &model_str,
+                run.prices,
+                &state.cfg,
+                crate::spend::RequestKind::Compaction,
+            ))
+        });
         let compacted = history
             .compact_with(
                 &control,
                 #[cfg(feature = "goal")]
                 Some(&goal_store_for_compaction),
-                move |messages, previous_summary| async move {
-                    compaction_client
-                        .compress_messages(
-                            compaction_model,
-                            &messages,
-                            previous_summary.as_deref(),
-                            None,
-                            context_window.saturating_sub(reserve),
-                            reserve,
-                            compaction_retry,
-                        )
-                        .await
+                move |messages, previous_summary| {
+                    let observed = observed.clone();
+                    async move {
+                        compaction_client
+                            .compress_messages_observed(
+                                compaction_model,
+                                &messages,
+                                previous_summary.as_deref(),
+                                None,
+                                context_window.saturating_sub(reserve),
+                                reserve,
+                                compaction_retry,
+                                observed,
+                            )
+                            .await
+                    }
                 },
             )
             .await;
@@ -2557,6 +2603,7 @@ async fn execute_prompt(
         return Ok(PromptOutcome::cancelled(None));
     };
 
+    let agent = agent.with_spend(crate::spend::run::Run::current());
     let Some(paused_runner) = run_owned_pre_run(
         &control,
         &work_scope,
@@ -3776,6 +3823,60 @@ mod protocol_tests {
             },
             Message::assistant("tools-complete"),
         ]
+    }
+
+    #[tokio::test]
+    async fn usd_budget_actual_acp_protocol_preserves_session_accounts_and_denies_without_model_effects()
+     {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let fixture: PromptFixture = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(vec![done("NEVER", vec![Message::assistant("NEVER")])]) })
+        });
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().cfg.max_budget_usd = Some(0.0);
+        let owner = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let first = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let second = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let failed = cx
+                    .send_request(prompt(first.clone(), "never admitted"))
+                    .block_task()
+                    .await;
+                assert!(failed.is_err(), "budget refusal is a JSON-RPC error");
+                assert!(
+                    failed
+                        .unwrap_err()
+                        .to_string()
+                        .contains(crate::spend::run::BUDGET_STOP)
+                );
+                let sessions = owner.sessions.lock().await;
+                let first = sessions.get(&first).unwrap();
+                let second = sessions.get(&second).unwrap();
+                assert!(first.history.lock().await.snapshot().is_empty());
+                assert!(second.history.lock().await.snapshot().is_empty());
+                assert!(first.spend.admit_effect().is_err());
+                assert!(second.spend.admit_effect().is_err());
+                assert_eq!(first.spend.account.snapshot().recorded_spend(), 0.0);
+                assert_eq!(second.spend.account.snapshot().recorded_spend(), 0.0);
+                assert_eq!(calls.load(Ordering::Acquire), 0);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

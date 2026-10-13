@@ -10,6 +10,7 @@ pub(crate) mod builder;
 pub(crate) mod prompt;
 pub(crate) mod task_tool;
 
+#[derive(Clone)]
 pub(crate) struct SubagentConfig {
     pub client: AnyClient,
     /// User-facing built-in or custom-provider alias corresponding to `client`.
@@ -45,6 +46,16 @@ impl SubagentConfig {
 
 static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
 
+// Scoped fixture configuration leaves the real TaskTool call, persona resolver,
+// child builder, SDK dispatch, and accounting untouched, without mutating the
+// production process-global config during concurrent tests.
+#[cfg(test)]
+tokio::task_local! { static TEST_CONFIG: SubagentConfig; }
+#[cfg(test)]
+pub(crate) async fn scope_test_config<F: Future>(config: SubagentConfig, work: F) -> F::Output {
+    TEST_CONFIG.scope(config, work).await
+}
+
 tokio::task_local! {
     static SUBAGENT_EVENT_TX: mpsc::Sender<AgentEvent>;
 }
@@ -68,6 +79,10 @@ pub(crate) fn with_config<F, R>(f: F) -> Result<R, ConfigNotInitialized>
 where
     F: FnOnce(&SubagentConfig) -> R,
 {
+    #[cfg(test)]
+    if let Ok(config) = TEST_CONFIG.try_with(Clone::clone) {
+        return with_config_value(Some(&config), f);
+    }
     let guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     with_config_value(guard.as_ref(), f)
 }

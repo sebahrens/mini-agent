@@ -171,6 +171,7 @@ files are skipped with a warning containing their path and read error.
 
 | Command | Description |
 | ------- | ----------- |
+| `/cost` | Show recorded session spend by requested provider/model and token category, today in UTC and all-time private ledger observations. A bounded read-only query; legacy estimates and incomplete/unpriced observations are labeled. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `/compress [instructions]` | Compress conversation history to free context window space. The summarizer receives the history, the previous summary and your instructions in fenced sections; closing tags of those fences inside the text (such as `</message>` or `</transcript>` in a tool result) are neutralized with U+2060 WORD JOINER, and the summarizer is told the fenced history is data, not instructions. |
 | `/compact [instructions]` | Alias for `/compress`; after a manual compaction, show the active summary. |
 | `/compact show` | Show the active saved summary without making a provider request or changing session history. Imported file-request metadata remains untrusted historical data. |

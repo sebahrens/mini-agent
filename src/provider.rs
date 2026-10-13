@@ -9,7 +9,6 @@ use rig::agent::Agent;
 use rig::client::{CompletionClient, ModelListingClient};
 use rig::completion::{CompletionModel, Message};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
-use rig::streaming::StreamingChat;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -20,7 +19,6 @@ use crate::auth::{AuthResolver, ProviderKind, ResolvedCredential};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 use crate::context::ContextFiles;
-#[cfg(any(feature = "hooks", feature = "subagents"))]
 use crate::event::AgentEvent;
 #[cfg(feature = "hooks")]
 use crate::extras::hooks::LoopInfo;
@@ -666,6 +664,10 @@ impl AnyClient {
     /// turn, a bounded response. The judge must not be able to act, only to
     /// read and answer.
     #[cfg(feature = "goal")]
+    #[allow(
+        dead_code,
+        reason = "Compatibility wrapper for callers without owned usage observers"
+    )]
     pub async fn judge_completion(
         &self,
         model_name: &str,
@@ -674,12 +676,34 @@ impl AnyClient {
         max_output_tokens: u64,
         retry_config: &RetryConfig,
     ) -> anyhow::Result<(String, rig::completion::Usage)> {
-        self.plain_completion(
+        self.judge_completion_observed(
             model_name,
             prompt,
             preamble,
             max_output_tokens,
             retry_config,
+            Default::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "goal")]
+    pub(crate) async fn judge_completion_observed(
+        &self,
+        model_name: &str,
+        prompt: String,
+        preamble: String,
+        max_output_tokens: u64,
+        retry_config: &RetryConfig,
+        observed: crate::spend::run::UsageObserver,
+    ) -> anyhow::Result<(String, rig::completion::Usage)> {
+        self.plain_completion_observed(
+            model_name,
+            prompt,
+            preamble,
+            max_output_tokens,
+            retry_config,
+            observed,
         )
         .await
     }
@@ -687,6 +711,10 @@ impl AnyClient {
     /// One no-tools, single-turn completion with a bounded response, on the
     /// summarizer's request path. Used for goal judging.
     #[cfg(feature = "goal")]
+    #[allow(
+        dead_code,
+        reason = "Compatibility wrapper for callers without owned usage observers"
+    )]
     pub async fn plain_completion(
         &self,
         model_name: &str,
@@ -695,6 +723,27 @@ impl AnyClient {
         max_output_tokens: u64,
         retry_config: &RetryConfig,
     ) -> anyhow::Result<(String, rig::completion::Usage)> {
+        self.plain_completion_observed(
+            model_name,
+            prompt,
+            preamble,
+            max_output_tokens,
+            retry_config,
+            Default::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "goal")]
+    pub(crate) async fn plain_completion_observed(
+        &self,
+        model_name: &str,
+        prompt: String,
+        preamble: String,
+        max_output_tokens: u64,
+        retry_config: &RetryConfig,
+        observed: crate::spend::run::UsageObserver,
+    ) -> anyhow::Result<(String, rig::completion::Usage)> {
         let model = self.completion_model(model_name.to_string());
         summarize_with_model(
             model,
@@ -702,6 +751,7 @@ impl AnyClient {
             preamble,
             max_output_tokens,
             retry_config.clone(),
+            observed,
         )
         .await
     }
@@ -779,6 +829,10 @@ impl AnyClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        dead_code,
+        reason = "Compatibility wrapper for callers without owned usage observers"
+    )]
     pub async fn compress_messages(
         &self,
         model_name: &str,
@@ -788,6 +842,34 @@ impl AnyClient {
         input_token_budget: u64,
         response_token_budget: u64,
         retry_config: &RetryConfig,
+    ) -> anyhow::Result<CompactionOutput> {
+        self.compress_messages_observed(
+            model_name,
+            messages,
+            previous_summary,
+            instructions,
+            input_token_budget,
+            response_token_budget,
+            retry_config,
+            Default::default(),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserves existing compaction inputs and adds request-owned usage settlement"
+    )]
+    pub(crate) async fn compress_messages_observed(
+        &self,
+        model_name: &str,
+        messages: &[SessionMessage],
+        previous_summary: Option<&str>,
+        instructions: Option<&str>,
+        input_token_budget: u64,
+        response_token_budget: u64,
+        retry_config: &RetryConfig,
+        observed: crate::spend::run::UsageObserver,
     ) -> anyhow::Result<CompactionOutput> {
         let preamble = summarizer_preamble();
         // Without a provider tokenizer, one UTF-8 byte per configured token is
@@ -808,6 +890,7 @@ impl AnyClient {
                 |summary_prompt| {
                     let preamble = preamble.clone();
                     let retry_config = retry_config.clone();
+                    let observed = observed.clone();
                     async move {
                         let model = self.completion_model(model_name.to_string());
                         summarize_with_model(
@@ -816,6 +899,7 @@ impl AnyClient {
                             preamble,
                             max_output_tokens,
                             retry_config,
+                            observed,
                         )
                         .await
                         .map(|(summary, usage)| (summary, usage.into()))
@@ -1295,6 +1379,22 @@ pub struct OpenRouterModelInfo {
     pub input_cost: f64,
     pub output_cost: f64,
     pub context_length: Option<u64>,
+    /// None permits only a positive legacy estimate. Decoded live metadata
+    /// always sets Some, distinguishing explicit free rates from absence.
+    pub prices_known: Option<bool>,
+}
+impl OpenRouterModelInfo {
+    pub(crate) fn known_prices(self) -> Option<(f64, f64)> {
+        let valid = self.input_cost.is_finite()
+            && self.input_cost >= 0.0
+            && self.output_cost.is_finite()
+            && self.output_cost >= 0.0;
+        (valid
+            && self
+                .prices_known
+                .unwrap_or(self.input_cost > 0.0 || self.output_cost > 0.0))
+        .then_some((self.input_cost, self.output_cost))
+    }
 }
 
 pub(crate) fn openrouter_pricing_request(
@@ -1337,14 +1437,9 @@ pub async fn fetch_openrouter_pricing(
     const MAX_PRICING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     let req = openrouter_pricing_request(api_key, custom_providers, config_api_keys)?;
     #[derive(serde::Deserialize)]
-    struct PricingResp {
-        prompt: String,
-        completion: String,
-    }
-    #[derive(serde::Deserialize)]
     struct PricingEntry {
         id: String,
-        pricing: Option<PricingResp>,
+        pricing: Option<serde_json::Value>,
         context_length: Option<u64>,
     }
     #[derive(serde::Deserialize)]
@@ -1374,24 +1469,28 @@ pub async fn fetch_openrouter_pricing(
             .ok()
             .map(|price| price * 1_000_000.0)
             .filter(|price| price.is_finite() && *price >= 0.0)
-            .unwrap_or(0.0)
     };
     for entry in resp.data {
-        let (input, output) = match entry.pricing.as_ref() {
-            Some(p) => (
-                price_per_million(&p.prompt),
-                price_per_million(&p.completion),
-            ),
-            None => (0.0, 0.0),
+        let rate = |key| {
+            entry
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.get(key))
+                .and_then(serde_json::Value::as_str)
+                .and_then(price_per_million)
         };
+        let input = rate("prompt");
+        let output = rate("completion");
+        let known = input.is_some() && output.is_some();
         let context_length = entry.context_length.filter(|length| *length > 0);
-        if input > 0.0 || output > 0.0 || context_length.is_some() {
+        if known || input.is_some() || output.is_some() || context_length.is_some() {
             map.insert(
                 entry.id,
                 OpenRouterModelInfo {
-                    input_cost: input,
-                    output_cost: output,
+                    input_cost: input.unwrap_or(0.0),
+                    output_cost: output.unwrap_or(0.0),
                     context_length,
+                    prices_known: Some(known),
                 },
             );
         }
@@ -1405,27 +1504,76 @@ async fn summarize_with_model(
     preamble: String,
     max_output_tokens: u64,
     retry_config: RetryConfig,
+    observed: crate::spend::run::UsageObserver,
 ) -> anyhow::Result<(String, rig::completion::Usage)> {
     match model {
         AnyModel::OpenRouter(m, _) => {
-            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
         }
         AnyModel::OpenAI(m) => match m {
             OpenAiModel::Responses(m) => {
-                run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+                run_summarizer(
+                    m,
+                    prompt,
+                    preamble,
+                    max_output_tokens,
+                    &retry_config,
+                    observed,
+                )
+                .await
             }
             OpenAiModel::Completions(m) => {
-                run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+                run_summarizer(
+                    m,
+                    prompt,
+                    preamble,
+                    max_output_tokens,
+                    &retry_config,
+                    observed,
+                )
+                .await
             }
         },
         AnyModel::Anthropic(m) => {
-            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
         }
         AnyModel::Gemini(m) => {
-            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
         }
         AnyModel::Ollama(m) => {
-            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
         }
     }
 }
@@ -1436,52 +1584,109 @@ async fn run_summarizer<M>(
     preamble: String,
     max_output_tokens: u64,
     retry_config: &RetryConfig,
+    observed: crate::spend::run::UsageObserver,
 ) -> anyhow::Result<(String, rig::completion::Usage)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let agent = rig::agent::AgentBuilder::new(model)
-        .preamble(&preamble)
-        .max_tokens(max_output_tokens)
-        .build();
-
-    let agent_ref = &agent;
-    let mut stream = retry::retry_stream_chat(retry_config, move || {
-        let p = prompt.clone();
+    use futures::{StreamExt, TryStreamExt};
+    use rig::completion::GetTokenUsage;
+    use rig::streaming::StreamedAssistantContent;
+    // The SDK agent rejects an unexpected tool call before its CompletionCall
+    // usage event. These requests never have tools: consume one raw stream and
+    // observe its canonical Final before validation, just like title requests.
+    let mut stream = retry::retry_stream_chat(retry_config, || {
+        let request = model
+            .completion_request(prompt.clone())
+            .preamble(preamble.clone())
+            .max_tokens(max_output_tokens);
+        let observed = observed.clone();
         async move {
-            agent_ref
-                .stream_chat(p, Vec::<Message>::new())
-                .max_turns(1)
-                .await
+            let prior =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<crate::event::UsageDelta>));
+            let admission = observed.clone();
+            let guard = observed.stream_guard();
+            let opening = guard.clone();
+            futures::stream::once(async move {
+                admission.admit().await.map_err(|_| {
+                    rig::completion::CompletionError::ProviderError(
+                        crate::spend::run::BUDGET_STOP.into(),
+                    )
+                })?;
+                let stream = request.stream().await?;
+                opening.opened();
+                Ok::<_, rig::completion::CompletionError>(stream)
+            })
+            .try_flatten()
+            .inspect({
+                let observed = observed.clone();
+                move |item| {
+                    if let Ok(StreamedAssistantContent::Final(raw)) = item {
+                        guard.finished();
+                        let usage = crate::event::UsageDelta::from(raw.token_usage());
+                        let mut prior = prior
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let delta = usage.nonnegative_difference(prior.unwrap_or_default());
+                        if prior.is_none() || delta.has_values() {
+                            observed.record(delta);
+                        }
+                        *prior = Some(usage);
+                    }
+                }
+            })
+            .then(move |item| {
+                let observed = observed.clone();
+                async move {
+                    observed.flush().await;
+                    item
+                }
+            })
+            .boxed()
         }
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Compression failed: {}", e))?;
+    .map_err(|error| anyhow::anyhow!("Compression failed: {error}"))?;
 
     let mut response = String::new();
-    // Zero when the provider reports none, which is how rig spells "unknown".
     let mut usage = rig::completion::Usage::new();
-    use futures::StreamExt;
+    let mut finished = false;
+    let mut unexpected_tool = false;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                rig::streaming::StreamedAssistantContent::Text(text),
-            )) => response.push_str(&text.text),
-            Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
-                usage = res.usage();
-                response = res.output.to_string();
-                break;
+            Ok(StreamedAssistantContent::Text(text)) => {
+                anyhow::ensure!(
+                    response.len().saturating_add(text.text.len()) <= 64 * 1024,
+                    "Compression output exceeds byte budget"
+                );
+                response.push_str(&text.text);
             }
-            Err(e) => return Err(anyhow::anyhow!("Compression failed: {}", e)),
+            Ok(StreamedAssistantContent::Final(raw)) => {
+                let delta = crate::event::UsageDelta::from(raw.token_usage())
+                    .nonnegative_difference(usage.into());
+                usage = crate::event::UsageDelta::from(usage)
+                    .saturating_add(delta)
+                    .into();
+                finished = true;
+            }
+            Ok(
+                StreamedAssistantContent::ToolCall { .. }
+                | StreamedAssistantContent::ToolCallDelta { .. },
+            ) => unexpected_tool = true,
+            Err(error) => return Err(anyhow::anyhow!("Compression failed: {error}")),
             _ => {}
         }
     }
-
-    if response.is_empty() {
-        anyhow::bail!("Compression returned empty response");
-    }
-
+    anyhow::ensure!(
+        finished,
+        "Compression stream ended without a final response"
+    );
+    anyhow::ensure!(
+        !unexpected_tool,
+        "Compression returned an unexpected tool call"
+    );
+    anyhow::ensure!(!response.is_empty(), "Compression returned empty response");
     Ok((response, usage))
 }
 
@@ -1521,16 +1726,37 @@ where
             request = request.temperature(temperature.clamp(0.0, 2.0));
         }
         let observed = ledger.clone();
+        let persistence = ledger.clone();
         async move {
+            let guard = observed.stream_guard();
+            let opening = guard.clone();
+            let admission = observed.clone();
             use futures::TryStreamExt;
-            futures::stream::once(async move { request.stream().await })
-                .try_flatten()
-                .inspect(move |item| {
-                    if let Ok(StreamedAssistantContent::Final(raw)) = item {
-                        observed.aggregate(raw.token_usage());
-                    }
-                })
-                .boxed()
+            futures::stream::once(async move {
+                admission.admit().await.map_err(|_| {
+                    rig::completion::CompletionError::ProviderError(
+                        crate::spend::run::BUDGET_STOP.into(),
+                    )
+                })?;
+                let stream = request.stream().await?;
+                opening.opened();
+                Ok::<_, rig::completion::CompletionError>(stream)
+            })
+            .try_flatten()
+            .inspect(move |item| {
+                if let Ok(StreamedAssistantContent::Final(raw)) = item {
+                    guard.finished();
+                    observed.aggregate(raw.token_usage());
+                }
+            })
+            .then(move |item| {
+                let persistence = persistence.clone();
+                async move {
+                    persistence.flush().await;
+                    item
+                }
+            })
+            .boxed()
         }
     })
     .await?;
@@ -1589,15 +1815,36 @@ where
             request = request.temperature(value.clamp(0.0, 2.0));
         }
         let ledger = usage.clone();
+        let persistence = usage.clone();
         async move {
-            futures::stream::once(async move { request.stream().await })
-                .try_flatten()
-                .inspect(move |item| {
-                    if let Ok(StreamedAssistantContent::Final(raw)) = item {
-                        ledger.observe(raw.token_usage());
-                    }
-                })
-                .boxed()
+            let guard = ledger.stream_guard();
+            let opening = guard.clone();
+            let admission = ledger.clone();
+            futures::stream::once(async move {
+                admission.admit().await.map_err(|_| {
+                    rig::completion::CompletionError::ProviderError(
+                        crate::spend::run::BUDGET_STOP.into(),
+                    )
+                })?;
+                let stream = request.stream().await?;
+                opening.opened();
+                Ok::<_, rig::completion::CompletionError>(stream)
+            })
+            .try_flatten()
+            .inspect(move |item| {
+                if let Ok(StreamedAssistantContent::Final(raw)) = item {
+                    guard.finished();
+                    ledger.observe(raw.token_usage());
+                }
+            })
+            .then(move |item| {
+                let persistence = persistence.clone();
+                async move {
+                    persistence.flush().await;
+                    item
+                }
+            })
+            .boxed()
         }
     })
     .await?;
@@ -1757,6 +2004,7 @@ pub struct AnyAgent {
     /// `max_tokens` is the per-response output cap sent to the provider — a
     /// different unit entirely.
     turn_token_budget: Option<u64>,
+    spend: Option<crate::spend::run::Run>,
     completion_verification: Option<runner::CompletionVerification>,
     context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "lsp")]
@@ -1772,6 +2020,7 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            spend: None,
             completion_verification: None,
             context_snapshot: None,
             #[cfg(feature = "lsp")]
@@ -1781,6 +2030,22 @@ impl AnyAgent {
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    #[cfg(any(feature = "goal", feature = "acp", feature = "subagents", test))]
+    pub(crate) fn with_spend(mut self, spend: Option<crate::spend::run::Run>) -> Self {
+        self.spend = spend;
+        self
+    }
+
+    pub(crate) fn with_spend_for_session(
+        mut self,
+        session: &mut crate::session::Session,
+        cfg: &Config,
+        kind: crate::spend::RequestKind,
+    ) -> Self {
+        self.spend = Some(crate::spend::run::Run::for_session(session, cfg, kind));
+        self
     }
 
     fn with_context_snapshot(mut self, snapshot: Option<builder::PreambleSnapshot>) -> Self {
@@ -1859,6 +2124,7 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            spend: None,
             completion_verification: None,
             context_snapshot: None,
             #[cfg(feature = "lsp")]
@@ -1874,7 +2140,6 @@ impl AnyAgent {
 /// Synthesizes an `AgentRunner` for a prompt blocked by a `UserPromptSubmit`
 /// hook: no model call happens, the block feedback surfaces through the same
 /// `AgentEvent::Error` path a real run-time error would use.
-#[cfg(feature = "hooks")]
 fn spawn_blocked_runner(
     feedback: String,
     work_scope: std::sync::Arc<runner::AgentWorkScope>,
@@ -1887,7 +2152,10 @@ fn spawn_blocked_runner(
     let join = tokio::spawn(async move {
         if start_rx.await.is_ok() {
             let _ = event_tx
-                .send(AgentEvent::error(CompactString::from(feedback)))
+                .send(AgentEvent::error_with(
+                    CompactString::from(feedback),
+                    Vec::new(),
+                ))
                 .await;
         }
         drop(event_tx);
@@ -1966,52 +2234,97 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
+        let accepted_before = self
+            .spend
+            .as_ref()
+            .map(|run| run.accepted_usage())
+            .unwrap_or_default();
         // Construct the aggregate provider future in a short heap_future frame
         // before layering cancellation and task-local scopes around it.
         // Box::pin(async { ... }) still reserves its temporary in this poll.
-        crate::print::run_headless_turn(crate::startup::heap_future(|| async {
-            let history = history.into();
-            #[cfg(feature = "skills")]
-            let _turn_guard = if self.skills.is_some() {
-                Some(
-                    match runner::await_headless_work(self.turn_gate.lock()).await {
-                        Ok(guard) => guard,
+        let mut turn = crate::spend::run::scope(
+            self.spend.clone(),
+            crate::print::run_headless_turn(crate::startup::heap_future(|| async {
+                if let Some(spend) = crate::spend::run::Run::current()
+                    && let Err(error) = spend.prepare().await
+                {
+                    return runner::HeadlessTurn::failed_before_start(error);
+                }
+                let history = history.into();
+                #[cfg(feature = "skills")]
+                let _turn_guard = if self.skills.is_some() {
+                    Some(
+                        match runner::await_headless_work(self.turn_gate.lock()).await {
+                            Ok(guard) => guard,
+                            Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                        },
+                    )
+                } else {
+                    None
+                };
+                #[cfg(feature = "skills")]
+                let prompt = if let Some(skills) = &self.skills {
+                    match runner::await_headless_work(skills.prepare_prompt(prompt)).await {
+                        Ok(prompt) => prompt,
                         Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                    }
+                } else {
+                    prompt.to_string()
+                };
+                #[cfg(not(feature = "skills"))]
+                let prompt = prompt.to_string();
+                match &self.inner {
+                    AnyAgentInner::OpenRouter(a) => {
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
+                        .await
+                    }
+                    AnyAgentInner::OpenAI(a) => match a {
+                        OpenAiAgent::Responses(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    history,
+                                    self.completion_verification.clone(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        OpenAiAgent::Completions(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    history,
+                                    self.completion_verification.clone(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
                     },
-                )
-            } else {
-                None
-            };
-            #[cfg(feature = "skills")]
-            let prompt = if let Some(skills) = &self.skills {
-                match runner::await_headless_work(skills.prepare_prompt(prompt)).await {
-                    Ok(prompt) => prompt,
-                    Err(error) => return runner::HeadlessTurn::failed_before_start(error),
-                }
-            } else {
-                prompt.to_string()
-            };
-            #[cfg(not(feature = "skills"))]
-            let prompt = prompt.to_string();
-            match &self.inner {
-                AnyAgentInner::OpenRouter(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::OpenAI(a) => match a {
-                    OpenAiAgent::Responses(a) => {
+                    AnyAgentInner::Anthropic(a) => {
                         crate::startup::heap_future(|| {
                             runner::run_print_with_output_and_verification(
                                 a,
@@ -2027,7 +2340,7 @@ impl AnyAgent {
                         })
                         .await
                     }
-                    OpenAiAgent::Completions(a) => {
+                    AnyAgentInner::Gemini(a) => {
                         crate::startup::heap_future(|| {
                             runner::run_print_with_output_and_verification(
                                 a,
@@ -2043,58 +2356,41 @@ impl AnyAgent {
                         })
                         .await
                     }
-                },
-                AnyAgentInner::Anthropic(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
+                    AnyAgentInner::Ollama(a) => {
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
+                        .await
+                    }
                 }
-                AnyAgentInner::Gemini(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::Ollama(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-            }
-        }))
-        .await
+            })),
+        )
+        .await;
+        // SDK hook errors carry a string. Recover the typed budget outcome
+        // only when this exact parent-owned run actually refused admission.
+        if let Some(spend) = &self.spend {
+            let accepted = spend
+                .accepted_usage()
+                .nonnegative_difference(accepted_before);
+            let projected: crate::event::UsageDelta = turn.usage.into();
+            turn.usage = projected
+                .saturating_add(accepted.nonnegative_difference(projected))
+                .into();
+        }
+        if self.spend.as_ref().is_some_and(|run| run.was_refused()) && turn.failure.is_some() {
+            turn.failure = Some(crate::spend::run::BudgetStopped.into());
+        }
+        turn
     }
 
     #[cfg(feature = "subagents")]
@@ -2106,62 +2402,96 @@ impl AnyAgent {
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
     ) -> runner::SubagentRunOutput {
-        #[cfg(feature = "skills")]
-        let _turn_guard = if self.skills.is_some() {
-            Some(self.turn_gate.lock().await)
-        } else {
-            None
-        };
-        #[cfg(feature = "skills")]
-        let prompt = if let Some(skills) = &self.skills {
-            skills.prepare_prompt(prompt).await
-        } else {
-            prompt.to_string()
-        };
-        #[cfg(not(feature = "skills"))]
-        let prompt = prompt.to_string();
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
-                    .await
-            }
-            AnyAgentInner::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => {
-                    runner::run_subagent(
-                        a,
-                        &prompt,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                    )
-                    .await
-                }
-                OpenAiAgent::Completions(a) => {
-                    runner::run_subagent(
-                        a,
-                        &prompt,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                    )
-                    .await
+        crate::spend::run::scope(
+            self.spend.clone().or_else(crate::spend::run::Run::current),
+            async {
+                #[cfg(feature = "skills")]
+                let _turn_guard = if self.skills.is_some() {
+                    Some(self.turn_gate.lock().await)
+                } else {
+                    None
+                };
+                #[cfg(feature = "skills")]
+                let prompt = if let Some(skills) = &self.skills {
+                    skills.prepare_prompt(prompt).await
+                } else {
+                    prompt.to_string()
+                };
+                #[cfg(not(feature = "skills"))]
+                let prompt = prompt.to_string();
+                match &self.inner {
+                    AnyAgentInner::OpenRouter(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
+                    AnyAgentInner::OpenAI(a) => match a {
+                        OpenAiAgent::Responses(a) => {
+                            runner::run_subagent(
+                                a,
+                                &prompt,
+                                max_turns,
+                                event_tx,
+                                retry_config,
+                                usage_ledger,
+                            )
+                            .await
+                        }
+                        OpenAiAgent::Completions(a) => {
+                            runner::run_subagent(
+                                a,
+                                &prompt,
+                                max_turns,
+                                event_tx,
+                                retry_config,
+                                usage_ledger,
+                            )
+                            .await
+                        }
+                    },
+                    AnyAgentInner::Anthropic(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
+                    AnyAgentInner::Gemini(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
+                    AnyAgentInner::Ollama(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
                 }
             },
-            AnyAgentInner::Anthropic(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
-                    .await
-            }
-            AnyAgentInner::Gemini(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
-                    .await
-            }
-            AnyAgentInner::Ollama(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
-                    .await
-            }
-        }
+        )
+        .await
     }
 
     /// Async because, under `hooks`, the `UserPromptSubmit` gate must resolve
@@ -2225,113 +2555,126 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
-        let history = history.into();
-        #[cfg(feature = "hooks")]
-        let prompt = match work_scope
-            .run(crate::extras::hooks::dispatch_user_prompt_submit(prompt))
-            .await
-        {
-            crate::extras::hooks::PromptGate::Blocked(feedback) => {
-                return spawn_blocked_runner(feedback, work_scope);
-            }
-            crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
-        };
-        #[cfg(feature = "skills")]
-        let turn_guard = if self.skills.is_some() {
-            Some(std::sync::Arc::clone(&self.turn_gate).lock_owned().await)
-        } else {
-            None
-        };
-        #[cfg(feature = "skills")]
-        let prompt = if let Some(skills) = &self.skills {
-            work_scope.run(skills.prepare_prompt(&prompt)).await
-        } else {
-            prompt
-        };
-        let turn_token_budget = self.turn_token_budget;
-        let completion_verification = self.completion_verification;
-        match self.inner {
-            AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
-                a,
-                prompt,
-                history,
-                retry_config,
-                turn_token_budget,
-                #[cfg(feature = "skills")]
-                turn_guard,
+        // The typed dispatch child is large in debug builds. Construct it in
+        // the short factory frame while the spend scope still owns every poll.
+        crate::spend::run::scope(
+            self.spend.clone(),
+            crate::startup::heap_future(|| async move {
+                if let Some(spend) = crate::spend::run::Run::current()
+                    && let Err(error) = work_scope.run(spend.prepare()).await
+                {
+                    return spawn_blocked_runner(error.to_string(), work_scope);
+                }
+                let history = history.into();
                 #[cfg(feature = "hooks")]
-                loop_info,
-                completion_verification.clone(),
-                work_scope,
-            ),
-            AnyAgentInner::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => runner::spawn_agent_paused_in_scope(
-                    a,
-                    prompt,
-                    history,
-                    retry_config,
-                    turn_token_budget,
-                    #[cfg(feature = "skills")]
-                    turn_guard,
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                    completion_verification.clone(),
-                    work_scope,
-                ),
-                OpenAiAgent::Completions(a) => runner::spawn_agent_paused_in_scope(
-                    a,
-                    prompt,
-                    history,
-                    retry_config,
-                    turn_token_budget,
-                    #[cfg(feature = "skills")]
-                    turn_guard,
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                    completion_verification.clone(),
-                    work_scope,
-                ),
-            },
-            AnyAgentInner::Anthropic(a) => runner::spawn_agent_paused_in_scope(
-                a,
-                prompt,
-                history,
-                retry_config,
-                turn_token_budget,
+                let prompt = match work_scope
+                    .run(crate::extras::hooks::dispatch_user_prompt_submit(prompt))
+                    .await
+                {
+                    crate::extras::hooks::PromptGate::Blocked(feedback) => {
+                        return spawn_blocked_runner(feedback, work_scope);
+                    }
+                    crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
+                };
                 #[cfg(feature = "skills")]
-                turn_guard,
-                #[cfg(feature = "hooks")]
-                loop_info,
-                completion_verification.clone(),
-                work_scope,
-            ),
-            AnyAgentInner::Gemini(a) => runner::spawn_agent_paused_in_scope(
-                a,
-                prompt,
-                history,
-                retry_config,
-                turn_token_budget,
+                let turn_guard = if self.skills.is_some() {
+                    Some(std::sync::Arc::clone(&self.turn_gate).lock_owned().await)
+                } else {
+                    None
+                };
                 #[cfg(feature = "skills")]
-                turn_guard,
-                #[cfg(feature = "hooks")]
-                loop_info,
-                completion_verification.clone(),
-                work_scope,
-            ),
-            AnyAgentInner::Ollama(a) => runner::spawn_agent_paused_in_scope(
-                a,
-                prompt,
-                history,
-                retry_config,
-                turn_token_budget,
-                #[cfg(feature = "skills")]
-                turn_guard,
-                #[cfg(feature = "hooks")]
-                loop_info,
-                completion_verification,
-                work_scope,
-            ),
-        }
+                let prompt = if let Some(skills) = &self.skills {
+                    work_scope.run(skills.prepare_prompt(&prompt)).await
+                } else {
+                    prompt
+                };
+                let turn_token_budget = self.turn_token_budget;
+                let completion_verification = self.completion_verification;
+                match self.inner {
+                    AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
+                        a,
+                        prompt,
+                        history,
+                        retry_config,
+                        turn_token_budget,
+                        #[cfg(feature = "skills")]
+                        turn_guard,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                        completion_verification.clone(),
+                        work_scope,
+                    ),
+                    AnyAgentInner::OpenAI(a) => match a {
+                        OpenAiAgent::Responses(a) => runner::spawn_agent_paused_in_scope(
+                            a,
+                            prompt,
+                            history,
+                            retry_config,
+                            turn_token_budget,
+                            #[cfg(feature = "skills")]
+                            turn_guard,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                            completion_verification.clone(),
+                            work_scope,
+                        ),
+                        OpenAiAgent::Completions(a) => runner::spawn_agent_paused_in_scope(
+                            a,
+                            prompt,
+                            history,
+                            retry_config,
+                            turn_token_budget,
+                            #[cfg(feature = "skills")]
+                            turn_guard,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                            completion_verification.clone(),
+                            work_scope,
+                        ),
+                    },
+                    AnyAgentInner::Anthropic(a) => runner::spawn_agent_paused_in_scope(
+                        a,
+                        prompt,
+                        history,
+                        retry_config,
+                        turn_token_budget,
+                        #[cfg(feature = "skills")]
+                        turn_guard,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                        completion_verification.clone(),
+                        work_scope,
+                    ),
+                    AnyAgentInner::Gemini(a) => runner::spawn_agent_paused_in_scope(
+                        a,
+                        prompt,
+                        history,
+                        retry_config,
+                        turn_token_budget,
+                        #[cfg(feature = "skills")]
+                        turn_guard,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                        completion_verification.clone(),
+                        work_scope,
+                    ),
+                    AnyAgentInner::Ollama(a) => runner::spawn_agent_paused_in_scope(
+                        a,
+                        prompt,
+                        history,
+                        retry_config,
+                        turn_token_budget,
+                        #[cfg(feature = "skills")]
+                        turn_guard,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                        completion_verification,
+                        work_scope,
+                    ),
+                }
+            }),
+        )
+        .await
     }
 
     pub fn spawn_btw(
@@ -2342,7 +2685,7 @@ impl AnyAgent {
         id: u32,
         retry_config: RetryConfig,
     ) -> crate::agent::runner::BtwRunner {
-        match self.inner {
+        crate::spend::run::scope_sync(self.spend.clone(), || match self.inner {
             AnyAgentInner::OpenRouter(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
@@ -2363,7 +2706,7 @@ impl AnyAgent {
             AnyAgentInner::Ollama(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
-        }
+        })
     }
 }
 
@@ -3730,7 +4073,14 @@ mod compaction_quality_tests {
                 async move {
                     let retry = RetryConfig::default();
                     crate::startup::heap_future(|| {
-                        run_summarizer(model, prompt, summarizer_preamble(), 256, &retry)
+                        run_summarizer(
+                            model,
+                            prompt,
+                            summarizer_preamble(),
+                            256,
+                            &retry,
+                            Default::default(),
+                        )
                     })
                     .await
                     .map(|(text, usage)| (text, usage.into()))

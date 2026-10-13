@@ -1,5 +1,5 @@
 //! Test-only native GH image. No GitHub access, shell or child launch exists here.
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,44 @@ fn valid_argv(args: &[String]) -> bool {
         && args[4] == "--body"
 }
 
+fn role_matches(root: &Path, image: &Path, marker: &[u8]) -> bool {
+    marker == b"native32" && image == root.join("fixture bin 雪").join("gh.exe")
+}
+
+fn owned_role() -> bool {
+    let Ok(root) = std::env::current_dir().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    let Ok(image) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    let marker = root.join("gh-role");
+    let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != 8 {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(marker) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 8)
+    {
+        return false;
+    }
+    let mut marker = Vec::with_capacity(9);
+    file.take(9).read_to_end(&mut marker).is_ok() && role_matches(&root, &image, &marker)
+}
+
 fn self_test() {
+    let root = Path::new("owned-root");
+    let image = root.join("fixture bin 雪").join("gh.exe");
+    assert!(role_matches(root, &image, b"native32"));
+    assert!(!role_matches(root, &image, b""));
+    assert!(!role_matches(root, &image, b"different"));
+    assert!(!role_matches(root, &root.join("other.exe"), b"native32"));
     let args = [
         "pr",
         "create",
@@ -45,10 +82,10 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     // Cargo runs harness=false targets during ordinary suites. Without the
-    // explicit owned fixture role, do no work and never touch application state.
-    if std::env::var_os("MINI_AGENT_TEST_GH_ROLE").as_deref()
-        != Some(std::ffi::OsStr::new("native32"))
-    {
+    // explicit owned workspace role and the copied image identity, do no work.
+    // The normal Shell environment intentionally strips arbitrary variables;
+    // fixture authority must not depend on widening that production allowlist.
+    if !owned_role() {
         return Ok(0);
     }
     if args == ["--posthook-redact"] {
@@ -59,7 +96,7 @@ fn run() -> Result<i32, String> {
     if !valid_argv(&args) {
         return Err("fixture expected six literal PR arguments".into());
     }
-    let record = serde_json::json!({"argv":args,"pid":std::process::id()});
+    let record = serde_json::json!({"argv":args,"pid":std::process::id(),"role_env_present":std::env::var_os("MINI_AGENT_TEST_GH_ROLE").is_some()});
     std::fs::write("gh-argv.json", serde_json::to_vec(&record).unwrap())
         .map_err(|_| "fixture argv marker failed")?;
     let mode = std::fs::read_to_string("gh-mode").map_err(|_| "fixture mode missing")?;

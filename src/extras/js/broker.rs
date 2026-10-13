@@ -1036,6 +1036,7 @@ pub(crate) enum BrokerBuildError {
 
 /// One invocation's parent-owned grant table and policy state.
 pub(crate) struct InvocationBroker<S> {
+    spend: Option<crate::spend::run::Run>,
     invocation_id: InvocationId,
     grants: HashMap<GrantId, InvocationGrant>,
     retired_grants: HashSet<GrantId>,
@@ -1077,6 +1078,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             }
         }
         Ok(Self {
+            spend: crate::spend::run::Run::current(),
             invocation_id,
             grants: grant_table,
             retired_grants: HashSet::new(),
@@ -1239,9 +1241,15 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             .get(&request.grant_id)
             .map(|grant| audit_identity(&grant.principal))
             .unwrap_or((None, None));
-        let preparation = self
-            .prepare_effect(&request, capability, cancellation.clone())
-            .await;
+        let preparation = if match self.spend.as_ref() {
+            Some(run) => run.admit_effect_ready().await.is_err(),
+            None => false,
+        } {
+            Err(HostEffectError::SessionDenied)
+        } else {
+            self.prepare_effect(&request, capability, cancellation.clone())
+                .await
+        };
         let (grant, authorized, audit_target) = match preparation {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1270,6 +1278,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                 return Err(error);
             }
         };
+        if let Some(run) = &self.spend {
+            // Persistence may wait, but never while holding the synchronous
+            // audit mutex. The authoritative check below still runs after it.
+            run.flush().await;
+        }
         let intent_result = self
             .audit
             .lock()
@@ -1293,6 +1306,14 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                         .map_err(HostEffectError::from)?;
                     return Err(HostEffectError::ExpiredGrant);
                 }
+                // Recheck the explicitly captured parent account after approval
+                // and audit lock waits, immediately before durable effect intent.
+                if match self.spend.as_ref() {
+                    Some(run) => run.admit_effect().is_err(),
+                    None => false,
+                } {
+                    return Err(HostEffectError::SessionDenied);
+                }
                 let normalized_target = sanitize_target(&audit, capability, audit_target)?;
                 audit
                     .append_intent(EffectIntent {
@@ -1310,6 +1331,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                     .map_err(HostEffectError::from)
             });
         if let Err(error) = intent_result {
+            if error == HostEffectError::SessionDenied {
+                self.service.discard_prepared();
+                self.append_pre_intent_outcome(&request, capability, error, denial_identity)?;
+                return Err(error);
+            }
             if error == HostEffectError::ExpiredGrant {
                 let _ = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at);
                 self.service.discard_prepared();

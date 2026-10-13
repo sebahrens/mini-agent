@@ -501,9 +501,15 @@ pub async fn handle_compress(
     }
     renderer.write_line("", crossterm::style::Color::White)?;
 
+    let observed = crate::spend::run::UsageObserver::with_run(crate::spend::run::Run::for_session(
+        ui.session,
+        ui.cfg,
+        crate::spend::RequestKind::Compaction,
+    ));
+    let request_observer = observed.clone();
     let client = &ui.client;
     let retry_config = &ui.cfg.retry;
-    let (first_kept_index, tokens_before, usage) = compact_session_with(
+    let compacted = compact_session_with(
         ui.session,
         cut_idx,
         summarizer_input_budget,
@@ -511,7 +517,7 @@ pub async fn handle_compress(
         keep_recent_tool_results,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             client
-                .compress_messages(
+                .compress_messages_observed(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
@@ -519,6 +525,7 @@ pub async fn handle_compress(
                     input_budget,
                     response_budget,
                     retry_config,
+                    request_observer,
                 )
                 .await
         },
@@ -537,7 +544,18 @@ pub async fn handle_compress(
             let _ = (summary, first_kept_index);
         },
     )
-    .await?;
+    .await;
+    let (first_kept_index, tokens_before, usage) = match compacted {
+        Ok(compacted) => compacted,
+        Err(error) => {
+            let usage = ui
+                .cfg
+                .normalize_usage(&ui.session.provider, observed.take());
+            ui.session
+                .charge_usage_delta(usage, ui.cfg.is_anthropic_native(&ui.session.provider));
+            return Err(error);
+        }
+    };
 
     // Every rolling summarizer request ran on the session's model: charge it
     // at the session's prices, and count it toward the goal round in progress
@@ -673,7 +691,7 @@ where
 pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
     matches!(
         split_command(text).first().copied(),
-        Some("/context" | "/doctor")
+        Some("/context" | "/cost" | "/doctor")
     )
 }
 
@@ -848,9 +866,8 @@ pub(crate) async fn handle_slash(
         "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
-        "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys" | "/advisor" => {
-            settings::handle(&parts, &mut ctx).await
-        }
+        "/cost" | "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys"
+        | "/advisor" => settings::handle(&parts, &mut ctx).await,
         "/sessions" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind" | "/retry"
         | "/quit" | "/exit" | "/history" => session::handle(&parts, &mut ctx).await,
         #[cfg(feature = "export")]

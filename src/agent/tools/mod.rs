@@ -505,6 +505,9 @@ async fn handle_ask_inner(
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
 ) -> Result<(), ToolError> {
+    crate::spend::run::admit_current_effect()
+        .await
+        .map_err(|error| ToolError::Msg(error.to_string()))?;
     // Directory-walking searches approve one literal root: default their
     // AllowAlways scope to that tree plus the root itself (as read, edit and
     // list_dir folder grants do) so the grant never widens to a sibling that
@@ -531,7 +534,11 @@ async fn handle_ask_inner(
         })
         .await
         .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
-    match reply_rx.await {
+    let decision = reply_rx.await;
+    crate::spend::run::admit_current_effect()
+        .await
+        .map_err(|error| ToolError::Msg(error.to_string()))?;
+    match decision {
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {
             let mut checker = permission.lock().unwrap_or_else(|e| e.into_inner());

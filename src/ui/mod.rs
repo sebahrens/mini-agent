@@ -1027,13 +1027,15 @@ pub(crate) async fn start_main_run(
     // Construct this measured large child in the short factory frame. The
     // exact request/profile scope and its owned await remain on this turn.
     let runner = crate::startup::heap_future(|| {
-        agent.spawn_runner(
-            text.to_string(),
-            history,
-            ui.cfg.retry.clone(),
-            #[cfg(feature = "hooks")]
-            None,
-        )
+        agent
+            .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+            .spawn_runner(
+                text.to_string(),
+                history,
+                ui.cfg.retry.clone(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
     })
     .await;
     run.compaction_decision_tx = runner.compaction_decision_tx;
@@ -1274,6 +1276,7 @@ pub(crate) async fn mid_turn_compact_and_respawn(
         .as_ref()
         .unwrap()
         .clone()
+        .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
         .spawn_runner(
             MID_TURN_CONTINUE_PROMPT.to_string(),
             history,

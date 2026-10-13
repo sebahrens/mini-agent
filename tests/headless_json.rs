@@ -350,6 +350,13 @@ impl TempRoot {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
+        let budget_fixture = outcome.starts_with("budget_");
+        let outcome = match outcome {
+            "budget_effect" => "permission_allow",
+            "budget_schema" => "schema_effect_repair",
+            "budget_completed" => "completed",
+            _ => outcome,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -380,7 +387,7 @@ impl TempRoot {
         let session_path = self.0.join("sessions");
         let waiting = self.0.join("provider.waiting");
         std::thread::spawn(move || -> io::Result<()> {
-            let requests = if outcome == "compaction" {
+            let requests = if matches!(outcome, "compaction" | "budget_compaction") {
                 17
             } else if matches!(
                 outcome,
@@ -428,6 +435,17 @@ impl TempRoot {
                 let mut socket = loop {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && budget_fixture
+                                && session_path
+                                    .parent()
+                                    .unwrap()
+                                    .join("budget.fixture_done")
+                                    .exists() =>
+                        {
+                            return Ok(());
+                        }
                         Err(error)
                             if error.kind() == io::ErrorKind::WouldBlock
                                 && Instant::now() < deadline =>
@@ -4439,4 +4457,233 @@ fn output_schema_passive_openrouter_privacy_is_retained_or_fails_before_auxiliar
             );
         }
     }
+}
+
+#[test]
+fn usd_budget_actual_provider_stops_effects_and_repair_but_keeps_valid_answer_and_usage() {
+    for (outcome, cap, expected_calls, expected_success, effect, schema) in [
+        ("budget_effect", "0", 0, false, false, false),
+        ("budget_effect", "0.0001", 1, false, false, false),
+        ("budget_schema", "0.0005", 2, false, true, true),
+        ("budget_completed", "0.0001", 1, true, false, false),
+    ] {
+        let root = TempRoot::new();
+        let mut server = SchemaProviderOwner(Some(root.local_provider(outcome)));
+        let path = root.0.join("config.toml");
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{cfg}\n[quick_models.test]\nprovider=\"local-test\"\nmodel=\"test\"\ninput_token_cost=2\noutput_token_cost=4\n")).unwrap();
+        let mut command = root.provider_command(if outcome == "budget_completed" {
+            ""
+        } else {
+            "write"
+        });
+        command.args(["-p", "answer", "--output", "json", "--max-budget-usd", cap]);
+        if schema {
+            command.arg("--output-schema").arg(schema_file(&root));
+        }
+        #[cfg(unix)]
+        if outcome == "budget_completed" {
+            let args = command
+                .get_args()
+                .map(std::ffi::OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            let envs = command
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+                .collect::<Vec<_>>();
+            let mut limited = root.command_for("/bin/sh");
+            limited
+                .args([
+                    "-c",
+                    "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                    "cost-stack-probe",
+                ])
+                .arg(env!("CARGO_BIN_EXE_mini-agent"))
+                .args(args);
+            for (key, value) in envs {
+                match value {
+                    Some(value) => {
+                        limited.env(key, value);
+                    }
+                    None => {
+                        limited.env_remove(key);
+                    }
+                }
+            }
+            command = limited;
+        }
+        let output = bounded_output(command);
+        std::fs::write(root.0.join("budget.fixture_done"), "child settled").unwrap();
+        server.finish();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), expected_success, "{stderr}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["stop_reason"],
+            if expected_success {
+                "completed"
+            } else {
+                "budget"
+            },
+            "{result} {stderr}"
+        );
+        assert_eq!(result["usage"]["input_tokens"], expected_calls * 100);
+        assert_eq!(root.0.join("effect.txt").exists(), effect);
+        assert!(!root.0.join("tmp/effect.txt").exists());
+        if schema {
+            assert!(result["result_json"].is_null());
+        }
+        for index in 0..expected_calls {
+            assert!(root.0.join(format!("request-{index}.json")).exists());
+        }
+        assert!(
+            !root
+                .0
+                .join(format!("request-{expected_calls}.json"))
+                .exists()
+        );
+        if expected_calls > 0 {
+            let rows = std::fs::read_to_string(root.0.join("usage.jsonl")).unwrap();
+            let rows = rows
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), expected_calls as usize);
+            assert!(
+                rows.iter()
+                    .all(|row| row["provider"] == "local-test" && row["model"] == "test")
+            );
+            let observed: f64 = rows.iter().map(|row| row["cost"].as_f64().unwrap()).sum();
+            assert!((observed - 0.00028 * expected_calls as f64).abs() < 1e-12);
+            let saved = root.saved_session();
+            assert!(
+                (saved["spend_account"]["observed_cost"].as_f64().unwrap() - observed).abs()
+                    < 1e-12
+            );
+        } else {
+            assert!(!root.0.join("usage.jsonl").exists());
+        }
+    }
+}
+
+#[test]
+fn usd_budget_headless_corrupt_ledger_fails_before_provider_and_never_repairs_bytes() {
+    let root = TempRoot::new();
+    let mut server = SchemaProviderOwner(Some(root.local_provider("budget_effect")));
+    let ledger = root.0.join("usage.jsonl");
+    let bytes = b"{\"crash-tail\":";
+    std::fs::write(&ledger, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut command = root.provider_command("write");
+    command.args([
+        "-p",
+        "never admitted",
+        "--output",
+        "json",
+        "--max-budget-usd",
+        "1",
+    ]);
+    let output = bounded_output(command);
+    std::fs::write(root.0.join("budget.fixture_done"), "settled").unwrap();
+    server.finish();
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["stop_reason"], "budget");
+    assert_eq!(result["usage"]["input_tokens"], 0);
+    assert!(!root.0.join("request-0.json").exists());
+    assert!(!root.0.join("effect.txt").exists());
+    assert_eq!(std::fs::read(&ledger).unwrap(), bytes);
+}
+
+#[test]
+fn usd_budget_headless_rolling_preparation_preserves_history_receipts_and_budget_envelope() {
+    let root = TempRoot::new();
+    let mut first_server = SchemaProviderOwner(Some(root.local_provider("completed")));
+    let append_prices = |settings: &str| {
+        format!(
+            "{settings}\n[quick_models.test]\nprovider=\"local-test\"\nmodel=\"test\"\ninput_token_cost=2\noutput_token_cost=4\n"
+        )
+    };
+    let config = root.0.join("config.toml");
+    std::fs::write(
+        &config,
+        append_prices(&std::fs::read_to_string(&config).unwrap()),
+    )
+    .unwrap();
+    let mut first = root.provider_command("");
+    first.args(["-p", "first answer", "--output", "json"]);
+    let output = bounded_output(first);
+    first_server.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut saved = root.saved_session();
+    let id = saved["id"].as_str().unwrap().to_owned();
+    let sample = saved["messages"][0].clone();
+    for index in 0..12 {
+        let mut message = sample.clone();
+        message["role"] = if index % 2 == 0 { "user" } else { "assistant" }.into();
+        message["content"] = format!("retained-history-{index}: {}", "x".repeat(5000)).into();
+        message["estimated_tokens"] = 1250.into();
+        saved["messages"].as_array_mut().unwrap().push(message);
+    }
+    let before = saved["messages"].clone();
+    std::fs::write(
+        root.0.join("sessions").join(format!("{id}.json")),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let mut server = SchemaProviderOwner(Some(root.local_provider("budget_compaction")));
+    let settings = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config,append_prices(&format!("compact_enabled=true\ncontext_window=10000\nreserve_tokens=1000\nkeep_recent_tokens=0\n{settings}"))).unwrap();
+    let mut command = root.provider_command("");
+    command.args([
+        "-p",
+        "after history",
+        "--output",
+        "json",
+        "--session",
+        &id,
+        "--max-budget-usd",
+        "0.00035",
+    ]);
+    let output = bounded_output(command);
+    std::fs::write(root.0.join("budget.fixture_done"), "settled").unwrap();
+    server.finish();
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["stop_reason"],
+        "budget",
+        "{result} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["usage"]["input_tokens"], 100);
+    assert_eq!(result["usage"]["output_tokens"], 20);
+    assert_eq!(result["session_persisted"], true);
+    let after = root.saved_session();
+    assert_eq!(
+        after["messages"], before,
+        "failed compaction must not erase old history or fabricate a model turn"
+    );
+    assert_eq!(after["total_input_tokens"], 200);
+    let rows = std::fs::read_to_string(root.0.join("usage.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["kind"], "compaction");
+    assert!((after["spend_account"]["observed_cost"].as_f64().unwrap() - 0.00056).abs() < 1e-12);
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.0.join("request-0.json")).unwrap()).unwrap();
+    assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
+    assert!(!root.0.join("request-1.json").exists());
+    assert!(!root.0.join("effect.txt").exists());
 }

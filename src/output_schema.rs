@@ -419,6 +419,7 @@ pub(crate) async fn repair_rounds(
         // The initial ordinary turn retains its configured retry policy.
         let mut repair_retry = cfg.retry.clone();
         repair_retry.max_attempts = 1;
+        let agent = agent.with_spend_for_session(session, cfg, crate::spend::RequestKind::Repair);
         let future = agent.run_print_with_output(
             &repair_prompt,
             output,

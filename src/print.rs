@@ -460,6 +460,24 @@ pub(crate) async fn emit_headless_failure(
     message: &str,
     identity: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
+    emit_headless_failure_reason(cli, root, message, identity, HeadlessStopReason::Failed).await
+}
+
+pub(crate) async fn emit_headless_budget_failure(
+    cli: &cli::Cli,
+    root: &Path,
+    message: &str,
+) -> anyhow::Result<()> {
+    emit_headless_failure_reason(cli, root, message, None, HeadlessStopReason::Budget).await
+}
+
+async fn emit_headless_failure_reason(
+    cli: &cli::Cli,
+    root: &Path,
+    message: &str,
+    identity: Option<(&str, &str)>,
+    reason: HeadlessStopReason,
+) -> anyhow::Result<()> {
     if cli.output_format() == cli::OutputFormat::Text {
         return Ok(());
     }
@@ -475,7 +493,7 @@ pub(crate) async fn emit_headless_failure(
             output_token_cost: 0.0,
             cache_prices: crate::pricing::CachePrices::default(),
         },
-        HeadlessStopReason::Failed,
+        reason,
         #[cfg(feature = "goal")]
         None,
     )?;
@@ -1085,6 +1103,7 @@ impl HeadlessGoal {
 pub(crate) enum HeadlessStopReason {
     Completed,
     Failed,
+    Budget,
     SchemaFailed,
     /// A goal stopped for a reason of its own. Each maps to a distinct process
     /// exit code so a script can tell "resume me, I ran out of budget" from
@@ -1112,7 +1131,7 @@ impl HeadlessStopReason {
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::Completed => 0,
-            Self::Failed | Self::SchemaFailed => 1,
+            Self::Failed | Self::SchemaFailed | Self::Budget => 1,
             #[cfg(feature = "goal")]
             Self::GoalMet => 0,
             #[cfg(feature = "goal")]
@@ -1949,6 +1968,12 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let mut limit_entries: Vec<(&str, String)> = vec![
         chat_history_limit_entry(),
         ("max-tokens", max_tokens.to_string()),
+        (
+            "max-budget-usd",
+            cli.resolve_max_budget_usd(cfg)
+                .map_err(io::Error::other)?
+                .map_or_else(|| "— (no cap)".into(), |cap| format!("{cap:.6}")),
+        ),
         ("max-agent-turns", max_agent_turns.to_string()),
         ("context-window", context_window.to_string()),
         (

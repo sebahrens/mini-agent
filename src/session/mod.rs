@@ -582,6 +582,13 @@ pub struct Session {
     /// rates only from positive legacy prices, never from default zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_output_prices_known: Option<bool>,
+    /// Monotonic live accounting and a saved observed-spend checkpoint. Pending
+    /// receipts are never imported from a session; only the ledger stores them.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::spend::Account::is_uninitialised"
+    )]
+    pub(crate) spend_account: crate::spend::Account,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -804,6 +811,7 @@ impl Session {
             input_token_cost: 0.0,
             output_token_cost: 0.0,
             input_output_prices_known: None,
+            spend_account: crate::spend::Account::default(),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             context_window,
@@ -1212,6 +1220,58 @@ impl Session {
             }),
         );
         (content, artifact)
+    }
+
+    pub(crate) fn initialize_spend_account(&mut self, cap: Option<f64>) -> anyhow::Result<()> {
+        let cap = crate::spend::validate_cap(cap)?;
+        if !self.spend_account.matches_session(&self.id) {
+            let baseline = if self.spend_account.is_uninitialised() {
+                self.total_cost
+            } else {
+                self.spend_account.snapshot().recorded_spend()
+            };
+            let prior = self.spend_account.snapshot();
+            self.spend_account = crate::spend::Account::new(&self.id, cap, baseline)?;
+            // Automatic busy-session/workspace forks inherit conservative
+            // uncertainty along with the labeled cost estimate. Rekeying does
+            // not make an unread or unpriced request free, or mint old rows.
+            self.spend_account.inherit_uncertainty(prior);
+        }
+        self.spend_account.set_cap(cap)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_spend(
+        &mut self,
+        cap: Option<f64>,
+        ledger: &crate::spend::Ledger,
+    ) -> anyhow::Result<()> {
+        self.initialize_spend_account(cap)?;
+        match ledger.summary_for_session(&self.id) {
+            Ok(summary) => self.spend_account.reconcile(cap, &summary.session),
+            Err(error) => {
+                self.spend_account.tracking_failed();
+                if cap.is_some() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    "usage ledger tracking unavailable; observed spend remains in memory"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Financial admission and display use the parent-observed monotonic
+    /// account. The legacy numeric field remains compatible with historical
+    /// session/event projections and is never imported into daily receipts.
+    pub(crate) fn recorded_total_cost(&self) -> f64 {
+        if self.spend_account.is_uninitialised() {
+            self.total_cost
+        } else {
+            self.spend_account.snapshot().recorded_spend()
+        }
     }
 
     pub(crate) fn set_input_output_prices(&mut self, prices: Option<(f64, f64)>) {

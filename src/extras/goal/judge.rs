@@ -524,6 +524,21 @@ impl JudgeCall {
         }
     }
 
+    pub(crate) fn interrupted_with_usage(
+        cfg: &crate::config::Config,
+        provider: &str,
+        observed: &crate::spend::run::UsageObserver,
+    ) -> Self {
+        let usage = cfg.normalize_usage(provider, observed.total());
+        Self {
+            outcome: JudgeOutcome::Unavailable {
+                reason: "judge request interrupted".into(),
+            },
+            tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            usage,
+        }
+    }
+
     /// What this call charges to the session, priced at `prices` (the judge
     /// model's own, from [`judge_prices`]). `None` when it reported no usage.
     pub fn charge(
@@ -625,6 +640,10 @@ pub(crate) fn judge_prices_with_cache_prices(
 /// Failures fail open: the caller receives [`JudgeOutcome::Unavailable`] and the
 /// gate keeps working rather than completing or ending the goal on a model that
 /// could not answer.
+#[allow(
+    dead_code,
+    reason = "Compatibility wrapper for callers without owned usage observers"
+)]
 pub async fn ask_with_transcript(
     goal: &Goal,
     request: &VerifyRequest,
@@ -633,6 +652,30 @@ pub async fn ask_with_transcript(
     transcript: &str,
     cfg: &crate::config::Config,
     checks: Option<&CheckOutcome>,
+) -> JudgeCall {
+    ask_with_transcript_observed(
+        goal,
+        request,
+        resolved,
+        session_client,
+        transcript,
+        cfg,
+        checks,
+        Default::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ask_with_transcript_observed(
+    goal: &Goal,
+    request: &VerifyRequest,
+    resolved: &ResolvedJudge,
+    session_client: &crate::provider::AnyClient,
+    transcript: &str,
+    cfg: &crate::config::Config,
+    checks: Option<&CheckOutcome>,
+    observed: crate::spend::run::UsageObserver,
 ) -> JudgeCall {
     if !request.run_judge {
         return JudgeCall::unmetered(JudgeOutcome::Unavailable {
@@ -676,12 +719,13 @@ pub async fn ask_with_transcript(
         cfg.verify_command.as_deref(),
     );
     match client
-        .judge_completion(
+        .judge_completion_observed(
             &resolved.model,
             prompt,
             preamble(),
             VERDICT_MAX_TOKENS,
             &cfg.retry,
+            observed.clone(),
         )
         .await
     {
@@ -704,9 +748,14 @@ pub async fn ask_with_transcript(
         }
         Err(error) => {
             tracing::warn!(%error, "goal: judge call failed");
-            JudgeCall::unmetered(JudgeOutcome::Unavailable {
-                reason: error.to_string(),
-            })
+            let usage = cfg.normalize_usage(&resolved.provider, observed.total());
+            JudgeCall {
+                outcome: JudgeOutcome::Unavailable {
+                    reason: error.to_string(),
+                },
+                tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+                usage,
+            }
         }
     }
 }

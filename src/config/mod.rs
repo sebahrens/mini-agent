@@ -73,6 +73,12 @@ pub struct Config {
     /// more than one response's worth of prompt tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_token_budget: Option<u64>,
+    /// Global owner ceiling; project layers cannot alter financial policy.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::spend::deserialize_cap"
+    )]
+    pub max_budget_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Provider-specific JSON shallow-merged into every completion request body

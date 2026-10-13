@@ -88,6 +88,16 @@ where
     let mut verified = Vec::new();
     tokio::pin!(interrupt);
     for (command, kind) in commands {
+        if let Err(error) = crate::spend::run::admit_current_effect().await {
+            return (
+                Some(CheckOutcome {
+                    all_passed: false,
+                    failure_tail: Some(error.to_string()),
+                    verified,
+                }),
+                false,
+            );
+        }
         let operation = crate::extras::validation::start_with_limits(sandbox, command, limits);
         let cancellation = operation.cancellation();
         let wait = operation.wait();
