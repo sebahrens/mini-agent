@@ -14,6 +14,7 @@ mod git;
 mod hex;
 mod logging;
 mod models_catalog;
+mod output_schema;
 mod paths;
 mod permission;
 mod pricing;
@@ -168,7 +169,12 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     result
 }
 
-async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
+async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
+    if let Err(error) = output_schema::prepare(&mut cli) {
+        print::emit_headless_preflight_failure(&cli, std::path::Path::new("."), &error.to_string())
+            .await?;
+        return Err(error);
+    }
     // Reject malformed seeds before provider/operator execution or session paths.
     permission::cli_rules::config(&cli)?;
     #[cfg(all(feature = "loop", unix))]
@@ -440,8 +446,17 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
     }
 
     if cli.resume && cli.session.is_none() {
-        print::print_sessions();
-        return Ok(());
+        if is_interactive {
+            match ui::pickers::sessions::choose(workspace.clone(), cli.resume_all, cli.no_color)? {
+                Some(ui::pickers::sessions::SessionPick::Selected(selection)) => {
+                    cli.resume_selection = Some(Box::new(selection))
+                }
+                _ => return Ok(()),
+            }
+        } else {
+            print::print_sessions(&workspace, cli.resume_all)?;
+            return Ok(());
+        }
     }
 
     let version_changed = docs::ensure_global()?;

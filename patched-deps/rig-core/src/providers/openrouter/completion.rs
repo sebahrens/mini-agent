@@ -1418,7 +1418,7 @@ impl TryFrom<OpenRouterRequestParams<'_>> for OpenrouterCompletionRequest {
             model,
             messages: full_history,
             temperature: req.temperature,
-            max_tokens: None,
+            max_tokens: req.max_tokens,
             tools,
             tool_choice,
             additional_params,
@@ -1520,6 +1520,35 @@ mod tests {
     use super::*;
     use crate::message::{AudioMediaType, ImageDetail, VideoMediaType};
     use serde_json::json;
+
+    #[test]
+    fn mini_agent_openrouter_typed_max_tokens_are_optional_and_preserved() {
+        for cap in [None, Some(64), Some(1000)] {
+            let request = CompletionRequest {
+                model: None,
+                preamble: None,
+                chat_history: crate::OneOrMany::one("Hello".into()),
+                documents: vec![],
+                tools: vec![],
+                temperature: None,
+                max_tokens: cap,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+            };
+            let request = OpenrouterCompletionRequest::try_from(("test", request)).unwrap();
+            let serialized = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                serialized
+                    .get("max_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cap
+            );
+            if cap.is_none() {
+                assert!(serialized.get("max_tokens").is_none());
+            }
+        }
+    }
 
     #[test]
     fn test_openrouter_request_uses_request_model_override() {

@@ -131,6 +131,14 @@ impl WorkspaceBinding {
         open_file_no_follow(&parent, &name)
     }
 
+    /// Open a retained-capability regular file without following links or
+    /// blocking on a FIFO swapped into its name.
+    pub(crate) fn open_regular_relative(&self, path: &Path) -> io::Result<std::fs::File> {
+        let path = self.normalize_relative(path)?;
+        let (parent, name) = self.open_parent(&path, false)?;
+        open_file_no_follow_impl(&parent, &name, true)
+    }
+
     /// Return the workspace-relative prefix of `path` whose final component is
     /// a symbolic link (or Windows reparse point), if any.
     ///

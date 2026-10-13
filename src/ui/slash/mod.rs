@@ -145,6 +145,7 @@ impl SlashCtx<'_> {
     /// Enter a different logical session and rebuild every agent-owned tool
     /// against that session's fresh, configuration-scoped runtime state.
     pub async fn replace_session(&mut self, mut session: Session) -> anyhow::Result<()> {
+        session = crate::session::catalogue::for_workspace(session, self.workspace)?;
         let provider_changed = session.provider != self.session.provider;
         session.working_dir =
             compact_str::CompactString::new(self.workspace.root().to_string_lossy());
@@ -161,6 +162,19 @@ impl SlashCtx<'_> {
             self.client.clone()
         };
         let next_agent = self.build_agent_for_client(&next_client, &session).await;
+
+        self.workspace.validate().map_err(anyhow::Error::msg)?;
+        if let Some(permission) = self.permission {
+            let entries: Vec<_> = session
+                .permission_allowlist
+                .iter()
+                .map(|entry| (entry.tool.to_string(), entry.pattern.to_string()))
+                .collect();
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .replace_session_allowlist(&entries);
+        }
 
         *self.client = next_client;
         *self.agent = Some(next_agent);
@@ -383,6 +397,42 @@ pub fn undo_last(session: &mut Session) -> usize {
     session.rewind_to(start)
 }
 
+pub(super) fn show_compaction_summary(renderer: &mut Renderer, session: &Session) {
+    let Some(summary) = session.compacted_context().0 else {
+        write_result(renderer, "no active compaction summary");
+        return;
+    };
+    let mut end = summary.len().min(64 * 1024);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = crate::ui::events::sanitize_output(&summary[..end]);
+    write_result(
+        renderer,
+        format!(
+            "previous summary ({} lines):\n{}",
+            summary.lines().count(),
+            text
+        ),
+    );
+    if session
+        .compactions
+        .last()
+        .is_some_and(|record| record.file_requests.is_imported())
+    {
+        write_result(
+            renderer,
+            "file requests are imported, untrusted historical data; effects are not verified",
+        );
+    }
+    if end < summary.len() {
+        write_result(
+            renderer,
+            "[summary display truncated; saved recap unchanged]",
+        );
+    }
+}
+
 fn summarizer_input_budget(context_window: u64, reserve: u64) -> u64 {
     if context_window == 0 {
         128_000
@@ -512,6 +562,17 @@ pub async fn handle_compress(
         ),
         C_AGENT,
     )?;
+    // render_session above already displayed the full active recap. Add an
+    // explicit manual-completion hint without printing the same body twice.
+    if !auto && let Some(summary) = ui.session.compacted_context().0 {
+        write_result(
+            renderer,
+            format!(
+                "previous summary ({} lines, /compact show)",
+                summary.lines().count()
+            ),
+        );
+    }
 
     Ok(())
 }
@@ -578,6 +639,7 @@ where
         .map(|compaction| compaction.summary.to_string());
     let crate::provider::CompactionOutput {
         summary,
+        summary_byte_budget,
         messages_included,
         usage,
     } = summarize(
@@ -595,7 +657,12 @@ where
         .map(|message| message.estimated_tokens)
         .sum();
     stage_summary(&summary, first_kept_index);
-    session.compress(summary, first_kept_index, tokens_before);
+    session.compress_with_budget(
+        summary,
+        first_kept_index,
+        tokens_before,
+        summary_byte_budget,
+    );
     Ok((first_kept_index, tokens_before, usage))
 }
 
@@ -690,8 +757,9 @@ pub(crate) fn routes_to_providers(command: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_slash(
+pub(crate) async fn handle_slash(
     text: &str,
+    selected_session: Option<Box<Session>>,
     renderer: &mut Renderer,
     input: &mut InputEditor,
     run: &mut AgentRunState,
@@ -738,6 +806,13 @@ pub async fn handle_slash(
         #[cfg(feature = "mcp")]
         mcp_manager: ui.mcp_manager.as_ref(),
     };
+
+    if let Some(session) = selected_session {
+        return crate::startup::heap_future(|| {
+            session::resume_selected_session(*session, &mut ctx)
+        })
+        .await;
+    }
 
     match parts[0] {
         "/models-add" => {
@@ -822,6 +897,22 @@ pub async fn handle_slash(
             Ok(())
         }
         _ => {
+            if let Some(name) = parts[0].strip_prefix('/')
+                && let Some(template) =
+                    crate::context::commands::load_for_workspace(ctx.workspace).remove(name)
+            {
+                let arguments = text
+                    .trim_start()
+                    .strip_prefix(parts[0])
+                    .unwrap_or("")
+                    .trim_start()
+                    .to_string();
+                return Err(crate::context::commands::DeferredCustomCommand {
+                    template,
+                    arguments,
+                }
+                .into());
+            }
             write_error(
                 ctx.renderer,
                 format!("unknown command: {} (try /help)", parts[0]),
@@ -883,6 +974,7 @@ mod compaction_budget_tests {
 
     fn output(summary: &str, messages_included: usize) -> crate::provider::CompactionOutput {
         crate::provider::CompactionOutput {
+            summary_byte_budget: 16 * 1024,
             summary: summary.to_string(),
             messages_included,
             usage: crate::event::UsageDelta::default(),
@@ -1030,7 +1122,7 @@ mod compaction_budget_tests {
     }
 
     #[tokio::test]
-    async fn compaction_summarizer_sees_pruned_results_but_their_calls() {
+    async fn compaction_summarizer_sees_retained_results_and_their_calls() {
         let mut session = Session::new("openai", "model", 10_000, "");
         for index in 0..2 {
             let id = format!("call-{index}");
@@ -1052,16 +1144,18 @@ mod compaction_budget_tests {
                 assert_eq!(messages.len(), 4, "tool calls must not be dropped");
                 assert_eq!(messages[0].role, MessageRole::ToolCall);
                 assert_eq!(messages[2].role, MessageRole::ToolCall);
-                assert!(messages[1].content.contains("[result cleared:"));
+                assert!(messages[1].content.contains("full-output-0"));
                 assert!(messages[3].content.contains("full-output-1"));
-                Ok(output("PRUNED_SUMMARY", 4))
+                Ok(output("UNPRUNED_SUMMARY", 4))
             },
             |_, _| {},
         )
         .await
         .unwrap();
 
-        assert_eq!(session.messages[0].content, "PRUNED_SUMMARY");
+        assert!(session.messages[0].content.starts_with("UNPRUNED_SUMMARY"));
+        assert!(session.messages[0].content.contains("file-0"));
+        assert!(session.messages[0].content.contains("file-1"));
     }
 
     #[test]

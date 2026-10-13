@@ -56,6 +56,15 @@ pub fn render_session(
                     .unwrap_or(0),
             ),
         );
+        if let Some(summary) = session.compacted_context().0 {
+            feed.push_line(
+                BlockStyle::System,
+                format!(
+                    "previous summary ({} lines, /compact show)",
+                    summary.lines().count()
+                ),
+            );
+        }
         feed.push_line(BlockStyle::Plain, "");
     }
     push_session_messages(feed, &session.messages, cfg);

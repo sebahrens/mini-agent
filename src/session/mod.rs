@@ -1,4 +1,6 @@
+pub(crate) mod catalogue;
 pub mod chat_history;
+pub(crate) mod compaction;
 pub mod lock;
 pub mod storage;
 pub mod title;
@@ -475,6 +477,8 @@ impl Clone for HistoryConversionCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Compaction {
+    #[serde(default)]
+    pub(crate) file_requests: compaction::FileRequests,
     pub summary: CompactString,
     pub first_kept_index: usize,
     pub summarized_count: usize,
@@ -1249,7 +1253,7 @@ impl Session {
         }
     }
 
-    fn charge_usage_delta_at(
+    pub(crate) fn charge_usage_delta_at(
         &mut self,
         usage: crate::event::UsageDelta,
         anthropic_native: bool,
@@ -1821,8 +1825,45 @@ impl Session {
         (None, 0)
     }
 
-    pub fn compress(&mut self, mut summary: String, first_kept_index: usize, token_savings: u64) {
+    pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        self.apply_compaction(summary, first_kept_index, token_savings, 16 * 1024);
+    }
+
+    pub(crate) fn compress_with_budget(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        token_savings: u64,
+        summary_byte_budget: usize,
+    ) {
+        if summary_byte_budget >= 16 * 1024 {
+            self.compress(summary, first_kept_index, token_savings);
+        } else {
+            self.apply_compaction(
+                summary,
+                first_kept_index,
+                token_savings,
+                summary_byte_budget,
+            );
+        }
+    }
+
+    fn apply_compaction(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        token_savings: u64,
+        summary_byte_budget: usize,
+    ) {
         let memory_ref = CompactString::new(compaction_ref(&summary));
+        let mut file_requests = self
+            .compactions
+            .last()
+            .filter(|_| self.compacted_context().0.is_some())
+            .map(|previous| previous.file_requests.clone())
+            .unwrap_or_default();
+        file_requests.extend(&self.messages[..first_kept_index]);
+        let mut summary = file_requests.attach(&summary, summary_byte_budget);
         if let Some(todo_context) = self.todos.critical_context() {
             summary.push_str("\n\n");
             summary.push_str(&todo_context);
@@ -1858,6 +1899,7 @@ impl Session {
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
 
         self.compactions.push(Compaction {
+            file_requests,
             summary: CompactString::from(summary),
             first_kept_index: 1, // The summary is at index 0
             summarized_count,
@@ -1895,15 +1937,16 @@ impl Session {
     pub fn compaction_input(
         &self,
         cut_idx: usize,
-        keep_recent_tool_results: usize,
+        _keep_recent_tool_results: usize,
     ) -> (usize, Vec<SessionMessage>) {
         let skipped = match self.compacted_context() {
             (Some(_), 1) if cut_idx > 1 => 1,
             _ => 0,
         };
-        let messages = self.context_messages_with_pruned_tool_results(keep_recent_tool_results)
-            [skipped..cut_idx]
-            .to_vec();
+        // The live model projection may clear old results; the summarizer
+        // instead sees the retained transcript, under its own rolling budget.
+        // Spill paths remain metadata. No private artifacts are re-read.
+        let messages = self.messages[skipped..cut_idx].to_vec();
         (skipped, messages)
     }
 

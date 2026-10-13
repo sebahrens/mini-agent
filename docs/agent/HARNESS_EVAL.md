@@ -54,3 +54,21 @@ cargo test --no-default-features --features js,skills,sandbox,subagents \
 The test records forty non-production oracle outcomes and links only the twenty library-arm rows
 to a durably invoked skill. Its equal metric delta is a library-invocation regression check, not a
 claim of real-model utility. See [GYM.md](GYM.md) for the separate operator runner and its limits.
+
+The regular `five_native_reads_survive_unpruned_fake_provider_compaction_and_history_roundtrip`
+regression reads five owned fixture files through the native read tool, sends the
+retained results to an actual scripted Rig summarizer request with live projection
+retention set to zero, serializes/restores and rewinds/redoes the session, and
+verifies the next model request still contains all five historical read-request
+paths and the retained tail. Provider usage is charged once. The scripted model
+intentionally omits the names from its prose so the structural file inventory is
+required for the continuation proof. No paid provider is contacted.
+
+The process regression
+`headless_compaction_instructions_and_retained_read_history_reach_actual_provider`
+resumes a saved session against a bounded local HTTP fixture. It proves
+`--compact-instructions` reaches every summarizer request, zero live-result
+retention does not clear five retained details before summarization, the next
+provider request includes all five paths, and summarizer plus turn usage is
+persisted exactly once. These are context-delivery regressions, rather than an
+assessment of real-model summary quality.

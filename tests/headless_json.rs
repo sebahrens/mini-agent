@@ -245,13 +245,29 @@ impl TempRoot {
         } else {
             ""
         };
+        let privacy = match outcome {
+            "schema_privacy" => {
+                "extra_body={provider={data_collection=\"deny\",allow_fallbacks=false,require_parameters=true,order=[\"backend-a\"],ignore=[\"backend-b\"],only=[\"backend-a\"],zdr=true,enforce_distillable_text=false}}\n"
+            }
+            "schema_effect_bad_privacy" => {
+                "extra_body={provider={data_collection=\"PRIVATE_SCHEMA_CANARY\"}}\n"
+            }
+            _ => "",
+        };
+        let protocol = if !privacy.is_empty() {
+            "openrouter"
+        } else {
+            "openai"
+        };
         std::fs::write(self.0.join("config.toml"), format!(
-            "{verification_config}[custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
+            "session_title_model=\"off\"\n{verification_config}{privacy}[custom_providers.local-test]\nprovider_type=\"{protocol}\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
         )).unwrap();
         let session_path = self.0.join("sessions");
         let waiting = self.0.join("provider.waiting");
         std::thread::spawn(move || -> io::Result<()> {
-            let requests = if matches!(
+            let requests = if outcome == "compaction" {
+                17
+            } else if matches!(
                 outcome,
                 "partial_failure"
                     | "partial_wait"
@@ -270,6 +286,23 @@ impl TempRoot {
                     | "flood_reasoning_after_tool"
                     | "gated_partial_failure"
                     | "gated_transient_failure"
+                    | "schema_effect_repair"
+                    | "schema_effect_cancel"
+                    | "schema_effect_bad_privacy"
+                    | "schema_privacy"
+            ) {
+                if outcome == "schema_effect_bad_privacy" {
+                    2
+                } else if outcome.starts_with("schema_effect_") {
+                    3
+                } else {
+                    2
+                }
+            } else if outcome == "schema_exhausted" {
+                3
+            } else if matches!(
+                outcome,
+                "schema_unknown_tool" | "schema_budget" | "schema_effect_bad_privacy"
             ) {
                 2
             } else {
@@ -316,6 +349,8 @@ impl TempRoot {
                 }
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body)?;
+                let compaction_request = outcome == "compaction"
+                    && String::from_utf8_lossy(&body).contains("<transcript>");
                 std::fs::write(
                     session_path
                         .parent()
@@ -338,8 +373,23 @@ impl TempRoot {
                     | "permission_deny"
                     | "permission_ask"
                     | "permission_readonly" => Some(&["write"]),
+                    "schema_effect_repair"
+                    | "schema_effect_cancel"
+                    | "schema_effect_bad_privacy" => Some(if index < 2 { &["write"] } else { &[] }),
+                    "schema_exhausted" | "schema_valid" | "schema_budget" | "schema_privacy" => {
+                        Some(&[])
+                    }
+                    "schema_unknown_tool" => Some(if index == 0 { &["write"] } else { &[] }),
                     _ => None,
                 };
+                if outcome.starts_with("schema_") {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).map_err(io::Error::other)?;
+                    assert!(
+                        request.get("output_config").is_none(),
+                        "custom gateway must not receive unsupported Anthropic fields"
+                    );
+                }
                 if let Some(expected) = expected_tools {
                     let request: serde_json::Value =
                         serde_json::from_slice(&body).map_err(io::Error::other)?;
@@ -355,6 +405,7 @@ impl TempRoot {
                     );
                 }
                 if outcome == "initial_wait"
+                    || (outcome == "schema_effect_cancel" && index == 2)
                     || (index == 1 && matches!(outcome, "partial_wait" | "second_wait"))
                 {
                     std::fs::write(&waiting, "ready")?;
@@ -393,7 +444,15 @@ impl TempRoot {
                 let (status, content_type, body) = if failed {
                     (if outcome == "gated_transient_failure" { "500 Internal Server Error" } else { "400 Bad Request" }, "application/json", r#"{"error":{"message":"local provider failure","type":"invalid_request_error"}}"#.to_owned())
                 } else {
-                    let partial = (outcome.starts_with("permission_") && index == 0)
+                    let partial = ((outcome.starts_with("permission_")
+                        || matches!(
+                            outcome,
+                            "schema_effect_repair"
+                                | "schema_effect_cancel"
+                                | "schema_effect_bad_privacy"
+                        ))
+                        && index == 0)
+                        || (outcome == "schema_unknown_tool" && index == 1)
                         || matches!(
                             outcome,
                             "partial_failure" | "partial_wait" | "active_command"
@@ -415,10 +474,19 @@ impl TempRoot {
                             "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
                         })
                     };
-                    let content = if shell {
+                    let content = if outcome == "schema_valid"
+                        || (outcome == "schema_effect_repair" && index == 2)
+                        || (outcome == "schema_privacy" && index == 1)
+                    {
+                        r#"{"value":7}"#.to_string()
+                    } else if outcome.starts_with("schema_") && !partial {
+                        r#"{"value":"wrong type"}"#.to_string()
+                    } else if shell {
                         String::new()
                     } else if partial {
                         "partial reply".to_string()
+                    } else if compaction_request {
+                        "## Task\ncontinue\n## Decisions\nkeep work\n## Files\nsee recorded history\n## Open Items\nfinish\n## Next Step\ncontinue".to_string()
                     } else if outcome == "large_completed" {
                         "x".repeat(2 * 1024 * 1024)
                     } else {
@@ -474,6 +542,31 @@ impl TempRoot {
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )?;
+                if outcome == "compaction" && !compaction_request {
+                    break;
+                }
+            }
+            if matches!(outcome, "schema_unknown_tool" | "schema_budget") {
+                // Stay alive until the child exits. Any uncounted follow-up
+                // gets a terminal response and an observable witness file.
+                let done = waiting.with_file_name("schema.fixture_done");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !done.exists() && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            std::fs::write(
+                                waiting.with_file_name("schema.extra_request"),
+                                "unexpected follow-up",
+                            )?;
+                            socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+                            socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")?;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
             Ok(())
         })
@@ -1740,7 +1833,7 @@ fn scripted_provider(
     std::fs::write(
         root.0.join("config.toml"),
         format!(
-            "{extra_config}\n\
+            "session_title_model=\"off\"\n{extra_config}\n\
              [custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n\
              [custom_providers.judge-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
         ),
@@ -3394,7 +3487,12 @@ fn cli_permission_seeds_allow_exact_effects_deny_and_fail_closed_without_saved_g
     struct ProviderOwner(Option<std::thread::JoinHandle<std::io::Result<()>>>);
     impl ProviderOwner {
         fn join(&mut self) {
-            assert!(self.0.take().unwrap().join().unwrap().is_ok());
+            self.0
+                .take()
+                .unwrap()
+                .join()
+                .expect("schema provider thread panicked")
+                .expect("schema provider fixture failed");
         }
     }
     impl Drop for ProviderOwner {
@@ -3550,4 +3648,638 @@ fn cli_permission_seed_print_config_lists_effective_rules_without_shell_secrets(
     }
     assert!(!stdout.contains("PRIVATE_RULE_CANARY"), "{stdout}");
     assert!(!root.0.join("sessions").exists());
+}
+
+#[test]
+fn headless_compaction_instructions_and_retained_read_history_reach_actual_provider() {
+    // Every provider request is loopback-only, captured and bounded. Join on
+    // unwind too; a failed consumer cannot leave a fixture server behind.
+    struct JoinedProvider(Option<std::thread::JoinHandle<std::io::Result<()>>>);
+    impl JoinedProvider {
+        fn finish(mut self) {
+            self.0.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    impl Drop for JoinedProvider {
+        fn drop(&mut self) {
+            if let Some(server) = self.0.take() {
+                let _ = server.join();
+            }
+        }
+    }
+    let root = TempRoot::new();
+    let seed_server = JoinedProvider(Some(root.local_provider("completed")));
+    let mut seed = root.provider_command("");
+    seed.args(["--output", "json", "-p", "seed history"]);
+    let output = bounded_output(seed);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    seed_server.finish();
+    let mut saved = root.saved_session();
+    let id = saved["id"].as_str().unwrap().to_string();
+    let messages = saved["messages"].as_array_mut().unwrap();
+    for index in 0..5 {
+        let call_id = format!("read-{index}");
+        let path = format!("retained-file-{index}.txt");
+        let result = format!("UNPRUNED_DETAIL_{index} {}", "x".repeat(4000));
+        messages.push(serde_json::json!({"role":"tool_call","content":"bounded call display","estimated_tokens":20,"tool_call_id":call_id,"tool":{"kind":"call","name":"read","arguments":{"path":path}}}));
+        messages.push(serde_json::json!({"role":"tool_result","content":"bounded result display","estimated_tokens":1000,"tool_call_id":call_id,"tool":{"kind":"result","output":result}}));
+    }
+    messages.push(serde_json::json!({"role":"assistant","content":"historical turn completed","estimated_tokens":10}));
+    let count = messages.len();
+    saved["calibrated_tokens"] = 24000.into();
+    saved["calibrated_msg_count"] = count.into();
+    saved["calibrated_tool_results_cleared"] = 0.into();
+    saved["context_window"] = 16000.into();
+    let file = std::fs::read_dir(root.0.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    std::fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let server = JoinedProvider(Some(root.local_provider("compaction")));
+    let config = root.0.join("config.toml");
+    let custom = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(config, format!("compact_enabled=true\ncontext_window=16000\nreserve_tokens=2048\nkeep_recent_tokens=0\nkeep_recent_tool_results=0\n{custom}")).unwrap();
+    let mut command = root.provider_command("");
+    command.args([
+        "--session",
+        &id,
+        "--compact-instructions",
+        "preserve exact filenames and blockers",
+        "--output",
+        "json",
+        "-p",
+        "continue history",
+    ]);
+    let output = bounded_output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.finish();
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["result"], "finished");
+    let requests: Vec<serde_json::Value> = (0..17)
+        .map(|index| root.0.join(format!("request-{index}.json")))
+        .take_while(|path| path.exists())
+        .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+        .collect();
+    assert!(
+        requests.len() >= 2,
+        "compaction and model turn must both run"
+    );
+    let summaries: Vec<_> = requests[..requests.len() - 1]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect();
+    assert!(
+        summaries
+            .iter()
+            .all(|request| request.contains("preserve exact filenames and blockers"))
+    );
+    let summarized = summaries.join("\n");
+    let continuation = requests.last().unwrap().to_string();
+    for index in 0..5 {
+        assert!(
+            summarized.contains(&format!("UNPRUNED_DETAIL_{index}")),
+            "read {index} cleared before summarizer"
+        );
+        assert!(
+            continuation.contains(&format!("retained-file-{index}.txt")),
+            "file {index} lost from next model context"
+        );
+    }
+    let persisted = root.saved_session();
+    assert_eq!(persisted["compactions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        persisted["compactions"][0]["file_requests"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        answer["usage"]["input_tokens"].as_u64().unwrap(),
+        100 * requests.len() as u64
+    );
+    assert_eq!(
+        persisted["total_input_tokens"].as_u64().unwrap(),
+        100 * (requests.len() as u64 + 1)
+    );
+}
+
+struct SchemaProviderOwner(Option<std::thread::JoinHandle<std::io::Result<()>>>);
+impl SchemaProviderOwner {
+    fn finish(&mut self) {
+        assert!(self.0.take().unwrap().join().unwrap().is_ok());
+    }
+}
+impl Drop for SchemaProviderOwner {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+fn schema_file(root: &TempRoot) -> std::path::PathBuf {
+    let path = root.0.join("answer-schema.json");
+    std::fs::write(&path, r#"{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}"#).unwrap();
+    path
+}
+
+#[test]
+fn output_schema_local_provider_positive_repair_and_exhaustion_keep_accounting_and_effects() {
+    for (outcome, streaming, expected_calls) in [
+        ("schema_valid", false, 1),
+        ("schema_effect_repair", false, 3),
+        ("schema_effect_repair", true, 3),
+        ("schema_exhausted", false, 3),
+    ] {
+        let root = TempRoot::new();
+        let path = schema_file(&root);
+        let mut server = SchemaProviderOwner(Some(root.local_provider(outcome)));
+        let mut command = root.provider_command(if outcome.starts_with("schema_effect_") {
+            "write"
+        } else {
+            ""
+        });
+        command
+            .args(["-p", "produce the typed answer", "--output-schema"])
+            .arg(&path);
+        if streaming {
+            command.args(["--output", "stream-json"]);
+        }
+        #[cfg(unix)]
+        if outcome == "schema_effect_repair" && !streaming {
+            // Exercise the full startup + original effect + repair consumer
+            // under the unchanged 1 MiB main-thread stack, as on Windows.
+            let args = command
+                .get_args()
+                .map(std::ffi::OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            let envs = command
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+                .collect::<Vec<_>>();
+            let mut limited = root.command_for("/bin/sh");
+            limited
+                .args([
+                    "-c",
+                    "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                    "schema-stack-probe",
+                ])
+                .arg(env!("CARGO_BIN_EXE_mini-agent"))
+                .args(args);
+            for (key, value) in envs {
+                match value {
+                    Some(value) => {
+                        limited.env(key, value);
+                    }
+                    None => {
+                        limited.env_remove(key);
+                    }
+                }
+            }
+            command = limited;
+        }
+        let output = bounded_output(command);
+        server.finish();
+        assert_eq!(
+            output.status.success(),
+            outcome != "schema_exhausted",
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let result = records.last().unwrap();
+        if streaming {
+            assert_eq!(records[0]["type"], "system");
+            assert_eq!(result["type"], "result");
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record["type"] == "result")
+                    .count(),
+                1
+            );
+            assert!(records.iter().any(|record| {
+                record["type"] == "assistant_text"
+                    && record["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("wrong type"))
+            }));
+        } else {
+            assert_eq!(records.len(), 1);
+        }
+        assert_eq!(result["usage"]["input_tokens"], expected_calls * 100);
+        assert_eq!(result["usage"]["output_tokens"], expected_calls * 20);
+        assert_eq!(result["session_persisted"], true);
+        if outcome == "schema_exhausted" {
+            assert_eq!(result["stop_reason"], "schema_failed");
+            assert!(result["result_json"].is_null());
+        } else {
+            assert_eq!(result["stop_reason"], "completed");
+            assert_eq!(result["result_json"], serde_json::json!({"value":7}));
+        }
+        let saved = root.saved_session();
+        assert_eq!(saved["total_input_tokens"], expected_calls * 100);
+        assert_eq!(saved["total_output_tokens"], expected_calls * 20);
+        let prompts = saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count();
+        assert_eq!(
+            prompts,
+            if outcome.starts_with("schema_effect_") {
+                2
+            } else {
+                expected_calls as usize
+            }
+        );
+        assert_eq!(
+            root.0.join("effect.txt").exists(),
+            outcome.starts_with("schema_effect_")
+        );
+        if outcome.starts_with("schema_effect_") {
+            assert_eq!(result["tool_calls"]["total"], 1);
+            assert_eq!(
+                std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+                "written\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn output_schema_hallucinated_repair_tool_cannot_act_or_launch_another_request() {
+    let root = TempRoot::new();
+    let path = schema_file(&root);
+    let mut server = SchemaProviderOwner(Some(root.local_provider("schema_unknown_tool")));
+    let mut command = root.provider_command("write");
+    command
+        .args(["-p", "produce the typed answer", "--output-schema"])
+        .arg(path);
+    let output = bounded_output(command);
+    std::fs::write(root.0.join("schema.fixture_done"), "child exited").unwrap();
+    server.finish();
+    assert!(!output.status.success());
+    assert!(!root.0.join("effect.txt").exists());
+    assert!(
+        !root.0.join("schema.extra_request").exists(),
+        "empty tools must not hide an extra SDK model turn"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["stop_reason"], "failed");
+    // The SDK rejects the unknown tool before observing the repair's final
+    // usage chunk. Preserve the original observed usage without inventing
+    // tokens from bytes the SDK did not consume.
+    assert_eq!(result["usage"]["input_tokens"], 100);
+    assert_eq!(root.saved_session()["total_input_tokens"], 100);
+}
+
+#[test]
+fn output_schema_preflight_rejects_invalid_or_external_schemas_before_provider_and_effects() {
+    for schema in [
+        r#"{"type":"PRIVATE_SCHEMA_CANARY"}"#,
+        r#"{"$ref":"https://127.0.0.1:1/PRIVATE_SCHEMA_CANARY"}"#,
+        r#"{"$ref":"file:///private/PRIVATE_SCHEMA_CANARY"}"#,
+    ] {
+        let root = TempRoot::new();
+        let path = root.0.join("answer-schema.json");
+        std::fs::write(&path, schema).unwrap();
+        let mut command = root.command();
+        command
+            .args([
+                "-p",
+                "hello",
+                "--provider",
+                "does-not-exist",
+                "--output-schema",
+            ])
+            .arg(path);
+        let output = bounded_output(command);
+        assert!(!output.status.success());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["stop_reason"], "failed");
+        assert!(result["session_id"].is_null());
+        assert_eq!(result["usage"]["total_tokens"], 0);
+        assert!(!root.0.join("sessions").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("PRIVATE_SCHEMA_CANARY") && !stderr.contains("Unknown provider"),
+            "{stderr}"
+        );
+    }
+    for (message, extra) in [
+        ("!printf effect > schema-must-not-run", vec![]),
+        ("hello", vec!["--output", "text"]),
+        ("hello", vec!["--goal", "a goal"]),
+    ] {
+        if extra.contains(&"--goal") && !cfg!(feature = "goal") {
+            continue;
+        }
+        let root = TempRoot::new();
+        let path = schema_file(&root);
+        let mut command = root.command();
+        command
+            .args([
+                "-p",
+                message,
+                "--provider",
+                "does-not-exist",
+                "--output-schema",
+            ])
+            .arg(path)
+            .args(extra);
+        assert!(!bounded_output(command).status.success());
+        assert!(!root.0.join("schema-must-not-run").exists());
+        assert!(!root.0.join("sessions").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn output_schema_cancel_during_repair_keeps_original_effect_and_saved_usage() {
+    use std::io::Read;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+    struct Owned {
+        child: Child,
+        out: Option<std::thread::JoinHandle<Vec<u8>>>,
+        err: Option<std::thread::JoinHandle<Vec<u8>>>,
+        server: SchemaProviderOwner,
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.out.take() {
+                let _ = reader.join();
+            }
+            if let Some(reader) = self.err.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => return bytes,
+                    Ok(n) => {
+                        let keep = n.min((4 * 1024 * 1024usize).saturating_sub(bytes.len()));
+                        bytes.extend_from_slice(&buffer[..keep]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return bytes,
+                }
+            }
+        })
+    }
+    let root = TempRoot::new();
+    let path = schema_file(&root);
+    let server = SchemaProviderOwner(Some(root.local_provider("schema_effect_cancel")));
+    let mut command = root.provider_command("write");
+    command
+        .args(["-p", "produce the typed answer", "--output-schema"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let out = drain(child.stdout.take().unwrap());
+    let err = drain(child.stderr.take().unwrap());
+    let mut owned = Owned {
+        child,
+        out: Some(out),
+        err: Some(err),
+        server,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.0.join("provider.waiting").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(root.0.join("provider.waiting").exists());
+    assert_eq!(
+        root.saved_session()["total_input_tokens"],
+        200,
+        "original progress must be durable before the repair starts"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(owned.child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = owned.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "repair did not cancel");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    let bytes = owned.out.take().unwrap().join().unwrap();
+    let _ = owned.err.take().unwrap().join().unwrap();
+    owned.server.finish();
+    let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["stop_reason"], "failed");
+    assert_eq!(result["usage"]["input_tokens"], 200);
+    assert_eq!(root.saved_session()["total_input_tokens"], 200);
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+        "written\n"
+    );
+}
+
+#[test]
+fn output_schema_repairs_share_the_original_turn_token_budget() {
+    let root = TempRoot::new();
+    let path = schema_file(&root);
+    let mut server = SchemaProviderOwner(Some(root.local_provider("schema_budget")));
+    let config_path = root.0.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(config_path, format!("turn_token_budget=240\n{config}")).unwrap();
+    let mut command = root.provider_command("");
+    command
+        .args(["-p", "produce the typed answer", "--output-schema"])
+        .arg(path);
+    let output = bounded_output(command);
+    std::fs::write(root.0.join("schema.fixture_done"), "child exited").unwrap();
+    server.finish();
+    assert!(!output.status.success());
+    assert!(!root.0.join("schema.extra_request").exists());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["stop_reason"], "failed");
+    assert_eq!(result["usage"]["input_tokens"], 200);
+    assert_eq!(result["usage"]["output_tokens"], 40);
+    assert_eq!(root.saved_session()["total_input_tokens"], 200);
+}
+
+#[cfg(all(unix, feature = "hooks"))]
+#[test]
+fn output_schema_repairs_do_not_repeat_executable_lifecycle_hooks() {
+    let root = TempRoot::new();
+    let path = schema_file(&root);
+    std::fs::write(root.0.join("settings.json"), serde_json::to_vec(&serde_json::json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/bin/sh","args":["-c","printf '%s\\n' original >> schema-hook-marker; printf '{}'"],"trust":"trusted","timeout":5}]}]}})).unwrap()).unwrap();
+    let mut server = SchemaProviderOwner(Some(root.local_provider("schema_effect_repair")));
+    let mut command = root.provider_command("write");
+    command
+        .args(["-p", "produce the typed answer", "--output-schema"])
+        .arg(path);
+    let output = bounded_output(command);
+    server.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker = std::fs::read_to_string(root.0.join("schema-hook-marker")).unwrap();
+    assert_eq!(
+        marker, "original\n",
+        "only the original turn may execute the lifecycle hook"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["usage"]["input_tokens"], 300);
+}
+
+#[cfg(feature = "goal")]
+#[test]
+fn output_schema_resumed_active_goal_rejects_before_provider_or_session_mutation() {
+    let root = TempRoot::new();
+    let path = schema_file(&root);
+    let mut server = SchemaProviderOwner(Some(root.local_provider("schema_valid")));
+    let mut first = root.provider_command("");
+    first.args(["-p", "answer", "--output-schema"]).arg(&path);
+    assert!(bounded_output(first).status.success());
+    server.finish();
+    let session_path = std::fs::read_dir(root.0.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let mut saved = root.saved_session();
+    let id = saved["id"].as_str().unwrap().to_owned();
+    saved["goal_store"] = serde_json::json!({
+        "id":"schema-resume-goal", "objective":"must not execute", "status":"active",
+        "created_at":"2026-10-13T00:00:00Z", "updated_at":"2026-10-13T00:00:00Z"
+    });
+    let before = serde_json::to_vec_pretty(&saved).unwrap();
+    std::fs::write(&session_path, &before).unwrap();
+    let mut resumed = root.command();
+    resumed
+        .args([
+            "-p",
+            "answer",
+            "--session",
+            &id,
+            "--provider",
+            "does-not-exist",
+            "--model",
+            "test",
+            "--output-schema",
+        ])
+        .arg(path);
+    let output = bounded_output(resumed);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot resume an active goal"), "{stderr}");
+    assert!(!stderr.contains("Unknown provider"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["stop_reason"], "failed");
+    assert_eq!(result["usage"]["total_tokens"], 0);
+    assert!(result["session_id"].is_null());
+    assert_eq!(std::fs::read(&session_path).unwrap(), before);
+    assert_eq!(root.saved_session(), saved);
+    assert!(!root.0.join("request-1.json").exists());
+    assert!(!root.0.join("effect.txt").exists());
+}
+
+#[test]
+fn output_schema_passive_openrouter_privacy_is_retained_or_fails_before_auxiliary_requests() {
+    for (outcome, good, cap, unsupported) in [
+        ("schema_privacy", true, 64, false),
+        ("schema_privacy", true, 1000, false),
+        ("schema_effect_bad_privacy", false, 64, false),
+        ("schema_effect_bad_privacy", false, 1000, true),
+    ] {
+        let root = TempRoot::new();
+        let path = schema_file(&root);
+        let mut server = SchemaProviderOwner(Some(root.local_provider(outcome)));
+        if unsupported {
+            let cfg_path = root.0.join("config.toml");
+            let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+            assert!(cfg.contains("provider={data_collection=\"PRIVATE_SCHEMA_CANARY\"}"));
+            std::fs::write(
+                &cfg_path,
+                cfg.replace(
+                    "provider={data_collection=\"PRIVATE_SCHEMA_CANARY\"}",
+                    "provider={zdr=true,unknown=\"PRIVATE_SCHEMA_CANARY\"}",
+                ),
+            )
+            .unwrap();
+        }
+        let cap_text = cap.to_string();
+        let mut command = root.provider_command(if good { "" } else { "write" });
+        command
+            .args(["-p", "answer", "--output-schema"])
+            .arg(path)
+            .args(["--max-tokens", &cap_text]);
+        let output = bounded_output(command);
+        std::fs::write(root.0.join("schema.fixture_done"), "child exited").unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), good, "{stderr}");
+        server.finish();
+        assert!(!root.0.join("schema.extra_request").exists());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["usage"]["input_tokens"], 200);
+        assert_eq!(root.saved_session()["total_input_tokens"], 200);
+        if good {
+            assert_eq!(result["result_json"], serde_json::json!({"value":7}));
+            let request: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.0.join("request-1.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                request["provider"],
+                serde_json::json!({"data_collection":"deny", "allow_fallbacks":false, "require_parameters":true, "order":["backend-a"], "ignore":["backend-b"], "only":["backend-a"],"zdr":true,"enforce_distillable_text":false})
+            );
+            assert_eq!(request["max_tokens"], cap);
+            let primary: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.0.join("request-0.json")).unwrap())
+                    .unwrap();
+            assert_eq!(primary["max_tokens"], cap);
+            assert!(!request.to_string().contains("PRIVATE_SCHEMA_CANARY"));
+        } else {
+            assert_eq!(result["stop_reason"], "failed");
+            assert!(result["result_json"].is_null());
+            assert!(
+                stderr.contains("invalid auxiliary provider routing/privacy constraints"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("PRIVATE_SCHEMA_CANARY"), "{stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+                "written\n"
+            );
+            let messages = root.saved_session()["messages"].as_array().unwrap().clone();
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            );
+        }
+    }
 }

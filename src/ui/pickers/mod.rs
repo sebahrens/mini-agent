@@ -4,6 +4,7 @@ pub(crate) mod handlers;
 pub(crate) mod list;
 pub(crate) mod models;
 pub(crate) mod rewind;
+pub(crate) mod sessions;
 
 use std::io::Write;
 

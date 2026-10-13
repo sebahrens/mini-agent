@@ -31,7 +31,7 @@ fn disabled(artifact: &'static str) -> bool {
     crate::paths::artifact_disabled(artifact)
 }
 
-fn existing_session_dir() -> anyhow::Result<Option<PathBuf>> {
+pub(super) fn existing_session_dir() -> anyhow::Result<Option<PathBuf>> {
     let dir = session_dir();
     match std::fs::symlink_metadata(&dir) {
         Ok(_) => {
@@ -396,6 +396,7 @@ fn session_paths_newest_first(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(entries.into_iter().map(|(_, path)| path).collect())
 }
 
+#[cfg(test)]
 pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     if disabled("sessions") {
         return Ok(Vec::new());

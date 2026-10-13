@@ -351,3 +351,87 @@ identity. Model continuation history excludes this field. The feed sanitizes fil
 controls and uses semantic addition/deletion/hunk styles; HTML escapes the same
 text. Configuration in [CONFIG.md](CONFIG.md#mutation-previews) controls context
 and retained rows, with deterministic byte, input, and matching-work limits.
+
+## Compaction history and file requests
+
+[`src/session/compaction.rs`](../../src/session/compaction.rs) retains a bounded
+historical file-request inventory across compaction, storage, and undo/redo. It
+uses only structured `read`, `write`, and `edit` path inputs from the prefix
+actually summarized, plus the previous structural inventory. Shell text and model
+claims cannot add entries. These are requested operations, never proof of effects
+or current file contents; nested requests retain their separate scope, and
+imported metadata is explicitly untrusted. Up to 128
+records and 16 KiB of names/paths are retained, with a 4096-byte path limit and
+explicit omission counts. The rendered appendix shares the summarizer's existing
+byte partition instead of increasing its context budget. Existing critical TODO
+and goal restatements still append under their existing contracts.
+
+The summarizer receives retained tool results before request-time context pruning.
+Structured request identities/arguments accompany them inside data fences. It
+never opens recorded spill paths, and typed mutation display rows remain excluded
+from the model transcript. Rolling requests retain their existing byte/count/time
+bounds, usage accounting, and partial-prefix drain contract. Summaries use Task,
+Decisions, Files, Open Items, and Next Step sections. `/compact show` exposes the
+active recap; manual compaction prints it and resume reports its line count.
+
+## Headless answer schemas
+
+The request-owned `src/output_schema.rs` module loads and compiles headless answer
+schemas before provider/session initialization. It uses the existing pinned Rust
+`jsonschema` dependency across platforms with retrieval features disabled, an
+explicit denying retriever, linear regex limits, structural/work caps, and bounded
+single-request tool-free repairs. It never executes QuickJS in the parent. The
+owning CLI, envelope, limits, and cancellation contracts are documented in
+[GET_STARTED.md](GET_STARTED.md#5-cli-flags). No production process-launch site
+is added: formatting repairs use the existing owned native provider stream path.
+
+## Custom slash-template loading
+
+[`src/context/commands.rs`](../../src/context/commands.rs) separates authored
+metadata and body segments before expansion. It uses the captured workspace and
+private process configuration root, bounded no-follow regular-file opens, and
+existing exact project/config/SHA trust bindings. Structured includes use the
+current side-effect-free read authority before any one-shot or model mutation;
+Ask remains fail-closed while slash dispatch owns the UI event loop. No read
+tracker, doom-loop counter, hook one-shot or permission grant is consumed by
+this check. Untrusted arguments and included data are never reparsed as
+metadata, include references, slash dispatch or shell commands. The command
+picker, help and real App submission share this loader. The older ambient
+project trust loaders are unchanged; their separate special-file/bounding audit
+is tracked as `mini-agent-i7ro6.95`.
+
+
+## Session catalogue and owned title work
+
+[`src/session/catalogue.rs`](../../src/session/catalogue.rs) reads private,
+no-follow, single-link UUID session files through bounded metadata discovery:
+2,048 directory entries, 8 MiB per file, 64 MiB total, and 100 displayed rows.
+Oversized or unsafe files are skipped with a visible catalogue notice. Stored
+workspace strings are labels; they are never canonicalized or opened. Selection
+reloads the exact bounded private record and verifies identity, unchanged scope,
+and the retained current workspace before admission. Same-workspace private
+resume retains its trusted history/grants/redo through claim-or-fork ownership;
+an explicitly selected foreign record forks visible history into the current
+workspace with a fresh ID, no old permission grants, and no hidden redo.
+
+[`src/ui/pickers/sessions.rs`](../../src/ui/pickers/sessions.rs) owns the key and
+filter state for the startup and in-app pickers. In-app drawing uses the
+renderer-owned writer and checked geometry; the startup picker owns and restores
+its terminal attachment before any provider is constructed.
+
+[`src/session/title.rs`](../../src/session/title.rs) captures title model prices
+and usage independently of conversation context calibration. Its provider
+stream observer records reported usage before validating the text or rejecting
+unexpected tool calls; there is no title tool dispatcher. The App retains a
+join handle, session ID, generation, and captured workspace for each title task,
+and cancels/joins it before replacement, worktree changes, or teardown. Late
+results cannot title a successor session. Headless title work is awaited after
+the actual turn is saved; observed usage survives empty answers, errors, and
+interruption. Auxiliary titles use the shared passive provider-parameter filter:
+raw tool/MCP/container capabilities, unknown gateway fields, retained server
+state, messages, model/cap overrides, and native format injection never reach
+the title wire; typed reasoning, generation, routing, and privacy settings remain.
+Declared OpenRouter routing/privacy constraints are validated before any title
+request; malformed or unsupported values, or use with another protocol, fail closed and keep the
+first-message fallback without inventing usage.
+See [CONFIG.md](CONFIG.md) for the default model and opt-out.

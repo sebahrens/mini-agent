@@ -44,6 +44,16 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
             write_result(ctx.renderer, text);
         }
     });
+    let commands = crate::context::commands::load_for_workspace(ctx.workspace);
+    if !commands.is_empty() {
+        write_ok(ctx.renderer, "custom prompt commands:");
+        for (name, command) in commands {
+            write_result(
+                ctx.renderer,
+                format!("  /{name} [arguments]  {}", command.description),
+            );
+        }
+    }
 }
 
 /// Every line `/help` prints, in order; `true` marks a section heading.

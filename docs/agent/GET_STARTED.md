@@ -296,10 +296,12 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
+| `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |
 | `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. |
 | `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
-| `-r`, `--resume` | Print recent sessions across workspaces and exit, including the saved workspace and a title from its name, an opt-in generated title (`session_title_model`), or its first message. Use `--session <id-or-name>` to load one. |
+| `-r`, `--resume` | Open a workspace-scoped session picker in a terminal. Tab explicitly toggles All workspaces, Enter resumes, and Esc cancels. Without a terminal, list bounded current-workspace rows and exit without provider work. |
+| `--resume-all` | With `--resume`, include foreign workspaces. Selecting foreign history forks it into the current workspace without foreign approvals or hidden redo. |
 | `--name <name>` | Name a new session or rename the selected session with `--continue`/`--session`. Renames are saved unless `--no-session` is set. |
 | `--session <id-or-name>` | Load a session: an exact ID or exact (case-insensitive) name wins, otherwise a unique ID prefix or name substring. A session another running process owns is continued in a forked copy. |
 | `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |
@@ -394,6 +396,66 @@ completion: text the agent wrote before a tool call is saved as its own message 
 is not prepended to `result`, matching the interactive transcript. A goal round that ends with an
 accepted `goal_report` and no closing text completes with an empty `result` rather than being
 retried as an empty response.
+
+`--output-schema FILE` enables a typed JSON answer in plain `-p` mode:
+
+```bash
+mini-agent -p --output-schema answer.schema.json "Extract the requested fields"
+```
+
+Without `--output`, this selects the JSON envelope. `--output stream-json` keeps
+candidate text/tool/usage events in observed order; candidates may be invalid,
+so consume only the final `result_json` as the validated value. The existing
+`result` string, usage, cost, effects, and session identity remain present.
+A valid answer adds `result_json`; exhausted validation emits `result_json: null`,
+`stop_reason: "schema_failed"`, and a nonzero exit. Provider, cancellation,
+persistence, and token-budget failures keep `stop_reason: "failed"`.
+The initial agent retains its ordinary tools. Up to two additional, single-request
+format repairs have no tools, skills, verification commands, child launchers, or
+executable prompt/stop lifecycle hooks. The original turn keeps all its hooks.
+Repairs preserve known generation/reasoning/privacy controls and owned OpenRouter
+routing. OpenRouter `provider.data_collection` (`allow`/`deny`), boolean
+`allow_fallbacks`/`require_parameters`, and `order`/`ignore`/`only` lists also survive;
+lists are capped at 16 nonempty, control-free names of at most 128 UTF-8 bytes.
+Malformed declared constraints, or known constraints on another protocol, fail
+before an auxiliary request; unknown routing keys are dropped. Arbitrary
+`extra_body` extensions, hosted tools, state/container
+handles, request-message replacements, and raw format/token-cap overrides are
+not forwarded. The repair token cap and any native schema format are host-owned.
+Their requests consume the same remaining turn-token budget, including observed
+auto-compaction usage. Automatic transport
+or SDK follow-ups are disabled for repairs; a repair provider failure ends the run. Each rejected
+answer and its observed usage are saved before a repair starts, preserving
+original effects on cancellation; repairs do not repeat tools. `--no-session`
+still disables every session save.
+
+This initial scope rejects ACP, loops, operator `!commands`, explicit text or
+pure-stdout output, and active goals (including a resumed goal), before any
+model/effect work. Schema files compile before provider or session initialization.
+Schema files must be regular UTF-8 JSON, at most 64 KiB. Validation supports the
+validator's bundled standard drafts, bounded acyclic local JSON-pointer `$ref`s,
+and linear regex syntax. External/file references, resource IDs, named/encoded
+anchors, dynamic/recursive refs, and backtracking-only regex features are rejected;
+no schema resource can be fetched. Schemas and answers have depth 32 caps;
+schema nodes/reference expansion are capped at 512, answer nodes at 4,096,
+and their validation-work product at 1,000,000. Answers must be exactly one JSON
+value, at most 256 KiB; no Markdown stripping or coercion occurs. Format checks
+are enabled, with unknown formats rejected. Over-limit answers cannot enter repair.
+
+Native Anthropic formatting is enabled only at the built-in official endpoint,
+without custom-provider entries, for `claude-opus-5-5`, `claude-sonnet-5-5`,
+`claude-haiku-5-5`, `claude-opus-4-6`, and `claude-sonnet-4-6`. Its conservative
+schema subset permits closed objects, basic scalar/array types, scalar enums and
+constants, with at most 24 optional fields; other constraints use local validation
+and tool-free repairs. Custom gateways receive no automatic native fields.
+All responses are still validated locally, including native output.
+The [Anthropic format contract](https://platform.claude.com/docs/en/build-with-claude/structured-outputs),
+[OpenRouter routing/privacy contract](https://openrouter.ai/docs/guides/routing/provider-selection),
+and [pinned Rust validator options](https://docs.rs/jsonschema/0.49.9/jsonschema/struct.ValidationOptions.html)
+define the supported wire shape and offline/linear validation controls.
+Auxiliary requests preserve typed OpenRouter `zdr` and `enforce_distillable_text`
+constraints alongside the documented routing allowlist. Unsupported or malformed
+provider preferences stop the auxiliary request; they are never silently removed.
 
 In text mode, closing stdout early (for example `mini-agent -p ... | head -5`) no longer aborts
 the run: output stops, the turn finishes, and the session is still saved.

@@ -1537,6 +1537,13 @@ impl PermissionChecker {
         }
     }
 
+    pub(crate) fn replace_session_allowlist(&mut self, entries: &[(String, String)]) {
+        self.session_allowlist.clear();
+        self.last_call = None;
+        self.consecutive_repeat_count = 0;
+        self.load_session_allowlist(entries);
+    }
+
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
             let tool = canonical_permission_tool(tool).to_string();
@@ -4281,5 +4288,46 @@ mod workspace_edit_grant_tests {
             CheckResult::Denied(_)
         ));
         assert!(checker.hook_decision_is_pending(17) && checker.hook_decision_is_pending(18));
+    }
+}
+
+#[cfg(test)]
+mod resumed_session_allowlist_tests {
+    use super::*;
+    #[test]
+    fn replacing_session_grants_removes_outgoing_scope_and_preserves_denies_and_mode() {
+        let root = crate::tests::OwnedTestDirectory::new("session-grant-replacement");
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [("never".to_owned(), Action::Deny)].into(),
+                )),
+                ..Default::default()
+            }),
+            SecurityMode::Guarded,
+            Some(root.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("bash".into(), "old-command");
+        assert_eq!(checker.check("bash", "old-command"), CheckResult::Allowed);
+        #[cfg(feature = "hooks")]
+        checker.allow_once_scoped("write".into(), 123);
+        checker.replace_session_allowlist(&[
+            ("bash".into(), "new-command".into()),
+            ("bash".into(), "never".into()),
+        ]);
+        #[cfg(feature = "hooks")]
+        assert!(
+            checker.hook_decision_is_pending(123),
+            "session allowlist replacement cannot consume invocation tokens"
+        );
+        assert_eq!(checker.mode(), SecurityMode::Guarded);
+        assert_eq!(checker.check("bash", "old-command"), CheckResult::Ask);
+        assert_eq!(checker.check("bash", "new-command"), CheckResult::Allowed);
+        assert!(matches!(
+            checker.check("bash", "never"),
+            CheckResult::Denied(_)
+        ));
     }
 }

@@ -862,6 +862,17 @@ impl Renderer {
         crossterm::terminal::size()
     }
 
+    pub(crate) fn draw_picker_with(
+        &mut self,
+        paint: impl FnOnce(&mut dyn std::io::Write, u16, u16, Option<Color>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (cols, _) = self.checked_draw_size()?;
+        let floor = self.picker_floor_row();
+        let bg = self.chat_bg;
+        let mut writer = self.writer();
+        paint(&mut writer, cols, floor, bg)
+    }
+
     fn max_line_width(&self) -> usize {
         let (cols, _) = self.terminal_size();
         cols.saturating_sub(1 + self.chat_margin) as usize

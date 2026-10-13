@@ -112,6 +112,33 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
     cmds
 }
 
+/// Reserve builtins even when their optional feature is disabled, so a
+/// template never silently changes meaning after a feature/build switch.
+pub(crate) fn reserved_command(name: &str) -> bool {
+    let slash = format!("/{name}");
+    BASE_COMMANDS.contains(&slash.as_str())
+        || COMMAND_ALIASES.iter().any(|(alias, _)| *alias == slash)
+        || [
+            "/advisor",
+            "/export",
+            "/import",
+            "/share",
+            "/goal",
+            "/worktree",
+            "/wt-exit",
+            "/wt-merge",
+            "/hooks",
+            "/loop",
+            "/mcp",
+            "/subagent-model",
+            "/subagent-models",
+            "/diff",
+            "/commit",
+            "/pr",
+        ]
+        .contains(&slash.as_str())
+}
+
 /// Rank how `name` matches a lowercase `query`, lower is better, or `None` when
 /// it does not contain the query. A leading `/` is ignored so `/re` and `re`
 /// rank the same: exact name, then prefix, then a match starting at a word
@@ -171,6 +198,16 @@ impl ListPicker {
         let mut picker = ListPicker::new();
         picker.items = available_commands().iter().map(|s| s.to_string()).collect();
         picker
+    }
+
+    pub(crate) fn append_described_items(&mut self, entries: Vec<(String, String)>) {
+        self.descriptions.resize(self.items.len(), String::new());
+        for (name, description) in entries {
+            if !self.items.contains(&name) {
+                self.items.push(name);
+                self.descriptions.push(description);
+            }
+        }
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {

@@ -168,11 +168,13 @@ fn assert_complete_read_and_current_spill(session: &mut Session, requests: &[Val
 #[tokio::test]
 async fn replacement_binds_incoming_owners_and_preserves_active_authority_on_failure() {
     for provider_changed in [false, true] {
-        exercise_replacement(provider_changed).await;
+        for foreign in [false, true] {
+            exercise_replacement(provider_changed, foreign).await;
+        }
     }
 }
 
-async fn exercise_replacement(provider_changed: bool) {
+async fn exercise_replacement(provider_changed: bool, foreign: bool) {
     let root = FixtureRoot(std::env::temp_dir().canonicalize().unwrap().join(format!(
         "mini-agent-session-restore-{}",
         uuid::Uuid::new_v4()
@@ -349,7 +351,11 @@ async fn exercise_replacement(provider_changed: bool) {
         "openrouter"
     };
     let mut incoming = Session::new(incoming_provider, "incoming-model", 256_000, "incoming");
-    incoming.working_dir = root.0.join("foreign").to_string_lossy().as_ref().into();
+    incoming.working_dir = if foreign {
+        root.0.join("foreign").to_string_lossy().as_ref().into()
+    } else {
+        workspace.root().to_string_lossy().as_ref().into()
+    };
     let incoming_id = incoming.id.clone();
     let incoming_spill = crate::session::storage::save_tool_output(
         &incoming_id,
@@ -364,17 +370,58 @@ async fn exercise_replacement(provider_changed: bool) {
         .put("owner".into(), "\"incoming\"".into())
         .unwrap();
     ctx.replace_session(incoming).await.unwrap();
+    if foreign {
+        assert_ne!(
+            ctx.session.id, incoming_id,
+            "foreign history gets a fresh owner"
+        );
+    } else {
+        assert_eq!(
+            ctx.session.id, incoming_id,
+            "same-workspace owner is retained"
+        );
+    }
+    // A foreign history fork cannot read its source's private namespace.
+    // Create a separately owned artifact under the new session, then exercise
+    // actual allowed current-owner and denied source-owner reads below.
+    let active_spill = if foreign {
+        crate::session::storage::save_tool_output(
+            &ctx.session.id,
+            "fixture_unbounded_tool",
+            "INCOMING_SESSION_SPILL",
+        )
+        .unwrap()
+    } else {
+        incoming_spill.clone()
+    };
+    let other_spill = if foreign {
+        &incoming_spill
+    } else {
+        &outgoing_spill
+    };
+    #[cfg(feature = "js")]
+    let active_scratch = ctx.session.js_session_state.for_workspace(workspace.root());
+    #[cfg(feature = "js")]
+    if foreign {
+        assert!(active_scratch.get("owner").unwrap().is_none());
+        assert_eq!(
+            incoming_scratch.get("owner").unwrap().as_deref(),
+            Some("\"incoming\"")
+        );
+        active_scratch
+            .put("owner".into(), "\"incoming\"".into())
+            .unwrap();
+    }
     let after = run_probe(
         ctx.agent.as_ref().unwrap(),
         &listener,
         "after",
         js,
-        &incoming_spill,
-        &outgoing_spill,
+        &active_spill,
+        other_spill,
     )
     .await;
     assert_eq!(after[0]["model"], "incoming-model");
-    assert_eq!(ctx.session.id, incoming_id);
     assert_ne!(ctx.session.id, outgoing_id);
     assert_eq!(
         ctx.session.working_dir.as_str(),
@@ -408,11 +455,15 @@ async fn exercise_replacement(provider_changed: bool) {
             Some("\"before\"")
         );
         assert_eq!(
-            incoming_scratch.get("last_probe").unwrap().as_deref(),
+            active_scratch.get("last_probe").unwrap().as_deref(),
             Some("\"after\"")
         );
     }
     assert_complete_read_and_current_spill(ctx.session, &after, "INCOMING_SESSION_SPILL");
+    #[cfg(feature = "js")]
+    if foreign {
+        assert!(incoming_scratch.get("last_probe").unwrap().is_none());
+    }
 
     let saved = serde_json::to_value(&*ctx.session).unwrap();
     let mut invalid = Session::new(
@@ -431,8 +482,8 @@ async fn exercise_replacement(provider_changed: bool) {
         &listener,
         "recovered",
         js,
-        &incoming_spill,
-        &outgoing_spill,
+        &active_spill,
+        other_spill,
     )
     .await;
     assert_eq!(recovered[0]["model"], "incoming-model");
@@ -447,7 +498,7 @@ async fn exercise_replacement(provider_changed: bool) {
     #[cfg(feature = "js")]
     if js {
         assert_eq!(
-            incoming_scratch.get("last_probe").unwrap().as_deref(),
+            active_scratch.get("last_probe").unwrap().as_deref(),
             Some("\"recovered\"")
         );
         assert_eq!(

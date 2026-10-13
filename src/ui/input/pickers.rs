@@ -13,6 +13,7 @@ pub enum Picker {
     Prefixed(ListPicker, &'static str),
     Models(ModelsPicker),
     Rewind(RewindPicker),
+    Sessions(crate::ui::pickers::sessions::SessionsPicker),
     /// `!` at the start of the input: previously run shell commands.
     Bang(ListPicker),
 }
@@ -25,6 +26,7 @@ impl Picker {
             Picker::Prefixed(p, _) => p.active,
             Picker::Models(p) => p.active,
             Picker::Rewind(p) => p.active(),
+            Picker::Sessions(p) => p.active,
             Picker::Bang(p) => p.active,
         }
     }
@@ -51,7 +53,20 @@ impl Picker {
             Picker::Prefixed(p, _) => p.set_monochrome(monochrome),
             Picker::Models(p) => p.set_monochrome(monochrome),
             Picker::Rewind(p) => p.set_monochrome(monochrome),
+            Picker::Sessions(p) => p.set_monochrome(monochrome),
             Picker::Bang(p) => p.set_monochrome(monochrome),
+        }
+    }
+
+    pub(crate) fn draw_with_renderer(
+        &mut self,
+        renderer: &mut crate::ui::renderer::Renderer,
+    ) -> std::io::Result<()> {
+        if let Picker::Sessions(picker) = self {
+            renderer
+                .draw_picker_with(|writer, cols, floor, bg| picker.draw(writer, cols, floor, bg))
+        } else {
+            self.draw(renderer.picker_floor_row())
         }
     }
 
@@ -71,6 +86,9 @@ impl Picker {
             }
             Picker::Models(p) => p.draw(floor_row),
             Picker::Rewind(p) => p.draw(floor_row),
+            Picker::Sessions(_) => Err(std::io::Error::other(
+                "sessions picker requires its renderer",
+            )),
             // A new command has no history match; stay out of the way
             // instead of announcing "no matches" for every keystroke.
             Picker::Bang(p) if p.matches.is_empty() => Ok(()),
@@ -101,14 +119,16 @@ impl InputEditor {
         if self
             .picker
             .as_ref()
-            .is_some_and(|p| p.active() && !matches!(p, Picker::Rewind(_)))
+            .is_some_and(|p| p.active() && !matches!(p, Picker::Rewind(_) | Picker::Sessions(_)))
         {
             self.picker = None;
         }
     }
 
     pub fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
-        if is_caret_editing_key(key) && !matches!(self.picker, Some(Picker::Rewind(_))) {
+        if is_caret_editing_key(key)
+            && !matches!(self.picker, Some(Picker::Rewind(_) | Picker::Sessions(_)))
+        {
             // Leave the key unconsumed so the editor moves the caret or
             // deletes in plain-text mode.
             self.close_query_picker();
@@ -155,6 +175,7 @@ impl InputEditor {
                 handlers::handle_models_key(&mut self.buffer, &mut self.cursor, p, key)
             }
             Some(Picker::Rewind(p)) => p.handle(key),
+            Some(Picker::Sessions(p)) => p.handle(key),
             Some(Picker::Bang(p)) => {
                 bang::handle_bang_key(&mut self.buffer, &mut self.cursor, p, key)
             }

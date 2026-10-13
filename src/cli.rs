@@ -58,6 +58,13 @@ fn parse_system_prompt_argument(value: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("system prompt file {path:?} is not UTF-8"))
 }
 
+fn parse_compact_instructions(value: &str) -> Result<String, String> {
+    if value.len() > 4096 {
+        return Err("compaction instructions exceed 4096 UTF-8 bytes".into());
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     #[default]
@@ -82,6 +89,12 @@ pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
     pub print: bool,
 
+    #[arg(long, requires = "print", value_name = "TEXT", value_parser = parse_compact_instructions,
+        help = "With -p: bounded preference for automatic history compaction")]
+    #[cfg_attr(feature = "loop", arg(conflicts_with = "loop_mode"))]
+    #[cfg_attr(feature = "acp", arg(conflicts_with = "acp_enabled"))]
+    pub compact_instructions: Option<String>,
+
     #[arg(
         long = "pure-stdout",
         help = "With -p: also print tool calls/results to stdout"
@@ -105,6 +118,18 @@ pub struct Cli {
         help = "With -p: output format (text, json, or stream-json)"
     )]
     pub output: Option<OutputFormat>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "print",
+        conflicts_with = "pure_stdout",
+        help = "With plain -p: validate the JSON answer against a local schema"
+    )]
+    pub output_schema: Option<std::path::PathBuf>,
+
+    #[arg(skip)]
+    pub(crate) loaded_output_schema: Option<std::sync::Arc<crate::output_schema::OutputSchema>>,
 
     #[arg(long = "load-prompt", help = "Load a named prompt (same as /prompt)")]
     pub load_prompt: Option<String>,
@@ -585,8 +610,23 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
     pub continue_session: bool,
 
-    #[arg(short = 'r', long = "resume", help = "List recent sessions")]
+    #[arg(
+        short = 'r',
+        long = "resume",
+        conflicts_with = "continue_session",
+        help = "Pick a recent workspace session (list and exit without a terminal)"
+    )]
     pub resume: bool,
+
+    #[arg(
+        long,
+        requires = "resume",
+        help = "Include other workspaces in the resume picker or listing"
+    )]
+    pub resume_all: bool,
+
+    #[arg(skip)]
+    pub(crate) resume_selection: Option<Box<crate::session::catalogue::ResumeSelection>>,
 
     #[arg(long = "session", help = "Load session by ID prefix or exact name")]
     pub session: Option<String>,
@@ -1018,7 +1058,13 @@ impl Cli {
     }
 
     pub fn output_format(&self) -> OutputFormat {
-        self.output.unwrap_or_default()
+        self.output.unwrap_or_else(|| {
+            if self.output_schema.is_some() {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Text
+            }
+        })
     }
 
     pub(crate) fn is_loop_mode(&self) -> bool {
@@ -2408,5 +2454,77 @@ output_token_cost = 0.0
             "distillation writes the package --import-learned-skill later reads; they are two \
              separate operator steps"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_instruction_tests {
+    use super::*;
+    #[test]
+    fn compact_preferences_require_print_and_reject_oversized_utf8() {
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "-p",
+            "--compact-instructions",
+            "preserve filenames",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.compact_instructions.as_deref(),
+            Some("preserve filenames")
+        );
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--compact-instructions", "preserve filenames"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "-p",
+                "--compact-instructions",
+                &"é".repeat(2049),
+                "hello"
+            ])
+            .is_err()
+        );
+        #[cfg(feature = "loop")]
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "-p",
+                "--loop",
+                "--compact-instructions",
+                "filenames",
+                "hello"
+            ])
+            .is_err()
+        );
+        #[cfg(feature = "acp")]
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "-p",
+                "--acp",
+                "--compact-instructions",
+                "filenames",
+                "hello"
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_picker_cli_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn resume_all_is_explicit_and_cannot_conflict_with_continue() {
+        let cli = Cli::try_parse_from(["mini-agent", "--resume", "--resume-all"]).unwrap();
+        assert!(cli.resume && cli.resume_all);
+        assert!(cli.resume_selection.is_none());
+        assert!(Cli::try_parse_from(["mini-agent", "--resume-all"]).is_err());
+        assert!(Cli::try_parse_from(["mini-agent", "--resume", "--continue"]).is_err());
     }
 }

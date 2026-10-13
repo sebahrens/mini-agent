@@ -798,6 +798,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/context/commands.rs",
+        "let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
         "src/cli.rs",
         "tokio::process::Command::new(std::env::current_exe().unwrap());",
         1,
@@ -865,6 +871,8 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned fixed-stack App selection test uses std::thread, not a subprocess.
+    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",
@@ -1604,6 +1612,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/context/commands.rs",
+        "assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/context/commands.rs",
+        "output.exit_status.unwrap().success(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/context/commands.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        1,
+        "NON-PROCESS",
+    ),
     // These inline shell tests inspect captured String output, not commands.
     (
         "src/agent/tools/bash.rs",
@@ -2723,6 +2749,19 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/context/commands.rs",
+        &[
+            (
+                "5da17685a5478627a5d0018f0bb97c840787645dfa5b8b84ba358081a56e9437",
+                1,
+            ),
+            (
+                "70251d766c54234bccb37237bbe744c2708d4881514462d0453c064fdb069eb4",
+                1,
+            ),
+        ],
+    ),
     // CLI executor output fields and todo labels are data. Full macro tokens
     // bind these exemptions; constructors remain TEST-ONLY, not exempted here.
     (
@@ -3844,6 +3883,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/context/commands.rs",
+        "let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());",
+        1,
+        "TEST-ONLY",
+    ),
     // reqwest response status is HTTP metadata, never a process terminal.
     (
         "src/update.rs",
@@ -4085,6 +4130,8 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned fixed-stack App selection test uses std::thread, not a subprocess.
+    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",

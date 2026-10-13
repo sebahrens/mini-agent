@@ -9,6 +9,9 @@ use std::sync::atomic::AtomicBool;
 
 mod private;
 
+#[cfg(unix)]
+pub(crate) use private::current_uid as private_current_uid;
+
 #[cfg(all(test, unix))]
 pub(crate) use private::atomic_write_with_failure as private_atomic_write_with_failure_sync;
 #[cfg(all(test, windows))]

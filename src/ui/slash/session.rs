@@ -434,19 +434,11 @@ fn rename_session_mutation(session: &mut crate::session::Session, name: &str) ->
 }
 
 async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if parts.len() < 2 {
-        let sessions = crate::session::storage::find_recent_sessions(20)?;
-        if sessions.is_empty() {
-            write_ok(ctx.renderer, "no saved sessions");
-        } else {
-            write_ok(
-                ctx.renderer,
-                format!("recent sessions ({}):", sessions.len()),
-            );
-            for s in &sessions {
-                write_result(ctx.renderer, format_session_line(s));
-            }
-        }
+    if parts.len() < 2 || parts[1] == "--all" {
+        let all = parts.get(1) == Some(&"--all");
+        let catalogue = crate::session::catalogue::list(ctx.workspace, all)?;
+        ctx.input
+            .start_session_picker(catalogue, ctx.workspace.clone(), all);
     } else if parts[1] == "delete" && parts.len() >= 3 {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
@@ -495,32 +487,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
             }
             crate::session::storage::SessionSelection::One(s) => {
-                let s = *s;
-                let msg_count = s.messages.len();
-                // Loading a session another live process owns continues in a
-                // fork rather than overwriting its turns (mini-agent-e42za).
-                let (s, notice) = if ctx.cli.no_session || s.id == ctx.session.id {
-                    (s, None)
-                } else {
-                    let resumed = crate::session::lock::claim_or_fork(s)?;
-                    (resumed.session, resumed.notice)
-                };
-                let previous_id = ctx.session.id.clone();
-                let incoming_id = s.id.clone();
-                if let Err(error) = ctx.replace_session(s).await {
-                    if incoming_id != previous_id {
-                        crate::session::lock::release_session(&incoming_id);
-                    }
-                    return Err(error);
-                }
-                if previous_id != ctx.session.id {
-                    crate::session::lock::release_session(&previous_id);
-                }
-                render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
-                if let Some(notice) = notice {
-                    write_error(ctx.renderer, notice);
-                }
-                write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
+                crate::startup::heap_future(|| resume_selected_session(*s, ctx)).await?;
             }
             crate::session::storage::SessionSelection::Ambiguous(sessions) => {
                 write_ok(
@@ -533,6 +500,50 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) async fn resume_selected_session(
+    s: crate::session::Session,
+    ctx: &mut SlashCtx<'_>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !*ctx.is_running,
+        "finish or stop the current turn before resuming a session"
+    );
+    let foreign = !crate::session::catalogue::same_workspace(&s.working_dir, ctx.workspace);
+    let s = crate::session::catalogue::for_workspace(s, ctx.workspace)?;
+    let msg_count = s.messages.len();
+    // Loading a session another live process owns continues in a
+    // fork rather than overwriting its turns (mini-agent-e42za).
+    let (s, notice) = if ctx.cli.no_session || s.id == ctx.session.id {
+        (s, None)
+    } else {
+        let resumed = crate::session::lock::claim_or_fork(s)?;
+        (resumed.session, resumed.notice)
+    };
+    let previous_id = ctx.session.id.clone();
+    let incoming_id = s.id.clone();
+    if let Err(error) = ctx.replace_session(s).await {
+        if incoming_id != previous_id {
+            crate::session::lock::release_session(&incoming_id);
+        }
+        return Err(error);
+    }
+    if previous_id != ctx.session.id {
+        crate::session::lock::release_session(&previous_id);
+    }
+    render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
+    if let Some(notice) = notice {
+        write_error(ctx.renderer, notice);
+    }
+    if foreign {
+        write_ok(
+            ctx.renderer,
+            "foreign history forked into current workspace; approvals and hidden redo removed",
+        );
+    }
+    write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
     Ok(())
 }
 

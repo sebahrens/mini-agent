@@ -130,7 +130,7 @@ pub(crate) fn arm_prompt_grant(name: &str, context: &ContextFiles, permission: &
 }
 
 /// Apply an already-parsed `%%mode=` directive to the permission checker.
-fn apply_mode_directive(
+pub(crate) fn apply_mode_directive(
     mode_directive: Option<&str>,
     permission: &Option<PermCheck>,
 ) -> PromptModeOutcome {
@@ -260,7 +260,7 @@ pub(crate) fn refresh_display(
     )?;
     if let Some(ref mut picker) = input.picker {
         let was_active = picker.active();
-        picker.draw(renderer.picker_floor_row())?;
+        picker.draw_with_renderer(renderer)?;
         if was_active {
             // Drawing the list moved the caret; put it back in the input.
             renderer.restore_bottom_cursor()?;

@@ -1132,6 +1132,88 @@ pub(crate) fn project_config_is_trusted(project_config: Option<&Path>, trust_sto
     store.bindings.contains(&binding)
 }
 
+/// Template discovery uses the existing path/SHA trust contract, reading
+/// only bounded regular files through retained capabilities. This does not
+/// change the older ambient config loader or its trust consumers.
+pub(crate) fn project_config_is_trusted_in_workspace(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    fn checked(
+        paths: &crate::paths::AppPaths,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Result<bool, String> {
+        workspace.validate()?;
+        let relative = Path::new(".zerostack/config.toml");
+        let file = workspace
+            .open_regular_relative(relative)
+            .map_err(|e| e.to_string())?;
+        let crate::paths::BoundedUtf8Read::Content(content) =
+            crate::paths::read_utf8_bounded_status(file, 256 * 1024).map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let binding = project_config_binding(&workspace.root().join(relative), &content)?;
+        if Path::new(&binding.canonical_project) != workspace.root()
+            || Path::new(&binding.canonical_config) != workspace.root().join(relative)
+        {
+            return Ok(false);
+        }
+        let store_path = paths.project_config_trust_file();
+        let parent = store_path.parent().ok_or("trust store has no parent")?;
+        // Existing private persistence owns this directory. Absent state is
+        // never created merely by template discovery.
+        if !parent.exists() {
+            return Ok(false);
+        }
+        crate::fs::ensure_private_directory(parent).map_err(|e| e.to_string())?;
+        let directory =
+            crate::paths::WorkspaceBinding::capture(parent).map_err(|e| e.to_string())?;
+        if directory.root() != parent {
+            return Ok(false);
+        }
+        let file = directory
+            .open_regular_relative(Path::new(
+                store_path.file_name().ok_or("trust store has no name")?,
+            ))
+            .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            // A private parent alone cannot authenticate a foreign-owned or
+            // hardlinked inode. Reuse the persistence owner's exact UID policy.
+            let uid = crate::fs::private_current_uid();
+            if metadata.uid() != uid || metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
+                return Ok(false);
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Preserve the existing private owner/DACL/reparse contract and
+            // prove it validated the exact retained regular-file descriptor.
+            let private = crate::fs::open_private_file(&store_path).map_err(|e| e.to_string())?;
+            crate::fs::ensure_same_file(
+                &store_path,
+                &crate::fs::checked_file_metadata(&file).map_err(|e| e.to_string())?,
+                &crate::fs::checked_file_metadata(&private).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let crate::paths::BoundedUtf8Read::Content(content) =
+            crate::paths::read_utf8_bounded_status(file, 1024 * 1024).map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let store: ProjectConfigTrustStore =
+            serde_json::from_str(&content).map_err(|_| "invalid trust store")?;
+        workspace.validate()?;
+        directory.validate()?;
+        Ok(store.schema == PROJECT_CONFIG_TRUST_SCHEMA && store.bindings.contains(&binding))
+    }
+    checked(paths, workspace).unwrap_or(false)
+}
+
 /// Record trust for `project_config` exactly as an interactive approval would.
 #[cfg(test)]
 pub(crate) fn trust_project_config(

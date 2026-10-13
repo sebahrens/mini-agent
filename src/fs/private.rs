@@ -280,7 +280,7 @@ fn prepare_write(path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
     }

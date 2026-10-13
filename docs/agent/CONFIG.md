@@ -597,7 +597,7 @@ Accepted top-level keys:
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
-| `session_title_model`     | string  | Opt-in, unset by default. A `quick_models` entry name that titles each interactive session for `--resume` and `/sessions`: after the first completed exchange it is sent the first user message and reply (bounded) in the background, and its short answer is stored in the session. The UI never waits for it; until it answers, or if it fails, lists keep the first-message title, and a session name always wins. Each session is asked once; headless runs and `--no-session` are not titled, and the call is not added to the session cost. Sensitive: it decides where that exchange is sent. |
+| `session_title_model` | string | Defaults to the session provider/model. Set `"off"` (or an empty string) to keep first-message titles without a title request; a `quick_models` alias selects a trusted override. After the first completed exchange, a no-tools request receives at most 2,000 bytes of the first user message and 1,000 bytes of the first reply, with a 64-token output cap and a 20-second deadline. Interactive generation runs as owned background work; headless saves title afterward. Names always win. Observed title usage is charged once at captured title-model prices, including on failure or cancellation; it does not change conversation context calibration. `--no-session` skips titles. Model/provider overrides remain sensitive project configuration. |
 | `goal`                    | object  | Goal defaults: `judge` (`"auto"`, `"off"`, `"session"`, or a `quick_models` name), `continuation` (`"continue"` or `"restart"`), `max_rounds` (50), `max_tokens`, `max_active_secs`, `no_progress_rounds` (3), `blocked_rounds` (3), `wrap_up_max_agent_turns` (4), `reinject_every` (6), `judge_every` (5), `check_every_round` (false: run checks only on a completion claim; true also runs them every round as feedback). Benign: every field bounds how long the harness keeps working or who reviews a claim, and none of them widens what may run. |
 | `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt. Default: `300`; clamped to `1..=3600`. |
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
@@ -1098,8 +1098,9 @@ verbatim. A cleared result tells the model to re-run the tool; when the original
 result was spilled to disk, the notice retains its recorded spill-file path.
 This is a request-time projection only: session exports, undo/redo state, and
 the spill file keep the original result. If the projected context is still over
-budget, the same cleared projection is passed to the summarizer before the
-ordinary compaction flow runs.
+budget, compaction summarizes the retained, unpruned session prefix under its
+separate bounded rolling input budget. It does not open recorded spill files;
+only the output already retained in the session is sent.
 
 By default mini-agent only compacts the conversation *between* turns, after a
 response finishes, when the accumulated session history exceeds
@@ -1143,9 +1144,13 @@ goal is running, compaction during a round counts toward that round's tokens
 and the goal's `max_tokens` bound (TUI, headless, and ACP); a manual
 `/compress` between rounds is charged to the session only. ACP keeps no session
 cost ledger, so there it counts toward a goal only. A compaction that fails is
-not charged for the requests it completed before failing. The opt-in
-`session_title_model` call is the one model call left out of the session cost
-(see its row above).
+not charged for the requests it completed before failing. Session-title requests
+also charge their observed usage at the title model's
+captured prices, including failed or cancelled requests. Headless JSON reports
+this auxiliary work in `session_title_usage`, separately from the main turn's
+`usage` and `cost` so an override model is never priced as the main model.
+Titles are auxiliary session work outside the main goal-round usage summary;
+their actual charges remain in total Session spend.
 
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
 provider call mini-agent compares the real provider-reported prompt size against

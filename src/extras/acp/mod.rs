@@ -211,6 +211,7 @@ impl SessionHistory {
                 summary,
                 messages_included,
                 usage: pass_usage,
+                ..
             } = match summarized {
                 Ok(result) => result,
                 Err(error) => {
@@ -2270,6 +2271,7 @@ fn compaction_output(
     messages_included: usize,
 ) -> crate::provider::CompactionOutput {
     crate::provider::CompactionOutput {
+        summary_byte_budget: 16 * 1024,
         summary: summary.into(),
         messages_included,
         usage: crate::event::UsageDelta::default(),

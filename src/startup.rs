@@ -533,6 +533,7 @@ async fn compact_headless_session_if_needed(
     cfg: &Config,
     context: &ContextFiles,
     pending_tokens: u64,
+    instructions: Option<&str>,
 ) -> anyhow::Result<crate::event::UsageDelta> {
     #[cfg(not(feature = "memory"))]
     let _ = context;
@@ -548,7 +549,7 @@ async fn compact_headless_session_if_needed(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
-                    None,
+                    instructions,
                     input_token_budget,
                     response_token_budget,
                     &cfg.retry,
@@ -616,6 +617,7 @@ where
         .map(|compaction| compaction.summary.to_string());
     let provider::CompactionOutput {
         summary,
+        summary_byte_budget,
         messages_included,
         usage,
     } = summarize(
@@ -644,7 +646,12 @@ where
             .map(|message| message.estimated_tokens)
             .sum()
     };
-    session.compress(summary.clone(), first_kept_index, tokens_before);
+    session.compress_with_budget(
+        summary.clone(),
+        first_kept_index,
+        tokens_before,
+        summary_byte_budget,
+    );
     Ok(Some(HeadlessCompaction {
         summary,
         first_kept_index,
@@ -783,6 +790,7 @@ impl Startup {
         version_changed: bool,
         is_interactive: bool,
     ) -> anyhow::Result<Self> {
+        crate::output_schema::prepare(&mut cli)?;
         validate_headless_prompt(&cli, workspace.root()).await?;
         use std::io::IsTerminal as _;
         let read_stdin = cli.print
@@ -854,6 +862,15 @@ impl Startup {
 
         let mut session_resumed = false;
 
+        if let Some(selection) = cli.resume_selection.take() {
+            anyhow::ensure!(
+                std::sync::Arc::ptr_eq(&selection.workspace, &workspace),
+                "resume workspace binding changed"
+            );
+            session = session::catalogue::selected(&selection.row, &workspace, selection.all)?;
+            session_resumed = true;
+        }
+
         if cli.continue_session && cli.session.is_none() {
             session = require_recent_session(
                 session::storage::find_recent_sessions_for_workspace(1, workspace.root()),
@@ -880,6 +897,22 @@ impl Startup {
                     anyhow::bail!("be more specific with the session ID prefix");
                 }
             }
+        }
+
+        #[cfg(feature = "goal")]
+        if cli.loaded_output_schema.is_some() && session.goal_store.is_live() {
+            let error = anyhow::anyhow!("--output-schema cannot resume an active goal");
+            crate::print::emit_headless_preflight_failure(
+                &cli,
+                workspace.root(),
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
+
+        if session_resumed {
+            session = session::catalogue::for_workspace(session, &workspace)?;
         }
 
         // Another live process that already owns this session keeps writing
@@ -1561,7 +1594,12 @@ impl Startup {
     }
 
     async fn dispatch_print_inner(mut self) -> anyhow::Result<()> {
-        let msg = self.cli.message.join(" ").trim().to_string();
+        let mut msg = self.cli.message.join(" ").trim().to_string();
+        let schema = self.cli.loaded_output_schema.clone();
+        if let Some(schema) = &schema {
+            msg.push_str("\n\n");
+            msg.push_str(&schema.instructions());
+        }
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -1686,10 +1724,16 @@ impl Startup {
                 &self.cfg,
                 &self.context,
                 pending_tokens,
+                self.cli.compact_instructions.as_deref(),
             )
             .await?;
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
-            let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
+            let extra_body = provider::merge_extra_body(
+                config::resolve_extra_body(&self.cfg, &self.model),
+                schema.as_ref().and_then(|schema| {
+                    schema.native_params(&self.session.provider, &self.model, &self.cfg)
+                }),
+            );
             let completion_model = self.client.completion_model(self.model.to_string());
             let read_tracker = self.session.read_tracker.clone();
             let todo_store = self.session.todos.clone();
@@ -1759,7 +1803,7 @@ impl Startup {
             // Construct the child in heap_future's short frame; Box::pin alone
             // still reserves its temporary in this parent poll frame. The
             // regression consumer uses the unchanged 1 MiB default stack.
-            let response_result = heap_future(|| {
+            let mut response_result = heap_future(|| {
                 run_headless_goal_rounds(
                     &agent,
                     &mut self.session,
@@ -1776,6 +1820,21 @@ impl Startup {
                 )
             })
             .await;
+            let schema_outcome = if let Some(schema) = &schema {
+                Box::pin(crate::output_schema::repair_rounds(
+                    &mut response_result,
+                    schema,
+                    &self.client,
+                    &self.cli,
+                    &self.cfg,
+                    &mut self.session,
+                    output,
+                    compaction_usage,
+                ))
+                .await
+            } else {
+                crate::output_schema::SchemaOutcome::default()
+            };
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
             }
@@ -1790,7 +1849,7 @@ impl Startup {
                         response,
                         usage,
                         interactions,
-                        failure,
+                        mut failure,
                     },
                 prompt: recorded_prompt,
                 persisted: already_persisted,
@@ -1825,6 +1884,7 @@ impl Startup {
             #[cfg(feature = "goal")]
             let finished_goal = self.session.goal_store.snapshot();
             let mut persistence_failure = None;
+            let mut title_accounting = None;
             if !self.cli.no_session {
                 let mut session = self.session;
                 // Prompt, then tool calls/results in provider order, then the
@@ -1847,6 +1907,30 @@ impl Startup {
                 if let Err(error) = session::storage::save_session(&session) {
                     persistence_failure = Some(error);
                 } else {
+                    // Persist the actual turn first; title failure cannot lose
+                    // history. This awaited no-tools request owns its work and
+                    // adds observed usage at its captured model prices.
+                    if failure.is_none() {
+                        let cost_before = session.total_cost;
+                        let (title_usage, interrupted) = session::title::generate_for_session(
+                            &mut session,
+                            &self.cfg,
+                            &self.client,
+                        )
+                        .await;
+                        if title_usage.has_values() {
+                            title_accounting = Some(
+                                serde_json::json!({"input_tokens":title_usage.input_tokens,"output_tokens":title_usage.output_tokens,"cached_input_tokens":title_usage.cached_input_tokens,"cache_creation_input_tokens":title_usage.cache_creation_input_tokens,"cost":session.total_cost-cost_before}),
+                            );
+                        }
+                        if interrupted {
+                            failure =
+                                Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
+                        }
+                        if let Err(error) = session::storage::save_session(&session) {
+                            persistence_failure = Some(error);
+                        }
+                    }
                     let _ = session::chat_history::append_entry(
                         &session::chat_history::ChatHistoryEntry {
                             content: msg,
@@ -1858,6 +1942,8 @@ impl Startup {
             if let Some((files_changed, pricing)) = json_context {
                 let stop_reason = if failure.is_some() || persistence_failure.is_some() {
                     crate::print::HeadlessStopReason::Failed
+                } else if schema_outcome.exhausted {
+                    crate::print::HeadlessStopReason::SchemaFailed
                 } else {
                     // A goal that stopped for a reason of its own reports that
                     // reason, so a script can branch on the outcome.
@@ -1874,18 +1960,28 @@ impl Startup {
                         crate::print::HeadlessStopReason::Completed
                     }
                 };
+                let rendered = crate::print::render_headless_json(
+                    self.workspace.root(),
+                    &response,
+                    &interactions,
+                    json_usage,
+                    files_changed,
+                    pricing,
+                    stop_reason,
+                    #[cfg(feature = "goal")]
+                    finished_goal.as_ref(),
+                )?;
+                let mut rendered: serde_json::Value = serde_json::from_str(&rendered)?;
+                if schema.is_some() {
+                    rendered["result_json"] = schema_outcome
+                        .result_json
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                if let Some(accounting) = title_accounting {
+                    rendered["session_title_usage"] = accounting;
+                }
                 crate::print::emit_headless_result(
-                    &crate::print::render_headless_json(
-                        self.workspace.root(),
-                        &response,
-                        &interactions,
-                        json_usage,
-                        files_changed,
-                        pricing,
-                        stop_reason,
-                        #[cfg(feature = "goal")]
-                        finished_goal.as_ref(),
-                    )?,
+                    &rendered.to_string(),
                     output.format,
                     Some((&identity.0, &identity.1)),
                     !self.cli.no_session && persistence_failure.is_none(),
@@ -1923,6 +2019,11 @@ impl Startup {
             }
             if let Some(error) = persistence_failure {
                 return Err(error);
+            }
+            if schema_outcome.exhausted {
+                anyhow::bail!(
+                    "final answer did not satisfy output schema after bounded JSON repairs"
+                );
             }
         }
 
@@ -2920,6 +3021,7 @@ mod tests {
                 assert_eq!(input_budget, 80);
                 assert_eq!(response_budget, 20);
                 Ok(crate::provider::CompactionOutput {
+                    summary_byte_budget: 16 * 1024,
                     summary: "HEADLESS_SUMMARY".to_string(),
                     messages_included: 1,
                     usage: crate::event::UsageDelta::default(),
@@ -2970,6 +3072,7 @@ mod tests {
             None,
             |_, messages, _, _, _| async move {
                 Ok(crate::provider::CompactionOutput {
+                    summary_byte_budget: 16 * 1024,
                     summary: "SUMMARY".to_string(),
                     messages_included: messages.len(),
                     usage,
@@ -3028,6 +3131,7 @@ mod tests {
                 );
                 assert_eq!(messages.len(), 2, "{messages:?}");
                 Ok(crate::provider::CompactionOutput {
+                    summary_byte_budget: 16 * 1024,
                     summary: "NEW_SUMMARY".to_string(),
                     messages_included: messages.len(),
                     usage: crate::event::UsageDelta::default(),

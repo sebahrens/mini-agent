@@ -29,7 +29,7 @@ use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
     copy_to_clipboard, read_from_clipboard,
 };
-use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
+use crate::ui::slash::{apply_prompt_model, handle_compress};
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
@@ -113,6 +113,8 @@ pub(super) mod test_support {
             title_tx,
             title_rx,
             title_requested_for: None,
+            title_generation: 0,
+            title_work: None,
             btw_abort: Vec::new(),
             btw_inflight: 0,
             btw_pricing: BtwPricingSnapshots::default(),
@@ -1029,8 +1031,26 @@ pub(crate) fn interrupt_target(
 
 /// A background session-title call's answer (mini-agent-3wsib).
 struct SessionTitleResult {
+    generation: u64,
     session_id: compact_str::CompactString,
     title: anyhow::Result<compact_str::CompactString>,
+}
+
+struct SessionTitleWork {
+    session_id: compact_str::CompactString,
+    generation: u64,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    provider: compact_str::CompactString,
+    pricing: crate::session::title::TitlePricing,
+    ledger: crate::session::title::UsageLedger,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for SessionTitleWork {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 pub(crate) struct App<'a> {
@@ -1059,6 +1079,8 @@ pub(crate) struct App<'a> {
     /// The session a title was last requested for, so each session is asked
     /// about at most once per process whatever the outcome.
     title_requested_for: Option<compact_str::CompactString>,
+    title_generation: u64,
+    title_work: Option<SessionTitleWork>,
     btw_abort: Vec<(
         u32,
         tokio::task::AbortHandle,
@@ -1121,6 +1143,12 @@ impl<'a> App<'a> {
         let mut input = InputEditor::new();
         input.set_monochrome(ui.cli.no_color);
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
+        input.set_custom_commands(
+            crate::context::commands::load_for_workspace(&ui.workspace)
+                .into_iter()
+                .map(|(name, template)| (format!("/{name}"), template.description))
+                .collect(),
+        );
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
         input.set_theme_names(ui.context.themes.keys().cloned().collect());
         if let Some(editor) = &ui.cfg.editor {
@@ -1468,6 +1496,8 @@ impl<'a> App<'a> {
             title_tx,
             title_rx,
             title_requested_for: None,
+            title_generation: 0,
+            title_work: None,
             btw_abort: Vec::new(),
             btw_inflight: 0,
             btw_pricing: BtwPricingSnapshots::default(),
@@ -1588,7 +1618,8 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 Some(titled) = self.title_rx.recv() => {
-                    self.apply_session_title(titled)?;
+                    self.apply_session_title(titled).await?;
+                    self.refresh()?;
                 }
                 _ = tokio::time::sleep_until(
                     self.renderer.notice_deadline().map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
@@ -1673,6 +1704,9 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn teardown(mut self) {
+        if let Err(error) = self.retire_session_title().await {
+            tracing::warn!(%error,"session title cleanup failed");
+        }
         self.cancel_pending_permissions();
         self.pause_event_thread();
 
@@ -1864,6 +1898,18 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        if self.handle_session_picker_event(&ev).await? {
+            return Ok(ControlFlow::Continue(()));
+        }
+        // Keep the measured large legacy handler out of the new picker poll
+        // and construct it in a short frame without changing event semantics.
+        crate::startup::heap_future(|| self.handle_standard_user_event(ev)).await
+    }
+
+    async fn handle_standard_user_event(
+        &mut self,
+        ev: UserEvent,
+    ) -> anyhow::Result<ControlFlow<(), ()>> {
         // A pending approval is never answered by mode cycling. Pickers keep
         // their own BackTab navigation, and modified shortcuts remain ignored.
         if matches!(&ev, UserEvent::Key(key) if key.code == KeyCode::BackTab
@@ -2107,6 +2153,69 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    async fn handle_session_picker_event(&mut self, event: &UserEvent) -> anyhow::Result<bool> {
+        let handled = match self.input.picker.as_mut() {
+            Some(crate::ui::input::Picker::Sessions(picker)) if picker.active => match event {
+                UserEvent::Key(key) => picker.handle(*key),
+                UserEvent::Paste(text) => {
+                    picker.paste(text);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !handled {
+            return Ok(false);
+        }
+        if let Some(outcome) = self.input.take_session_outcome() {
+            self.input.picker = None;
+            self.renderer.invalidate();
+            match outcome {
+                crate::ui::pickers::sessions::SessionPick::Reload(all) => {
+                    let catalogue = crate::session::catalogue::list(&self.ui.workspace, all)?;
+                    self.input
+                        .start_session_picker(catalogue, self.ui.workspace.clone(), all);
+                }
+                crate::ui::pickers::sessions::SessionPick::Cancelled => {}
+                crate::ui::pickers::sessions::SessionPick::Selected(selection) => {
+                    let selected = (|| -> anyhow::Result<_> {
+                        anyhow::ensure!(
+                            Arc::ptr_eq(&selection.workspace, &self.ui.workspace),
+                            "workspace changed; reopen the session picker"
+                        );
+                        crate::session::catalogue::selected(
+                            &selection.row,
+                            &self.ui.workspace,
+                            selection.all,
+                        )
+                    })();
+                    match selected {
+                        Ok(session) => {
+                            self.retire_session_title().await?;
+                            let command = format!("/sessions {}", selection.row.id);
+                            // Construct the selected-session slash future in
+                            // the short factory frame, not this picker poll.
+                            crate::startup::heap_future(|| {
+                                self.run_slash_command_selected(&command, Some(Box::new(session)))
+                            })
+                            .await?;
+                        }
+                        Err(error) => self.renderer.write_line(
+                            &format!(
+                                "session selection failed: {}",
+                                sanitize_output(&error.to_string())
+                            ),
+                            C_ERROR,
+                        )?,
+                    }
+                }
+            }
+        }
+        self.refresh()?;
+        Ok(true)
+    }
+
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         if self.renderer.selection_active && key.code == KeyCode::Char('y') {
             self.copy_selection_to_clipboard().await?;
@@ -2180,6 +2289,10 @@ impl<'a> App<'a> {
                     .write_line("rewound; /redo to restore", Color::Green)?;
             }
             return Ok(());
+        }
+
+        if key.code == KeyCode::Char('/') && self.input.buffer.is_empty() {
+            self.refresh_custom_commands();
         }
 
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3108,6 +3221,39 @@ impl<'a> App<'a> {
     }
 
     async fn run_slash_command(&mut self, text: &str) -> anyhow::Result<()> {
+        self.run_slash_command_selected(text, None).await
+    }
+
+    async fn run_slash_command_selected(
+        &mut self,
+        text: &str,
+        selected_session: Option<Box<Session>>,
+    ) -> anyhow::Result<()> {
+        if selected_session.is_some()
+            && (self.run.is_running
+                || self.permission_prompt.is_some()
+                || self.run.pending_turn.is_some())
+        {
+            self.renderer.write_line(
+                "finish or stop the current turn before resuming a session",
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
+        let mut command = text.split_whitespace();
+        let name = command.next();
+        let argument = command.next();
+        if selected_session.is_some()
+            || matches!(
+                name,
+                Some("/import" | "/new" | "/clear" | "/rename" | "/worktree")
+            )
+            || name == Some("/sessions")
+                && argument.is_some_and(|arg| arg != "--all" && arg != "delete")
+        {
+            self.retire_session_title().await?;
+        }
+
         for line in text.lines() {
             let safe_line = sanitize_output(line);
             self.renderer
@@ -3122,16 +3268,22 @@ impl<'a> App<'a> {
         if needs_tty {
             self.pause_event_thread();
         }
-        let result = handle_slash(
-            text,
-            &mut self.renderer,
-            &mut self.input,
-            &mut self.run,
-            &mut self.ui,
-            &mut self.slash,
-            &mut self.chain,
-            &mut self.terminal_guard,
-        )
+        // The selected-session branch makes this generic slash future large.
+        // Build it in the short factory frame so it does not inflate every
+        // user-event/event-loop polling frame, including unrelated commands.
+        let result = crate::startup::heap_future(|| {
+            crate::ui::slash::handle_slash(
+                text,
+                selected_session,
+                &mut self.renderer,
+                &mut self.input,
+                &mut self.run,
+                &mut self.ui,
+                &mut self.slash,
+                &mut self.chain,
+                &mut self.terminal_guard,
+            )
+        })
         .await;
         if needs_tty {
             self.rebind_event_thread();
@@ -3165,8 +3317,138 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn refresh_custom_commands(&mut self) {
+        self.input.set_custom_commands(
+            crate::context::commands::load_for_workspace(&self.ui.workspace)
+                .into_iter()
+                .map(|(name, template)| (format!("/{name}"), template.description))
+                .collect(),
+        );
+    }
+
+    async fn submit_custom_command(
+        &mut self,
+        command: crate::context::commands::DeferredCustomCommand,
+    ) -> anyhow::Result<()> {
+        let template = command.template;
+        if template
+            .mode
+            .as_ref()
+            .is_some_and(|mode| !self.ui.context.prompts.contains_key(mode))
+        {
+            self.renderer
+                .write_line("custom command names an unavailable prompt mode", C_ERROR)?;
+            return Ok(());
+        }
+        let message =
+            match template.expand(&command.arguments, &self.ui.workspace, &self.ui.permission) {
+                Ok(message) => message,
+                Err(error) => {
+                    self.renderer
+                        .write_line(&format!("custom command: {error}"), C_ERROR)?;
+                    return Ok(());
+                }
+            };
+        let reserve = self.ui.cfg.resolve_reserve_tokens(
+            &self.ui.session.model,
+            &config::quick_models_map(self.ui.cfg),
+            self.ui.session.context_window,
+        );
+        if self
+            .ui
+            .session
+            .is_irreducible_with_pending(reserve, Session::estimate_tokens(&message))
+        {
+            self.renderer.write_line(
+                "expanded custom command is too large for the current context",
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
+        if let Some(model) = &template.model {
+            let model_command = format!("/model {model}");
+            let result = crate::startup::heap_future(|| {
+                crate::ui::slash::handle_slash(
+                    &model_command,
+                    None,
+                    &mut self.renderer,
+                    &mut self.input,
+                    &mut self.run,
+                    &mut self.ui,
+                    &mut self.slash,
+                    &mut self.chain,
+                    &mut self.terminal_guard,
+                )
+            })
+            .await;
+            if let Err(error) = result {
+                self.renderer.write_line(
+                    &format!(
+                        "custom command model: {}",
+                        sanitize_output(&error.to_string())
+                    ),
+                    C_ERROR,
+                )?;
+                return Ok(());
+            }
+        }
+        if template.mode.is_some() || template.security_mode.is_some() {
+            self.chain.dot_prompt_restore = Some(self.ui.context.active_selection());
+        }
+        if let Some(mode) = &template.mode {
+            if let Some(permission) = &self.ui.permission {
+                permission
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_prompt_grant_offer(None);
+            }
+            // Activate authored prompt selection without arming any embedded
+            // grant offer: templates cannot create implicit permission grants.
+            let directive = self.ui.context.activate_prompt(mode).flatten();
+            super::apply_mode_directive(directive.as_deref(), &self.ui.permission);
+            if template.model.is_none() {
+                apply_prompt_model(
+                    mode,
+                    &mut self.ui,
+                    &mut self.run.agent,
+                    self.slash.reasoning_enabled,
+                    &mut self.renderer,
+                )
+                .await;
+            }
+        }
+        super::apply_mode_directive(template.security_mode.as_deref(), &self.ui.permission);
+        self.ui.invalidate_prebuild();
+        self.run.agent = None;
+        self.echo_main_submission(&message)?;
+        self.start_main_run(&message).await?;
+        if !self.run.is_running
+            && let Some(selection) = self.chain.dot_prompt_restore.take()
+        {
+            self.ui.context.restore_selection(selection);
+            if let Some(permission) = &self.ui.permission {
+                permission
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .restore_user_mode();
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_slash_result(&mut self, result: anyhow::Result<()>) -> anyhow::Result<()> {
         match result {
+            Err(e)
+                if e.downcast_ref::<crate::context::commands::DeferredCustomCommand>()
+                    .is_some() =>
+            {
+                let command = e
+                    .downcast::<crate::context::commands::DeferredCustomCommand>()
+                    .unwrap();
+                // Keep the template child future out of the generic slash
+                // result poll frame, which also carries session-resume work.
+                crate::startup::heap_future(|| self.submit_custom_command(command)).await?;
+            }
             Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                 let err_msg = e.to_string();
                 let instructions = err_msg.strip_prefix("DEFER_COMPRESS:").and_then(|s| {
@@ -3291,6 +3573,7 @@ impl<'a> App<'a> {
                 if e.downcast_ref::<crate::extras::git_worktree::DeferredWorktreeAction>()
                     .is_some() =>
             {
+                self.retire_session_title().await?;
                 let action = e
                     .downcast_ref::<crate::extras::git_worktree::DeferredWorktreeAction>()
                     .unwrap();
@@ -3617,12 +3900,11 @@ impl<'a> App<'a> {
         rendered
     }
 
-    /// Ask the opt-in `session_title_model` for a title once the session's
-    /// first exchange is complete (mini-agent-3wsib). The call runs on its own
-    /// task and reports back through `title_rx`; nothing waits for it, and
-    /// until (or unless) it answers, lists keep the first-message title.
+    /// Title work has a retained join handle, captured prices/root/generation,
+    /// and once-only usage. Main input and streams remain independently live.
     fn request_session_title(&mut self) {
         if self.ui.cli.no_session
+            || self.title_work.is_some()
             || self.title_requested_for.as_deref() == Some(self.ui.session.id.as_str())
         {
             return;
@@ -3631,7 +3913,12 @@ impl<'a> App<'a> {
         else {
             return;
         };
+        if self.ui.workspace.validate().is_err() {
+            return;
+        }
         self.title_requested_for = Some(request.session_id.clone());
+        self.title_generation = self.title_generation.wrapping_add(1);
+        let generation = self.title_generation;
         let client = if request.provider == self.ui.session.provider {
             Ok(self.ui.client.clone())
         } else {
@@ -3642,23 +3929,91 @@ impl<'a> App<'a> {
                 self.ui.cfg.api_keys.as_ref(),
             )
         };
+        let pricing =
+            crate::session::title::TitlePricing::capture(self.ui.cfg, self.ui.session, &request);
+        let ledger = crate::session::title::UsageLedger::default();
+        let observed = ledger.clone();
         let cfg = self.ui.cfg.clone();
         let tx = self.title_tx.clone();
-        tokio::spawn(async move {
+        let id = request.session_id.clone();
+        let provider = request.provider.clone();
+        let task = tokio::spawn(async move {
             let title = match client {
-                Ok(client) => crate::session::title::generate(&request, &client, &cfg).await,
+                Ok(client) => {
+                    crate::session::title::generate(&request, &client, &cfg, observed).await
+                }
                 Err(error) => Err(error),
             };
             let _ = tx
                 .send(SessionTitleResult {
+                    generation,
                     session_id: request.session_id,
                     title,
                 })
                 .await;
         });
+        self.title_work = Some(SessionTitleWork {
+            session_id: id,
+            generation,
+            workspace: self.ui.workspace.clone(),
+            provider,
+            pricing,
+            ledger,
+            task: Some(task),
+        });
     }
 
-    fn apply_session_title(&mut self, titled: SessionTitleResult) -> anyhow::Result<()> {
+    async fn settle_session_title(&mut self, cancel: bool) -> anyhow::Result<()> {
+        let Some(mut work) = self.title_work.take() else {
+            return Ok(());
+        };
+        if let Some(mut task) = work.task.take() {
+            if cancel {
+                task.abort();
+            }
+            // The owned title future has no child jobs. Aborting and awaiting
+            // its handle cancels the provider request before publication.
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        anyhow::ensure!(
+            work.session_id == self.ui.session.id
+                && Arc::ptr_eq(&work.workspace, &self.ui.workspace),
+            "title ownership changed before settlement"
+        );
+        let usage = self
+            .ui
+            .cfg
+            .normalize_usage(&work.provider, work.ledger.take());
+        work.pricing.charge(self.ui.session, usage);
+        if usage.has_values() {
+            self.save_session()?;
+        }
+        Ok(())
+    }
+
+    async fn retire_session_title(&mut self) -> anyhow::Result<()> {
+        self.title_generation = self.title_generation.wrapping_add(1);
+        self.settle_session_title(true).await
+    }
+
+    async fn apply_session_title(&mut self, titled: SessionTitleResult) -> anyhow::Result<()> {
+        if titled.generation != self.title_generation || titled.session_id != self.ui.session.id {
+            return Ok(());
+        }
+        if let Some(work) = &self.title_work
+            && (work.generation != titled.generation
+                || !Arc::ptr_eq(&work.workspace, &self.ui.workspace))
+        {
+            return Ok(());
+        }
+        self.settle_session_title(false).await?;
+        self.ui.workspace.validate().map_err(anyhow::Error::msg)?;
         match titled.title {
             Ok(title) => {
                 if crate::session::title::apply(self.ui.session, &titled.session_id, title) {
@@ -3666,7 +4021,7 @@ impl<'a> App<'a> {
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, "session title generation failed; keeping the first-message title");
+                tracing::debug!(%error,"session title unavailable; keeping first-message fallback")
             }
         }
         Ok(())
@@ -4177,6 +4532,7 @@ impl<'a> App<'a> {
 
     #[cfg(feature = "git-worktree")]
     async fn refresh_worktree_workspace_context(&mut self) -> anyhow::Result<()> {
+        self.refresh_custom_commands();
         apply_current_prompt_mode(self.ui.context, &self.ui.permission);
         #[cfg(feature = "mcp")]
         rebind_mcp_manager(&mut self.ui.mcp_manager, self.ui.cfg, &self.ui.workspace).await;
@@ -5699,6 +6055,7 @@ mod permission_loop_tests {
         sent(
             &app.title_tx,
             SessionTitleResult {
+                generation: app.title_generation,
                 session_id: app.ui.session.id.clone(),
                 title: Ok("BACKGROUND_TITLE".into()),
             },
@@ -6789,5 +7146,651 @@ mod mutation_consumer_tests {
         assert!(
             hidden.contains("write") && !hidden.contains("+newα") && !hidden.contains("-old🙂")
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_visibility_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+
+    #[tokio::test]
+    async fn actual_compact_show_is_read_only_and_sanitizes_the_active_saved_summary() {
+        let root = crate::tests::OwnedTestDirectory::new("compact-show-app");
+        let bindings = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _env = crate::tests::ScopedProcessEnv::set(&bindings);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg:crate::config::Config=serde_json::from_value(serde_json::json!({"custom_providers":{"local-test":{"provider_type":"openai","base_url":"http://127.0.0.1:9/v1","api_style":"completions"}}})).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            Session::new("local-test", "test", 128_000, root.path().to_str().unwrap());
+        session.add_message(crate::session::MessageRole::User, "old turn");
+        session.compress(
+            "## Task\nSHOW_THIS_SUMMARY\x1b]52;c;ZXZpbA==\x07\n## Next Step\ncontinue".into(),
+            1,
+            10,
+        );
+        let before = serde_json::to_vec(&session).unwrap();
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace: workspace.clone(),
+            client: crate::provider::create_client(
+                "local-test",
+                Some("unused-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        app.run_slash_command("/compact show").await.unwrap();
+        let text = app.renderer.captured_output();
+        assert!(text.contains("SHOW_THIS_SUMMARY"));
+        assert!(text.contains("previous summary"));
+        assert!(
+            !text.contains("\x1b]52"),
+            "saved content must not emit a terminal command"
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert!(
+            app.run.main_abort.is_none(),
+            "show must not start a provider turn"
+        );
+        app.run_slash_command("/compact show extra").await.unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("usage: /compact show")
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        crate::ui::events::render_session(
+            &mut app.renderer,
+            app.ui.session,
+            &cli,
+            &cfg,
+            app.ui.context,
+        )
+        .unwrap();
+        assert!(app.renderer.captured_output().contains("/compact show"));
+
+        // Imported/oversized recaps remain stored exactly; display is bounded
+        // and the actual command must not mutate or dispatch a provider turn.
+        app.ui.session.compress("é".repeat(40_000), 1, 1);
+        app.ui
+            .session
+            .compactions
+            .last_mut()
+            .unwrap()
+            .file_requests
+            .mark_imported();
+        let large = serde_json::to_vec(app.ui.session).unwrap();
+        app.run_slash_command("/compact show").await.unwrap();
+        let text = app.renderer.captured_output();
+        assert!(text.contains("summary display truncated; saved recap unchanged"));
+        assert!(text.contains("imported, untrusted historical data"));
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), large);
+        assert!(app.run.main_abort.is_none());
+
+        *app.ui.session = Session::new("local-test", "test", 128_000, "");
+        let empty = serde_json::to_vec(app.ui.session).unwrap();
+        app.run_slash_command("/compact show").await.unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("no active compaction summary")
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), empty);
+        assert!(app.run.main_abort.is_none());
+    }
+}
+
+#[cfg(test)]
+mod custom_command_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+
+    #[tokio::test]
+    async fn actual_custom_slash_submits_one_literal_user_turn_and_restores_one_shot_context() {
+        let root = crate::tests::OwnedTestDirectory::new("custom-slash-app");
+        let bindings = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            api_key: Some("unused-key".into()),
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({"custom_providers":{"local-test":{"provider_type":"openai","base_url":"http://127.0.0.1:9/v1","api_style":"completions"}},"quick_models":{"same":{"provider":"local-test","model":"chosen-model","input_token_cost":2.0,"output_token_cost":4.0}},"retry":{"max_attempts":1}})).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        context
+            .prompts
+            .insert("plan".into(), "ONE_SHOT_PLAN".into());
+        let original = context.active_selection();
+        let paths = crate::paths::process_paths().unwrap();
+        std::fs::create_dir_all(paths.config_dir.join("commands")).unwrap();
+        std::fs::write(paths.config_dir.join("commands/fix-issue.md"), "---\ndescription: Fix an issue\nmode: plan\nmodel: same\n---\n%%mode=readonly\n/clear !touch injected $1\n$ARGUMENTS").unwrap();
+        std::fs::write(
+            paths.config_dir.join("commands/blocked.md"),
+            "---\nmode: plan\nmodel: same\n---\n@missing",
+        )
+        .unwrap();
+        let mut session = Session::new(
+            "local-test",
+            "test-model",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::create_client(
+                "local-test",
+                Some("unused-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        let before = serde_json::to_vec(app.ui.session).unwrap();
+        app.run_slash_command("/blocked").await.unwrap();
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert_eq!(app.ui.context.active_selection(), original);
+        assert!(app.run.main_abort.is_none());
+        std::fs::write(root.path().join("missing"), "PRIVATE_DENIED_CONTENT").unwrap();
+        for action in [
+            crate::permission::Action::Deny,
+            crate::permission::Action::Ask,
+        ] {
+            let policy =
+                crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                    read: Some(crate::permission::ToolPerm::Simple(action)),
+                    ..Default::default()
+                });
+            let checker = crate::permission::checker::PermissionChecker::new(
+                &policy,
+                crate::permission::SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            app.ui.permission = Some(Arc::new(std::sync::Mutex::new(checker)));
+            app.run_slash_command("/blocked").await.unwrap();
+            assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+            assert_eq!(app.ui.context.active_selection(), original);
+            assert_eq!(
+                app.ui.permission.as_ref().unwrap().lock().unwrap().mode(),
+                crate::permission::SecurityMode::Standard
+            );
+            assert!(app.run.main_abort.is_none());
+            assert!(
+                !app.renderer
+                    .captured_output()
+                    .contains("PRIVATE_DENIED_CONTENT")
+            );
+        }
+        app.run_slash_command("/help").await.unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("/fix-issue [arguments]  Fix an issue")
+        );
+        app.renderer.clear_content().unwrap();
+        app.run_slash_command("/fix-issue 123 @missing %%mode=yolo")
+            .await
+            .unwrap();
+        let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(app.ui.context.current_prompt_name.as_deref(), Some("plan"));
+            assert_eq!(app.chain.dot_prompt_restore, Some(original.clone()));
+            let users: Vec<_> = app
+                .ui
+                .session
+                .messages
+                .iter()
+                .filter(|message| message.role == crate::session::MessageRole::User)
+                .collect();
+            assert_eq!(users.len(), 1);
+            assert_eq!(
+                users[0].content,
+                "/clear !touch injected 123\n123 @missing %%mode=yolo"
+            );
+            let feed = app.renderer.feed();
+            let transcript = (0..feed.block_count())
+                .filter_map(|index| feed.block_text(index))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                transcript.matches("> /clear !touch injected 123").count(),
+                1
+            );
+            assert!(!root.path().join("injected").exists());
+            assert_eq!(app.ui.session.model, "chosen-model");
+            assert_eq!(app.ui.session.input_token_cost, 2.0);
+            assert_eq!(
+                app.ui.permission.as_ref().unwrap().lock().unwrap().mode(),
+                crate::permission::SecurityMode::ReadOnly
+            );
+        }));
+        // Settle the owned runner on every assertion outcome before fixture
+        // teardown: no real provider is used; endpoint is loopback discard.
+        app.run
+            .retire(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+        app.run.is_running = false;
+        app.finalize_turn().await.unwrap();
+        assert_eq!(app.ui.context.active_selection(), original);
+        assert_eq!(
+            app.ui.permission.as_ref().unwrap().lock().unwrap().mode(),
+            crate::permission::SecurityMode::Standard
+        );
+        assert_eq!(
+            app.ui.session.model, "chosen-model",
+            "quick-model switches persist as with existing dot prompts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_session_picker_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    fn environment(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
+        crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ])
+    }
+    fn ui<'a>(
+        cli: &'a crate::cli::Cli,
+        cfg: &'a config::Config,
+        session: &'a mut Session,
+        context: &'a mut crate::context::ContextFiles,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> UiContext<'a> {
+        UiContext::new(
+            cli,
+            cfg,
+            session,
+            context,
+            workspace,
+            crate::provider::create_client(
+                "anthropic",
+                Some("unused-local-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        )
+    }
+    fn store(session: &Session) {
+        crate::session::storage::atomic_write(
+            &crate::session::storage::session_path(&session.id).unwrap(),
+            &serde_json::to_string(session).unwrap(),
+        )
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn actual_app_picker_scope_toggle_and_exact_tool_history_resume_use_owned_renderer() {
+        let root = crate::tests::OwnedTestDirectory::new("app-session-picker");
+        let _env = environment(&root);
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let cfg = config::Config {
+            session_title_model: Some("off".into()),
+            ..Default::default()
+        };
+        let mut current = Session::new("anthropic", "test", 128_000, "");
+        current.working_dir = root.path().to_string_lossy().into();
+        current.add_message(crate::session::MessageRole::User, "CURRENT_PICKER_ROW");
+        current.add_tool_call_with_id(
+            "captured-call",
+            "read",
+            &serde_json::json!({"path":"a.txt"}),
+        );
+        current.add_tool_result_with_id("captured-call", "read", "CAPTURED_TOOL_BODY");
+        current.permission_allowlist = vec![crate::session::PermissionAllowEntry {
+            tool: "bash".into(),
+            pattern: "incoming-command".into(),
+        }];
+        store(&current);
+        let mut other = Session::new("anthropic", "test", 128_000, "");
+        other.working_dir = foreign.to_string_lossy().into();
+        other.add_message(crate::session::MessageRole::User, "FOREIGN_PICKER_ROW");
+        other.permission_allowlist = vec![crate::session::PermissionAllowEntry {
+            tool: "bash".into(),
+            pattern: "*".into(),
+        }];
+        store(&other);
+        let mut session = Session::new("anthropic", "test", 128_000, "");
+        session.working_dir = root.path().to_string_lossy().into();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut app = fixture_app(ui(&cli, &cfg, &mut session, &mut context, workspace));
+        let mut checker = crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::default(),
+            crate::permission::SecurityMode::Standard,
+            Some(root.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("bash".into(), "outgoing-command");
+        app.ui.permission = Some(Arc::new(std::sync::Mutex::new(checker)));
+        app.run_slash_command("/sessions").await.unwrap();
+        app.refresh().unwrap();
+        let rendered = app.renderer.captured_output();
+        assert!(rendered.contains("Current workspace"));
+        assert!(rendered.contains("CURRENT_PICKER_ROW"));
+        assert!(!rendered.contains("FOREIGN_PICKER_ROW"));
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        let rendered = app.renderer.captured_output();
+        assert!(rendered.contains("All workspaces"));
+        assert!(rendered.contains("FOREIGN_PICKER_ROW"));
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Paste("CURRENT_PICKER_ROW".into()))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert_eq!(app.ui.session.id, current.id);
+        assert_eq!(app.ui.session.messages.len(), 3);
+        assert_eq!(
+            app.ui.session.messages[2].content,
+            current.messages[2].content
+        );
+        assert_eq!(
+            app.ui.session.messages[2].tool_call_id.as_deref(),
+            Some("captured-call")
+        );
+        assert!(app.input.picker.is_none());
+        {
+            let mut permission = app.ui.permission.as_ref().unwrap().lock().unwrap();
+            assert_eq!(
+                permission.check("bash", "incoming-command"),
+                crate::permission::checker::CheckResult::Allowed
+            );
+            assert_eq!(
+                permission.check("bash", "outgoing-command"),
+                crate::permission::checker::CheckResult::Ask
+            );
+        }
+        app.run_slash_command("/sessions --all").await.unwrap();
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Paste("FOREIGN_PICKER_ROW".into()))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert_ne!(app.ui.session.id, other.id);
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert_eq!(app.ui.session.working_dir, current.working_dir);
+        assert_eq!(
+            app.ui
+                .permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .check("bash", "incoming-command"),
+            crate::permission::checker::CheckResult::Ask
+        );
+        let foreign_fork = app.ui.session.id.clone();
+        app.run_slash_command("/sessions").await.unwrap();
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Paste("CURRENT_PICKER_ROW".into()))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        app.run.is_running = true;
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert_eq!(
+            app.ui.session.id, foreign_fork,
+            "busy run cannot publish a selected successor"
+        );
+    }
+    #[test]
+    fn actual_session_picker_event_loop_runs_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .name("session-picker-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        let root = crate::tests::OwnedTestDirectory::new("picker-one-mib");
+                        let _env = environment(&root);
+                        let workspace =
+                            Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                        let cli = crate::cli::Cli {
+                            no_session: true,
+                            tools: vec!["read".into()],
+                            ..Default::default()
+                        };
+                        let cfg = config::Config {
+                            session_title_model: Some("off".into()),
+                            ..Default::default()
+                        };
+                        let mut saved = Session::new("anthropic", "test", 128_000, "");
+                        saved.working_dir = root.path().to_string_lossy().into();
+                        saved.add_message(crate::session::MessageRole::User, "ONE_MIB_SAVED_ROW");
+                        store(&saved);
+                        let mut session = Session::new("anthropic", "test", 128_000, "");
+                        session.working_dir = root.path().to_string_lossy().into();
+                        let mut context =
+                            crate::context::load(true).for_workspace_binding(true, &workspace);
+                        let mut app =
+                            fixture_app(ui(&cli, &cfg, &mut session, &mut context, workspace));
+                        let catalogue =
+                            crate::session::catalogue::list(&app.ui.workspace, false).unwrap();
+                        app.input
+                            .start_session_picker(catalogue, app.ui.workspace.clone(), false);
+                        app.deferred_user_events.extend([
+                            UserEvent::Paste("ONE_MIB_SAVED_ROW".into()),
+                            UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            UserEvent::Quit,
+                        ]);
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            crate::startup::heap_future(|| app.run_inner()),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(app.ui.session.id, saved.id);
+                        assert!(app.renderer.captured_output().contains("ONE_MIB_SAVED_ROW"));
+                        assert!(app.input.picker.is_none());
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn actual_app_title_retirement_joins_owned_work_charges_once_and_rejects_stale_result() {
+        let root = crate::tests::OwnedTestDirectory::new("app-title-retirement");
+        let _env = environment(&root);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let cli = crate::cli::Cli {
+            no_session: true,
+            ..Default::default()
+        };
+        let cfg = config::Config::default();
+        let mut session = Session::new("anthropic", "test", 128_000, "");
+        session.working_dir = root.path().to_string_lossy().into();
+        session.input_token_cost = 2.0;
+        session.output_token_cost = 4.0;
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut app = fixture_app(ui(&cli, &cfg, &mut session, &mut context, workspace));
+        let ledger = crate::session::title::UsageLedger::default();
+        ledger.observe(rig::completion::Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+            total_tokens: 105,
+            ..Default::default()
+        });
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (retired, observed) = tokio::sync::oneshot::channel();
+        struct Retired(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let task = tokio::spawn(async move {
+            let _retired = Retired(Some(retired));
+            let _ = ready.send(());
+            std::future::pending::<()>().await;
+        });
+        app.title_generation = 4;
+        app.title_work = Some(SessionTitleWork {
+            session_id: app.ui.session.id.clone(),
+            generation: 4,
+            workspace: app.ui.workspace.clone(),
+            provider: "anthropic".into(),
+            pricing: crate::session::title::TitlePricing {
+                input: 2.0,
+                output: 4.0,
+                cache: Default::default(),
+                anthropic_native: true,
+            },
+            ledger,
+            task: Some(task),
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.ui.session.input_token_cost = 200.0;
+        app.retire_session_title().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(app.title_work.is_none());
+        assert_eq!(app.ui.session.total_input_tokens, 100);
+        assert!((app.ui.session.total_cost - 0.00022).abs() < 1e-12);
+        app.apply_session_title(SessionTitleResult {
+            generation: 4,
+            session_id: app.ui.session.id.clone(),
+            title: Ok("STALE_TITLE".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.ui.session.generated_title.is_none());
+        app.retire_session_title().await.unwrap();
+        assert_eq!(app.ui.session.total_input_tokens, 100);
     }
 }

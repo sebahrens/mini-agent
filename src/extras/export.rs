@@ -199,6 +199,9 @@ impl ImportedReplayMetadata {
     pub fn apply(&self, session: &mut Session) {
         session.generated_title = self.generated_title.clone();
         session.compactions = self.compactions.clone();
+        for compaction in &mut session.compactions {
+            compaction.file_requests.mark_imported();
+        }
         session.tool_call_provenance = self.tool_call_provenance.clone();
         session.retain_visible_replay_metadata();
     }
@@ -386,6 +389,9 @@ pub fn parse_session_file(content: &str) -> Result<ParsedSessionFile> {
     }
 
     let mut session: Session = serde_json::from_value(first).context("invalid native session")?;
+    for compaction in &mut session.compactions {
+        compaction.file_requests.mark_imported();
+    }
     for message in &mut session.messages {
         message.recorded_diff =
             imported_mutation_diff(message.recorded_diff.take(), message.role, &message.tool);

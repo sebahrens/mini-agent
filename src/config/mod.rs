@@ -125,8 +125,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_judge_model: Option<CompactString>,
     /// A `quick_models` entry name that titles sessions for `--resume` and
-    /// `/sessions` after their first exchange. Unset (the default) keeps the
-    /// first-user-message title and makes no model call.
+    /// `/sessions` after their first exchange. Unset uses the session model
+    /// (the default); `"off"` disables generation and keeps the first message.
     ///
     /// Sensitive like any model selection: the first exchange is sent to the
     /// named entry's endpoint (mini-agent-3wsib).

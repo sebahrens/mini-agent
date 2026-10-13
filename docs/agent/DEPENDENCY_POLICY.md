@@ -77,6 +77,14 @@ crate-specific formatting traits. This keeps stored IDs, trust records, and
 wire-visible hashes as stable lowercase hexadecimal when digest crates change
 their output types.
 
+The bounded headless output-schema validator reuses the exact `jsonschema =
+"=0.49.9"` version already reviewed for Windows worker policy validation. Its
+direct dependency is now available on every platform, including minimal builds,
+with default retrieval features disabled. An application-owned denying retriever
+also rejects resource access explicitly. This promotion adds no lockfile package
+or version change; the ordinary all-target license/source and feature-graph gates
+remain authoritative.
+
 Tool versions are pinned under `[workspace.metadata.dependency-policy]` in
 `Cargo.toml`. Update the pin and CI install command together, review the
 tooling changelog, then run:

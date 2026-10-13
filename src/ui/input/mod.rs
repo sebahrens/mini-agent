@@ -320,6 +320,7 @@ pub struct InputEditor {
     prompt_names: Vec<String>,
     agent_names: Vec<String>,
     theme_names: Vec<String>,
+    custom_commands: Vec<(String, String)>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
     current_model: Option<String>,
@@ -347,6 +348,7 @@ impl InputEditor {
             prompt_names: Vec::new(),
             agent_names: Vec::new(),
             theme_names: Vec::new(),
+            custom_commands: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
             current_model: None,
@@ -416,6 +418,10 @@ impl InputEditor {
         self.history_pos = None;
         self.draft = None;
         self.yank_pos = None;
+    }
+
+    pub(crate) fn set_custom_commands(&mut self, commands: Vec<(String, String)>) {
+        self.custom_commands = commands;
     }
 
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
@@ -502,6 +508,7 @@ impl InputEditor {
 
     pub fn start_command_picker(&mut self) {
         let mut picker = ListPicker::with_static_commands();
+        picker.append_described_items(self.custom_commands.clone());
         picker.set_monochrome(self.monochrome);
         picker.activate();
         self.picker = Some(Picker::Command(picker));
@@ -575,6 +582,27 @@ impl InputEditor {
         }
         picker.activate();
         self.picker = Some(Picker::Prefixed(picker, "."));
+    }
+
+    pub(crate) fn start_session_picker(
+        &mut self,
+        catalogue: crate::session::catalogue::Catalogue,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        all: bool,
+    ) {
+        let mut picker =
+            crate::ui::pickers::sessions::SessionsPicker::new(catalogue, workspace, all);
+        picker.set_monochrome(self.monochrome);
+        self.picker = Some(Picker::Sessions(picker));
+    }
+
+    pub(crate) fn take_session_outcome(
+        &mut self,
+    ) -> Option<crate::ui::pickers::sessions::SessionPick> {
+        match self.picker.as_mut() {
+            Some(Picker::Sessions(picker)) => picker.take_outcome(),
+            _ => None,
+        }
     }
 
     pub fn start_theme_picker(&mut self) {
@@ -672,7 +700,7 @@ impl InputEditor {
         // control-bearing pastes use the normal atomic buffer path below.
         let picker_accepts_query = self.picker.as_ref().is_some_and(|picker| {
             picker.active()
-                && !matches!(picker, Picker::Rewind(_))
+                && !matches!(picker, Picker::Rewind(_) | Picker::Sessions(_))
                 && data.chars().take(MAX_PICKER_PASTE_CHARS + 1).count() <= MAX_PICKER_PASTE_CHARS
                 && data.chars().all(|c| !c.is_control())
         });

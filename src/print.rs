@@ -1025,6 +1025,8 @@ pub(crate) struct HeadlessJsonOutput {
     pub session_name: Option<String>,
     pub session_persisted: bool,
     pub result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_json: Option<serde_json::Value>,
     pub files_changed: Vec<String>,
     pub tool_calls: HeadlessToolCalls,
     pub usage: Usage,
@@ -1083,6 +1085,7 @@ impl HeadlessGoal {
 pub(crate) enum HeadlessStopReason {
     Completed,
     Failed,
+    SchemaFailed,
     /// A goal stopped for a reason of its own. Each maps to a distinct process
     /// exit code so a script can tell "resume me, I ran out of budget" from
     /// "stop retrying, this cannot be done".
@@ -1109,7 +1112,7 @@ impl HeadlessStopReason {
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::Completed => 0,
-            Self::Failed => 1,
+            Self::Failed | Self::SchemaFailed => 1,
             #[cfg(feature = "goal")]
             Self::GoalMet => 0,
             #[cfg(feature = "goal")]
@@ -1353,6 +1356,7 @@ pub(crate) fn render_headless_json(
         session_name: None,
         session_persisted: false,
         result: result.to_string(),
+        result_json: None,
         files_changed,
         tool_calls,
         usage,
@@ -1795,24 +1799,53 @@ pub(crate) fn session_list_line(s: &Session) -> String {
     )
 }
 
-pub(crate) fn print_sessions() {
-    let sessions = match session::storage::find_recent_sessions(20) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error listing sessions: {e}");
-            return;
-        }
-    };
-    if sessions.is_empty() {
-        println!("no saved sessions");
+pub(crate) fn print_sessions(
+    workspace: &crate::paths::WorkspaceBinding,
+    all: bool,
+) -> anyhow::Result<()> {
+    let catalogue = session::catalogue::list(workspace, all)?;
+    if catalogue.rows.is_empty() {
+        println!(
+            "no saved sessions in {}",
+            if all {
+                "any workspace"
+            } else {
+                "the current workspace"
+            }
+        );
     } else {
-        println!("recent sessions ({}):", sessions.len());
-        for s in &sessions {
-            println!("{}", session_list_line(s));
+        println!(
+            "recent sessions ({}; {}):",
+            catalogue.rows.len(),
+            if all {
+                "all workspaces"
+            } else {
+                "current workspace"
+            }
+        );
+        for row in &catalogue.rows {
+            println!(
+                "  {}  {}  {}msgs  {}/{}  workspace:{}  {}",
+                short_session_id(&row.id),
+                crate::ui::pickers::sessions::relative_time(&row.updated_at),
+                row.message_count,
+                crate::ui::events::sanitize_output(&row.provider),
+                crate::ui::events::sanitize_output(&row.model),
+                crate::ui::events::sanitize_output(&row.working_dir),
+                row.title
+            );
         }
-        println!();
-        println!("Use --session <id-or-name> to load a session by its ID prefix or name.");
+        println!(
+            "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
+        );
     }
+    if catalogue.truncated || catalogue.skipped > 0 {
+        eprintln!(
+            "session catalogue limited; {} unsafe/invalid/oversized entries skipped",
+            catalogue.skipped
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {

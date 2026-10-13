@@ -8,6 +8,15 @@ pub(crate) mod settings;
 pub(crate) mod subprocess;
 pub(crate) mod trust;
 
+tokio::task_local! {
+    // Host-only scope: formatting repairs perform no executable lifecycle work.
+    static FORMAT_REPAIR: ();
+}
+
+pub(crate) async fn format_repair_scope<F: std::future::Future>(future: F) -> F::Output {
+    FORMAT_REPAIR.scope((), future).await
+}
+
 /// Outcome of a non-tool-permission hook dispatch: lifecycle events (`Stop`,
 /// `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `SubagentStart`,
 /// `SubagentStop`) and constrained `PostToolUse` redaction. Carries no rig
@@ -276,6 +285,9 @@ pub(crate) async fn gate_user_prompt(
     ctx: &HookCtx,
     prompt: String,
 ) -> PromptGate {
+    if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
+        return PromptGate::Proceed(prompt);
+    }
     let decision = dispatcher
         .dispatch(
             "UserPromptSubmit",
@@ -345,6 +357,9 @@ pub(crate) async fn gate_stop(
     loop_active: Option<bool>,
     goal: Option<GoalHookInfo>,
 ) -> StopGate {
+    if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
+        return StopGate::Release;
+    }
     let decision = dispatcher
         .dispatch(
             "Stop",

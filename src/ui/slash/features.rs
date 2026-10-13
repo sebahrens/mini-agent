@@ -16,6 +16,14 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 }
 
 fn handle_compress(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if _parts.get(1) == Some(&"show") {
+        if _parts.len() != 2 {
+            write_error(_ctx.renderer, "usage: /compact show");
+        } else {
+            super::show_compaction_summary(_ctx.renderer, _ctx.session);
+        }
+        return Ok(());
+    }
     let instructions = if _parts.len() > 1 {
         Some(_parts[1..].join(" "))
     } else {

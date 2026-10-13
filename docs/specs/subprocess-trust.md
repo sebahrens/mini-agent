@@ -509,6 +509,10 @@ The audit currently resolves as follows:
 | `TEST-ONLY` | Inline Bash-tool and loop-validation process-existence helpers, plus the unconfined protocol-pipe worker fixture in `src/sandbox/worker.rs`. |
 | `NON-PROCESS` | Lexical exclusions in ACP (including permission-result status builders), export/HTTP (including the bounded MCP streamable-HTTP client's response-status read), JS runtime/skill/supervisor stderr-drain, verification-dispatch, idle-retirement, the session-owned sandbox background-task dispatch, fake verification, source comments, and assertions that legacy loop callers contain no raw Tokio process constructor. |
 
+The fixed-1-MiB App session-picker event-loop regression owns and joins one
+`std::thread::Builder` thread. Its exact `.spawn(|| {` expression is
+`NON-PROCESS`; no process constructor or process-terminal exemption is added.
+
 ## Review and change rules
 
 - A new launch site must update the checked inventory in the same change.
@@ -536,3 +540,12 @@ The audit currently resolves as follows:
       commands, and the current shared model-action sandbox; no current launch may claim it.
 - [x] The default test suite contains a drift check for newly added, changed, duplicated, or
       removed launch expressions.
+
+The custom slash-template special-file regression in `context/commands.rs` uses
+one exact `TEST-ONLY` current-test-executable constructor. Its child receives
+only an owned fixture root, runs exactly one FIFO/root-replacement test, and is
+bounded and reaped by `Sandbox::output_built_command_with_limits`. Three
+assertion data contexts inspect the returned `CommandOutput` fields, with exact
+source fingerprints and full macro-token identities classified `NON-PROCESS`.
+They do not waive constructors or terminal launch syntax, and the inventory's
+existing unknown-context and cross-family negative controls remain enforced.

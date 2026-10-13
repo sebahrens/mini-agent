@@ -8,6 +8,7 @@ use smallvec::SmallVec;
 use crate::session::storage;
 
 pub mod agents;
+pub(crate) mod commands;
 pub mod prompts;
 pub mod themes;
 
