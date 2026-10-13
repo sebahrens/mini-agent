@@ -47,6 +47,31 @@ def validate_native_step(workflow):
     return body
 
 
+def validate_fixture_role(source, native):
+    required = [
+        'marker == b"native32" && image == root.join("fixture bin 雪").join("gh.exe")',
+        'std::env::current_dir().and_then(std::fs::canonicalize)',
+        'std::env::current_exe().and_then(std::fs::canonicalize)',
+        'let marker = root.join("gh-role");',
+        'std::fs::symlink_metadata(&marker)',
+        '!metadata.is_file() || metadata.len() != 8',
+        'metadata.is_file() && metadata.len() == 8',
+        'file.take(9).read_to_end(&mut marker).is_ok() && role_matches(&root, &image, &marker)',
+        'if !owned_role() {\n        return Ok(0);\n    }',
+        '"role_env_present":std::env::var_os("MINI_AGENT_TEST_GH_ROLE").is_some()',
+    ]
+    for fragment in required:
+        if fragment not in source:
+            raise AssertionError("missing owned fixture role guard: " + fragment)
+    role = source.split("fn owned_role()", 1)[1].split("fn self_test()", 1)[0]
+    if "var_os" in role or "var(" in role:
+        raise AssertionError("environment canary must not authorize the helper")
+    if source.index("if !owned_role()") > source.index('std::fs::write("gh-posthook"'):
+        raise AssertionError("inert role gate must precede fixture effects")
+    if not re.search(r'assert_eq!\(\s*record\["role_env_present"\], false', native):
+        raise AssertionError("native Shell proof must assert the canary remains scrubbed")
+
+
 class WindowsGhCiTests(unittest.TestCase):
     def test_exact_native_lane_and_fixture_role_are_guarded(self):
         validate_native_step((ROOT / ".github/workflows/ci.yml").read_text())
@@ -57,14 +82,28 @@ class WindowsGhCiTests(unittest.TestCase):
         self.assertEqual(targets[0]["required-features"], ["git-worktree", "sandbox"])
         self.assertNotIn("windows_gh_fixture", [entry["name"] for entry in manifest.get("bin", [])])
         source = (ROOT / targets[0]["path"]).read_text()
-        self.assertIn('"MINI_AGENT_TEST_GH_ROLE"', source)
-        self.assertIn('Some(std::ffi::OsStr::new("native32"))', source)
-        self.assertIn('return Ok(0);', source)
         self.assertNotIn('Command::new', source)
         self.assertNotIn('reqwest', source)
         native = (ROOT / "src/ui/slash/git.rs").read_text().split("mod windows_native_pr_tests", 1)[1]
+        validate_fixture_role(source, native)
         self.assertEqual(set(re.findall(r"async fn (windows_native_pr_\w+)\(", native)), CASES)
         self.assertEqual(native.count('#[ignore = "requires guarded native Windows GH fixture discovery"]'), 5)
+
+    def test_weakened_marker_image_bounds_and_canary_guards_are_rejected(self):
+        source = (ROOT / "tests/fixtures/windows_gh_fixture.rs").read_text()
+        native = (ROOT / "src/ui/slash/git.rs").read_text().split("mod windows_native_pr_tests", 1)[1]
+        for before, after in [
+            ('marker == b"native32"', 'true'),
+            ('image == root.join("fixture bin 雪").join("gh.exe")', 'true'),
+            ('!metadata.is_file() || metadata.len() != 8', 'false'),
+            ('metadata.is_file() && metadata.len() == 8', 'true'),
+            ('file.take(9)', 'file'),
+            ('if !owned_role()', 'if false'),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                validate_fixture_role(source.replace(before, after), native)
+        with self.assertRaises(AssertionError):
+            validate_fixture_role(source, native.replace('record["role_env_present"], false', 'record["role_env_present"], true'))
 
     def test_stack_lane_requires_exact_four_actual_portable_consumers(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

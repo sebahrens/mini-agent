@@ -506,16 +506,26 @@ GitHub. Ordinary test execution is inert; the native image acts as GH only under
 an explicit owned fixture role. Five ignored Windows cases exercise literal
 Unicode/quotes/metacharacters through the retained Windows PowerShell
 `ProcessStartInfo` path, normal Shell Ask/deny, immutable foreground status and
-bounded completeness, post-hook display redaction, and exact descendant Job
+bounded completeness, post-hook display redaction, and required descendant
 retirement before a controlled late effect is released. Fixture roots and actors
 are owned and bounded.
 
 These cases explicitly select the supported trusted `--no-sandbox` Shell policy;
 there is no Git execution and no fallback from a required AppContainer boundary.
-They establish native argv/result/cancellation authority, alongside the unchanged
+They require native argv/result/cancellation authority, alongside the unchanged
 standard-user AppContainer and worker-containment witnesses. The Windows proof
 remains pending until the exact hosted step passes; macOS execution and pure
 argument-encoder tests are separate evidence.
+
+The explicit disabled foreground path currently owns the direct child but does
+not attach the Job owner used by AppContainer helpers and trusted hooks. Its
+descendant retirement assertion remains a failing acceptance requirement; the
+bypass is not documented as providing that Job guarantee. To diagnose the
+remaining hosted failures without changing policy or deadlines, the native
+typed case first runs a separate literal PowerShell preflight through ordinary
+Shell Ask. Failed assertions report only fixed owned marker files (no-follow,
+4096 bytes per file), copied image size, and bounded actual tool results. The
+production PR script remains unchanged; no diagnostic marker is inserted into it.
 
 ### Cached LSP diagnostic metadata
 

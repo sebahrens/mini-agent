@@ -1009,6 +1009,10 @@ fn bounded_event_output(value: &impl serde::Serialize) -> Result<String, String>
 macro_rules! settled_actor {
     ($actor:ident, $body:block) => {{
         let result: Result<(), _> = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async $body)).await;
+        #[cfg(windows)]
+        if result.is_err() {
+            $actor.diagnostics();
+        }
         $actor.runner.abort_handle.abort();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while $actor.runner.event_rx.recv().await.is_some() {}
@@ -1020,8 +1024,75 @@ macro_rules! settled_actor {
 }
 
 #[cfg(test)]
+fn native_fixture_snapshot(workspace: &crate::paths::WorkspaceBinding) -> String {
+    use std::io::Read;
+    let mut rows = Vec::new();
+    for name in [
+        "gh-role",
+        "gh-mode",
+        "gh-argv.json",
+        "gh-ready.json",
+        "gh-posthook",
+        "gh-late",
+        "NEVER_EXECUTE",
+    ] {
+        if workspace
+            .symlink_component(std::path::Path::new(name))
+            .is_some()
+        {
+            rows.push(format!("{name}: unavailable (link refused)"));
+            continue;
+        }
+        let row = match workspace.open_regular_relative(std::path::Path::new(name)) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                match file.take(4097).read_to_end(&mut bytes) {
+                    Ok(_) if bytes.len() <= 4096 => {
+                        format!("{name}: {:?}", String::from_utf8_lossy(&bytes))
+                    }
+                    Ok(_) => format!("{name}: exceeds 4096 bytes (content omitted)"),
+                    Err(error) => format!("{name}: read failed ({:?})", error.kind()),
+                }
+            }
+            Err(error) => format!("{name}: unavailable ({:?})", error.kind()),
+        };
+        rows.push(row);
+    }
+    let image = workspace.open_regular_relative(std::path::Path::new("fixture bin 雪/gh.exe"));
+    rows.push(format!(
+        "copied image: {:?}",
+        image
+            .and_then(|file| file.metadata())
+            .map(|metadata| metadata.len())
+    ));
+    rows.join("\n")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_fixture_diagnostics_are_bounded_and_owned() {
+        let root = crate::tests::OwnedTestDirectory::new("native-gh-diagnostic");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        std::fs::write(root.path().join("gh-role"), "native32").unwrap();
+        std::fs::write(root.path().join("gh-mode"), vec![b'x'; 4097]).unwrap();
+        std::fs::write(root.path().join("unrelated-secret"), "DO_NOT_REPORT").unwrap();
+        let text = native_fixture_snapshot(&workspace);
+        assert!(text.contains("native32"));
+        assert!(text.contains("gh-mode: exceeds 4096 bytes (content omitted)"));
+        assert!(!text.contains("DO_NOT_REPORT"));
+        assert!(text.len() < 2048);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("unrelated-secret", root.path().join("gh-argv.json"))
+                .unwrap();
+            let text = native_fixture_snapshot(&workspace);
+            assert!(text.contains("gh-argv.json: unavailable"), "{text}");
+            assert!(!text.contains("DO_NOT_REPORT"));
+        }
+    }
 
     struct CountingTool(Arc<std::sync::atomic::AtomicUsize>);
     impl ToolDyn for CountingTool {
@@ -2221,6 +2292,7 @@ mod windows_native_pr_tests {
                 runner,
                 observations,
                 sandbox: self.sandbox.clone(),
+                workspace: self.workspace.clone(),
             }
         }
         fn recorded_argv(&self) -> serde_json::Value {
@@ -2232,14 +2304,82 @@ mod windows_native_pr_tests {
             );
             record
         }
+        async fn literal_shell_preflight(&self) {
+            use crate::agent::tools::bash::{ForegroundResult, ShellTool};
+            const COMMAND: &str = "[Console]::Out.Write('NATIVE32_PREFLIGHT')";
+            let (ask, mut requests) = tokio::sync::mpsc::channel(4);
+            let tool = ShellTool::new(
+                Some(self.checker(Action::Ask)),
+                Some(ask),
+                self.sandbox.clone(),
+                Some(1),
+            )
+            .with_foreground_timeout_secs(15);
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let assertions = std::panic::AssertUnwindSafe(async {
+                let work = scope.run(async {
+                    rig::tool::Tool::call_structured(&tool, crate::agent::tools::BashArgs {
+                        command: COMMAND.into(), timeout: None, background: false,
+                    }, &ToolCallExtensions::default()).await
+                });
+                tokio::pin!(work);
+                let pending = tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        pending = requests.recv() => pending.expect("literal preflight needs ordinary Ask"),
+                        result = &mut work => panic!("literal preflight completed before Ask: {result:?}"),
+                    }
+                }).await.expect("literal preflight Ask delivery must be bounded");
+                assert_eq!(pending.tool, "shell");
+                assert_eq!(pending.input, COMMAND);
+                pending.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(20), work).await
+                    .expect("literal preflight result must be bounded");
+                eprintln!("native GH literal Shell preflight: {:?}", format!("{result:?}").chars().take(4096).collect::<String>());
+                let result = result.expect("literal native PowerShell preflight must complete");
+                let actual = result.extensions.get::<ForegroundResult>().expect("literal preflight actual foreground result");
+                assert_eq!(actual.status, crate::sandbox::CommandStatus::Completed);
+                assert_eq!(actual.exit_code, Some(0));
+                assert_eq!(actual.stdout, b"NATIVE32_PREFLIGHT");
+                assert!(actual.stdout_complete && !actual.descendants_escaped);
+                assert!(!self.path("gh-argv.json").exists());
+            }).catch_unwind().await;
+            if assertions.is_err() {
+                eprintln!(
+                    "native GH preflight owned fixture snapshot:\n{}",
+                    native_fixture_snapshot(&self.workspace)
+                );
+            }
+            scope.cancellation_handle().cancel();
+            tokio::time::timeout(Duration::from_secs(10), scope.wait_idle())
+                .await
+                .expect("literal preflight cleanup must be bounded");
+            if let Err(panic) = assertions {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 
     struct Actor {
         runner: crate::agent::runner::AgentRunner,
         observations: tokio::sync::mpsc::Receiver<Observation>,
         sandbox: crate::sandbox::Sandbox,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
     }
     impl Actor {
+        fn diagnostics(&self) {
+            eprintln!(
+                "native GH owned fixture snapshot:\n{}",
+                native_fixture_snapshot(&self.workspace)
+            );
+        }
+        fn log_event(event: &AgentEvent) {
+            if let AgentEvent::ToolResult { output: text, .. } = event {
+                eprintln!(
+                    "native GH actual tool result: {:?}",
+                    text.chars().take(4096).collect::<String>()
+                );
+            }
+        }
         async fn terminal(&mut self) -> AgentEvent {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -2247,6 +2387,7 @@ mod windows_native_pr_tests {
                         Some(_) = self.observations.recv() => {},
                         event = self.runner.event_rx.recv() => {
                             let event = event.expect("owned native actor closed before its terminal event");
+                            Self::log_event(&event);
                             if matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
                                 while self.runner.event_rx.recv().await.is_some() {}
                                 return event;
@@ -2459,6 +2600,7 @@ mod windows_native_pr_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         use crate::agent::tools::bash::{ForegroundResult, ShellTool};
         let fixture = Fixture::new("success");
+        fixture.literal_shell_preflight().await;
         let command = pr_command(&proposal(), crate::sandbox::ShellDialect::PowerShell).unwrap();
         for (mode, expected_code, complete) in [
             ("success", 0, true),
@@ -2502,7 +2644,9 @@ mod windows_native_pr_tests {
                 assert!(!fixture.path("gh-argv.json").exists());
                 pending.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
                 let result = tokio::time::timeout(Duration::from_secs(20), work)
-                    .await.expect("typed Shell result must be bounded").unwrap();
+                    .await.expect("typed Shell result must be bounded");
+                eprintln!("native GH typed actual result: {:?}", format!("{result:?}").chars().take(4096).collect::<String>());
+                let result = result.unwrap();
                 let actual = result.extensions.get::<ForegroundResult>()
                     .expect("actual native foreground extension");
                 let ForegroundResult {
@@ -2516,6 +2660,12 @@ mod windows_native_pr_tests {
                 assert_eq!(foreground_pr_url(actual).is_ok(), mode == "success");
                 assert_eq!(fixture.recorded_argv()["argv"].as_array().unwrap().len(), 6);
             }).catch_unwind().await;
+            if assertions.is_err() {
+                eprintln!(
+                    "native GH typed failure owned fixture snapshot:\n{}",
+                    native_fixture_snapshot(&fixture.workspace)
+                );
+            }
             // Settle the exact scoped process owner while its runtime is still
             // alive, including after a failed assertion or request deadline.
             scope.cancellation_handle().cancel();

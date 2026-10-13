@@ -2032,7 +2032,7 @@ impl AnyAgent {
         }
     }
 
-    #[cfg(any(feature = "goal", feature = "acp", feature = "subagents", test))]
+    #[cfg(any(feature = "acp", feature = "subagents", test))]
     pub(crate) fn with_spend(mut self, spend: Option<crate::spend::run::Run>) -> Self {
         self.spend = spend;
         self
