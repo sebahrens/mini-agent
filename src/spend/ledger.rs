@@ -93,6 +93,45 @@ struct Scan {
     summary: LedgerSummary,
 }
 
+/// Owns the acquired OS lock independently of descriptor close. A concurrent
+/// fork can retain the open-file description until exec, despite CLOEXEC.
+struct LockedLedgerFile {
+    file: File,
+    armed: bool,
+}
+impl LockedLedgerFile {
+    fn new(file: File) -> Self {
+        Self { file, armed: true }
+    }
+    fn release(&mut self) -> anyhow::Result<()> {
+        self.file
+            .unlock()
+            .map_err(|_| anyhow::anyhow!("usage ledger unlock failed"))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+impl std::ops::Deref for LockedLedgerFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+impl std::ops::DerefMut for LockedLedgerFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+impl Drop for LockedLedgerFile {
+    fn drop(&mut self) {
+        if self.armed {
+            // Errors/unwind still attempt explicit release; their original
+            // failure remains closed and never ACKs an unvalidated receipt.
+            let _ = self.file.unlock();
+        }
+    }
+}
+
 /// One ledger's directory authority, not a global registry. Read-only summaries
 /// never create a file/directory or repair permissions. Missing storage is empty.
 #[derive(Debug)]
@@ -106,6 +145,16 @@ pub(crate) struct Ledger {
     lock_blocked: Option<std::sync::mpsc::SyncSender<()>>,
     #[cfg(test)]
     summary_scanned: Option<SummaryScanGate>,
+    #[cfg(all(test, unix))]
+    lock_gate: Option<LockTestGate>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Debug)]
+struct LockTestGate {
+    locked: std::sync::mpsc::SyncSender<std::os::fd::RawFd>,
+    released: Mutex<std::sync::mpsc::Receiver<()>>,
+    started: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -168,6 +217,8 @@ impl Ledger {
             lock_blocked: None,
             #[cfg(test)]
             summary_scanned: None,
+            #[cfg(all(test, unix))]
+            lock_gate: None,
         }
     }
     #[cfg(test)]
@@ -275,6 +326,36 @@ impl Ledger {
     pub(crate) fn summary(&self) -> anyhow::Result<LedgerSummary> {
         self.summary_with_session(None)
     }
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_lock_test_gate(
+        state_dir: &Path,
+        locked: std::sync::mpsc::SyncSender<std::os::fd::RawFd>,
+        released: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        let mut ledger = Self::new(state_dir);
+        ledger.lock_gate = Some(LockTestGate {
+            locked,
+            released: Mutex::new(released),
+            started: Default::default(),
+        });
+        ledger
+    }
+    #[cfg(all(test, unix))]
+    fn pause_lock_for_test(&self, file: &File) {
+        use std::os::fd::AsRawFd;
+        if let Some(gate) = &self.lock_gate
+            && !gate.started.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            gate.locked
+                .try_send(file.as_raw_fd())
+                .expect("lock phase published");
+            gate.released
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("bounded lock test gate release");
+        }
+    }
     pub(crate) fn summary_for_session(&self, session_id: &str) -> anyhow::Result<LedgerSummary> {
         self.summary_with_session(Some(session_id))
     }
@@ -283,14 +364,18 @@ impl Ledger {
             .io
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
-        let Some((mut file, binding)) = self.open(false)? else {
+        let Some((file, binding)) = self.open(false)? else {
             return Ok(LedgerSummary::default());
         };
         file.try_lock_shared()
             .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+        let mut file = LockedLedgerFile::new(file);
+        #[cfg(all(test, unix))]
+        self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
         let scan = scan(&mut file, session_id)?;
         Self::revalidate(&binding, &file)?;
+        file.release()?;
         #[cfg(test)]
         if let Some(gate) = &self.summary_scanned {
             drop(file);
@@ -346,10 +431,13 @@ impl Ledger {
         }
     }
     fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
-        let (mut file, binding) = self
+        let (file, binding) = self
             .open(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
         self.lock_writer(&binding, &file)?;
+        let mut file = LockedLedgerFile::new(file);
+        #[cfg(all(test, unix))]
+        self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
         let mut scanned = scan(&mut file, None)?;
         // Validate the entire pending batch before appending any of it.
@@ -390,6 +478,7 @@ impl Ledger {
         file.sync_all()
             .map_err(|_| anyhow::anyhow!("usage ledger sync failed"))?;
         Self::revalidate(&binding, &file)?;
+        file.release()?;
         for row in pending {
             account.acknowledge(row.id);
         }

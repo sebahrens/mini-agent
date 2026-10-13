@@ -615,6 +615,10 @@ completion and observed usage are retained. See [COST_TRACKING.md](COST_TRACKING
 for pricing, private-ledger bounds, failure handling and the reported-estimate
 limit. Existing command classes, deadlines, URL policy and permission precedence
 are preserved.
+`src/tests/ledger_lock_tests.rs` exercises acquired ledger-lock retirement with
+an owned Unix child held before exec. Explicit unlock ends the lock's ownership
+before receipt acknowledgement; inherited descriptors cannot extend it after
+the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
 ### Notebook cells
 
@@ -739,6 +743,16 @@ replay prefix or suppressing ordinary effect/accounting settlement. An empty
 collection or absence of an error marker does not prove a completed transport,
 a compatible request prefix, or permission to reuse opaque content.
 
+Native Anthropic reasoning display uses nonempty streamed summary deltas.
+Completed signed and redacted blocks enter the transcript and optional canonical
+capture independently of presentation; their signature and opaque payload bytes
+are never rendered as reasoning. The typed native route selects this policy even
+when canonical capture is disabled. Generic reasoning display is unchanged.
+`src/provider_effort_replay_probe.rs` exercises omitted and nonempty native
+summaries through the ordinary interactive runner with capture enabled and
+disabled, checking one displayed summary and retained opaque blocks. This display
+rule does not enable saved-session opaque replay or promise prefix compatibility.
+
 
 ### Windows foreground ownership experiment
 
@@ -754,3 +768,25 @@ This module is an experiment for mini-agent-i7ro6.108. Production disabled Shell
 yet use it; the observed descendant-settlement gap remains open. A successful prototype
 does not prove production integration or atomic recovery from a parent crash between
 creation and assignment. The broker-only worker and AppContainer launcher are unchanged.
+
+
+### ACP server idle exit
+
+`--acp --idle-exit <positive-seconds>` exits successfully after the configured
+quiet interval with no loaded sessions and no active requests or jobs. The
+interval restarts when the final owned task settles. A dormant ACP session
+retains its history and prevents this exit until `session/close`; sessions are
+not silently expired. Admission and idle shutdown are ordered under one lock.
+
+`src/extras/acp/idle.rs` tracks request and whole prompt-task ownership through
+verification, receipts, history and terminal cleanup. Permission/question
+bridges and both plaintext and TLS authentication tasks retain their own
+activity until actual cleanup, including cancellation before first poll. The
+listener waiting for its first peer is idle. Enabled transports drain these
+owners after connection teardown. Without the option the existing lifecycle
+is unchanged. Provider stream-stall timeouts remain independent.
+
+`--loop` accepts this server option, but its existing finite goal driver exits
+when it stops; it has no parked idle listener. Active rounds, validation and
+judge requests are never terminated by `--idle-exit`, and their stop outcomes
+and persistence keep their existing semantics.

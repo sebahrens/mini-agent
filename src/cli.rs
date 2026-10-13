@@ -77,6 +77,9 @@ pub enum OutputFormat {
 #[command(name = "mini-agent", version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
     about = "Minimal coding agent")]
+#[cfg_attr(all(feature = "acp", feature = "loop"), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled", "loop_mode"]).multiple(true))))]
+#[cfg_attr(all(feature = "acp", not(feature = "loop")), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled"]))))]
+#[cfg_attr(all(feature = "loop", not(feature = "acp")), command(group(clap::ArgGroup::new("idle_server_mode").args(["loop_mode"]))))]
 pub struct Cli {
     #[arg(
         long,
@@ -854,6 +857,15 @@ pub struct Cli {
         help = "Enable ACP (Agent Communication Protocol) support"
     )]
     pub acp_enabled: bool,
+
+    #[cfg(any(feature = "acp", feature = "loop"))]
+    #[arg(
+        long = "idle-exit",
+        value_name = "SECONDS",
+        requires = "idle_server_mode",
+        help = "Exit an idle server after positive seconds with no loaded sessions or active work; active loop rounds are never timed out"
+    )]
+    pub idle_exit_secs: Option<std::num::NonZeroU64>,
 
     #[cfg(feature = "acp")]
     #[arg(long = "acp-host", help = "ACP TCP bind host [default: stdio mode]")]
@@ -2581,5 +2593,29 @@ mod usd_budget_cli_tests {
                 .is_err()
         );
         assert!(toml::from_str::<config::Config>("max_budget_usd = nan").is_err());
+    }
+}
+
+#[cfg(all(test, any(feature = "acp", feature = "loop")))]
+mod idle_exit_tests {
+    use super::*;
+
+    #[test]
+    fn idle_exit_requires_a_server_and_positive_seconds() {
+        assert!(Cli::try_parse_from(["mini-agent", "--idle-exit", "2"]).is_err());
+        let mode = if cfg!(feature = "acp") {
+            "--acp"
+        } else {
+            "--loop"
+        };
+        for invalid in ["0", "-1", "not-seconds"] {
+            assert!(Cli::try_parse_from(["mini-agent", mode, "--idle-exit", invalid]).is_err());
+        }
+        let cli = Cli::try_parse_from(["mini-agent", mode, "--idle-exit", "2"]).unwrap();
+        assert_eq!(cli.idle_exit_secs.unwrap().get(), 2);
+        #[cfg(feature = "loop")]
+        assert!(Cli::try_parse_from(["mini-agent", "--loop", "--idle-exit", "2"]).is_ok());
+        #[cfg(feature = "acp")]
+        assert!(Cli::try_parse_from(["mini-agent", "--acp", "--idle-exit", "2"]).is_ok());
     }
 }

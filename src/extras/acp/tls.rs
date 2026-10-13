@@ -117,6 +117,7 @@ pub(super) type TlsStream = tokio_native_tls::TlsStream<tokio::net::TcpStream>;
 /// Accepts connections until one completes the TLS handshake and the
 /// channel-bound challenge-response. Slow or failing peers never block a
 /// valid one: each is handled concurrently, bounded in number and time.
+#[cfg(test)]
 pub(super) async fn accept_tls_peer(
     listener: std::net::TcpListener,
     api_key: String,
@@ -132,14 +133,49 @@ pub(super) async fn accept_tls_peer(
     .await
 }
 
-/// [`accept_tls_peer`] over any [`AcceptSource`]. A failed accept of one
+pub(super) async fn accept_tls_peer_with_idle(
+    listener: std::net::TcpListener,
+    api_key: String,
+    tls: Arc<AcpTlsConfig>,
+    max_pending: usize,
+    idle: Arc<super::idle::Idle>,
+) -> std::io::Result<(TlsStream, SocketAddr)> {
+    accept_tls_peer_from_with_idle(
+        super::accept::tokio_listener(listener)?,
+        api_key,
+        tls,
+        max_pending,
+        idle,
+    )
+    .await
+}
+
+/// [`accept_tls_peer_with_idle`] over any [`AcceptSource`]. A failed accept of one
 /// connection is logged and skipped (see [`super::accept`]); only a failure
 /// of the listener itself ends the loop.
+#[cfg(test)]
 pub(super) async fn accept_tls_peer_from<S: AcceptSource>(
+    source: S,
+    api_key: String,
+    tls: Arc<AcpTlsConfig>,
+    max_pending: usize,
+) -> std::io::Result<(TlsStream, SocketAddr)> {
+    accept_tls_peer_from_with_idle(
+        source,
+        api_key,
+        tls,
+        max_pending,
+        super::idle::Idle::new(None).unwrap(),
+    )
+    .await
+}
+
+async fn accept_tls_peer_from_with_idle<S: AcceptSource>(
     mut source: S,
     api_key: String,
     tls: Arc<AcpTlsConfig>,
     max_pending: usize,
+    idle: Arc<super::idle::Idle>,
 ) -> std::io::Result<(TlsStream, SocketAddr)> {
     let api_key: Arc<str> = api_key.into();
     let mut pending: tokio::task::JoinSet<PeerOutcome> = tokio::task::JoinSet::new();
@@ -169,7 +205,10 @@ pub(super) async fn accept_tls_peer_from<S: AcceptSource>(
                 }
                 let authentication =
                     authenticate_connection(tcp, peer_addr, api_key.clone(), tls.clone());
-                pending.spawn(authentication);
+                let activity = idle
+                    .admit()
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::ConnectionAborted))?;
+                pending.spawn(activity.track(authentication));
             }
             PeerEvent::Settled(Ok((Ok(stream), peer_addr))) => return Ok((stream, peer_addr)),
             PeerEvent::Settled(Ok((Err(_), peer_addr))) => {
@@ -255,6 +294,62 @@ mod tests {
         TLS_CHALLENGE_PREFIX, TLS_RESPONSE_PREFIX, channel_bound_response_digest,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_tls_auth_abort_drains_the_actual_owned_socket() {
+        use futures::FutureExt;
+        use tokio::io::AsyncReadExt;
+        struct ObservedSource {
+            listener: tokio::net::TcpListener,
+            accepted: Arc<tokio::sync::Notify>,
+        }
+        impl AcceptSource for ObservedSource {
+            async fn accept(&mut self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+                let peer = self.listener.accept().await?;
+                self.accepted.notify_one();
+                Ok(peer)
+            }
+        }
+        let idle = super::super::idle::Idle::new(Some(Duration::from_secs(1))).unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let source = ObservedSource {
+            listener,
+            accepted: accepted.clone(),
+        };
+        let server = tokio::spawn(accept_tls_peer_from_with_idle(
+            source,
+            "inert-key".into(),
+            config(),
+            2,
+            idle.clone(),
+        ));
+        let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+        accepted.notified().await;
+        // Same-thread admission occurs synchronously after accept, before the
+        // spawned handshake's first poll. A silent peer cannot be called idle.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(idle.expired().now_or_never().is_none());
+        tokio::time::resume();
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(5), idle.wait_settled())
+            .await
+            .unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "owned socket must be closed before auth activity settles"
+        );
+        assert!(idle.expired().now_or_never().is_none());
+    }
 
     const CERT: &str = include_str!("testdata/test-only-tls-cert.pem");
     const KEY: &str = include_str!("testdata/test-only-tls-key.pem");

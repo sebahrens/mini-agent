@@ -219,7 +219,10 @@ impl Write for CountBytes {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct NativeCaptureHook(Option<(NativeCapture, String)>);
+pub(crate) struct NativeCaptureHook {
+    native: bool,
+    capture: Option<(NativeCapture, String)>,
+}
 
 impl NativeCaptureHook {
     pub(crate) fn for_native(capture: Option<NativeCapture>, model: &str) -> Self {
@@ -227,15 +230,24 @@ impl NativeCaptureHook {
             if let Some(capture) = capture {
                 capture.unavailable(Unavailable::Limit);
             }
-            return Self::default();
+            return Self {
+                native: true,
+                capture: None,
+            };
         }
-        Self(capture.map(|capture| (capture, model.to_string())))
+        Self {
+            native: true,
+            capture: capture.map(|capture| (capture, model.to_string())),
+        }
+    }
+    pub(crate) fn is_native(&self) -> bool {
+        self.native
     }
 }
 
 impl<M: CompletionModel> AgentHook<M> for NativeCaptureHook {
     fn observes(&self, kind: StepEventKind) -> bool {
-        self.0.is_some()
+        self.capture.is_some()
             && matches!(
                 kind,
                 StepEventKind::ModelTurnFinished
@@ -244,7 +256,7 @@ impl<M: CompletionModel> AgentHook<M> for NativeCaptureHook {
             )
     }
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
-        if let Some((capture, model)) = &self.0 {
+        if let Some((capture, model)) = &self.capture {
             match event {
                 StepEvent::ModelTurnFinished { turn, content, .. } => {
                     capture.record(ctx.run_id().as_str(), turn, model, content)
@@ -345,9 +357,11 @@ mod tests {
         assert_eq!(capture.snapshot().1, Some(Unavailable::MissingCallIdentity));
         assert!(
             NativeCaptureHook::for_native(None, "native-model")
-                .0
+                .capture
                 .is_none()
         );
+        assert!(NativeCaptureHook::for_native(None, "native-model").is_native());
+        assert!(!NativeCaptureHook::default().is_native());
     }
 
     #[test]

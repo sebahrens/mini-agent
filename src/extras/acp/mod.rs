@@ -1,5 +1,6 @@
 mod accept;
 pub mod config;
+mod idle;
 mod tls;
 
 use std::collections::{HashMap, VecDeque};
@@ -598,6 +599,7 @@ fn acp_hook_root_claims() -> Option<Arc<HookRootClaims>> {
 }
 
 struct AcpState {
+    idle: Arc<idle::Idle>,
     cli: Cli,
     cfg: Config,
     context: ContextFiles,
@@ -657,6 +659,7 @@ struct TcpTransport {
     port: u16,
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
+    idle: Arc<idle::Idle>,
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -676,12 +679,17 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 
         if let Some(tls) = self.tls {
             tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
-            let (stream, peer_addr) =
-                tls::accept_tls_peer(listener, self.api_key, tls, MAX_PENDING_AUTHENTICATIONS)
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
-                    })?;
+            let (stream, peer_addr) = tls::accept_tls_peer_with_idle(
+                listener,
+                self.api_key,
+                tls,
+                MAX_PENDING_AUTHENTICATIONS,
+                self.idle,
+            )
+            .await
+            .map_err(|e| {
+                agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
+            })?;
             tracing::info!("Authenticated ACP TLS client connected from {}", peer_addr);
             let (read_half, write_half) = tokio::io::split(stream);
             return ConnectTo::<Counterpart>::connect_to(
@@ -695,10 +703,14 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let accept_error =
             |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
         let listener = accept::tokio_listener(listener).map_err(accept_error)?;
-        let (stream, peer_addr) =
-            accept_authenticated_peer(listener, self.api_key, MAX_PENDING_AUTHENTICATIONS)
-                .await
-                .map_err(accept_error)?;
+        let (stream, peer_addr) = accept_authenticated_peer_with_idle(
+            listener,
+            self.api_key,
+            MAX_PENDING_AUTHENTICATIONS,
+            self.idle,
+        )
+        .await
+        .map_err(accept_error)?;
         tracing::info!("Authenticated ACP client connected from {}", peer_addr);
 
         let read_half = stream.try_clone().map_err(|e| {
@@ -719,10 +731,26 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 /// silent peer never blocks a valid one, and at most `max_pending` are in
 /// flight at once. A failed accept of one connection is logged and skipped
 /// (see [`accept`]); only a failure of the listener itself ends the loop.
+#[cfg(test)]
 async fn accept_authenticated_peer<S: accept::AcceptSource>(
+    source: S,
+    api_key: String,
+    max_pending: usize,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    accept_authenticated_peer_with_idle(
+        source,
+        api_key,
+        max_pending,
+        idle::Idle::new(None).unwrap(),
+    )
+    .await
+}
+
+async fn accept_authenticated_peer_with_idle<S: accept::AcceptSource>(
     mut source: S,
     api_key: String,
     max_pending: usize,
+    idle: Arc<idle::Idle>,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
     let api_key: Arc<str> = api_key.into();
     let mut pending: tokio::task::JoinSet<(Option<TcpStream>, SocketAddr)> =
@@ -763,7 +791,7 @@ async fn accept_authenticated_peer<S: accept::AcceptSource>(
         // The challenge-response uses bounded blocking reads on the blocking
         // pool, and the session afterwards is driven through a blocking
         // adapter, so the peer leaves the reactor in blocking mode.
-        let mut stream = match tcp
+        let stream = match tcp
             .into_std()
             .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
         {
@@ -776,10 +804,26 @@ async fn accept_authenticated_peer<S: accept::AcceptSource>(
             }
         };
         let api_key = api_key.clone();
-        pending.spawn_blocking(move || {
-            let accepted = authenticate_peer(&mut stream, &api_key).is_ok();
-            (accepted.then_some(stream), peer_addr)
-        });
+        let activity = idle
+            .admit()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::ConnectionAborted))?;
+        struct AuthenticationJob {
+            stream: TcpStream,
+            _activity: idle::Activity,
+        }
+        impl AuthenticationJob {
+            fn authenticate(self, api_key: &str) -> Option<TcpStream> {
+                let _activity = self._activity;
+                let mut stream = self.stream;
+                let accepted = authenticate_peer(&mut stream, api_key).is_ok();
+                accepted.then_some(stream)
+            }
+        }
+        let job = AuthenticationJob {
+            stream,
+            _activity: activity,
+        };
+        pending.spawn_blocking(move || (job.authenticate(&api_key), peer_addr));
     }
 }
 
@@ -994,6 +1038,10 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
     init_acp_subagents(&cli, &cfg);
 
     let state = Arc::new(AcpState {
+        idle: idle::Idle::new(
+            cli.idle_exit_secs
+                .map(|seconds| std::time::Duration::from_secs(seconds.get())),
+        )?,
         cli,
         cfg,
         context,
@@ -1017,6 +1065,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
 
     // Choose transport: TCP if an endpoint is configured, otherwise stdio.
     if let Some(settings) = tcp_settings {
+        let idle = state.idle.clone();
         connect_agent(
             state,
             TcpTransport {
@@ -1024,6 +1073,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
                 port: settings.port,
                 api_key: settings.api_key,
                 tls: settings.tls,
+                idle,
             },
         )
         .await
@@ -1092,8 +1142,13 @@ async fn connect_agent(
                     // notification receipt. The returned future may be polled
                     // after this generation settles, so it performs no
                     // cancellation work and cannot lose a race to `Done`.
-                    let generation = receive_cancel(&state, &notification.session_id);
+                    let activity = state.idle.admit();
+                    let generation = activity
+                        .as_ref()
+                        .ok()
+                        .and_then(|_| receive_cancel(&state, &notification.session_id));
                     async move {
+                        let _activity = activity?;
                         if let Some(generation) = generation {
                             tracing::debug!(generation, "ACP cancellation dispatch completed");
                         }
@@ -1104,19 +1159,27 @@ async fn connect_agent(
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_dispatch(
-            |dispatch: Dispatch<AgentRequest, AgentNotification>, _cx: ConnectionTo<Client>| {
-                async move {
-                    match dispatch {
-                        Dispatch::Request(_, responder) => {
-                            tracing::warn!("ACP received an unhandled request");
-                            responder.respond_with_error(agent_client_protocol::Error::method_not_found())
-                        }
-                        Dispatch::Notification(_) => {
-                            tracing::warn!("ACP received an unhandled notification");
-                            Ok(())
-                        }
-                        Dispatch::Response(response, router) => {
-                            router.route_with_result(response)
+            {
+                let state = state.clone();
+                move |dispatch: Dispatch<AgentRequest, AgentNotification>,
+                      _cx: ConnectionTo<Client>| {
+                    let state = state.clone();
+                    async move {
+                        let _activity = state.idle.admit()?;
+                        match dispatch {
+                            Dispatch::Request(_, responder) => {
+                                tracing::warn!("ACP received an unhandled request");
+                                responder.respond_with_error(
+                                    agent_client_protocol::Error::method_not_found(),
+                                )
+                            }
+                            Dispatch::Notification(_) => {
+                                tracing::warn!("ACP received an unhandled notification");
+                                Ok(())
+                            }
+                            Dispatch::Response(response, router) => {
+                                router.route_with_result(response)
+                            }
                         }
                     }
                 }
@@ -1124,7 +1187,21 @@ async fn connect_agent(
             agent_client_protocol::on_receive_dispatch!(),
         );
 
-    builder.connect_to(transport).await
+    let result = if state.idle.enabled() {
+        // Both connection futures are dropped before waiting for actual task
+        // cleanup. Dropping a Tokio JoinHandle alone would detach that cleanup.
+        tokio::select! {
+            result = builder.connect_to(transport) => result,
+            () = state.idle.expired() => {
+                tracing::info!("ACP server exiting after idle");
+                Ok(())
+            }
+        }
+    } else {
+        builder.connect_to(transport).await
+    };
+    state.idle.wait_settled().await;
+    result
 }
 
 fn receive_cancel(state: &AcpState, session_id: &SessionId) -> Option<u64> {
@@ -1154,8 +1231,9 @@ fn receive_cancel(state: &AcpState, session_id: &SessionId) -> Option<u64> {
 async fn handle_initialize(
     _req: InitializeRequest,
     responder: Responder<InitializeResponse>,
-    _state: &AcpState,
+    state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
     let caps = acp_capabilities();
 
     let resp = InitializeResponse::new(acp_protocol_version())
@@ -1174,6 +1252,7 @@ async fn handle_new_session(
     _cx: ConnectionTo<Client>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
     #[cfg(feature = "mcp")]
     let client_mcp_servers = client_mcp_servers(state, &req.mcp_servers)?;
@@ -1241,6 +1320,7 @@ async fn handle_new_session(
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
+    state.idle.sessions_changed(sessions.len());
     drop(sessions);
 
     let resp = NewSessionResponse::new(session_id);
@@ -1431,6 +1511,7 @@ async fn handle_close_session(
     responder: Responder<CloseSessionResponse>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
     let session_id = &req.session_id;
     tracing::info!("ACP close session: {}", session_id);
 
@@ -1446,7 +1527,11 @@ async fn handle_close_session(
         }
     }
 
-    state.sessions.lock().await.remove(session_id);
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(session_id);
+        state.idle.sessions_changed(sessions.len());
+    }
 
     responder.respond(CloseSessionResponse::new())
 }
@@ -1596,6 +1681,7 @@ async fn handle_prompt(
     cx: ConnectionTo<Client>,
     state: Arc<AcpState>,
 ) -> Result<(), agent_client_protocol::Error> {
+    let activity = state.idle.admit()?;
     let session_id = req.session_id.clone();
 
     tracing::info!("ACP prompt for session {}", session_id);
@@ -1703,7 +1789,7 @@ async fn handle_prompt(
             // cancellation while the turn remains alive just long enough to
             // kill/reap hooks and finish tracked blocking work.
             let _cancel_on_connection_drop = CancelTurnOnDrop(teardown_control);
-            tokio::spawn(async move {
+            tokio::spawn(activity.track(async move {
                 // Held until the turn, its hooks and its tracked work settle.
                 let _hook_lease = hook_lease;
                 let registration = registration;
@@ -1748,7 +1834,7 @@ async fn handle_prompt(
                     barrier.release.notified().await;
                 }
                 result
-            })
+            }))
             .await
             .map_err(|error| {
                 agent_client_protocol::Error::new(
@@ -2087,6 +2173,7 @@ async fn drive_question_request(
 
 async fn drive_permission_bridge(
     cx: ConnectionTo<Client>,
+    _activity: idle::Activity,
     session_id: SessionId,
     mut ask_rx: crate::permission::ask::AskReceiver,
     control: Arc<TurnControl>,
@@ -2739,14 +2826,15 @@ async fn execute_prompt(
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
     if let Some(rx) = ask_rx {
-        tokio::spawn(drive_permission_bridge(
+        tokio::spawn(state.idle.admit()?.track(drive_permission_bridge(
             cx.clone(),
+            idle::Activity::default(),
             session_id.clone(),
             rx,
             control.clone(),
             #[cfg(feature = "goal")]
             blocked_ms,
-        ));
+        )));
     }
     let (provider_str, model_str) = acp_provider_and_model(&state.cli, &state.cfg);
 
@@ -3992,6 +4080,7 @@ mod protocol_tests {
 
     fn fixture_state(prompt_fixture: PromptFixture) -> Arc<AcpState> {
         Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
             cli: Cli::default(),
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -4010,6 +4099,7 @@ mod protocol_tests {
 
     fn runner_fixture_state(runner_fixture: RunnerFixture) -> Arc<AcpState> {
         Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
             cli: Cli::default(),
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -4031,6 +4121,7 @@ mod protocol_tests {
         prompt_exit_barrier: Arc<PromptExitBarrier>,
     ) -> Arc<AcpState> {
         Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
             cli: Cli::default(),
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -4064,6 +4155,7 @@ mod protocol_tests {
         }
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(temp.path()).unwrap());
         let state = AcpState {
+            idle: idle::Idle::new(None).unwrap(),
             cli: Cli {
                 no_sandbox: true,
                 shell: Some("bash".to_string()),
@@ -4224,6 +4316,7 @@ mod protocol_tests {
             .with_spawned(move |cx| async move {
                 drive_permission_bridge(
                     cx,
+                    idle::Activity::default(),
                     SessionId::new("allow-always-meta"),
                     ask_rx,
                     control,
@@ -4369,6 +4462,7 @@ mod protocol_tests {
                     .with_spawned(move |cx| async move {
                         drive_permission_bridge(
                             cx,
+                            idle::Activity::default(),
                             SessionId::new("permission-test"),
                             ask_rx,
                             bridge_control,
@@ -6875,6 +6969,267 @@ mod protocol_tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_empty_protocol_server_closes_without_model_work() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fixture: PromptFixture = {
+            let calls = calls.clone();
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Box::pin(async { panic!("idle server must not invoke a model") })
+            })
+        };
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let retained = state.clone();
+        let connection = Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // A successful server close does not cancel the SDK callback.
+                // Observe its explicit EOF signal and let the callback finish.
+                cx.incoming_closed().await;
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.sessions.lock().await.is_empty());
+        assert!(
+            retained.idle.admit().is_err(),
+            "server completed by idle selection"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_connection_eof_drains_actual_prompt_cleanup() {
+        use futures::FutureExt;
+        let fixture: PromptFixture = Arc::new(|p, _| {
+            Box::pin(async move { Ok(vec![done(&p, vec![Message::assistant(p.clone())])]) })
+        });
+        let barrier = Arc::new(PromptExitBarrier {
+            generation: 0,
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut state = fixture_state_with_exit_barrier(fixture, barrier.clone());
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let retained = state.clone();
+        let callback_barrier = barrier.clone();
+        // The server is independently owned, like the actual process. A
+        // connect_with foreground must not own/drop this server future.
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let server = connect_agent(
+            state,
+            ByteStreams::new(tls::FuturesIo(server_write), tls::FuturesIo(server_read)),
+        );
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                ByteStreams::new(tls::FuturesIo(client_write), tls::FuturesIo(client_read)),
+                async move |cx| {
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let session = cx
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?
+                        .session_id;
+                    cx.send_request(prompt(session.clone(), "finish response before task"))
+                        .block_task()
+                        .await?;
+                    callback_barrier.entered.notified().await;
+                    cx.send_request(CloseSessionRequest::new(session))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                },
+            );
+        tokio::pin!(server, client);
+        let mut server_done = false;
+        let mut client_done = false;
+        let assertions = std::panic::AssertUnwindSafe(async {
+            tokio::select! {
+                result = &mut client => { client_done = true; result.unwrap(); },
+                result = &mut server => { server_done = true; panic!("server completed before client EOF/cleanup: {result:?}"); },
+            }
+            // Drive the actual server after physical byte-transport EOF for
+            // ten idle intervals; only the retained prompt task keeps it live.
+            tokio::select! {
+                result = &mut server => { server_done = true; panic!("server completed before actual prompt cleanup: {result:?}"); },
+                () = tokio::time::sleep(Duration::from_secs(30)) => {},
+            }
+            assert!(retained.sessions.lock().await.is_empty());
+            assert!(retained.idle.wait_settled().now_or_never().is_none());
+        }).catch_unwind().await;
+        // Clear completed futures through explicit flags and unconditionally
+        // settle both endpoints and the actual task before directory removal.
+        barrier.release.notify_one();
+        if !client_done {
+            tokio::time::timeout(Duration::from_secs(5), &mut client)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        if !server_done {
+            tokio::time::timeout(Duration::from_secs(5), &mut server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        retained_wait_for_fixture_cleanup(&retained).await;
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_preserves_dormant_session_until_explicit_close() {
+        use futures::FutureExt;
+        let fixture: PromptFixture = Arc::new(|p, _| {
+            Box::pin(async move { Ok(vec![done(&p, vec![Message::assistant(p.clone())])]) })
+        });
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let retained = state.clone();
+        let callback_state = retained.clone();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                tokio::time::advance(Duration::from_secs(30)).await;
+                assert!(callback_state.idle.expired().now_or_never().is_none());
+                let response = cx
+                    .send_request(prompt(session.clone(), "still loaded"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                cx.send_request(CloseSessionRequest::new(session))
+                    .block_task()
+                    .await?;
+                assert!(callback_state.sessions.lock().await.is_empty());
+                assert!(callback_state.idle.expired().now_or_never().is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        retained_wait_for_fixture_cleanup(&retained).await;
+    }
+
+    // Session deletion and response delivery happen before the actual prompt
+    // task reaches this retained barrier. This is an actual protocol control,
+    // not an inference from the registered-turn queue.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_close_waits_for_whole_prompt_terminal_cleanup() {
+        use futures::FutureExt;
+        struct ReleaseBarrier(Arc<PromptExitBarrier>);
+        impl Drop for ReleaseBarrier {
+            fn drop(&mut self) {
+                self.0.release.notify_one();
+            }
+        }
+        let fixture: PromptFixture = Arc::new(|p, _| {
+            Box::pin(async move { Ok(vec![done(&p, vec![Message::assistant(p.clone())])]) })
+        });
+        let barrier = Arc::new(PromptExitBarrier {
+            generation: 0,
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut state = fixture_state_with_exit_barrier(fixture, barrier.clone());
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let retained = state.clone();
+        let callback_state = retained.clone();
+        let callback_barrier = barrier.clone();
+        let result = Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let _release_on_any_exit = ReleaseBarrier(callback_barrier.clone());
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let response = cx
+                    .send_request(prompt(session.clone(), "complete before cleanup"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                callback_barrier.entered.notified().await;
+                cx.send_request(CloseSessionRequest::new(session))
+                    .block_task()
+                    .await?;
+                assert!(callback_state.sessions.lock().await.is_empty());
+                assert!(lock_unpoisoned(&callback_state.cancel_routes).is_empty());
+                tokio::time::advance(Duration::from_secs(30)).await;
+                assert!(
+                    callback_state.idle.expired().now_or_never().is_none(),
+                    "terminal cleanup was detached from idle ownership"
+                );
+                assert!(callback_state.idle.wait_settled().now_or_never().is_none());
+                // Still accept an ordinary request while the actual task owns
+                // cleanup, despite an empty session catalogue and queue.
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                callback_barrier.release.notify_one();
+                callback_state.idle.wait_settled().await;
+                assert!(callback_state.idle.expired().now_or_never().is_none());
+                Ok(())
+            })
+            .await;
+        // Every assertion exit releases the retained cleanup owner before the
+        // protocol directory is removed, including a failed control.
+        barrier.release.notify_one();
+        retained_wait_for_fixture_cleanup(&retained).await;
+        result.unwrap();
+    }
+
+    async fn retained_wait_for_fixture_cleanup(state: &Arc<AcpState>) {
+        tokio::time::timeout(Duration::from_secs(5), state.idle.wait_settled())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn close_session_removes_it_and_is_idempotent() {
         let fixture: PromptFixture = Arc::new(|p, _| {
@@ -7761,6 +8116,42 @@ mod hook_root_tests {
 
 #[cfg(test)]
 mod tcp_authentication_tests {
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_plaintext_auth_remains_active_until_native_job_settles() {
+        use futures::FutureExt;
+        use tokio::io::AsyncReadExt;
+        let idle = idle::Idle::new(Some(Duration::from_secs(1))).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = accept::tokio_listener(listener).unwrap();
+        let server = tokio::spawn(accept_authenticated_peer_with_idle(
+            source,
+            "inert-key".into(),
+            2,
+            idle.clone(),
+        ));
+        let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut byte = [0; 1];
+        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        // The actual challenge byte proves the blocking task owns the peer.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(idle.expired().now_or_never().is_none());
+        tokio::time::resume();
+        drop(peer);
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(5), idle.wait_settled())
+            .await
+            .unwrap();
+        assert!(
+            idle.expired().now_or_never().is_none(),
+            "quiet interval must restart after native auth settles"
+        );
+    }
+
     use super::*;
     use crate::acp_auth::{read_challenge, send_response};
     use crate::extras::acp::config::AcpServerConfig;
@@ -8265,6 +8656,7 @@ mod question_transport_tests {
                 .with_spawned(move |cx| async move {
                     drive_permission_bridge(
                         cx,
+                        idle::Activity::default(),
                         SessionId::new("question-rpc"),
                         receiver,
                         control,

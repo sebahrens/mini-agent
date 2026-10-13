@@ -242,3 +242,6 @@ mod turn_persistence_tests;
 pub(crate) mod update_tests;
 #[cfg(all(test, feature = "git-worktree"))]
 mod worktree_tests;
+
+#[cfg(unix)]
+mod ledger_lock_tests;

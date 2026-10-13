@@ -1095,7 +1095,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/acp/tls.rs",
-        "pending.spawn(authentication);",
+        "pending.spawn(activity.track(authentication));",
         1,
         "NON-PROCESS",
     ),
@@ -4528,7 +4528,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/acp/tls.rs",
-        "pending.spawn(authentication);",
+        "pending.spawn(activity.track(authentication));",
         1,
         "NON-PROCESS",
     ),

@@ -692,3 +692,105 @@ async fn effort46_owned_capture_precedes_canonical_budget_stop_without_second_ch
     assert!(profile.admit().is_err());
     assert_eq!(wire.finish().len(), 1);
 }
+
+#[tokio::test]
+async fn effort46_native_display_deltas_once_preserves_completed_opaque_content() {
+    use crate::agent::native_capture::NativeCapture;
+    use crate::event::AgentEvent;
+    for enabled in [false, true] {
+        for summary in ["", "visible native summary"] {
+            let response = start()
+                + &thinking(0, summary, "display-control-signature")
+                + &redacted(1)
+                + &text(2, "settled")
+                + &finish();
+            let wire = Wire::new(vec![(true, response)]);
+            let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5")
+            else {
+                unreachable!()
+            };
+            let inner = rig::agent::AgentBuilder::new(model)
+                .max_tokens(1000)
+                .default_max_turns(1)
+                .build();
+            let capture = NativeCapture::default();
+            let mut agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner));
+            if enabled {
+                agent = agent.with_native_capture(capture.clone());
+            }
+            let mut runner = agent
+                .spawn_runner(
+                    "display and opaque retention control".into(),
+                    Vec::<Message>::new(),
+                    RetryConfig {
+                        max_attempts: 1,
+                        ..Default::default()
+                    },
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+                .await;
+            let mut displayed = String::new();
+            let mut completed = None;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = runner.event_rx.recv().await {
+                    match event {
+                        AgentEvent::Reasoning(text) => displayed.push_str(&text),
+                        AgentEvent::Done { interactions, .. } => completed = Some(interactions),
+                        AgentEvent::Error { message, .. } => {
+                            panic!("native display control failed: {message}")
+                        }
+                        AgentEvent::UsageDelta {
+                            awaits_compaction_decision: true,
+                            ..
+                        } => {
+                            runner
+                                .compaction_decision_tx
+                                .as_ref()
+                                .unwrap()
+                                .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                                .await
+                                .unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("owned native display runner retirement");
+            assert_eq!(
+                displayed, summary,
+                "native summary was duplicated or opaque content rendered"
+            );
+            assert!(!displayed.contains("display-control-signature"));
+            assert!(!displayed.contains("opaque-redacted-two"));
+            let transcript =
+                serde_json::to_string(&completed.expect("successful terminal interactions"))
+                    .unwrap();
+            assert!(transcript.contains("display-control-signature"));
+            assert!(transcript.contains("opaque-redacted-two"));
+            if enabled {
+                let (frames, unavailable) = capture.snapshot();
+                assert_eq!(unavailable, None);
+                assert_eq!(frames.len(), 1);
+                let native =
+                    rig::providers::anthropic::completion::Message::try_from(Message::Assistant {
+                        id: None,
+                        content: frames[0].content.clone(),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(native).unwrap()["content"],
+                    json!([
+                        {"type":"thinking", "thinking":summary, "signature":"display-control-signature"},
+                        {"type":"redacted_thinking", "data":"opaque-redacted-two"},
+                        {"type":"text", "text":"settled"},
+                    ])
+                );
+            } else {
+                assert!(capture.snapshot().0.is_empty());
+            }
+            assert_eq!(wire.finish().len(), 1);
+        }
+    }
+}

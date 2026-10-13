@@ -1162,8 +1162,14 @@ pub struct BtwRunner {
     pub(crate) work_scope: Arc<AgentWorkScope>,
 }
 
-fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<CompactString> {
+fn streamed_reasoning_text<R>(
+    content: &StreamedAssistantContent<R>,
+    native: bool,
+) -> Option<CompactString> {
     match content {
+        // Native deltas carry display text; completed blocks carry replay
+        // authority, including opaque redacted data, and must not be rendered.
+        StreamedAssistantContent::Reasoning(_) if native => None,
         StreamedAssistantContent::Reasoning(reasoning) => {
             Some(CompactString::new(reasoning.display_text()))
         }
@@ -2905,12 +2911,14 @@ where
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
-                        if let Some(reasoning) = streamed_reasoning_text(&content) {
-                            // A complete reasoning item also has to enter the
-                            // replayed transcript; a delta is display only.
-                            if let StreamedAssistantContent::Reasoning(item) = &content {
-                                append_reasoning(&mut interactions, item);
-                            }
+                        // Ingestion is independent of display: native opaque
+                        // completed blocks remain available to the transcript.
+                        if let StreamedAssistantContent::Reasoning(item) = &content {
+                            append_reasoning(&mut interactions, item);
+                        }
+                        if let Some(reasoning) =
+                            streamed_reasoning_text(&content, native_capture.is_native())
+                        {
                             let _ = event_tx.send(AgentEvent::Reasoning(reasoning)).await;
                             continue;
                         }
@@ -3879,7 +3887,9 @@ where
                     StreamedAssistantContent::Reasoning(r),
                 )) => {
                     append_reasoning(&mut interactions, &r);
-                    if let Err(error) = output_policy.reasoning(&r.display_text()).await {
+                    if !native_capture.is_native()
+                        && let Err(error) = output_policy.reasoning(&r.display_text()).await
+                    {
                         fail_turn!(error);
                     }
                 }
@@ -9255,7 +9265,7 @@ mod tests {
         };
 
         assert_eq!(
-            streamed_reasoning_text(&content).as_deref(),
+            streamed_reasoning_text(&content, false).as_deref(),
             Some("thinking in progress")
         );
     }
@@ -9267,7 +9277,35 @@ mod tests {
             reasoning: String::new(),
         };
 
-        assert!(streamed_reasoning_text(&content).is_none());
+        assert!(streamed_reasoning_text(&content, false).is_none());
+    }
+
+    #[test]
+    fn native_completed_reasoning_is_replay_only_and_generic_display_is_unchanged() {
+        for (block, previous_display) in [
+            (
+                serde_json::json!({"type":"thinking", "thinking":"summary", "signature":"opaque-signature"}),
+                "summary",
+            ),
+            (
+                serde_json::json!({"type":"redacted_thinking", "data":"opaque-redacted"}),
+                "opaque-redacted",
+            ),
+        ] {
+            let native: rig::providers::anthropic::completion::Content =
+                serde_json::from_value(block).unwrap();
+            let AssistantContent::Reasoning(reasoning) =
+                AssistantContent::try_from(native).unwrap()
+            else {
+                unreachable!()
+            };
+            let content = StreamedAssistantContent::<()>::Reasoning(reasoning);
+            assert!(streamed_reasoning_text(&content, true).is_none());
+            assert_eq!(
+                streamed_reasoning_text(&content, false).as_deref(),
+                Some(previous_display)
+            );
+        }
     }
 
     fn tool_call_ids_of(interactions: &[Message]) -> Vec<&str> {

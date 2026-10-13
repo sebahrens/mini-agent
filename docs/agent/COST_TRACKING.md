@@ -126,6 +126,14 @@ other I/O/identity failure leaves the charge and pending receipt intact and
 tracking incomplete. Summaries retain their one-shot nonblocking shared lock.
 Read-only queries never create, repair, quarantine or rewrite storage.
 
+Acquired ledger locks are explicitly released before returning a summary or
+acknowledging persisted receipts. Descriptor close alone can leave a Unix lock
+held by an already-forked child until exec, even with CLOEXEC. Error and unwind
+paths also attempt explicit release; an unlock failure cannot acknowledge a
+receipt or return a successful summary. Append acknowledgement still follows
+fsync and retained-identity validation. This changes neither the contention
+budget nor the owned blocking-I/O boundary.
+
 Reads are limited to 64 MiB, 65,536 records and 4 KiB per record. Pending receipts
 are limited to 1,024; detailed model aggregates to 128 identities. Receipt token
 counts are capped at 10^15 per field and cost/aggregate amounts at 10^18 USD.
@@ -138,6 +146,10 @@ receipt retries cannot charge or append the same receipt twice.
 `src/spend/request_tests.rs` owns fake native HTTP fixtures for raw auxiliary
 accounting, cancellation, SDK invalid-tool failures, captured prices and refusal
 of subsequent requests. Production credentials and paid endpoints are not used.
+`src/tests/ledger_lock_tests.rs` owns Unix pre-exec controls against the actual
+private ledger: a child retains an inherited descriptor while successful and
+corrupt-tail reader/writer operations retire. The controls check immediate lock
+release, unchanged corrupt bytes, exact receipts and idempotent persistence.
 
 The status bar's `calls` counter is display metadata on the same session account.
 Only deduplicated accepted receipts with a canonical usage report increment it,
