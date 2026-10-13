@@ -3206,6 +3206,9 @@ an explicitly configured `0` means a free tier. Saving and reloading config keep
 omitted tiers absent. An unlisted model with an omitted tier remains unpriced.
 Negative and non-finite declared rates are rejected. Cache rates remain separate,
 so a free base rate can still have a paid native Anthropic cache tier.
+Cache-ratio scaling uses the input rate independently: an explicit input/cache
+price remains usable when the output rate is unknown, while complete model
+pricing still requires both base tiers.
 
 
 Project config and trust-file reads reject special files and symlinks instead

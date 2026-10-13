@@ -169,7 +169,7 @@ pub(crate) fn cache_prices_for_model(
             })
             .or_else(|| {
                 let entry = matching?;
-                let entry_input_price = entry.resolved_prices()?.0;
+                let entry_input_price = entry.resolved_input_price()?;
                 if !entry_input_price.is_finite()
                     || entry_input_price <= 0.0
                     || !input_price.is_finite()
@@ -474,6 +474,17 @@ mod cache_pricing_tests {
                 read: 0.25,
                 write: 0.0
             }
+        );
+        let gateway_config = &cfg.quick_models.as_ref().unwrap()["gateway"];
+        assert_eq!(gateway_config.resolved_prices(), None);
+        assert_eq!(gateway_config.resolved_input_price(), Some(8.0));
+        assert_eq!(
+            cache_prices_for_model("private-gateway", "private-model", &cfg, None, 4.0),
+            CachePrices {
+                read: Some(1.0),
+                write: Some(0.0),
+            },
+            "a known input/cache ratio does not fabricate an omitted output rate"
         );
         // A mismatched alias cannot lend its explicit rates to another model.
         assert_eq!(

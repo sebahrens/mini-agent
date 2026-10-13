@@ -625,6 +625,19 @@ jobs:
       # specifically prevents default-feature cfg and compilation drift.
       - name: Compile the Windows default feature suite
         run: cargo test --locked --no-run
+      - name: Test native one MiB App event loops
+        shell: pwsh
+        run: |
+          $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack')
+          $listing = @(& cargo test --locked --bin mini-agent -- @filters --list)
+          if ($LASTEXITCODE -ne 0) { throw 'App stack test discovery failed' }
+          foreach ($name in $filters) {
+            if ($listing -notcontains "ui::app::workspace_session_picker_tests::${name}: test") {
+              throw "Missing native App stack test: $name"
+            }
+          }
+          & cargo test --locked --bin mini-agent -- @filters --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native one MiB App event loop failed' }
 
   # `hooks` is opt-in, so the default-feature compile above never builds the
   # hook launcher or its Windows process-tree code. A Windows-only duplicate

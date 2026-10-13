@@ -1661,7 +1661,9 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
-                    self.handle_agent_event(event).await?;
+                    // This measured large child is unrelated to input, but
+                    // its inline storage inflated every event-loop poll.
+                    crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
                     // Streaming paints the chat directly and would leave an
                     // open picker erased until the next key; repaint it.
                     if self.input.picker.as_ref().is_some_and(|picker| picker.active()) {
@@ -2143,7 +2145,8 @@ impl<'a> App<'a> {
                                 IdleInterrupt::Exit => return Ok(ControlFlow::Break(())),
                                 IdleInterrupt::ClearDraft => self.input.discard_draft(),
                                 IdleInterrupt::EditorKey => {
-                                    self.handle_key_event(key).await?;
+                                    crate::startup::heap_future(|| self.handle_key_event(key))
+                                        .await?;
                                 }
                             }
                         }
@@ -2152,7 +2155,10 @@ impl<'a> App<'a> {
                     return Ok(ControlFlow::Continue(()));
                 }
 
-                if let Err(e) = self.handle_key_event(key).await {
+                // The measured key-handler future makes this generic event
+                // poll too large for the native 1 MiB stack. Construct it in
+                // the existing short factory, retaining the same owned await.
+                if let Err(e) = crate::startup::heap_future(|| self.handle_key_event(key)).await {
                     if e.downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
                     {
@@ -3280,7 +3286,9 @@ impl<'a> App<'a> {
     }
 
     async fn run_slash_command(&mut self, text: &str) -> anyhow::Result<()> {
-        self.run_slash_command_selected(text, None).await
+        // The ordinary wrapper previously duplicated the measured large
+        // selected-command future in the key-handler polling chain.
+        crate::startup::heap_future(|| self.run_slash_command_selected(text, None)).await
     }
 
     async fn run_slash_command_selected(
@@ -3371,7 +3379,9 @@ impl<'a> App<'a> {
             self.sync_live_model_names(true);
         }
 
-        self.handle_slash_result(result).await?;
+        // Keep the measured settlement future out of the command poll frame,
+        // including commands that immediately return an exit/error result.
+        crate::startup::heap_future(|| self.handle_slash_result(result)).await?;
         self.save_session()?;
         Ok(())
     }
@@ -7769,6 +7779,124 @@ mod workspace_session_picker_tests {
                         assert_eq!(app.ui.session.id, saved.id);
                         assert!(app.renderer.captured_output().contains("ONE_MIB_SAVED_ROW"));
                         assert!(app.input.picker.is_none());
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn actual_standard_app_event_loop_runs_on_one_mib_stack() {
+        standard_app_one_mib_case(false);
+        standard_app_one_mib_case(true);
+    }
+
+    fn standard_app_one_mib_case(pending_permission: bool) {
+        std::thread::Builder::new()
+            .name("standard-app-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        let root = crate::tests::OwnedTestDirectory::new("standard-app-one-mib");
+                        eprintln!("standard App stack fixture: {}", root.path().display());
+                        let _env = environment(&root);
+                        let workspace =
+                            Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                        let cli = crate::cli::Cli {
+                            no_session: true,
+                            no_tools: true,
+                            ..Default::default()
+                        };
+                        let cfg = config::Config {
+                            session_title_model: Some("off".into()),
+                            ..Default::default()
+                        };
+                        let mut session = Session::new("anthropic", "test", 128_000, "");
+                        session.working_dir = root.path().to_string_lossy().into();
+                        let mut context =
+                            crate::context::load(true).for_workspace_binding(true, &workspace);
+                        let mut app =
+                            fixture_app(ui(&cli, &cfg, &mut session, &mut context, workspace));
+                        let captured_workspace = app.ui.workspace.clone();
+                        let captured_prompt = app.ui.context.current_prompt_name.clone();
+                        let session_id = app.ui.session.id.clone();
+                        let checker = crate::permission::checker::PermissionChecker::new(
+                            &crate::permission::PermissionConfigs::default(),
+                            crate::permission::SecurityMode::Standard,
+                            Some(root.path().to_owned()),
+                            None,
+                        )
+                        .unwrap();
+                        let permission = Arc::new(std::sync::Mutex::new(checker));
+                        app.ui.permission = Some(permission.clone());
+                        let mut decision = if pending_permission {
+                            let (reply, decision) = tokio::sync::oneshot::channel();
+                            app.begin_permission_request(crate::permission::ask::AskRequest {
+                                tool: "bash".into(),
+                                input: "owned unanswered command".into(),
+                                #[cfg(feature = "acp")]
+                                tool_call_id: Some("owned-stack-call".into()),
+                                suggested_pattern: None,
+                                additional_allow_patterns: Vec::new(),
+                                reply,
+                            })
+                            .unwrap();
+                            Some(decision)
+                        } else {
+                            None
+                        };
+                        let events = [
+                            UserEvent::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+                            UserEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                            UserEvent::Key(KeyEvent::new(
+                                KeyCode::Char('c'),
+                                KeyModifiers::CONTROL,
+                            )),
+                            UserEvent::Paste("/quit".into()),
+                            UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                        ];
+                        let sender = app.user_tx.clone();
+                        let feed = async move {
+                            for event in events {
+                                sender.send(event).await.unwrap();
+                            }
+                        };
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            let (_, result) =
+                                tokio::join!(feed, crate::startup::heap_future(|| app.run_inner()));
+                            result
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(app.renderer.captured_output().contains("/quit"));
+                        assert!(app.deferred_user_events.is_empty());
+                        assert!(matches!(
+                            app.user_rx.try_recv(),
+                            Err(mpsc::error::TryRecvError::Empty)
+                        ));
+                        assert!(!app.run.is_running);
+                        assert!(app.permission_prompt.is_none());
+                        assert!(app.run.pending_turn.is_none());
+                        assert!(app.ui.session.messages.is_empty());
+                        assert_eq!(app.ui.session.id, session_id);
+                        assert_eq!(app.ui.context.current_prompt_name, captured_prompt);
+                        assert!(Arc::ptr_eq(&app.ui.workspace, &captured_workspace));
+                        assert!(app.ui.session.permission_allowlist.is_empty());
+                        assert_eq!(
+                            permission.lock().unwrap().mode(),
+                            crate::permission::SecurityMode::Guarded
+                        );
+                        if let Some(decision) = decision.as_mut() {
+                            assert!(matches!(
+                                decision.try_recv().unwrap(),
+                                crate::permission::ask::UserDecision::Deny
+                            ));
+                        }
                     }));
             })
             .unwrap()

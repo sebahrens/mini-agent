@@ -442,3 +442,13 @@ Declared OpenRouter routing/privacy constraints are validated before any title
 request; malformed or unsupported values, or use with another protocol, fail closed and keep the
 first-message fallback without inventing usage.
 See [CONFIG.md](CONFIG.md) for the default model and opt-out.
+
+The App event loop constructs measured large agent-event, key-handler, and
+slash-command futures through the existing short `heap_future` factory. This
+keeps their temporary storage out of parent polling frames while preserving
+the same awaits, interruption cleanup, and permission ownership. Fixed 1 MiB
+thread tests exercise a cold typed command, draft interruption, pending
+approval denial, mode cycling, and session-picker selection. The Windows
+default job discovers and runs both App stack consumers after compiling its
+existing feature suite; compilation alone is insufficient evidence for this
+stack budget. No production stack-size override is introduced.

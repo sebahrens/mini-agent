@@ -126,11 +126,22 @@ pub struct QuickModelConfig {
 }
 
 impl QuickModelConfig {
+    /// Cache ratios require only a known input rate. A missing output tier
+    /// must not discard this independently declared or catalogued price.
+    pub fn resolved_input_price(&self) -> Option<f64> {
+        self.input_token_cost
+            .or_else(|| {
+                super::Config::catalog_input_output_cost(&self.provider, &self.model)
+                    .map(|price| price.0)
+            })
+            .filter(|price| price.is_finite() && *price >= 0.0)
+    }
+
     /// Declared tiers override catalogue rates independently. Explicit zero is
     /// a known free tier; omission never creates a free rate.
     pub fn resolved_prices(&self) -> Option<(f64, f64)> {
         let catalog = super::Config::catalog_input_output_cost(&self.provider, &self.model);
-        let input = self.input_token_cost.or(catalog.map(|price| price.0))?;
+        let input = self.resolved_input_price()?;
         let output = self.output_token_cost.or(catalog.map(|price| price.1))?;
         (input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0)
             .then_some((input, output))
