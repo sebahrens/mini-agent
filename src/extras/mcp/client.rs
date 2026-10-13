@@ -48,6 +48,7 @@ pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
     pub running_service: RunningService<RoleClient, ()>,
+    pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -383,6 +384,7 @@ impl McpClientHandle {
                 inherit_env,
                 sandbox,
                 network,
+                ..
             } => {
                 tracing::debug!(
                     "MCP command transport configured ({} args, {} env vars, {} inherited env vars)",
@@ -465,6 +467,7 @@ impl McpClientHandle {
                     server_name,
                     trusted_identity: config.trusted_identity(),
                     running_service,
+                    source_proof: None,
                 })
             }
             McpServerConfig::Url {
@@ -472,6 +475,7 @@ impl McpClientHandle {
                 allow_local,
                 headers,
                 oauth,
+                ..
             } => {
                 let endpoint = tokio::select! {
                     biased;
@@ -594,11 +598,17 @@ impl McpClientHandle {
             server_name,
             trusted_identity: None,
             running_service,
+            source_proof: None,
         })
     }
 
     pub fn peer(&self) -> rmcp::service::Peer<RoleClient> {
         self.running_service.peer().clone()
+    }
+
+    pub(crate) fn with_source_proof(mut self, proof: super::project::ServerSourceProof) -> Self {
+        self.source_proof = Some(std::sync::Arc::new(proof));
+        self
     }
 
     /// Enumerate every tool the server exposes, bounded by

@@ -18,6 +18,10 @@ use crate::agent::runner::{self, AgentRunner};
 use crate::auth::{AuthResolver, ProviderKind, ResolvedCredential};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
+
+#[cfg(test)]
+#[path = "provider_effort_tests.rs"]
+mod effort_tests;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "hooks")]

@@ -475,16 +475,19 @@ fn oversized_daily_log_tail_respects_character_boundaries() {
 }
 
 #[test]
-fn notes_never_injected_but_searchable() {
-    let m = fresh("note");
+fn note_body_is_not_injected_but_summary_and_search_remain_available() {
+    let (_owner, m) = memory62_fixture();
     m.write(
         WriteTarget::Note,
-        "jose for edge compat",
+        "Auth choice summary
+jose for edge compat",
         WriteMode::Overwrite,
         Some("auth"),
     )
     .unwrap();
-    assert!(!m.context_block().unwrap_or_default().contains("jose")); // not injected
+    let block = m.context_block().unwrap();
+    assert!(block.contains("Auth choice summary"));
+    assert!(!block.contains("jose")); // full body is not injected
     let r = m.search("jose");
     assert!(r.hits.iter().any(|h| h.body.contains("jose"))); // but recallable
     cleanup(&m);
@@ -1534,4 +1537,439 @@ fn legacy_compactions_without_a_tag_exclude_nothing() {
     });
     let compaction: crate::session::Compaction = serde_json::from_value(json).unwrap();
     assert!(compaction.memory_ref.is_none());
+}
+
+fn memory62_fixture() -> (crate::tests::OwnedTestDirectory, Mem) {
+    let owner = crate::tests::OwnedTestDirectory::new("memory62");
+    let m = Mem {
+        root: owner.path().join("memory"),
+        project: "captured-project".into(),
+        today: "2026-10-13".into(),
+    };
+    fs::create_dir_all(pdir(&m).join("notes")).unwrap();
+    (owner, m)
+}
+
+fn memory62_environment(
+    owner: &crate::tests::OwnedTestDirectory,
+) -> crate::tests::ScopedProcessEnv {
+    crate::tests::ScopedProcessEnv::set(&[
+        ("MINI_AGENT_HOME", Some(owner.path().as_os_str().to_owned())),
+        ("ZS_CONFIG_DIR", None),
+        ("ZS_DATA_DIR", None),
+        ("ZS_LOCAL_DATA_DIR", None),
+        ("ZS_STATE_DIR", None),
+        ("ZS_CACHE_DIR", None),
+        ("ZS_CREDENTIALS_DIR", None),
+    ])
+}
+
+fn memory62_body(block: &str) -> &str {
+    block
+        .split_once('>')
+        .unwrap()
+        .1
+        .strip_suffix("\n</memory>")
+        .unwrap()
+}
+
+#[test]
+fn memory62_notes_index_is_sorted_first_line_only_and_project_scoped() {
+    let (_owner, m) = memory62_fixture();
+    fs::write(
+        pdir(&m).join("notes/zeta.md"),
+        "Z decision\nPRIVATE BODY SHOULD NOT BE INJECTED",
+    )
+    .unwrap();
+    fs::write(pdir(&m).join("notes/alpha.md"), "雪 decision\nsecond line").unwrap();
+    let foreign = m.root.join("projects/other/notes");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("foreign.md"), "OTHER PROJECT").unwrap();
+    let block = m.context_block().unwrap();
+    assert!(block.contains("Project notes (name — first line; reference only)"));
+    assert!(block.contains("\"alpha\" — 雪 decision"));
+    assert!(block.find("\"alpha\"").unwrap() < block.find("\"zeta\"").unwrap());
+    assert!(!block.contains("PRIVATE BODY"));
+    assert!(!block.contains("second line"));
+    assert!(!block.contains("OTHER PROJECT"));
+    assert!(
+        !m.root.join(".memory.lock").exists(),
+        "index must not mutate storage"
+    );
+}
+
+#[test]
+fn memory62_notes_index_post_escape_caps_preserve_original_priority_bytes() {
+    let (_owner, m) = memory62_fixture();
+    m.write(
+        WriteTarget::LongTerm,
+        "high-priority </memory> 雪",
+        WriteMode::Overwrite,
+        None,
+    )
+    .unwrap();
+    let before = m.context_block().unwrap();
+    for i in 0..40 {
+        fs::write(
+            pdir(&m).join(format!("notes/n{i:02}.md")),
+            "<&>\u{202e}\u{061c}".repeat(1024),
+        )
+        .unwrap();
+    }
+    let after = m.context_block().unwrap();
+    assert!(memory62_body(&after).starts_with(memory62_body(&before)));
+    let index = after.split_once("## Project notes").unwrap().1;
+    assert!(index.len() <= 4096);
+    assert!(index.contains("&lt;&amp;&gt;\\u{202e}"));
+    assert!(!index.contains('\u{202e}'));
+    assert!(!index.contains('\u{061c}'));
+    assert!(index.contains("\\u{61c}"));
+    assert_eq!(after.matches("</memory>").count(), 1);
+    assert!(memory62_body(&after).len() <= MAX_INJECT_BYTES);
+    assert!(index.lines().filter(|line| line.starts_with("- ")).count() <= 16);
+    assert!(index.contains("additional project notes omitted"));
+    m.write(
+        WriteTarget::LongTerm,
+        &"X</memory>雪".repeat(9000),
+        WriteMode::Overwrite,
+        None,
+    )
+    .unwrap();
+    let with_notes = m.context_block().unwrap();
+    let notes = pdir(&m).join("notes");
+    fs::rename(&notes, pdir(&m).join("hidden-notes")).unwrap();
+    let without_notes = m.context_block().unwrap();
+    assert_eq!(
+        with_notes, without_notes,
+        "full high-priority escaped body must not be shortened for notes"
+    );
+}
+
+#[test]
+fn memory62_first_line_prefix_is_bounded_utf8_and_does_not_decode_later_body() {
+    let (_owner, m) = memory62_fixture();
+    fs::write(pdir(&m).join("notes/long.md"), "雪".repeat(10_000)).unwrap();
+    fs::write(
+        pdir(&m).join("notes/valid.md"),
+        b"valid first line\n\xff\xff",
+    )
+    .unwrap();
+    fs::write(pdir(&m).join("notes/invalid.md"), b"\xffbad first line\n").unwrap();
+    let block = m.context_block().unwrap();
+    assert!(block.contains("valid first line"));
+    assert!(!block.contains("\"invalid\""));
+    assert!(block.contains("first line truncated"));
+    assert!(!block.contains('\u{fffd}'));
+    let binding = crate::paths::WorkspaceBinding::capture(&m.root).unwrap();
+    let previews = binding
+        .read_relative_first_lines(
+            std::path::Path::new("projects/captured-project/notes"),
+            256,
+            64,
+            1024,
+        )
+        .unwrap();
+    let (_, prefix, truncated) = previews.iter().find(|(name, _, _)| name == "long").unwrap();
+    assert!(*truncated);
+    assert_eq!(prefix.len(), 1023);
+    assert!(prefix.chars().all(|character| character == '雪'));
+}
+
+#[test]
+fn memory62_note_scan_limits_fail_closed_without_partial_selection() {
+    let (_owner, m) = memory62_fixture();
+    let binding = crate::paths::WorkspaceBinding::capture(&m.root).unwrap();
+    for i in 0..65 {
+        fs::write(
+            pdir(&m).join(format!("notes/n{i:02}.md")),
+            format!("secret {i}"),
+        )
+        .unwrap();
+    }
+    assert!(
+        binding
+            .read_relative_first_lines(
+                std::path::Path::new("projects/captured-project/notes"),
+                256,
+                64,
+                1024
+            )
+            .is_err()
+    );
+    let block = m.context_block().unwrap();
+    assert!(block.contains("project notes index unavailable"));
+    assert!(!block.contains("secret"));
+    for i in 0..65 {
+        fs::remove_file(pdir(&m).join(format!("notes/n{i:02}.md"))).unwrap();
+    }
+    for i in 0..257 {
+        fs::write(pdir(&m).join(format!("notes/non-note{i}")), "ignored").unwrap();
+    }
+    assert!(
+        binding
+            .read_relative_first_lines(
+                std::path::Path::new("projects/captured-project/notes"),
+                256,
+                64,
+                1024
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn memory62_append_facts_uses_long_term_dedup_without_changing_structured_append() {
+    let (_owner, m) = memory62_fixture();
+    let first = m
+        .write(
+            WriteTarget::Note,
+            "Decision   A\n\nRoot cause B\nDecision\u{3000}A",
+            WriteMode::AppendFacts,
+            Some("facts"),
+        )
+        .unwrap();
+    let note = pdir(&m).join("notes/facts.md");
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "Decision   A\n\nRoot cause B\n"
+    );
+    let before = fs::read(&note).unwrap();
+    let duplicate = m
+        .write(
+            WriteTarget::Note,
+            " Decision A \nRoot cause\tB",
+            WriteMode::AppendFacts,
+            Some("facts"),
+        )
+        .unwrap();
+    assert_eq!(
+        first, duplicate,
+        "success must not reveal guessed preimage equality"
+    );
+    assert_eq!(fs::read(&note).unwrap(), before);
+    m.write(
+        WriteTarget::Note,
+        "decision A",
+        WriteMode::AppendFacts,
+        Some("facts"),
+    )
+    .unwrap();
+    assert!(
+        fs::read_to_string(&note).unwrap().ends_with("decision A\n"),
+        "dedup preserves case"
+    );
+    let formatted = "```rust\n}\n}\n```";
+    m.write(
+        WriteTarget::Note,
+        formatted,
+        WriteMode::Append,
+        Some("code"),
+    )
+    .unwrap();
+    m.write(
+        WriteTarget::Note,
+        formatted,
+        WriteMode::Append,
+        Some("code"),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(pdir(&m).join("notes/code.md")).unwrap(),
+        format!("{formatted}\n{formatted}\n")
+    );
+    let schema = crate::extras::memory::MemoryWrite::new(None, None);
+    assert!(
+        rig::tool::Tool::parameters(&schema)["properties"]["mode"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("append_facts")
+    );
+}
+
+#[test]
+fn memory62_append_facts_rejects_other_targets_and_oversized_prior_note() {
+    let (_owner, m) = memory62_fixture();
+    for target in [
+        WriteTarget::LongTerm,
+        WriteTarget::Daily,
+        WriteTarget::Scratchpad,
+    ] {
+        assert!(
+            m.write(target, "not written", WriteMode::AppendFacts, None)
+                .is_err()
+        );
+    }
+    assert!(!m.root.join("MEMORY.md").exists());
+    let note = pdir(&m).join("notes/facts.md");
+    fs::write(&note, vec![b'x'; 128 * 1024 + 1]).unwrap();
+    let prior = fs::read(&note).unwrap();
+    assert!(
+        m.write(
+            WriteTarget::Note,
+            "fact",
+            WriteMode::AppendFacts,
+            Some("facts")
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&note).unwrap(), prior);
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn memory62_fifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the owned fixture path is NUL-terminated and remains live; the
+    // FIFO has no writer, so a blocking open would fail the owning regression.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn memory62_note_opens_refuse_fifo_links_and_keep_captured_directory() {
+    use std::os::unix::fs::symlink;
+    let (owner, m) = memory62_fixture();
+    let notes = pdir(&m).join("notes");
+    fs::write(notes.join("real.md"), "original note\nbody").unwrap();
+    fs::write(owner.path().join("outside.md"), "outside private").unwrap();
+    symlink(owner.path().join("outside.md"), notes.join("linked.md")).unwrap();
+    fs::hard_link(owner.path().join("outside.md"), notes.join("hard.md")).unwrap();
+    memory62_fifo(&notes.join("fifo.md"));
+    let block = m.context_block().unwrap();
+    assert!(block.contains("original note"));
+    assert!(!block.contains("outside private"));
+    assert!(!block.contains("\"fifo\""));
+    assert!(
+        m.write(
+            WriteTarget::Note,
+            "fact",
+            WriteMode::AppendFacts,
+            Some("fifo")
+        )
+        .is_err()
+    );
+    assert!(
+        m.write(
+            WriteTarget::Note,
+            "fact",
+            WriteMode::AppendFacts,
+            Some("linked")
+        )
+        .is_err()
+    );
+    let binding = crate::paths::WorkspaceBinding::capture(&m.root).unwrap();
+    fs::rename(&m.root, owner.path().join("retained-memory")).unwrap();
+    fs::create_dir(&m.root).unwrap();
+    symlink(owner.path(), m.root.join("projects")).unwrap();
+    let previews = binding
+        .read_relative_first_lines(
+            std::path::Path::new("projects/captured-project/notes"),
+            256,
+            64,
+            1024,
+        )
+        .unwrap();
+    assert!(
+        previews
+            .iter()
+            .any(|(name, line, _)| name == "real" && line == "original note")
+    );
+    assert!(
+        previews
+            .iter()
+            .all(|(_, line, _)| !line.contains("outside private"))
+    );
+    assert!(!m.context_block().unwrap().contains("outside private"));
+}
+
+#[test]
+fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
+    let (owner, m) = memory62_fixture();
+    let _env = memory62_environment(&owner);
+    let mut context = crate::context::ContextFiles {
+        workspace_root: owner.path().to_path_buf(),
+        agents: None,
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    assert!(!context.replace_memory_if_changed(m.context_block()));
+    m.write(
+        WriteTarget::Note,
+        "decision first line\nfull body",
+        WriteMode::AppendFacts,
+        Some("topic"),
+    )
+    .unwrap();
+    assert!(context.replace_memory_if_changed(m.context_block()));
+    let first = crate::agent::builder::build_preamble(&context, true);
+    assert!(first.contains("\"topic\" — decision first line"));
+    assert!(!first.contains("full body"));
+    assert!(!context.replace_memory_if_changed(m.context_block()));
+    assert_eq!(first, crate::agent::builder::build_preamble(&context, true));
+    m.write(
+        WriteTarget::Note,
+        "new first line",
+        WriteMode::Overwrite,
+        Some("topic"),
+    )
+    .unwrap();
+    assert!(context.replace_memory_if_changed(m.context_block()));
+    let next = crate::agent::builder::build_preamble(&context, true);
+    assert_ne!(first, next);
+    assert!(next.contains("\"topic\" — new first line"));
+    assert!(!next.contains("decision first line"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory62_actual_tool_mode_dispatch_dedups_note_facts() {
+    use rig::tool::Tool;
+    let owner = crate::tests::OwnedTestDirectory::new("memory62-tool");
+    let _env = memory62_environment(&owner);
+    let m = Mem::open();
+    assert!(
+        m.root.starts_with(owner.path()),
+        "fixture storage must be owned before any mutation"
+    );
+    let tool = crate::extras::memory::MemoryWrite::new(None, None);
+    let first = tool
+        .call(crate::extras::memory::MemoryWriteArgs {
+            target: "note".into(),
+            content: "Fact\u{3000}A\nFact A".into(),
+            mode: Some("append_facts".into()),
+            name: Some("dispatch".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(pdir(&m).join("notes/dispatch.md")).unwrap(),
+        "Fact\u{3000}A\n"
+    );
+    let second = tool
+        .call(crate::extras::memory::MemoryWriteArgs {
+            target: "note".into(),
+            content: "Fact A".into(),
+            mode: Some("append_facts".into()),
+            name: Some("dispatch".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        fs::read_to_string(pdir(&m).join("notes/dispatch.md")).unwrap(),
+        "Fact\u{3000}A\n"
+    );
 }

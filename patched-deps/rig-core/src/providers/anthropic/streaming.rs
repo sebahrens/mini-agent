@@ -6,8 +6,9 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CacheTtl,
-    Content, GenericCompletionModel, Usage,
+    AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CacheCreation,
+    CacheTtl, Content, GenericCompletionModel, Usage, validate_cache_creation,
+    validate_usage_counts,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
@@ -154,6 +155,61 @@ pub struct PartialUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+impl PartialUsage {
+    fn from_start(usage: &Usage) -> Result<Self, CompletionError> {
+        validate_cache_creation(usage.cache_creation_input_tokens, usage.cache_creation)?;
+        validate_usage_counts(
+            usage.input_tokens,
+            usage.cache_read_input_tokens.unwrap_or_default(),
+            usage.cache_creation_input_tokens.unwrap_or_default(),
+            usage.output_tokens,
+        )?;
+        Ok(Self {
+            input_tokens: Some(usize::try_from(usage.input_tokens).map_err(|_| {
+                CompletionError::ResponseError("Anthropic input usage exceeds limits".into())
+            })?),
+            output_tokens: usize::try_from(usage.output_tokens).map_err(|_| {
+                CompletionError::ResponseError("Anthropic output usage exceeds limits".into())
+            })?,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation: usage.cache_creation,
+        })
+    }
+
+    fn apply_delta(&mut self, delta: &Self) -> Result<(), CompletionError> {
+        // Usage deltas carry cumulative fields. Omitted fields retain the start
+        // snapshot; an explicitly reported zero replaces the prior value.
+        self.output_tokens = delta.output_tokens;
+        if let Some(input) = delta.input_tokens {
+            self.input_tokens = Some(input);
+        }
+        if let Some(read) = delta.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(read);
+        }
+        if let Some(total) = delta.cache_creation_input_tokens {
+            if self.cache_creation_input_tokens != Some(total) && delta.cache_creation.is_none() {
+                // A new total without a corresponding split cannot inherit
+                // the previous split or be inferred from configured TTL.
+                self.cache_creation = None;
+            }
+            self.cache_creation_input_tokens = Some(total);
+        }
+        if let Some(breakdown) = delta.cache_creation {
+            self.cache_creation = Some(breakdown);
+        }
+        validate_cache_creation(self.cache_creation_input_tokens, self.cache_creation)?;
+        validate_usage_counts(
+            self.input_tokens.unwrap_or_default() as u64,
+            self.cache_read_input_tokens.unwrap_or_default(),
+            self.cache_creation_input_tokens.unwrap_or_default(),
+            self.output_tokens as u64,
+        )
+    }
 }
 
 impl GetTokenUsage for PartialUsage {
@@ -291,7 +347,7 @@ where
             let mut server_tool_uses: HashMap<usize, ServerToolUseState> = HashMap::new();
             let mut current_thinking: Option<ThinkingState> = None;
             let mut sse_stream = Box::pin(stream);
-            let mut input_tokens = 0;
+            let mut accumulated_usage = PartialUsage::default();
             let mut final_usage = None;
 
             let mut text_content = String::new();
@@ -305,27 +361,24 @@ where
                             Ok(event) => {
                                 match &event {
                                     StreamingEvent::MessageStart { message } => {
-                                        input_tokens = message.usage.input_tokens;
+                                        match PartialUsage::from_start(&message.usage) {
+                                            Ok(usage) => accumulated_usage = usage,
+                                            Err(error) => { yield Err(error); break; }
+                                        }
 
                                         let span = tracing::Span::current();
                                         span.record("gen_ai.response.id", &message.id);
                                         span.record("gen_ai.response.model", &message.model);
                                     },
                                     StreamingEvent::MessageDelta { delta, usage } => {
+                                        if let Err(error) = accumulated_usage.apply_delta(usage) {
+                                            yield Err(error);
+                                            break;
+                                        }
                                         if delta.stop_reason.is_some() {
-                                            // cache_creation_input_tokens and cache_read_input_tokens
-                                            // are cumulative totals on message_delta.usage per the
-                                            // Anthropic streaming API spec — use them directly.
-                                            let usage = PartialUsage {
-                                                 output_tokens: usage.output_tokens,
-                                                 input_tokens: usize::try_from(input_tokens).ok(),
-                                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
-                                            };
-
                                             let span = tracing::Span::current();
-                                            span.record_token_usage(&usage);
-                                            final_usage = Some(usage);
+                                            span.record_token_usage(&accumulated_usage);
+                                            final_usage = Some(accumulated_usage.clone());
                                             break;
                                         }
                                     }
@@ -409,10 +462,15 @@ fn handle_event(
                     .thinking
                     .push_str(thinking);
 
-                Some(Ok(RawStreamingChoice::ReasoningDelta {
-                    id: None,
-                    reasoning: thinking.clone(),
-                }))
+                // Omitted thinking sends an empty delta before its signature.
+                // There is no display text to emit; an unsigned placeholder
+                // would be replayed alongside the completed signed block.
+                (!thinking.is_empty()).then(|| {
+                    Ok(RawStreamingChoice::ReasoningDelta {
+                        id: None,
+                        reasoning: thinking.clone(),
+                    })
+                })
             }
             ContentDelta::SignatureDelta { signature } => {
                 current_thinking
@@ -486,7 +544,7 @@ fn handle_event(
         },
         StreamingEvent::ContentBlockStop { index } => {
             if let Some(thinking_state) = Option::take(current_thinking)
-                && !thinking_state.thinking.is_empty()
+                && (!thinking_state.thinking.is_empty() || !thinking_state.signature.is_empty())
             {
                 let signature = if thinking_state.signature.is_empty() {
                     None

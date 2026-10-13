@@ -115,3 +115,13 @@ observing a bypass and explicitly rejecting the candidate protocol before any
 candidate write. These results do not implement configuration transactions,
 crash recovery, trust approval or Windows existing-file add/remove support.
 The ordinary workspace compare-and-replace restriction remains unchanged.
+
+## Captured source checks at tool dispatch
+
+Each configured connection retains its captured workspace, selected server and
+source proof. Its tools revalidate current source bytes and private trust before
+permission evaluation and again after an approval wait, immediately before the
+RPC. A changed or revoked source sends no tool call; reconnect captures the new
+approved definition. These checks confer no permission grants and do not repair
+private files. Explicit manually constructed originless clients retain their
+existing behavior.

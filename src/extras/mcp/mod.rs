@@ -264,21 +264,21 @@ impl McpClientManager {
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let result = if let Some(binding) = binding {
+                        let proof = project::ServerSourceProof::capture(
+                            binding.clone(),
+                            name.clone(),
+                            Some(cfg.clone()),
+                            origin,
+                            declared_source,
+                        );
                         client::McpClientHandle::connect_in_binding_guarded(
                             CompactString::new(name.clone()),
                             &cfg,
                             &binding,
-                            &|| {
-                                (!declared_source || origin.is_some())
-                                    && project::server_source_is_current(
-                                        &binding,
-                                        &name,
-                                        Some(&cfg),
-                                        origin.as_ref(),
-                                    )
-                            },
+                            &|| proof.is_current(),
                         )
                         .await
+                        .map(|handle| handle.with_source_proof(proof))
                     } else {
                         client::McpClientHandle::connect_in(
                             CompactString::new(name.clone()),
@@ -370,6 +370,7 @@ impl McpClientManager {
                 let peer = handle.peer();
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;
+                let source_proof = handle.source_proof.clone();
                 let attempt = self
                     .health
                     .begin(&server_name, health::AttemptKind::Catalogue);
@@ -382,7 +383,7 @@ impl McpClientManager {
                         Err(_) => health::AttemptOutcome::Failed,
                     };
                     attempt.finish(outcome);
-                    (server_name, trusted_identity, peer, result)
+                    (server_name, trusted_identity, source_proof, peer, result)
                 }
             })
             .collect();
@@ -390,7 +391,7 @@ impl McpClientManager {
         let results = futures::future::join_all(futs).await;
 
         let mut all_tools = Vec::new();
-        for (server_name, trusted_identity, peer, result) in results {
+        for (server_name, trusted_identity, source_proof, peer, result) in results {
             match result {
                 Ok(tools) => {
                     tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
@@ -410,6 +411,7 @@ impl McpClientManager {
                         all_tools.push(McpTool {
                             server_name: server_name.clone(),
                             trusted_identity,
+                            source_proof: source_proof.clone(),
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
                             model_description,

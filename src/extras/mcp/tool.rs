@@ -31,6 +31,7 @@ impl std::error::Error for McpToolError {}
 pub struct McpTool {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
+    pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub definition: rmcp::model::Tool,
     pub(super) model_description: String,
     pub(super) model_parameters: serde_json::Value,
@@ -200,8 +201,10 @@ impl ToolDyn for McpTool {
         let ask_tx = self.ask_tx.clone();
         let call_timeout = self.call_timeout;
         let spill_scope = self.spill_scope.clone();
+        let source_proof = self.source_proof.clone();
 
         Box::pin(async move {
+            ensure_source_current(source_proof.as_deref())?;
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
             let coaching = check_mcp_perm(
                 &permission,
@@ -221,6 +224,9 @@ impl ToolDyn for McpTool {
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
 
+            // Permission/hook waits may outlive the approved source revision.
+            // Recheck immediately before the exact retained peer receives RPC.
+            ensure_source_current(source_proof.as_deref())?;
             let result = call_tool_bounded(&peer, params, call_timeout)
                 .await
                 .map_err(|e| {
@@ -287,6 +293,18 @@ impl ToolDyn for McpTool {
                 None => bounded,
             })
         })
+    }
+}
+
+fn ensure_source_current(
+    proof: Option<&super::project::ServerSourceProof>,
+) -> Result<(), ToolError> {
+    if proof.is_some_and(|proof| !proof.is_current()) {
+        Err(ToolError::ToolCallError(Box::new(McpToolError(
+            "MCP configuration source changed; reconnect before calling tools".into(),
+        ))))
+    } else {
+        Ok(())
     }
 }
 

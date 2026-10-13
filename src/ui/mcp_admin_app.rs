@@ -286,13 +286,22 @@ impl App<'_> {
                 }
             }
             let handle = crate::extras::mcp::client::McpClientHandle::connect_in_binding_guarded(
-                task_name.into(),
+                task_name.clone().into(),
                 &task_server,
                 &workspace,
                 &|| proof.valid(&proof.session_id, &proof.workspace),
             )
             .await
-            .map_err(|_| "MCP connection failed (credential values omitted)".to_owned())?;
+            .map_err(|_| "MCP connection failed (credential values omitted)".to_owned())?
+            .with_source_proof(
+                crate::extras::mcp::project::ServerSourceProof::capture(
+                    workspace,
+                    task_name,
+                    Some(task_server),
+                    proof.origin.clone(),
+                    false,
+                ),
+            );
             Ok(Completion::Connected(handle))
         })?;
         self.mcp_state().work.as_mut().unwrap().attempt = Some(attempt);

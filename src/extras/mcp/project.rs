@@ -20,6 +20,46 @@ pub(crate) struct ServerOrigin {
     pub digest: Option<String>,
 }
 
+/// Captured launch source retained by its exact connected client. Diagnostic
+/// origin labels alone do not confer authority: every use rechecks the binding,
+/// selected content and private trust through `server_source_is_current`.
+#[derive(Clone)]
+pub(crate) struct ServerSourceProof {
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    name: String,
+    server: Option<McpServerConfig>,
+    origin: Option<ServerOrigin>,
+    declared_source: bool,
+}
+
+impl ServerSourceProof {
+    pub(crate) fn capture(
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        name: String,
+        server: Option<McpServerConfig>,
+        origin: Option<ServerOrigin>,
+        declared_source: bool,
+    ) -> Self {
+        Self {
+            workspace,
+            name,
+            server,
+            origin,
+            declared_source,
+        }
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        (!self.declared_source || self.origin.is_some())
+            && server_source_is_current(
+                &self.workspace,
+                &self.name,
+                self.server.as_ref(),
+                self.origin.as_ref(),
+            )
+    }
+}
+
 pub(crate) fn digest(content: &str) -> String {
     crate::hex::encode_lower(Sha256::digest(content.as_bytes()))
 }
@@ -320,6 +360,7 @@ pub(crate) fn review(content: &str) -> Result<String, String> {
                 inherit_env,
                 sandbox,
                 network,
+                ..
             } => {
                 rendered.push_str(&format!(
                     "    command: {}\n",
@@ -374,6 +415,7 @@ pub(crate) fn review(content: &str) -> Result<String, String> {
                 allow_local,
                 headers,
                 oauth,
+                ..
             } => {
                 let shown = url.split(['?', '#']).next().unwrap_or("");
                 // Credentials are rejected before connection; hide them even in raw reviews.

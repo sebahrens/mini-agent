@@ -321,6 +321,70 @@ impl WorkspaceBinding {
             .collect())
     }
 
+    /// Bounded first-line previews from one retained directory. Enumeration is
+    /// complete before selection; overfull directories never select a partial
+    /// prefix based on filesystem iteration order. No links or special files.
+    #[cfg(feature = "memory")]
+    pub(crate) fn read_relative_first_lines(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_files: usize,
+        max_line_bytes: usize,
+    ) -> io::Result<Vec<(String, String, bool)>> {
+        use std::io::BufRead;
+        let directory = self.open_dir_relative(path)?;
+        let mut names = Vec::new();
+        for (index, entry) in directory.read_dir(".")?.enumerate() {
+            if index >= max_entries {
+                return Err(io::Error::other("note directory exceeds entry limit"));
+            }
+            let name = entry?.file_name();
+            let candidate = Path::new(&name);
+            if candidate.extension().is_none_or(|value| value != "md") {
+                continue;
+            }
+            if names.len() >= max_files {
+                return Err(io::Error::other("note directory exceeds file limit"));
+            }
+            names.push(name);
+        }
+        names.sort_unstable();
+        let mut previews = Vec::new();
+        for name in names {
+            let Some(stem) = Path::new(&name).file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let Ok(file) = open_file_no_follow_impl(&directory, &name, true) else {
+                continue;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if file.metadata()?.nlink() != 1 {
+                    continue;
+                }
+            }
+            #[cfg(windows)]
+            if crate::fs::windows_file_link_count(&file)? != 1 {
+                continue;
+            }
+            // The take bounds BufReader's read-ahead too. Decode only the first
+            // line, so malformed later content cannot hide a valid index line.
+            let mut reader =
+                std::io::BufReader::new(file.take(max_line_bytes.saturating_add(1) as u64));
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line)?;
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if let Some((line, truncated)) = read_utf8_prefix(line.as_slice(), max_line_bytes)? {
+                previews.push((stem.to_string(), line, truncated));
+            }
+        }
+        Ok(previews)
+    }
+
     /// Each named context file in the workspace, read up to `max_bytes`:
     /// `(directory, name, content, truncated)`. A file that is not UTF-8 is
     /// skipped; one larger than `max_bytes` is never read whole.

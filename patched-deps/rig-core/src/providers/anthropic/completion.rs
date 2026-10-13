@@ -108,7 +108,54 @@ pub struct Usage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
     pub output_tokens: u64,
+}
+
+/// Actual cache creation tier counts reported by Anthropic, not inferred TTL.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CacheCreation {
+    pub ephemeral_5m_input_tokens: u64,
+    pub ephemeral_1h_input_tokens: u64,
+}
+
+pub(super) fn validate_cache_creation(
+    total: Option<u64>,
+    breakdown: Option<CacheCreation>,
+) -> Result<(), CompletionError> {
+    if let Some(breakdown) = breakdown {
+        let sum = breakdown
+            .ephemeral_5m_input_tokens
+            .checked_add(breakdown.ephemeral_1h_input_tokens)
+            .ok_or_else(|| {
+                CompletionError::ResponseError(
+                    "Anthropic cache creation usage exceeds limits".into(),
+                )
+            })?;
+        if total != Some(sum) {
+            return Err(CompletionError::ResponseError(
+                "inconsistent Anthropic cache creation usage".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_usage_counts(
+    input: u64,
+    read: u64,
+    write: u64,
+    output: u64,
+) -> Result<(), CompletionError> {
+    input
+        .checked_add(read)
+        .and_then(|sum| sum.checked_add(write))
+        .and_then(|sum| sum.checked_add(output))
+        .ok_or_else(|| {
+            CompletionError::ResponseError("Anthropic token usage exceeds limits".into())
+        })?;
+    Ok(())
 }
 
 impl std::fmt::Display for Usage {
@@ -218,6 +265,19 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
+        validate_cache_creation(
+            response.usage.cache_creation_input_tokens,
+            response.usage.cache_creation,
+        )?;
+        validate_usage_counts(
+            response.usage.input_tokens,
+            response.usage.cache_read_input_tokens.unwrap_or_default(),
+            response
+                .usage
+                .cache_creation_input_tokens
+                .unwrap_or_default(),
+            response.usage.output_tokens,
+        )?;
         let content = response
             .content
             .iter()
@@ -1822,7 +1882,50 @@ enum OutputFormat {
 /// Configuration for the model's output format.
 #[derive(Debug, Deserialize, Serialize)]
 struct OutputConfig {
-    format: OutputFormat,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+// Keep one serialized output_config. Flattening a second raw object would
+// otherwise overwrite the format derived from the caller's typed schema.
+fn resolve_output_config(
+    schema: Option<schemars::Schema>,
+    additional_params: &mut serde_json::Value,
+) -> Result<Option<OutputConfig>, CompletionError> {
+    let raw = additional_params
+        .as_object_mut()
+        .and_then(|params| params.remove("output_config"));
+    let present = raw.is_some() || schema.is_some();
+    let mut fields = match raw {
+        Some(serde_json::Value::Object(fields)) => fields,
+        None => serde_json::Map::new(),
+        Some(_) => {
+            return Err(CompletionError::RequestError(
+                "Anthropic output_config must be an object".into(),
+            ));
+        }
+    };
+    if let Some(effort) = fields.get("effort")
+        && !matches!(
+            effort.as_str(),
+            Some("low" | "medium" | "high" | "xhigh" | "max")
+        )
+    {
+        return Err(CompletionError::RequestError(
+            "invalid Anthropic output_config.effort".into(),
+        ));
+    }
+    if let Some(schema) = schema {
+        let mut schema_value = schema.to_value();
+        sanitize_schema(&mut schema_value);
+        fields.insert(
+            "format".to_owned(),
+            serde_json::to_value(OutputFormat::JsonSchema {
+                schema: schema_value,
+            })?,
+        );
+    }
+    Ok(present.then_some(OutputConfig { fields }))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2360,17 +2463,8 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             top_level_cache_control.as_ref(),
         )?;
 
-        let output_config = if let Some(schema) = req.output_schema {
-            let mut schema_value = schema.to_value();
-            sanitize_schema(&mut schema_value);
-            Some(OutputConfig {
-                format: OutputFormat::JsonSchema {
-                    schema: schema_value,
-                },
-            })
-        } else {
-            None
-        };
+        let output_config =
+            resolve_output_config(req.output_schema, &mut additional_params_payload)?;
 
         Ok(Self {
             model: model.to_string(),
@@ -4970,6 +5064,7 @@ mod tests {
                 input_tokens: 7,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation: None,
                 output_tokens: 2,
             },
         };
@@ -4998,6 +5093,7 @@ mod tests {
                 input_tokens: 7,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation: None,
                 output_tokens: 2,
             },
         };
@@ -5513,6 +5609,7 @@ mod tests {
                 input_tokens: 1,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation: None,
                 output_tokens: 1,
             },
         };

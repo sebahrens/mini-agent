@@ -134,7 +134,7 @@ Conversation to summarize:
 </transcript>";
 
 #[cfg(feature = "memory")]
-pub const MEMORY_WRITE_TOOL_PROMPT: &str = "\n- **memory_write** persists durable facts, daily progress, scratchpad tasks, or named notes.";
+pub const MEMORY_WRITE_TOOL_PROMPT: &str = "\n- **memory_write** persists durable facts, daily progress, scratchpad tasks, or named notes. When a project decision is made or a bug root cause is verified, save a short project note with a useful first-line summary: target=note, name=<topic>, mode=append_facts, one fact per line. Search existing notes first; edit obsolete facts instead of accumulating contradictions. This explicit fact mode uses long_term's case-sensitive Unicode-whitespace dedup; ordinary append/overwrite preserves structured Markdown/code notes. Never store credentials or unverified guesses; normal write permissions still apply.";
 #[cfg(feature = "memory")]
 pub const MEMORY_EDIT_TOOL_PROMPT: &str =
     "\n- **memory_edit** replaces one exact unique substring or removes a named note.";

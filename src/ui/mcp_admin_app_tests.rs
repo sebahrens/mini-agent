@@ -84,6 +84,7 @@ impl Server {
                                 let result = match method {
                                     "initialize" => serde_json::json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"owned57","version":"1"}}),
                                     "tools/list" => serde_json::json!({"tools":[{"name":"owned_echo","description":"owned test echo","inputSchema":{"type":"object","properties":{}}}]}),
+                                    "tools/call" => serde_json::json!({"content":[{"type":"text","text":"actual owned echo"}]}),
                                     _ => serde_json::json!({}),
                                 };
                                 ("200 OK", serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string())
@@ -479,6 +480,159 @@ async fn actual_initial_mcp_source_revoked_during_handshake_retires_candidate() 
     server.finish().await;
     assert_eq!(initializations, 1, "must reach the real handshake");
     assert_eq!(handles, 0, "revoked candidate must not be adopted");
+}
+
+#[tokio::test]
+async fn actual_connected_mcp_tool_refuses_revoked_source_before_rpc() {
+    use rig::tool::ToolDyn;
+    let root = crate::tests::OwnedTestDirectory::new("mcp-call-source-proof");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+    let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true}}})
+        .to_string();
+    let project = root.path().join(".mcp.json");
+    crate::fs::private_atomic_create_sync(&project, raw.as_bytes()).unwrap();
+    config::approve_project_mcp(
+        &paths,
+        &workspace,
+        &crate::extras::mcp::project::digest(&raw),
+    )
+    .unwrap();
+    let cfg = config::mcp_config_in_workspace_at(
+        &workspace,
+        base.provenance.global_file.as_ref().unwrap(),
+    )
+    .unwrap();
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let tools = manager
+        .collect_tools_with_timeouts(None, None, Default::default())
+        .await;
+    assert_eq!(tools.len(), 1);
+    let positive = tools[0].call("{}".into()).await;
+    let positive_calls = server.method_count("tools/call");
+    std::fs::write(&project, "{\"mcpServers\":{}}").unwrap();
+    let denied = tools[0].call("{}".into()).await;
+    let final_calls = server.method_count("tools/call");
+    drop(tools);
+    manager.shutdown().await;
+    server.assert_no_provider_request();
+    server.finish().await;
+    assert!(positive.unwrap().contains("actual owned echo"));
+    assert_eq!(positive_calls, 1, "real current source must dispatch");
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("configuration source changed")
+    );
+    assert_eq!(
+        final_calls, 1,
+        "revoked source must dispatch zero additional RPCs"
+    );
+}
+
+#[tokio::test]
+async fn actual_connected_mcp_source_revocation_during_ordinary_ask_refuses_rpc() {
+    use rig::tool::ToolDyn;
+    let root = crate::tests::OwnedTestDirectory::new("mcp-call-source-ask");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+    let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true}}})
+        .to_string();
+    let project = root.path().join(".mcp.json");
+    crate::fs::private_atomic_create_sync(&project, raw.as_bytes()).unwrap();
+    config::approve_project_mcp(
+        &paths,
+        &workspace,
+        &crate::extras::mcp::project::digest(&raw),
+    )
+    .unwrap();
+    let cfg = config::mcp_config_in_workspace_at(
+        &workspace,
+        base.provenance.global_file.as_ref().unwrap(),
+    )
+    .unwrap();
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let permission = Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs {
+                glob: crate::permission::PermissionConfig {
+                    default: Some(crate::permission::Action::Ask),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap(),
+    ));
+    let (asks, mut requests) = mpsc::channel(1);
+    let tools = manager
+        .collect_tools_with_timeouts(Some(permission.clone()), Some(asks), Default::default())
+        .await;
+    assert_eq!(tools.len(), 1);
+    let mut results = Vec::new();
+    for revoke in [false, true] {
+        let mut call = tools[0].call("{}".into());
+        let request = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut call => panic!("ordinary Ask must occur before RPC: {result:?}"),
+                request = requests.recv() => request.unwrap().into_permission(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(request.tool, "mcp_tool");
+        assert_eq!(request.input, "mcp_tool:owned:owned_echo");
+        assert_eq!(server.method_count("tools/call"), usize::from(revoke));
+        if revoke {
+            std::fs::write(&project, "{\"mcpServers\":{}}").unwrap();
+        }
+        request
+            .reply
+            .send(crate::permission::ask::UserDecision::AllowOnce)
+            .unwrap();
+        results.push(
+            tokio::time::timeout(Duration::from_secs(3), call)
+                .await
+                .unwrap(),
+        );
+    }
+    let calls = server.method_count("tools/call");
+    let no_saved_grant = matches!(
+        permission
+            .lock()
+            .unwrap()
+            .check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"),
+        crate::permission::checker::CheckResult::Ask
+    );
+    drop(tools);
+    manager.shutdown().await;
+    server.assert_no_provider_request();
+    server.finish().await;
+    assert!(results.remove(0).unwrap().contains("actual owned echo"));
+    assert!(
+        results
+            .remove(0)
+            .unwrap_err()
+            .to_string()
+            .contains("configuration source changed")
+    );
+    assert_eq!(
+        calls, 1,
+        "approval of a revoked invocation cannot send another RPC"
+    );
+    assert!(no_saved_grant);
 }
 
 #[tokio::test]

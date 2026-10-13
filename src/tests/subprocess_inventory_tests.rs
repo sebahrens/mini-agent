@@ -2884,7 +2884,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/ui/mcp_admin_app_tests.rs",
         &[(
-            "4c39d6a903d89f13d456f6fdcb5ab78a928a5378a48986cc2bb893814235d3b7",
+            "28fe326e751f2fcbbd8a13e23e1a733ced05adfdbb3e4f370663a0425a9afcfc",
             1,
         )],
     ),

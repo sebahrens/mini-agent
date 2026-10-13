@@ -683,3 +683,28 @@ loaded grammar files. Model-authored diff fences do not become mutation metadata
 actual typed mutation rows retain their existing event path and colors. Limits and
 the engine/size tradeoff are recorded in
 [the syntax decision](../decisions/2026-10-13-bounded-terminal-syntax.md).
+
+### Project note summaries
+
+The memory feature appends a bounded project-note name/first-line index after the original escaped memory sections, within their remaining 32 KiB context budget. The directory scan and regular-file opens reuse captured filesystem capabilities; no links, FIFO blocking opens, note-body injection or new permissions are introduced. `append_facts` is an explicit note-only mode using long-term normalized line deduplication, while ordinary note appends retain Markdown/code formatting. See [MEMORY.md](MEMORY.md) for exact limits and the next-turn refresh behavior.
+
+## Native output and opaque-thinking transport probes
+
+`src/provider_effort_tests.rs` owns the bounded native Anthropic SDK wire
+fixtures for output-schema/effort composition and completed empty signed
+thinking. They use fake loopback responses, preserve owned token caps, reject
+malformed effort before HTTP, and distinguish a completed opaque block from an
+interrupted signature. The pinned SDK backports are documented in
+`patched-deps/rig-core/PATCH.md`; they do not change permissions or tool dispatch.
+These transport controls do not establish application history-prefix stability
+or live effort support: frontend replay and mutable-context placement require
+separate actual request-body proofs before those features are described as
+delivered. Local reasoning display remains independent of provider computation.
+The native cache-usage fixtures in `src/provider_cache_tests.rs` use the same
+bounded owned HTTP fixture. They verify that message-start cache counts survive
+output-only deltas, cumulative updates replace rather than add, and invalid
+reported tier sums are rejected. The retained raw five-minute/one-hour split is
+provider-reported data; it is never inferred from the requested cache TTL.
+This transport correction does not enable a one-hour configuration or change
+memory placement. Application tier pricing and durable receipt compatibility
+are reviewed separately before that option is exposed.
