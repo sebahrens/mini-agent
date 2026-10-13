@@ -10,6 +10,7 @@ pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
 pub(crate) mod lsp;
 pub(crate) mod memoize;
+pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod read;
 #[cfg(all(test, unix))]
@@ -432,13 +433,17 @@ pub enum JobAction {
     #[default]
     Poll,
     Stop,
+    Wait,
+    List,
 }
 
 #[derive(Deserialize)]
 pub struct JobStatusArgs {
-    pub id: String,
+    pub id: Option<String>,
     #[serde(default)]
     pub action: JobAction,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -453,6 +458,10 @@ pub struct GrepArgs {
     pub files_only: bool,
     #[serde(default)]
     pub count: bool,
+    /// A call may lower, but never raise, the configured result cap.
+    pub max_results: Option<u64>,
+    #[serde(default)]
+    pub multiline: bool,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -464,6 +473,14 @@ pub enum FindFilesMode {
     Regex,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FindFilesSort {
+    #[default]
+    Name,
+    Mtime,
+}
+
 #[derive(Deserialize)]
 pub struct FindFilesArgs {
     pub pattern: String,
@@ -471,6 +488,8 @@ pub struct FindFilesArgs {
     /// Auto treats glob metacharacters and path separators as a path glob.
     #[serde(default)]
     pub mode: FindFilesMode,
+    #[serde(default)]
+    pub sort: FindFilesSort,
 }
 
 #[derive(Deserialize)]
@@ -541,7 +560,9 @@ pub(crate) async fn request_hook_approval(
     input: &str,
 ) -> Result<(), ToolError> {
     let Some(perm) = permission else {
-        return Ok(());
+        return Err(ToolError::Msg(
+            "Permission system unavailable for hook approval".to_string(),
+        ));
     };
     let result = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());

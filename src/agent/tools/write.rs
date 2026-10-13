@@ -1,7 +1,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use rig::tool::Tool;
+use super::mutation_diff::{DiffOptions, MutationDiff, MutationOutcome};
+use rig::tool::{Tool, ToolCallExtensions, ToolReturn};
 use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::Crc32;
@@ -60,6 +61,7 @@ pub struct WriteTool {
     pub max_text_file_size: u64,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read_tracker: ReadTracker,
+    diff_options: DiffOptions,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -93,6 +95,7 @@ impl WriteTool {
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             workspace: None,
             read_tracker,
+            diff_options: DiffOptions::default(),
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -114,6 +117,11 @@ impl WriteTool {
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     ) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    pub(crate) fn with_diff_options(mut self, options: DiffOptions) -> Self {
+        self.diff_options = options;
         self
     }
 
@@ -179,6 +187,20 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
+        self.apply(args).await.map(|result| result.output)
+    }
+
+    async fn call_structured(
+        &self,
+        args: WriteArgs,
+        _extensions: &ToolCallExtensions,
+    ) -> Result<ToolReturn<String>, ToolError> {
+        self.apply(args).await.map(MutationOutcome::into_return)
+    }
+}
+
+impl WriteTool {
+    async fn apply(&self, args: WriteArgs) -> Result<MutationOutcome, ToolError> {
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
         let requested = target.requested;
@@ -207,6 +229,8 @@ impl Tool for WriteTool {
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
                     .await?;
+            let mut preview_before = None;
+            let mut created = false;
             match workspace.open_relative(relative) {
                 Ok(mut existing) => {
                     if !args.overwrite {
@@ -229,6 +253,16 @@ impl Tool for WriteTool {
                     {
                         return Err(overwrite_not_authorized(&expanded));
                     }
+                    if self.diff_options.max_lines > 0
+                        && current.len() <= super::mutation_diff::MAX_INPUT_BYTES
+                        && super::mutation_diff::preimage_allowed(&self.permission, &expanded, true)
+                    {
+                        preview_before = Some(
+                            std::str::from_utf8(&current)
+                                .expect("full text fingerprint validates UTF-8")
+                                .to_owned(),
+                        );
+                    }
                     workspace.replace_relative_atomic_expecting(
                         relative,
                         args.content.as_bytes(),
@@ -236,18 +270,33 @@ impl Tool for WriteTool {
                         &crate::fs::ContentDigest::of(&current),
                     )?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace
-                    .create_relative_atomic(relative, args.content.as_bytes())
-                    .map_err(|error| match error.kind() {
-                        std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
-                        _ => crate::agent::tools::bound_open_error(workspace, relative, error),
-                    })?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    workspace
+                        .create_relative_atomic(relative, args.content.as_bytes())
+                        .map_err(|error| match error.kind() {
+                            std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
+                            _ => crate::agent::tools::bound_open_error(workspace, relative, error),
+                        })?;
+                    created = true;
+                }
                 Err(error) => {
                     return Err(crate::agent::tools::bound_open_error(
                         workspace, relative, error,
                     ));
                 }
             }
+            let diff = if created {
+                MutationDiff::replacement(&expanded, None, &args.content, self.diff_options)
+            } else {
+                preview_before.as_deref().and_then(|before| {
+                    MutationDiff::replacement(
+                        &expanded,
+                        Some(before),
+                        &args.content,
+                        self.diff_options,
+                    )
+                })
+            };
             self.read_tracker.untrack_read_path(&expanded);
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
             if let Some(msg) = coaching {
@@ -263,7 +312,10 @@ impl Tool for WriteTool {
                     result.push_str(&block);
                 }
             }
-            return Ok(result);
+            return Ok(MutationOutcome {
+                output: result,
+                diff,
+            });
         }
 
         let resolved = resolve_write_path(&requested).await?;
@@ -277,6 +329,7 @@ impl Tool for WriteTool {
         )
         .await?;
 
+        let mut preview_before = None;
         let existing = if path.exists() {
             tracing::warn!("tool write file exists: path={}", expanded);
             if !args.overwrite {
@@ -301,6 +354,20 @@ impl Tool for WriteTool {
             ) {
                 return Err(overwrite_not_authorized(&expanded));
             }
+            if self.diff_options.max_lines > 0
+                && current.len() <= super::mutation_diff::MAX_INPUT_BYTES
+                && super::mutation_diff::preimage_allowed(
+                    &self.permission,
+                    &path.to_string_lossy(),
+                    false,
+                )
+            {
+                preview_before = Some(
+                    std::str::from_utf8(&current)
+                        .expect("full text fingerprint validates UTF-8")
+                        .to_owned(),
+                );
+            }
             Some(crate::fs::ContentDigest::of(&current))
         } else {
             None
@@ -322,6 +389,7 @@ impl Tool for WriteTool {
             )
         })?)
         .await?;
+        let created = existing.is_none();
         if let Some(base) = existing {
             crate::fs::atomic_write_resolved_expecting(path, &args.content, approved_parent, base)
                 .await?;
@@ -330,6 +398,23 @@ impl Tool for WriteTool {
                 .await
                 .map_err(|error| create_error(&expanded, error))?;
         }
+        let diff = if created {
+            MutationDiff::replacement(
+                &path.to_string_lossy(),
+                None,
+                &args.content,
+                self.diff_options,
+            )
+        } else {
+            preview_before.as_deref().and_then(|before| {
+                MutationDiff::replacement(
+                    &path.to_string_lossy(),
+                    Some(before),
+                    &args.content,
+                    self.diff_options,
+                )
+            })
+        };
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
@@ -345,7 +430,10 @@ impl Tool for WriteTool {
             }
         }
 
-        Ok(result)
+        Ok(MutationOutcome {
+            output: result,
+            diff,
+        })
     }
 }
 

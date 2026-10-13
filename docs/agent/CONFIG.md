@@ -612,6 +612,8 @@ Accepted top-level keys:
 | `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
+| `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
+| `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
 | `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
 | `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent. Default: `150`. |
@@ -653,6 +655,8 @@ Accepted top-level keys:
 | `js-write-unrestricted`   | boolean | Explicitly allow brokered JS writes outside configured roots; cannot be combined with `js-write-roots`. Default: `false`. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo` (`accept` is an alias for `standard`). Any other value is rejected at startup with the list of accepted values. |
 | `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` omits previews and hidden-result placeholders during live rendering and session replay; tool-call lines remain visible. Task-list updates remain visible independently of this setting. `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
+| `diff_context_lines`      | integer | Unchanged context rows around a successful native edit/write preview. Default: `3`; clamped to `20`. |
+| `max_diff_lines`          | integer | Maximum retained mutation-preview rows, including headers and notices. Default: `200`; clamped to `1000`. `0` disables preview capture/display. `show_tool_details=false` hides previews during live rendering and replay; integer tool-detail limits apply to ordinary result text separately. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
@@ -721,6 +725,36 @@ validated macOS 26 hosts require the one-time-image Seatbelt denial and guardian
 preflight and report typed `DeprecatedBestEffort` assurance; Windows requires a cached minimal
 LPAC/Job production attestation. Other macOS majors remain unavailable. No unavailable worker
 backend falls back to in-parent or uncontained JavaScript.
+
+## Build identity and optional update notices
+
+`mini-agent --version` prints the package version, exact build fingerprint, and
+Cargo target triple without loading configuration or starting services. `-V`
+retains the short package version.
+Release archive and installer smokes accept the older single-line version or
+the current three-line identity. They reject unknown trailers and malformed
+fingerprints; archive smokes also compare the reported target with the
+requested license-inventory target.
+
+Set `update_check = true` in global configuration to enable an interactive
+startup notice for a newer stable release. [`src/update.rs`](../../src/update.rs)
+owns the check. It uses the package repository's GitHub latest-release endpoint
+without credentials, provider settings, redirects, or ambient proxies. Drafts,
+prereleases, malformed tags, oversized bodies, and network failures produce no
+new notice. The check never downloads or runs an installer. A notice prints
+the explicit-release command for the existing installer, which checks release
+`SHA256SUMS` and also requires build attestation when authenticated `gh` is
+available. The release metadata itself is not an attestation.
+
+The private `<state>/update/latest.json` cache retains the last valid version
+and attempt timestamp. A nonblocking cross-process lock admits one check at a
+time; the timestamp is saved before network work so offline failures and
+cancellation also consume the 24-hour attempt interval. A cached newer version
+can be shown on later startups. Invalid or linked cache state disables the
+optional check for that startup. HTTP headers and body share a two-second
+deadline and a 128 KiB body cap. Headless, loop, and ACP modes neither check nor
+create update-cache state. Unset or `update_check = false` disables the feature;
+project-local opt-in requires the ordinary content-bound project trust approval.
 
 ## Ad hoc system instructions
 
@@ -902,6 +936,18 @@ normalization (e.g. `Bash` ↔ `bash`, `Glob` ↔ `find_files`, `Edit|Write`
 matches mini-agent's `write` tool); anything else is treated as a regex.
 Invalid regexes are reported at load time.
 
+MCP tool hooks match `mcp__<server>__<tool>` using the raw configured server
+name and raw protocol tool name, regardless of the alias registered with the
+model. MCP components retain their case; escape regex punctuation when needed.
+For example, `mcp__alpha__search` and `mcp__.*` match an MCP `search` tool on
+`alpha`, including when the model sees `alpha__search` or another allocated alias.
+The pre/post/failure stdin envelopes keep that model-visible alias in `tool_name`
+and include raw `mcp_server` and `mcp_tool` fields. Builtin normalization and
+envelope names retain their existing behavior. The compatibility matcher label
+is not a reversible identity when components contain `__`; use the structured
+fields to distinguish those tuples. Identity is captured by the parent at tool
+registration, never inferred from an alias or rewritten input.
+
 ### Events
 
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`,
@@ -920,7 +966,8 @@ may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it
 (defer to the normal permission system). `deny` always blocks, holding even
 under `--yolo`. `ask` forces an interactive confirmation regardless of
 permission mode, and escalates to deny in non-interactive contexts (`-p`,
-`--loop`) where no confirmation is possible. `allow` suppresses the
+`--loop`) where no confirmation is possible, or when the permission system is
+unavailable. `allow` suppresses the
 interactive prompt for that one call only, after the permission and
 repeated-call checks. It can suppress an `ask`, but never override a deny from
 a rule, security mode, configured doom-loop safeguard, managed policy, or
@@ -928,7 +975,9 @@ another hook. `PreToolUse` may
 also set `"updatedInput"` to rewrite the tool's arguments before it runs.
 When a hook requests approval, the confirmation shows those effective
 arguments. Approval applies to that invocation only; any unused grant is
-removed on completion, failure, or cancellation.
+removed on completion, failure, or cancellation. MCP deny rules are checked
+against the raw server/tool permission key before a hook-requested confirmation;
+a concurrent MCP invocation cannot borrow the approval token.
 `PostToolUse` may set `"redactions"` to an array of exact, non-empty strings.
 Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
 `"result"` replacements are ignored so a hook cannot substitute arbitrary
@@ -1665,8 +1714,9 @@ fail-closed instead (deny, then ask, then allow).
 
 Tool argument validation happens before permissions or execution. `read.limit` must
 be positive (including an effective configured default); invalid windows return a
-JSON example instead of an inverted line range. Shell `timeout` must be 1–30000 ms
-in foreground mode or 1–86400000 ms in background mode; larger values are rejected
+JSON example instead of an inverted line range. Shell `timeout` must be positive
+and at most the effective foreground deadline (120000 ms by default, configured
+by `shell_timeout_secs`), or 86400000 ms in background mode; larger values are rejected
 with a background-job example rather than silently clamped. `todo_write` accepts
 only case-sensitive statuses `pending`, `in_progress`, `completed`, `cancelled` and
 priorities `high`, `medium`, `low`, both in its schema and runtime validation. A
@@ -1746,8 +1796,10 @@ including LSP's identity-tracking handles; newly opened readers see the complete
 replacement. Handles that deny delete sharing still prevent publication and
 follow the bounded sharing-lock retry policy.
 
-Bash commands have a mandatory 30-second deadline. A tool call's optional
-`timeout` value is milliseconds and can only lower that deadline. Captured raw
+Foreground shell commands have a mandatory deadline of 120 seconds by default.
+`shell_timeout_secs` sets that deadline between 1 and 600 seconds. A tool call's optional
+`timeout` value is milliseconds and can only lower that deadline. Brokered JS
+`spawn` and other sandbox command classes retain their separate limits. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
 both pipes are drained concurrently. Timeout, cancellation, or any output cap
 kills and reaps the command's process group and returns an explicit non-success
@@ -1755,8 +1807,14 @@ status, with any retained prefix labelled as partial.
 
 Set the shell tool's `background` argument to `true` for builds, test suites,
 or servers that must outlive one tool call. The call returns a session-scoped
-job id; `job_status` polls its state and rolling output or stops it with
-`action = "stop"`. Background commands have a 24-hour maximum, accept a lower
+job id; `job_status` polls its state and rolling output, stops it with
+`action = "stop"`, or waits with `action = "wait"` and optional `timeout_ms`
+(1–60000, default 10000). Wait returns on completion or expiration; expiration
+and dropping a wait do not stop the job. `action = "list"` takes no id and
+lists this session's retained job ids, statuses, exit codes, and command summaries
+without their output. This registry survives transcript compaction and agent
+rebuilds, so lost ids remain discoverable within the same session.
+Background commands have a 24-hour maximum, accept a lower
 `timeout`, keep 64 KiB of head/tail output per stream, allow eight concurrent
 jobs, and retain the newest 32 job records. Cancellation and session shutdown
 kill and reap every owned background process tree.
@@ -2984,6 +3042,29 @@ Behavior notes:
   diagnostics", never a failed edit.
 - Post-edit diagnostics are capped (errors first, ~20 lines); nothing is
   appended when the file is clean.
+
+## Mutation previews
+
+Successful native `edit` and `write` calls can display a colored unified preview
+under their actual tool call: green additions, red deletions, and cyan hunk
+headers. The tool computes it from the bytes checked and atomically published by
+that invocation. The renderer never reopens the path or treats model text as a
+file snapshot. New files start from an empty image; existing-file previews require
+read policy to allow the captured preimage. Write/edit permission, a hook approval,
+or an old read-tracker snapshot does not grant that additional read authority.
+
+The defaults are three context rows and 200 retained rows. Independent hard
+bounds limit previews to 64 KiB, 500 Unicode characters per row, 1000 rows, 128
+applied ranges, and 2 MiB/100000 lines per input image. Omitted rows and clipped
+long rows are labeled. If bounded line matching is exhausted, a labeled coarse
+replacement is shown. Larger images keep the normal tool result without a
+preview. No-op writes report “No content change”; CRLF/LF-only changes are labeled.
+
+Session replay and HTML export retain the bounded historical preview. Imports
+label it as an imported record, never current file state or permission/verification
+authority. `show_tool_details=false` hides it in the TUI, while an integer such as
+`3` limits ordinary tool-result text separately. These display records do not
+change model-visible tool output or continuation history.
 
 ## Logging
 

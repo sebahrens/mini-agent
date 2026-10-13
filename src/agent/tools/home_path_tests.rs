@@ -227,6 +227,8 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let grep = GrepTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: "needle".into(),
             path: Some("$HOME/project".into()),
             include: None,
@@ -243,6 +245,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let found = FindFilesTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(FindFilesArgs {
+            sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Auto,
             pattern: "*.txt".into(),
             path: Some("~/project".into()),
@@ -255,6 +258,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let found_dollar = FindFilesTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(FindFilesArgs {
+            sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Auto,
             pattern: "*.txt".into(),
             path: Some("$HOME/project".into()),

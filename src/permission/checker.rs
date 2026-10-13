@@ -1259,6 +1259,75 @@ impl PermissionChecker {
         }
     }
 
+    /// Optional display of an already captured mutation preimage. The caller
+    /// supplies the same immutable logical (capability-contained) or canonical
+    /// identity used by the real mutation. This is not a new read invocation:
+    /// no path resolution, hook one-shot, doom-loop, or grant state is consumed.
+    /// An operation-specific write/edit approval can never supply read authority.
+    pub(crate) fn allows_mutation_preimage(&self, identity: &str, contained: bool) -> bool {
+        let path = Path::new(identity);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        let normalized = normalize_path(path);
+        let working_dir = normalize_path(Path::new(&self.working_dir));
+        if contained && !normalized.starts_with(&working_dir) {
+            return false;
+        }
+        let logical = normalized.to_string_lossy();
+        let relative = self.workspace_relative(&logical);
+        let mut inputs: SmallVec<[&str; 3]> = SmallVec::new();
+        inputs.push(identity);
+        inputs.push(&logical);
+        if let Some(relative) = relative.as_deref() {
+            inputs.push(relative);
+        }
+        let external = !contained && !normalized.starts_with(&working_dir);
+        let external_action = external
+            .then(|| self.match_ext_dir_bound(&logical))
+            .flatten();
+        if self.matches_deny_rule("read", &inputs)
+            || (external && external_action == Some(Action::Deny))
+        {
+            return false;
+        }
+        if inputs
+            .iter()
+            .any(|input| self.is_session_allowed("read", input))
+        {
+            return true;
+        }
+        let external_allow_needs_anchor = external && external_action != Some(Action::Allow);
+        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
+        if self.apply_rules()
+            && let Some(rules) = self.rules.get("read")
+        {
+            for (pattern, action) in rules {
+                if *action == Action::Allow
+                    && external_allow_needs_anchor
+                    && !pattern.is_absolute_anchored()
+                {
+                    continue;
+                }
+                if inputs.iter().any(|input| pattern.matches_path(input)) {
+                    matched.push((pattern.specificity(), *action));
+                }
+            }
+        }
+        self.resolve_path_action(
+            "read",
+            &matched,
+            &logical,
+            external,
+            external_action,
+            contained,
+        ) == Action::Allow
+    }
+
     /// Check a capability-contained path without consulting its mutable
     /// ambient pathname. The caller must provide an absolute, lexically
     /// normalized identity beneath this checker's immutable workspace root.
@@ -3824,5 +3893,122 @@ mod path_deny_probe_tests {
         assert!(checker.is_path_denied("grep", ".env"));
         assert!(checker.is_path_denied("list_dir", "secrets/key"));
         let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod mutation_preimage_policy_tests {
+    use super::*;
+    use crate::permission::{PermissionConfig, ToolPerm};
+
+    #[test]
+    fn preimage_policy_is_inert_bound_and_deny_first() {
+        let root = crate::tests::OwnedTestDirectory::new("preimage-policy");
+        let allowed = root
+            .path()
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        let denied = root
+            .path()
+            .join("secret.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                read: Some(ToolPerm::Granular(
+                    [
+                        (String::from("**"), Action::Allow),
+                        (String::from("secret.txt"), Action::Deny),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            }),
+            SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("read".into(), "**");
+        checker.last_call = Some(("write".into(), allowed.clone()));
+        checker.consecutive_repeat_count = 3;
+        #[cfg(feature = "hooks")]
+        checker.allow_once_scoped("write".into(), 123);
+        assert!(checker.allows_mutation_preimage(&allowed, true));
+        assert!(!checker.allows_mutation_preimage(&denied, true));
+        assert!(!checker.allows_mutation_preimage("relative.txt", true));
+        assert!(
+            !checker.allows_mutation_preimage(
+                &root
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .join("outside.txt")
+                    .to_string_lossy(),
+                true
+            )
+        );
+        assert_eq!(checker.last_call, Some(("write".into(), allowed)));
+        assert_eq!(checker.consecutive_repeat_count, 3);
+        #[cfg(feature = "hooks")]
+        assert!(checker.hook_decision_is_pending(123));
+    }
+
+    #[test]
+    fn external_directory_denial_precedes_broad_read_and_session_grants() {
+        let root = crate::tests::OwnedTestDirectory::new("preimage-external-policy");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let external = root
+            .path()
+            .join("external-missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                read: Some(ToolPerm::Simple(Action::Allow)),
+                external_directory: Some(
+                    [(format!("{}/**", root.path().display()), Action::Deny)].into(),
+                ),
+                ..Default::default()
+            }),
+            SecurityMode::Standard,
+            Some(workspace),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("read".into(), "**");
+        assert!(!checker.allows_mutation_preimage(&external, false));
+        assert!(!checker.allows_mutation_preimage(&external, true));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn current_write_hook_grant_never_authorizes_read_or_gets_consumed_by_preview() {
+        let root = crate::tests::OwnedTestDirectory::new("preimage-hook-policy");
+        let path = root
+            .path()
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        for action in [Action::Ask, Action::Deny] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    read: Some(ToolPerm::Simple(action)),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            checker.allow_once_scoped("write".into(), 321);
+            scope_hook_permission(321, async {
+                assert!(!checker.allows_mutation_preimage(&path, true));
+                assert!(checker.hook_decision_is_pending(321));
+            })
+            .await;
+        }
     }
 }

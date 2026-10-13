@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
@@ -12,7 +13,7 @@ use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, FindFilesMode, PermCheck, ToolError, check_perm,
+    AskSender, FindFilesArgs, FindFilesMode, FindFilesSort, PermCheck, ToolError, check_perm,
     check_perm_bound_path, check_perm_path, combine_coaching, is_skip_dir, is_vcs_metadata,
 };
 
@@ -862,10 +863,16 @@ impl DirectoryFrame {
     }
 }
 
+pub(super) const SEARCH_ENTRY_BUDGET: usize = 100_000;
+pub(super) const SEARCH_MAX_DIRECTORY_DEPTH: usize = 256;
+
 pub(crate) struct BoundWalker {
     approved_root: PathBuf,
     stack: Vec<DirectoryFrame>,
     hidden: Option<PathFilter>,
+    remaining_entries: Option<usize>,
+    max_depth: usize,
+    work_limit_hit: bool,
 }
 
 impl BoundWalker {
@@ -894,7 +901,22 @@ impl BoundWalker {
             approved_root,
             stack: vec![frame],
             hidden,
+            remaining_entries: None,
+            max_depth: usize::MAX,
+            work_limit_hit: false,
         })
+    }
+}
+
+impl BoundWalker {
+    pub(super) fn with_search_limits(mut self, entries: usize, depth: usize) -> Self {
+        self.remaining_entries = Some(entries);
+        self.max_depth = depth.max(1);
+        self
+    }
+
+    pub(super) fn work_limit_hit(&self) -> bool {
+        self.work_limit_hit
     }
 }
 
@@ -903,11 +925,20 @@ impl Iterator for BoundWalker {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            let depth = self.stack.len();
             let frame = self.stack.last_mut()?;
             let Some(name) = frame.names.next() else {
                 self.stack.pop();
                 continue;
             };
+            if let Some(remaining) = self.remaining_entries.as_mut() {
+                if *remaining == 0 {
+                    self.work_limit_hit = true;
+                    self.stack.clear();
+                    return None;
+                }
+                *remaining -= 1;
+            }
             if is_vcs_metadata(name.to_str().unwrap_or("")) {
                 continue;
             }
@@ -936,6 +967,10 @@ impl Iterator for BoundWalker {
                 continue;
             }
             if is_directory {
+                if self.remaining_entries.is_some() && depth >= self.max_depth {
+                    self.work_limit_hit = true;
+                    continue;
+                }
                 let matchers = frame.matchers.clone();
                 if let Ok(child_frame) =
                     DirectoryFrame::new(child, relative_path, matchers, &self.approved_root)
@@ -1184,6 +1219,21 @@ impl FindFilesTool {
     }
 }
 
+fn find_file_rank(
+    sort: FindFilesSort,
+    modified: Option<SystemTime>,
+    path: String,
+) -> (Reverse<Option<SystemTime>>, String) {
+    (
+        Reverse(if sort == FindFilesSort::Mtime {
+            modified
+        } else {
+            None
+        }),
+        path,
+    )
+}
+
 impl Tool for FindFilesTool {
     const NAME: &'static str = "find_files";
 
@@ -1192,7 +1242,7 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Returns the deterministic lexicographically first results when capped. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
+        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1206,6 +1256,12 @@ impl Tool for FindFilesTool {
                 "path": {
                     "type": "string",
                     "description": "Directory to search in (defaults to current working directory)"
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["name", "mtime"],
+                    "default": "name",
+                    "description": "Name order, or newest modification time first; path breaks ties and unavailable times sort last"
                 },
                 "mode": {
                     "type": "string",
@@ -1279,14 +1335,17 @@ impl Tool for FindFilesTool {
         let coaching = combine_coaching(coaching, path_coaching);
 
         let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
-        let (first_results, total_matches) =
+        let sort = args.sort;
+        let (first_results, total_matches, work_limit_hit) =
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
                 let traversal_root = bound_directory.approved_root().to_path_buf();
-                let walker = bound_directory.walker()?;
+                let mut walker = bound_directory
+                    .walker()?
+                    .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH);
                 let mut first_results = BinaryHeap::with_capacity(max_results.min(64));
                 let mut total_matches = 0_usize;
 
-                for entry in walker {
+                for entry in walker.by_ref() {
                     let fname = entry.file_name.to_string_lossy();
                     let relative_path = entry
                         .path
@@ -1295,24 +1354,31 @@ impl Tool for FindFilesTool {
                     if pattern.is_match(&fname, relative_path) {
                         total_matches = total_matches.saturating_add(1);
                         let path = entry.path.to_string_lossy().to_string();
+                        let ranked = find_file_rank(sort, entry.metadata.modified().ok(), path);
                         if first_results.len() < max_results {
-                            first_results.push(path);
+                            first_results.push(ranked);
                         } else if let Some(current_last) = first_results.peek()
-                            && path < *current_last
+                            && ranked < *current_last
                         {
                             first_results.pop();
-                            first_results.push(path);
+                            first_results.push(ranked);
                         }
                     }
                 }
-                Ok((first_results, total_matches))
+                Ok((first_results, total_matches, walker.work_limit_hit()))
             })
             .await
             .map_err(|error| {
                 ToolError::Msg(format!("find_files directory walker failed: {error}"))
             })??;
+        let work_notice = if work_limit_hit {
+            "\n[search traversal limit reached (100000 directory entries or depth 256); results cover only the visited entries — narrow the path]"
+        } else {
+            ""
+        };
         if total_matches == 0 {
-            let msg = format!("No files found matching the pattern.\n{no_matches_hint}");
+            let msg =
+                format!("No files found matching the pattern.\n{no_matches_hint}{work_notice}");
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -1322,6 +1388,7 @@ impl Tool for FindFilesTool {
         let limit_hit = total_matches > max_results;
         let mut results = first_results.into_vec();
         results.sort();
+        let results: Vec<_> = results.into_iter().map(|(_, path)| path).collect();
 
         let result = if limit_hit {
             format!(
@@ -1336,6 +1403,7 @@ impl Tool for FindFilesTool {
             format!("{} files found:\n{}", total_matches, results.join("\n"))
         };
 
+        let result = format!("{result}{work_notice}");
         tracing::debug!(
             "tool find_files done: results={}, truncated={}",
             total_matches,
@@ -1459,6 +1527,7 @@ mod tests {
         );
 
         let call = tool.call(FindFilesArgs {
+            sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "needle".to_string(),
             path: Some(external.path().to_string_lossy().into_owned()),
@@ -1496,6 +1565,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some("nested".to_string()),
@@ -1510,6 +1580,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
                 path: Some("src/agent/tools".to_string()),
@@ -1533,6 +1604,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some(external.to_string_lossy().into_owned()),
@@ -1561,6 +1633,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(requested.to_string_lossy().into_owned()),
@@ -1583,6 +1656,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some("~".to_string()),
@@ -1610,6 +1684,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(link.to_string_lossy().into_owned()),
@@ -1641,6 +1716,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "marker".to_string(),
             path: Some(link.to_string_lossy().into_owned()),
@@ -1676,6 +1752,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "must_not_be_returned".to_string(),
             path: Some(authorized.to_string_lossy().into_owned()),
@@ -1737,6 +1814,7 @@ mod tests {
 
         let output = FindFilesTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!(".*{marker}$"),
                 path: Some(workspace.to_string_lossy().into_owned()),
@@ -1760,6 +1838,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: None,
@@ -1773,6 +1852,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
                 path: None,
@@ -1790,6 +1870,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
                 path: Some(String::new()),
@@ -1818,6 +1899,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
                 path: Some(external.to_string_lossy().into_owned()),
@@ -1839,6 +1921,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
@@ -1859,6 +1942,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
@@ -1880,6 +1964,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 10)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: FindFilesMode::Auto,
                 pattern: "**/*.rs".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
@@ -1987,6 +2072,7 @@ mod tests {
         ] {
             let output = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    sort: crate::agent::tools::FindFilesSort::Name,
                     pattern: pattern.to_string(),
                     path: Some(dir.path().to_string_lossy().into_owned()),
                     mode,
@@ -2002,6 +2088,7 @@ mod tests {
         ] {
             let error = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    sort: crate::agent::tools::FindFilesSort::Name,
                     pattern: "[".to_string(),
                     path: Some(dir.path().to_string_lossy().into_owned()),
                     mode,
@@ -2021,6 +2108,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 2)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^[a-z]\.txt$".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
@@ -2033,6 +2121,141 @@ mod tests {
         assert!(!output.contains("m.txt"), "{output}");
         assert!(!output.contains("z.txt"), "{output}");
         assert!(output.starts_with("4 files found (showing first 2):"));
+    }
+
+    #[tokio::test]
+    async fn mtime_sort_retains_newest_paths_with_stable_ties_and_name_default() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-mtime");
+        for (name, seconds) in [
+            ("a.txt", 100),
+            ("z.txt", 300),
+            ("b.txt", 200),
+            ("c.txt", 200),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        }
+        let tool = FindFilesTool::new(None, None, 3);
+        let call = |sort: Option<&str>| {
+            let mut value =
+                serde_json::json!({"pattern":"*.txt", "path":directory.path().to_string_lossy()});
+            if let Some(sort) = sort {
+                value["sort"] = sort.into();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let newest = tool.call(call(Some("mtime"))).await.unwrap();
+        let paths: Vec<_> = newest
+            .lines()
+            .filter(|line| line.ends_with(".txt"))
+            .collect();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| Path::new(path).file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["z.txt", "b.txt", "c.txt"]
+        );
+        assert!(
+            newest.starts_with("4 files found (showing first 3)"),
+            "{newest}"
+        );
+        let names = tool.call(call(None)).await.unwrap();
+        let paths: Vec<_> = names
+            .lines()
+            .filter(|line| line.ends_with(".txt"))
+            .collect();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| Path::new(path).file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a.txt", "b.txt", "c.txt"]
+        );
+        assert!(
+            serde_json::from_value::<FindFilesArgs>(
+                serde_json::json!({"pattern":"*", "sort":"size"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bound_search_entry_budget_counts_ignored_entries_and_releases_the_walk() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-entry-budget");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(directory.path().join(name), "").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let mut walker = bound
+            .walker()
+            .unwrap()
+            .with_search_limits(2, SEARCH_MAX_DIRECTORY_DEPTH);
+        assert_eq!(walker.by_ref().count(), 2);
+        assert!(walker.work_limit_hit());
+        assert!(
+            walker.stack.is_empty(),
+            "work exhaustion releases directory descriptors"
+        );
+        let bound = BoundDirectory::open(directory.path(), &metadata)
+            .unwrap()
+            .with_hidden_filter(Some(Arc::new(|_, _| true)));
+        let mut walker = bound
+            .walker()
+            .unwrap()
+            .with_search_limits(2, SEARCH_MAX_DIRECTORY_DEPTH);
+        assert_eq!(walker.by_ref().count(), 0);
+        assert!(
+            walker.work_limit_hit(),
+            "hidden entries consume traversal work too"
+        );
+    }
+
+    #[test]
+    fn mtime_sort_unavailable_timestamps_sort_last_and_name_ignores_them() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let mut ranks = [
+            find_file_rank(FindFilesSort::Mtime, None, "a".into()),
+            find_file_rank(FindFilesSort::Mtime, Some(older), "b".into()),
+            find_file_rank(FindFilesSort::Mtime, Some(newer), "c".into()),
+        ];
+        ranks.sort();
+        assert_eq!(ranks.map(|(_, path)| path), ["c", "b", "a"]);
+        assert!(
+            find_file_rank(FindFilesSort::Name, Some(older), "a".into())
+                < find_file_rank(FindFilesSort::Name, Some(newer), "b".into())
+        );
+    }
+
+    #[test]
+    fn bound_search_depth_limit_skips_deep_descendants_and_preserves_siblings() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-depth-budget");
+        std::fs::create_dir_all(directory.path().join("one/two/three")).unwrap();
+        for relative in ["root.txt", "one/visible.txt", "one/two/deep.txt"] {
+            std::fs::write(directory.path().join(relative), "").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let mut walker = bound.walker().unwrap().with_search_limits(100, 2);
+        let mut names: Vec<_> = walker.by_ref().map(|file| file.file_name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [OsString::from("root.txt"), OsString::from("visible.txt")]
+        );
+        assert!(walker.work_limit_hit());
+        assert!(walker.stack.is_empty());
     }
 
     #[test]
@@ -2135,6 +2358,7 @@ mod tests {
         ] {
             let listing = tool
                 .call(FindFilesArgs {
+                    sort: crate::agent::tools::FindFilesSort::Name,
                     mode: crate::agent::tools::FindFilesMode::Regex,
                     pattern: r"\.txt$".to_string(),
                     path: path.map(str::to_string),

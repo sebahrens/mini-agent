@@ -39,6 +39,8 @@ impl PreservedConfig {
 /// Default `max_bash_output_lines` when the config does not set one. Output
 /// beyond this many lines keeps its head and tail with an omitted-count marker.
 pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
+pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
+pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,6 +145,13 @@ pub struct Config {
     pub max_read_lines: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bash_output_lines: Option<u64>,
+    /// Foreground shell tool deadline. Other sandbox command classes retain
+    /// their own limits; this does not alter brokered JavaScript spawn limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_timeout_secs: Option<u64>,
+    /// Opt-in anonymous release check, only during interactive startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_grep_results: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,6 +354,12 @@ pub struct Config {
     pub permission_modes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_details: Option<ShowToolDetails>,
+    /// Context rows in successful edit/write previews (hard maximum 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_context_lines: Option<usize>,
+    /// Preview row cap (hard maximum 1000); zero disables mutation previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_diff_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_reasoning: Option<bool>,
     /// Configurable status-bar (up to 3 lines). When absent, a built-in
@@ -476,9 +491,22 @@ pub struct Config {
     /// from or written to a config file.
     #[serde(skip)]
     pub load_warnings: Vec<String>,
+    /// Interactive startup presentation only; never persisted or sent to a model.
+    #[serde(skip)]
+    pub update_notice: Option<String>,
 }
 
 impl Config {
+    pub(crate) fn mutation_diff_options(&self) -> crate::agent::tools::mutation_diff::DiffOptions {
+        crate::agent::tools::mutation_diff::DiffOptions {
+            context: self.diff_context_lines.unwrap_or(3).min(20),
+            max_lines: self
+                .max_diff_lines
+                .unwrap_or(200)
+                .min(crate::agent::tools::mutation_diff::MAX_DIFF_LINES),
+        }
+    }
+
     pub fn custom_providers_map(&self) -> HashMap<String, types::CustomProviderConfig> {
         self.custom_providers.clone().unwrap_or_default()
     }
@@ -796,6 +824,12 @@ impl Config {
             Some(lines) => Some(lines),
             None => Some(DEFAULT_MAX_BASH_OUTPUT_LINES),
         }
+    }
+
+    pub fn resolve_shell_timeout_secs(&self) -> u64 {
+        self.shell_timeout_secs
+            .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
+            .clamp(1, MAX_SHELL_TIMEOUT_SECS)
     }
 
     /// LSP configuration, `Some` only when an `[lsp]` table exists with
@@ -1117,6 +1151,51 @@ impl ShowToolDetails {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn shell_deadline_configuration_has_a_finite_hard_ceiling() {
+        assert_eq!(Config::default().resolve_shell_timeout_secs(), 120);
+        for (requested, expected) in [(0, 1), (1, 1), (121, 121), (600, 600), (u64::MAX, 600)] {
+            let cfg = Config {
+                shell_timeout_secs: Some(requested),
+                ..Default::default()
+            };
+            assert_eq!(cfg.resolve_shell_timeout_secs(), expected);
+        }
+        assert_eq!(
+            crate::sandbox::DEFAULT_COMMAND_LIMITS.timeout.as_secs(),
+            30,
+            "raising the shell tool deadline must not change other command classes"
+        );
+    }
+
+    #[test]
+    fn shell_deadline_is_an_owned_roundtrip_config_key() {
+        let path = std::path::Path::new("config.toml");
+        let mut cfg =
+            parse_config_content(path, "shell_timeout_secs = 321\nfuture_key = 'kept'\n").unwrap();
+        assert_eq!(cfg.resolve_shell_timeout_secs(), 321);
+        assert!(!cfg.preserved.keys().any(|key| key == "shell_timeout_secs"));
+        cfg.shell_timeout_secs = Some(9999);
+        let content = serialize_config_content(path, &cfg).unwrap();
+        let reloaded = parse_config_content(path, &content).unwrap();
+        assert_eq!(reloaded.shell_timeout_secs, Some(9999));
+        assert_eq!(
+            reloaded.resolve_shell_timeout_secs(),
+            MAX_SHELL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            reloaded
+                .preserved
+                .0
+                .get("future_key")
+                .and_then(toml::Value::as_str),
+            Some("kept")
+        );
+        cfg.shell_timeout_secs = None;
+        let removed = serialize_config_content(path, &cfg).unwrap();
+        assert!(!removed.contains("shell_timeout_secs"));
+    }
 
     fn make_config(map: HashMap<String, String>) -> Config {
         Config {

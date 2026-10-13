@@ -60,6 +60,13 @@ pub enum AgentEvent {
         #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         is_error: bool,
     },
+    /// Native successful mutation metadata, bound by the SDK hook to the
+    /// exact internal call. Never reconstructed from model-visible text.
+    FileMutation {
+        id: CompactString,
+        name: CompactString,
+        diff: crate::agent::tools::mutation_diff::MutationDiff,
+    },
     /// The runner has honored a UI compaction request only after every
     /// in-flight tool result is correlated into this structured transcript.
     CompactionBoundary {

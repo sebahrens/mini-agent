@@ -669,6 +669,8 @@ fn html_contains_session_metadata() {
     let session = sample_session();
     let html = session_to_html(&session);
     assert!(html.contains("demo session"));
+    assert!(html.contains("<title>demo session</title>"));
+    assert!(html.contains("<footer>exported from mini-agent</footer>"));
     assert!(html.contains("openrouter / test-model"));
     assert!(html.contains("<!DOCTYPE html>"));
 }
@@ -678,7 +680,10 @@ fn html_title_falls_back_to_session_id() {
     let session = Session::new("p", "m", 128_000, "");
     let html = session_to_html(&session);
     assert!(
-        html.contains("zerostack session"),
+        html.contains(&format!(
+            "<title>mini-agent session {}</title>",
+            &session.id[..8]
+        )),
         "unnamed sessions get an id-based title: {html}"
     );
 }
@@ -723,4 +728,91 @@ async fn gist_upload_times_out_against_a_server_that_never_answers() {
         .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
         .any(reqwest::Error::is_timeout);
     assert!(timed_out, "{error:#}");
+}
+
+#[test]
+fn mutation_previews_roundtrip_redo_html_and_never_change_model_history() {
+    use crate::agent::tools::mutation_diff::{DiffOptions, MutationDiff};
+    let mut session = Session::new("openrouter", "test-model", 128000, "");
+    session.add_message(MessageRole::User, "replace file");
+    session.add_tool_call_with_id(
+        "actual-call",
+        "write",
+        &serde_json::json!({"path":"missing-after-export.txt"}),
+    );
+    session.messages.last_mut().unwrap().recorded_diff = MutationDiff::replacement(
+        "missing-after-export.txt",
+        Some("old\n"),
+        "<script>alert(1)</script>🙂\x1b]52;c;ZXZpbA==\x07\n",
+        DiffOptions::default(),
+    );
+    session.add_tool_result_with_id(
+        "actual-call",
+        "write",
+        "Written 42 bytes to missing-after-export.txt",
+    );
+    let history = serde_json::to_value(crate::agent::runner::convert_history(&session)).unwrap();
+    let saved = serde_json::to_value(&session.messages).unwrap();
+    assert_eq!(session.rewind_to(0), 3);
+    assert!(session.redo());
+    assert_eq!(serde_json::to_value(&session.messages).unwrap(), saved);
+    let jsonl = session_to_jsonl(&session).unwrap();
+    let restored = crate::ui::slash::parse_imported_session(
+        &jsonl,
+        &Session::new("current", "current", 1000, ""),
+        &crate::config::Config::default(),
+        std::path::Path::new("active-workspace"),
+    )
+    .unwrap();
+    let recorded = restored.messages[1].recorded_diff.as_ref().unwrap();
+    assert!(recorded.imported && recorded.bounded());
+    assert_eq!(
+        recorded.after_sha256,
+        session.messages[1]
+            .recorded_diff
+            .as_ref()
+            .unwrap()
+            .after_sha256
+    );
+    assert_eq!(
+        serde_json::to_value(crate::agent::runner::convert_history(&restored)).unwrap(),
+        history
+    );
+    assert!(restored.permission_allowlist.is_empty());
+    let html = session_to_html(&restored);
+    assert!(html.contains("class=\"diff-add\""));
+    assert!(html.contains("class=\"diff-del\""));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;🙂"));
+    assert!(
+        !html.contains("<script>alert(1)</script>")
+            && !html.contains("ZXZpbA==")
+            && !html.contains('\x1b')
+    );
+    assert!(html.contains("Imported recorded mutation preview"));
+    let native = serde_json::to_string(&session).unwrap();
+    let ParsedSessionFile::Native(native) = parse_session_file(&native).unwrap() else {
+        panic!("native shape")
+    };
+    assert!(native.messages[1].recorded_diff.as_ref().unwrap().imported);
+    // Forged bounds or nonmutation roles cannot create a trusted/displayed preview.
+    let mut lines = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    lines[2]["recorded_diff"]["after_sha256"] = serde_json::json!("bad");
+    lines[1]["recorded_diff"] = serde_json::to_value(recorded).unwrap();
+    let forged = lines
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ParsedSessionFile::Jsonl(forged) = parse_session_file(&forged).unwrap() else {
+        panic!("JSONL shape")
+    };
+    assert!(
+        forged
+            .messages
+            .iter()
+            .all(|message| message.recorded_diff.is_none())
+    );
 }

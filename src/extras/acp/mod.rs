@@ -191,6 +191,7 @@ impl SessionHistory {
                         Message::System { .. } => crate::session::MessageRole::System,
                     };
                     serialized.push(crate::session::SessionMessage {
+                        recorded_diff: None,
                         role,
                         estimated_tokens: crate::session::Session::estimate_tokens(&content),
                         content: content.into(),
@@ -2753,6 +2754,24 @@ async fn relay_prompt_events(
             AgentEvent::SubagentStarted { .. } => {
                 // Display-only provenance; the outer task call remains the
                 // canonical ACP tool lifecycle.
+            }
+            AgentEvent::FileMutation { id, name, diff } => {
+                // A distinct historical preview survives the subsequent tool
+                // result update; it never asserts current filesystem contents.
+                if diff.bounded() {
+                    let text = crate::ui::events::sanitize_for_review(&format!(
+                        "Recorded {name} mutation preview (call {id}):\n{}",
+                        diff.review_text()
+                    ));
+                    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                    let notification = SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentThoughtChunk(chunk),
+                    );
+                    if let Err(error) = cx.send_notification(notification) {
+                        tracing::warn!(%error,"ACP failed to send mutation preview");
+                    }
+                }
             }
             AgentEvent::ToolResult {
                 id,
@@ -6618,6 +6637,8 @@ mod workspace_tests {
             GrepTool::new(None, None, 100).with_workspace_binding(second_workspace.clone());
         let (first_grep, second_grep) = tokio::join!(
             first_grep_tool.call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "first-only".into(),
                 path: Some(".".into()),
                 include: None,
@@ -6627,6 +6648,8 @@ mod workspace_tests {
                 count: false,
             }),
             second_grep_tool.call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "second-only".into(),
                 path: Some(".".into()),
                 include: None,
@@ -6642,6 +6665,7 @@ mod workspace_tests {
         let first_find = FindFilesTool::new(None, None, 100)
             .with_workspace_binding(first_workspace.clone())
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "sentinel".into(),
                 path: Some(".".into()),

@@ -1012,6 +1012,7 @@ mod tests {
         tool: Option<PersistedToolMessage>,
     ) -> SessionMessage {
         SessionMessage {
+            recorded_diff: None,
             role,
             content: CompactString::new(""),
             estimated_tokens: 0,

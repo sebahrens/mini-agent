@@ -296,7 +296,8 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
-| `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
+| `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. |
+| `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
 | `-r`, `--resume` | Print recent sessions across workspaces and exit, including the saved workspace and a title from its name, an opt-in generated title (`session_title_model`), or its first message. Use `--session <id-or-name>` to load one. |
 | `--name <name>` | Name a new session or rename the selected session with `--continue`/`--session`. Renames are saved unless `--no-session` is set. |
@@ -322,10 +323,67 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--status-socket <path>` | Send start/stop status messages to a Unix socket. |
 | `--load-prompt <prompt>` | Use a specific prompt |
 
+In default text mode, stdout contains the canonical final answer after the turn and its session
+save settle. Intermediate assistant text and tool transcripts remain in the saved session;
+bounded, terminal-safe tool summaries and reasoning go to stderr. `--pure-stdout` retains the
+streamed assistant/tool transcript on stdout, with bounded tool previews.
+
+For ordinary `-p` model prompts, redirected stdin is read through EOF before provider work,
+up to 1 MiB of UTF-8. It is appended as explicitly untrusted reference material, with quoted
+lines and fences that cannot be closed by the supplied text. For example:
+
+```bash
+git diff | mini-agent -p --quiet "Review this diff"
+cat report.txt | mini-agent -p --output json "Summarize this report"
+mini-agent -p --output stream-json "Update the README example"
+```
+
+Invalid UTF-8 and oversized input fail locally. Empty prompts fail before reading stdin;
+`--loop`, ACP, interactive mode, and explicit `-p '!command'` do not consume it. A stalled stdin
+reader uses the same interrupt and 10-second forced-stop grace as an active headless turn.
+
+`--output stream-json` writes one JSON object per line: `system` (logical session ID/name,
+provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional
+`goal` updates, optional `file_mutation` records, and a final `result`. Calls and results share `id`; `provider_call_id` records
+the provider identifier separately (its preview is capped at 512 bytes). Tool result events include `is_error`; text/arguments and
+tool previews are limited to 8 KiB and mark truncation. JSON escapes terminal control and deceptive
+Unicode characters while preserving decoded argument data. These events reflect observed SDK
+ordering, including intermediate assistant text. Usage events contain observed per-request
+`usage` deltas and per-round `cumulative` totals; the final result is authoritative for normalized
+usage, compaction, cost, and persistence. Native edit/write mutation records retain the exact
+invocation `id`, affected path, byte counts, and SHA-256 identities from the successful typed SDK
+result; no path is reopened for output. Their final escaped `diff` JSON preview is capped at 8 KiB; larger diffs retain
+identity/counts, omit rows, and set `truncated`; their path preview is capped at 1024 UTF-8 bytes
+and marks `path_truncated` when shortened. Already-observed callbacks retain order even if the SDK result batch later fails; hooks that
+abort before the mutation observer runs cannot provide a record. At most 32 records wait in the run-local queue; `file_mutation_gap`
+reports `omitted_events` explicitly if a larger atomic batch overflows it. Text and final JSON
+retain their existing schemas. Diagnostics stay on stderr. A terminal failure still
+emits a final result and retains the existing nonzero exit status. Closing stdout stops output
+while allowing owned work cleanup and session persistence to finish.
+
+Runtime stdout and stderr writes preserve backpressure and event order. Consumers should drain
+both pipes. If a consumer holds either sink open but stops reading, the pending write remains
+owned; an interrupt closes admission to that sink, saves observed turn progress, and waits for
+that write's cleanup. This includes tool/reasoning progress, verification and goal notices, and
+runtime error reporting. Default tracing diagnostics inside an active headless turn use a
+nonblocking queue capped at 32 records of 4 KiB, with one turn-owned drain worker; overflow is
+reported as dropped diagnostics when delivery is possible, and cancellation drops pending logs.
+Pre-provider startup/config/MCP notices, diagnostics outside an active turn, pre-runtime Clap,
+and explicit file logging retain their existing I/O behavior. A second signal or the 10-second grace ends
+the process with status 130. A kernel-blocked write cannot be canceled portably; it remains owned
+until its exact join or forced process exit. Forced transport shutdown can leave a partial NDJSON
+line. An interrupted output transport cannot promise delivery of a final record. This output path
+does not change inherited blocking, append, async, or access modes.
+
+Final JSON and NDJSON results include `session_id`, `session_name`, and `session_persisted`.
+IDs identify the actual selected or forked session; `--no-session` still has a logical ID but
+sets persistence false. Early input errors use null identity. The initial stream event describes
+logical identity only; it makes no claim that the session has been saved.
+
 `-p --output json` reserves stdout for exactly one JSON object when a turn result is available:
 
 ```json
-{"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
+{"session_id":"saved-session-id","session_name":"docs update","session_persisted":true,"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
 ```
 
 The object is the first and only line on stdout. `usage` and `cost` cover the turn's requests and

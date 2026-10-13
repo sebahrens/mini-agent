@@ -63,10 +63,13 @@ pub enum OutputFormat {
     #[default]
     Text,
     Json,
+    StreamJson,
 }
 
 #[derive(Parser, Debug, Default, Clone)]
-#[command(name = "mini-agent", version, about = "Minimal coding agent")]
+#[command(name = "mini-agent", version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
+    about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(
         long,
@@ -86,12 +89,20 @@ pub struct Cli {
     pub pure_stdout: bool,
 
     #[arg(
+        long,
+        requires = "print",
+        conflicts_with = "pure_stdout",
+        help = "With -p: silence reasoning and tool progress on stderr"
+    )]
+    pub quiet: bool,
+
+    #[arg(
         long = "output",
         value_name = "FORMAT",
         value_enum,
         requires = "print",
         conflicts_with = "pure_stdout",
-        help = "With -p: output format (text or json)"
+        help = "With -p: output format (text, json, or stream-json)"
     )]
     pub output: Option<OutputFormat>,
 
@@ -989,6 +1000,17 @@ impl Cli {
         self.output.unwrap_or_default()
     }
 
+    pub(crate) fn is_loop_mode(&self) -> bool {
+        #[cfg(feature = "loop")]
+        {
+            self.loop_mode
+        }
+        #[cfg(not(feature = "loop"))]
+        {
+            false
+        }
+    }
+
     pub fn is_headless(&self) -> bool {
         self.print || {
             #[cfg(feature = "loop")]
@@ -1329,6 +1351,16 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_version_reports_exact_build_identity_without_startup() {
+        use clap::Parser;
+        let error = super::Cli::try_parse_from(["mini-agent", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let version = error.to_string();
+        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+        assert!(version.contains(env!("MINI_AGENT_BUILD_FINGERPRINT")));
+        assert!(version.contains(env!("MINI_AGENT_BUILD_TARGET")));
+    }
     use clap::{CommandFactory, Parser};
 
     use super::{Cli, OutputFormat, default_sandbox_backend};
@@ -1759,6 +1791,32 @@ output_token_cost = 0.0
         let json = Cli::try_parse_from(["mini-agent", "-p", "--output", "json", "hello"]).unwrap();
         assert_eq!(json.output_format(), OutputFormat::Json);
         assert!(json.is_headless());
+        let stream = Cli::try_parse_from([
+            "mini-agent",
+            "-p",
+            "--output",
+            "stream-json",
+            "--quiet",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(stream.output_format(), OutputFormat::StreamJson);
+        assert!(stream.quiet);
+        for args in [
+            vec!["mini-agent", "--quiet"],
+            vec!["mini-agent", "--output", "stream-json", "hello"],
+            vec![
+                "mini-agent",
+                "-p",
+                "--output",
+                "stream-json",
+                "--pure-stdout",
+                "hello",
+            ],
+            vec!["mini-agent", "-p", "--quiet", "--pure-stdout", "hello"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     /// Every goal flag parses, and the ones that only make sense alongside an

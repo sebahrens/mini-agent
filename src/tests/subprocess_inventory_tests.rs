@@ -790,6 +790,13 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // reqwest response status is HTTP metadata, never a process terminal.
+    (
+        "src/update.rs",
+        "if response.status() != reqwest::StatusCode::OK {",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/cli.rs",
         "tokio::process::Command::new(std::env::current_exe().unwrap());",
@@ -1597,6 +1604,25 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // These inline shell tests inspect captured String output, not commands.
+    (
+        "src/agent/tools/bash.rs",
+        "assert!(output.contains(\"CONFIGURED_DEADLINE\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "output.contains(\"Status: completed\") && output.contains(\"JOB_FINISHED\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "output.contains(\"Status: running\") && output.contains(\"JOB_READY\"),",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/agent/runner.rs",
         "assert_eq!(output.as_str(), third);",
@@ -2145,7 +2171,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/agent/runner.rs", "output,", 2, "NON-PROCESS"),
+    ("src/agent/runner.rs", "output,", 3, "NON-PROCESS"),
     ("src/agent/runner.rs", "output.len(),", 1, "NON-PROCESS"),
     (
         "src/agent/tools/bash.rs",
@@ -2931,6 +2957,8 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
+                // assert_eq! compares the attributed image placeholder String;
+                // the third "output," fingerprint shares this exact macro tree.
                 "2e9d6fe2b541c8535dfabf335779690424c0bb5bb198ff7429dbaede8642b50f",
                 1,
             ),
@@ -2951,6 +2979,19 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/agent/tools/bash.rs",
         &[
+            // Full assert! token trees for configured deadline/job strings.
+            (
+                "793a3b50bb43dadca3a774dd894872be1b909dec7f1433ffeb83675180d47419",
+                1,
+            ),
+            (
+                "77648ada4ea01cfcd7468cc0851a96b2a1da7595c6e26d227c5661d8b40b8d0a",
+                1,
+            ),
+            (
+                "72029598af562279a2f55077ed2f8982a210ca6ac75f687ed0189688201b4489",
+                1,
+            ),
             (
                 "11590494b23b272022bf8aa154b2fcfb865b05cc25efb8a449623f43dbd184c8",
                 1,
@@ -3803,6 +3844,13 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // reqwest response status is HTTP metadata, never a process terminal.
+    (
+        "src/update.rs",
+        "if response.status() != reqwest::StatusCode::OK {",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/cli.rs",
         "tokio::process::Command::new(std::env::current_exe().unwrap());",

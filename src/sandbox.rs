@@ -168,7 +168,7 @@ impl ShellCapability {
         &self.executable
     }
 
-    #[cfg(all(test, feature = "js"))]
+    #[cfg(test)]
     pub(crate) fn for_test(executable: &Path, dialect: ShellDialect) -> Self {
         let executable = executable.canonicalize().unwrap();
         #[cfg(windows)]
@@ -397,6 +397,7 @@ pub(crate) struct CommandOutput {
 const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
 const MAX_RETAINED_BACKGROUND_JOBS: usize = 32;
 const BACKGROUND_STREAM_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_BACKGROUND_JOB_WAIT_MILLIS: u64 = 60_000;
 pub(crate) const DEFAULT_BACKGROUND_COMMAND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -424,7 +425,7 @@ impl BackgroundJobStatus {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         !matches!(self, Self::Running | Self::Stopping)
     }
 }
@@ -438,6 +439,14 @@ pub(crate) struct BackgroundJobSnapshot {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub descendants_escaped: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundJobSummary {
+    pub id: String,
+    pub command: String,
+    pub status: BackgroundJobStatus,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -2839,7 +2848,7 @@ impl Sandbox {
         id: &str,
     ) -> Result<BackgroundJobSnapshot, String> {
         validate_background_job_id(id)?;
-        let changed = {
+        {
             let mut jobs = self
                 .background_jobs
                 .jobs
@@ -2853,10 +2862,34 @@ impl Sandbox {
             }
             job.stop_requested = true;
             job.cancellation.cancel();
-            job.changed.clone()
+        }
+
+        self.wait_background_job(id, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    pub(crate) async fn wait_background_job(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        validate_background_job_id(id)?;
+        let changed = {
+            let jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            jobs.get(id)
+                .ok_or_else(|| format!("background job not found: {id}"))?
+                .changed
+                .clone()
         };
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + wait.min(std::time::Duration::from_millis(
+                MAX_BACKGROUND_JOB_WAIT_MILLIS,
+            ));
         loop {
             let notified = changed.notified();
             tokio::pin!(notified);
@@ -2870,6 +2903,41 @@ impl Sandbox {
                 return self.background_job_snapshot(id);
             }
         }
+    }
+
+    pub(crate) fn background_job_summaries(&self) -> Vec<BackgroundJobSummary> {
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut summaries: Vec<_> = jobs
+            .iter()
+            .map(|(id, job)| {
+                let terminal = job.terminal.as_ref();
+                let status = terminal.map_or_else(
+                    || {
+                        if job.stop_requested {
+                            BackgroundJobStatus::Stopping
+                        } else {
+                            BackgroundJobStatus::Running
+                        }
+                    },
+                    |terminal| terminal.status,
+                );
+                (
+                    job.sequence,
+                    BackgroundJobSummary {
+                        id: id.clone(),
+                        command: job.command.clone(),
+                        status,
+                        exit_code: terminal.and_then(|terminal| terminal.exit_code),
+                    },
+                )
+            })
+            .collect();
+        summaries.sort_unstable_by_key(|(sequence, _)| *sequence);
+        summaries.into_iter().map(|(_, summary)| summary).collect()
     }
 
     pub(crate) fn running_background_job_count(&self) -> usize {

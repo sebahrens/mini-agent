@@ -197,8 +197,130 @@ fn enqueue_tui_diagnostic(
     }
 }
 
+const HEADLESS_LOG_CAPACITY: usize = 32;
+const HEADLESS_LOG_MAX_BYTES: usize = 4096;
+
+#[derive(Default)]
+pub(crate) struct HeadlessDiagnostics(Mutex<HeadlessPending>);
+#[derive(Default)]
+struct HeadlessPending {
+    messages: std::collections::VecDeque<String>,
+    dropped: usize,
+    draining: bool,
+    closed: bool,
+}
+impl HeadlessDiagnostics {
+    fn admit(
+        &self,
+        message: String,
+        cancellation: &crate::agent::runner::AgentWorkCancellation,
+    ) -> bool {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.closed || cancellation.is_cancelled() {
+            pending.closed = true;
+            pending.messages.clear();
+            return false;
+        }
+        if pending.messages.len() == HEADLESS_LOG_CAPACITY {
+            pending.dropped = pending.dropped.saturating_add(1);
+            return false;
+        }
+        pending.messages.push_back(message);
+        if pending.draining {
+            false
+        } else {
+            pending.draining = true;
+            true
+        }
+    }
+    fn next(&self, cancellation: &crate::agent::runner::AgentWorkCancellation) -> Option<String> {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancellation.is_cancelled() {
+            pending.closed = true;
+            pending.messages.clear();
+            pending.draining = false;
+            return None;
+        }
+        if let Some(message) = pending.messages.pop_front() {
+            return Some(message);
+        }
+        if pending.dropped != 0 {
+            return Some(format!(
+                "headless logging: {} diagnostics dropped\n",
+                std::mem::take(&mut pending.dropped)
+            ));
+        }
+        pending.draining = false;
+        None
+    }
+    async fn drain(
+        self: std::sync::Arc<Self>,
+        cancellation: crate::agent::runner::AgentWorkCancellation,
+    ) {
+        while let Some(message) = self.next(&cancellation) {
+            if crate::print::headless_stderr_async(message).await.is_err() {
+                let mut pending = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.closed = true;
+                pending.draining = false;
+                pending.messages.clear();
+                break;
+            }
+        }
+    }
+}
+struct HeadlessLogWriter {
+    bytes: Vec<u8>,
+    clipped: bool,
+    pending: std::sync::Arc<HeadlessDiagnostics>,
+    cancellation: crate::agent::runner::AgentWorkCancellation,
+}
+impl Write for HeadlessLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = HEADLESS_LOG_MAX_BYTES.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        self.clipped |= bytes.len() > remaining;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Drop for HeadlessLogWriter {
+    fn drop(&mut self) {
+        if self.bytes.is_empty() {
+            return;
+        }
+        let raw = String::from_utf8_lossy(&self.bytes);
+        let raw = if self.clipped {
+            format!("{raw} [diagnostic truncated]\n")
+        } else {
+            raw.into_owned()
+        };
+        let (message, _) = crate::print::bounded_progress(&raw, HEADLESS_LOG_MAX_BYTES);
+        if self.pending.admit(message, &self.cancellation) {
+            let pending = self.pending.clone();
+            let cancellation = self.cancellation.clone();
+            // The current scope owns this worker and each blocking write/join.
+            std::mem::drop(crate::agent::runner::spawn_async_scoped(
+                pending.drain(cancellation),
+            ));
+        }
+    }
+}
+
 pub fn init(cli: &Cli, is_interactive: bool) {
     let stderr_filter = build_stderr_filter(cli);
+    let headless = cli.is_headless();
     let file_filter = build_file_filter();
 
     let (sender, receiver) = mpsc::channel(TUI_LOG_CAPACITY);
@@ -211,6 +333,16 @@ pub fn init(cli: &Cli, is_interactive: bool) {
         .with_writer(move || {
             if is_interactive {
                 LogWriter::Tui(TuiLogWriter::default())
+            } else if headless
+                && let Some((pending, cancellation)) =
+                    crate::agent::runner::current_headless_diagnostics()
+            {
+                LogWriter::Headless(HeadlessLogWriter {
+                    bytes: Vec::new(),
+                    clipped: false,
+                    pending,
+                    cancellation,
+                })
             } else {
                 LogWriter::Stderr(io::stderr())
             }
@@ -244,6 +376,7 @@ pub fn init(cli: &Cli, is_interactive: bool) {
 
 enum LogWriter {
     Tui(TuiLogWriter),
+    Headless(HeadlessLogWriter),
     Stderr(io::Stderr),
 }
 
@@ -251,6 +384,7 @@ impl Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tui(writer) => writer.write(bytes),
+            Self::Headless(writer) => writer.write(bytes),
             Self::Stderr(writer) => writer.write(bytes),
         }
     }
@@ -258,6 +392,7 @@ impl Write for LogWriter {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tui(writer) => writer.flush(),
+            Self::Headless(writer) => writer.flush(),
             Self::Stderr(writer) => writer.flush(),
         }
     }
@@ -348,5 +483,96 @@ mod tui_diagnostic_tests {
         assert!(record.len() <= TUI_LOG_MAX_BYTES + 32);
         drop(receiver);
         assert!(!enqueue_tui_diagnostic(b"later", &sender, &dropped));
+    }
+}
+
+#[cfg(test)]
+mod headless_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn queue_admission_is_bounded_ordered_restartable_and_cancel_closes_it() {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cancellation = scope.cancellation_handle();
+        let queue = HeadlessDiagnostics::default();
+        for index in 0..HEADLESS_LOG_CAPACITY + 3 {
+            assert_eq!(
+                queue.admit(format!("record-{index}"), &cancellation),
+                index == 0
+            );
+        }
+        for index in 0..HEADLESS_LOG_CAPACITY {
+            assert_eq!(
+                queue.next(&cancellation).unwrap(),
+                format!("record-{index}")
+            );
+        }
+        assert_eq!(
+            queue.next(&cancellation).unwrap(),
+            "headless logging: 3 diagnostics dropped\n"
+        );
+        assert!(queue.next(&cancellation).is_none());
+        assert!(queue.admit("restart".into(), &cancellation));
+        cancellation.cancel();
+        assert!(queue.next(&cancellation).is_none());
+        assert!(!queue.admit("no fallback or new worker".into(), &cancellation));
+        assert!(queue.0.lock().unwrap().closed);
+        assert_eq!(scope.active_children(), 0);
+    }
+    #[test]
+    fn formatted_writer_caps_bytes_and_retains_bounded_terminal_safe_diagnostic() {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let queue = std::sync::Arc::new(HeadlessDiagnostics::default());
+        // Keep pure fixture admission from launching a real transport worker.
+        queue.0.lock().unwrap().draining = true;
+        let mut writer = HeadlessLogWriter {
+            bytes: Vec::new(),
+            clipped: false,
+            pending: queue.clone(),
+            cancellation: scope.cancellation_handle(),
+        };
+        let bytes = format!("\x1b[31m{}", "é".repeat(HEADLESS_LOG_MAX_BYTES));
+        assert_eq!(writer.write(bytes.as_bytes()).unwrap(), bytes.len());
+        assert_eq!(writer.bytes.len(), HEADLESS_LOG_MAX_BYTES);
+        assert!(writer.clipped);
+        drop(writer);
+        let record = queue.next(&scope.cancellation_handle()).unwrap();
+        assert!(record.len() <= HEADLESS_LOG_MAX_BYTES);
+        assert!(!record.contains('\x1b'));
+        assert!(record.ends_with("[truncated]"));
+    }
+    #[tokio::test]
+    async fn current_scope_owns_worker_to_exact_idle_and_canceled_writer_starts_no_job() {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope
+            .run(async {
+                let (queue, cancellation) =
+                    crate::agent::runner::current_headless_diagnostics().unwrap();
+                let mut writer = HeadlessLogWriter {
+                    bytes: Vec::new(),
+                    clipped: false,
+                    pending: queue.clone(),
+                    cancellation,
+                };
+                writer.write_all(b"owned diagnostic\n").unwrap();
+                drop(writer);
+                tokio::time::timeout(std::time::Duration::from_secs(2), scope.wait_idle())
+                    .await
+                    .unwrap();
+                assert!(!queue.0.lock().unwrap().draining);
+                scope.cancellation_handle().cancel();
+                let (queue, cancellation) =
+                    crate::agent::runner::current_headless_diagnostics().unwrap();
+                let mut writer = HeadlessLogWriter {
+                    bytes: Vec::new(),
+                    clipped: false,
+                    pending: queue.clone(),
+                    cancellation,
+                };
+                writer.write_all(b"canceled diagnostic\n").unwrap();
+                drop(writer);
+                assert_eq!(scope.active_children(), 0);
+                assert!(queue.0.lock().unwrap().messages.is_empty());
+            })
+            .await;
     }
 }

@@ -61,6 +61,8 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "SENTINEL".into(),
                 path: None,
                 include: None,
@@ -78,6 +80,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let found = FindFilesTool::new(None, None, 100)
             .with_workspace(&root)
             .call(FindFilesArgs {
+                sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r".*\.txt".into(),
                 path: None,
@@ -102,6 +105,8 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let explicit_grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "VCS_SENTINEL".into(),
                 path: Some(".git".into()),
                 include: None,

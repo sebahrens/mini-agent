@@ -50,6 +50,8 @@ const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "show_cost_always",
     "show_reasoning",
     "show_tool_details",
+    "diff_context_lines",
+    "max_diff_lines",
     "statusline",
     "subagent_max_find_results",
     "subagent_max_grep_results",
@@ -1759,6 +1761,82 @@ mod project_config_trust_tests {
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
+    }
+
+    #[test]
+    fn project_update_check_cannot_opt_in_to_network_without_trust() {
+        let root = crate::tests::OwnedTestDirectory::new("project-update-check-trust");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "update_check = true\n").unwrap();
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                panic!("headless must not prompt")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert!(cfg.update_check.is_none());
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|description| {
+            assert!(description.contains("update_check"));
+            true
+        })
+        .unwrap();
+        assert_eq!(cfg.update_check, Some(true));
+    }
+
+    #[test]
+    fn project_shell_deadline_requires_content_bound_trust() {
+        let root = crate::tests::OwnedTestDirectory::new("project-shell-deadline-trust");
+        let config_path = root.path().join("project/.zerostack/config.toml");
+        let trust_path = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "shell_timeout_secs = 600\n").unwrap();
+        let mut cfg = Config {
+            shell_timeout_secs: Some(45),
+            ..Default::default()
+        };
+        let skipped = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            false,
+            &|_| panic!("headless mode must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(skipped, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(cfg.resolve_shell_timeout_secs(), 45);
+
+        apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            true,
+            &|request| {
+                assert!(request.contains("shell_timeout_secs"), "{request}");
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_shell_timeout_secs(), 600);
+
+        std::fs::write(&config_path, "shell_timeout_secs = 120\n").unwrap();
+        cfg.shell_timeout_secs = Some(45);
+        let changed = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            false,
+            &|_| panic!("changed headless project must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(changed, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(cfg.resolve_shell_timeout_secs(), 45);
     }
 
     #[test]

@@ -700,6 +700,7 @@ pub(crate) struct AgentWorkScope {
     /// Internal call ids whose tool outcome was an error or denial, recorded by
     /// `ToolLoopGuard` and consumed when the matching `ToolResult` is emitted.
     failed_tool_calls: std::sync::Mutex<std::collections::HashSet<String>>,
+    headless_diagnostics: std::sync::OnceLock<Arc<crate::logging::HeadlessDiagnostics>>,
     cancellation: Notify,
     idle: Notify,
     /// Workspace root that hook dispatch inside this turn uses instead of
@@ -722,6 +723,7 @@ impl AgentWorkScope {
             #[cfg(feature = "advisor")]
             advisor_messages: std::sync::Mutex::new(Vec::new()),
             failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+            headless_diagnostics: std::sync::OnceLock::new(),
             cancellation: Notify::new(),
             idle: Notify::new(),
             #[cfg(feature = "hooks")]
@@ -759,6 +761,7 @@ impl AgentWorkScope {
                 #[cfg(feature = "advisor")]
                 advisor_messages: std::sync::Mutex::new(Vec::new()),
                 failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+                headless_diagnostics: std::sync::OnceLock::new(),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
                 #[cfg(feature = "hooks")]
@@ -833,7 +836,6 @@ impl AgentWorkCancellation {
         self.scope.cancel();
     }
 
-    #[cfg(all(test, feature = "acp"))]
     pub(crate) fn is_cancelled(&self) -> bool {
         self.scope.is_cancelled()
     }
@@ -1042,6 +1044,29 @@ pub(crate) fn current_hook_execution_root() -> Option<std::path::PathBuf> {
         .try_with(|scope| scope.hook_execution_root.get().cloned())
         .ok()
         .flatten()
+}
+
+pub(crate) fn current_headless_diagnostics() -> Option<(
+    Arc<crate::logging::HeadlessDiagnostics>,
+    AgentWorkCancellation,
+)> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            (
+                scope
+                    .headless_diagnostics
+                    .get_or_init(|| Arc::new(crate::logging::HeadlessDiagnostics::default()))
+                    .clone(),
+                scope.cancellation_handle(),
+            )
+        })
+        .ok()
+}
+
+pub(crate) fn current_work_cancellation() -> Option<AgentWorkCancellation> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| scope.cancellation_handle())
+        .ok()
 }
 
 #[cfg(feature = "mcp")]
@@ -2612,6 +2637,7 @@ where
     let compaction_enabled = Arc::new(AtomicBool::new(false));
     let runner_compaction_enabled = Arc::clone(&compaction_enabled);
     let runner_lifecycle_tx = event_tx.clone();
+    let mutation_events = event_tx.clone();
     let (start_tx, start_rx) = if start_paused {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
@@ -3336,6 +3362,9 @@ where
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
 
+    let agent_future =
+        crate::agent::tools::mutation_diff::scope_events(mutation_events, agent_future);
+
     #[cfg(feature = "acp")]
     let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
 
@@ -3353,7 +3382,7 @@ where
 }
 
 /// Test convenience for the headless turn loop with default verification and
-/// stream policies. Production uses [`run_print_with_verification`] so it can
+/// stream policies. Production uses [`run_print_with_output_and_verification`] so it can
 /// persist partial progress on failure.
 #[cfg(test)]
 pub async fn run_print<M, H>(
@@ -3392,6 +3421,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_print_with_verification<M, H>(
     agent: &Agent<M>,
@@ -3409,21 +3439,63 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     H: Into<Arc<[Message]>>,
 {
-    // This large streaming state must not be copied into the enclosing
-    // provider and cancellation futures on small native main-thread stacks.
-    Box::pin(run_print_with_stream_policy_and_verification(
+    run_print_with_output_and_verification(
         agent,
         prompt,
-        pure_stdout,
-        emit_stdout,
+        crate::print::HeadlessOutputPolicy::legacy(pure_stdout, emit_stdout),
         retry_config,
         turn_token_budget,
-        history.into(),
-        RunnerStreamPolicy::default(),
+        history,
         completion_verification,
         #[cfg(feature = "hooks")]
         loop_info,
-    ))
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_print_with_output_and_verification<M, H>(
+    agent: &Agent<M>,
+    prompt: &str,
+    output: crate::print::HeadlessOutputPolicy,
+    retry_config: &RetryConfig,
+    turn_token_budget: Option<u64>,
+    history: H,
+    completion_verification: Option<CompletionVerification>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> HeadlessTurn
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    H: Into<Arc<[Message]>>,
+{
+    // This large streaming state must not be copied into the enclosing
+    // provider and cancellation futures on small native main-thread stacks.
+    let mutations = crate::print::HeadlessMutationEvents::new(output);
+    crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), async {
+        let mut turn = Box::pin(run_print_with_stream_policy_and_verification(
+            agent,
+            prompt,
+            output,
+            Some(&mutations),
+            retry_config,
+            turn_token_budget,
+            history.into(),
+            RunnerStreamPolicy::default(),
+            completion_verification,
+            #[cfg(feature = "hooks")]
+            loop_info,
+        ))
+        .await;
+        // A sibling/tool-result hook can fail the SDK batch after a mutation
+        // committed. Such callbacks remain truthful without a stream result.
+        if let Err(error) = mutations.emit(output).await
+            && turn.failure.is_none()
+        {
+            turn.failure = Some(error);
+        }
+        turn
+    })
     .await
 }
 
@@ -3452,8 +3524,8 @@ where
     run_print_with_stream_policy_and_verification(
         agent,
         prompt,
-        pure_stdout,
-        true,
+        crate::print::HeadlessOutputPolicy::legacy(pure_stdout, true),
+        None,
         retry_config,
         turn_token_budget,
         history.into(),
@@ -3511,8 +3583,8 @@ impl HeadlessTurn {
 async fn run_print_with_stream_policy_and_verification<M>(
     agent: &Agent<M>,
     prompt: &str,
-    pure_stdout: bool,
-    emit_stdout: bool,
+    output_policy: crate::print::HeadlessOutputPolicy,
+    mutations: Option<&crate::print::HeadlessMutationEvents>,
     retry_config: &RetryConfig,
     turn_token_budget: Option<u64>,
     history: Arc<[Message]>,
@@ -3628,23 +3700,25 @@ where
                 ))) => {
                     full_response.push_str(&text.text);
                     append_streamed_text(&mut interactions, &text.text);
-                    if emit_stdout {
-                        crate::print::headless_stdout(format_args!("{}", text.text));
+                    if let Err(error) = output_policy.assistant_text(&text.text).await {
+                        fail_turn!(error);
                     }
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::Reasoning(r),
                 )) => {
                     append_reasoning(&mut interactions, &r);
-                    eprint!("{}", r.display_text());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if let Err(error) = output_policy.reasoning(&r.display_text()).await {
+                        fail_turn!(error);
+                    }
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. },
                 )) => {
                     // Display only: the complete item above is what gets replayed.
-                    eprint!("{reasoning}");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if let Err(error) = output_policy.reasoning(&reasoning).await {
+                        fail_turn!(error);
+                    }
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::ToolCall {
@@ -3669,11 +3743,18 @@ where
                     // of the answer (mini-agent-knwk1).
                     full_response.clear();
                     response_len_at_stream_start = 0;
-                    if pure_stdout {
-                        let summary = format_tool_args_summary(&tool_call.function.arguments);
-                        crate::print::headless_stdout(format_args!("\n◈ {} {}\n", name, summary));
-                    }
                     append_tool_call(&mut interactions, &tool_call);
+                    if let Err(error) = output_policy
+                        .tool_call(
+                            &internal_call_id,
+                            &tool_call.id,
+                            name,
+                            &tool_call.function.arguments,
+                        )
+                        .await
+                    {
+                        fail_turn!(error);
+                    }
                     #[cfg(feature = "acp")]
                     crate::permission::ask::record_tool_call(name, &internal_call_id);
                 }
@@ -3702,27 +3783,32 @@ where
                     #[cfg(feature = "acp")]
                     crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                     goal_report_accepted |= is_accepted_goal_report(&name, &output);
-                    if pure_stdout && !output.is_empty() {
-                        let lines: Vec<&str> = output.lines().collect();
-                        if lines.len() > 40 {
-                            let truncated: Vec<&str> = lines.iter().take(40).copied().collect();
-                            crate::print::headless_stdout(format_args!(
-                                "◈ {} result:\n{}\n(truncated {} more lines)\n",
-                                name,
-                                truncated.join("\n"),
-                                lines.len().saturating_sub(40)
-                            ));
-                        } else {
-                            crate::print::headless_stdout(format_args!(
-                                "◈ {name} result:\n{output}\n"
-                            ));
-                        }
+                    // Append the actual result before awaiting machine output;
+                    // interruption must retain the successful tool transcript.
+                    if let Some(mutations) = mutations
+                        && let Err(error) = mutations.emit(output_policy).await
+                    {
+                        fail_turn!(error);
+                    }
+                    if let Err(error) = output_policy
+                        .tool_result(
+                            &internal_call_id,
+                            &name,
+                            &output,
+                            take_tool_failure(&internal_call_id),
+                        )
+                        .await
+                    {
+                        fail_turn!(error);
                     }
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                     completion_retry.reset(retry_config);
                     turns_used = turns_used.saturating_add(1);
-                    usage_ledger.record(call.usage);
+                    let delta = usage_ledger.record(call.usage);
+                    if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
+                        fail_turn!(error);
+                    }
                     tracing::debug!(
                         "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                         call.usage.input_tokens,
@@ -3744,7 +3830,10 @@ where
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     terminal_response_seen = true;
-                    usage_ledger.reconcile_terminal(res.usage());
+                    let delta = usage_ledger.reconcile_terminal(res.usage());
+                    if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
+                        fail_turn!(error);
+                    }
                     let terminal_was_streamed = full_response.len() > response_len_at_stream_start;
                     reconcile_terminal_response(
                         &mut full_response,
@@ -3756,8 +3845,8 @@ where
                     // it does interactively (mini-agent-4v2iq).
                     if !terminal_was_streamed && !res.output.is_empty() {
                         append_streamed_text(&mut interactions, &res.output);
-                        if emit_stdout {
-                            crate::print::headless_stdout(format_args!("{}", res.output));
+                        if let Err(error) = output_policy.assistant_text(&res.output).await {
+                            fail_turn!(error);
                         }
                     }
                     if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
@@ -3793,13 +3882,21 @@ where
                         #[cfg(feature = "skills")]
                         verification.record_verify_outcome(passed, verification_attempt);
                         let diagnostic = result.render_tail(VERIFICATION_DIAGNOSTIC_CHARS);
-                        eprintln!(
-                            "verification {} ({verification_attempt}/{})",
+                        if let Err(error) = crate::print::headless_stderr_async(format!(
+                            "verification {} ({verification_attempt}/{})\n",
                             if passed { "passed" } else { "failed" },
                             verification.max_attempts,
-                        );
+                        ))
+                        .await
+                        {
+                            fail_turn!(error);
+                        }
                         if !passed {
-                            eprintln!("{diagnostic}");
+                            if let Err(error) =
+                                crate::print::headless_stderr_async(format!("{diagnostic}\n")).await
+                            {
+                                fail_turn!(error);
+                            }
                             if verification_attempt < verification.max_attempts {
                                 next_instruction = Some(format!(
                                     "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
@@ -3921,8 +4018,10 @@ where
 
     // Terminate the streamed text line. JSON output streams nothing, and its
     // stdout must be exactly one JSON value (mini-agent-itc4b).
-    if emit_stdout {
-        crate::print::headless_stdout(format_args!("\n"));
+    if output_policy.streams_text()
+        && let Err(error) = crate::print::headless_stdout_async("\n".into()).await
+    {
+        fail_turn!(error);
     }
     committed_interactions.append(&mut interactions);
     HeadlessTurn {
@@ -3933,7 +4032,7 @@ where
     }
 }
 
-fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
+pub(crate) fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
     match args_json {
         serde_json::Value::Object(obj) => {
             let first_key = [

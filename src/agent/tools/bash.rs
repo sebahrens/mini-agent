@@ -6,7 +6,8 @@ use crate::agent::tools::{
 use crate::extras::truncate::head_lines;
 use crate::sandbox::{
     BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus,
-    DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS, Sandbox,
+    DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS, MAX_BACKGROUND_JOB_WAIT_MILLIS,
+    Sandbox,
 };
 
 pub struct ShellTool {
@@ -19,6 +20,7 @@ pub struct ShellTool {
     /// partial output embedded in a resource-limit error. The config default
     /// is [`crate::config::DEFAULT_MAX_BASH_OUTPUT_LINES`].
     pub max_output_lines: Option<u64>,
+    foreground_timeout: std::time::Duration,
 }
 
 impl ShellTool {
@@ -33,7 +35,16 @@ impl ShellTool {
             ask_tx,
             sandbox,
             max_output_lines,
+            foreground_timeout: std::time::Duration::from_secs(
+                crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
+            ),
         }
+    }
+
+    pub fn with_foreground_timeout_secs(mut self, seconds: u64) -> Self {
+        self.foreground_timeout =
+            std::time::Duration::from_secs(seconds.clamp(1, crate::config::MAX_SHELL_TIMEOUT_SECS));
+        self
     }
 }
 
@@ -52,10 +63,11 @@ impl Tool for ShellTool {
             .unwrap_or("configured shell");
         format!(
             "Execute a {dialect} command in the current working directory. Foreground commands have a hard \
-             30 second deadline and bounded output. Set background=true for builds, test suites, or servers; \
+             {} second deadline and bounded output. Set background=true for builds, test suites, or servers; \
              this returns a session-scoped job id for the job_status tool and uses a 24 hour maximum. The \
              optional timeout can lower the applicable deadline. Commands keep the same sandbox and permission \
-             policy in either mode."
+             policy in either mode.",
+            self.foreground_timeout.as_secs()
         )
     }
 
@@ -73,7 +85,7 @@ impl Tool for ShellTool {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 86_400_000,
-                    "description": "Lower command deadline in milliseconds (optional; maximum 30000 foreground or 86400000 background)"
+                    "description": format!("Lower command deadline in milliseconds (optional; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
                 },
                 "background": {
                     "type": "boolean",
@@ -94,7 +106,7 @@ impl Tool for ShellTool {
         let maximum = if args.background {
             DEFAULT_BACKGROUND_COMMAND_TIMEOUT
         } else {
-            DEFAULT_COMMAND_LIMITS.timeout
+            self.foreground_timeout
         };
         if let Some(timeout) = args.timeout
             && (timeout == 0 || std::time::Duration::from_millis(timeout) > maximum)
@@ -133,6 +145,7 @@ impl Tool for ShellTool {
         }
 
         let mut limits = DEFAULT_COMMAND_LIMITS;
+        limits.timeout = self.foreground_timeout;
         if let Some(timeout_ms) = args.timeout {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
@@ -205,7 +218,7 @@ impl Tool for JobStatusTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Poll or stop a session-scoped background shell job. Polling returns its current bounded head/tail output and terminal exit status when available. Stopping waits for process-tree cleanup before returning whenever cleanup completes within 5 seconds."
+        "Poll, wait for, stop, or list session-scoped background shell jobs. Poll returns current bounded head/tail output. Wait returns when the job ends or timeout_ms expires (default 10000, maximum 60000 milliseconds); expiration leaves the job running. List returns ids, commands and statuses without an id. Stop waits up to 5 seconds for process-tree cleanup."
             .to_string()
     }
 
@@ -219,18 +232,71 @@ impl Tool for JobStatusTool {
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["poll", "stop"],
-                    "description": "Poll status/output, or stop and reap the job (default poll)"
+                    "enum": ["poll", "stop", "wait", "list"],
+                    "description": "Poll status/output, wait for completion, stop and reap, or list current session jobs (default poll)"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_BACKGROUND_JOB_WAIT_MILLIS,
+                    "description": "Only with action=wait: maximum wait in milliseconds (default 10000). Expiration does not stop the job."
                 }
             },
-            "required": ["id"]
+            "required": []
         })
     }
 
     async fn call(&self, args: JobStatusArgs) -> Result<String, ToolError> {
+        if let Some(timeout) = args.timeout_ms
+            && (args.action != JobAction::Wait
+                || !(1..=MAX_BACKGROUND_JOB_WAIT_MILLIS).contains(&timeout))
+        {
+            return Err(ToolError::Msg(
+                "job_status timeout_ms is only valid with action=wait and must be between 1 and 60000 milliseconds. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"timeout_ms\":10000}".into(),
+            ));
+        }
+        if args.action == JobAction::List {
+            if args.id.is_some() {
+                return Err(ToolError::Msg(
+                    "job_status action=list does not take an id. Example: {\"action\":\"list\"}"
+                        .into(),
+                ));
+            }
+            let summaries = self.sandbox.background_job_summaries();
+            if summaries.is_empty() {
+                return Ok("No background jobs in this session.".into());
+            }
+            return Ok(summaries
+                .into_iter()
+                .map(|job| {
+                    let exit = job
+                        .exit_code
+                        .map_or_else(String::new, |code| format!("; exit {code}"));
+                    format!(
+                        "{}: {}{exit}\n  {}",
+                        job.id,
+                        job.status.as_str(),
+                        job.command
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
+        let id = args.id.as_deref().ok_or_else(|| ToolError::Msg(
+            "job_status requires an id for poll, wait or stop. Example: {\"id\":\"job-...\",\"action\":\"wait\"}".into(),
+        ))?;
         let snapshot = match args.action {
-            JobAction::Poll => self.sandbox.background_job_snapshot(&args.id),
-            JobAction::Stop => self.sandbox.stop_background_job(&args.id).await,
+            JobAction::Poll => self.sandbox.background_job_snapshot(id),
+            JobAction::Stop => self.sandbox.stop_background_job(id).await,
+            JobAction::Wait => {
+                self.sandbox
+                    .wait_background_job(
+                        id,
+                        std::time::Duration::from_millis(args.timeout_ms.unwrap_or(10_000)),
+                    )
+                    .await
+            }
+            JobAction::List => unreachable!("list returned before id lookup"),
         }
         .map_err(ToolError::Msg)?;
         Ok(render_background_job(snapshot, self.max_output_lines))
@@ -388,6 +454,310 @@ mod tests {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)
     }
 
+    #[cfg(unix)]
+    struct GatedJobFixture {
+        shell: ShellTool,
+        gate: crate::tests::process_gate::ProcessGate,
+        id: String,
+        _directory: crate::tests::OwnedTestDirectory,
+    }
+
+    #[cfg(unix)]
+    impl GatedJobFixture {
+        async fn start() -> Self {
+            let directory = crate::tests::OwnedTestDirectory::new("job-wait-list");
+            let path = directory.path().join("release.fifo");
+            let gate = crate::tests::process_gate::ProcessGate::new(&path).unwrap();
+            let shell = test_tool();
+            let mut fixture = Self {
+                shell,
+                gate,
+                id: String::new(),
+                _directory: directory,
+            };
+            let started = fixture
+                .shell
+                .call(BashArgs {
+                    command: format!(
+                        "printf JOB_READY; IFS= read -r release < {}; printf JOB_FINISHED",
+                        shell_quote(&path)
+                    ),
+                    timeout: Some(30_000),
+                    background: true,
+                })
+                .await
+                .unwrap();
+            fixture.id = background_id(&started);
+            let ready = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let snapshot = fixture
+                        .shell
+                        .sandbox
+                        .background_job_snapshot(&fixture.id)
+                        .unwrap();
+                    if String::from_utf8_lossy(&snapshot.stdout).contains("JOB_READY") {
+                        break;
+                    }
+                    assert!(
+                        !snapshot.status.is_terminal(),
+                        "fixture ended before readiness"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            ready.expect("background fixture readiness deadline");
+            fixture
+        }
+
+        async fn stop(&self) {
+            let snapshot = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.shell.sandbox.stop_background_job(&self.id),
+            )
+            .await
+            .expect("owned job cleanup deadline")
+            .unwrap();
+            assert!(snapshot.status.is_terminal(), "owned job did not retire");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GatedJobFixture {
+        fn drop(&mut self) {
+            let _ = self.gate.release();
+            self.shell.sandbox.kill_active();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_foreground_default_expires_and_reaps_without_a_call_timeout() {
+        let root = crate::tests::OwnedTestDirectory::new("configured-shell-expiry");
+        let path = root.path().join("release.fifo");
+        let _gate = crate::tests::process_gate::ProcessGate::new(&path).unwrap();
+        let tool = test_tool().with_foreground_timeout_secs(1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.call(BashArgs {
+                command: format!(
+                    "printf CONFIGURED_READY; IFS= read -r release < {}",
+                    shell_quote(&path)
+                ),
+                timeout: None,
+                background: false,
+            }),
+        )
+        .await
+        .expect("configured default must impose its own finite deadline")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed_out; timeout_ms: 1000"), "{error}");
+        assert!(
+            error.contains("CONFIGURED_READY"),
+            "the real command must have reached its gate"
+        );
+        assert_eq!(
+            tool.sandbox.active_group_count(),
+            0,
+            "deadline result must follow native cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_foreground_deadline_accepts_longer_calls_and_publishes_the_cap() {
+        let tool = test_tool().with_foreground_timeout_secs(u64::MAX);
+        assert!(tool.description().contains("600 second deadline"));
+        assert!(
+            tool.parameters()["properties"]["timeout"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("600000 foreground")
+        );
+        let output = tool
+            .call(BashArgs {
+                command: "printf CONFIGURED_DEADLINE".into(),
+                timeout: Some(60_001),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert!(output.contains("CONFIGURED_DEADLINE"));
+        assert!(
+            tool.call(BashArgs {
+                command: "must-not-execute".into(),
+                timeout: Some(600_001),
+                background: false
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("600000")
+        );
+    }
+
+    #[tokio::test]
+    async fn job_wait_and_list_arguments_fail_before_job_lookup_when_invalid() {
+        let tool = JobStatusTool::new(test_tool().sandbox, None);
+        for action in [JobAction::Poll, JobAction::Stop, JobAction::Wait] {
+            assert!(
+                tool.call(JobStatusArgs {
+                    id: None,
+                    action,
+                    timeout_ms: None
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires an id")
+            );
+        }
+        for (action, timeout_ms) in [
+            (JobAction::Wait, 0),
+            (JobAction::Wait, 60_001),
+            (JobAction::Poll, 1),
+            (JobAction::List, 1),
+        ] {
+            assert!(
+                tool.call(JobStatusArgs {
+                    id: Some("not-a-job-id".into()),
+                    action,
+                    timeout_ms: Some(timeout_ms)
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("timeout_ms")
+            );
+        }
+        assert!(
+            tool.call(JobStatusArgs {
+                id: Some("ignored-id".into()),
+                action: JobAction::List,
+                timeout_ms: None
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not take an id")
+        );
+        let args: JobStatusArgs =
+            serde_json::from_value(serde_json::json!({"action":"list"})).unwrap();
+        assert_eq!(
+            tool.call(args).await.unwrap(),
+            "No background jobs in this session."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_wait_wakes_on_completion_and_list_survives_transcript_compaction() {
+        let mut fixture = GatedJobFixture::start().await;
+        let tool = JobStatusTool::new(fixture.shell.sandbox.clone(), None);
+        let wait = tool.call(JobStatusArgs {
+            id: Some(fixture.id.clone()),
+            action: JobAction::Wait,
+            timeout_ms: Some(60_000),
+        });
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(wait.as_mut()).is_pending(),
+            "gated job must still be running"
+        );
+        let sibling_wait = tool.call(JobStatusArgs {
+            id: Some(fixture.id.clone()),
+            action: JobAction::Wait,
+            timeout_ms: Some(60_000),
+        });
+        tokio::pin!(sibling_wait);
+        assert!(futures::poll!(sibling_wait.as_mut()).is_pending());
+        fixture.gate.release().unwrap();
+        let (output, sibling) = tokio::time::timeout(
+            Duration::from_secs(15),
+            futures::future::join(wait, sibling_wait),
+        )
+        .await
+        .expect("completion must wake every waiter before its 60-second wait");
+        let output = output.unwrap();
+        assert!(sibling.unwrap().contains("Status: completed"));
+        assert!(
+            output.contains("Status: completed") && output.contains("JOB_FINISHED"),
+            "{output}"
+        );
+        let mut session = crate::session::Session::new("fixture", "model", 128_000, "");
+        session.add_message(crate::session::MessageRole::User, &fixture.id);
+        session.compress("job ids omitted from summary".into(), 1, 0);
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&fixture.id))
+        );
+        let rebuilt = JobStatusTool::new(fixture.shell.sandbox.clone(), None);
+        let list = rebuilt
+            .call(JobStatusArgs {
+                id: None,
+                action: JobAction::List,
+                timeout_ms: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            list.contains(&fixture.id) && list.contains("completed; exit 0"),
+            "{list}"
+        );
+        assert!(
+            !list.contains("[stdout]"),
+            "listing does not copy stored output"
+        );
+        let foreign = JobStatusTool::new(test_tool().sandbox, None);
+        assert_eq!(
+            foreign
+                .call(JobStatusArgs {
+                    id: None,
+                    action: JobAction::List,
+                    timeout_ms: None
+                })
+                .await
+                .unwrap(),
+            "No background jobs in this session."
+        );
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_wait_expiration_and_caller_drop_leave_the_job_running() {
+        let fixture = GatedJobFixture::start().await;
+        let tool = JobStatusTool::new(fixture.shell.sandbox.clone(), None);
+        {
+            let wait = tool.call(JobStatusArgs {
+                id: Some(fixture.id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(60_000),
+            });
+            tokio::pin!(wait);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+        }
+        tokio::time::pause();
+        let output = tool
+            .call(JobStatusArgs {
+                id: Some(fixture.id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(25),
+            })
+            .await
+            .unwrap();
+        tokio::time::resume();
+        assert!(
+            output.contains("Status: running") && output.contains("JOB_READY"),
+            "{output}"
+        );
+        assert_eq!(fixture.shell.sandbox.running_background_job_count(), 1);
+        fixture.stop().await;
+    }
+
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
@@ -435,7 +805,8 @@ mod tests {
         loop {
             let output = tool
                 .call(JobStatusArgs {
-                    id: id.to_string(),
+                    id: Some(id.to_string()),
+                    timeout_ms: None,
                     action: JobAction::Poll,
                 })
                 .await
@@ -478,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn out_of_range_shell_timeouts_are_rejected_before_starting_a_job() {
         let tool = test_tool();
-        for (background, maximum) in [(false, 30_000), (true, 86_400_000)] {
+        for (background, maximum) in [(false, 120_000), (true, 86_400_000)] {
             for timeout in [0, maximum + 1, u64::MAX] {
                 let error = tool
                     .call(BashArgs {
@@ -508,7 +879,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("between 1 and 30000 milliseconds"));
+        assert!(error.contains("between 1 and 120000 milliseconds"));
         assert!(error.contains(r#"{"command":"cargo test","background":true,"timeout":120000}"#));
     }
 
@@ -710,7 +1081,8 @@ mod tests {
         loop {
             let running = status
                 .call(JobStatusArgs {
-                    id: id.clone(),
+                    id: Some(id.clone()),
+                    timeout_ms: None,
                     action: JobAction::Poll,
                 })
                 .await
@@ -760,7 +1132,8 @@ mod tests {
 
         let stopped = status
             .call(JobStatusArgs {
-                id,
+                id: Some(id),
+                timeout_ms: None,
                 action: JobAction::Stop,
             })
             .await
@@ -818,7 +1191,8 @@ mod tests {
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let unknown = status
             .call(JobStatusArgs {
-                id: id.clone(),
+                id: Some(id.clone()),
+                timeout_ms: None,
                 action: JobAction::Poll,
             })
             .await
@@ -828,7 +1202,8 @@ mod tests {
 
         let invalid = status
             .call(JobStatusArgs {
-                id: "x".repeat(128 * 1024),
+                id: Some("x".repeat(128 * 1024)),
+                timeout_ms: None,
                 action: JobAction::Poll,
             })
             .await
@@ -856,7 +1231,8 @@ mod tests {
 
         let stopped = status
             .call(JobStatusArgs {
-                id,
+                id: Some(id),
+                timeout_ms: None,
                 action: JobAction::Stop,
             })
             .await

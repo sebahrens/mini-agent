@@ -477,10 +477,17 @@ pub(crate) fn prompt_block_rows(
     rows
 }
 
+#[cfg(test)]
+type NativeSizeQuery = fn() -> io::Result<(u16, u16)>;
+
 pub struct Renderer {
     /// An owned terminal-byte capture for App tests, never process stdout.
     #[cfg(test)]
     test_output: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    #[cfg(test)]
+    test_native_size_query: Option<NativeSizeQuery>,
+    #[cfg(test)]
+    native_size_queries: std::cell::Cell<usize>,
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
@@ -589,6 +596,10 @@ impl Renderer {
         Ok(Renderer {
             #[cfg(test)]
             test_output: None,
+            #[cfg(test)]
+            test_native_size_query: None,
+            #[cfg(test)]
+            native_size_queries: std::cell::Cell::new(0),
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -832,6 +843,23 @@ impl Renderer {
             return (180, 50);
         }
         crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
+    /// Bottom drawing preserves native query errors. App fixtures own both
+    /// geometry and output, so they never query the process's real terminal.
+    fn checked_draw_size(&self) -> io::Result<(u16, u16)> {
+        #[cfg(test)]
+        {
+            if self.test_output.is_some() {
+                return Ok((180, 50));
+            }
+            self.native_size_queries
+                .set(self.native_size_queries.get() + 1);
+            if let Some(query) = self.test_native_size_query {
+                return query();
+            }
+        }
+        crossterm::terminal::size()
     }
 
     fn max_line_width(&self) -> usize {
@@ -1741,7 +1769,7 @@ impl Renderer {
         statusline_key: u64,
         is_running: bool,
     ) -> io::Result<()> {
-        let (cols, rows) = crossterm::terminal::size()?;
+        let (cols, rows) = self.checked_draw_size()?;
         if self.notice.is_some() && self.active_notice().is_none() {
             self.notice = None;
         }
@@ -2717,4 +2745,111 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
         } as char);
     }
     out
+}
+
+#[cfg(test)]
+mod captured_app_geometry_tests {
+    use super::*;
+
+    fn would_block_query() -> io::Result<(u16, u16)> {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "controlled native terminal query failure",
+        ))
+    }
+    fn forbidden_query() -> io::Result<(u16, u16)> {
+        panic!("captured App renderer must never query the native terminal")
+    }
+
+    #[test]
+    fn uncaptured_bottom_draw_preserves_native_geometry_errors() {
+        let mut renderer = Renderer::new().unwrap();
+        renderer.test_native_size_query = Some(would_block_query);
+        let error = renderer.draw_bottom("draft", 5, &[], 0, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(renderer.native_size_queries.get(), 1);
+    }
+
+    #[test]
+    fn actual_captured_bottom_draw_owns_geometry_and_never_queries_native_terminal() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        renderer.test_native_size_query = Some(forbidden_query);
+        renderer.sync_input_height("owned draft").unwrap();
+        renderer.render_viewport().unwrap();
+        renderer
+            .draw_bottom("owned draft", 11, &[], 0, false)
+            .unwrap();
+        assert_eq!(renderer.native_size_queries.get(), 0);
+        assert!(renderer.captured_output().contains("owned draft"));
+        renderer.permission_prompt = Some(PermissionPrompt {
+            tool: "[permission] owned request".into(),
+            options: "(n) deny once".into(),
+            expanded: false,
+        });
+        renderer.sync_input_height("").unwrap();
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 1, true).unwrap();
+        renderer.resize();
+        renderer.invalidate();
+        renderer.draw_bottom("", 0, &[], 2, true).unwrap();
+        assert_eq!(renderer.native_size_queries.get(), 0);
+        assert!(renderer.captured_output().contains("owned request"));
+    }
+}
+
+#[cfg(test)]
+mod mutation_diff_capture_tests {
+    use super::*;
+    use crate::agent::tools::mutation_diff::{DiffOptions, MutationDiff};
+
+    #[test]
+    fn actual_renderer_paints_semantic_diff_and_preserves_monochrome_theme_behavior() {
+        let diff =
+            MutationDiff::replacement("f", Some("old🙂\n"), "newα\n", DiffOptions::default())
+                .unwrap();
+        for monochrome in [false, true] {
+            let mut renderer = Renderer::for_app_test().unwrap();
+            renderer.set_monochrome(monochrome);
+            renderer.set_background_colors(
+                Some(Color::Rgb {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                }),
+                None,
+                None,
+            );
+            renderer
+                .feed_mut()
+                .push_anchored_block("call", BlockStyle::Tool, "write f");
+            crate::ui::events::push_mutation_diff(
+                renderer.feed_mut(),
+                "call",
+                &diff,
+                &crate::config::Config::default(),
+            );
+            renderer.render_viewport().unwrap();
+            let painted = renderer.captured_output();
+            assert!(
+                painted.contains("+newα") && painted.contains("-old🙂") && painted.contains("@@")
+            );
+            assert_eq!(
+                renderer.color(BlockStyle::DiffAdd.color()),
+                if monochrome {
+                    Color::Reset
+                } else {
+                    Color::Green
+                }
+            );
+            assert_eq!(
+                renderer.background_colors_for_test().0,
+                Some(Color::Rgb {
+                    r: 10,
+                    g: 20,
+                    b: 30
+                })
+            );
+            assert_eq!(renderer.native_size_queries.get(), 0);
+        }
+    }
 }

@@ -809,3 +809,750 @@ async fn a_post_hook_observes_the_arguments_that_actually_ran() {
         "post hook must not see the superseded arguments: {envelope}"
     );
 }
+
+#[cfg(unix)]
+struct McpLikeTool {
+    alias: String,
+    identity: crate::extras::hooks::normalize::McpToolIdentity,
+    permission: Option<crate::permission::checker::PermCheck>,
+    effects: Arc<std::sync::atomic::AtomicUsize>,
+    waiting: Option<(tokio::sync::mpsc::Sender<()>, Arc<tokio::sync::Notify>)>,
+}
+
+#[cfg(unix)]
+impl ToolDyn for McpLikeTool {
+    fn name(&self) -> String {
+        self.alias.clone()
+    }
+    fn description(&self) -> String {
+        "MCP-like singleton dispatch fixture".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        Box::pin(async move {
+            if let Some((entered, release)) = &self.waiting {
+                entered.send(()).await.unwrap();
+                release.notified().await;
+            }
+            crate::agent::tools::check_perm(
+                &self.permission,
+                &None,
+                "mcp_tool",
+                &self.identity.permission_input(),
+            )
+            .await
+            .map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let input: serde_json::Value = serde_json::from_str(&args).unwrap();
+            if input["fail"] == true {
+                return Err(ToolError::ToolCallError(Box::new(
+                    crate::agent::tools::ToolError::Msg(format!(
+                        "fixture MCP failure: {}",
+                        input["query"]
+                    )),
+                )));
+            }
+            Ok(format!("secret-canary: {}", input["query"]))
+        })
+    }
+}
+
+#[cfg(unix)]
+fn mcp_wrap(
+    tools: Vec<McpLikeTool>,
+    dispatcher: Arc<HookDispatcher>,
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
+) -> Vec<Box<dyn ToolDyn>> {
+    let identities = tools
+        .iter()
+        .map(|tool| (tool.alias.clone(), tool.identity.clone()))
+        .collect();
+    crate::extras::hooks::decorator::wrap_all_with_mcp(
+        tools
+            .into_iter()
+            .map(|tool| Box::new(tool) as Box<dyn ToolDyn>)
+            .collect(),
+        dispatcher,
+        permission,
+        ask_tx,
+        identities,
+    )
+}
+
+#[cfg(unix)]
+fn quote_hook_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn mcp_dispatcher(matcher: &str, command: &str) -> Arc<HookDispatcher> {
+    Arc::new(
+        HookDispatcher::from_config(&HashMap::from([(
+            "PreToolUse".into(),
+            vec![HookGroup {
+                matcher: Some(matcher.into()),
+                hooks: vec![handler(command)],
+            }],
+        )]))
+        .unwrap(),
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_mcp_provenance_matches_all_events_and_preserves_model_alias_and_rewrites() {
+    use crate::extras::hooks::normalize::McpToolIdentity;
+    for (alias, server, tool, matcher) in [
+        ("search", "alpha", "search", "mcp__alpha__search"),
+        (
+            "Alpha_Space__SearchValue__2",
+            "Alpha.Space",
+            "SearchValue",
+            "^mcp__Alpha[.]Space__SearchValue$",
+        ),
+    ] {
+        for fail in [false, true] {
+            let root = crate::tests::OwnedTestDirectory::new("mcp-hook-envelopes");
+            let pre = root.path().join("pre.json");
+            let post = root.path().join("post.json");
+            let failure = root.path().join("failure.json");
+            let mut config = HashMap::new();
+            for (event, path, output) in [
+                (
+                    "PreToolUse",
+                    &pre,
+                    serde_json::json!({"permissionDecision":"allow", "updatedInput":{"query":"rewritten", "fail":fail}}),
+                ),
+                (
+                    "PostToolUse",
+                    &post,
+                    serde_json::json!({"redactions":["secret-canary"]}),
+                ),
+                (
+                    "PostToolUseFailure",
+                    &failure,
+                    serde_json::json!({"permissionDecision":"deny"}),
+                ),
+            ] {
+                config.insert(
+                    event.into(),
+                    vec![HookGroup {
+                        matcher: Some(matcher.into()),
+                        hooks: vec![handler(&format!(
+                            "cat > {}; printf '%s\\n' '{}'",
+                            quote_hook_path(path),
+                            output
+                        ))],
+                    }],
+                );
+            }
+            let permission = permission_restrictive();
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wrapped = mcp_wrap(
+                vec![McpLikeTool {
+                    alias: alias.into(),
+                    identity: McpToolIdentity {
+                        server: server.into(),
+                        tool: tool.into(),
+                    },
+                    permission: permission.clone(),
+                    effects: effects.clone(),
+                    waiting: None,
+                }],
+                Arc::new(HookDispatcher::from_config(&config).unwrap()),
+                permission.clone(),
+                None,
+            );
+            assert_eq!(wrapped[0].name(), alias);
+            let result = wrapped[0].call(r#"{"query":"original"}"#.into()).await;
+            assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                permission
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .hook_decision_count(),
+                0
+            );
+            if fail {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fixture MCP failure: \"rewritten\"")
+                );
+                assert!(!post.exists());
+            } else {
+                assert_eq!(result.unwrap(), "[REDACTED]: \"rewritten\"");
+                assert!(!failure.exists());
+            }
+            for (event, path) in [
+                ("PreToolUse", &pre),
+                (
+                    if fail {
+                        "PostToolUseFailure"
+                    } else {
+                        "PostToolUse"
+                    },
+                    if fail { &failure } else { &post },
+                ),
+            ] {
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(envelope["hook_event_name"], event);
+                assert_eq!(envelope["tool_name"], alias);
+                assert_eq!(envelope["mcp_server"], server);
+                assert_eq!(envelope["mcp_tool"], tool);
+                assert_eq!(
+                    envelope["tool_input"]["query"],
+                    if event == "PreToolUse" {
+                        "original"
+                    } else {
+                        "rewritten"
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_ask_without_permission_channel_or_live_reply_has_zero_mcp_effects() {
+    use crate::extras::hooks::normalize::McpToolIdentity;
+    let identity = McpToolIdentity {
+        server: "alpha".into(),
+        tool: "search".into(),
+    };
+    let dispatcher = mcp_dispatcher(
+        &identity.matcher_name(),
+        r#"printf '%s\n' '{"permissionDecision":"ask"}'"#,
+    );
+    for (with_permission, with_channel) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let permission = with_permission.then(|| permission_restrictive().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        if with_permission && with_channel {
+            rx.close();
+        }
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = mcp_wrap(
+            vec![McpLikeTool {
+                alias: "registered_search".into(),
+                identity: identity.clone(),
+                permission: permission.clone(),
+                effects: effects.clone(),
+                waiting: None,
+            }],
+            dispatcher.clone(),
+            permission.clone(),
+            with_channel.then_some(tx),
+        );
+        let error = wrapped[0]
+            .call(r#"{"query":"effective"}"#.into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Permission"), "{error}");
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+        if let Some(permission) = permission {
+            assert_eq!(permission.lock().unwrap().hook_decision_count(), 0);
+        }
+    }
+    for decision in [
+        None,
+        Some(crate::permission::ask::UserDecision::Deny),
+        Some(crate::permission::ask::UserDecision::AllowOnce),
+    ] {
+        let permission = permission_restrictive();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = mcp_wrap(
+            vec![McpLikeTool {
+                alias: "registered_search".into(),
+                identity: identity.clone(),
+                permission: permission.clone(),
+                effects: effects.clone(),
+                waiting: None,
+            }],
+            dispatcher.clone(),
+            permission.clone(),
+            Some(tx),
+        );
+        let mut call = wrapped[0].call(r#"{"query":"effective"}"#.into());
+        let request = tokio::select! {
+            request = rx.recv() => request.unwrap(),
+            result = &mut call => panic!("call bypassed approval: {result:?}"),
+        };
+        assert_eq!(request.tool, "registered_search");
+        assert_eq!(request.input, r#"{"query":"effective"}"#);
+        let approved = matches!(
+            &decision,
+            Some(crate::permission::ask::UserDecision::AllowOnce)
+        );
+        if let Some(decision) = decision {
+            request.reply.send(decision).unwrap();
+        } else {
+            drop(request.reply);
+        }
+        let result = call.await;
+        assert_eq!(result.is_ok(), approved);
+        assert_eq!(
+            effects.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(approved)
+        );
+        assert_eq!(
+            permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hook_decision_count(),
+            0
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_explicit_deny_precedes_hook_ask_and_allow_without_prompt_or_effect() {
+    use crate::extras::hooks::normalize::McpToolIdentity;
+    let identity = McpToolIdentity {
+        server: "alpha".into(),
+        tool: "search".into(),
+    };
+    for verdict in ["ask", "allow"] {
+        let permission = Some(Arc::new(std::sync::Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(crate::permission::PermissionConfig {
+                    mcp_tool: Some(crate::permission::ToolPerm::Granular(HashMap::from([(
+                        identity.permission_input(),
+                        crate::permission::Action::Deny,
+                    )]))),
+                    ..Default::default()
+                }),
+                SecurityMode::Restrictive,
+                Some(permission_workspace()),
+                None,
+            )
+            .unwrap(),
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = mcp_wrap(
+            vec![McpLikeTool {
+                alias: "renamed_search".into(),
+                identity: identity.clone(),
+                permission: permission.clone(),
+                effects: effects.clone(),
+                waiting: None,
+            }],
+            mcp_dispatcher(
+                &identity.matcher_name(),
+                &format!("printf '%s\\n' '{{\"permissionDecision\":\"{verdict}\"}}'"),
+            ),
+            permission.clone(),
+            Some(tx),
+        );
+        assert!(
+            wrapped[0]
+                .call("{}".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("deny rule")
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hook_decision_count(),
+            0
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_mcp_calls_cannot_borrow_another_invocations_hook_grant() {
+    let root = crate::tests::OwnedTestDirectory::new("mcp-hook-grants");
+    let permission = Some(Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(root.path().to_owned()),
+            None,
+        )
+        .unwrap(),
+    )));
+    permission
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .allow_once_scoped("stale".into(), 0);
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered, mut entered_rx) = tokio::sync::mpsc::channel(1);
+    let alpha = crate::extras::hooks::normalize::McpToolIdentity {
+        server: "alpha".into(),
+        tool: "search".into(),
+    };
+    let beta = crate::extras::hooks::normalize::McpToolIdentity {
+        server: "beta".into(),
+        tool: "search".into(),
+    };
+    let wrapped = mcp_wrap(
+        vec![
+            McpLikeTool {
+                alias: "alpha__search".into(),
+                identity: alpha.clone(),
+                permission: permission.clone(),
+                effects: effects.clone(),
+                waiting: Some((entered, release.clone())),
+            },
+            McpLikeTool {
+                alias: "beta__search".into(),
+                identity: beta,
+                permission: permission.clone(),
+                effects: effects.clone(),
+                waiting: None,
+            },
+        ],
+        mcp_dispatcher(
+            &alpha.matcher_name(),
+            r#"printf '%s\n' '{"permissionDecision":"allow"}'"#,
+        ),
+        permission.clone(),
+        None,
+    );
+    for cancel in [false, true] {
+        let mut call = wrapped[0].call(r#"{"query":"alpha"}"#.into());
+        tokio::select! {
+            entered = entered_rx.recv() => assert_eq!(entered, Some(())),
+            result = &mut call => panic!("alpha did not wait: {result:?}"),
+        }
+        assert_eq!(
+            permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hook_decision_count(),
+            2
+        );
+        assert!(wrapped[1].call(r#"{"query":"beta"}"#.into()).await.is_err());
+        assert_eq!(
+            permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hook_decision_count(),
+            2
+        );
+        if cancel {
+            drop(call);
+        } else {
+            release.notify_one();
+            call.await.unwrap();
+        }
+        let checker = permission.as_ref().unwrap().lock().unwrap();
+        assert_eq!(checker.hook_decision_count(), 1);
+        assert!(checker.hook_decision_is_pending(0));
+    }
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_sdk_wrapper_stack_preserves_typed_results_outcomes_and_exact_call_ids() {
+    use futures::StreamExt;
+    use rig::agent::{AgentBuilder, AgentHook, Flow, HookContext, StepEvent};
+    use rig::completion::CompletionModel;
+    use rig::streaming::StreamingChat;
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+    use rig::tool::{Tool, ToolCallExtensions, ToolFailure, ToolReturn};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TypedResult(i64);
+    #[derive(Clone)]
+    struct TypedInput(i64);
+    struct NativeProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Tool for NativeProbe {
+        const NAME: &'static str = "typed_probe";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Structured tool fixture".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<String, Self::Error> {
+            Ok("legacy string path".into())
+        }
+        async fn call_structured(
+            &self,
+            args: Self::Args,
+            extensions: &ToolCallExtensions,
+        ) -> Result<ToolReturn<String>, Self::Error> {
+            match args["kind"].as_str().unwrap() {
+                "timeout" => Ok(ToolReturn::failed(
+                    "handled timeout".to_string(),
+                    ToolFailure::timeout("fixture timeout"),
+                )),
+                "denied" => Ok(ToolReturn::denied("fixture refusal".to_string())),
+                _ => {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let input = extensions.get::<TypedInput>().map_or(0, |input| input.0);
+                    let value = args["value"].as_i64().unwrap();
+                    Ok(ToolReturn::success(format!("secret-canary:{value}"))
+                        .with_extension(TypedResult(value + input)))
+                }
+            }
+        }
+    }
+    struct ObservedResult {
+        metadata: Option<TypedResult>,
+        provider_id: Option<String>,
+        internal_id: String,
+        output: String,
+        outcome: String,
+    }
+    #[derive(Clone)]
+    struct Observe {
+        results: Arc<std::sync::Mutex<Vec<ObservedResult>>>,
+        calls: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    }
+    impl<M: CompletionModel> AgentHook<M> for Observe {
+        async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            match event {
+                StepEvent::ToolCall {
+                    tool_call_id,
+                    internal_call_id,
+                    ..
+                } => {
+                    self.calls.lock().unwrap().insert(
+                        tool_call_id
+                            .expect("mock provider call must retain its ID")
+                            .into(),
+                        internal_call_id.into(),
+                    );
+                }
+                StepEvent::ToolResult {
+                    extensions,
+                    tool_call_id,
+                    internal_call_id,
+                    result,
+                    outcome,
+                    ..
+                } => {
+                    self.results.lock().unwrap().push(ObservedResult {
+                        metadata: extensions.get::<TypedResult>().cloned(),
+                        provider_id: tool_call_id.map(str::to_owned),
+                        internal_id: internal_call_id.into(),
+                        output: result.into(),
+                        outcome: outcome.as_str().into(),
+                    });
+                }
+                _ => {}
+            }
+            Flow::cont()
+        }
+    }
+    // A lifecycle-only dispatcher still wraps tools but must preserve the
+    // structured fast path without dispatching a tool hook.
+    {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = wrap_all(
+            vec![Box::new(NativeProbe(effects.clone()))],
+            dispatcher_with("SessionStart", vec![handler("true")]),
+            None,
+            None,
+        );
+        let mut extensions = ToolCallExtensions::new();
+        extensions.insert(TypedInput(7));
+        let result = tools[0]
+            .call_structured(r#"{"kind":"success","value":1}"#.into(), &extensions)
+            .await;
+        assert_eq!(
+            result.extensions().get::<TypedResult>(),
+            Some(&TypedResult(8))
+        );
+        assert_eq!(result.model_output(), "secret-canary:1");
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    for kind in ["success", "timeout", "denied", "hook-deny"] {
+        let root = crate::tests::OwnedTestDirectory::new("hooks-structured-sdk");
+        let failure = root.path().join("failure.json");
+        let verdict = if kind == "hook-deny" { "deny" } else { "allow" };
+        let dispatcher = Arc::new(HookDispatcher::from_config(&HashMap::from([
+            ("PreToolUse".into(), vec![HookGroup { matcher: None, hooks: vec![handler(&format!(
+                "printf '%s\\n' '{{\"permissionDecision\":\"{verdict}\",\"updatedInput\":{{\"kind\":\"{kind}\",\"value\":42}}}}'"))] }]),
+            ("PostToolUse".into(), vec![HookGroup { matcher: None, hooks: vec![handler(r#"printf '%s\n' '{"redactions":["secret-canary"]}'"#)] }]),
+            ("PostToolUseFailure".into(), vec![HookGroup { matcher: None, hooks: vec![handler(&format!("cat > {}", quote_hook_path(&failure)))] }]),
+        ])).unwrap());
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools =
+            crate::agent::tools::memoize::definitions(vec![Box::new(NativeProbe(effects.clone()))]);
+        let tools = wrap_all(tools, dispatcher, None, None);
+        let tools = crate::agent::tools::concurrency::bind(tools);
+        if kind == "success" {
+            let mut extensions = ToolCallExtensions::new();
+            extensions.insert(TypedInput(7));
+            let result = tools[0]
+                .call_structured(r#"{"kind":"success","value":1}"#.into(), &extensions)
+                .await;
+            assert_eq!(
+                result.extensions().get::<TypedResult>(),
+                Some(&TypedResult(49))
+            );
+            assert_eq!(result.model_output(), "[REDACTED]:42");
+            effects.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "model-visible-id",
+                    "typed_probe",
+                    serde_json::json!({"kind":kind, "value":1}),
+                )
+                .with_call_id("provider-exact-id"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let observed = Observe {
+            results: Arc::new(std::sync::Mutex::new(Vec::new())),
+            calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let agent = AgentBuilder::new(model)
+            .tools(tools)
+            .add_hook(observed.clone())
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<rig::completion::Message>::new())
+            .max_turns(2)
+            .await;
+        while let Some(item) = stream.next().await {
+            item.expect("mock tool turn completes");
+        }
+        let rows = observed.results.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        let ObservedResult {
+            metadata,
+            provider_id,
+            internal_id,
+            output,
+            outcome,
+        } = &rows[0];
+        assert_eq!(provider_id.as_deref(), Some("provider-exact-id"));
+        assert!(!internal_id.is_empty());
+        assert_eq!(
+            observed.calls.lock().unwrap().get("provider-exact-id"),
+            Some(internal_id)
+        );
+        match kind {
+            "success" => {
+                assert_eq!(metadata, &Some(TypedResult(42)));
+                assert_eq!(output, "[REDACTED]:42");
+                assert_eq!(outcome, "success");
+                assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(!failure.exists());
+            }
+            "timeout" | "denied" => {
+                assert!(metadata.is_none());
+                assert_eq!(outcome, if kind == "timeout" { "error" } else { "denied" });
+                assert_eq!(
+                    output,
+                    if kind == "timeout" {
+                        "handled timeout"
+                    } else {
+                        "fixture refusal"
+                    }
+                );
+                assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&failure).unwrap()).unwrap();
+                assert_eq!(envelope["tool_input"]["value"], 42);
+                assert_eq!(envelope["error"], output.as_str());
+            }
+            _ => {
+                assert!(metadata.is_none());
+                assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(outcome, "error");
+                assert!(output.contains("Blocked by guard rail"));
+                assert!(!failure.exists());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delimiter_colliding_mcp_labels_keep_distinct_registration_provenance() {
+    use crate::extras::hooks::normalize::McpToolIdentity;
+    let root = crate::tests::OwnedTestDirectory::new("mcp-hook-component-collision");
+    let path = root.path().join("envelope.json");
+    let first = McpToolIdentity {
+        server: "a__b".into(),
+        tool: "c".into(),
+    };
+    let second = McpToolIdentity {
+        server: "a".into(),
+        tool: "b__c".into(),
+    };
+    assert_eq!(first.matcher_name(), second.matcher_name());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wrapped = mcp_wrap(
+        vec![
+            McpLikeTool {
+                alias: "allocated_one".into(),
+                identity: first.clone(),
+                permission: None,
+                effects: effects.clone(),
+                waiting: None,
+            },
+            McpLikeTool {
+                alias: "allocated_two".into(),
+                identity: second.clone(),
+                permission: None,
+                effects: effects.clone(),
+                waiting: None,
+            },
+        ],
+        mcp_dispatcher(
+            &first.matcher_name(),
+            &format!("cat > {}", quote_hook_path(&path)),
+        ),
+        None,
+        None,
+    );
+    for (index, identity) in [first, second].iter().enumerate() {
+        wrapped[index]
+            .call(r#"{"query":"same"}"#.into())
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope["tool_name"], wrapped[index].name());
+        assert_eq!(envelope["mcp_server"], identity.server);
+        assert_eq!(envelope["mcp_tool"], identity.tool);
+    }
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

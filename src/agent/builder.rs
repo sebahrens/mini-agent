@@ -683,7 +683,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             max_text_file_size,
             read_tracker.clone(),
         )
-        .with_workspace_binding(workspace.clone());
+        .with_workspace_binding(workspace.clone())
+        .with_diff_options(cfg.mutation_diff_options());
         #[cfg(feature = "lsp")]
         let write_tool = write_tool.with_lsp(lsp_manager.clone());
         let edit_tool = tools::EditTool::new_with_tracker(
@@ -692,7 +693,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             max_text_file_size,
             read_tracker.clone(),
         )
-        .with_workspace_binding(workspace.clone());
+        .with_workspace_binding(workspace.clone())
+        .with_diff_options(cfg.mutation_diff_options());
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let mut base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::new();
@@ -709,12 +711,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         base_tools.push(Box::new(write_tool));
         base_tools.push(Box::new(edit_tool));
         if shell_tool_enabled {
-            base_tools.push(Box::new(tools::ShellTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                sandbox.clone(),
-                max_bash_output_lines,
-            )));
+            base_tools.push(Box::new(
+                tools::ShellTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    sandbox.clone(),
+                    max_bash_output_lines,
+                )
+                .with_foreground_timeout_secs(cfg.resolve_shell_timeout_secs()),
+            ));
             base_tools.push(Box::new(tools::JobStatusTool::new(
                 sandbox.clone(),
                 max_bash_output_lines,
@@ -778,6 +783,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             allow(unused_mut)
         )]
         let mut all_tools: Vec<Box<dyn rig::tool::ToolDyn>> = base_tools.into_vec();
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        let mut mcp_hook_identities = std::collections::HashMap::new();
 
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
@@ -835,6 +842,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             let mcp_tools =
                 collect_mcp_tools(manager, permission.clone(), ask_tx.clone(), timeouts).await;
             for t in mcp_tools {
+                #[cfg(feature = "hooks")]
+                mcp_hook_identities.insert(
+                    rig::tool::ToolDyn::name(&t),
+                    crate::extras::hooks::normalize::McpToolIdentity {
+                        server: t.server_name.to_string(),
+                        tool: t.definition.name.to_string(),
+                    },
+                );
                 all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
             }
         }
@@ -880,7 +895,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
         let all_tools = tools::memoize::definitions(all_tools);
 
-        #[cfg(feature = "hooks")]
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        let all_tools = crate::extras::hooks::wrap_from_global_with_mcp(
+            all_tools,
+            permission.clone(),
+            ask_tx.clone(),
+            mcp_hook_identities,
+        );
+        #[cfg(all(feature = "hooks", not(feature = "mcp")))]
         let all_tools =
             crate::extras::hooks::wrap_from_global(all_tools, permission.clone(), ask_tx.clone());
 
@@ -911,7 +933,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         .preamble(&preamble)
         .max_tokens(cli.resolve_max_tokens(cfg))
         .default_max_turns(cli.resolve_max_agent_turns(cfg))
-        .add_hook(crate::agent::runner::ToolLoopGuard);
+        .add_hook(crate::agent::runner::ToolLoopGuard)
+        .add_hook(tools::mutation_diff::MutationDiffHook);
     // Restates the objective every few tool results, so a long tool-heavy
     // round cannot drift away from it between provider calls.
     #[cfg(feature = "goal")]
@@ -1299,6 +1322,81 @@ mod extra_file_tests {
                 assert!(prompt.contains("explicit authorization"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn configured_shell_deadline_reaches_the_registered_runtime_definition() {
+        let root = crate::tests::OwnedTestDirectory::new("configured-shell-deadline");
+        let cli = crate::cli::Cli {
+            tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config {
+            shell_timeout_secs: Some(321),
+            ..Default::default()
+        };
+        let sandbox = crate::sandbox::Sandbox::new(false, "none").with_resolved_shell(Some(
+            crate::sandbox::ShellCapability::for_test(
+                &std::env::current_exe().unwrap(),
+                crate::sandbox::ShellDialect::Posix,
+            ),
+        ));
+        let agent = super::build_agent_inner(
+            rig::test_utils::MockCompletionModel::from_turns([rig::test_utils::MockTurn::text(
+                "unused",
+            )]),
+            &cli,
+            &cfg,
+            &empty_ctx(),
+            Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap()),
+            None,
+            None,
+            sandbox.clone(),
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
+            "configured-shell-deadline",
+            None,
+            false,
+            None,
+            None,
+            #[cfg(feature = "js")]
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                reason: "shell-only test".into(),
+            },
+            #[cfg(feature = "js")]
+            crate::extras::js::session::ScratchStore::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await;
+        let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        let shell = definitions
+            .iter()
+            .find(|tool| tool.name == "shell")
+            .unwrap();
+        assert!(shell.description.contains("321 second deadline"));
+        assert!(
+            shell.parameters["properties"]["timeout"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("321000 foreground")
+        );
+        let result = agent
+            .tool_server_handle
+            .call_tool(
+                "shell",
+                r#"{"command":"must-not-execute","timeout":321001}"#,
+            )
+            .await;
+        assert!(result.unwrap_err().to_string().contains("321000"));
+        assert_eq!(sandbox.active_group_count(), 0);
+        assert!(definitions.iter().any(|tool| tool.name == "job_status"));
     }
 
     #[tokio::test]

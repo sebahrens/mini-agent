@@ -3,6 +3,7 @@ use crate::session::{MessageRole, SessionMessage};
 
 fn msg(role: MessageRole, content: &str) -> SessionMessage {
     SessionMessage {
+        recorded_diff: None,
         role,
         content: content.into(),
         estimated_tokens: 0,

@@ -88,6 +88,12 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
             line["tool"] =
                 serde_json::to_value(tool).context("serialize structured tool record")?;
         }
+        if let Some(diff) = &msg.recorded_diff
+            && diff.bounded()
+        {
+            line["recorded_diff"] =
+                serde_json::to_value(diff).context("serialize mutation preview")?;
+        }
         let line = line.to_string();
         if line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
             anyhow::bail!("session message exceeds the JSONL line limit");
@@ -117,6 +123,8 @@ struct ImportMessage {
     tool_call_id: Option<CompactString>,
     #[serde(default)]
     tool: Option<crate::session::PersistedToolMessage>,
+    #[serde(default)]
+    recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
 }
 
 #[derive(Deserialize)]
@@ -377,7 +385,11 @@ pub fn parse_session_file(content: &str) -> Result<ParsedSessionFile> {
         anyhow::bail!("native session JSON has trailing values");
     }
 
-    let session: Session = serde_json::from_value(first).context("invalid native session")?;
+    let mut session: Session = serde_json::from_value(first).context("invalid native session")?;
+    for message in &mut session.messages {
+        message.recorded_diff =
+            imported_mutation_diff(message.recorded_diff.take(), message.role, &message.tool);
+    }
     if session.messages.len() > MAX_SESSION_IMPORT_MESSAGES {
         anyhow::bail!(
             "native session contains more than {} messages",
@@ -385,6 +397,16 @@ pub fn parse_session_file(content: &str) -> Result<ParsedSessionFile> {
         );
     }
     Ok(ParsedSessionFile::Native(session))
+}
+
+fn imported_mutation_diff(
+    diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
+    role: MessageRole,
+    tool: &Option<crate::session::PersistedToolMessage>,
+) -> Option<crate::agent::tools::mutation_diff::MutationDiff> {
+    diff.filter(|diff| diff.bounded())
+        .filter(|_| role == MessageRole::ToolCall && matches!(tool, Some(crate::session::PersistedToolMessage::Call { name, .. }) if matches!(name.as_str(), "edit" | "write")))
+        .map(|mut diff| {diff.imported = true; diff})
 }
 
 fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
@@ -443,7 +465,10 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         }
         let message: ImportMessage = serde_json::from_value(value)
             .with_context(|| format!("line {} is not a session message", index + 1))?;
+        let recorded_diff =
+            imported_mutation_diff(message.recorded_diff, message.role, &message.tool);
         messages.push(SessionMessage {
+            recorded_diff,
             role: message.role,
             content: message.content,
             estimated_tokens: message.estimated_tokens,
@@ -493,7 +518,9 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
         }
         let msg: ImportMessage = serde_json::from_value(value)
             .with_context(|| format!("line {} is not a session message", idx + 1))?;
+        let recorded_diff = imported_mutation_diff(msg.recorded_diff, msg.role, &msg.tool);
         messages.push(SessionMessage {
+            recorded_diff,
             role: msg.role,
             content: msg.content,
             estimated_tokens: msg.estimated_tokens,
@@ -536,6 +563,45 @@ pub fn session_to_html(session: &Session) -> String {
                 escape_html_into(&mut messages, &msg.content);
                 messages.push_str("</pre>\n");
             }
+        }
+        if let Some(diff) = &msg.recorded_diff
+            && diff.bounded()
+            && msg.role == MessageRole::ToolCall
+            && matches!(&msg.tool, Some(crate::session::PersistedToolMessage::Call { name, .. }) if matches!(name.as_str(), "edit" | "write"))
+        {
+            messages.push_str("<pre class=\"mutation-diff\">");
+            if diff.imported {
+                messages.push_str("Imported recorded mutation preview (not current file state)\n");
+            }
+            for row in &diff.rows {
+                use crate::agent::tools::mutation_diff::DiffKind;
+                let (class, prefix) = match row.kind {
+                    DiffKind::Add => ("diff-add", "+"),
+                    DiffKind::Delete => ("diff-del", "-"),
+                    DiffKind::Hunk => ("diff-hunk", ""),
+                    DiffKind::Context => ("diff-context", " "),
+                    DiffKind::Notice => ("diff-notice", ""),
+                };
+                messages.push_str(&format!("<span class=\"{class}\">"));
+                escape_html_into(
+                    &mut messages,
+                    &format!(
+                        "{prefix}{}",
+                        crate::ui::events::sanitize_for_review(&row.text)
+                    ),
+                );
+                messages.push_str("</span>\n");
+            }
+            if diff.omitted_rows > 0 {
+                messages.push_str(&format!(
+                    "(+{} more diff rows omitted)\n",
+                    diff.omitted_rows
+                ));
+            }
+            if diff.clipped_rows > 0 {
+                messages.push_str(&format!("({} long diff rows clipped)\n", diff.clipped_rows));
+            }
+            messages.push_str("</pre>\n");
         }
         messages.push_str("</section>\n");
     }
@@ -703,7 +769,7 @@ fn hex_value(value: u8) -> Option<u8> {
 fn session_title(session: &Session) -> String {
     if session.name.is_empty() {
         format!(
-            "zerostack session {}",
+            "mini-agent session {}",
             &session.id[..8.min(session.id.len())]
         )
     } else {

@@ -27,12 +27,20 @@ including unchanged and changed providers and failed provider setup. JS assertio
 run when the platform permits JS registration; macOS additionally needs the
 installed-binary path because libtest is not a production worker executable.
 
-Foreground shell commands run under a fixed 30 s deadline that a call can only
-lower; an explicit timeout must be at least one millisecond. A shell call with
+Foreground shell commands default to a 120 s deadline. `shell_timeout_secs`
+sets it between 1 and 600 seconds; the tool definition publishes the effective
+deadline. A call's millisecond `timeout` can only lower that deadline and must
+be positive. Other sandbox command classes, including brokered JS `spawn`,
+retain their existing limits. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
-The companion `job_status` tool polls bounded live output or stops and reaps
-the job. A session permits at most eight concurrent jobs and retains the newest
+The companion `job_status` tool polls bounded live output, stops and reaps
+the job, or waits for completion. `action = "wait"` accepts `timeout_ms` from
+1 to 60000 (default 10000); expiration or dropping the wait leaves the job
+running. `action = "list"` needs no id and returns bounded command summaries,
+ids, and statuses without copying captured output. The job registry belongs
+to the session's sandbox, so list can recover ids after transcript compaction
+and agent rebuilds. A session permits at most eight concurrent jobs and retains the newest
 32 job records; each stream keeps a 64 KiB rolling head/tail view. Background
 commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
@@ -207,8 +215,32 @@ basename globs such as `*.rs` and `test_*.rs` match at any depth. Other patterns
 retain filename-regex matching. Set `mode: "regex"` explicitly for patterns such
 as `^test_.*\.rs$`, or `mode: "glob"` for literal glob semantics. An empty result
 names the interpretation and suggests an alternative. Capped output is selected
-with a bounded lexicographic top-N heap, making “first N” stable across filesystem
-traversal orders while still reporting the exact match count.
+with a bounded top-N heap: omitted `sort` or `sort: "name"` selects paths in
+lexicographic order; `sort: "mtime"` selects the most recently modified files first.
+Equal timestamps use ascending path order, and unavailable timestamps sort last.
+Timestamps come from the already opened file's metadata, without an additional path
+lookup. Counts and ordering cover the visited entries; a traversal limit notice
+identifies incomplete searches.
+
+`grep` accepts `max_results` from 1 through its configured result cap; omission
+preserves that cap. It limits displayed source/context lines, or matching files in
+`files_only` and `count` modes. Separators do not consume the cap. Invalid limits
+fail explicitly. `multiline: true` searches each complete loaded file and enables
+dot to match newlines (`(?-s:...)` can disable that flag locally). Output keeps the
+existing numbered source-line format, showing each touched line once plus requested
+context. In multiline mode `count` counts non-overlapping regex matches; ordinary
+line mode continues counting matching source lines. Result limits still apply if
+one match spans many lines.
+
+Both recursive searches visit at most 100,000 directory entries and descend at
+most 256 directories. Grep additionally reads at most 100 MiB per call, loads at
+most 10 MiB per file (including files that grow during a read), and inspects at most
+100,000 multiline matches and 100,000 touched source lines per file. A byte-budget-ending file is skipped rather
+than searched as an incomplete prefix. Binary sniffing consumes the same byte
+budget. Work limits produce a partial-result notice, including when no matches
+were found; narrow the path or pattern to continue. These bounds leave path,
+read-deny, external-directory approval, ignore, and no-follow traversal policy
+unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and
 renders symbolic links as `name -> target`. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
@@ -270,3 +302,32 @@ audited, and stops later JavaScript/effects after acknowledgement. The tool
 returns that JSON directly without another model round trip. Ordinary final
 expressions remain limited to strings, finite scalars, or plain JSON and use the
 smaller 64 KiB result channel.
+
+
+## Native mutation result metadata
+
+[`src/agent/tools/mutation_diff.rs`](../../src/agent/tools/mutation_diff.rs) owns
+bounded review rows, applied byte ranges, and before/after SHA-256 digests for
+successful native edits and writes. Producers use their existing checked source
+bytes and the bytes accepted by atomic publication, without a preview filesystem
+read. A new-file create has no prior digest. Existing-file previews require the
+side-effect-free read-policy query in `permission/checker.rs`: deny rules and
+external-directory limits still apply, and an invocation's edit/write hook grant
+cannot supply read authority. Failed, denied, oversized, and read-unapproved
+mutations provide no extension.
+
+The native tools return Rig typed result extensions alongside their unchanged
+model-visible strings. Definition memoization, hook decorators (including output
+redaction), and concurrency wrappers forward these extensions. `MutationDiffHook`
+observes successful results and transports a bounded snapshot with Rig's exact
+internal call ID through a run-local event sink or headless observer. It uses no
+name-keyed queue, global invocation registry, model-text parser, or path lookup.
+The UI accepts a record only under the matching native tool-call ID and name.
+
+`SessionMessage.recorded_diff` is display-only historical data, retained by
+undo/redo, storage, JSONL, and HTML export. Import validates its bounds and labels
+it as imported; it cannot confer permission, skill verification, or filesystem
+identity. Model continuation history excludes this field. The feed sanitizes file
+controls and uses semantic addition/deletion/hunk styles; HTML escapes the same
+text. Configuration in [CONFIG.md](CONFIG.md#mutation-previews) controls context
+and retained rows, with deterministic byte, input, and matching-work limits.

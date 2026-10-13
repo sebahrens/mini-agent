@@ -253,6 +253,14 @@ Rust compiler version. Ordinary local and packaged builds therefore reject a sam
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
 
+[`build_inputs.rs`](../../build_inputs.rs) enumerates and hashes these source inputs
+with stable repository-relative names and length-prefixed bytes. The production
+`patched-deps/rig-core` path dependency contributes its manifest, Rust source tree,
+and build script when present; the lockfile alone has no checksum for its local
+contents. Generated dependency build caches are excluded. Controlled native tests
+prove that a same-length, mtime-preserving SDK edit changes identity, while identical
+source copies at different paths have the same input digest.
+
 Protocol version 11 adds a closed `full`/`read_only` model-effect profile to every `RunStep`.
 The read-only profile installs exactly `read_file`, `list_dir`, and `grep`; the parent separately
 issues only `read_file` capability and marks spawn unavailable. Protocol version 8 retains the

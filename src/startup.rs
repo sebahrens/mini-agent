@@ -19,31 +19,11 @@ use crate::session::{self, Session};
 #[error("no prompt given")]
 pub(crate) struct HeadlessUsageError;
 
-fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::Result<()> {
+async fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::Result<()> {
     if !cli.print || cli.message.iter().any(|part| !part.trim().is_empty()) {
         return Ok(());
     }
-    if cli.output_format() == OutputFormat::Json {
-        crate::print::headless_stdout(format_args!(
-            "{}\n",
-            crate::print::render_headless_json(
-                workspace,
-                "no prompt given",
-                &[],
-                rig::completion::Usage::default(),
-                Vec::new(),
-                crate::print::HeadlessPricing {
-                    anthropic_native: false,
-                    input_token_cost: 0.0,
-                    output_token_cost: 0.0,
-                    cache_prices: crate::pricing::CachePrices::default(),
-                },
-                crate::print::HeadlessStopReason::Failed,
-                #[cfg(feature = "goal")]
-                None,
-            )?
-        ));
-    }
+    crate::print::emit_headless_preflight_failure(cli, workspace, "no prompt given").await?;
     Err(HeadlessUsageError.into())
 }
 
@@ -795,7 +775,7 @@ impl Startup {
     /// Phase 1: context load, provider/model resolution, session
     /// creation/resolution, client creation.
     pub(crate) async fn init(
-        cli: Cli,
+        mut cli: Cli,
         cfg: Config,
         paths: AppPaths,
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
@@ -803,7 +783,33 @@ impl Startup {
         version_changed: bool,
         is_interactive: bool,
     ) -> anyhow::Result<Self> {
-        validate_headless_prompt(&cli, workspace.root())?;
+        validate_headless_prompt(&cli, workspace.root()).await?;
+        use std::io::IsTerminal as _;
+        let read_stdin = cli.print
+            && !cli.is_loop_mode()
+            && !cli.message.join(" ").trim_start().starts_with('!')
+            && !std::io::stdin().is_terminal();
+        #[cfg(feature = "acp")]
+        let read_stdin = read_stdin && !cli.acp_enabled;
+        if read_stdin {
+            let stdin = match crate::print::read_headless_stdin(cli.quiet).await {
+                Ok(stdin) => stdin,
+                Err(error) => {
+                    crate::print::emit_headless_preflight_failure(
+                        &cli,
+                        workspace.root(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            cli.message = vec![crate::print::append_stdin_reference(
+                &cli.message.join(" "),
+                &stdin,
+            )];
+        }
+
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early.
@@ -1532,9 +1538,32 @@ impl Startup {
         }
     }
 
-    async fn dispatch_print(mut self) -> anyhow::Result<()> {
+    async fn dispatch_print(self) -> anyhow::Result<()> {
+        let cli = self.cli.clone();
+        let root = self.workspace.root().to_path_buf();
+        let identity = (self.session.id.to_string(), self.session.name.to_string());
+        let result = Box::pin(self.dispatch_print_inner()).await;
+        if let Err(error) = &result
+            && cli.output_format() == OutputFormat::StreamJson
+            && !crate::print::headless_result_emitted()
+        {
+            crate::print::emit_headless_failure(
+                &cli,
+                &root,
+                &error.to_string(),
+                Some((&identity.0, &identity.1)),
+            )
+            .await?;
+        }
+        result
+    }
+
+    async fn dispatch_print_inner(mut self) -> anyhow::Result<()> {
         let msg = self.cli.message.join(" ").trim().to_string();
-        let json_output = self.cli.output_format() == OutputFormat::Json;
+        let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
+        let json_output = output.format != OutputFormat::Text;
+        let identity = (self.session.id.to_string(), self.session.name.to_string());
+        output.emit_event(serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model})).await?;
         let change_baseline = if json_output {
             crate::print::capture_workspace_change_baseline(self.workspace.root()).await
         } else {
@@ -1566,9 +1595,6 @@ impl Startup {
                 } else {
                     None
                 };
-                if !json_output {
-                    crate::print::headless_stdout(format_args!("{result}\n"));
-                }
                 let mut persistence_failure = None;
                 if !self.cli.no_session {
                     let mut session = self.session;
@@ -1590,9 +1616,8 @@ impl Startup {
                     } else {
                         crate::print::HeadlessStopReason::Failed
                     };
-                    crate::print::headless_stdout(format_args!(
-                        "{}\n",
-                        crate::print::render_headless_json(
+                    crate::print::emit_headless_result(
+                        &crate::print::render_headless_json(
                             self.workspace.root(),
                             &result,
                             &[],
@@ -1602,8 +1627,15 @@ impl Startup {
                             stop_reason,
                             #[cfg(feature = "goal")]
                             None,
-                        )?
-                    ));
+                        )?,
+                        output.format,
+                        Some((&identity.0, &identity.1)),
+                        !self.cli.no_session && persistence_failure.is_none(),
+                    )
+                    .await?;
+                }
+                if !json_output {
+                    crate::print::headless_stdout_async(format!("{result}\n")).await?;
                 }
                 if !run.succeeded() {
                     let failure = anyhow::anyhow!("explicit shell command failed");
@@ -1838,9 +1870,8 @@ impl Startup {
                         crate::print::HeadlessStopReason::Completed
                     }
                 };
-                crate::print::headless_stdout(format_args!(
-                    "{}\n",
-                    crate::print::render_headless_json(
+                crate::print::emit_headless_result(
+                    &crate::print::render_headless_json(
                         self.workspace.root(),
                         &response,
                         &interactions,
@@ -1850,8 +1881,15 @@ impl Startup {
                         stop_reason,
                         #[cfg(feature = "goal")]
                         finished_goal.as_ref(),
-                    )?
-                ));
+                    )?,
+                    output.format,
+                    Some((&identity.0, &identity.1)),
+                    !self.cli.no_session && persistence_failure.is_none(),
+                )
+                .await?;
+            }
+            if output.format == OutputFormat::Text && !output.streams_text() {
+                crate::print::headless_stdout_async(format!("{response}\n")).await?;
             }
             // A goal that stopped for a reason of its own exits with that
             // reason's code, whatever the output format. The distinction
@@ -1961,7 +1999,7 @@ impl Startup {
     async fn dispatch_interactive(self) -> anyhow::Result<()> {
         let Startup {
             cli,
-            cfg,
+            mut cfg,
             mut session,
             mut context,
             workspace,
@@ -1972,6 +2010,8 @@ impl Startup {
             sandbox,
             status_signals,
             arch_msg,
+            paths,
+            is_interactive,
             #[cfg(feature = "advisor")]
             handoff_rx,
             #[cfg(feature = "hooks")]
@@ -1979,6 +2019,8 @@ impl Startup {
             ..
         } = self;
 
+        cfg.update_notice =
+            crate::update::startup_notice(&cli, &cfg, is_interactive, &paths.state_dir).await;
         let auto_trigger_msg = select_interactive_auto_trigger(&cli, arch_msg);
 
         crate::ui::run_interactive(
@@ -2232,8 +2274,11 @@ async fn run_headless_goal_rounds(
     // everyone who reads them.
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
-    let quiet = cli.pure_stdout && !json_output;
-    let stream = !json_output;
+    let output = if cli.is_loop_mode() && !cli.print {
+        crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)
+    } else {
+        crate::print::HeadlessOutputPolicy::from_cli(cli)
+    };
     // Rounds after the first run the gate's instruction rather than the
     // message the operator typed, and each is persisted as it completes. The
     // caller has to know both, or it writes the final turn a second time and
@@ -2250,10 +2295,9 @@ async fn run_headless_goal_rounds(
     let mut round_started = std::time::Instant::now();
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut turn = agent
-        .run_print(
+        .run_print_with_output(
             message,
-            quiet,
-            stream,
+            output,
             &cfg.retry,
             history,
             #[cfg(feature = "hooks")]
@@ -2339,6 +2383,10 @@ async fn run_headless_goal_rounds(
             // before the round is persisted (mini-agent-kfsup).
             let judge_charge_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
             let judge_charge_out = judge_charge_slot.clone();
+            // Defer notices until usage and the round transcript are durable.
+            // A blocked diagnostic must not hold up their settlement.
+            let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let check_notices = notices.clone();
             let session_prices = (session.input_token_cost, session.output_token_cost);
             let session_cache_prices = session.cache_prices();
             let outcome =
@@ -2367,7 +2415,10 @@ async fn run_headless_goal_rounds(
                         // is reported here instead.
                         if let Some(tail) = checks.as_ref().and_then(|o| o.failure_tail.as_deref())
                         {
-                            eprintln!("{tail}");
+                            check_notices
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!("{tail}\n"));
                         }
                         return driver::Verification {
                             interrupted: true,
@@ -2433,6 +2484,7 @@ async fn run_headless_goal_rounds(
                     }
                 })
                 .await;
+
             let judge_charge = judge_charge_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2440,10 +2492,10 @@ async fn run_headless_goal_rounds(
             if let Some(charge) = judge_charge {
                 let first_unpriced = session.unpriced_judge_tokens == 0;
                 if !session.charge_judge_call(&charge) && first_unpriced {
-                    eprintln!(
-                        "goal: no known price for judge model {}; its tokens are counted without cost",
+                    notices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(format!(
+                        "goal: no known price for judge model {}; its tokens are counted without cost\n",
                         charge.model
-                    );
+                    ));
                 }
             }
             // The round that just ran is history for whatever comes next, and its
@@ -2461,26 +2513,65 @@ async fn run_headless_goal_rounds(
                 cfg,
                 cli.no_session,
             ) {
-                eprintln!("warning: failed to save session between goal rounds: {error}");
+                notices
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!(
+                        "warning: failed to save session between goal rounds: {error}\n"
+                    ));
             } else {
                 persisted = true;
+            }
+            let notices = std::mem::take(
+                &mut *notices
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let mut notice_failed = false;
+            for notice in notices {
+                if let Err(error) = crate::print::headless_stderr_async(notice).await {
+                    turn.failure = Some(error);
+                    notice_failed = true;
+                    break;
+                }
+            }
+            if notice_failed {
+                break;
+            }
+            if let Some(goal) = session.goal_store.snapshot()
+                && let Err(error) = output.emit_event(serde_json::json!({"type":"goal", "goal":crate::print::HeadlessGoal::from_goal(&goal)})).await
+            {
+                turn.failure = Some(error);
+                break;
             }
             // An interrupt that landed while the tiers were running is
             // reported in its own words: the round settled as interrupted, so
             // the gate's line would say only that, and an operator needs to
             // know the check they stopped is why.
             if verification_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("goal: interrupted during verification");
+                if let Err(error) = crate::print::headless_stderr_async(
+                    "goal: interrupted during verification\n".to_owned(),
+                )
+                .await
+                {
+                    turn.failure = Some(error);
+                }
                 break;
             }
 
             let RoundOutcome::Relaunch { relaunch, line } = outcome else {
-                if let RoundOutcome::Stopped { line, .. } = outcome {
-                    eprintln!("{line}");
+                if let RoundOutcome::Stopped { line, .. } = outcome
+                    && let Err(error) =
+                        crate::print::headless_stderr_async(format!("{line}\n")).await
+                {
+                    turn.failure = Some(error);
                 }
                 break;
             };
-            eprintln!("{line}");
+            if let Err(error) = crate::print::headless_stderr_async(format!("{line}\n")).await {
+                turn.failure = Some(error);
+                break;
+            }
 
             let next_history: std::sync::Arc<[rig::completion::Message]> = match relaunch.history {
                 driver::HistoryMode::Retained => {
@@ -2507,10 +2598,9 @@ async fn run_headless_goal_rounds(
             persisted = false;
             round_started = std::time::Instant::now();
             let next = round_agent
-                .run_print(
+                .run_print_with_output(
                     &relaunch.prompt,
-                    quiet,
-                    stream,
+                    output,
                     &cfg.retry,
                     next_history,
                     #[cfg(feature = "hooks")]

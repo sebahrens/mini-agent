@@ -121,6 +121,7 @@ mod auth_tests;
 mod bash_tests;
 #[cfg(test)]
 mod btw_tests;
+mod build_inputs_tests;
 #[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
@@ -238,5 +239,6 @@ mod tools_filter_tests;
 mod tools_mod_tests;
 #[cfg(test)]
 mod turn_persistence_tests;
+pub(crate) mod update_tests;
 #[cfg(all(test, feature = "git-worktree"))]
 mod worktree_tests;

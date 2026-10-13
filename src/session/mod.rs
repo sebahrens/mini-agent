@@ -160,6 +160,10 @@ pub enum MessageRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
+    /// Bounded historical preview of a committed native mutation. This is
+    /// display data, never current-filesystem or permission authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
     pub role: MessageRole,
     pub content: CompactString,
     pub estimated_tokens: u64,
@@ -1134,6 +1138,7 @@ impl Session {
     ) {
         let tokens = Self::estimate_tokens(content);
         self.messages.push(SessionMessage {
+            recorded_diff: None,
             role,
             content: CompactString::new(content),
             estimated_tokens: tokens,
@@ -1835,6 +1840,7 @@ impl Session {
 
         // Insert a System message with the summary at the boundary
         let summary_msg = SessionMessage {
+            recorded_diff: None,
             role: MessageRole::System,
             content: CompactString::from(summary.clone()),
             estimated_tokens: summary_tokens,

@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
 use rig::tool::Tool;
 
-use super::find_files::BoundDirectory;
+use super::find_files::{BoundDirectory, SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH};
 use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
     combine_coaching,
@@ -12,6 +13,8 @@ use crate::agent::tools::{
 const MAX_OUTPUT_LINE_CHARS: usize = 500;
 const MAX_SEARCH_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: u64 = 8 * 1024;
+const MAX_SEARCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_MULTILINE_MATCHES: usize = 100_000;
 
 struct GrepSearchResult {
     file_count: usize,
@@ -19,6 +22,7 @@ struct GrepSearchResult {
     results: Vec<String>,
     emitted_results: usize,
     limit_hit: bool,
+    work_limit_hit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +31,7 @@ struct GrepSearchOptions {
     context: usize,
     files_only: bool,
     count: bool,
+    multiline: bool,
 }
 
 pub(crate) fn truncate_output_line(line: &str, match_range: Option<Range<usize>>) -> String {
@@ -189,10 +194,88 @@ impl GrepTool {
             return Ok(None);
         }
 
-        let mut data = Vec::with_capacity(capacity);
+        let mut data = Vec::with_capacity(capacity.min(MAX_SEARCH_FILE_BYTES as usize));
         data.extend_from_slice(&prefix);
-        reader.read_to_end(&mut data)?;
-        Ok(Some(data))
+        reader
+            .take(MAX_SEARCH_FILE_BYTES + 1 - data.len() as u64)
+            .read_to_end(&mut data)?;
+        Ok((data.len() as u64 <= MAX_SEARCH_FILE_BYTES).then_some(data))
+    }
+}
+
+struct MatchedLines {
+    lines: Vec<usize>,
+    ranges: BTreeMap<usize, Range<usize>>,
+    count: usize,
+    limit_hit: bool,
+}
+
+fn matched_source_lines(
+    content: &str,
+    lines: &[&str],
+    re: &Regex,
+    multiline: bool,
+) -> MatchedLines {
+    if !multiline {
+        let matches: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| re.is_match(line).then_some(index))
+            .collect();
+        return MatchedLines {
+            count: matches.len(),
+            lines: matches,
+            ranges: BTreeMap::new(),
+            limit_hit: false,
+        };
+    }
+    let mut ranges = BTreeMap::new();
+    let mut starts = vec![0];
+    starts.extend(content.match_indices('\n').map(|(offset, _)| offset + 1));
+    starts.truncate(lines.len());
+    let mut count = 0;
+    let mut budget_hit = false;
+    'matches: for found in re.find_iter(content) {
+        if count == MAX_MULTILINE_MATCHES {
+            budget_hit = true;
+            break;
+        }
+        count += 1;
+        if starts.is_empty() {
+            continue;
+        }
+        let first = starts
+            .partition_point(|&start| start <= found.start())
+            .saturating_sub(1);
+        let last_byte = if found.is_empty() {
+            found.start()
+        } else {
+            found.end() - 1
+        };
+        let last = starts
+            .partition_point(|&start| start <= last_byte)
+            .saturating_sub(1);
+        for index in first..=last {
+            if ranges.len() == MAX_MULTILINE_MATCHES && !ranges.contains_key(&index) {
+                budget_hit = true;
+                break 'matches;
+            }
+            let start = found
+                .start()
+                .saturating_sub(starts[index])
+                .min(lines[index].len());
+            let end = found
+                .end()
+                .saturating_sub(starts[index])
+                .min(lines[index].len());
+            ranges.entry(index).or_insert(start..end);
+        }
+    }
+    MatchedLines {
+        lines: ranges.keys().copied().collect(),
+        ranges,
+        count,
+        limit_hit: budget_hit,
     }
 }
 
@@ -203,14 +286,18 @@ fn search_bound_directory(
     options: GrepSearchOptions,
 ) -> Result<GrepSearchResult, ToolError> {
     let include_root = bound_directory.approved_root().to_path_buf();
-    let walker = bound_directory.walker()?;
+    let mut walker = bound_directory
+        .walker()?
+        .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH);
     let mut file_count = 0;
     let mut files_with_matches = 0;
     let mut results = Vec::with_capacity(options.max_results.min(64));
     let mut emitted_results = 0_usize;
     let mut limit_hit = false;
+    let mut work_limit_hit = false;
+    let mut remaining_bytes = MAX_SEARCH_TOTAL_BYTES;
 
-    for entry in walker {
+    for entry in walker.by_ref() {
         if emitted_results >= options.max_results {
             limit_hit = true;
             break;
@@ -239,7 +326,16 @@ fn search_bound_directory(
         let path_str = entry.path.to_string_lossy().to_string();
         let capacity = entry.metadata.len() as usize;
         let mut file = entry.file;
-        let Some(data) = GrepTool::read_non_binary(&mut file, capacity).unwrap_or_default() else {
+        // Bind the read itself, not only the earlier metadata length: the file
+        // may grow while its descriptor remains open.
+        let mut bounded = (&mut file).take(remaining_bytes);
+        let data = GrepTool::read_non_binary(&mut bounded, capacity).unwrap_or_default();
+        remaining_bytes = bounded.limit();
+        if remaining_bytes == 0 {
+            work_limit_hit = true;
+            break; // The final file may be only a prefix; never search that prefix.
+        }
+        let Some(data) = data else {
             continue;
         };
         file_count += 1;
@@ -247,12 +343,13 @@ fn search_bound_directory(
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
 
-        let match_lines: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| re.is_match(line))
-            .map(|(index, _)| index)
-            .collect();
+        let MatchedLines {
+            lines: match_lines,
+            ranges: match_ranges,
+            count: match_count,
+            limit_hit: match_budget_hit,
+        } = matched_source_lines(&content, &lines, &re, options.multiline);
+        work_limit_hit |= match_budget_hit;
 
         if match_lines.is_empty() {
             continue;
@@ -265,14 +362,18 @@ fn search_bound_directory(
             continue;
         }
         if options.count {
-            results.push(format!("{}:{}", path_str, match_lines.len()));
+            results.push(format!("{}:{}", path_str, match_count));
             emitted_results += 1;
             continue;
         }
 
         if options.context == 0 {
             for (match_index, &matched_line) in match_lines.iter().enumerate() {
-                let matched = re.find(lines[matched_line]).map(|found| found.range());
+                let matched = if options.multiline {
+                    match_ranges.get(&matched_line).cloned()
+                } else {
+                    re.find(lines[matched_line]).map(|found| found.range())
+                };
                 let displayed = truncate_output_line(lines[matched_line], matched);
                 results.push(format!("{}:{}:{}", path_str, matched_line + 1, displayed));
                 emitted_results += 1;
@@ -283,12 +384,19 @@ fn search_bound_directory(
             }
         } else {
             let mut shown = vec![false; total];
+            let mut filled_until = 0;
             for &matched_line in &match_lines {
-                let start = matched_line.saturating_sub(options.context);
-                let end = (matched_line + 1 + options.context).min(total);
+                let start = matched_line
+                    .saturating_sub(options.context)
+                    .max(filled_until);
+                let end = matched_line
+                    .saturating_add(1)
+                    .saturating_add(options.context)
+                    .min(total);
                 for shown_line in &mut shown[start..end] {
                     *shown_line = true;
                 }
+                filled_until = end;
             }
 
             let mut index = 0;
@@ -305,10 +413,11 @@ fn search_bound_directory(
                 while index < total && shown[index] && emitted_results < options.max_results {
                     let is_match = match_lines.binary_search(&index).is_ok();
                     let separator = if is_match { ':' } else { '-' };
-                    let matched = is_match
-                        .then(|| re.find(lines[index]))
-                        .flatten()
-                        .map(|found| found.range());
+                    let matched = if options.multiline {
+                        match_ranges.get(&index).cloned()
+                    } else {
+                        re.find(lines[index]).map(|found| found.range())
+                    };
                     let displayed = truncate_output_line(lines[index], matched);
                     results.push(format!(
                         "{}:{}{} {}",
@@ -341,6 +450,7 @@ fn search_bound_directory(
         results,
         emitted_results,
         limit_hit,
+        work_limit_hit: work_limit_hit || walker.work_limit_hit(),
     })
 }
 
@@ -353,7 +463,7 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.",
             self.max_results, MAX_OUTPUT_LINE_CHARS
         )
     }
@@ -386,6 +496,17 @@ impl Tool for GrepTool {
                     "type": "boolean",
                     "description": "Return only paths of files containing a match (default false)"
                 },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": self.max_results,
+                    "description": "Lower the configured result-line or matching-file cap for this call"
+                },
+                "multiline": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Match across source lines, including newlines with dot; output includes touched lines, count counts non-overlapping matches"
+                },
                 "count": {
                     "type": "boolean",
                     "description": "Return each matching path and its match count (default false)"
@@ -409,8 +530,19 @@ impl Tool for GrepTool {
                 "grep files_only and count modes are mutually exclusive".to_string(),
             ));
         }
+        let max_results = args.max_results.unwrap_or(self.max_results);
+        if args
+            .max_results
+            .is_some_and(|limit| limit == 0 || limit > self.max_results)
+        {
+            return Err(ToolError::Msg(format!(
+                "grep max_results must be between 1 and the configured cap {}",
+                self.max_results
+            )));
+        }
         let re = RegexBuilder::new(&args.pattern)
             .case_insensitive(args.case_insensitive)
+            .dot_matches_new_line(args.multiline)
             .build()
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;
 
@@ -464,7 +596,8 @@ impl Tool for GrepTool {
             .map(Self::compile_include_glob)
             .transpose()?;
 
-        let max_results = self.max_results as usize;
+        let max_results = usize::try_from(max_results).unwrap_or(usize::MAX);
+        let multiline = args.multiline;
         let files_only = args.files_only;
         let count = args.count;
         let search = crate::agent::runner::spawn_blocking_scoped(move || {
@@ -477,6 +610,7 @@ impl Tool for GrepTool {
                     context,
                     files_only,
                     count,
+                    multiline,
                 },
             )
         })
@@ -488,9 +622,15 @@ impl Tool for GrepTool {
             results: all_results,
             emitted_results,
             limit_hit,
+            work_limit_hit,
         } = search;
+        let work_notice = if work_limit_hit {
+            "\n[search work limit reached (100000 directory entries, depth 256, 100 MiB read bytes, or 100000 multiline matches/touched lines per file); results cover only visited complete files and inspected matches — narrow the path or pattern]"
+        } else {
+            ""
+        };
         if all_results.is_empty() {
-            let msg = "No matches found.".to_string();
+            let msg = format!("No matches found.{work_notice}");
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -530,6 +670,8 @@ impl Tool for GrepTool {
                 all_results.join("\n")
             )
         };
+
+        let result = format!("{result}{work_notice}");
 
         // Add a "consider task" hint when results span multiple files and the
         // count is non-trivial. The agent sees this at the moment it decides
@@ -651,6 +793,8 @@ mod tests {
                     .run(async move {
                         GrepTool::new(None, None, 10)
                             .call(GrepArgs {
+                                max_results: None,
+                                multiline: false,
                                 pattern: "needle".to_owned(),
                                 path: Some(path),
                                 include: None,
@@ -849,6 +993,8 @@ mod tests {
         );
 
         let call = tool.call(GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: "needle".to_string(),
             path: Some(external.path().to_string_lossy().into_owned()),
             include: None,
@@ -879,6 +1025,8 @@ mod tests {
 
     fn grep_args(pattern: &str, path: Option<&str>, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: pattern.to_string(),
             path: path.map(str::to_string),
             include: include.map(str::to_string),
@@ -929,6 +1077,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
@@ -980,6 +1130,8 @@ mod tests {
 
         let result = GrepTool::new(Some(permission), None, 10)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: marker.to_string(),
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
@@ -1009,6 +1161,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(requested.to_string_lossy().into_owned()),
                 include: None,
@@ -1035,6 +1189,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some("~".to_string()),
                 include: None,
@@ -1066,6 +1222,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(link.to_string_lossy().into_owned()),
                 include: None,
@@ -1105,6 +1263,8 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: "binding_marker".to_string(),
             path: Some(link.to_string_lossy().into_owned()),
             include: None,
@@ -1144,6 +1304,8 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: "must_not_be_returned".to_string(),
             path: Some(authorized.to_string_lossy().into_owned()),
             include: None,
@@ -1213,6 +1375,8 @@ mod tests {
 
         let output = GrepTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: marker.to_string(),
                 path: Some(workspace.to_string_lossy().into_owned()),
                 include: None,
@@ -1258,6 +1422,8 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(String::new()),
                 include: None,
@@ -1290,6 +1456,8 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: marker.to_string(),
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
@@ -1315,6 +1483,8 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
@@ -1339,6 +1509,8 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
@@ -1363,6 +1535,8 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
@@ -1401,6 +1575,8 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                max_results: None,
+                multiline: false,
                 pattern: "needle".to_string(),
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
@@ -1430,6 +1606,8 @@ mod tests {
 
     fn ergonomic_args(path: &Path, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            max_results: None,
+            multiline: false,
             pattern: "needle".to_string(),
             path: Some(path.to_string_lossy().into_owned()),
             include: include.map(str::to_string),

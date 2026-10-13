@@ -17,9 +17,20 @@ fi
 bash "${ROOT_DIR}/install.sh" --release "$VERSION" --dir "${INSTALL_ROOT}/bin"
 VERSION_OUTPUT=$("${INSTALL_ROOT}/bin/mini-agent" --version)
 EXPECTED_OUTPUT="mini-agent ${VERSION}"
-if [[ "$VERSION_OUTPUT" != "$EXPECTED_OUTPUT" ]]; then
+VERSION_FIRST_LINE="${VERSION_OUTPUT%%$'\n'*}"
+if [[ "$VERSION_FIRST_LINE" != "$EXPECTED_OUTPUT" ]]; then
     echo "Error: canonical installer produced ${VERSION_OUTPUT}; expected ${EXPECTED_OUTPUT}" >&2
     exit 1
+fi
+if [[ "$VERSION_OUTPUT" != "$VERSION_FIRST_LINE" ]]; then
+    VERSION_METADATA="${VERSION_OUTPUT#*$'\n'}"
+    METADATA_PATTERN='^build: [0-9a-f]{64}'
+    METADATA_PATTERN+=$'\n'
+    METADATA_PATTERN+='target: [A-Za-z0-9_][A-Za-z0-9_-]{0,127}$'
+    if [[ ! "$VERSION_METADATA" =~ $METADATA_PATTERN ]]; then
+        echo "Error: canonical installer produced invalid build identity metadata" >&2
+        exit 1
+    fi
 fi
 # The release ships the documents of its tag, which the working tree may have
 # moved past since; compare with the tagged copies when the tag is available.

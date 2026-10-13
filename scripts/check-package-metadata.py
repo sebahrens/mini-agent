@@ -1249,9 +1249,14 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "cargo install --path . --debug",
         ),
         "build.rs": (
-            "is_ignored_build_input(&path)",
+            "build_inputs::collect(&root)",
+            "build_inputs::hash(&mut digest, &root, &inputs)",
+        ),
+        "build_inputs.rs": (
             'name == "__pycache__"',
             'extension == "pyc" || extension == "pyo"',
+            'PATCHED_RIG: &str = "patched-deps/rig-core"',
+            'collect_directory(&rig.join("src"), &mut files)',
         ),
         "scripts/update-release-checksums.sh": (
             CANONICAL_REPOSITORY_URL,

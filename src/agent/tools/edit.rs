@@ -1,4 +1,5 @@
-use rig::tool::Tool;
+use super::mutation_diff::{AppliedRange, DiffOptions, MutationDiff, MutationOutcome};
+use rig::tool::{Tool, ToolCallExtensions, ToolReturn};
 use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
@@ -23,6 +24,7 @@ pub struct EditTool {
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read_tracker: ReadTracker,
     max_text_file_size: u64,
+    diff_options: DiffOptions,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -53,6 +55,7 @@ impl EditTool {
             workspace: None,
             read_tracker,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
+            diff_options: DiffOptions::default(),
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -69,6 +72,11 @@ impl EditTool {
     #[cfg(test)]
     pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
         self.with_workspace_binding(crate::agent::tools::capture_workspace_binding(root.into()))
+    }
+
+    pub(crate) fn with_diff_options(mut self, options: DiffOptions) -> Self {
+        self.diff_options = options;
+        self
     }
 
     #[cfg(feature = "lsp")]
@@ -971,6 +979,20 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
+        self.apply(args).await.map(|result| result.output)
+    }
+
+    async fn call_structured(
+        &self,
+        args: EditArgs,
+        _extensions: &ToolCallExtensions,
+    ) -> Result<ToolReturn<String>, ToolError> {
+        self.apply(args).await.map(MutationOutcome::into_return)
+    }
+}
+
+impl EditTool {
+    async fn apply(&self, args: EditArgs) -> Result<MutationOutcome, ToolError> {
         // Reject an unusable argument combination before opening or reading the
         // target: an invalid mode must never allocate a large file first.
         if args.block.is_none() && (args.file_crc.is_none() || args.edits.is_none()) {
@@ -1117,6 +1139,31 @@ impl Tool for EditTool {
         reject_overlapping_ranges(&ranges, &content, edit_label)?;
 
         let resulting_spans = final_edit_spans(&ranges);
+        let preview_before = (self.diff_options.max_lines > 0
+            && ranges.len() <= super::mutation_diff::MAX_RANGES
+            && content.len() <= super::mutation_diff::MAX_INPUT_BYTES
+            && super::mutation_diff::preimage_allowed(
+                &self.permission,
+                &path,
+                capability_metadata.is_some(),
+            ))
+        .then(|| content.clone());
+        let applied_ranges = if preview_before.is_some() {
+            let mut ordered_ranges: Vec<_> = ranges.iter().collect();
+            ordered_ranges.sort_by_key(|(start, _, _)| *start);
+            ordered_ranges
+                .into_iter()
+                .zip(&resulting_spans)
+                .map(|((start, end, _), (new_start, new_end))| AppliedRange {
+                    before_start: *start,
+                    before_end: *end,
+                    after_start: *new_start,
+                    after_end: *new_end,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Apply last-to-first so earlier byte positions remain valid
         ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
@@ -1166,6 +1213,17 @@ impl Tool for EditTool {
             )
             .await?;
         }
+        // Publication succeeded against the exact source identity and bytes.
+        // Failed validation/publication never produces result metadata.
+        let diff = preview_before.as_deref().and_then(|before| {
+            MutationDiff::build(
+                &path,
+                Some(before),
+                &output,
+                applied_ranges,
+                self.diff_options,
+            )
+        });
         self.read_tracker.untrack_read_path(&path);
 
         tracing::debug!(
@@ -1202,7 +1260,10 @@ impl Tool for EditTool {
             }
         }
 
-        Ok(result)
+        Ok(MutationOutcome {
+            output: result,
+            diff,
+        })
     }
 }
 

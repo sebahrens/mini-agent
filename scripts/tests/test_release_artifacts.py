@@ -82,6 +82,22 @@ SMOKE_INVENTORY = {
 
 
 class ReleaseArtifactManifestTests(unittest.TestCase):
+    def test_version_identity_accepts_legacy_and_checks_long_metadata_and_target(self) -> None:
+        legacy = "mini-agent 1.8.0\n"
+        current = legacy + f"build: {'a' * 64}\ntarget: {TARGET}\n"
+        self.assertTrue(RELEASE.valid_version_output(legacy, "1.8.0", TARGET))
+        self.assertTrue(RELEASE.valid_version_output(current, "1.8.0", TARGET))
+        self.assertTrue(RELEASE.valid_version_output(current, "1.8.0", None))
+        for invalid in [
+            current.replace("1.8.0", "1.8.1"),
+            current.replace("a" * 64, "a" * 63),
+            current.replace("a" * 64, "G" * 64),
+            current.replace(TARGET, "aarch64-apple-darwin"),
+            current + "unexpected trailer\n",
+            legacy + "arbitrary metadata\n",
+        ]:
+            with self.subTest(output=invalid):
+                self.assertFalse(RELEASE.valid_version_output(invalid, "1.8.0", TARGET))
     def test_windows_release_smoke_is_clean_runner_and_non_publishing(self) -> None:
         workflow = (ROOT / ".github/workflows/windows-release-smoke.yml").read_text()
         self.assertEqual(workflow.count("runs-on: windows-latest"), 2)
@@ -286,7 +302,7 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
             executable = (
                 b"#!/bin/sh\n"
                 b"case \"$1\" in\n"
-                b"  --version) echo 'mini-agent 1.8.0' ;;\n"
+                b"  --version) printf '%s\\n' 'mini-agent 1.8.0' 'build: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'target: x86_64-unknown-linux-gnu' ;;\n"
                 b"  --js-runtime-check) echo 'JS runtime check: PASS (2)' ;;\n"
                 b"  *) exit 2 ;;\n"
                 b"esac\n"

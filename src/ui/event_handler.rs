@@ -203,6 +203,18 @@ pub async fn handle_agent_event(
                 C_TOOL,
             )?;
         }
+        AgentEvent::FileMutation { id, name, diff } => {
+            if diff.bounded() && matches!(name.as_str(), "edit"|"write")
+                && let Some(call)=ui.session.messages.iter_mut().rev().find(|message|
+                    message.role==MessageRole::ToolCall && message.tool_call_id.as_deref()==Some(id.as_str())
+                    && matches!(&message.tool,Some(crate::session::PersistedToolMessage::Call { name:called, .. }) if called==name)) {
+                call.recorded_diff=Some(diff.clone());
+                crate::ui::events::push_mutation_diff(renderer.feed_mut(),&id,&diff,ui.cfg);
+                renderer.invalidate();
+                renderer.render_viewport()?;
+                save_session_if_settled(ui.session,ui.cli,run,renderer)?;
+            }
+        }
         AgentEvent::ToolResult {
             id, name, output, ..
         } => {

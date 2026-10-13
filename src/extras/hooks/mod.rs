@@ -240,6 +240,26 @@ pub(crate) fn wrap_from_global(
     }
 }
 
+/// Builder-owned MCP provenance, captured while concrete `McpTool` fields
+/// remain available. Other tools retain the legacy wrapper API and envelopes.
+#[cfg(feature = "mcp")]
+pub(crate) fn wrap_from_global_with_mcp(
+    tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
+    mcp: std::collections::HashMap<String, normalize::McpToolIdentity>,
+) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    if mcp.is_empty() {
+        return wrap_from_global(tools, permission, ask_tx);
+    }
+    match get_dispatcher() {
+        Some(dispatcher) => {
+            decorator::wrap_all_with_mcp(tools, dispatcher, permission, ask_tx, mcp)
+        }
+        None => tools,
+    }
+}
+
 /// Outcome of gating a user prompt through `UserPromptSubmit` hooks.
 pub(crate) enum PromptGate {
     /// The original prompt should be sent to the model.

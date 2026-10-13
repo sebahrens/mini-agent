@@ -200,6 +200,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for AdvisorCo
 
 fn append_context(messages: &mut Vec<SessionMessage>, role: MessageRole, content: String) {
     messages.push(SessionMessage {
+        recorded_diff: None,
         role,
         content: content.into(),
         estimated_tokens: 0,

@@ -96,6 +96,70 @@ fn welcome_header(model: &str, workspace_root: &std::path::Path) -> String {
     )
 }
 
+/// Append a bounded historical mutation preview without opening its path.
+/// Rows contain inert text; semantic colors are renderer-owned, never ANSI
+/// supplied by files/model output. The ordinary result text limit is separate.
+pub(crate) fn push_mutation_diff(
+    feed: &mut crate::ui::feed::Feed,
+    anchor: &str,
+    diff: &crate::agent::tools::mutation_diff::MutationDiff,
+    cfg: &Config,
+) {
+    use crate::agent::tools::mutation_diff::DiffKind;
+    if !diff.bounded()
+        || matches!(
+            cfg.show_tool_details
+                .as_ref()
+                .map(|setting| setting.resolve()),
+            Some(crate::config::ResolvedShowToolDetails::Off)
+        )
+    {
+        return;
+    }
+    let limit = cfg.mutation_diff_options().max_lines;
+    if limit == 0 {
+        return;
+    }
+    if diff.imported {
+        feed.place_after_anchor(
+            anchor,
+            BlockStyle::ToolResult,
+            "Imported recorded mutation preview (not current file state)",
+        );
+    }
+    for row in diff.rows.iter().take(limit) {
+        let (style, prefix) = match row.kind {
+            DiffKind::Add => (BlockStyle::DiffAdd, "+"),
+            DiffKind::Delete => (BlockStyle::DiffDel, "-"),
+            DiffKind::Context => (BlockStyle::ToolResult, " "),
+            DiffKind::Hunk => (BlockStyle::DiffHunk, ""),
+            DiffKind::Notice => (BlockStyle::ToolResult, ""),
+        };
+        feed.place_after_anchor(
+            anchor,
+            style,
+            format!("{prefix}{}", sanitize_for_review(&row.text)),
+        );
+    }
+    let omitted = diff
+        .omitted_rows
+        .saturating_add(diff.rows.len().saturating_sub(limit));
+    if omitted > 0 {
+        feed.place_after_anchor(
+            anchor,
+            BlockStyle::ToolResult,
+            format!("(+{omitted} more diff rows omitted)"),
+        );
+    }
+    if diff.clipped_rows > 0 {
+        feed.place_after_anchor(
+            anchor,
+            BlockStyle::ToolResult,
+            format!("({} long diff rows clipped)", diff.clipped_rows),
+        );
+    }
+}
+
 /// Replay stored messages into the feed. A tool result is placed directly
 /// under its own call (matched by tool-call id), as the live view does, so a
 /// response that issued several calls before any result replays as
@@ -129,6 +193,9 @@ pub(crate) fn push_session_messages(
                     BlockStyle::Tool,
                     format!("◈ {}", replayed_tool_call(&msg.content)),
                 );
+                if let Some(diff) = &msg.recorded_diff {
+                    push_mutation_diff(feed, msg.tool_call_id.as_deref().unwrap_or(""), diff, cfg);
+                }
             }
             MessageRole::ToolResult => {
                 let Some(text) = tool_result_text(&msg.content, cfg) else {
@@ -771,5 +838,68 @@ mod replay_tests {
         assert!(rows[0].starts_with("◈ read"), "{rows:?}");
         assert_eq!(rows[1], "");
         assert!(rows[2].contains("legacy-result"), "{rows:?}");
+    }
+}
+
+#[cfg(test)]
+mod mutation_preview_tests {
+    use super::*;
+    use crate::agent::tools::mutation_diff::{DiffOptions, MutationDiff};
+    use crate::ui::feed::{BlockStyle, Feed};
+    use crossterm::style::Color;
+
+    #[test]
+    fn diff_rows_are_semantic_safe_anchored_and_independently_bounded() {
+        let diff = MutationDiff::replacement(
+            "f",
+            Some("old🙂\n"),
+            "newα\x1b]52;c;ZXZpbA==\x07\n",
+            DiffOptions::default(),
+        )
+        .unwrap();
+        let mut feed = Feed::new();
+        feed.push_anchored_block("call-a", BlockStyle::Tool, "call a");
+        feed.push_anchored_block("call-b", BlockStyle::Tool, "call b");
+        let cfg: Config =
+            serde_json::from_value(serde_json::json!({"show_tool_details":1})).unwrap();
+        push_mutation_diff(&mut feed, "call-a", &diff, &cfg);
+        let lines = feed.lines(180);
+        let text = (0..lines.len())
+            .map(|index| lines[index].text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.find("+newα").unwrap() < text.find("call b").unwrap());
+        assert!(!text.contains("\x1b") && !text.contains("ZXZpbA=="));
+        assert!(
+            (0..lines.len()).any(|index| lines[index].text.starts_with("+newα")
+                && lines[index].color == Color::Green)
+        );
+        assert!((0..lines.len()).any(
+            |index| lines[index].text.starts_with("-old🙂") && lines[index].color == Color::Red
+        ));
+        assert!(
+            (0..lines.len())
+                .any(|index| lines[index].text.starts_with("@@")
+                    && lines[index].color == Color::Cyan)
+        );
+        let cfg: Config = serde_json::from_value(serde_json::json!({"max_diff_lines":2})).unwrap();
+        let mut limited = Feed::new();
+        limited.push_anchored_block("a", BlockStyle::Tool, "call");
+        push_mutation_diff(&mut limited, "a", &diff, &cfg);
+        let text = limited
+            .selected_text(180, 0, limited.line_count(180).saturating_sub(1))
+            .unwrap();
+        assert!(text.contains("more diff rows omitted") && !text.contains("+newα"));
+        for setting in [
+            serde_json::json!({"show_tool_details":false}),
+            serde_json::json!({"max_diff_lines":0}),
+        ] {
+            let cfg: Config = serde_json::from_value(setting).unwrap();
+            let mut hidden = Feed::new();
+            hidden.push_anchored_block("a", BlockStyle::Tool, "call");
+            let count = hidden.block_count();
+            push_mutation_diff(&mut hidden, "a", &diff, &cfg);
+            assert_eq!(hidden.block_count(), count);
+        }
     }
 }

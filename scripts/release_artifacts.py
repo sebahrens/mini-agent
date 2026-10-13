@@ -53,6 +53,20 @@ class ReleaseArtifactError(ValueError):
     """A release candidate failed a closed validation gate."""
 
 
+def valid_version_output(output: str, expected_version: str, target: str | None) -> bool:
+    """Accept legacy short output or the exact current three-line identity."""
+    lines = output.strip().splitlines()
+    if not lines or lines[0] != f"mini-agent {expected_version}":
+        return False
+    if len(lines) == 1:
+        return True
+    if len(lines) != 3 or not re.fullmatch(r"build: [0-9a-f]{64}", lines[1]):
+        return False
+    if not re.fullmatch(r"target: [A-Za-z0-9_][A-Za-z0-9_-]{0,127}", lines[2]):
+        return False
+    return target is None or lines[2] == f"target: {target}"
+
+
 def read_expected(path: Path) -> list[str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -379,7 +393,9 @@ def smoke_archive(
         smoke_environment = _smoke_environment(destination)
         version = _run(binary, "--version", environment=smoke_environment)
         expected = f"mini-agent {expected_version}"
-        if version.returncode != 0 or version.stdout.strip() != expected:
+        if version.returncode != 0 or not valid_version_output(
+            version.stdout, expected_version, inventory_target
+        ):
             raise ReleaseArtifactError(
                 f"packaged version smoke failed: expected={expected!r}, "
                 f"status={version.returncode}, stdout={version.stdout.strip()!r}"

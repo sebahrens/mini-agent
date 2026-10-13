@@ -28,6 +28,7 @@ mod session;
 mod setup;
 mod startup;
 mod ui;
+mod update;
 
 #[cfg(test)]
 mod tests;
@@ -75,6 +76,7 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    let runtime_headless = cli.is_headless();
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
@@ -84,14 +86,17 @@ fn main() -> anyhow::Result<ExitCode> {
     // Exit now: dropping the runtime would wait for that work forever.
     if print::headless_force_stopped() {
         if let Err(error) = &result {
-            eprintln!("Error: {error:?}");
+            report_runtime_headless_error(&runtime, format!("Error: {error:?}\n"));
         }
         print::exit_force_stopped();
     }
     if let Err(error) = &result
         && error.is::<startup::HeadlessUsageError>()
     {
-        eprintln!("Error: {error}");
+        report_runtime_headless_error(&runtime, format!("Error: {error}\n"));
+        if print::headless_force_stopped() {
+            print::exit_force_stopped();
+        }
         return Ok(ExitCode::from(2));
     }
     match result {
@@ -102,11 +107,31 @@ fn main() -> anyhow::Result<ExitCode> {
         #[cfg(feature = "goal")]
         Err(error) => match error.downcast::<print::HeadlessGoalExit>() {
             Ok(exit) => Ok(ExitCode::from(exit.0.exit_code() as u8)),
-            Err(error) => Err(error),
+            Err(error) => finish_runtime_error(&runtime, error, runtime_headless),
         },
         #[cfg(not(feature = "goal"))]
-        Err(error) => Err(error),
+        Err(error) => finish_runtime_error(&runtime, error, runtime_headless),
     }
+}
+
+fn report_runtime_headless_error(runtime: &tokio::runtime::Runtime, message: String) {
+    let (message, _) = print::bounded_progress(&message, print::HEADLESS_PROGRESS_BYTES);
+    let _ = runtime.block_on(Box::pin(print::headless_stderr_async(message)));
+}
+
+fn finish_runtime_error(
+    runtime: &tokio::runtime::Runtime,
+    error: anyhow::Error,
+    headless: bool,
+) -> anyhow::Result<ExitCode> {
+    if !headless {
+        return Err(error);
+    }
+    report_runtime_headless_error(runtime, format!("Error: {error:?}\n"));
+    if print::headless_force_stopped() {
+        print::exit_force_stopped();
+    }
+    Ok(ExitCode::from(1))
 }
 
 fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {

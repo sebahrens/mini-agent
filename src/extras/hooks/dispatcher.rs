@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use regex::Regex;
 
 use super::channel::{ChannelResult, interpret_hook_output};
-use super::envelope::{EventFields, build_envelope};
-use super::normalize::canonical_tool_name;
+use super::envelope::{EventFields, build_envelope, build_tool_envelope};
+use super::normalize::{McpToolIdentity, canonical_tool_name};
 use super::pins::HookContentPins;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
@@ -514,7 +514,21 @@ impl HookDispatcher {
         tool_name: &str,
         tool_input: serde_json::Value,
     ) -> PreDecision {
-        let canonical = canonical_tool_name(tool_name);
+        self.dispatch_pre_tool_use_with_mcp(ctx, tool_name, tool_input, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_pre_tool_use_with_mcp(
+        &self,
+        ctx: &HookCtx,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        mcp: Option<&McpToolIdentity>,
+    ) -> PreDecision {
+        let canonical = mcp.map_or_else(
+            || canonical_tool_name(tool_name),
+            McpToolIdentity::matcher_name,
+        );
         let handlers = self.handlers_for("PreToolUse", &canonical);
         if handlers.is_empty() {
             return PreDecision {
@@ -534,13 +548,18 @@ impl HookDispatcher {
                 };
             }
         };
-        let envelope = build_envelope(
+        let envelope = build_tool_envelope(
             &ctx,
             "PreToolUse",
             EventFields::PreToolUse {
-                tool_name: canonical,
+                tool_name: if mcp.is_some() {
+                    tool_name.to_owned()
+                } else {
+                    canonical
+                },
                 tool_input: tool_input.clone(),
             },
+            mcp,
         );
         let outputs = self
             .run_handlers(
@@ -564,7 +583,22 @@ impl HookDispatcher {
         tool_input: serde_json::Value,
         tool_response: &str,
     ) -> Decision {
-        let canonical = canonical_tool_name(tool_name);
+        self.dispatch_post_tool_use_with_mcp(ctx, tool_name, tool_input, tool_response, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_post_tool_use_with_mcp(
+        &self,
+        ctx: &HookCtx,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        tool_response: &str,
+        mcp: Option<&McpToolIdentity>,
+    ) -> Decision {
+        let canonical = mcp.map_or_else(
+            || canonical_tool_name(tool_name),
+            McpToolIdentity::matcher_name,
+        );
         let handlers = self.handlers_for("PostToolUse", &canonical);
         if handlers.is_empty() {
             return Decision::Continue;
@@ -576,14 +610,19 @@ impl HookDispatcher {
                 return Decision::Continue;
             }
         };
-        let envelope = build_envelope(
+        let envelope = build_tool_envelope(
             &ctx,
             "PostToolUse",
             EventFields::PostToolUse {
-                tool_name: canonical,
+                tool_name: if mcp.is_some() {
+                    tool_name.to_owned()
+                } else {
+                    canonical
+                },
                 tool_input,
                 tool_response: tool_response.to_string(),
             },
+            mcp,
         );
         let outputs = self
             .run_handlers(
@@ -605,7 +644,22 @@ impl HookDispatcher {
         tool_input: serde_json::Value,
         error: &str,
     ) {
-        let canonical = canonical_tool_name(tool_name);
+        self.dispatch_post_tool_use_failure_with_mcp(ctx, tool_name, tool_input, error, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_post_tool_use_failure_with_mcp(
+        &self,
+        ctx: &HookCtx,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        error: &str,
+        mcp: Option<&McpToolIdentity>,
+    ) {
+        let canonical = mcp.map_or_else(
+            || canonical_tool_name(tool_name),
+            McpToolIdentity::matcher_name,
+        );
         let handlers = self.handlers_for("PostToolUseFailure", &canonical);
         if handlers.is_empty() {
             return;
@@ -617,14 +671,19 @@ impl HookDispatcher {
                 return;
             }
         };
-        let envelope = build_envelope(
+        let envelope = build_tool_envelope(
             &ctx,
             "PostToolUseFailure",
             EventFields::PostToolUseFailure {
-                tool_name: canonical,
+                tool_name: if mcp.is_some() {
+                    tool_name.to_owned()
+                } else {
+                    canonical
+                },
                 tool_input,
                 error: error.to_string(),
             },
+            mcp,
         );
         let _ = self
             .run_handlers(

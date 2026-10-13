@@ -127,3 +127,19 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
 
     envelope
 }
+
+/// MCP identity is registration provenance, independent of the model alias in
+/// `tool_name`. Builtin envelopes retain their existing shape.
+pub(crate) fn build_tool_envelope(
+    ctx: &HookCtx,
+    event: &str,
+    fields: EventFields,
+    mcp: Option<&super::normalize::McpToolIdentity>,
+) -> Value {
+    let mut envelope = build_envelope(ctx, event, fields);
+    if let Some(mcp) = mcp {
+        envelope["mcp_server"] = json!(mcp.server);
+        envelope["mcp_tool"] = json!(mcp.tool);
+    }
+    envelope
+}

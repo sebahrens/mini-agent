@@ -398,7 +398,7 @@ with `"stop_reason":"failed"`.
 
 An empty or whitespace-only `-p` prompt is a local usage error (exit 2) before
 provider and session initialization. Text mode reports `no prompt given` on
-stderr; `--output json` emits one result with `stop_reason: "failed"`, zero usage
+stderr; `--output json` (or the final `--output stream-json` record) emits a result with `stop_reason: "failed"`, zero usage
 and cost, and the same message. No provider request or session message is created.
 
 At startup, mini-agent resolves the configured shell once against the canonical
