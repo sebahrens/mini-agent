@@ -825,6 +825,7 @@ mod doctor_config_tests {
     fn doctor_config_warning_count_matches_real_loading_without_disclosing_authored_keys() {
         let root = crate::tests::OwnedTestDirectory::new("doctor-config-warnings");
         let paths = paths(root.path());
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
         let path = paths.config_dir.join("config.toml");
         crate::fs::private_atomic_create_sync(&path, b"provider = 'ollama'\nPRIVATE_UNKNOWN_KEY = 'PRIVATE_VALUE'\n[retry]\nmax_attempts = 1000\n").unwrap();
         let diagnosed = load_for_diagnostics(&paths);
