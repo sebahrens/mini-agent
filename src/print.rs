@@ -904,7 +904,11 @@ where
     let scope = crate::agent::runner::AgentWorkScope::new();
     let (result, deadline) = scope
         .run(async {
-            tokio::select! {
+            // Keep the response receiver alive until this scope is cancelled.
+            // A moved select loser would drop it before the signal branch runs,
+            // letting cleanup diagnostics admit a writer into a live scope.
+            tokio::pin!(command);
+            let outcome = tokio::select! {
                 // Poll first so the listeners are live before work launches.
                 biased;
                 signal = interrupts.recv() => {
@@ -913,13 +917,14 @@ where
                     });
                     (result, Some(tokio::time::Instant::now() + grace))
                 }
-                result = command => (result, None),
-            }
+                result = &mut command => (result, None),
+            };
+            scope.cancellation_handle().cancel();
+            // Drop under the captured, now-cancelled ownership scope. Closing
+            // the receiver still drives the worker's kill/reap and audit.
+            outcome
         })
         .await;
-    // Dropping the command future closes its response receiver. The scoped
-    // worker then cancels, kills/reaps the group, and completes its audit.
-    scope.cancellation_handle().cancel();
     match settle_headless_scope(&scope, &mut interrupts, grace, deadline).await {
         Some(forced) => (Err(forced_stop_io_error(forced, grace)), Some(forced)),
         None => (result, None),
@@ -2505,6 +2510,61 @@ mod tests {
             .unwrap();
         assert_eq!(forced, None);
         assert!(turn.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_command_cancels_before_drop_triggered_diagnostic_admission() {
+        struct DropProbe {
+            cancellation: crate::agent::runner::AgentWorkCancellation,
+            diagnostics: crate::logging::HeadlessDiagnostics,
+            dropped: Option<tokio::sync::oneshot::Sender<(bool, bool, bool)>>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let captured_cancelled = self.cancellation.is_cancelled();
+                let current_cancelled = crate::agent::runner::current_work_cancellation()
+                    .is_some_and(|cancellation| cancellation.is_cancelled());
+                let admitted = self
+                    .diagnostics
+                    .admit_for_test("command cleanup audit\n".into(), &self.cancellation);
+                let _ = self.dropped.take().unwrap().send((
+                    captured_cancelled,
+                    current_cancelled,
+                    admitted,
+                ));
+            }
+        }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (signals, interrupts) = injected_interrupts();
+        let run = tokio::spawn(super::run_headless_command_with(
+            async move {
+                let _probe = DropProbe {
+                    cancellation: crate::agent::runner::current_work_cancellation().unwrap(),
+                    diagnostics: crate::logging::HeadlessDiagnostics::default(),
+                    dropped: Some(dropped_tx),
+                };
+                started_tx.send(()).unwrap();
+                std::future::pending::<io::Result<()>>().await
+            },
+            interrupts,
+            std::time::Duration::from_secs(5),
+        ));
+        started_rx.await.unwrap();
+        signals.send(()).unwrap();
+        let (result, forced) = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced, None);
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), "headless command interrupted");
+        assert_eq!(
+            dropped_rx.await.unwrap(),
+            (true, true, false),
+            "command drop must see its cancelled ownership scope and refuse cleanup diagnostics"
+        );
     }
 
     // mini-agent-p73n1: the `!command` path is bounded the same way.

@@ -1471,6 +1471,28 @@ mod native_actor_tests {
     use crate::event::AgentEvent;
     #[cfg(all(target_os = "macos", feature = "sandbox"))]
     use crate::permission::{Action, PermissionConfig, ToolPerm};
+    #[test]
+    fn native_launch_stage_controls_are_inert_and_keep_each_stage_visible() {
+        for cmdlets in [false, true] {
+            let command = native_launch_stage_control(cmdlets);
+            for label in ["entered", "info", "cwd", "process", "started", "exited"] {
+                assert_eq!(
+                    command.matches(&format!("NATIVE32_STAGE {label} ")).count(),
+                    1
+                );
+            }
+            assert!(command.contains("FileName='gh';"));
+            assert!(command.contains("Arguments='--self-test';"));
+            assert!(command.contains("UseShellExecute=$false;"));
+            assert!(command.contains("ReadToEndAsync()"));
+            assert!(command.contains("finally{$miniGitPrProcess.Dispose()}"));
+            assert!(command.ends_with("exit $miniGitPrCode"));
+            assert!(!command.contains("pr create"));
+            assert!(!command.contains("std::env"));
+            assert_eq!(command.contains("New-Object"), cmdlets);
+            assert_eq!(command.contains("Get-Location"), cmdlets);
+        }
+    }
     #[tokio::test]
     async fn native_actor_disabled_containment_refuses_effects() {
         #[cfg(feature = "hooks")]
@@ -2186,6 +2208,51 @@ mod native_pr_tests {
     }
 }
 
+// A separate inert launch control: never wrap or alter the real PR command.
+// Fixed labels make native CI distinguish cmdlet initialization from inner
+// CreateProcess/helper work. The copied helper's self-test makes no effects.
+#[cfg(test)]
+fn native_launch_stage_control(cmdlets: bool) -> String {
+    let (info, cwd, process) = if cmdlets {
+        (
+            "New-Object System.Diagnostics.ProcessStartInfo",
+            "(Get-Location).ProviderPath",
+            "New-Object System.Diagnostics.Process",
+        )
+    } else {
+        (
+            "[System.Diagnostics.ProcessStartInfo]::new()",
+            "[System.Environment]::CurrentDirectory",
+            "[System.Diagnostics.Process]::new()",
+        )
+    };
+    format!(
+        "$miniGitPrClock=[System.Diagnostics.Stopwatch]::StartNew();\
+         [Console]::Error.WriteLine('NATIVE32_STAGE entered '+$miniGitPrClock.ElapsedMilliseconds);\
+         $miniGitPrInfo={info};\
+         [Console]::Error.WriteLine('NATIVE32_STAGE info '+$miniGitPrClock.ElapsedMilliseconds);\
+         $miniGitPrInfo.FileName='gh';$miniGitPrInfo.Arguments='--self-test';\
+         $miniGitPrInfo.WorkingDirectory={cwd};\
+         [Console]::Error.WriteLine('NATIVE32_STAGE cwd '+$miniGitPrClock.ElapsedMilliseconds);\
+         $miniGitPrInfo.UseShellExecute=$false;\
+         $miniGitPrInfo.RedirectStandardOutput=$true;$miniGitPrInfo.RedirectStandardError=$true;\
+         $miniGitPrProcess={process};\
+         [Console]::Error.WriteLine('NATIVE32_STAGE process '+$miniGitPrClock.ElapsedMilliseconds);\
+         try {{\
+         if(-not $miniGitPrProcess.Start()){{throw 'native32 inert launch failed'}};\
+         [Console]::Error.WriteLine('NATIVE32_STAGE started '+$miniGitPrClock.ElapsedMilliseconds);\
+         $miniGitPrOut=$miniGitPrProcess.StandardOutput.ReadToEndAsync();\
+         $miniGitPrErr=$miniGitPrProcess.StandardError.ReadToEndAsync();\
+         $miniGitPrProcess.WaitForExit();\
+         [Console]::Error.WriteLine('NATIVE32_STAGE exited '+$miniGitPrClock.ElapsedMilliseconds);\
+         [Console]::Error.Write($miniGitPrErr.GetAwaiter().GetResult());\
+         [Console]::Out.Write($miniGitPrOut.GetAwaiter().GetResult());\
+         $miniGitPrCode=$miniGitPrProcess.ExitCode;\
+         }}finally{{$miniGitPrProcess.Dispose()}};\
+         [Console]::Out.Write('NATIVE32_STAGE_PREFLIGHT');exit $miniGitPrCode"
+    )
+}
+
 #[cfg(all(test, windows, feature = "sandbox"))]
 mod windows_native_pr_tests {
     use super::*;
@@ -2305,21 +2372,36 @@ mod windows_native_pr_tests {
             record
         }
         async fn literal_shell_preflight(&self) {
+            self.shell_preflight(
+                "literal",
+                "[Console]::Out.Write('NATIVE32_PREFLIGHT')",
+                b"NATIVE32_PREFLIGHT",
+            )
+            .await;
+            for (label, cmdlets) in [("cmdlets", true), ("typed constructors", false)] {
+                self.shell_preflight(
+                    label,
+                    &native_launch_stage_control(cmdlets),
+                    b"NATIVE32_STAGE_PREFLIGHT",
+                )
+                .await;
+            }
+        }
+        async fn shell_preflight(&self, label: &str, command: &str, expected_stdout: &[u8]) {
             use crate::agent::tools::bash::{ForegroundResult, ShellTool};
-            const COMMAND: &str = "[Console]::Out.Write('NATIVE32_PREFLIGHT')";
             let (ask, mut requests) = tokio::sync::mpsc::channel(4);
             let tool = ShellTool::new(
                 Some(self.checker(Action::Ask)),
                 Some(ask),
                 self.sandbox.clone(),
-                Some(1),
+                Some(200),
             )
             .with_foreground_timeout_secs(15);
             let scope = crate::agent::runner::AgentWorkScope::new();
             let assertions = std::panic::AssertUnwindSafe(async {
                 let work = scope.run(async {
                     rig::tool::Tool::call_structured(&tool, crate::agent::tools::BashArgs {
-                        command: COMMAND.into(), timeout: None, background: false,
+                        command: command.into(), timeout: None, background: false,
                     }, &ToolCallExtensions::default()).await
                 });
                 tokio::pin!(work);
@@ -2330,16 +2412,16 @@ mod windows_native_pr_tests {
                     }
                 }).await.expect("literal preflight Ask delivery must be bounded");
                 assert_eq!(pending.tool, "shell");
-                assert_eq!(pending.input, COMMAND);
+                assert_eq!(pending.input, command);
                 pending.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
                 let result = tokio::time::timeout(Duration::from_secs(20), work).await
                     .expect("literal preflight result must be bounded");
-                eprintln!("native GH literal Shell preflight: {:?}", format!("{result:?}").chars().take(4096).collect::<String>());
+                eprintln!("native GH {label} Shell preflight: {:?}", format!("{result:?}").chars().take(4096).collect::<String>());
                 let result = result.expect("literal native PowerShell preflight must complete");
                 let actual = result.extensions.get::<ForegroundResult>().expect("literal preflight actual foreground result");
                 assert_eq!(actual.status, crate::sandbox::CommandStatus::Completed);
                 assert_eq!(actual.exit_code, Some(0));
-                assert_eq!(actual.stdout, b"NATIVE32_PREFLIGHT");
+                assert_eq!(actual.stdout, expected_stdout);
                 assert!(actual.stdout_complete && !actual.descendants_escaped);
                 assert!(!self.path("gh-argv.json").exists());
             }).catch_unwind().await;

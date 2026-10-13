@@ -13,7 +13,7 @@ use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 
 use super::events::sanitize_output;
-use super::feed::{BlockStyle, Feed, FeedLines, style_from_color};
+use super::feed::{BlockStyle, Feed, FeedLines, ForegroundPalette, style_from_color};
 use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
 use super::utils::{char_display_width, display_width, resolve_color};
@@ -503,6 +503,7 @@ pub struct Renderer {
     input_first_visible: usize,
     input_visible_line_count: usize,
     monochrome: bool,
+    palette: ForegroundPalette,
     chat_bg: Option<Color>,
     input_bg: Option<Color>,
     status_bg: Option<Color>,
@@ -613,6 +614,7 @@ impl Renderer {
             input_first_visible: 0,
             input_visible_line_count: 0,
             monochrome: false,
+            palette: ForegroundPalette::default(),
             chat_bg: None,
             input_bg: None,
             status_bg: None,
@@ -833,6 +835,21 @@ impl Renderer {
         self.status_bg = status_bg;
     }
 
+    pub(crate) fn set_foreground_palette(&mut self, palette: ForegroundPalette) {
+        if self.palette == palette {
+            return;
+        }
+        self.palette = palette;
+        self.feed.set_palette(palette);
+        self.last_chat_snapshot = None;
+        self.last_bottom_snapshot = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn foreground_palette_for_test(&self) -> ForegroundPalette {
+        self.palette
+    }
+
     #[cfg(test)]
     pub(crate) fn background_colors_for_test(
         &self,
@@ -893,7 +910,7 @@ impl Renderer {
     fn chat_lines(&self, width: usize) -> Arc<FeedLines> {
         let lines = self.feed.lines(width);
         if !self.partial.is_empty() {
-            let color = self.partial_style.color();
+            let color = self.palette.block_color(self.partial_style);
             let mut partial = Vec::new();
             for chunk in word_wrap(&self.partial, width) {
                 partial.push(LineEntry { text: chunk, color });
@@ -1526,7 +1543,7 @@ impl Renderer {
         write!(
             stdout,
             "{}",
-            SetForegroundColor(self.color(Color::DarkGrey))
+            SetForegroundColor(self.color(self.palette.system))
         )?;
         let sep: String = "─".repeat(cols as usize);
         write!(stdout, "{}", sep)?;
@@ -1621,12 +1638,17 @@ impl Renderer {
                 break;
             }
             match span {
-                StatusSpan::Text { text, fg, bg, .. } => {
+                StatusSpan::Text {
+                    text,
+                    fg,
+                    bg,
+                    layout,
+                } => {
                     let bgc = bg.or(self.status_bg);
                     if let Some(c) = bgc {
                         write!(stdout, "{}", SetBackgroundColor(self.color(c)))?;
                     }
-                    let fgc = fg.unwrap_or(Color::DarkGrey);
+                    let fgc = self.status_foreground(layout, *fg);
                     write!(stdout, "{}", SetForegroundColor(self.color(fgc)))?;
                     debug_assert!(display_width(text) <= budget);
                     budget = budget.saturating_sub(display_width(text));
@@ -1658,6 +1680,30 @@ impl Renderer {
         write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
         write!(stdout, "{}", ResetColor)?;
         Ok(())
+    }
+
+    fn status_foreground(
+        &self,
+        layout: &super::statusline::SpanLayout,
+        fg: Option<Color>,
+    ) -> Color {
+        match (layout, fg) {
+            (
+                super::statusline::SpanLayout::Item {
+                    dynamic_color: true,
+                    ..
+                },
+                Some(Color::Red),
+            ) => self.palette.error,
+            (
+                super::statusline::SpanLayout::Item {
+                    dynamic_color: true,
+                    ..
+                },
+                Some(Color::Yellow),
+            ) => self.palette.warning,
+            _ => fg.unwrap_or(self.palette.status),
+        }
     }
 
     /// Snapshot of everything `draw_bottom` would paint for these arguments.
@@ -1815,7 +1861,7 @@ impl Renderer {
                 self.draw_separator(sep_above, cols)?;
             }
 
-            let prompt_color = self.color(Color::DarkYellow);
+            let prompt_color = self.color(self.palette.permission);
             for (i, line) in prompt_rows.iter().enumerate() {
                 let render_row = input_top.saturating_add(i as u16);
                 stdout.execute(MoveTo(0, render_row))?;
@@ -1931,10 +1977,14 @@ impl Renderer {
                 write!(
                     stdout,
                     "{}",
-                    SetForegroundColor(self.color(Color::DarkYellow))
+                    SetForegroundColor(self.color(self.palette.tool))
                 )?;
                 write!(stdout, "{}", prompt)?;
-                write!(stdout, "{}", SetForegroundColor(Color::Reset))?;
+                write!(
+                    stdout,
+                    "{}",
+                    SetForegroundColor(self.color(self.palette.text))
+                )?;
             } else {
                 write!(stdout, "{}", " ".repeat(prompt_width))?;
             }
@@ -2867,6 +2917,96 @@ mod statusline_layout_tests {
     use crate::ui::statusline::{self, StatusContext};
 
     #[test]
+    fn light_theme_status_warnings_use_contrast_roles_and_keep_explicit_colors() {
+        let renderer = &mut Renderer::for_app_test().unwrap();
+        crate::context::themes::apply(
+            include_str!("../../data/themes/default-light.json"),
+            renderer,
+        )
+        .unwrap();
+        let mut session = Session::new("p", "model", 1000, "");
+        session.overhead_tokens = 950;
+        let context = StatusContext {
+            workspace: std::path::Path::new("."),
+            loop_label: None,
+            goal_label: None,
+            prompt_name: None,
+            reasoning_effort: None,
+            perm_mode: None,
+            chain_label: None,
+            background_jobs: 0,
+            btw_cost: 0.0,
+            btw_in: 0,
+            btw_out: 0,
+            sandbox_label: None,
+        };
+        let spec = StatusLineConfig {
+            lines: vec![StatusLineLine {
+                segments: vec![
+                    StatusLineSegment {
+                        item: "context".into(),
+                        ..Default::default()
+                    },
+                    StatusLineSegment {
+                        item: "separator".into(),
+                        ..Default::default()
+                    },
+                    StatusLineSegment {
+                        item: "model".into(),
+                        color: Some("yellow".into()),
+                        ..Default::default()
+                    },
+                ],
+            }],
+        };
+        let rows = statusline::build_lines(&spec, &session, &context);
+        renderer.draw_statusline_row(5, &rows[0], None, 80).unwrap();
+        let captured = renderer.captured_output();
+        let StatusSpan::Text { layout, fg, .. } = &rows[0][0] else {
+            panic!("context item")
+        };
+        let warning = renderer.status_foreground(layout, *fg);
+        assert_eq!(
+            warning,
+            Color::Rgb {
+                r: 137,
+                g: 80,
+                b: 0
+            }
+        );
+        assert!(
+            captured.contains(&format!("{}", SetForegroundColor(warning))),
+            "{captured:?}"
+        );
+        let StatusSpan::Text { layout, fg, .. } = &rows[0][2] else {
+            panic!("custom model item")
+        };
+        assert_eq!(renderer.status_foreground(layout, *fg), Color::Yellow);
+        assert!(captured.contains(&format!("{}", SetForegroundColor(Color::Yellow))));
+        renderer.capture_bytes().lock().unwrap().clear();
+        session.overhead_tokens = 1100;
+        let rows = statusline::build_lines(&spec, &session, &context);
+        renderer.draw_statusline_row(5, &rows[0], None, 80).unwrap();
+        let StatusSpan::Text { layout, fg, .. } = &rows[0][0] else {
+            panic!("context item")
+        };
+        let error = renderer.status_foreground(layout, *fg);
+        assert_eq!(
+            error,
+            Color::Rgb {
+                r: 180,
+                g: 35,
+                b: 24
+            }
+        );
+        assert!(
+            renderer
+                .captured_output()
+                .contains(&format!("{}", SetForegroundColor(error)))
+        );
+    }
+
+    #[test]
     fn actual_statusline_draw_reserves_last_cell_and_marks_unicode_clipping() {
         let renderer = Renderer::for_app_test().unwrap();
         let session = Session::new("p", "m", 1000, "/workspace");
@@ -2919,6 +3059,7 @@ mod statusline_layout_tests {
                 priority: 100,
                 plain: text.into(),
                 compact: None,
+                dynamic_color: false,
             },
         };
         let spans = [

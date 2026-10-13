@@ -18,12 +18,15 @@ fn role_matches(root: &Path, image: &Path, marker: &[u8]) -> bool {
 }
 
 fn owned_role() -> bool {
+    let clock = Instant::now();
     let Ok(root) = std::env::current_dir().and_then(std::fs::canonicalize) else {
         return false;
     };
+    let root_ms = clock.elapsed().as_millis();
     let Ok(image) = std::env::current_exe().and_then(std::fs::canonicalize) else {
         return false;
     };
+    let image_ms = clock.elapsed().as_millis();
     let marker = root.join("gh-role");
     let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
         return false;
@@ -31,6 +34,7 @@ fn owned_role() -> bool {
     if !metadata.is_file() || metadata.len() != 8 {
         return false;
     }
+    let metadata_ms = clock.elapsed().as_millis();
     let Ok(file) = std::fs::File::open(marker) else {
         return false;
     };
@@ -40,8 +44,19 @@ fn owned_role() -> bool {
     {
         return false;
     }
+    let opened_ms = clock.elapsed().as_millis();
     let mut marker = Vec::with_capacity(9);
-    file.take(9).read_to_end(&mut marker).is_ok() && role_matches(&root, &image, &marker)
+    let matched =
+        file.take(9).read_to_end(&mut marker).is_ok() && role_matches(&root, &image, &marker);
+    // Fixed cumulative timings only, and only after the existing owned role has
+    // been proven. No path, argv, environment value or marker content is logged.
+    if matched {
+        eprintln!(
+            "NATIVE32_HELPER role root_ms={root_ms} image_ms={image_ms} metadata_ms={metadata_ms} opened_ms={opened_ms} validated_ms={}",
+            clock.elapsed().as_millis()
+        );
+    }
+    matched
 }
 
 fn self_test() {

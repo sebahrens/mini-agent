@@ -72,6 +72,41 @@ def validate_fixture_role(source, native):
         raise AssertionError("native Shell proof must assert the canary remains scrubbed")
 
 
+def validate_stage_controls(source, helper):
+    control = source.split("fn native_launch_stage_control(", 1)[1].split(
+        '#[cfg(all(test, windows, feature = "sandbox"))]', 1
+    )[0]
+    required = [
+        "New-Object System.Diagnostics.ProcessStartInfo",
+        "[System.Diagnostics.ProcessStartInfo]::new()",
+        "(Get-Location).ProviderPath", "[System.Environment]::CurrentDirectory",
+        "New-Object System.Diagnostics.Process", "[System.Diagnostics.Process]::new()",
+        "FileName='gh';", "Arguments='--self-test';", "UseShellExecute=$false;",
+        "ReadToEndAsync()", "finally", "Dispose()", "exit $miniGitPrCode",
+    ]
+    required += ["NATIVE32_STAGE " + name + " " for name in
+                 ["entered", "info", "cwd", "process", "started", "exited"]]
+    for fragment in required:
+        if fragment not in control:
+            raise AssertionError("missing inert launch-stage guard: " + fragment)
+    preflight = source.split("async fn shell_preflight(", 1)[1].split(
+        "\n    }\n\n    struct Actor", 1
+    )[0]
+    for fragment in ["Some(self.checker(Action::Ask))", "pending.input, command",
+                     "UserDecision::AllowOnce", "Duration::from_secs(10)",
+                     "Duration::from_secs(20)", "with_foreground_timeout_secs(15)",
+                     "expected_stdout", "stdout_complete", "descendants_escaped",
+                     "scope.cancellation_handle().cancel()", "scope.wait_idle()"]:
+        if fragment not in preflight:
+            raise AssertionError("missing ordinary bounded stage-control guard: " + fragment)
+    role = helper.split("fn owned_role()", 1)[1].split("fn self_test()", 1)[0]
+    if "if matched" not in role or role.index("if matched") > role.index('"NATIVE32_HELPER role'):
+        raise AssertionError("role timing must be emitted after role validation")
+    production = source.split("fn pr_command(", 1)[1].split("fn require_mutation_success", 1)[0]
+    if "NATIVE32_STAGE" in production or "--self-test" in production:
+        raise AssertionError("stage controls must not instrument the real PR command")
+
+
 class WindowsGhCiTests(unittest.TestCase):
     def test_exact_native_lane_and_fixture_role_are_guarded(self):
         validate_native_step((ROOT / ".github/workflows/ci.yml").read_text())
@@ -104,6 +139,21 @@ class WindowsGhCiTests(unittest.TestCase):
                 validate_fixture_role(source.replace(before, after), native)
         with self.assertRaises(AssertionError):
             validate_fixture_role(source, native.replace('record["role_env_present"], false', 'record["role_env_present"], true'))
+
+    def test_stage_controls_preserve_inertness_permission_and_bounds(self):
+        source = (ROOT / "src/ui/slash/git.rs").read_text()
+        helper = (ROOT / "tests/fixtures/windows_gh_fixture.rs").read_text()
+        validate_stage_controls(source, helper)
+        for before, after in [
+            ("Arguments='--self-test';", "Arguments='pr create';"),
+            ("NATIVE32_STAGE started ", "removed stage "),
+            ("Some(self.checker(Action::Ask))", "Some(self.checker(Action::Allow))"),
+            ("scope.wait_idle()", "scope.not_waited()"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                validate_stage_controls(source.replace(before, after), helper)
+        with self.assertRaises(AssertionError):
+            validate_stage_controls(source, helper.replace("if matched {", "if true {"))
 
     def test_stack_lane_requires_exact_four_actual_portable_consumers(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

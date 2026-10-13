@@ -41,6 +41,7 @@ pub enum SpanLayout {
         priority: u8,
         plain: String,
         compact: Option<String>,
+        dynamic_color: bool,
     },
 }
 
@@ -232,6 +233,7 @@ pub fn build_lines(
                 priority: 255,
                 plain: single_line_safe(label),
                 compact: None,
+                dynamic_color: true,
             },
         });
     }
@@ -277,7 +279,9 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     resolve_item(item, session, ctx, always).map(|text| single_line_safe(&text))
                 {
                     let plain = text.clone();
+                    let live_color = dynamic_item_color(item, session);
                     let layout = SpanLayout::Item {
+                        dynamic_color: live_color.is_some(),
                         priority: item_priority(item, seg.priority),
                         compact: if matches!(item, "mode" | "sandbox" | "goal" | "loop") {
                             None
@@ -297,7 +301,7 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     // a reading at or past 100% reads as a deliberate warning
                     // rather than a rendering glitch. The powerline cap below
                     // derives from this fg, so the segment edge tracks it too.
-                    let fg = dynamic_item_color(item, session).or_else(|| color(&seg.color));
+                    let fg = live_color.or_else(|| color(&seg.color));
                     let bg = color(&seg.bg);
                     // Powerline caps: the glyph is drawn in the segment's bg color
                     // (so it reads as the segment's rounded/triangle edge) over the
@@ -942,7 +946,7 @@ pub fn default_spec() -> StatusLineConfig {
         }
     }
     let segments = vec![
-        seg("cwd", Some("dark_grey")),
+        seg("cwd", None),
         sep("  "),
         StatusLineSegment {
             item: "git_branch".into(),
@@ -952,38 +956,38 @@ pub fn default_spec() -> StatusLineConfig {
             ..Default::default()
         },
         sep(" | "),
-        seg("model", Some("dark_grey")),
+        seg("model", None),
         sep(" "),
-        seg("reasoning_effort", Some("dark_grey")),
+        seg("reasoning_effort", None),
         sep("  |  "),
-        seg("context", Some("dark_grey")),
+        seg("context", None),
         sep("  "),
-        seg("calls", Some("dark_grey")),
+        seg("calls", None),
         sep(" "),
-        seg("tokens_input", Some("dark_grey")),
+        seg("tokens_input", None),
         sep(" "),
-        seg("tokens_output", Some("dark_grey")),
+        seg("tokens_output", None),
         sep(" "),
-        seg("cache_hit_ratio", Some("dark_grey")),
+        seg("cache_hit_ratio", None),
         StatusLineSegment {
             item: "flex_separator".into(),
             ..Default::default()
         },
         seg("sandbox", Some("red")),
         sep(" "),
-        seg("loop", Some("dark_grey")),
+        seg("loop", None),
         sep(" "),
-        seg("goal", Some("dark_grey")),
+        seg("goal", None),
         sep(" "),
-        seg("mode", Some("dark_grey")),
+        seg("mode", None),
         sep(" "),
-        seg("background_jobs", Some("dark_grey")),
+        seg("background_jobs", None),
         sep(" "),
-        seg("cost", Some("dark_grey")),
+        seg("cost", None),
         sep(" "),
-        seg("btw", Some("dark_grey")),
+        seg("btw", None),
         sep(" "),
-        seg("prompt", Some("dark_grey")),
+        seg("prompt", None),
     ];
     StatusLineConfig {
         lines: vec![StatusLineLine { segments }],

@@ -1,0 +1,20 @@
+{
+  "chat_background": "#ffffff",
+  "input_background": "#ffffff",
+  "status_background": "#f6f8fa",
+  "user": "#246b34",
+  "agent": "#24292f",
+  "tool": "#895000",
+  "result": "#57606a",
+  "code": "#895000",
+  "reasoning": "#6f42c1",
+  "error": "#b42318",
+  "diff_add": "#246b34",
+  "diff_del": "#b42318",
+  "status": "#57606a",
+  "system": "#57606a",
+  "permission": "#8250df",
+  "link": "#0969da",
+  "text": "#24292f",
+  "warning": "#895000"
+}

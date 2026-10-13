@@ -1,5 +1,20 @@
 {
   "chat_background": "#0D0D0D",
   "input_background": "#0D0D0D",
-  "status_background": "#0D0D0D"
+  "status_background": "#0D0D0D",
+  "user": "#98c379",
+  "agent": "#e6edf3",
+  "tool": "#e5c07b",
+  "result": "#abb2bf",
+  "code": "#e5c07b",
+  "reasoning": "#c792ea",
+  "error": "#ff6b6b",
+  "diff_add": "#98c379",
+  "diff_del": "#ff6b6b",
+  "status": "#abb2bf",
+  "system": "#abb2bf",
+  "permission": "#d291e4",
+  "link": "#61afef",
+  "text": "#e6edf3",
+  "warning": "#e5c07b"
 }

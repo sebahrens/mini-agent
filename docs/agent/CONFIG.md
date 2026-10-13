@@ -1672,9 +1672,19 @@ to accept or read, including during turn interruption and shutdown.
 
 ## Colors
 
-The `colors` object accepts an optional `scheme_type` field and three optional
-string fields for background colors, each of which can be a named color or hex
-color (e.g. `"#1e1e2e"`). Named colors are case-insensitive.
+The `colors` object accepts `scheme_type`, background colors, and foreground
+roles. Each color is an optional named color or hex string (e.g.
+`"#1e1e2e"`). Named colors are case-insensitive. Built-in themes include full
+foreground palettes and explicit `default-light` / `default-dark` variants in
+`/theme`; choosing a theme retains its saved precedence over config colors.
+
+Without a saved theme, foreground defaults follow an explicit `chat_background`,
+then the final ANSI background index in `COLORFGBG` (including 256-color indices),
+then the dark preset. Configured foreground roles override those defaults.
+Background detection currently uses this hint without reading terminal input;
+OSC 11 querying is not yet enabled. Changing a theme invalidates feed and
+Markdown color caches so existing messages repaint. Monochrome output still
+emits no RGB colors.
 
 ### `scheme_type`
 
@@ -1691,6 +1701,15 @@ Controls the terminal color escape sequences emitted. Two values:
 - `chat_background` — background color for the main conversation buffer.
 - `input_background` — background color for the text input area.
 - `status_background` — background color for the status bar (lowest line).
+
+### Foreground roles
+
+`user`, `agent`, `tool`, `result`, `code`, `reasoning`, `error`, `warning`,
+`diff_add`, `diff_del`, `status`, `system`, `permission`, `link`, and `text`
+set their respective foreground colors. `text` also colors ordinary input.
+Default status items inherit `status`; explicit custom segment colors remain
+explicit. Live context/sandbox alerts use `warning`/`error`, including their
+compact forms, rather than a bright yellow that disappears on white.
 
 Supported named colors: `reset`, `black`, `red`, `green`, `yellow`, `blue`,
 `magenta`, `cyan`, `white`, `grey`, `dark_grey`, `dark_red`, `dark_green`,

@@ -60,6 +60,68 @@ impl BlockStyle {
     }
 }
 
+/// Resolved foreground roles. Kept separate from content so switching themes
+/// cannot change a block's identity, text, or markdown structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForegroundPalette {
+    pub user: Color,
+    pub agent: Color,
+    pub tool: Color,
+    pub result: Color,
+    pub code: Color,
+    pub reasoning: Color,
+    pub error: Color,
+    pub warning: Color,
+    pub diff_add: Color,
+    pub diff_del: Color,
+    pub status: Color,
+    pub system: Color,
+    pub permission: Color,
+    pub link: Color,
+    pub text: Color,
+}
+
+impl Default for ForegroundPalette {
+    fn default() -> Self {
+        Self {
+            user: BlockStyle::User.color(),
+            agent: BlockStyle::Agent.color(),
+            tool: BlockStyle::Tool.color(),
+            result: BlockStyle::ToolResult.color(),
+            code: Color::DarkYellow,
+            reasoning: BlockStyle::Reasoning.color(),
+            error: BlockStyle::Error.color(),
+            warning: Color::Yellow,
+            diff_add: BlockStyle::DiffAdd.color(),
+            diff_del: BlockStyle::DiffDel.color(),
+            status: Color::DarkGrey,
+            system: BlockStyle::System.color(),
+            permission: BlockStyle::Permission.color(),
+            link: Color::Cyan,
+            text: Color::White,
+        }
+    }
+}
+
+impl ForegroundPalette {
+    pub(crate) fn block_color(self, style: BlockStyle) -> Color {
+        match style {
+            BlockStyle::User => self.user,
+            BlockStyle::Agent => self.agent,
+            BlockStyle::Reasoning => self.reasoning,
+            BlockStyle::Tool => self.tool,
+            BlockStyle::ToolResult => self.result,
+            BlockStyle::DiffAdd => self.diff_add,
+            BlockStyle::DiffDel => self.diff_del,
+            BlockStyle::DiffHunk | BlockStyle::Welcome => self.link,
+            BlockStyle::Error => self.error,
+            BlockStyle::System => self.system,
+            BlockStyle::Permission => self.permission,
+            BlockStyle::Plain => self.text,
+        }
+    }
+}
+
 /// Map a legacy terminal color to the closest semantic block style.
 ///
 /// This is used while migrating callers from `Renderer::write_line(text, color)`
@@ -266,6 +328,7 @@ impl Index<usize> for FeedLines {
 /// any width.
 #[derive(Clone, Debug, Default)]
 pub struct Feed {
+    palette: ForegroundPalette,
     blocks: VecDeque<Block>,
     total_bytes: usize,
     pruned_blocks: u64,
@@ -305,6 +368,7 @@ struct LayoutCache {
 impl Feed {
     pub fn new() -> Self {
         Self {
+            palette: ForegroundPalette::default(),
             blocks: VecDeque::new(),
             total_bytes: 0,
             pruned_blocks: 0,
@@ -318,6 +382,19 @@ impl Feed {
             markdown_bytes_parsed: std::cell::Cell::new(0),
             #[cfg(test)]
             block_renders: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn set_palette(&mut self, palette: ForegroundPalette) {
+        if self.palette == palette {
+            return;
+        }
+        self.palette = palette;
+        self.generation = self.generation.wrapping_add(1);
+        *self.layout_cache.borrow_mut() = None;
+        for block in &self.blocks {
+            *block.render_cache.borrow_mut() = None;
+            *block.md_cache.borrow_mut() = None;
         }
     }
 
@@ -357,6 +434,7 @@ impl Feed {
                     format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
                 ),
                 width,
+                self.palette,
             )
             .len()
         } else {
@@ -749,6 +827,7 @@ impl Feed {
                     format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
                 ),
                 width,
+                self.palette,
             )));
         }
         for block in &self.blocks {
@@ -959,7 +1038,7 @@ fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineE
     let segments = match block.style {
         BlockStyle::Agent => agent_block_segments(feed, block, width),
         BlockStyle::Reasoning => vec![Arc::new(reasoning_block_lines(feed, block, width))],
-        _ => vec![Arc::new(plain_block_lines(block, width))],
+        _ => vec![Arc::new(plain_block_lines(block, width, feed.palette))],
     };
     *block.render_cache.borrow_mut() = Some(BlockRenderCache {
         width,
@@ -974,7 +1053,7 @@ fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEn
         return Vec::new();
     }
     let Some(reasoning) = &block.reasoning else {
-        return plain_block_lines(block, width);
+        return plain_block_lines(block, width, feed.palette);
     };
     let expanded = reasoning
         .expanded
@@ -1005,17 +1084,17 @@ fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEn
         .collect();
     let mut lines = vec![LineEntry {
         text: CompactString::from(clipped),
-        color: BlockStyle::Reasoning.color(),
+        color: feed.palette.reasoning,
     }];
     if expanded {
-        lines.extend(plain_block_lines(block, width));
+        lines.extend(plain_block_lines(block, width, feed.palette));
     }
     lines
 }
 
-fn plain_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
+fn plain_block_lines(block: &Block, width: usize, palette: ForegroundPalette) -> Vec<LineEntry> {
     let mut result = Vec::new();
-    let color = block.style.color();
+    let color = palette.block_color(block.style);
     for line in block.text.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -1240,7 +1319,7 @@ fn contains_global_markdown_definition(text: &str) -> bool {
 /// segments. Appending a token to the tail never clones completed rows.
 fn agent_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
     let mut segments = agent_completed_lines(feed, block, width);
-    let tail = agent_tail_lines(block, width, segments.is_empty());
+    let tail = agent_tail_lines(block, width, segments.is_empty(), feed.palette);
     if !tail.is_empty() {
         segments.push(Arc::new(tail));
     }
@@ -1471,12 +1550,19 @@ fn parse_agent_markdown(feed: &Feed, text: &str, width: usize) -> Vec<LineEntry>
     #[cfg(test)]
     feed.markdown_bytes_parsed
         .set(feed.markdown_bytes_parsed.get() + text.len());
-    #[cfg(not(test))]
-    let _ = feed;
-    markdown_to_styled(text, width)
+    let mut rows = markdown_to_styled(text, width);
+    for row in &mut rows {
+        row.color = super::markdown::palette_color(row.color, feed.palette);
+    }
+    rows
 }
 
-fn agent_tail_lines(block: &Block, width: usize, needs_prefix: bool) -> Vec<LineEntry> {
+fn agent_tail_lines(
+    block: &Block,
+    width: usize,
+    needs_prefix: bool,
+    palette: ForegroundPalette,
+) -> Vec<LineEntry> {
     if !block.running {
         return Vec::new();
     }
@@ -1485,7 +1571,7 @@ fn agent_tail_lines(block: &Block, width: usize, needs_prefix: bool) -> Vec<Line
     if tail.is_empty() {
         return Vec::new();
     }
-    let color = BlockStyle::Agent.color();
+    let color = palette.agent;
     let mut lines = word_wrap(tail, width)
         .into_iter()
         .map(|text| LineEntry { text, color })

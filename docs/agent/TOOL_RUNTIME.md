@@ -523,9 +523,16 @@ descendant retirement assertion remains a failing acceptance requirement; the
 bypass is not documented as providing that Job guarantee. To diagnose the
 remaining hosted failures without changing policy or deadlines, the native
 typed case first runs a separate literal PowerShell preflight through ordinary
-Shell Ask. Failed assertions report only fixed owned marker files (no-follow,
-4096 bytes per file), copied image size, and bounded actual tool results. The
-production PR script remains unchanged; no diagnostic marker is inserted into it.
+Shell Ask, followed by two independently asked inert-helper controls. Fixed
+elapsed labels distinguish `New-Object`/`Get-Location` initialization from typed
+.NET constructors and inner process start/exit; both invoke only the copied
+helper's pure `--self-test`. Helper role-validation timings are printed only after
+its existing marker and copied-image checks succeed. These observations do not
+attribute the launch delay or establish descendant containment. Failed assertions
+report only fixed owned marker files (no-follow, 4096 bytes per file), copied image
+size, and bounded actual tool results. All original readiness, command, settlement
+and cleanup bounds remain. The production PR script remains unchanged; no
+diagnostic marker is inserted into it.
 
 ### Cached LSP diagnostic metadata
 

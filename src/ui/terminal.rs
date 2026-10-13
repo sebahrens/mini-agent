@@ -19,6 +19,92 @@ pub(crate) fn is_attached() -> bool {
     SYSTEM_TERMINAL_ATTACHED.load(Ordering::Acquire)
 }
 
+/// COLORFGBG's final ANSI color is the terminal background. Invalid or absent
+/// hints remain unknown; this never reads or discards terminal input.
+pub(crate) fn background_hint_is_light(hint: &str) -> Option<bool> {
+    if hint.len() > 128 {
+        return None;
+    }
+    let index = hint.rsplit(';').next()?.trim().parse::<u8>().ok()?;
+    Some(background_color_is_light(
+        crossterm::style::Color::AnsiValue(index),
+    ))
+}
+
+pub(crate) fn background_color_is_light(color: crossterm::style::Color) -> bool {
+    use crossterm::style::Color;
+    let ansi = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let (r, g, b) = match color {
+        Color::Rgb { r, g, b } => (r, g, b),
+        Color::AnsiValue(index @ 0..=15) => ansi[index as usize],
+        Color::AnsiValue(index @ 16..=231) => {
+            let cube = [0, 95, 135, 175, 215, 255];
+            let index = usize::from(index - 16);
+            (cube[index / 36], cube[(index / 6) % 6], cube[index % 6])
+        }
+        Color::AnsiValue(index) => {
+            let gray = 8 + (index - 232) * 10;
+            (gray, gray, gray)
+        }
+        Color::Black => ansi[0],
+        Color::DarkRed => ansi[1],
+        Color::DarkGreen => ansi[2],
+        Color::DarkYellow => ansi[3],
+        Color::DarkBlue => ansi[4],
+        Color::DarkMagenta => ansi[5],
+        Color::DarkCyan => ansi[6],
+        Color::Grey => ansi[7],
+        Color::DarkGrey => ansi[8],
+        Color::Red => ansi[9],
+        Color::Green => ansi[10],
+        Color::Yellow => ansi[11],
+        Color::Blue => ansi[12],
+        Color::Magenta => ansi[13],
+        Color::Cyan => ansi[14],
+        Color::White => ansi[15],
+        Color::Reset => return false,
+    };
+    299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) >= 128_000
+}
+
+#[cfg(test)]
+mod background_hint_tests {
+    use super::*;
+
+    #[test]
+    fn background_hints_distinguish_light_dark_and_unknown_without_input_io() {
+        for value in ["15;0", "0", "15;16", "15;232"] {
+            assert_eq!(background_hint_is_light(value), Some(false), "{value}");
+        }
+        for value in ["0;15", "15", "0;7", "0;231", "0;255"] {
+            assert_eq!(background_hint_is_light(value), Some(true), "{value}");
+        }
+        for value in ["", "0;", "0;256", "0;-1", "rgb:ffff/ffff/ffff", "default"] {
+            assert_eq!(background_hint_is_light(value), None, "{value}");
+        }
+        assert_eq!(background_hint_is_light(&"0".repeat(129)), None);
+        assert!(background_color_is_light(crossterm::style::Color::White));
+        assert!(!background_color_is_light(crossterm::style::Color::Black));
+    }
+}
+
 #[derive(Debug)]
 pub struct TerminalLifecycleError {
     operation: &'static str,

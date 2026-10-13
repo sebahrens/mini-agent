@@ -6,6 +6,18 @@ use smallvec::{SmallVec, smallvec};
 use super::renderer::LineEntry;
 use super::utils::display_width;
 
+/// Translate only colors produced by this parser; callers' explicit colors
+/// and the parsed markdown text are retained.
+pub(crate) fn palette_color(color: Color, palette: super::feed::ForegroundPalette) -> Color {
+    match color {
+        Color::White => palette.agent,
+        Color::DarkYellow => palette.code,
+        Color::DarkGrey => palette.system,
+        Color::Cyan | Color::DarkCyan => palette.link,
+        _ => color,
+    }
+}
+
 pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString; 4]> {
     if text.is_empty() || max_width == 0 {
         return smallvec![CompactString::from(text)];

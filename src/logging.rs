@@ -210,6 +210,15 @@ struct HeadlessPending {
     closed: bool,
 }
 impl HeadlessDiagnostics {
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(
+        &self,
+        message: String,
+        cancellation: &crate::agent::runner::AgentWorkCancellation,
+    ) -> bool {
+        self.admit(message, cancellation)
+    }
+
     fn admit(
         &self,
         message: String,
