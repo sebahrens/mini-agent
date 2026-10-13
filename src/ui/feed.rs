@@ -9,7 +9,7 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 
 use super::events::sanitize_output;
-use super::markdown::{markdown_to_styled, word_wrap};
+use super::markdown::{StyledMarkdown, markdown_with_code_state, word_wrap};
 use super::renderer::LineEntry;
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
 
@@ -156,6 +156,7 @@ pub struct Block {
     /// Memoized markdown layout. Interior mutability keeps `Feed::lines` a
     /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
     md_cache: RefCell<Option<MdCache>>,
+    syntax_cache: RefCell<super::highlight::TokenCache>,
     revision: u64,
     render_cache: RefCell<Option<BlockRenderCache>>,
     /// Producer key (a tool-call id) that later blocks can be placed after,
@@ -192,6 +193,9 @@ struct BlockRenderCache {
 #[derive(Clone, Debug)]
 struct MdCache {
     width: usize,
+    highlighting: bool,
+    /// Lexical state at stable_len, paired with the exact replayable fence.
+    stable_code: Option<super::highlight::CodeState>,
     /// Byte offset where markdown is definitely finalized: after a top-level
     /// blank line, or after any completed line inside a replayable fence.
     stable_len: usize,
@@ -259,6 +263,7 @@ impl Block {
             text,
             running: false,
             md_cache: RefCell::new(None),
+            syntax_cache: RefCell::new(super::highlight::TokenCache::default()),
             revision: 0,
             render_cache: RefCell::new(None),
             anchor: None,
@@ -329,6 +334,7 @@ impl Index<usize> for FeedLines {
 #[derive(Clone, Debug, Default)]
 pub struct Feed {
     palette: ForegroundPalette,
+    monochrome: bool,
     blocks: VecDeque<Block>,
     total_bytes: usize,
     pruned_blocks: u64,
@@ -369,6 +375,7 @@ impl Feed {
     pub fn new() -> Self {
         Self {
             palette: ForegroundPalette::default(),
+            monochrome: false,
             blocks: VecDeque::new(),
             total_bytes: 0,
             pruned_blocks: 0,
@@ -395,6 +402,21 @@ impl Feed {
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
             *block.md_cache.borrow_mut() = None;
+            block.syntax_cache.borrow_mut().clear();
+        }
+    }
+
+    pub(crate) fn set_monochrome(&mut self, monochrome: bool) {
+        if self.monochrome == monochrome {
+            return;
+        }
+        self.monochrome = monochrome;
+        self.generation = self.generation.wrapping_add(1);
+        *self.layout_cache.borrow_mut() = None;
+        for block in &self.blocks {
+            *block.render_cache.borrow_mut() = None;
+            *block.md_cache.borrow_mut() = None;
+            block.syntax_cache.borrow_mut().clear();
         }
     }
 
@@ -656,7 +678,7 @@ impl Feed {
             {
                 reasoning.elapsed_secs = Some(started.elapsed().as_secs());
             }
-            // Force one full re-parse now that the text is complete.
+            // Re-layout the completed Markdown; exact syntax rows remain reusable.
             *block.md_cache.borrow_mut() = None;
             *block.render_cache.borrow_mut() = None;
         }
@@ -717,6 +739,7 @@ impl Feed {
             *block.render_cache.borrow_mut() = None;
             if compacted {
                 *block.md_cache.borrow_mut() = None;
+                block.syntax_cache.borrow_mut().clear();
                 self.retention_generation = self.retention_generation.wrapping_add(1);
             }
             self.prune_completed_prefix();
@@ -745,6 +768,7 @@ impl Feed {
             last.running = false;
             last.revision = last.revision.wrapping_add(1);
             *last.md_cache.borrow_mut() = None;
+            last.syntax_cache.borrow_mut().clear();
             *last.render_cache.borrow_mut() = None;
         } else {
             let block = Block::new(style, text);
@@ -1083,6 +1107,7 @@ fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEn
         })
         .collect();
     let mut lines = vec![LineEntry {
+        syntax_spans: None,
         text: CompactString::from(clipped),
         color: feed.palette.reasoning,
     }];
@@ -1099,12 +1124,17 @@ fn plain_block_lines(block: &Block, width: usize, palette: ForegroundPalette) ->
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             result.push(LineEntry {
+                syntax_spans: None,
                 text: CompactString::new(""),
                 color,
             });
         } else {
             for chunk in word_wrap(trimmed, width) {
-                result.push(LineEntry { text: chunk, color });
+                result.push(LineEntry {
+                    syntax_spans: None,
+                    text: chunk,
+                    color,
+                });
             }
         }
     }
@@ -1342,32 +1372,38 @@ const MD_SEGMENT_COALESCE_ROWS: usize = 64;
 /// contains the close (or is the last region of a running block).
 fn render_region(
     feed: &Feed,
+    block: &Block,
     text: &str,
     entry_fence: Option<&OpenFence>,
+    entry_code: Option<super::highlight::CodeState>,
     width: usize,
     ends_inside_fence: bool,
-) -> Vec<LineEntry> {
-    let mut rows = match entry_fence {
+) -> StyledMarkdown {
+    let highlighting = !feed.monochrome && super::highlight::within_budget(&block.text);
+    let mut rendered = match entry_fence {
         Some(fence) => {
             let mut replayed = String::with_capacity(fence.opener.len() + 1 + text.len());
             replayed.push_str(&fence.opener);
             replayed.push('\n');
             replayed.push_str(text);
-            parse_agent_markdown(feed, &replayed, width)
+            parse_agent_markdown(feed, block, &replayed, width, highlighting, entry_code)
         }
-        None => parse_agent_markdown(feed, text, width),
+        None => parse_agent_markdown(feed, block, text, width, highlighting, None),
     };
     if ends_inside_fence {
         // Closing a code block emits the blank separator row, and the code
         // accumulator's trailing newline emits one empty code row. Both belong
         // to the fence's real close, which has not been seen yet.
         for _ in 0..2 {
-            if rows.last().is_some_and(|row| row.text.is_empty()) {
-                rows.pop();
+            if rendered.lines.last().is_some_and(|row| row.text.is_empty()) {
+                rendered.lines.pop();
             }
         }
     }
-    rows
+    if !ends_inside_fence {
+        rendered.code_state = None;
+    }
+    rendered
 }
 
 /// Lay out the completed portion of an agent block as markdown.
@@ -1388,9 +1424,17 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         block.text.len()
     };
 
+    let highlighting = !feed.monochrome && super::highlight::within_budget(&block.text);
+
     // Try an exact cache hit before scanning markdown boundaries. Appending an
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
-    if let Some(cached) = cached_agent_lines(block, width, completed_len) {
+    if let Some(cached) = cached_agent_lines(block, width, completed_len).filter(|_| {
+        block
+            .md_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.highlighting == highlighting)
+    }) {
         return cached;
     }
 
@@ -1399,39 +1443,48 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
     let incremental_base = {
         let cache = block.md_cache.borrow();
         cache.as_ref().and_then(|cache| {
-            (cache.width == width && cache.parsed_len < completed_len).then(|| {
-                (
-                    cache.stable_len,
-                    cache.stable_fence.clone(),
-                    cache.stable_segments.clone(),
-                    cache.has_rows(),
-                    cache.parsed_len,
-                )
-            })
+            (cache.width == width
+                && cache.parsed_len < completed_len
+                && cache.highlighting == highlighting)
+                .then(|| {
+                    (
+                        cache.stable_len,
+                        cache.stable_fence.clone(),
+                        cache.stable_code,
+                        cache.stable_segments.clone(),
+                        cache.has_rows(),
+                        cache.parsed_len,
+                    )
+                })
         })
     };
 
-    if let Some((previous_stable_len, previous_fence, mut stable_segments, mut has_rows, _)) =
-        incremental_base.filter(
-            |(previous_stable_len, previous_fence, _, _, previous_parsed_len)| {
-                // A link or footnote definition can change how an earlier reference
-                // renders, so its arrival invalidates the cached prefix. Nothing
-                // inside a fence is a definition, so a region that stays inside one
-                // never needs the check.
-                let (_, fence_at_end) = find_stable_boundary(
-                    &block.text,
-                    *previous_stable_len,
-                    completed_len,
-                    previous_fence.as_ref(),
-                );
-                let stays_in_fence = previous_fence.is_some() && fence_at_end == *previous_fence;
-                stays_in_fence
-                    || !contains_global_markdown_definition(
-                        &block.text[*previous_parsed_len..completed_len],
-                    )
-            },
-        )
-    {
+    if let Some((
+        previous_stable_len,
+        previous_fence,
+        mut stable_code,
+        mut stable_segments,
+        mut has_rows,
+        _,
+    )) = incremental_base.filter(
+        |(previous_stable_len, previous_fence, _, _, _, previous_parsed_len)| {
+            // A link or footnote definition can change how an earlier reference
+            // renders, so its arrival invalidates the cached prefix. Nothing
+            // inside a fence is a definition, so a region that stays inside one
+            // never needs the check.
+            let (_, fence_at_end) = find_stable_boundary(
+                &block.text,
+                *previous_stable_len,
+                completed_len,
+                previous_fence.as_ref(),
+            );
+            let stays_in_fence = previous_fence.is_some() && fence_at_end == *previous_fence;
+            stays_in_fence
+                || !contains_global_markdown_definition(
+                    &block.text[*previous_parsed_len..completed_len],
+                )
+        },
+    ) {
         let (stable_len, stable_fence) = find_stable_boundary(
             &block.text,
             previous_stable_len,
@@ -1442,11 +1495,15 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         if stable_len > previous_stable_len {
             let mut finalized = render_region(
                 feed,
+                block,
                 &block.text[previous_stable_len..stable_len],
                 previous_fence.as_ref(),
+                stable_code,
                 width,
                 stable_fence.is_some(),
             );
+            stable_code = finalized.code_state.take();
+            let mut finalized = finalized.lines;
             if !has_rows && !finalized.is_empty() {
                 prefix_agent_first_line(&mut finalized);
                 has_rows = true;
@@ -1454,19 +1511,24 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             push_stable_segment(&mut stable_segments, finalized);
         }
 
-        let mut suffix = render_region(
+        let suffix = render_region(
             feed,
+            block,
             &block.text[stable_len..completed_len],
             stable_fence.as_ref(),
+            stable_code,
             width,
             false,
         );
+        let mut suffix = suffix.lines;
         if !has_rows && !suffix.is_empty() {
             prefix_agent_first_line(&mut suffix);
         }
 
         let cache = MdCache {
             width,
+            highlighting,
+            stable_code,
             stable_len,
             stable_fence,
             stable_segments,
@@ -1483,33 +1545,43 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
     let (stable_len, stable_fence) = find_stable_boundary(&block.text, 0, completed_len, None);
     let mut stable_segments: Vec<Arc<Vec<LineEntry>>> = Vec::new();
     let mut has_rows = false;
+    let mut stable_code = None;
     if stable_len > 0 {
         let mut finalized = render_region(
             feed,
+            block,
             &block.text[..stable_len],
+            None,
             None,
             width,
             stable_fence.is_some(),
         );
+        stable_code = finalized.code_state.take();
+        let mut finalized = finalized.lines;
         if !finalized.is_empty() {
             prefix_agent_first_line(&mut finalized);
             has_rows = true;
         }
         stable_segments.push(Arc::new(finalized));
     }
-    let mut suffix = render_region(
+    let suffix = render_region(
         feed,
+        block,
         &block.text[stable_len..completed_len],
         stable_fence.as_ref(),
+        stable_code,
         width,
         false,
     );
+    let mut suffix = suffix.lines;
     if !has_rows && !suffix.is_empty() {
         prefix_agent_first_line(&mut suffix);
     }
 
     let cache = MdCache {
         width,
+        highlighting,
+        stable_code,
         stable_len,
         stable_fence,
         stable_segments,
@@ -1543,18 +1615,38 @@ fn prefix_agent_first_line(lines: &mut [LineEntry]) {
         && !first.text.starts_with("< ")
     {
         first.text = CompactString::from(format!("< {}", first.text));
+        if let Some(spans) = &mut first.syntax_spans {
+            for span in Arc::make_mut(spans) {
+                span.range.start += 2;
+                span.range.end += 2;
+            }
+        }
     }
 }
 
-fn parse_agent_markdown(feed: &Feed, text: &str, width: usize) -> Vec<LineEntry> {
+fn parse_agent_markdown(
+    feed: &Feed,
+    block: &Block,
+    text: &str,
+    width: usize,
+    highlighting: bool,
+    entry_code: Option<super::highlight::CodeState>,
+) -> StyledMarkdown {
     #[cfg(test)]
     feed.markdown_bytes_parsed
         .set(feed.markdown_bytes_parsed.get() + text.len());
-    let mut rows = markdown_to_styled(text, width);
-    for row in &mut rows {
+    let mut rendered = markdown_with_code_state(
+        text,
+        width,
+        feed.palette,
+        highlighting,
+        entry_code,
+        Some(&block.syntax_cache),
+    );
+    for row in &mut rendered.lines {
         row.color = super::markdown::palette_color(row.color, feed.palette);
     }
-    rows
+    rendered
 }
 
 fn agent_tail_lines(
@@ -1574,7 +1666,11 @@ fn agent_tail_lines(
     let color = palette.agent;
     let mut lines = word_wrap(tail, width)
         .into_iter()
-        .map(|text| LineEntry { text, color })
+        .map(|text| LineEntry {
+            syntax_spans: None,
+            text,
+            color,
+        })
         .collect::<Vec<_>>();
     if needs_prefix {
         prefix_agent_first_line(&mut lines);

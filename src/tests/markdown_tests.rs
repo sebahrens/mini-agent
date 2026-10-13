@@ -349,3 +349,69 @@ fn blockquotes_still_work() {
     let quoted = styled.iter().any(|e| e.color == Color::DarkGrey);
     assert!(quoted, "blockquote text should be DarkGrey");
 }
+
+#[test]
+fn syntax_rust_fence_has_theme_spans_and_unknown_language_is_plain() {
+    let rust = markdown_to_styled("```rust\nlet greeting = \"雪\"; // comment\n```\n", 80);
+    let line = rust
+        .iter()
+        .find(|line| line.text.contains("greeting"))
+        .unwrap();
+    let spans = line
+        .syntax_spans
+        .as_ref()
+        .expect("Rust grammar produces token spans");
+    assert!(
+        spans
+            .iter()
+            .map(|span| span.color)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            >= 3
+    );
+    let plain = markdown_to_styled(
+        "```unknown-mini-agent-language\nlet greeting = \"雪\";\n```\n",
+        80,
+    );
+    assert!(plain.iter().all(|line| line.syntax_spans.is_none()));
+    assert!(
+        plain
+            .iter()
+            .any(|line| line.text == "let greeting = \"雪\";")
+    );
+}
+
+#[test]
+fn syntax_diff_fence_uses_add_delete_and_hunk_palette_roles() {
+    let rows = markdown_to_styled("```diff\n@@ -1 +1 @@\n-old\n+new\n```\n", 80);
+    for (text, color) in [
+        ("@@ -1 +1 @@", Color::Cyan),
+        ("-old", Color::Red),
+        ("+new", Color::Green),
+    ] {
+        let row = rows.iter().find(|row| row.text == text).unwrap();
+        assert_eq!(row.syntax_spans.as_ref().unwrap()[0].color, color);
+    }
+}
+
+#[test]
+fn syntax_ten_thousand_lines_skip_parser_without_losing_literal_content() {
+    let source = format!("```rust\n{}```\n", "let x = 1;\n".repeat(10_000));
+    let before = crate::ui::highlight::parsed_lines_for_test();
+    let start = std::time::Instant::now();
+    let rows = markdown_to_styled(&source, 80);
+    assert_eq!(
+        crate::ui::highlight::parsed_lines_for_test(),
+        before,
+        "oversize block must not dispatch the grammar parser"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.text == "let x = 1;").count(),
+        10_000
+    );
+    assert!(rows.iter().all(|row| row.syntax_spans.is_none()));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "plain bounded fallback unexpectedly stalled"
+    );
+}

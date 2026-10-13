@@ -1139,3 +1139,141 @@ fn inserting_a_block_changes_the_generation_and_layout() {
         .collect();
     assert_eq!(rows, ["call a", "result", "later"]);
 }
+
+#[test]
+fn syntax_streamed_fences_match_finalized_multiline_unicode_and_crlf_rows() {
+    let source = "```rust\r\n/* outer\r\n/* inner */ still comment\r\n*/ let text = r##\"雪🙂\r\nnot /* a comment \"#\r\nend\"##; let n = 42;\r\n```\r\n\nafter\n```python\ns = '''open\n# string still\nclosed'''\n```\n";
+    let mut streaming = Feed::new();
+    streaming.push_streaming_block(BlockStyle::Agent);
+    let index = streaming.block_count() - 1;
+    for chunk in source.split_inclusive('\n') {
+        streaming.append_to(index, chunk);
+        let actual = streaming.lines(65);
+        let mut fresh = Feed::new();
+        fresh.push_block(BlockStyle::Agent, streaming.block_text(index).unwrap());
+        let expected = fresh.lines(65);
+        // A streaming open fence omits only synthetic close/separator blanks.
+        let actual_nonempty: Vec<_> = indexed_rows(&actual)
+            .filter(|r| !r.text.is_empty())
+            .collect();
+        let expected_nonempty: Vec<_> = indexed_rows(&expected)
+            .filter(|r| !r.text.is_empty())
+            .collect();
+        assert_eq!(actual_nonempty.len(), expected_nonempty.len());
+        for (a, e) in actual_nonempty.into_iter().zip(expected_nonempty) {
+            assert_eq!(a.text, e.text);
+            assert_eq!(a.syntax_spans, e.syntax_spans, "{}", a.text);
+        }
+    }
+    streaming.finalize_block(index);
+    let mut fresh = Feed::new();
+    fresh.push_block(BlockStyle::Agent, source);
+    let actual = streaming.lines(65);
+    let expected = fresh.lines(65);
+    assert_same_rows(&actual, &expected);
+    for i in 0..actual.len() {
+        assert_eq!(actual[i].syntax_spans, expected[i].syntax_spans);
+    }
+}
+
+#[test]
+fn syntax_width_cache_theme_and_monochrome_lifecycle_is_owned_by_block() {
+    use crate::ui::feed::ForegroundPalette;
+    use crate::ui::highlight::parsed_lines_for_test;
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let index = feed.block_count() - 1;
+    feed.append_to(index, "```rust\nlet text = \"雪\";\n/* unfinished\n");
+    let before = parsed_lines_for_test();
+    let first = feed.lines(80);
+    let after = parsed_lines_for_test();
+    assert!(after > before);
+    let resized = feed.lines(19);
+    assert_eq!(
+        parsed_lines_for_test(),
+        after,
+        "width must not re-tokenize code"
+    );
+    for row in indexed_rows(&first).filter(|r| r.syntax_spans.is_some()) {
+        assert!(
+            indexed_rows(&resized)
+                .any(|r| r.text == row.text && r.syntax_spans == row.syntax_spans)
+        );
+    }
+    feed.append_to(index, "still comment */ let n = 3;\n```\n");
+    feed.lines(19);
+    let complete = parsed_lines_for_test();
+    feed.finalize_block(index);
+    feed.lines(80);
+    assert_eq!(
+        parsed_lines_for_test(),
+        complete,
+        "completed rows keep exact syntax snapshots"
+    );
+    let palette = ForegroundPalette {
+        diff_add: Color::Rgb {
+            r: 30,
+            g: 220,
+            b: 160,
+        },
+        ..Default::default()
+    };
+    feed.set_palette(palette);
+    let themed = feed.lines(80);
+    assert!(parsed_lines_for_test() > complete);
+    assert!(
+        indexed_rows(&themed)
+            .filter_map(|r| r.syntax_spans.as_ref())
+            .flat_map(|spans| spans.iter())
+            .any(|s| s.color == palette.diff_add)
+    );
+    feed.set_monochrome(true);
+    let mono_before = parsed_lines_for_test();
+    let plain = feed.lines(80);
+    assert_eq!(parsed_lines_for_test(), mono_before);
+    assert!(indexed_rows(&plain).all(|r| r.syntax_spans.is_none()));
+    assert_eq!(
+        indexed_rows(&plain)
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>(),
+        indexed_rows(&themed)
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>()
+    );
+    feed.set_monochrome(false);
+    feed.lines(80);
+    assert!(parsed_lines_for_test() > mono_before);
+}
+
+#[test]
+fn syntax_unclosed_adversarial_and_oversized_streams_keep_literal_content() {
+    use crate::ui::highlight::parsed_lines_for_test;
+    let source = format!("```rust\n{}\n", "r#################\"/*雪\\".repeat(100));
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let index = feed.block_count() - 1;
+    feed.append_to(index, &source);
+    let before = parsed_lines_for_test();
+    let rows = feed.lines(80);
+    assert_eq!(
+        parsed_lines_for_test(),
+        before,
+        "overlong line skips lexical work"
+    );
+    assert!(indexed_rows(&rows).any(
+        |r| r.text.strip_prefix("< ").unwrap_or(&r.text) == source.split('\n').nth(1).unwrap()
+    ));
+    assert!(indexed_rows(&rows).all(|r| r.syntax_spans.is_none()));
+    let mut bounded = Feed::new();
+    bounded.push_streaming_block(BlockStyle::Agent);
+    let index = bounded.block_count() - 1;
+    bounded.append_to(index, "```rust\nlet n = 1;\n");
+    assert!(indexed_rows(&bounded.lines(80)).any(|r| r.syntax_spans.is_some()));
+    bounded.append_to(index, "/* x\n".repeat(10_000));
+    let before = parsed_lines_for_test();
+    let rows = bounded.lines(80);
+    assert_eq!(parsed_lines_for_test(), before);
+    assert!(indexed_rows(&rows).all(|r| r.syntax_spans.is_none()));
+    bounded.replace_last(BlockStyle::Agent, "```rust\nlet n=2;\n```");
+    assert!(indexed_rows(&bounded.lines(80)).any(|r| r.syntax_spans.is_some()));
+}

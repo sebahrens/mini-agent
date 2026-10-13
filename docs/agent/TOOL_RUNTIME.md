@@ -668,3 +668,18 @@ exchange; an already-started publication remains owned until it settles and may
 have an ambiguous caller outcome. External aliases and approved parent identity
 are revalidated; symlink/FIFO workspace targets are refused. No file creation,
 implicit permission grant or notebook execution occurs.
+
+## Terminal code presentation
+
+`src/ui/highlight.rs` adds bounded lexical foreground spans to fenced Markdown.
+The feed stores plain text plus ephemeral spans, preserving exact multiline state
+at streamed fence boundaries and caching tokens independently of terminal width.
+Unknown fence labels and oversized blocks use the ordinary code foreground;
+monochrome mode skips tokenization. Theme changes invalidate token and layout caches.
+
+Common Rust, C-family, JavaScript/TypeScript, Python, JSON, TOML, shell and diff/patch
+labels are recognized. This is lexical presentation, with no code execution or
+loaded grammar files. Model-authored diff fences do not become mutation metadata;
+actual typed mutation rows retain their existing event path and colors. Limits and
+the engine/size tradeoff are recorded in
+[the syntax decision](../decisions/2026-10-13-bounded-terminal-syntax.md).

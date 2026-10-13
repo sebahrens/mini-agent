@@ -8,6 +8,7 @@ pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, int
 pub(crate) mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
+pub(crate) mod highlight;
 pub(crate) mod input;
 pub(crate) mod markdown;
 #[cfg(feature = "mcp")]

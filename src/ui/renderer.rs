@@ -59,6 +59,75 @@ pub(crate) fn paint_row_text(
     }
 }
 
+/// Paint validated typed foreground spans without putting escape bytes in
+/// copied text. Selection remains a byte-range overlay on the original row.
+pub(crate) fn paint_styled_row(
+    out: &mut impl Write,
+    entry: &LineEntry,
+    selected: Option<(usize, usize)>,
+    monochrome: bool,
+) -> io::Result<()> {
+    let Some(spans) = entry.syntax_spans.as_ref().filter(|_| !monochrome) else {
+        return paint_row_text(out, &entry.text, selected);
+    };
+    let mut previous = 0;
+    for span in spans.iter() {
+        if span.range.start < previous
+            || span.range.start >= span.range.end
+            || span.range.end > entry.text.len()
+            || !entry.text.is_char_boundary(span.range.start)
+            || !entry.text.is_char_boundary(span.range.end)
+        {
+            return paint_row_text(out, &entry.text, selected);
+        }
+        previous = span.range.end;
+    }
+    let mut paint = |range: std::ops::Range<usize>, color: Color| -> io::Result<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let selection = selected.and_then(|(start, end)| {
+            let start = start.max(range.start);
+            let end = end.min(range.end);
+            (start < end).then(|| (start - range.start, end - range.start))
+        });
+        write!(out, "{}", SetForegroundColor(color))?;
+        paint_row_text(out, &entry.text[range], selection)
+    };
+    // A syntax boundary must not cut a pre-existing OSC8 URL into unrelated fragments.
+    // Treat complete inert URL text as one foreground run; selection still overlays it.
+    let mut urls = URL_RE.find_iter(&entry.text).peekable();
+    let mut offset = 0;
+    let mut span_index = 0;
+    while offset < entry.text.len() {
+        while spans
+            .get(span_index)
+            .is_some_and(|span| span.range.end <= offset)
+        {
+            span_index += 1;
+        }
+        while urls.peek().is_some_and(|url| url.end() <= offset) {
+            urls.next();
+        }
+        let (mut end, mut color) = match spans.get(span_index) {
+            Some(span) if span.range.start <= offset => (span.range.end, span.color),
+            Some(span) => (span.range.start, entry.color),
+            None => (entry.text.len(), entry.color),
+        };
+        if let Some(url) = urls.peek() {
+            if url.start() <= offset {
+                end = url.end();
+                color = entry.color;
+            } else {
+                end = end.min(url.start());
+            }
+        }
+        paint(offset..end, color)?;
+        offset = end;
+    }
+    Ok(())
+}
+
 fn paint_text(text: &str) -> String {
     if text.chars().any(super::events::needs_terminal_sanitizing) {
         wrap_urls_osc8(&sanitize_output(text))
@@ -71,6 +140,8 @@ fn paint_text(text: &str) -> String {
 pub struct LineEntry {
     pub text: CompactString,
     pub color: Color,
+    /// Ephemeral foreground spans; text stays plain for widths and copying.
+    pub(crate) syntax_spans: Option<std::sync::Arc<[super::highlight::TokenSpan]>>,
 }
 
 pub struct PermissionPrompt {
@@ -806,6 +877,7 @@ impl Renderer {
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
+        self.feed.set_monochrome(monochrome);
         self.monochrome = monochrome;
     }
 
@@ -923,7 +995,11 @@ impl Renderer {
             let color = self.palette.block_color(self.partial_style);
             let mut partial = Vec::new();
             for chunk in word_wrap(&self.partial, width) {
-                partial.push(LineEntry { text: chunk, color });
+                partial.push(LineEntry {
+                    syntax_spans: None,
+                    text: chunk,
+                    color,
+                });
             }
             return Arc::new(lines.with_segment(Arc::new(partial)));
         }
@@ -1403,7 +1479,7 @@ impl Renderer {
             }
             self.write_chat_margin(&mut stdout)?;
             write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-            paint_row_text(&mut stdout, chunk, selected)?;
+            paint_styled_row(&mut stdout, entry, selected, self.monochrome)?;
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;
 
@@ -3089,5 +3165,136 @@ mod statusline_layout_tests {
             crate::ui::events::sanitize_output(&renderer.captured_output()),
             "a b c"
         );
+    }
+}
+
+#[cfg(test)]
+mod syntax_paint_tests {
+    use super::*;
+    use crate::ui::highlight::TokenSpan;
+    #[test]
+    fn syntax_row_paint_preserves_unicode_selection_and_plain_copy_text() {
+        let entry = LineEntry {
+            text: "let 雪=1;".into(),
+            color: Color::DarkYellow,
+            syntax_spans: Some(
+                vec![
+                    TokenSpan {
+                        range: 0..3,
+                        color: Color::Cyan,
+                    },
+                    TokenSpan {
+                        range: 4..7,
+                        color: Color::Green,
+                    },
+                    TokenSpan {
+                        range: 8..9,
+                        color: Color::Yellow,
+                    },
+                ]
+                .into(),
+            ),
+        };
+        let mut painted = Vec::new();
+        paint_styled_row(&mut painted, &entry, Some((4, 7)), false).unwrap();
+        let painted = String::from_utf8(painted).unwrap();
+        assert!(painted.contains(&SetForegroundColor(Color::Cyan).to_string()));
+        assert!(painted.contains(&format!(
+            "{}雪{}",
+            SetAttribute(Attribute::Reverse),
+            SetAttribute(Attribute::NoReverse)
+        )));
+        assert_eq!(entry.text, "let 雪=1;");
+        let mut mono = Vec::new();
+        paint_styled_row(&mut mono, &entry, None, true).unwrap();
+        assert_eq!(String::from_utf8(mono).unwrap(), "let 雪=1;");
+    }
+    #[test]
+    fn syntax_actual_viewport_paints_theme_foregrounds_and_monochrome_keeps_plain_text() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        let palette = ForegroundPalette {
+            link: Color::Rgb {
+                r: 10,
+                g: 180,
+                b: 220,
+            },
+            diff_add: Color::Rgb {
+                r: 40,
+                g: 220,
+                b: 150,
+            },
+            ..Default::default()
+        };
+        renderer.set_foreground_palette(palette);
+        renderer.feed_mut().push_block(
+            BlockStyle::Agent,
+            "```rust\nlet s = \"雪\";\n```\n```diff\n-old\n+new\n```\n",
+        );
+        renderer.render_viewport().unwrap();
+        let painted = renderer.captured_output();
+        // Crossterm's process-level NO_COLOR may suppress ANSI independently of
+        // the renderer's monochrome setting. Typed role assertions still apply.
+        if SetForegroundColor(palette.link)
+            .to_string()
+            .contains("38;2;")
+        {
+            assert!(painted.contains("\x1b[38;2;10;180;220m"));
+            assert!(painted.contains("\x1b[38;2;40;220;150m"));
+            assert!(painted.contains(&SetForegroundColor(palette.diff_del).to_string()));
+        }
+        let rows = renderer.feed().lines(120);
+        assert!((0..rows.len()).any(|i| rows[i].text.contains("雪")));
+        assert!(
+            (0..rows.len())
+                .filter_map(|i| rows[i].syntax_spans.as_ref())
+                .any(|spans| spans.iter().any(|s| s.color == palette.link))
+        );
+        assert!(
+            (0..rows.len())
+                .filter_map(|i| rows[i].syntax_spans.as_ref())
+                .any(|spans| spans.iter().any(|s| s.color == palette.diff_add))
+        );
+        renderer.capture_bytes().lock().unwrap().clear();
+        renderer.set_monochrome(true);
+        renderer.render_viewport().unwrap();
+        let mono = renderer.captured_output();
+        assert!(!mono.contains("\x1b[38;2;10;180;220m"));
+        assert!(!mono.contains("\x1b[38;2;40;220;150m"));
+        assert!(mono.contains("雪"));
+        let plain = renderer.feed().lines(120);
+        assert!((0..plain.len()).all(|i| plain[i].syntax_spans.is_none()));
+    }
+    #[test]
+    fn syntax_url_spans_preserve_existing_complete_osc8_links() {
+        let lines = crate::ui::markdown::markdown_to_styled(
+            "```rust\nlet s=https://example.test/path;\n```",
+            80,
+        );
+        let entry = lines
+            .iter()
+            .find(|row| row.text.contains("https://"))
+            .unwrap();
+        let mut painted = Vec::new();
+        paint_styled_row(&mut painted, entry, None, false).unwrap();
+        let painted = String::from_utf8(painted).unwrap();
+        assert!(painted.contains("\x1b]8;;https://example.test/path;\x1b\\"));
+        assert_eq!(sanitize_output(&painted), entry.text);
+    }
+    #[test]
+    fn syntax_invalid_byte_ranges_use_the_complete_plain_fallback() {
+        let entry = LineEntry {
+            text: "雪".into(),
+            color: Color::White,
+            syntax_spans: Some(
+                vec![TokenSpan {
+                    range: 1..2,
+                    color: Color::Red,
+                }]
+                .into(),
+            ),
+        };
+        let mut painted = Vec::new();
+        paint_styled_row(&mut painted, &entry, None, false).unwrap();
+        assert_eq!(String::from_utf8(painted).unwrap(), "雪");
     }
 }
