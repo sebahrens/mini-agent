@@ -67,6 +67,15 @@ make a failing provider be retried more often or waited on longer. Every
 `initial_backoff_ms <= max_backoff_ms`; each clamped field prints a startup
 warning naming the field, the value now in effect, and the file it came from.
 
+Project and private trust readers accept bounded UTF-8 regular files through
+retained workspace/private-file handles; FIFOs, oversize files, links and stale
+workspace identities cannot supply approval. The existing Windows default
+`platform-paths` job now discovers and runs exactly the two native bounded
+project-trust controls, including hardlinked private trust-store rejection and
+exact schema/content-bound approval. Native acceptance remains pending until
+that hosted step passes; successful unrelated path or sandbox tests do not
+substitute for these readers.
+
 Trusted project specialist definitions and the append-only
 `.zerostack/agents/.notes.md` layer use this same content-and-path-bound trust
 decision. They remain inert in untrusted, headless, or copied checkouts even

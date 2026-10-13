@@ -1189,5 +1189,73 @@ class BubblewrapInstallerTests(unittest.TestCase):
                     self.assertIn("bubblewrap fixture", completed.stdout)
 
 
+
+class WindowsBoundedProjectTrustCiTests(unittest.TestCase):
+    """The changed Windows readers need native execution, not compile-only coverage."""
+
+    @staticmethod
+    def validate(workflow: str) -> str:
+        job = job_body(workflow, "platform-paths")
+        name = "Test native Windows bounded project trust readers"
+        if job.count("- name: " + name) != 1:
+            raise AssertionError("one owning native bounded trust step is required")
+        step = job.split("- name: " + name, 1)[1].split("- name:", 1)[0]
+        required = [
+            "if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'",
+            "shell: pwsh",
+            "$filter = 'config::load::bounded_project_trust_tests::'",
+            "cargo test --locked --bin mini-agent $filter -- --list 2>&1",
+            "$actual.Count -ne 2",
+            "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
+            "'^config::load::bounded_project_trust_tests::.*: test$'",
+            "cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1",
+        ]
+        for fragment in required:
+            if fragment not in step:
+                raise AssertionError("missing native bounded trust guard: " + fragment)
+        expected = {
+            "bounded_config_and_private_state_reject_size_utf8_links_and_keep_mode_repair",
+            "bounded_trust_preserves_exact_schema_hash_and_sensitive_application",
+        }
+        actual = re.findall(r"'config::load::bounded_project_trust_tests::(\w+): test'", step)
+        if len(actual) != 2 or set(actual) != expected:
+            raise AssertionError("exact two changed Windows reader controls are required")
+        if step.count("if ($LASTEXITCODE -ne 0)") != 2 or step.count("throw ") != 3:
+            raise AssertionError("discovery, exact set and native proof must fail closed")
+        if "--ignored" in step or "continue-on-error" in step or "cargo build" in step:
+            raise AssertionError("native trust proof cannot be replaced or waived")
+        return step
+
+    def test_existing_windows_default_job_executes_exact_changed_readers(self) -> None:
+        self.validate(WORKFLOW.read_text())
+
+    def test_missing_or_weakened_reader_discovery_is_rejected(self) -> None:
+        original = WORKFLOW.read_text()
+        for before, after in [
+            ("Test native Windows bounded project trust readers", "Removed bounded trust proof"),
+            ("$actual.Count -ne 2", "$actual.Count -lt 0"),
+            ("Compare-Object -ReferenceObject $expected -DifferenceObject $actual", "$null"),
+            ("--bin mini-agent $filter -- --list", "--bin mini-agent $filter"),
+            ("bounded_trust_preserves_exact_schema_hash_and_sensitive_application: test", "other_reader: test"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(original.replace(before, after))
+
+    def test_native_execution_scope_and_failure_checks_cannot_be_widened(self) -> None:
+        original = WORKFLOW.read_text()
+        name = "Test native Windows bounded project trust readers"
+        prefix, suffix = original.split("- name: " + name, 1)
+        step, rest = suffix.split("- name:", 1)
+        for before, after in [
+            ("if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "if: matrix.os == 'windows-latest'"),
+            ("--bin mini-agent $filter -- --nocapture --test-threads=1", "--bin mini-agent -- --nocapture --test-threads=1"),
+            ("if ($LASTEXITCODE -ne 0)", "if ($LASTEXITCODE -lt 0)"),
+            ("--nocapture --test-threads=1", "--ignored --nocapture --test-threads=1"),
+            ("throw 'Native Windows bounded project trust proof failed'", "Write-Host 'Native Windows bounded project trust proof failed'"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
+
+
 if __name__ == "__main__":
     unittest.main()

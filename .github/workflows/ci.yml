@@ -2187,6 +2187,24 @@ jobs:
           cargo test --locked ${{ matrix.feature.args }} config_persistence_permissions
           cargo test --locked ${{ matrix.feature.args }} session_storage_permissions
 
+      - name: Test native Windows bounded project trust readers
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $filter = 'config::load::bounded_project_trust_tests::'
+          $expected = @(
+            'config::load::bounded_project_trust_tests::bounded_config_and_private_state_reject_size_utf8_links_and_keep_mode_repair: test',
+            'config::load::bounded_project_trust_tests::bounded_trust_preserves_exact_schema_hash_and_sensitive_application: test'
+          )
+          $discovered = cargo test --locked --bin mini-agent $filter -- --list 2>&1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows bounded project trust discovery failed' }
+          $actual = @($discovered | Where-Object { $_ -match '^config::load::bounded_project_trust_tests::.*: test$' })
+          if ($actual.Count -ne 2 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Exact two Windows bounded project trust tests were not discovered'
+          }
+          cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows bounded project trust proof failed' }
+
       - name: Test MCP OAuth credential storage
         if: matrix.feature.mcp
         shell: bash
