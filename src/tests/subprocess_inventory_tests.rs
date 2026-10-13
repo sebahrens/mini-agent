@@ -871,8 +871,9 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App selection test uses std::thread, not a subprocess.
+    // Owned fixed-stack App picker and ordinary-event tests use std::thread.
     ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",
@@ -4158,8 +4159,9 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App selection test uses std::thread, not a subprocess.
+    // Owned fixed-stack App picker and ordinary-event tests use std::thread.
     ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",

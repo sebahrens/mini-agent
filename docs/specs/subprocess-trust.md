@@ -11,6 +11,14 @@ controls how mini-agent selects a subprocess boundary and records the authority 
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
 
+## App thread regression inventory
+
+The fixed 1 MiB App picker and ordinary-event regressions create owned Rust
+threads and join them before fixture teardown. Their exact `.spawn(|| ...)` and
+`.spawn(move || ...)` sites are classified as non-process operations in the
+checked inventory and Windows creation-boundary catalogue; all process
+negative controls remain unchanged.
+
 ## 2026-09-06 inventory reconciliation
 
 The `TC-MODEL-ACTION` row includes the delivered general-profile hardening: captured commands use
