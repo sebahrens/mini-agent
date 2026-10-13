@@ -2312,7 +2312,6 @@ mod windows_native_pr_tests {
         #[cfg(feature = "hooks")]
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         use crate::agent::tools::bash::{ForegroundResult, ShellTool};
-        use rig::tool::Tool;
         let fixture = Fixture::new("success");
         let tool = ShellTool::new(
             Some(fixture.checker(Action::Allow)),
@@ -2331,7 +2330,8 @@ mod windows_native_pr_tests {
             let scope = crate::agent::runner::AgentWorkScope::new();
             let result = scope
                 .run(async {
-                    tool.call_structured(
+                    rig::tool::Tool::call_structured(
+                        &tool,
                         crate::agent::tools::BashArgs {
                             command: command.clone(),
                             timeout: None,
@@ -2365,11 +2365,14 @@ mod windows_native_pr_tests {
 
     struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
     impl ProcessHandle {
+        #[allow(unsafe_code)]
         fn capture(pid: u32) -> Self {
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
                 PROCESS_TERMINATE,
             };
+            // SAFETY: OpenProcess takes a numeric PID, has no borrowed pointers,
+            // and returns an owned handle that this wrapper closes exactly once.
             let handle = unsafe {
                 OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
@@ -2383,7 +2386,10 @@ mod windows_native_pr_tests {
             );
             Self(handle)
         }
+        #[allow(unsafe_code)]
         fn exited(&self) -> bool {
+            // SAFETY: capture checked this owned handle is valid; &self keeps it
+            // alive during the nonblocking query, and Drop is the only closer.
             unsafe {
                 windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 0)
                     == windows_sys::Win32::Foundation::WAIT_OBJECT_0
@@ -2391,7 +2397,10 @@ mod windows_native_pr_tests {
         }
     }
     impl Drop for ProcessHandle {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
+            // SAFETY: this is the exact retained fixture child handle, owned by
+            // this wrapper. Query/terminate/wait precede its one CloseHandle.
             unsafe {
                 if !self.exited() {
                     // Assertion failures still clean the exact retained child;
