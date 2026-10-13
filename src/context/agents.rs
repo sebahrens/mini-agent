@@ -538,11 +538,11 @@ fn warn_metadata(name: &str, source: &AgentDefinitionSource, metadata: &AgentMet
     }
 }
 
-fn project_definitions_trusted(paths: &crate::paths::AppPaths) -> bool {
-    crate::config::load::project_config_is_trusted(
-        paths.project_config_file().as_deref(),
-        &paths.project_config_trust_file(),
-    )
+fn project_definitions_trusted(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    crate::config::load::project_config_is_trusted_in_workspace(paths, workspace)
 }
 
 fn merge_project_definitions(
@@ -743,7 +743,7 @@ fn load_for_paths_and_workspace(
     let mut agents = load_base(paths);
     let trusted = paths
         .with_workspace_root(workspace.root())
-        .map(|paths| project_definitions_trusted(&paths))
+        .map(|paths| project_definitions_trusted(&paths, workspace))
         .unwrap_or(false);
     if trusted {
         for layer in PROJECT_AGENT_LAYERS {
@@ -845,7 +845,7 @@ pub(crate) fn source_hint_for_workspace(
     if let Some(workspace) = workspace {
         let trusted = paths
             .with_workspace_root(workspace.root())
-            .map(|paths| project_definitions_trusted(&paths))
+            .map(|paths| project_definitions_trusted(&paths, workspace))
             .unwrap_or(false);
         if trusted {
             for layer in PROJECT_AGENT_LAYERS.into_iter().rev() {

@@ -313,7 +313,7 @@ fn resolve_model_pricing_from_listing(
                 .filter(|(_, quick)| quick.provider == provider && quick.model == model_id)
                 // Multiple aliases for one raw id resolve deterministically.
                 .min_by(|(a, _), (b, _)| a.cmp(b))
-                .map(|(_, quick)| (quick.input_token_cost, quick.output_token_cost))
+                .and_then(|(_, quick)| quick.resolved_prices())
         })
 }
 
@@ -322,9 +322,7 @@ fn apply_model_pricing(
     model_id: &str,
     pricing: Option<(f64, f64)>,
 ) -> Option<String> {
-    let (input, output) = pricing.unwrap_or((0.0, 0.0));
-    session.input_token_cost = input;
-    session.output_token_cost = output;
+    session.set_input_output_prices(pricing);
     pricing.is_none().then(|| format!(
         "no pricing known for {model_id}; costs will not be tracked (set input_token_cost/output_token_cost in a quick model)"
     ))
@@ -512,6 +510,13 @@ pub(crate) fn resolve_model_target<'a>(
     }
 }
 
+fn quick_price_notice(quick: &config::QuickModelConfig) -> String {
+    quick.resolved_prices().map_or_else(
+        || "pricing unknown".to_owned(),
+        |(input, output)| format!("${input:.4}/M in  ${output:.4}/M out"),
+    )
+}
+
 async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
     let qm = config::quick_models_map(ctx.cfg);
     match resolve_model_target(arg, &qm) {
@@ -520,22 +525,19 @@ async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
             ctx.switch_client(&q.provider)?;
             apply_model(ctx, &q.model).await;
             // preserve v1.4.x pricing/cost tracking
-            ctx.session.input_token_cost = q.input_token_cost;
-            ctx.session.output_token_cost = q.output_token_cost;
+            let input_price = q.resolved_prices().map(|prices| prices.0).unwrap_or(0.0);
+            ctx.session.set_input_output_prices(q.resolved_prices());
             ctx.session
                 .set_cache_prices(crate::pricing::cache_prices_for_model(
                     &q.provider,
                     &q.model,
                     ctx.cfg,
                     Some(name),
-                    q.input_token_cost,
+                    input_price,
                 ));
             write_result(
                 ctx.renderer,
-                format!(
-                    "  quick model {} — ${:.4}/M in  ${:.4}/M out",
-                    name, q.input_token_cost, q.output_token_cost
-                ),
+                format!("  quick model {} — {}", name, quick_price_notice(q)),
             );
         }
         ModelTarget::Raw(id) => apply_model(ctx, id).await,
@@ -591,8 +593,11 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                     write_result(
                         ctx.renderer,
                         format!(
-                            "  {}  ({} / {})  ${:.4}/M in  ${:.4}/M out",
-                            name, q.provider, q.model, q.input_token_cost, q.output_token_cost
+                            "  {}  ({} / {})  {}",
+                            name,
+                            q.provider,
+                            q.model,
+                            quick_price_notice(q)
                         ),
                     );
                 }
@@ -652,10 +657,7 @@ async fn handle_models_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Re
         Ok(()) => {
             write_ok(
                 ctx.renderer,
-                format!(
-                    "saved quick model: {} ({} / {})  ${}/M in  ${}/M out",
-                    name, provider, model, input_cost, output_cost
-                ),
+                format!("saved quick model: {} ({} / {})", name, provider, model),
             );
         }
         Err(e) => {
@@ -665,7 +667,9 @@ async fn handle_models_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Re
     Ok(())
 }
 
-fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<(&'a str, &'a str, &'a str, f64, f64), ()> {
+type ModelAddArgs<'a> = (&'a str, &'a str, &'a str, Option<f64>, Option<f64>);
+
+fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<ModelAddArgs<'a>, ()> {
     if !matches!(parts.len(), 4 | 6) || parts.first() != Some(&"/models-add") {
         return Err(());
     }
@@ -675,9 +679,9 @@ fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<(&'a str, &'a str, &'a s
         if !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0 {
             return Err(());
         }
-        (input, output)
+        (Some(input), Some(output))
     } else {
-        (0.0, 0.0)
+        (None, None)
     };
     Ok((parts[1], parts[2], parts[3], input_cost, output_cost))
 }
@@ -737,8 +741,11 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
                 write_result(
                     ctx.renderer,
                     format!(
-                        "  {}  ({} / {})  ${:.4}/M in  ${:.4}/M out",
-                        name, q.provider, q.model, q.input_token_cost, q.output_token_cost
+                        "  {}  ({} / {})  {}",
+                        name,
+                        q.provider,
+                        q.model,
+                        quick_price_notice(q)
                     ),
                 );
             }
@@ -772,8 +779,11 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
         write_ok(
             ctx.renderer,
             format!(
-                "switched subagent to quick model: {} ({} / {})  ${:.4}/M in  ${:.4}/M out",
-                name, q.provider, q.model, q.input_token_cost, q.output_token_cost
+                "switched subagent to quick model: {} ({} / {})  {}",
+                name,
+                q.provider,
+                q.model,
+                quick_price_notice(q)
             ),
         );
     } else {
@@ -967,6 +977,18 @@ mod models_add_tests {
     use super::parse_models_add;
 
     #[test]
+    fn quick_model_price_presence_models_add_omitted_rates_stay_absent() {
+        assert_eq!(
+            parse_models_add(&["/models-add", "paid", "anthropic", "claude-sonnet-5-5"]),
+            Ok(("paid", "anthropic", "claude-sonnet-5-5", None, None))
+        );
+        assert_eq!(
+            parse_models_add(&["/models-add", "free", "gateway", "unlisted", "0", "0"]),
+            Ok(("free", "gateway", "unlisted", Some(0.0), Some(0.0)))
+        );
+    }
+
+    #[test]
     fn parses_optional_cost_pair_without_corrupting_model_id() {
         assert_eq!(
             parse_models_add(&[
@@ -977,7 +999,7 @@ mod models_add_tests {
                 "1.5",
                 "2.75"
             ]),
-            Ok(("fast", "openrouter", "org/model", 1.5, 2.75))
+            Ok(("fast", "openrouter", "org/model", Some(1.5), Some(2.75)))
         );
     }
 

@@ -355,6 +355,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
 | Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
 | Update-cache fixtures | `MINI_AGENT_TEST_UPDATE_ADMISSION`, `MINI_AGENT_TEST_UPDATE_NOW`: test-only child cache path and controlled timestamp for cross-process release-check admission; never read by production update checks. |
+| Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
@@ -3198,3 +3199,26 @@ With `-v`, the following subsystems produce debug/trace output:
 - **Memory**: store open, write operations (target/bytes), searches, tool entry points
 - **Advisor**: initialization (model, enabled, max uses), tool call prompts
 - **Filesystem**: atomic write paths and byte counts
+
+Quick-model `input_token_cost` and `output_token_cost` are optional USD-per-million
+rates. An omitted tier inherits the existing model catalogue price when known;
+an explicitly configured `0` means a free tier. Saving and reloading config keeps
+omitted tiers absent. An unlisted model with an omitted tier remains unpriced.
+Negative and non-finite declared rates are rejected. Cache rates remain separate,
+so a free base rate can still have a paid native Anthropic cache tier.
+
+
+Project config and trust-file reads reject special files and symlinks instead
+of waiting for a writer. Project config text is limited to 256 KiB; private
+global config and trust state are limited to 1 MiB each and must contain UTF-8.
+The private trust store must already have private file permissions; an owned
+global config still receives the existing private-permission repair. Hardlinked
+private files are rejected. Existing canonical project/config paths and the
+SHA-256 of the complete accepted config bytes still define an approval;
+editing those bytes invalidates it. Project prompt and specialist discovery
+use their session's captured workspace rather than accepting a replacement
+root at the old pathname. Project prompt directories accept at most 128
+Markdown definitions and 1024 entries per layer, with a 256 KiB limit per
+prompt; oversized, invalid UTF-8, link, and special-file definitions are
+omitted with a diagnostic. Global prompt/specialist aliases retain their
+existing compatibility policy.

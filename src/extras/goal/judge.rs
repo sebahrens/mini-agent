@@ -594,19 +594,7 @@ pub fn judge_prices(
         .filter(|entry| matches(entry))
         .into_iter()
         .chain(quick.values().filter(|entry| matches(entry)))
-        .find_map(|entry| {
-            let prices = (entry.input_token_cost, entry.output_token_cost);
-            known(prices).or_else(|| {
-                (prices == (0.0, 0.0)
-                    && cfg.is_anthropic_native(&entry.provider)
-                    && crate::pricing::CachePrices {
-                        read: entry.cache_read_token_cost,
-                        write: entry.cache_write_token_cost,
-                    }
-                    .has_valid_tier())
-                .then_some(prices)
-            })
-        })
+        .find_map(|entry| entry.resolved_prices())
         .or_else(|| {
             crate::config::Config::catalog_input_output_cost(&resolved.provider, &resolved.model)
                 .and_then(known)
@@ -736,8 +724,8 @@ mod tests {
                 QuickModelConfig {
                     provider: (*provider).into(),
                     model: (*model).into(),
-                    input_token_cost: 0.0,
-                    output_token_cost: 0.0,
+                    input_token_cost: None,
+                    output_token_cost: None,
                     cache_read_token_cost: None,
                     cache_write_token_cost: None,
                     reserve_tokens: None,
@@ -1151,8 +1139,8 @@ mod tests {
         let mut cfg = cfg_with(&[("cheap", "anthropic", "small"), ("free", "local", "tiny")]);
         let quick = cfg.quick_models.as_mut().unwrap();
         let cheap = quick.get_mut("cheap").unwrap();
-        cheap.input_token_cost = 0.25;
-        cheap.output_token_cost = 1.25;
+        cheap.input_token_cost = Some(0.25);
+        cheap.output_token_cost = Some(1.25);
 
         let session = resolve(&JudgePolicy::Session, &cfg, "openai", "big").unwrap();
         assert_eq!(judge_prices(&session, &cfg, (5.0, 15.0)), Some((5.0, 15.0)));

@@ -169,14 +169,15 @@ pub(crate) fn cache_prices_for_model(
             })
             .or_else(|| {
                 let entry = matching?;
-                if !entry.input_token_cost.is_finite()
-                    || entry.input_token_cost <= 0.0
+                let entry_input_price = entry.resolved_prices()?.0;
+                if !entry_input_price.is_finite()
+                    || entry_input_price <= 0.0
                     || !input_price.is_finite()
                     || input_price <= 0.0
                 {
                     return None;
                 }
-                let price = get(entry)? / entry.input_token_cost * input_price;
+                let price = get(entry)? / entry_input_price * input_price;
                 valid_price(price).then_some(price)
             })
     };

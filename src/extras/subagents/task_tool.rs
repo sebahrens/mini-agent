@@ -708,7 +708,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             &runtime.provider_name
         };
         let input_price = selected
-            .map(|entry| entry.input_token_cost)
+            .and_then(|entry| entry.resolved_prices().map(|price| price.0))
             .or_else(|| {
                 crate::config::Config::catalog_input_output_cost(
                     catalog_provider,
@@ -721,7 +721,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .iter()
                     .filter(|(_, entry)| matches(entry))
                     .min_by(|(a, _), (b, _)| a.cmp(b))
-                    .map(|(_, entry)| entry.input_token_cost)
+                    .and_then(|(_, entry)| entry.resolved_prices().map(|price| price.0))
             })
             .unwrap_or(0.0);
         let cache_multipliers = crate::pricing::cache_prices_for_model(
@@ -2085,8 +2085,8 @@ mod tests {
             crate::config::QuickModelConfig {
                 provider: CompactString::new("openai"),
                 model: CompactString::new("test/reviewer"),
-                input_token_cost: 0.0,
-                output_token_cost: 0.0,
+                input_token_cost: Some(0.0),
+                output_token_cost: Some(0.0),
                 cache_read_token_cost: None,
                 cache_write_token_cost: None,
                 reserve_tokens: None,

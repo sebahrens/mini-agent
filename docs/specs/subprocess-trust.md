@@ -430,8 +430,11 @@ syntactically proven task/thread or local associated `spawn` calls are excluded;
 unrecognized terminals fail closed. The learned-skill reevaluation branch
 `matches!(status.as_str(), "verified" | "awaiting_approval")` compares a database status string;
 its exact source expression and full macro-context digest are classified `NON-PROCESS`.
-The pricing metadata assertions in `startup.rs` compare numeric `output` values,
-and the task scheduler's `FakeStep` vectors contain response data fields named
+The pricing metadata assertions in `startup.rs` and `session/title.rs` compare
+numeric `output` values. The setup renderer's price-pair closure also binds
+`output` as a numeric rate inside its formatting macro. Their exact expressions
+and full macro-context digests are classified `NON-PROCESS`.
+The task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
 `NON-PROCESS`. The ACP cancellation test uses the state-aware process helper;
 its system `ps` fallback and owned control process are `TEST-ONLY`. Configured-hook

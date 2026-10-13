@@ -35,7 +35,7 @@ fn resolve_startup_model_pricing(
     openrouter_model: Option<&str>,
 ) -> Option<(f64, f64)> {
     if let Some(quick) = cli.resolve_quick_model(cfg) {
-        return Some((quick.input_token_cost, quick.output_token_cost));
+        return quick.resolved_prices();
     }
     // A selected config alias carries operator pricing, just like /models or
     // /provider. A CLI/raw environment override selects raw-id pricing even
@@ -48,7 +48,7 @@ fn resolve_startup_model_pricing(
             && quick.provider == provider
             && quick.model == model
         {
-            return Some((quick.input_token_cost, quick.output_token_cost));
+            return quick.resolved_prices();
         }
     }
     crate::ui::slash::resolve_model_pricing(provider, model, cfg)
@@ -263,11 +263,9 @@ fn apply_resume_provider_decision(
         saved.provider != target.provider,
     );
     let qm = config::quick_models_map(cfg);
-    let (input, output) =
-        crate::ui::slash::resolve_model_pricing(&target.provider, &target.model, cfg)
-            .unwrap_or((0.0, 0.0));
-    session.input_token_cost = input;
-    session.output_token_cost = output;
+    let prices = crate::ui::slash::resolve_model_pricing(&target.provider, &target.model, cfg);
+    session.set_input_output_prices(prices);
+    let input = session.input_token_cost;
     session.set_cache_prices(crate::pricing::cache_prices_for_model(
         &target.provider,
         &target.model,
@@ -367,14 +365,14 @@ fn apply_startup_prompt_model(
     *model = qmc.model.clone();
     session.model = qmc.model.clone();
     session.provider = qmc.provider.clone();
-    session.input_token_cost = qmc.input_token_cost;
-    session.output_token_cost = qmc.output_token_cost;
+    let input_price = qmc.resolved_prices().map(|prices| prices.0).unwrap_or(0.0);
+    session.set_input_output_prices(qmc.resolved_prices());
     session.set_cache_prices(crate::pricing::cache_prices_for_model(
         &qmc.provider,
         &qmc.model,
         cfg,
         Some(qm_name),
-        qmc.input_token_cost,
+        input_price,
     ));
     session.update_context_window(cfg.resolve_context_window(
         &session.provider,
@@ -756,9 +754,8 @@ fn apply_openrouter_pricing_refresh_result(
     let Some(info) = infos.get(session.model.as_str()) else {
         return;
     };
-    if refresh.need_pricing && session.input_token_cost == 0.0 && session.output_token_cost == 0.0 {
-        session.input_token_cost = info.input_cost;
-        session.output_token_cost = info.output_cost;
+    if refresh.need_pricing && session.known_input_output_prices().is_none() {
+        session.set_input_output_prices(Some((info.input_cost, info.output_cost)));
     }
     if refresh.need_context
         && session.context_window == refresh.initial_context_window
@@ -847,10 +844,7 @@ impl Startup {
             &model,
             std::env::var("OPENROUTER_MODEL").ok().as_deref(),
         );
-        if let Some((input, output)) = costs {
-            session.input_token_cost = input;
-            session.output_token_cost = output;
-        }
+        session.set_input_output_prices(costs);
         session.set_cache_prices(resolve_startup_cache_prices(
             &cli,
             &cfg,
@@ -1197,8 +1191,7 @@ impl Startup {
         if self.provider != "openrouter" {
             return;
         }
-        let need_pricing =
-            self.session.input_token_cost == 0.0 && self.session.output_token_cost == 0.0;
+        let need_pricing = self.session.known_input_output_prices().is_none();
         let need_context = needs_openrouter_context_refresh(&self.cfg, self.model.as_str());
         if !need_pricing && !need_context {
             return;
@@ -2783,6 +2776,39 @@ mod tests {
     /// A refused containment preflight must reach the startup banner with its
     /// reason intact, and a healthy (or not-compiled) runtime must add nothing.
     #[test]
+    fn quick_model_price_presence_startup_selected_alias_charges_paid_catalogue() {
+        let cfg: Config = toml::from_str("provider='anthropic'\nmodel='paid'\n[quick_models.paid]\nprovider='anthropic'\nmodel='claude-sonnet-5-5'").unwrap();
+        let expected = Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5").unwrap();
+        for cli in [
+            Cli::default(),
+            Cli {
+                quick_model: Some("paid".into()),
+                ..Default::default()
+            },
+        ] {
+            let prices = super::resolve_startup_model_pricing(
+                &cli,
+                &cfg,
+                "anthropic",
+                "claude-sonnet-5-5",
+                None,
+            );
+            assert_eq!(prices, Some(expected));
+            let mut session = Session::new("anthropic", "claude-sonnet-5-5", 1_000_000, "");
+            session.set_input_output_prices(prices);
+            session.charge_usage_delta(
+                crate::event::UsageDelta {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+                true,
+            );
+            assert_eq!(session.total_cost, expected.0 + expected.1);
+        }
+    }
+
+    #[test]
     fn js_runtime_banner_names_the_verbatim_containment_reason() {
         use crate::provider::{
             JS_RUNTIME_PROBE_PENDING_REASON, JsRuntimeReport, RuntimeAvailability,
@@ -3727,8 +3753,8 @@ mod tests {
                 crate::config::QuickModelConfig {
                     provider: "openrouter".into(),
                     model: "uncatalogued/model".into(),
-                    input_token_cost: 0.0,
-                    output_token_cost: 0.0,
+                    input_token_cost: Some(0.0),
+                    output_token_cost: Some(0.0),
                     cache_read_token_cost: None,
                     cache_write_token_cost: None,
                     reserve_tokens: None,

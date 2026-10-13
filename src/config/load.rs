@@ -5,7 +5,7 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::io::{self, Read};
+use std::io;
 
 use crate::config::keys;
 use crate::config::{
@@ -16,6 +16,9 @@ use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
 
 const PROJECT_CONFIG_TRUST_SCHEMA: u32 = 1;
+const MAX_PROJECT_CONFIG_BYTES: usize = 256 * 1024;
+const MAX_PRIVATE_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_PROJECT_TRUST_BYTES: usize = 1024 * 1024;
 
 /// Project-local keys that cannot launch a process, select an executable
 /// integration/provider, or weaken an authorization boundary. Every other
@@ -277,10 +280,7 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
         )
     })?;
     crate::fs::ensure_private_directory(parent)?;
-    let mut file = crate::fs::open_private_file(path)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    read_private_content(path, MAX_PRIVATE_CONFIG_BYTES, false)
 }
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
@@ -425,8 +425,8 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
         QuickModelConfig {
             provider: CompactString::new("openrouter"),
             model: CompactString::new("deepseek/deepseek-v4-flash"),
-            input_token_cost: 0.0983,
-            output_token_cost: 0.1966,
+            input_token_cost: Some(0.0983),
+            output_token_cost: Some(0.1966),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             reserve_tokens: None,
@@ -440,8 +440,8 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
         QuickModelConfig {
             provider: CompactString::new("openrouter"),
             model: CompactString::new("deepseek/deepseek-v4-pro"),
-            input_token_cost: 0.435,
-            output_token_cost: 0.87,
+            input_token_cost: Some(0.435),
+            output_token_cost: Some(0.87),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             reserve_tokens: None,
@@ -461,8 +461,8 @@ pub fn save_quick_model(
     name: &str,
     provider: &str,
     model: &str,
-    input_token_cost: f64,
-    output_token_cost: f64,
+    input_token_cost: Option<f64>,
+    output_token_cost: Option<f64>,
 ) -> std::io::Result<()> {
     let path = resolve_config_path();
     let mut cfg: Config = if path_entry_exists(&path)? {
@@ -876,10 +876,184 @@ fn project_config_binding(path: &Path, content: &str) -> Result<ProjectConfigTru
     })
 }
 
+/// Read one bounded private file while retaining its parent and exact inode.
+/// The ordinary private opener still owns UID, permission repair, DACL and
+/// descriptor-identity checks; it cannot authorize a different captured file.
+fn read_private_content(
+    path: &Path,
+    max_bytes: usize,
+    require_private_mode: bool,
+) -> io::Result<String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("private file has no parent"))?;
+    if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private directory is a link",
+        ));
+    }
+    crate::fs::ensure_private_directory(parent)?;
+    let directory = crate::paths::WorkspaceBinding::capture(parent)?;
+    let name = Path::new(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("private file has no name"))?,
+    );
+    directory.validate().map_err(io::Error::other)?;
+    let file = directory.open_regular_relative(name)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        if metadata.uid() != crate::fs::private_current_uid()
+            || metadata.nlink() != 1
+            || (require_private_mode && metadata.mode() & 0o077 != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file authority is invalid",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_private_mode;
+    #[cfg(windows)]
+    if crate::fs::windows_file_link_count(&file)? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file is hardlinked",
+        ));
+    }
+    let private = crate::fs::open_private_file(path)?;
+    crate::fs::ensure_same_file(
+        path,
+        &crate::fs::checked_file_metadata(&file)?,
+        &crate::fs::checked_file_metadata(&private)?,
+    )?;
+    let content = bounded_config_text(private, max_bytes)?;
+    let current = directory.open_regular_relative(name)?;
+    crate::fs::ensure_same_file(
+        path,
+        &crate::fs::checked_file_metadata(&file)?,
+        &crate::fs::checked_file_metadata(&current)?,
+    )?;
+    directory.validate().map_err(io::Error::other)?;
+    if parent.canonicalize()? != directory.root()
+        || std::fs::symlink_metadata(parent)?.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private directory changed during read",
+        ));
+    }
+    Ok(content)
+}
+
+fn bounded_config_text(file: std::fs::File, max_bytes: usize) -> io::Result<String> {
+    match crate::paths::read_utf8_bounded_status(file, max_bytes)? {
+        crate::paths::BoundedUtf8Read::Content(content) => Ok(content),
+        crate::paths::BoundedUtf8Read::Oversized => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("configuration exceeds {max_bytes} bytes"),
+        )),
+        crate::paths::BoundedUtf8Read::InvalidUtf8 => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration is not valid UTF-8",
+        )),
+    }
+}
+
+fn read_project_config_text_in_workspace(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+) -> io::Result<String> {
+    workspace.validate().map_err(io::Error::other)?;
+    let file = workspace.open_regular_relative(relative)?;
+    let identity = crate::fs::checked_file_metadata(&file)?;
+    let content = bounded_config_text(file, MAX_PROJECT_CONFIG_BYTES)?;
+    let path = workspace.root().join(relative);
+    let canonical_config = path.canonicalize()?;
+    let current = workspace.open_regular_relative(relative)?;
+    crate::fs::ensure_same_file(
+        &path,
+        &identity,
+        &crate::fs::checked_file_metadata(&current)?,
+    )?;
+    workspace.validate().map_err(io::Error::other)?;
+    if canonical_config != path {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project config identity changed",
+        ));
+    }
+    Ok(content)
+}
+
+fn checked_project_config_binding(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    content: &str,
+) -> Result<ProjectConfigTrustBinding, String> {
+    let binding = project_config_binding(&workspace.root().join(relative), content)?;
+    workspace.validate()?;
+    if Path::new(&binding.canonical_project) != workspace.root()
+        || Path::new(&binding.canonical_config) != workspace.root().join(relative)
+    {
+        return Err("project config trust identity changed".to_string());
+    }
+    Ok(binding)
+}
+
+fn read_project_config_in_workspace(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+) -> io::Result<(String, ProjectConfigTrustBinding)> {
+    let content = read_project_config_text_in_workspace(workspace, relative)?;
+    let binding =
+        checked_project_config_binding(workspace, relative, &content).map_err(io::Error::other)?;
+    Ok((content, binding))
+}
+
+fn capture_project_config(path: &Path) -> io::Result<(crate::paths::WorkspaceBinding, PathBuf)> {
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("project config has no root"))?;
+    let workspace = crate::paths::WorkspaceBinding::capture(root)?;
+    let relative = Path::new(
+        path.parent()
+            .and_then(Path::file_name)
+            .ok_or_else(|| io::Error::other("project config has no directory"))?,
+    )
+    .join(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("project config has no name"))?,
+    );
+    Ok((workspace, relative))
+}
+
+fn captured_project_config_content(
+    path: &Path,
+) -> io::Result<(crate::paths::WorkspaceBinding, PathBuf, String)> {
+    let (workspace, relative) = capture_project_config(path)?;
+    let content = read_project_config_text_in_workspace(&workspace, &relative)?;
+    Ok((workspace, relative, content))
+}
+
+fn read_project_config_content(path: &Path) -> io::Result<String> {
+    captured_project_config_content(path).map(|(_, _, content)| content)
+}
+
+#[cfg(test)]
+fn read_project_config(path: &Path) -> io::Result<(String, ProjectConfigTrustBinding)> {
+    let (workspace, relative) = capture_project_config(path)?;
+    read_project_config_in_workspace(&workspace, &relative)
+}
+
 fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustStore> {
-    let mut file = match crate::fs::open_private_file(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let content = match read_private_content(path, MAX_PROJECT_TRUST_BYTES, true) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ProjectConfigTrustStore {
                 schema: PROJECT_CONFIG_TRUST_SCHEMA,
                 bindings: Vec::new(),
@@ -887,8 +1061,6 @@ fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustS
         }
         Err(error) => return Err(error),
     };
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
     let store: ProjectConfigTrustStore = serde_json::from_str(&content)
         .map_err(|_| std::io::Error::other("project config trust store is invalid"))?;
     if store.schema != PROJECT_CONFIG_TRUST_SCHEMA {
@@ -1031,7 +1203,7 @@ fn apply_local_override_with_confirmation(
     interactive: bool,
     confirm: &dyn Fn(&str) -> bool,
 ) -> Result<ProjectConfigTrustOutcome, String> {
-    let content = std::fs::read_to_string(path)
+    let (workspace, relative, content) = captured_project_config_content(path)
         .map_err(|error| format!("failed to read project config: {error}"))?;
     let (benign, sensitive, sensitive_keys) = split_project_override(&content)?;
     let benign_cfg = merge_config_value(cfg, benign)?;
@@ -1040,7 +1212,7 @@ fn apply_local_override_with_confirmation(
         return Ok(ProjectConfigTrustOutcome::NoSensitiveKeys);
     }
 
-    let binding = match project_config_binding(path, &content) {
+    let binding = match checked_project_config_binding(&workspace, &relative, &content) {
         Ok(binding) => binding,
         Err(error) => {
             *cfg = benign_cfg;
@@ -1116,14 +1288,12 @@ fn apply_local_override_with_confirmation(
 /// exact current content. Consumers other than config loading (for example
 /// project prompt `%%mode=` directives) use this to decide whether repository
 /// content may influence the security posture.
+#[cfg(test)]
 pub(crate) fn project_config_is_trusted(project_config: Option<&Path>, trust_store: &Path) -> bool {
     let Some(path) = project_config else {
         return false;
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(binding) = project_config_binding(path, &content) else {
+    let Ok((_, binding)) = read_project_config(path) else {
         return false;
     };
     let Ok(store) = load_project_config_trust(trust_store) else {
@@ -1132,86 +1302,21 @@ pub(crate) fn project_config_is_trusted(project_config: Option<&Path>, trust_sto
     store.bindings.contains(&binding)
 }
 
-/// Template discovery uses the existing path/SHA trust contract, reading
-/// only bounded regular files through retained capabilities. This does not
-/// change the older ambient config loader or its trust consumers.
+/// Existing project/config/SHA trust authority shared by templates, prompts
+/// and specialist definitions, using the caller's retained workspace.
 pub(crate) fn project_config_is_trusted_in_workspace(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
 ) -> bool {
-    fn checked(
-        paths: &crate::paths::AppPaths,
-        workspace: &crate::paths::WorkspaceBinding,
-    ) -> Result<bool, String> {
-        workspace.validate()?;
-        let relative = Path::new(".zerostack/config.toml");
-        let file = workspace
-            .open_regular_relative(relative)
-            .map_err(|e| e.to_string())?;
-        let crate::paths::BoundedUtf8Read::Content(content) =
-            crate::paths::read_utf8_bounded_status(file, 256 * 1024).map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
-        let binding = project_config_binding(&workspace.root().join(relative), &content)?;
-        if Path::new(&binding.canonical_project) != workspace.root()
-            || Path::new(&binding.canonical_config) != workspace.root().join(relative)
-        {
-            return Ok(false);
-        }
-        let store_path = paths.project_config_trust_file();
-        let parent = store_path.parent().ok_or("trust store has no parent")?;
-        // Existing private persistence owns this directory. Absent state is
-        // never created merely by template discovery.
-        if !parent.exists() {
-            return Ok(false);
-        }
-        crate::fs::ensure_private_directory(parent).map_err(|e| e.to_string())?;
-        let directory =
-            crate::paths::WorkspaceBinding::capture(parent).map_err(|e| e.to_string())?;
-        if directory.root() != parent {
-            return Ok(false);
-        }
-        let file = directory
-            .open_regular_relative(Path::new(
-                store_path.file_name().ok_or("trust store has no name")?,
-            ))
-            .map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            // A private parent alone cannot authenticate a foreign-owned or
-            // hardlinked inode. Reuse the persistence owner's exact UID policy.
-            let uid = crate::fs::private_current_uid();
-            if metadata.uid() != uid || metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
-                return Ok(false);
-            }
-        }
-        #[cfg(windows)]
-        {
-            // Preserve the existing private owner/DACL/reparse contract and
-            // prove it validated the exact retained regular-file descriptor.
-            let private = crate::fs::open_private_file(&store_path).map_err(|e| e.to_string())?;
-            crate::fs::ensure_same_file(
-                &store_path,
-                &crate::fs::checked_file_metadata(&file).map_err(|e| e.to_string())?,
-                &crate::fs::checked_file_metadata(&private).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        let crate::paths::BoundedUtf8Read::Content(content) =
-            crate::paths::read_utf8_bounded_status(file, 1024 * 1024).map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
-        let store: ProjectConfigTrustStore =
-            serde_json::from_str(&content).map_err(|_| "invalid trust store")?;
-        workspace.validate()?;
-        directory.validate()?;
-        Ok(store.schema == PROJECT_CONFIG_TRUST_SCHEMA && store.bindings.contains(&binding))
-    }
-    checked(paths, workspace).unwrap_or(false)
+    let Ok((_, binding)) =
+        read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml"))
+    else {
+        return false;
+    };
+    let Ok(store) = load_project_config_trust(&paths.project_config_trust_file()) else {
+        return false;
+    };
+    workspace.validate().is_ok() && store.bindings.contains(&binding)
 }
 
 /// Record trust for `project_config` exactly as an interactive approval would.
@@ -1220,8 +1325,7 @@ pub(crate) fn trust_project_config(
     project_config: &Path,
     trust_store: &Path,
 ) -> Result<(), String> {
-    let content = std::fs::read_to_string(project_config).map_err(|error| error.to_string())?;
-    let binding = project_config_binding(project_config, &content)?;
+    let (_, binding) = read_project_config(project_config).map_err(|error| error.to_string())?;
     let mut store = load_project_config_trust(trust_store).map_err(|error| error.to_string())?;
     store.bindings.push(binding);
     if let Some(parent) = trust_store.parent() {
@@ -1298,7 +1402,7 @@ fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
 /// Unknown-key warnings for the project-local config at `path`. Unreadable or
 /// invalid files yield none: loading them reports its own error.
 fn project_config_unknown_key_warnings(path: &Path) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = read_project_config_content(path) else {
         return Vec::new();
     };
     let Ok(local) = parse_project_toml(&content) else {
@@ -2883,5 +2987,346 @@ permission-allow-prefix = { shell = ["git status"] }
         assert!(raw.get("sandbox_backend").is_none());
         assert_eq!(raw["max_tokens"].as_integer(), Some(1));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod bounded_project_trust_tests {
+    use super::*;
+
+    fn paths(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: Some(root.join(".zerostack")),
+        }
+    }
+
+    #[test]
+    fn bounded_trust_preserves_exact_schema_hash_and_sensitive_application() {
+        let root = crate::tests::OwnedTestDirectory::new("bounded-trust-positive");
+        let paths = paths(root.path());
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        let content = "model='project-model'\nshell_timeout_secs=9\n";
+        std::fs::write(&config, content).unwrap();
+        trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        assert!(project_config_is_trusted(
+            Some(&config),
+            &paths.project_config_trust_file()
+        ));
+        assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        let expected = project_config_binding(&config, content).unwrap();
+        let stored = load_project_config_trust(&paths.project_config_trust_file()).unwrap();
+        assert_eq!(stored.schema, 1);
+        assert!(stored.bindings.contains(&expected));
+        let mut cfg = Config::default();
+        assert_eq!(
+            apply_local_override_with_confirmation(
+                &mut cfg,
+                &config,
+                &paths.project_config_trust_file(),
+                false,
+                &|_| panic!("already trusted must not prompt")
+            )
+            .unwrap(),
+            ProjectConfigTrustOutcome::AlreadyTrusted
+        );
+        assert_eq!(cfg.model.as_deref(), Some("project-model"));
+        assert_eq!(cfg.shell_timeout_secs, Some(9));
+        std::fs::write(&config, "model='changed'\nshell_timeout_secs=1\n").unwrap();
+        assert!(!project_config_is_trusted_in_workspace(&paths, &workspace));
+    }
+
+    #[test]
+    fn bounded_config_and_private_state_reject_size_utf8_links_and_keep_mode_repair() {
+        let root = crate::tests::OwnedTestDirectory::new("bounded-trust-limits");
+        let paths = paths(root.path());
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, vec![b'x'; MAX_PROJECT_CONFIG_BYTES + 1]).unwrap();
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            apply_local_override_with_confirmation(
+                &mut cfg,
+                &config,
+                &paths.project_config_trust_file(),
+                true,
+                &|_| panic!("bad data must not prompt")
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+        std::fs::write(&config, [0xff]).unwrap();
+        assert!(read_project_config(&config).is_err());
+        let private = paths.config_dir.join("config.toml");
+        std::fs::write(&private, "model='owned'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(read_config_content(&private).unwrap(), "model='owned'\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&private, vec![b'x'; MAX_PRIVATE_CONFIG_BYTES + 1]).unwrap();
+        assert!(read_config_content(&private).is_err());
+        std::fs::write(&private, [0xff]).unwrap();
+        assert!(read_config_content(&private).is_err());
+        let store = paths.project_config_trust_file();
+        crate::fs::ensure_private_directory(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, vec![b'x'; MAX_PROJECT_TRUST_BYTES + 1]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(load_project_config_trust(&store).is_err());
+        std::fs::write(&store, [0xff]).unwrap();
+        assert!(load_project_config_trust(&store).is_err());
+        std::fs::write(&store, b"{\"schema\":1,\"bindings\":[]}").unwrap();
+        std::fs::hard_link(&store, root.path().join("alias")).unwrap();
+        assert!(load_project_config_trust(&store).is_err());
+        assert!(crate::fs::open_private_file(&store).is_err());
+        std::fs::remove_file(root.path().join("alias")).unwrap();
+        assert!(
+            load_project_config_trust(&store)
+                .unwrap()
+                .bindings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_prompt_and_specialist_consumers_never_rebind_replaced_workspace() {
+        let root = crate::tests::OwnedTestDirectory::new("bounded-trust-consumers");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let environment = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&environment);
+        let process = crate::paths::process_paths().unwrap();
+        crate::paths::prepare_storage_roots(&process).unwrap();
+        let paths = process.with_workspace_root(&workspace_root).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".zerostack/prompts")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".zerostack/agents")).unwrap();
+        std::fs::write(
+            paths.project_config_file().unwrap(),
+            "default_prompt='code'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_root.join(".zerostack/prompts/owned.md"),
+            "%%mode=yolo\nOWNED_PROMPT",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_root.join(".zerostack/agents/owned.md"),
+            "---\ndescription: Owned specialist\n---\nOWNED_AGENT",
+        )
+        .unwrap();
+        trust_project_config(
+            &paths.project_config_file().unwrap(),
+            &paths.project_config_trust_file(),
+        )
+        .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap();
+        let prompts = crate::context::prompts::load_for_workspace_binding(&workspace);
+        assert_eq!(
+            crate::context::prompts::parse_directives(&prompts["owned"]).mode,
+            Some("yolo")
+        );
+        assert!(
+            crate::context::agents::load_for_workspace_binding(&workspace).contains_key("owned")
+        );
+        std::fs::rename(&workspace_root, root.path().join("retained")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".zerostack/prompts")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".zerostack/agents")).unwrap();
+        std::fs::write(
+            paths.project_config_file().unwrap(),
+            "default_prompt='code'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_root.join(".zerostack/prompts/owned.md"),
+            "%%mode=yolo\nREPLACEMENT_PROMPT",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_root.join(".zerostack/agents/owned.md"),
+            "REPLACEMENT_AGENT",
+        )
+        .unwrap();
+        trust_project_config(
+            &paths.project_config_file().unwrap(),
+            &paths.project_config_trust_file(),
+        )
+        .unwrap();
+        assert!(!project_config_is_trusted_in_workspace(&paths, &workspace));
+        assert!(
+            !crate::context::prompts::load_for_workspace_binding(&workspace).contains_key("owned")
+        );
+        assert!(
+            !crate::context::agents::load_for_workspace_binding(&workspace).contains_key("owned")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_project_identity_keeps_benign_keys_without_sensitive_authority() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = crate::tests::OwnedTestDirectory::new("bounded-project-nonutf8");
+        let project = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        std::fs::create_dir_all(project.join(".zerostack")).unwrap();
+        let config = project.join(".zerostack/config.toml");
+        std::fs::write(&config, "model='benign'\nshell_timeout_secs=9\n").unwrap();
+        let mut cfg = Config::default();
+        assert_eq!(
+            apply_local_override_with_confirmation(
+                &mut cfg,
+                &config,
+                &root.path().join("trust.json"),
+                true,
+                &|_| panic!("unrepresentable identity must not prompt")
+            )
+            .unwrap(),
+            ProjectConfigTrustOutcome::TrustUnavailable
+        );
+        assert_eq!(cfg.model.as_deref(), Some("benign"));
+        assert_eq!(cfg.shell_timeout_secs, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_rejects_parent_and_symlink_replacement_after_capture() {
+        let root = crate::tests::OwnedTestDirectory::new("bounded-private-read-race");
+        let parent = root.path().join("private");
+        crate::fs::ensure_private_directory(&parent).unwrap();
+        let path = parent.join("config.toml");
+        std::fs::write(&path, "model='selected'\n").unwrap();
+        let source = parent.clone();
+        let retained = root.path().join("retained");
+        let result = crate::fs::with_private_open_test_hook(
+            move |stage| {
+                if stage == "initial_open" {
+                    std::fs::rename(&source, &retained).unwrap();
+                    crate::fs::ensure_private_directory(&source).unwrap();
+                    std::fs::write(source.join("config.toml"), "model='replacement'\n").unwrap();
+                }
+            },
+            || read_config_content(&path),
+        );
+        assert!(
+            result.is_err(),
+            "replacement parent must not supply config bytes"
+        );
+        let replacement = root.path().join("other.toml");
+        std::fs::write(&replacement, "model='external'\n").unwrap();
+        let swap = path.clone();
+        let result = crate::fs::with_private_open_test_hook(
+            move |stage| {
+                if stage == "initial_open" {
+                    std::fs::remove_file(&swap).unwrap();
+                    std::os::unix::fs::symlink(&replacement, &swap).unwrap();
+                }
+            },
+            || read_config_content(&path),
+        );
+        assert!(result.is_err(), "symlink swap must not supply config bytes");
+    }
+
+    /// Called by the existing bounded child fixture. A blocking regression
+    /// aborts only its disposable child; the parent always kills and reaps it.
+    #[cfg(unix)]
+    pub(crate) fn assert_fifo_readers_and_both_private_open_races(
+        root: &Path,
+        paths: &AppPaths,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) {
+        let config = paths.project_config_file().unwrap();
+        assert!(!project_config_is_trusted(
+            Some(&config),
+            &paths.project_config_trust_file()
+        ));
+        assert!(project_config_unknown_key_warnings(&config).is_empty());
+        let mut cfg = Config::default();
+        assert!(
+            apply_local_override_with_confirmation(
+                &mut cfg,
+                &config,
+                &paths.project_config_trust_file(),
+                true,
+                &|_| panic!("FIFO must not prompt")
+            )
+            .is_err()
+        );
+        assert!(!project_config_is_trusted_in_workspace(paths, workspace));
+        for stage in ["initial_open", "revalidation_open"] {
+            let path = root.join(format!("private-race-{stage}"));
+            std::fs::write(&path, b"owned private bytes").unwrap();
+            let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marker = changed.clone();
+            let swap = path.clone();
+            let result = crate::fs::with_private_open_test_hook(
+                move |seen| {
+                    if seen == stage {
+                        eprintln!("PRIVATE_RACE_STAGE_REACHED={stage}");
+                        std::fs::remove_file(&swap).unwrap();
+                        drop(crate::tests::process_gate::ProcessGate::new(&swap).unwrap());
+                        marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+                || crate::fs::open_private_file(&path),
+            );
+            assert!(changed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(result.is_err(), "{stage} FIFO must reject without blocking");
+        }
+        let environment = [
+            ("ZS_CONFIG_DIR", &paths.config_dir),
+            ("ZS_DATA_DIR", &paths.data_dir),
+            ("ZS_LOCAL_DATA_DIR", &paths.local_data_dir),
+            ("ZS_STATE_DIR", &paths.state_dir),
+            ("ZS_CACHE_DIR", &paths.cache_dir),
+            ("ZS_CREDENTIALS_DIR", &paths.credentials_dir),
+        ]
+        .map(|(name, path)| (name, Some(path.clone().into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&environment);
+        std::fs::create_dir_all(root.join(".zerostack/prompts")).unwrap();
+        let prompt = root.join(".zerostack/prompts/fifo.md");
+        drop(crate::tests::process_gate::ProcessGate::new(&prompt).unwrap());
+        assert!(
+            !crate::context::prompts::load_for_workspace_binding(workspace).contains_key("fifo")
+        );
+        assert!(
+            !crate::context::agents::load_for_workspace_binding(workspace).contains_key("fifo")
+        );
+        let store = paths.project_config_trust_file();
+        std::fs::remove_file(&store).unwrap();
+        drop(crate::tests::process_gate::ProcessGate::new(&store).unwrap());
+        assert!(load_project_config_trust(&store).is_err());
     }
 }

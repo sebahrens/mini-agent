@@ -178,6 +178,7 @@ impl WorkspaceBinding {
             .map(cap_std::fs::Dir::into_std_file)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_relative_dir_files(
         &self,
         path: &Path,

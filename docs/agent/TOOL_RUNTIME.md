@@ -396,9 +396,16 @@ Ask remains fail-closed while slash dispatch owns the UI event loop. No read
 tracker, doom-loop counter, hook one-shot or permission grant is consumed by
 this check. Untrusted arguments and included data are never reparsed as
 metadata, include references, slash dispatch or shell commands. The command
-picker, help and real App submission share this loader. The older ambient
-project trust loaders are unchanged; their separate special-file/bounding audit
-is tracked as `mini-agent-i7ro6.95`.
+picker, help and real App submission share this loader. Project config trust
+is shared with prompt and specialist discovery. Those consumers validate the
+supplied retained workspace before and after reading a regular, non-link
+config of at most 256 KiB; existing canonical project/config paths plus SHA-256
+still define approval. Private trust state is limited to 1 MiB and retains owner,
+private permissions/DACL, one-link and exact inode checks. Both Unix
+private-open phases use `O_NONBLOCK` and validate the opened descriptor, so a
+FIFO replacement fails instead of hanging. Global prompt/specialist aliases
+and global theme loading keep their existing compatibility policy; this change
+does not claim to harden every definition loader.
 
 
 ## Session catalogue and owned title work

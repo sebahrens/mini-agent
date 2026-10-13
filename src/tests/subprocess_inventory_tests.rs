@@ -1612,6 +1612,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Price-pair bindings inside assertion/rendering macros are numeric data.
+    (
+        "src/session/title.rs",
+        ".map(|(input, output)| input + output)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/setup/mod.rs",
+        "|(input, output)| format!(\"${input:.4}/M in  ${output:.4}/M out\")",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/context/commands.rs",
         "assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);",
@@ -3775,8 +3788,23 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/setup/mod.rs",
+        &[
+            (
+                "b945ed43b6634d640ac67926eb81d8a86cbeb71a124db0ee8a3c0d9fac65f891",
+                1,
+            ),
+            // Price-pair closure in the setup renderer's format!; no process call.
+            (
+                "3fe711d4827c7e1bce3abfabd2cd8e0007745ba1311752f25add29cfc450ef6a",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/session/title.rs",
+        // The assertion sums captured input/output prices; both identifiers are data.
         &[(
-            "b945ed43b6634d640ac67926eb81d8a86cbeb71a124db0ee8a3c0d9fac65f891",
+            "e9aa8d89774cc408a3aa61dd9ac2621f7b493c84046448e28d3db3767d648e86",
             1,
         )],
     ),

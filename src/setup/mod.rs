@@ -564,14 +564,16 @@ fn render_manage_models(ctx: &Ctx, selected: usize, confirm_delete: bool) -> io:
                 row,
                 4,
                 &format!(
-                    "{} {}. {}    {} / {}    ${:.4}/M in  ${:.4}/M out",
+                    "{} {}. {}    {} / {}    {}",
                     marker,
                     i + 1,
                     name,
                     qm.provider,
                     qm.model,
-                    qm.input_token_cost,
-                    qm.output_token_cost
+                    qm.resolved_prices().map_or_else(
+                        || "pricing unknown".to_owned(),
+                        |(input, output)| format!("${input:.4}/M in  ${output:.4}/M out")
+                    )
                 ),
                 color,
             )?;
@@ -1388,6 +1390,18 @@ fn handle_manage_models_key(
     }
 }
 
+fn parse_optional_model_price(value: &str) -> Result<Option<f64>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let price = value.parse::<f64>().map_err(|_| ())?;
+    if !price.is_finite() || price < 0.0 {
+        return Err(());
+    }
+    Ok(Some(price))
+}
+
 fn make_model_detail_state(is_new: bool, name: String, cfg: &Config) -> Screen {
     let qm = if is_new {
         None
@@ -1398,11 +1412,13 @@ fn make_model_detail_state(is_new: bool, name: String, cfg: &Config) -> Screen {
     let provider = qm.map(|q| q.provider.to_string()).unwrap_or_default();
     let model_id = qm.map(|q| q.model.to_string()).unwrap_or_default();
     let input_cost = qm
-        .map(|q| q.input_token_cost.to_string())
-        .unwrap_or_else(|| "0.0".to_string());
+        .and_then(|q| q.input_token_cost)
+        .map(|price| price.to_string())
+        .unwrap_or_default();
     let output_cost = qm
-        .map(|q| q.output_token_cost.to_string())
-        .unwrap_or_else(|| "0.0".to_string());
+        .and_then(|q| q.output_token_cost)
+        .map(|price| price.to_string())
+        .unwrap_or_default();
     let context_window = qm
         .and_then(|q| q.context_window)
         .map(|c| c.to_string())
@@ -1629,17 +1645,24 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
                     .map(|f| f.value.clone())
                     .unwrap_or_default();
 
-                let new_input_cost = fields
-                    .iter()
-                    .find(|f| f.label == "Input Cost ($/M)")
-                    .and_then(|f| f.value.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-
-                let new_output_cost = fields
-                    .iter()
-                    .find(|f| f.label == "Output Cost ($/M)")
-                    .and_then(|f| f.value.parse::<f64>().ok())
-                    .unwrap_or(0.0);
+                let price_field = |label| {
+                    fields
+                        .iter()
+                        .find(|field| field.label == label)
+                        .map(|field| parse_optional_model_price(&field.value))
+                        .unwrap_or(Ok(None))
+                };
+                let (Ok(new_input_cost), Ok(new_output_cost)) = (
+                    price_field("Input Cost ($/M)"),
+                    price_field("Output Cost ($/M)"),
+                ) else {
+                    return Ok(KeyResult::Screen(make_screen(
+                        fields,
+                        selected_field,
+                        None,
+                        Some("Prices must be blank or finite nonnegative numbers".to_owned()),
+                    )));
+                };
 
                 let new_context_window = fields
                     .iter()
@@ -1982,5 +2005,18 @@ mod tests {
         assert_eq!(masked_key("🔑秘密alpha"), "🔑秘密a****");
         assert_eq!(masked_key("秘密"), "****");
         assert_eq!(centered_column(10, "秘密"), 3);
+    }
+}
+
+#[cfg(test)]
+mod price_presence_tests {
+    #[test]
+    fn quick_model_price_presence_wizard_blank_is_absent_and_invalid_is_rejected() {
+        assert_eq!(super::parse_optional_model_price(" "), Ok(None));
+        assert_eq!(super::parse_optional_model_price("0"), Ok(Some(0.0)));
+        assert_eq!(super::parse_optional_model_price("2.5"), Ok(Some(2.5)));
+        for invalid in ["-1", "NaN", "inf", "free"] {
+            assert!(super::parse_optional_model_price(invalid).is_err());
+        }
     }
 }

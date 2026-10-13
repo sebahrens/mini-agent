@@ -3651,6 +3651,48 @@ fn cli_permission_seed_print_config_lists_effective_rules_without_shell_secrets(
 }
 
 #[test]
+fn quick_model_price_presence_actual_cli_omitted_paid_alias_is_charged() {
+    let root = TempRoot::new();
+    let provider = root.local_provider("completed");
+    let path = root.0.join("config.toml");
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("custom_providers.local-test", "custom_providers.openai");
+    std::fs::write(path, format!("provider='openai'\nmodel='paid'\n[quick_models.paid]\nprovider='openai'\nmodel='gpt-5.5'\n{config}")).unwrap();
+    let mut command = root.command();
+    command
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--no-sandbox",
+            "--no-context-files",
+            "--no-tools",
+            "--quick-model",
+            "paid",
+            "-p",
+            "--output",
+            "json",
+            "reply",
+        ]);
+    let output = bounded_output(command);
+    assert!(provider.join().unwrap().is_ok());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let saved = root.saved_session();
+    assert!(result["cost"].as_f64().unwrap() > 0.0, "{result}");
+    assert!(saved["total_cost"].as_f64().unwrap() > 0.0, "{saved}");
+    assert_eq!(saved["input_output_prices_known"], true);
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.0.join("request-0.json")).unwrap()).unwrap();
+    assert_eq!(request["model"], "gpt-5.5");
+}
+
+#[test]
 fn headless_compaction_instructions_and_retained_read_history_reach_actual_provider() {
     // Every provider request is loopback-only, captured and bounded. Join on
     // unwind too; a failed consumer cannot leave a fixture server behind.

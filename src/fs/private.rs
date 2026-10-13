@@ -129,6 +129,39 @@ fn same_open_file_identity(
     }
 }
 
+#[cfg(all(test, unix))]
+type OpenTestHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static OPEN_TEST_HOOK: std::cell::RefCell<Option<OpenTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn run_open_test_hook(stage: &'static str) {
+    OPEN_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_open_test_hook<T>(
+    hook: impl FnMut(&'static str) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<OpenTestHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OPEN_TEST_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = OPEN_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+    let _restore = Restore(previous);
+    operation()
+}
+
 #[cfg(unix)]
 pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -140,21 +173,27 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     // file identity of two independently opened descriptors while `file`
     // keeps the selected inode alive throughout the check.
     let before = open_existing_stage("initial_metadata", std::fs::symlink_metadata(path))?;
-    if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.uid() != current_uid()
+        || before.nlink() != 1
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "private file is not an owned regular file",
         ));
     }
+    #[cfg(test)]
+    run_open_test_hook("initial_open");
     let file = open_existing_stage(
         "initial_open",
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
+            .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK)
             .open(path),
     )?;
     let opened = open_existing_stage("initial_open_metadata", file.metadata())?;
-    if !opened.is_file() || opened.uid() != current_uid() {
+    if !opened.is_file() || opened.uid() != current_uid() || opened.nlink() != 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "private file is not an owned regular file",
@@ -164,14 +203,22 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         "permissions",
         file.set_permissions(std::fs::Permissions::from_mode(0o600)),
     )?;
+    #[cfg(test)]
+    run_open_test_hook("revalidation_open");
     let current = open_existing_stage(
         "revalidation_open",
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
+            .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK)
             .open(path),
     )?;
     let after = open_existing_stage("revalidation_metadata", current.metadata())?;
+    if !after.is_file() || after.uid() != current_uid() || after.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file is not an owned singly linked regular file",
+        ));
+    }
     if !open_existing_stage(
         "revalidation_identity",
         same_open_file_identity(&file, &opened, &current, &after),
@@ -700,6 +747,12 @@ mod windows {
                 "private path is a reparse point or has the wrong type",
             ));
         }
+        if !expect_directory && information._number_of_links != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file is hardlinked",
+            ));
+        }
         ensure_current_owner(handle)?;
         let descriptor = SecurityDescriptor::private()?;
         let status = unsafe {
@@ -899,6 +952,12 @@ mod windows {
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
+        if super::super::windows_file_link_count(&file)? != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private file is hardlinked",
+            ));
+        }
         let opened = super::super::checked_file_metadata(&file)?;
         let after = super::super::checked_path_metadata(path)?;
         super::super::ensure_same_file(path, &before, &opened)?;

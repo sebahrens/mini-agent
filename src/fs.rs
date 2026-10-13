@@ -13,6 +13,9 @@ mod private;
 pub(crate) use private::current_uid as private_current_uid;
 
 #[cfg(all(test, unix))]
+pub(crate) use private::with_open_test_hook as with_private_open_test_hook;
+
+#[cfg(all(test, unix))]
 pub(crate) use private::atomic_write_with_failure as private_atomic_write_with_failure_sync;
 #[cfg(all(test, windows))]
 pub(crate) use private::dacl_sddl as private_dacl_sddl;

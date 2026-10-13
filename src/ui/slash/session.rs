@@ -283,13 +283,11 @@ pub(crate) fn parse_imported_session(
                 .values()
                 .find(|model| model.provider == session.provider && model.model == session.model)
             {
-                session.input_token_cost = model.input_token_cost;
-                session.output_token_cost = model.output_token_cost;
+                session.set_input_output_prices(model.resolved_prices());
             } else if let Some((input, output)) =
                 crate::config::Config::catalog_input_output_cost(&session.provider, &session.model)
             {
-                session.input_token_cost = input;
-                session.output_token_cost = output;
+                session.set_input_output_prices(Some((input, output)));
             }
             import.totals.apply(&mut session);
             session.set_cache_prices(crate::pricing::cache_prices_for_model(

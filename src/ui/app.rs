@@ -281,6 +281,65 @@ mod btw_pricing_tests {
     use super::test_support::fixture_app;
     use super::*;
 
+    #[tokio::test]
+    async fn quick_model_price_presence_actual_app_usage_charges_paid_alias() {
+        let root = crate::tests::OwnedTestDirectory::new("quick-model-price-presence-app");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
+            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+        ]);
+        let cli = crate::cli::Cli::default();
+        let cfg: crate::config::Config =
+            toml::from_str("[quick_models.paid]\nprovider='anthropic'\nmodel='claude-sonnet-5-5'")
+                .unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("anthropic", "claude-fable-5-1", 1_000_000, "");
+        session
+            .set_input_output_prices(cfg.quick_models.as_ref().unwrap()["paid"].resolved_prices());
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::create_client(
+                "anthropic",
+                Some("unused-test-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        let expected =
+            crate::config::Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5")
+                .unwrap();
+        app.handle_agent_event(AgentEvent::UsageDelta {
+            usage: crate::event::UsageDelta {
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+            context_complete: false,
+            awaits_compaction_decision: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.ui.session.total_cost, expected.0 + expected.1);
+        assert_eq!(app.ui.session.known_input_output_prices(), Some(expected));
+    }
+
     #[test]
     fn actual_btw_event_handler_charges_snapshot_and_ignores_duplicate_or_cancelled_ids() {
         let root = crate::tests::OwnedTestDirectory::new("btw-pricing-handler");
@@ -7761,6 +7820,7 @@ mod workspace_session_picker_tests {
             workspace: app.ui.workspace.clone(),
             provider: "anthropic".into(),
             pricing: crate::session::title::TitlePricing {
+                known: true,
                 input: 2.0,
                 output: 4.0,
                 cache: Default::default(),

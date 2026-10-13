@@ -90,10 +90,18 @@ pub struct EmbeddingConfig {
 pub struct QuickModelConfig {
     pub provider: CompactString,
     pub model: CompactString,
-    #[serde(default)]
-    pub input_token_cost: f64,
-    #[serde(default)]
-    pub output_token_cost: f64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub input_token_cost: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub output_token_cost: Option<f64>,
     /// Optional cache prices in USD per million tokens. Absent tiers inherit
     /// the model's catalog ratio at this alias's selected input price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +123,31 @@ pub struct QuickModelConfig {
     /// model catalog but is overridden by the global `context_window` setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+}
+
+impl QuickModelConfig {
+    /// Declared tiers override catalogue rates independently. Explicit zero is
+    /// a known free tier; omission never creates a free rate.
+    pub fn resolved_prices(&self) -> Option<(f64, f64)> {
+        let catalog = super::Config::catalog_input_output_cost(&self.provider, &self.model);
+        let input = self.input_token_cost.or(catalog.map(|price| price.0))?;
+        let output = self.output_token_cost.or(catalog.map(|price| price.1))?;
+        (input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0)
+            .then_some((input, output))
+    }
+}
+
+fn optional_token_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|price| !price.is_finite() || price < 0.0) {
+        return Err(serde::de::Error::custom(
+            "token price must be finite and nonnegative",
+        ));
+    }
+    Ok(value)
 }
 
 /// Defaults for goal bounds and the judge.

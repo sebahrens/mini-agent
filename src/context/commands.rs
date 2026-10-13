@@ -664,6 +664,7 @@ mod tests {
                 .unwrap(),
         );
         assert!(!crate::config::load::project_config_is_trusted_in_workspace(&paths, &workspace));
+        crate::config::load::bounded_project_trust_tests::assert_fifo_readers_and_both_private_open_races(&workspace_dir, &paths, &workspace);
         let outside = root.join("outside");
         std::fs::write(&outside, "PRIVATE_OUTSIDE").unwrap();
         std::fs::write(workspace_dir.join("link"), "regular include before swap").unwrap();

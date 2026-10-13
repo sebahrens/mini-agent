@@ -167,6 +167,7 @@ impl UsageLedger {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TitlePricing {
+    pub known: bool,
     pub input: f64,
     pub output: f64,
     pub cache: crate::pricing::CachePrices,
@@ -184,38 +185,39 @@ impl TitlePricing {
             .map(str::trim)
             .filter(|alias| !alias.trim().is_empty() && *alias != "off");
         let quick = crate::config::quick_models_map(cfg);
-        let (input, output, cache) = if let Some(entry) = alias.and_then(|alias| quick.get(alias)) {
+        let (prices, cache) = if let Some(entry) = alias.and_then(|alias| quick.get(alias)) {
+            let prices = entry.resolved_prices();
             (
-                entry.input_token_cost,
-                entry.output_token_cost,
+                prices,
                 crate::pricing::cache_prices_for_model(
                     &request.provider,
                     &request.model,
                     cfg,
                     alias,
-                    entry.input_token_cost,
+                    prices.map(|prices| prices.0).unwrap_or(0.0),
                 ),
             )
         } else {
-            (
-                session.input_token_cost,
-                session.output_token_cost,
-                session.cache_prices(),
-            )
+            (session.known_input_output_prices(), session.cache_prices())
         };
+        let (input, output) = prices.unwrap_or((0.0, 0.0));
         Self {
+            known: prices.is_some(),
             input,
             output,
             cache,
             anthropic_native: cfg.is_anthropic_native(&request.provider),
         }
     }
+    pub(crate) fn known_prices(self) -> Option<(f64, f64)> {
+        self.known.then_some((self.input, self.output))
+    }
     pub(crate) fn charge(self, session: &mut Session, usage: crate::event::UsageDelta) {
         session.charge_usage_delta_at(
             usage,
             self.anthropic_native,
-            self.input,
-            self.output,
+            self.known_prices().map(|prices| prices.0).unwrap_or(0.0),
+            self.known_prices().map(|prices| prices.1).unwrap_or(0.0),
             self.cache,
         );
     }
@@ -288,8 +290,8 @@ mod tests {
             QuickModelConfig {
                 provider: "openrouter".into(),
                 model: "tiny-model".into(),
-                input_token_cost: 0.0,
-                output_token_cost: 0.0,
+                input_token_cost: Some(0.0),
+                output_token_cost: Some(0.0),
                 cache_read_token_cost: None,
                 cache_write_token_cost: None,
                 reserve_tokens: None,
@@ -310,6 +312,52 @@ mod tests {
         session.add_message(MessageRole::User, "fix the flaky parser test in ci");
         session.add_message(MessageRole::Assistant, "The race is in the fixture setup.");
         session
+    }
+
+    #[test]
+    fn quick_model_price_presence_title_captures_alias_rates_and_unknownness() {
+        let mut session = Session::new("anthropic", "claude-opus-5-5", 1_000_000, "");
+        session.set_input_output_prices(Some((99.0, 199.0)));
+        for (provider, model, fields, expected) in [
+            (
+                "anthropic",
+                "claude-sonnet-5-5",
+                "",
+                crate::config::Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5"),
+            ),
+            (
+                "gateway",
+                "unlisted",
+                "input_token_cost=0\noutput_token_cost=0",
+                Some((0.0, 0.0)),
+            ),
+            ("gateway", "unlisted", "", None),
+        ] {
+            let cfg: crate::config::Config = toml::from_str(&format!("session_title_model='alias'\n[quick_models.alias]\nprovider='{provider}'\nmodel='{model}'\n{fields}")).unwrap();
+            let request = TitleRequest {
+                session_id: session.id.clone(),
+                provider: provider.into(),
+                model: model.into(),
+                prompt: "exchange".to_owned(),
+            };
+            let captured = TitlePricing::capture(&cfg, &session, &request);
+            assert_eq!(captured.known_prices(), expected);
+            let mut charged = Session::new(provider, model, 1_000_000, "");
+            captured.charge(
+                &mut charged,
+                crate::event::UsageDelta {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                charged.total_cost,
+                expected
+                    .map(|(input, output)| input + output)
+                    .unwrap_or(0.0)
+            );
+        }
     }
 
     #[test]

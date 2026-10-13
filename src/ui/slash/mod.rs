@@ -254,15 +254,15 @@ impl SlashCtx<'_> {
             .await;
         *self.agent = Some(new_agent);
 
-        self.session.input_token_cost = qmc.input_token_cost;
-        self.session.output_token_cost = qmc.output_token_cost;
+        let input_price = qmc.resolved_prices().map(|prices| prices.0).unwrap_or(0.0);
+        self.session.set_input_output_prices(qmc.resolved_prices());
         self.session
             .set_cache_prices(crate::pricing::cache_prices_for_model(
                 &qmc.provider,
                 &qmc.model,
                 self.cfg,
                 Some(qm_name),
-                qmc.input_token_cost,
+                input_price,
             ));
         self.session
             .update_context_window(self.cfg.resolve_context_window(
@@ -343,15 +343,15 @@ pub(crate) async fn apply_prompt_model(
             .await,
     );
 
-    ui.session.input_token_cost = qmc.input_token_cost;
-    ui.session.output_token_cost = qmc.output_token_cost;
+    let input_price = qmc.resolved_prices().map(|prices| prices.0).unwrap_or(0.0);
+    ui.session.set_input_output_prices(qmc.resolved_prices());
     ui.session
         .set_cache_prices(crate::pricing::cache_prices_for_model(
             &qmc.provider,
             &qmc.model,
             ui.cfg,
             Some(qm_name),
-            qmc.input_token_cost,
+            input_price,
         ));
     ui.session
         .update_context_window(ui.cfg.resolve_context_window(

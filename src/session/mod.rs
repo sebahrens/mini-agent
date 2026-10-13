@@ -578,6 +578,10 @@ pub struct Session {
     pub input_token_cost: f64,
     #[serde(default)]
     pub output_token_cost: f64,
+    /// Explicit presence for new pricing snapshots; older sessions infer known
+    /// rates only from positive legacy prices, never from default zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_output_prices_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -795,6 +799,7 @@ impl Session {
             calibrated_tool_results_cleared: 0,
             input_token_cost: 0.0,
             output_token_cost: 0.0,
+            input_output_prices_known: None,
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             context_window,
@@ -1202,6 +1207,26 @@ impl Session {
             }),
         );
         (content, artifact)
+    }
+
+    pub(crate) fn set_input_output_prices(&mut self, prices: Option<(f64, f64)>) {
+        let prices = prices.filter(|(input, output)| {
+            input.is_finite() && *input >= 0.0 && output.is_finite() && *output >= 0.0
+        });
+        (self.input_token_cost, self.output_token_cost) = prices.unwrap_or((0.0, 0.0));
+        self.input_output_prices_known = Some(prices.is_some());
+    }
+
+    pub(crate) fn known_input_output_prices(&self) -> Option<(f64, f64)> {
+        let known = self
+            .input_output_prices_known
+            .unwrap_or(self.input_token_cost > 0.0 || self.output_token_cost > 0.0);
+        (known
+            && self.input_token_cost.is_finite()
+            && self.input_token_cost >= 0.0
+            && self.output_token_cost.is_finite()
+            && self.output_token_cost >= 0.0)
+            .then_some((self.input_token_cost, self.output_token_cost))
     }
 
     /// Apply one reconciled provider-usage delta to every persisted accounting

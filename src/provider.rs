@@ -158,10 +158,7 @@ pub(crate) fn default_model_for_provider(
     if let Some(configured) = cfg.model.as_deref() {
         if let Some(quick) = qm.get(configured) {
             if quick.provider == provider {
-                return Some((
-                    quick.model.to_string(),
-                    Some((quick.input_token_cost, quick.output_token_cost)),
-                ));
+                return Some((quick.model.to_string(), quick.resolved_prices()));
             }
         } else {
             let owner = cfg.provider.as_deref().unwrap_or_else(|| {
@@ -182,10 +179,7 @@ pub(crate) fn default_model_for_provider(
     if let Some(quick) = qm.get("deepseek-v4-pro")
         && quick.provider == provider
     {
-        return Some((
-            quick.model.to_string(),
-            Some((quick.input_token_cost, quick.output_token_cost)),
-        ));
+        return Some((quick.model.to_string(), quick.resolved_prices()));
     }
     // Deterministic: otherwise prefer the alphabetically-first quick model for this provider
     // (HashMap iteration order would otherwise be unstable).
@@ -194,10 +188,7 @@ pub(crate) fn default_model_for_provider(
     for name in names {
         let q = &qm[name];
         if q.provider.as_str() == provider {
-            return Some((
-                q.model.to_string(),
-                Some((q.input_token_cost, q.output_token_cost)),
-            ));
+            return Some((q.model.to_string(), q.resolved_prices()));
         }
     }
     let m = match provider {

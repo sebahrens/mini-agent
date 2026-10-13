@@ -161,11 +161,11 @@ pub(crate) fn prompt_grant_offer(
 /// store. Project prompts may only carry prompt directives when the user has
 /// explicitly trusted this exact project config (see CONFIG.md "Prompt
 /// directives").
-fn project_prompts_trusted(paths: &crate::paths::AppPaths) -> bool {
-    crate::config::load::project_config_is_trusted(
-        paths.project_config_file().as_deref(),
-        &paths.project_config_trust_file(),
-    )
+fn project_prompts_trusted(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    crate::config::load::project_config_is_trusted_in_workspace(paths, workspace)
 }
 
 /// Paths substituted into embedded and user prompts when they are loaded, so
@@ -372,6 +372,16 @@ fn neutralize_untrusted_directive(name: &str, content: String) -> String {
     neutralized
 }
 
+fn readable_project_prompts(
+    files: Vec<(String, Result<String, String>)>,
+    directory: &std::path::Path,
+) -> Vec<(String, String)> {
+    files.into_iter().filter_map(|(name, content)| match content {
+        Ok(content) => Some((name, content)),
+        Err(error) => { tracing::warn!(path = %directory.join(format!("{name}.md")).display(), %error, "could not read workspace prompt file"); None }
+    }).collect()
+}
+
 pub fn load() -> HashMap<String, String> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     load_with_paths(&paths)
@@ -383,8 +393,9 @@ pub(crate) fn load_for_workspace_binding(
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let user = crate::context::load_dir_files(&paths.prompts_dir(), "md");
     let project_dir = std::path::Path::new(".zerostack/prompts");
-    let project = workspace
-        .read_relative_dir_files(project_dir, "md")
+    let project = workspace.validate().map_err(std::io::Error::other)
+        .and_then(|_| workspace.read_relative_definition_layer(project_dir, "md", 256 * 1024, 1024, 128))
+        .and_then(|files| { workspace.validate().map_err(std::io::Error::other)?; Ok(files) })
         .unwrap_or_else(|error| {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %workspace.root().join(project_dir).display(), %error, "could not read workspace prompt directory");
@@ -394,20 +405,50 @@ pub(crate) fn load_for_workspace_binding(
     let workspace_paths = paths.with_workspace_root(workspace.root()).ok();
     let project_trusted = workspace_paths
         .as_ref()
-        .is_some_and(project_prompts_trusted);
+        .is_some_and(|paths| project_prompts_trusted(paths, workspace));
     let variables = PromptVariables::from_paths(workspace_paths.as_ref().unwrap_or(&paths));
-    finalize_prompts(merge_sources(user, project), project_trusted, &variables)
+    finalize_prompts(
+        merge_sources(
+            user,
+            readable_project_prompts(project, &workspace.root().join(project_dir)),
+        ),
+        project_trusted,
+        &variables,
+    )
 }
 
 fn load_with_paths(paths: &crate::paths::AppPaths) -> HashMap<String, String> {
     let user = crate::context::load_dir_files(&paths.prompts_dir(), "md");
-    let project_prompts = paths
-        .project_prompts_dir()
-        .expect("workspace paths must have a project prompt directory");
-    let project = crate::context::load_dir_files(&project_prompts, "md");
+    let captured = paths
+        .project_dir
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .and_then(|root| crate::paths::WorkspaceBinding::capture(root).ok());
+    let project = captured
+        .as_ref()
+        .and_then(|workspace| {
+            workspace
+                .read_relative_definition_layer(
+                    std::path::Path::new(".zerostack/prompts"),
+                    "md",
+                    256 * 1024,
+                    1024,
+                    128,
+                )
+                .and_then(|files| {
+                    workspace.validate().map_err(std::io::Error::other)?;
+                    Ok(files)
+                })
+                .ok()
+        })
+        .unwrap_or_default();
+    let project = readable_project_prompts(project, &paths.project_prompts_dir().unwrap());
+    let trusted = captured
+        .as_ref()
+        .is_some_and(|workspace| project_prompts_trusted(paths, workspace));
     finalize_prompts(
         merge_sources(user, project),
-        project_prompts_trusted(paths),
+        trusted,
         &PromptVariables::from_paths(paths),
     )
 }

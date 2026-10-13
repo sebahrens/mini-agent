@@ -180,8 +180,8 @@ fn resolve_context_window_from_quick_model() {
         crate::config::types::QuickModelConfig {
             provider: compact_str::CompactString::new("openrouter"),
             model: compact_str::CompactString::new("deepseek/deepseek-chat"),
-            input_token_cost: 0.0,
-            output_token_cost: 0.0,
+            input_token_cost: Some(0.0),
+            output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             reserve_tokens: None,
@@ -959,8 +959,8 @@ mod extra_body_api_style_scoping {
         QuickModelConfig {
             provider: CompactString::new(provider),
             model: CompactString::new("gpt-5"),
-            input_token_cost: 0.0,
-            output_token_cost: 0.0,
+            input_token_cost: Some(0.0),
+            output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             reserve_tokens: None,
@@ -1148,8 +1148,8 @@ fn known_context_window_orders_pin_quick_model_then_catalog() {
         crate::config::types::QuickModelConfig {
             provider: compact_str::CompactString::new("openrouter"),
             model: compact_str::CompactString::new("deepseek/deepseek-v4-pro"),
-            input_token_cost: 0.0,
-            output_token_cost: 0.0,
+            input_token_cost: Some(0.0),
+            output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
             reserve_tokens: None,
@@ -1199,4 +1199,105 @@ fn custom_provider_inherit_builtin_key_defaults_false_and_parses() {
     )
     .unwrap();
     assert!(parsed.inherit_builtin_key);
+}
+
+#[test]
+fn quick_model_price_presence_preserves_omission_free_partial_and_roundtrip() {
+    let catalog = Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5").unwrap();
+    for (fields, expected) in [
+        ("", Some(catalog)),
+        ("input_token_cost=0\noutput_token_cost=0", Some((0.0, 0.0))),
+        ("input_token_cost=2\noutput_token_cost=4", Some((2.0, 4.0))),
+        ("input_token_cost=0", Some((0.0, catalog.1))),
+        ("output_token_cost=7", Some((catalog.0, 7.0))),
+    ] {
+        let source = format!("provider='anthropic'\nmodel='claude-sonnet-5-5'\n{fields}");
+        let entry: crate::config::QuickModelConfig = toml::from_str(&source).unwrap();
+        assert_eq!(entry.resolved_prices(), expected, "{fields}");
+        let serialized = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            serialized.get("input_token_cost").is_some(),
+            fields.contains("input_token_cost")
+        );
+        assert_eq!(
+            serialized.get("output_token_cost").is_some(),
+            fields.contains("output_token_cost")
+        );
+        let json_reloaded: crate::config::QuickModelConfig =
+            serde_json::from_value(serialized).unwrap();
+        let toml_reloaded: crate::config::QuickModelConfig =
+            toml::from_str(&toml::to_string(&entry).unwrap()).unwrap();
+        for reloaded in [json_reloaded, toml_reloaded] {
+            assert_eq!(reloaded.resolved_prices(), expected);
+            assert_eq!(reloaded.input_token_cost, entry.input_token_cost);
+            assert_eq!(reloaded.output_token_cost, entry.output_token_cost);
+        }
+    }
+    let unknown: crate::config::QuickModelConfig =
+        toml::from_str("provider='gateway'\nmodel='unlisted'\ninput_token_cost=2").unwrap();
+    assert_eq!(
+        unknown.resolved_prices(),
+        None,
+        "a missing unknown tier is not free"
+    );
+    for malformed in [
+        "input_token_cost=-1",
+        "output_token_cost=nan",
+        "input_token_cost=inf",
+        "output_token_cost='free'",
+    ] {
+        assert!(
+            toml::from_str::<crate::config::QuickModelConfig>(&format!(
+                "provider='anthropic'\nmodel='claude-sonnet-5-5'\n{malformed}"
+            ))
+            .is_err(),
+            "{malformed}"
+        );
+    }
+}
+
+#[test]
+fn quick_model_price_presence_session_free_and_native_cache_survive_reload() {
+    let mut session = crate::session::Session::new("anthropic", "unlisted", 128_000, "");
+    assert_eq!(session.known_input_output_prices(), None);
+    session.set_input_output_prices(Some((0.0, 0.0)));
+    session.set_cache_prices(crate::pricing::CachePrices {
+        read: Some(0.3),
+        write: Some(4.0),
+    });
+    session.charge_usage_delta(
+        crate::event::UsageDelta {
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
+        },
+        true,
+    );
+    assert_eq!(session.total_cost, 4.3);
+    let mut reloaded: crate::session::Session =
+        serde_json::from_value(serde_json::to_value(session).unwrap()).unwrap();
+    assert_eq!(reloaded.known_input_output_prices(), Some((0.0, 0.0)));
+    reloaded.set_input_output_prices(None);
+    assert_eq!(reloaded.known_input_output_prices(), None);
+}
+
+#[test]
+fn quick_model_price_presence_actual_config_save_does_not_invent_free_rates() {
+    let root = crate::tests::OwnedTestDirectory::new("price-presence-config-save");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "ZS_CONFIG_DIR",
+        Some(root.path().as_os_str().to_owned()),
+    )]);
+    crate::config::save_quick_model("paid", "anthropic", "claude-sonnet-5-5", None, None).unwrap();
+    crate::config::save_quick_model("free", "gateway", "unlisted", Some(0.0), Some(0.0)).unwrap();
+    let source = std::fs::read_to_string(crate::config::config_file_path()).unwrap();
+    let cfg: Config = toml::from_str(&source).unwrap();
+    let quick = cfg.quick_models.unwrap();
+    assert_eq!(quick["paid"].input_token_cost, None);
+    assert_eq!(quick["paid"].output_token_cost, None);
+    assert_eq!(
+        quick["paid"].resolved_prices(),
+        Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5")
+    );
+    assert_eq!(quick["free"].resolved_prices(), Some((0.0, 0.0)));
 }
