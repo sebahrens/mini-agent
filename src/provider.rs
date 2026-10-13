@@ -531,6 +531,48 @@ pub(crate) fn openai_completions_extra_body(
 }
 
 impl AnyClient {
+    #[cfg(feature = "git-worktree")]
+    pub(crate) async fn git_proposal_completion(
+        &self,
+        model_name: &str,
+        cfg: &Config,
+        session_id: &str,
+        prompt: String,
+        preamble: String,
+        usage: crate::ui::slash::git::UsageLedger,
+    ) -> anyhow::Result<String> {
+        let model = self.completion_model(model_name.to_owned());
+        let extras = passive_provider_request_params(
+            &model,
+            cfg,
+            cfg.resolve_extra_body(model_name, &crate::config::quick_models_map(cfg)),
+            session_id,
+            1024,
+        )?;
+        macro_rules! complete {
+            ($model:expr) => {
+                git_proposal_with_model(
+                    $model,
+                    prompt,
+                    preamble,
+                    extras,
+                    cfg.temperature,
+                    &cfg.retry,
+                    usage,
+                )
+                .await
+            };
+        }
+        match model {
+            AnyModel::OpenRouter(model, _) => complete!(model),
+            AnyModel::OpenAI(OpenAiModel::Responses(model)) => complete!(model),
+            AnyModel::OpenAI(OpenAiModel::Completions(model)) => complete!(model),
+            AnyModel::Anthropic(model) => complete!(model),
+            AnyModel::Gemini(model) => complete!(model),
+            AnyModel::Ollama(model) => complete!(model),
+        }
+    }
+
     pub fn provider_name(&self) -> &'static str {
         match self {
             AnyClient::OpenRouter(_) => "openrouter",
@@ -1518,6 +1560,72 @@ where
     Ok(response)
 }
 
+#[cfg(feature = "git-worktree")]
+async fn git_proposal_with_model<M>(
+    model: M,
+    prompt: String,
+    preamble: String,
+    params: Option<serde_json::Value>,
+    temperature: Option<f64>,
+    retry_config: &RetryConfig,
+    usage: crate::ui::slash::git::UsageLedger,
+) -> anyhow::Result<String>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    use futures::{StreamExt, TryStreamExt};
+    use rig::completion::GetTokenUsage;
+    use rig::streaming::StreamedAssistantContent;
+    let mut stream = retry::retry_stream_chat(retry_config, || {
+        let mut request = model
+            .completion_request(prompt.clone())
+            .preamble(preamble.clone())
+            .max_tokens(1024);
+        if let Some(params) = params.clone() {
+            request = request.additional_params(params);
+        }
+        if let Some(value) = temperature {
+            request = request.temperature(value.clamp(0.0, 2.0));
+        }
+        let ledger = usage.clone();
+        async move {
+            futures::stream::once(async move { request.stream().await })
+                .try_flatten()
+                .inspect(move |item| {
+                    if let Ok(StreamedAssistantContent::Final(raw)) = item {
+                        ledger.observe(raw.token_usage());
+                    }
+                })
+                .boxed()
+        }
+    })
+    .await?;
+    let mut answer = String::new();
+    let mut finished = false;
+    let mut tool = false;
+    while let Some(item) = stream.next().await {
+        match item? {
+            StreamedAssistantContent::Text(text) => {
+                anyhow::ensure!(
+                    answer.len().saturating_add(text.text.len()) <= 32 * 1024,
+                    "Git proposal exceeded response budget"
+                );
+                answer.push_str(&text.text);
+            }
+            StreamedAssistantContent::Final(_) => finished = true,
+            StreamedAssistantContent::ToolCall { .. }
+            | StreamedAssistantContent::ToolCallDelta { .. } => tool = true,
+            _ => {}
+        }
+    }
+    anyhow::ensure!(
+        finished && !tool,
+        "Git proposal stream lacked a final response or requested tools"
+    );
+    Ok(answer)
+}
+
 fn summarizer_preamble() -> String {
     let mut preamble = prompt::COMPACTION_SYSTEM_PROMPT.to_string();
     if let Some(s) = crate::session::storage::load_suffix() {
@@ -1650,6 +1758,7 @@ pub struct AnyAgent {
     /// different unit entirely.
     turn_token_budget: Option<u64>,
     completion_verification: Option<runner::CompletionVerification>,
+    context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "skills")]
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
@@ -1662,11 +1771,50 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             completion_verification: None,
+            context_snapshot: None,
             #[cfg(feature = "skills")]
             skills: None,
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    fn with_context_snapshot(mut self, snapshot: Option<builder::PreambleSnapshot>) -> Self {
+        self.context_snapshot = snapshot;
+        self
+    }
+
+    pub(crate) fn context_snapshot(&self) -> Option<&builder::PreambleSnapshot> {
+        self.context_snapshot.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_preamble_for_test(&self) -> &str {
+        match &self.inner {
+            AnyAgentInner::OpenRouter(a) => a.preamble.as_deref(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.preamble.as_deref(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.preamble.as_deref(),
+            AnyAgentInner::Anthropic(a) => a.preamble.as_deref(),
+            AnyAgentInner::Gemini(a) => a.preamble.as_deref(),
+            AnyAgentInner::Ollama(a) => a.preamble.as_deref(),
+        }
+        .unwrap_or("")
+    }
+
+    /// Metadata already registered in this agent. `None` never selects
+    /// dynamic/vector tools and cannot connect an MCP server or call a tool.
+    pub(crate) async fn context_tool_definitions(
+        &self,
+    ) -> anyhow::Result<Vec<rig::completion::ToolDefinition>> {
+        let handle = match &self.inner {
+            AnyAgentInner::OpenRouter(a) => &a.tool_server_handle,
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &a.tool_server_handle,
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &a.tool_server_handle,
+            AnyAgentInner::Anthropic(a) => &a.tool_server_handle,
+            AnyAgentInner::Gemini(a) => &a.tool_server_handle,
+            AnyAgentInner::Ollama(a) => &a.tool_server_handle,
+        };
+        Ok(handle.get_tool_defs(None).await?)
     }
 
     pub(crate) fn with_turn_token_budget(mut self, budget: Option<u64>) -> Self {
@@ -1697,6 +1845,7 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             completion_verification: None,
+            context_snapshot: None,
             #[cfg(feature = "skills")]
             skills,
             #[cfg(feature = "skills")]
@@ -2609,6 +2758,7 @@ fn build_openrouter_client(
 /// Builds an OpenAiModel (Responses / Completions) into the matching OpenAiAgent.
 #[allow(clippy::too_many_arguments)]
 async fn build_openai_agent(
+    context_snapshot: &mut Option<builder::PreambleSnapshot>,
     model: OpenAiModel,
     cli: &Cli,
     cfg: &Config,
@@ -2635,7 +2785,8 @@ async fn build_openai_agent(
 ) -> OpenAiAgent {
     match model {
         OpenAiModel::Responses(m) => OpenAiAgent::Responses(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2669,7 +2820,8 @@ async fn build_openai_agent(
             .await,
         ),
         OpenAiModel::Completions(m) => OpenAiAgent::Completions(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2771,9 +2923,11 @@ pub async fn build_agent_in_workspace(
         None => completion_verification,
     };
 
+    let mut context_snapshot = None;
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                &mut context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2804,6 +2958,7 @@ pub async fn build_agent_in_workspace(
         ),
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(
             build_openai_agent(
+                &mut context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2833,7 +2988,8 @@ pub async fn build_agent_in_workspace(
             .await,
         ),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                &mut context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2863,7 +3019,8 @@ pub async fn build_agent_in_workspace(
             .await,
         ),
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                &mut context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2893,7 +3050,8 @@ pub async fn build_agent_in_workspace(
             .await,
         ),
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(
-            builder::build_agent_inner(
+            builder::build_agent_inner_with_snapshot(
+                &mut context_snapshot,
                 m,
                 cli,
                 cfg,
@@ -2928,6 +3086,7 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "skills")]
         skills,
     )
+    .with_context_snapshot(context_snapshot)
     .with_turn_token_budget(cfg.resolve_turn_token_budget())
     .with_completion_verification(completion_verification)
 }
@@ -3972,5 +4131,260 @@ mod session_title_completion_tests {
             );
             assert!(!ledger.take().has_values());
         }
+    }
+}
+
+#[cfg(all(test, feature = "git-worktree"))]
+pub(crate) mod git_proposal_test_support {
+    use super::*;
+    use std::io::{Read, Write};
+    pub(crate) struct Wire {
+        pub address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        task: Option<std::thread::JoinHandle<anyhow::Result<serde_json::Value>>>,
+    }
+    impl Wire {
+        pub(crate) fn new(answer: &str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            let answer = answer.to_owned();
+            let task = std::thread::spawn(move || -> anyhow::Result<serde_json::Value> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                for _ in 0..8 {
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                anyhow::ensure!(
+                                    !stopped.load(std::sync::atomic::Ordering::Acquire)
+                                        && std::time::Instant::now() < deadline,
+                                    "owned proposal wire cancelled or timed out"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    };
+                    socket.set_nonblocking(false)?;
+                    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0; 1024];
+                        let count = socket.read(&mut chunk)?;
+                        anyhow::ensure!(count > 0, "request ended before headers");
+                        bytes.extend_from_slice(&chunk[..count]);
+                        anyhow::ensure!(bytes.len() <= 16 * 1024, "fixture headers exceeded bound");
+                        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break index + 4;
+                        }
+                    };
+                    let headers = std::str::from_utf8(&bytes[..header_end])?;
+                    if headers.starts_with("GET ") {
+                        let models = r#"{"object":"list","data":[{"id":"fixture","object":"model","created":0,"owned_by":"local"}]}"#;
+                        write!(
+                            socket,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{models}",
+                            models.len()
+                        )?;
+                        socket.flush()?;
+                        continue;
+                    }
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("missing request length"))?;
+                    anyhow::ensure!(length <= 64 * 1024, "fixture body exceeded bound");
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0; 1024];
+                        let count = socket.read(&mut chunk)?;
+                        anyhow::ensure!(count > 0, "request ended before body");
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = serde_json::from_slice(&bytes[header_end..header_end + length])?;
+                    let first = serde_json::json!({"id":"proposal32","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{"role":"assistant","content":answer},"finish_reason":null}]});
+                    let last = serde_json::json!({"id":"proposal32","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}});
+                    let response = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )?;
+                    socket.flush()?;
+                    return Ok(request);
+                }
+                Err(anyhow::anyhow!(
+                    "owned fixture exceeded GET admission bound"
+                ))
+            });
+            Self {
+                address,
+                stop,
+                task: Some(task),
+            }
+        }
+        pub(crate) fn config(&self) -> Config {
+            serde_json::from_value(serde_json::json!({"session_title_model":"off","retry":{"max_attempts":1},"custom_providers":{"git32-wire":{"provider_type":"openrouter","base_url":format!("http://{}",self.address)}}})).unwrap()
+        }
+        pub(crate) fn body(&mut self) -> serde_json::Value {
+            self.task.take().unwrap().join().unwrap().unwrap()
+        }
+    }
+    impl Drop for Wire {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(task) = self.task.take() {
+                let _ = task.join();
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "git-worktree"))]
+mod git_proposal_wire_tests {
+    use super::*;
+    #[tokio::test]
+    async fn actual_git_proposal_wire_is_passive_capped_and_preserves_declared_privacy_and_usage() {
+        let mut wire =
+            git_proposal_test_support::Wire::new(r#"{"message":"wire literal proposal"}"#);
+        let mut cfg = wire.config();
+        cfg.extra_body = Some(
+            serde_json::json!({"tools":[{"type":"web_search_preview"}],"mcp_servers":[{"url":"https://NEVER.invalid"}],"containers":{"execute":true},"messages":[{"role":"system","content":"INJECTED_OVERRIDE"}],"model":"INJECTED_MODEL","max_tokens":999999,"response_format":{"type":"json_object"},"previous_response_id":"NEVER_STATE","gateway_action":{"execute":true},"provider":{"data_collection":"deny","zdr":true,"enforce_distillable_text":false,"allow_fallbacks":false}}),
+        );
+        let client = create_client(
+            "git32-wire",
+            Some("unused-owned-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let usage = crate::ui::slash::git::UsageLedger::default();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.git_proposal_completion(
+                "fixture",
+                &cfg,
+                "owned-session",
+                "ACTUAL_GIT_CONTEXT".into(),
+                "Commit JSON only".into(),
+                usage.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        let body = wire.body();
+        assert_eq!(answer.unwrap(), r#"{"message":"wire literal proposal"}"#);
+        assert_eq!(body["model"], "fixture");
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(body["provider"]["enforce_distillable_text"], false);
+        for field in [
+            "mcp_servers",
+            "containers",
+            "previous_response_id",
+            "gateway_action",
+            "response_format",
+        ] {
+            assert!(body.get(field).is_none(), "{field}: {body}");
+        }
+        assert!(
+            body.get("tools")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(!body.to_string().contains("INJECTED_OVERRIDE"));
+        assert!(body.to_string().contains("ACTUAL_GIT_CONTEXT"));
+        let observed = usage.take();
+        assert_eq!(observed.input_tokens, 7);
+        assert_eq!(observed.output_tokens, 5);
+        assert!(!usage.take().has_values());
+    }
+    #[tokio::test]
+    async fn actual_git_proposal_unknown_or_malformed_privacy_sends_zero_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut cfg:Config=serde_json::from_value(serde_json::json!({"custom_providers":{"git32-wire":{"provider_type":"openrouter","base_url":format!("http://{}",listener.local_addr().unwrap())}}})).unwrap();
+        for provider in [
+            serde_json::json!({"region":"private-only"}),
+            serde_json::json!({"zdr":"true"}),
+            serde_json::json!({"data_collection":null}),
+        ] {
+            cfg.extra_body = Some(serde_json::json!({"provider":provider}));
+            let client = create_client(
+                "git32-wire",
+                Some("unused-owned-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap();
+            let usage = crate::ui::slash::git::UsageLedger::default();
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.git_proposal_completion(
+                    "fixture",
+                    &cfg,
+                    "owned-session",
+                    "NEVER_SENT".into(),
+                    "JSON".into(),
+                    usage.clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains("invalid auxiliary provider"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(!usage.take().has_values());
+        }
+    }
+    #[tokio::test]
+    async fn actual_sdk_git_proposal_unexpected_tool_keeps_usage_without_dispatch() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let root = crate::tests::OwnedTestDirectory::new("git32-no-tool-dispatch");
+        let target = root.path().join("NEVER_CREATED");
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call(
+                "proposal-tool",
+                "write",
+                serde_json::json!({"path":target,"content":"never"}),
+            ),
+            MockStreamEvent::final_response(rig::completion::Usage {
+                input_tokens: 21,
+                output_tokens: 7,
+                total_tokens: 28,
+                ..Default::default()
+            }),
+        ]]);
+        let ledger = crate::ui::slash::git::UsageLedger::default();
+        let error = git_proposal_with_model(
+            model.clone(),
+            "diff context".into(),
+            "JSON only".into(),
+            None,
+            None,
+            &RetryConfig::default(),
+            ledger.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("requested tools"));
+        assert!(!target.exists());
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].max_tokens, Some(1024));
+        let usage = ledger.take();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (21, 7));
+        assert!(!ledger.take().has_values());
     }
 }

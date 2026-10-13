@@ -490,6 +490,8 @@ impl AgentRunState {
 
 #[derive(Default)]
 pub(crate) struct ChainState {
+    #[cfg(feature = "git-worktree")]
+    pub git: crate::ui::slash::git::ControlState,
     pub pending: Option<crate::extras::chain::ChainPhase>,
     pub label_msg: Option<String>,
     pub dot_prompt_restore: Option<crate::context::ActiveContextSelection>,

@@ -10,6 +10,23 @@ use crate::sandbox::{
     Sandbox,
 };
 
+/// Immutable observation of the actual foreground child, before display limits,
+/// permission coaching or hooks rewrite model-visible text. Payload is bounded;
+/// consumers must require complete successful output before interpreting it.
+#[cfg(any(feature = "git-worktree", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct ForegroundResult {
+    pub status: CommandStatus,
+    pub exit_code: Option<i32>,
+    pub descendants_escaped: bool,
+    pub stdout: Vec<u8>,
+    pub stdout_complete: bool,
+}
+
+// Without the native Git/PR consumer there is no result observation to allocate.
+#[cfg(not(any(feature = "git-worktree", test)))]
+type ForegroundResult = std::convert::Infallible;
+
 pub struct ShellTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -97,6 +114,29 @@ impl Tool for ShellTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
+        self.execute(args).await.map(|(text, _)| text)
+    }
+    #[cfg(any(feature = "git-worktree", test))]
+    async fn call_structured(
+        &self,
+        args: BashArgs,
+        _extensions: &rig::tool::ToolCallExtensions,
+    ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
+        self.execute(args).await.map(|(text, metadata)| {
+            let result = rig::tool::ToolReturn::success(text);
+            match metadata {
+                Some(metadata) => result.with_extension(metadata),
+                None => result,
+            }
+        })
+    }
+}
+
+impl ShellTool {
+    async fn execute(
+        &self,
+        args: BashArgs,
+    ) -> Result<(String, Option<ForegroundResult>), ToolError> {
         tracing::debug!(
             "tool shell start: cmd_len={}, timeout={:?}, background={}",
             args.command.len(),
@@ -138,10 +178,13 @@ impl Tool for ShellTool {
             let result = format!(
                 "Background job started: {id}\nUse job_status with this id to poll output or stop it."
             );
-            return Ok(match coaching {
-                Some(message) => format!("{message}\n\n{result}"),
-                None => result,
-            });
+            return Ok((
+                match coaching {
+                    Some(message) => format!("{message}\n\n{result}"),
+                    None => result,
+                },
+                None,
+            ));
         }
 
         let mut limits = DEFAULT_COMMAND_LIMITS;
@@ -159,6 +202,23 @@ impl Tool for ShellTool {
             return Err(resource_limit_error(output, limits, self.max_output_lines));
         }
 
+        #[cfg(any(feature = "git-worktree", test))]
+        const METADATA_STDOUT_BYTES: usize = 64 * 1024;
+        #[cfg(any(feature = "git-worktree", test))]
+        let metadata = Some(ForegroundResult {
+            status: output.status,
+            exit_code: output.exit_status.and_then(|status| status.code()),
+            descendants_escaped: output.descendants_escaped,
+            stdout: output
+                .stdout
+                .iter()
+                .copied()
+                .take(METADATA_STDOUT_BYTES)
+                .collect(),
+            stdout_complete: output.stdout.len() <= METADATA_STDOUT_BYTES,
+        });
+        #[cfg(not(any(feature = "git-worktree", test)))]
+        let metadata = None;
         let termination = render_termination(output.exit_status);
         if let Some(termination) = termination.as_deref() {
             tracing::warn!("tool shell: {termination}");
@@ -192,7 +252,7 @@ impl Tool for ShellTool {
             output.exit_status,
             output_len,
         );
-        Ok(result)
+        Ok((result, metadata))
     }
 }
 
@@ -1305,5 +1365,112 @@ mod tests {
         drop(sandbox);
         wait_for_process_exit(pid).await;
         let _ = std::fs::remove_file(pid_file);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod foreground_metadata_tests {
+    use super::*;
+    use rig::tool::{Tool, ToolCallExtensions};
+    fn tool(lines: Option<u64>) -> ShellTool {
+        ShellTool::new(None, None, Sandbox::new(false, "none"), lines)
+    }
+    #[tokio::test]
+    async fn actual_foreground_metadata_preserves_stdout_before_display_truncation_and_nonzero_exit()
+     {
+        let extensions = ToolCallExtensions::default();
+        for (command, code) in [
+            ("printf 'HEAD\\nBODY\\nTAIL\\n'", 0),
+            (
+                "printf 'https://never-claimed.invalid/pull/1\\n'; exit 3",
+                3,
+            ),
+        ] {
+            let result = Tool::call_structured(
+                &tool(Some(1)),
+                BashArgs {
+                    command: command.into(),
+                    timeout: None,
+                    background: false,
+                },
+                &extensions,
+            )
+            .await
+            .unwrap();
+            let actual = result.extensions.get::<ForegroundResult>().unwrap();
+            assert_eq!(actual.status, CommandStatus::Completed);
+            assert_eq!(actual.exit_code, Some(code));
+            assert!(actual.stdout_complete);
+            assert!(!actual.descendants_escaped);
+            if code == 0 {
+                assert_eq!(actual.stdout, b"HEAD\nBODY\nTAIL\n");
+                assert!(result.output.contains("omitted"));
+            } else {
+                assert_eq!(actual.stdout, b"https://never-claimed.invalid/pull/1\n");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn actual_foreground_metadata_marks_bounded_stdout_incomplete_and_timeout_has_no_success_metadata()
+     {
+        let extensions = ToolCallExtensions::default();
+        let result = Tool::call_structured(
+            &tool(None),
+            BashArgs {
+                command: "head -c 65537 /dev/zero | tr '\\000' x".into(),
+                timeout: None,
+                background: false,
+            },
+            &extensions,
+        )
+        .await
+        .unwrap();
+        let actual = result.extensions.get::<ForegroundResult>().unwrap();
+        assert_eq!(actual.stdout.len(), 64 * 1024);
+        assert!(!actual.stdout_complete);
+        let error = Tool::call_structured(
+            &tool(None),
+            BashArgs {
+                command: "printf 'https://never-claimed.invalid/pull/1\\n'; sleep 5".into(),
+                timeout: Some(30),
+                background: false,
+            },
+            &extensions,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("timed out") || error.to_string().contains("timeout"),
+            "{error}"
+        );
+    }
+    #[tokio::test]
+    async fn actual_background_structured_result_has_no_foreground_observation() {
+        let shell = tool(None);
+        let result = Tool::call_structured(
+            &shell,
+            BashArgs {
+                command: "printf BACKGROUND32".into(),
+                timeout: None,
+                background: true,
+            },
+            &ToolCallExtensions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.extensions.get::<ForegroundResult>().is_none());
+        let id = result
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("Background job started: "))
+            .unwrap();
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shell.sandbox.stop_background_job(id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.status.is_terminal());
     }
 }

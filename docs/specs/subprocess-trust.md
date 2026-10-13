@@ -19,6 +19,16 @@ threads and join them before fixture teardown. Their exact `.spawn(|| ...)` and
 checked inventory and Windows creation-boundary catalogue; all process
 negative controls remain unchanged.
 
+## App integration inventory
+
+The fixed 1 MiB App picker, ordinary-event and combined context/Git confirmation
+regressions create owned Rust threads and join them before fixture teardown. Their
+exact `.spawn` sites are classified as non-process operations; process inventory
+and Windows creation-boundary negative controls remain unchanged. `/context`
+uses registered metadata without launching a process. Native Git/PR actors keep
+the existing Git runner and ShellTool trust classes rather than adding a new
+process boundary.
+
 ## 2026-09-06 inventory reconciliation
 
 The `TC-MODEL-ACTION` row includes the delivered general-profile hardening: captured commands use

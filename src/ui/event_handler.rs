@@ -38,21 +38,12 @@ pub async fn ensure_agent(
             .rebuild_agent(&ui.session.model, reasoning_enabled)
             .await,
     );
-    // Keep the pre-calibration context estimate in sync with the preamble we
-    // just built (system prompt + tools + context files).
-    #[cfg(feature = "goal")]
-    let goal_block =
-        crate::extras::goal::prompt::goal_block(ui.session.goal_store.snapshot().as_ref());
-    #[cfg(not(feature = "goal"))]
-    let goal_block: Option<String> = None;
-    ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
-        ui.context,
-        reasoning_enabled,
-        ui.cli,
-        ui.cfg,
-        &ui.sandbox,
-        goal_block.as_deref(),
-    );
+    // The builder captured these counts from the actual preamble and actual
+    // registered tools. Never reread added/suffix files after building it.
+    if let Some(snapshot) = agent.as_ref().and_then(AnyAgent::context_snapshot) {
+        ui.session.overhead_tokens = snapshot.tokens;
+        ui.session.overhead_parts = snapshot.parts.clone();
+    }
 }
 
 /// Minimum spacing between streamed-token repaints once a segment is large.

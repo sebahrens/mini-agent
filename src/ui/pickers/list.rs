@@ -11,6 +11,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/btw",
     "/clear",
     "/compress",
+    "/context",
     "/drop",
     "/drop-all",
     "/editsys",
@@ -88,6 +89,9 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
 
     #[cfg(feature = "git-worktree")]
     {
+        cmds.push("/commit");
+        cmds.push("/diff");
+        cmds.push("/pr");
         cmds.push("/worktree");
         cmds.push("/wt-exit");
         cmds.push("/wt-merge");

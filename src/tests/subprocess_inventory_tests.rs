@@ -871,8 +871,8 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git and ordinary-event tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 2, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
@@ -1613,6 +1613,37 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Context diagnostics inspect captured renderer String values.
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(\"Context composition:\") && output.contains(\"agent not built\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(!output.contains(\"PRIVATE_USER_CONTENT\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(\"actual built-agent preamble snapshot\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(&format!(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(!output.contains(\"CAPTURED_\") && !output.contains(\"PRIVATE_USER_CONTENT\"));",
+        1,
+        "NON-PROCESS",
+    ),
     // Price-pair bindings inside assertion/rendering macros are numeric data.
     (
         "src/session/title.rs",
@@ -3718,6 +3749,28 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/ui/app.rs",
         &[
+            // Context diagnostic assertions inspect captured renderer strings,
+            // never process builders; bind each complete macro invocation.
+            (
+                "27b4360381c77aa12e4fcf4c083cd1150bf4cf12dfc6914c7507d9ddaeb3aa49",
+                1,
+            ),
+            (
+                "2ec28ae5aeb94b904650c110aed46f8a6119bf282cb94103305353c2cd086655",
+                1,
+            ),
+            (
+                "43396f941f737accd9c4d4d101e440fe68fc3b52a834529227f028abb9e1c58f",
+                1,
+            ),
+            (
+                "7129b5cf6f964bbd2698b0f39b68c8552a420fc5594d81482b5fcce6512b6aba",
+                1,
+            ),
+            (
+                "039c1c846af0d5772694e02ae88965b6fec2b6260b55bd0f961fd55c057ae21f",
+                1,
+            ),
             (
                 "842d29cd63634e7d8359ed65fd83710f1b986f46e826f81235b6c5a6c07e71c4",
                 1,
@@ -4159,8 +4212,8 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
-    // Owned fixed-stack App picker and ordinary-event tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Owned fixed-stack App picker/Git and ordinary-event tests use std::thread.
+    ("src/ui/app.rs", ".spawn(|| {", 2, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (

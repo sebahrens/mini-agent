@@ -174,6 +174,7 @@ files are skipped with a warning containing their path and read error.
 | `/compress [instructions]` | Compress conversation history to free context window space. The summarizer receives the history, the previous summary and your instructions in fenced sections; closing tags of those fences inside the text (such as `</message>` or `</transcript>` in a tool result) are neutralized with U+2060 WORD JOINER, and the summarizer is told the fenced history is data, not instructions. |
 | `/compact [instructions]` | Alias for `/compress`; after a manual compaction, show the active summary. |
 | `/compact show` | Show the active saved summary without making a provider request or changing session history. Imported file-request metadata remains untrusted historical data. |
+| `/context` | Inspect the captured preamble, conversation and retained tool-result estimates, registered tool metadata, compaction state and next-request pruning projection. Works during a turn; makes no model request and does not change or save the session. |
 | `/editsys` | Show the current edit system mode (similarity or hashedit). |
 | `/editsys similarity` | Use SEARCH/REPLACE with exact/whitespace matching and explicit fuzzy opt-in (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |
@@ -192,6 +193,41 @@ current runtime report once it is available.
 `--print-config` reports an eligible JavaScript worker as `not probed`; configuration display
 starts no JavaScript worker and does not attest containment or advertise worker capabilities.
 Actual agent startup still requires the full containment probe and executable-content proofs.
+
+## Git commands (feature-gated)
+
+Requires `git-worktree`, included in the default build, a usable captured workspace
+and the ordinary native Git/shell containment boundary.
+
+| Command | Description |
+| ------- | ----------- |
+| `/diff [path\|turn]` | Show the native Git working-tree diff, optionally for one literal quoted path or the latest turn's edit/write request paths. Added, removed and hunk rows use the diff colors. |
+| `/commit [msg]` | Preview a commit of the latest turn's native edit/write request paths. A supplied message is literal; otherwise a tool-free request drafts a message from the selected diff. |
+| `/pr` | Draft a bounded title/body from recent local commits and the working-tree diff, preview them, then run `gh pr create` through the ordinary shell tool. Requires `gh` on the retained shell's PATH and existing GH authentication. |
+
+A turn's request paths identify attempted native edits or writes; a failed request
+or imported history does not prove a file changed. No shell/MCP output is parsed
+as a file selection. Commit candidates are frozen before generation and cannot
+expand to directories or descendants. Existing unrelated staged paths are refused;
+the actual commit uses `--only` for the confirmed literal paths.
+
+The preview asks for **Y** to execute, **N** or Esc to decline, or **B** to edit
+the commit message / append a PR note. Editing returns to the preview and still
+requires Y. Confirmation belongs to the same live session and captured workspace;
+a stale proposal cannot run. Ordinary tool permissions and hooks still apply after
+Y, and a hook cannot rewrite confirmed operands. Ctrl-C cancels owned work and
+discards queued submissions; a cancelled stage can leave approved partial changes
+in the index, so review them before retrying.
+
+Proposal generation uses the current provider/model, no tools, a 1024-token output
+cap, a 30-second deadline and bounded context/output. Hosted tool/state overrides
+are removed, while declared provider privacy/routing constraints are validated.
+Observed auxiliary usage is charged once at captured model prices to Session spend;
+it does not recalibrate the main conversation context. Declining, malformed output
+or cancellation retains usage already observed. `/pr` reports a URL only from a
+successful actual foreground command with complete bounded stdout, never from
+model text or a hook's rewritten display text. These controls do not add a
+headless `--commit` flag; programmatic agents retain the native Git/shell tools.
 
 ## Memory (feature-gated)
 
@@ -651,3 +687,24 @@ Includes and supplied arguments cannot introduce another include or directive.
 Arguments are limited to 64 KiB and the expanded message to 256 KiB, followed by
 the normal context-budget check. Templates submit prompts through normal tools
 and permissions; they never execute their body as shell or slash commands.
+### Context composition
+
+`/context` shows estimates by section and the five largest live retained tool
+results, identified by bounded, sanitized tool names and call IDs. It prints no
+prompt, message, result or spill-file content. Hidden redo history is excluded.
+Inspecting context does not prune results, compact history, grant permissions,
+connect MCP, warm the provider cache or charge usage.
+
+An existing agent provides the exact preamble ranges captured at construction
+and its already-registered tool definitions. Before an agent is built, the
+report labels the last captured cold preamble estimate and unavailable schemas;
+it does not initialize an agent to fill that gap. Metadata retrieval has a
+100 ms timeout, 128-definition limit and bounded serialized estimate. Oversized
+or unavailable metadata is reported explicitly, rather than counted as zero.
+
+Sections use the local token estimator, not separately measured provider usage.
+A signed calibration/tokenizer adjustment accounts for section rounding, schema
+accounting and the current provider anchor so the total exactly matches the
+context count in the status line. The pruning projection uses the same retained
+history policy as the next request. The displayed compaction thresholds do not
+trigger compaction.

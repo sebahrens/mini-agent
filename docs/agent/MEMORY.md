@@ -262,7 +262,7 @@ The injected memory block without the daily-log entry tagged `ref`. The session 
 
 ### `effective_reserve(base, memory_block)`
 
-Compaction reserve including the injected memory block's token estimate. Since the memory block lives in the preamble (not in session messages), the session's own token accounting doesn't count it. This function folds the block's estimate into the reserve so compaction fires early enough to leave headroom.
+Compaction reserve including the injected memory block's token estimate. Since the memory block lives in the preamble (not in session messages), the session's own token accounting doesn't count it. This function folds the block's estimate into the reserve so compaction fires early enough to leave headroom. Addition saturates at `u64::MAX`: a maximum configured reserve plus nonempty memory keeps the available compaction-input headroom at zero, rather than overflowing or wrapping into extra capacity. Missing or empty memory leaves the base reserve unchanged; ordinary sums retain their previous thresholds.
 
 ### `append_memory_block(preamble, memory)`
 

@@ -123,7 +123,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         crate::extras::goal::prompt::goal_block(session.goal_store.snapshot().as_ref());
     #[cfg(not(feature = "goal"))]
     let goal_block: Option<String> = None;
-    session.overhead_tokens = crate::agent::builder::estimate_overhead(
+    let (overhead, parts) = crate::agent::builder::estimate_overhead_breakdown(
         ctx.context,
         *ctx.reasoning_enabled,
         ctx.cli,
@@ -131,6 +131,8 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         ctx.sandbox,
         goal_block.as_deref(),
     );
+    session.overhead_tokens = overhead;
+    session.overhead_parts = parts;
     let new_client = match crate::provider::create_client(
         &session.provider,
         ctx.cli.api_key.as_deref(),

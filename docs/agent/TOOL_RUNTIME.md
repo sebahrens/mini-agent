@@ -443,12 +443,56 @@ request; malformed or unsupported values, or use with another protocol, fail clo
 first-message fallback without inventing usage.
 See [CONFIG.md](CONFIG.md) for the default model and opt-out.
 
-The App event loop constructs measured large agent-event, key-handler, and
-slash-command futures through the existing short `heap_future` factory. This
-keeps their temporary storage out of parent polling frames while preserving
-the same awaits, interruption cleanup, and permission ownership. Fixed 1 MiB
-thread tests exercise a cold typed command, draft interruption, pending
-approval denial, mode cycling, and session-picker selection. The Windows
-default job discovers and runs both App stack consumers after compiling its
-existing feature suite; compilation alone is insufficient evidence for this
-stack budget. No production stack-size override is introduced.
+## Native Git command proposals
+
+`src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
+validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
+owns the preview, async event receiver and captured session/workspace identity.
+Actors enter an `AgentWorkScope` before spawn and retain cleanup ownership through
+receiver settlement. Cancellation denies pending requests and settles the exact
+actor before auxiliary usage or a successor can be admitted. A cleanup failure
+retains the work receiver and blocks a new run.
+
+A per-invocation `FrozenTool` forwards structured calls through ordinary hooks and
+captures the inner immutable result before post-hook display redaction. It rejects
+pre-hook changes to the confirmed JSON operands; status guards and mutation
+success checks consume that captured result. Selected staging uses nonrecursive
+`git update-index --add --remove --` after the existing path, permission and
+external-filter checks; selected commits use `git commit --only --`. Guards refuse
+unrelated staged paths before and after staging. Concurrent external Git/filesystem
+writers are not a transaction lock; users should inspect state after an interrupted
+or refused command rather than assume rollback.
+
+With `git-worktree` compiled, `ShellTool` adds an immutable `ForegroundResult` structured extension containing
+actual completion status, exit code, descendant cleanup state and at most 64 KiB
+of stdout with an explicit completeness bit. Text rendering and background job
+behavior are unchanged. Resource-limit errors supply no successful foreground
+extension. The PR consumer accepts only completed exit-zero results without escaped
+descendants and with complete UTF-8 stdout containing exactly one HTTP(S) URL.
+Hooks may redact model/display text while the captured inner extension remains
+the authority for that decision. Metadata is invocation-local; no ambient result
+registry or filename/model-text inference is used.
+
+## Read-only context composition
+
+`src/ui/slash/context.rs` implements `/context` from immutable agent-build
+metadata and retained `Session` estimates. The production preamble composer
+records contiguous UTF-8 byte ranges while constructing the actual text, then
+captures its token estimates on `AnyAgent`. Capture does not change preamble
+bytes, cache-prefix order or provider calibration. `Session.overhead_parts` is
+runtime-only; imported JSON cannot supply these diagnostic labels.
+
+The diagnostic reads static definitions through the existing SDK tool-server
+handle with `get_tool_defs(None)`, which excludes vector retrieval and tool
+execution. It neither rebuilds an agent nor connects MCP. A timeout bounds the
+await; count, depth, node and final JSON-byte limits bound accepted metadata
+encoding. The SDK may clone already-registered metadata before those encoding
+checks. Unavailable or excessive schemas remain visibly unavailable.
+
+The diagnostic emits no prompt, message or output content and opens no files
+or spills. Hidden redo is not inspected. Projection reuses retained in-memory
+metadata and the normal pruning estimator. The five largest live result estimates carry only bounded sanitized names and
+IDs. A signed adjustment reconciles per-section local estimates with the
+existing effective-context total. The command changes no history, calibration,
+costs, permissions, pruning or persistence and bypasses the ordinary slash
+command model-cache warming and session-save steps.

@@ -1,6 +1,9 @@
 pub(crate) mod add;
 mod content;
+pub(crate) mod context;
 mod features;
+#[cfg(feature = "git-worktree")]
+pub(crate) mod git;
 mod help;
 #[cfg(feature = "hooks")]
 mod hooks;
@@ -815,6 +818,20 @@ pub(crate) async fn handle_slash(
     }
 
     match parts[0] {
+        "/diff" | "/commit" | "/pr" => {
+            #[cfg(feature = "git-worktree")]
+            {
+                Err(git::DeferredCommand(text.to_owned()).into())
+            }
+            #[cfg(not(feature = "git-worktree"))]
+            {
+                write_error(
+                    ctx.renderer,
+                    "Git commands require the git-worktree feature",
+                );
+                Ok(())
+            }
+        }
         "/models-add" => {
             let model_parts: SmallVec<[&str; 6]> = text.split_whitespace().collect();
             providers::handle(&model_parts, &mut ctx).await
@@ -843,6 +860,7 @@ pub(crate) async fn handle_slash(
         "/export" | "/import" => session::handle(&path_parts, &mut ctx).await,
         #[cfg(feature = "export")]
         "/share" => session::handle(&parts, &mut ctx).await,
+        "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/help" => {
             help::handle(&parts, &mut ctx);
             Ok(())

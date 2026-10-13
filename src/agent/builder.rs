@@ -160,6 +160,51 @@ pub(crate) fn build_preamble_for_workspace(
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreambleSnapshot {
+    pub(crate) tokens: u64,
+    pub(crate) parts: Vec<(&'static str, u64)>,
+    pub(crate) ranges: Vec<(&'static str, std::ops::Range<usize>)>,
+    pub(crate) bytes: usize,
+}
+
+struct PreambleComposition {
+    text: String,
+    parts: Vec<(&'static str, std::ops::Range<usize>)>,
+}
+
+impl PreambleComposition {
+    fn snapshot(&self) -> PreambleSnapshot {
+        PreambleSnapshot {
+            tokens: crate::session::Session::estimate_tokens(&self.text),
+            parts: self
+                .parts
+                .iter()
+                .map(|(label, range)| {
+                    (
+                        *label,
+                        crate::session::Session::estimate_tokens(&self.text[range.clone()]),
+                    )
+                })
+                .collect(),
+            ranges: self.parts.clone(),
+            bytes: self.text.len(),
+        }
+    }
+}
+
+fn record_part(
+    parts: &mut Vec<(&'static str, std::ops::Range<usize>)>,
+    text: &str,
+    label: &'static str,
+) {
+    let start = parts.last().map_or(0, |(_, range)| range.end);
+    if start < text.len() {
+        parts.push((label, start..text.len()));
+    }
+}
+
+#[cfg(test)]
 fn build_preamble_with_overrides(
     context: &ContextFiles,
     reasoning_enabled: bool,
@@ -169,6 +214,27 @@ fn build_preamble_with_overrides(
     persona: Option<&str>,
     appended: Option<&str>,
 ) -> String {
+    compose_preamble(
+        context,
+        reasoning_enabled,
+        workspace_root,
+        headless,
+        goal_block,
+        persona,
+        appended,
+    )
+    .text
+}
+
+fn compose_preamble(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    workspace_root: Option<&Path>,
+    headless: bool,
+    goal_block: Option<&str>,
+    persona: Option<&str>,
+    appended: Option<&str>,
+) -> PreambleComposition {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
     } else {
@@ -249,6 +315,7 @@ fn build_preamble_with_overrides(
     let total_len = total_len + extra_files_len;
 
     let mut preamble = String::with_capacity(total_len);
+    let mut parts = Vec::new();
     preamble.push_str(reasoning_prefix);
     if let Some(persona) = persona {
         // Only the opening persona is replaceable. Workflow/authority rules
@@ -263,13 +330,16 @@ fn build_preamble_with_overrides(
         preamble.push_str(system_prompt);
     }
     preamble.push('\n');
+    record_part(&mut parts, &preamble, "System prompt");
     if !main_agent_persona.is_empty() {
         preamble.push_str("\n\n");
         preamble.push_str(main_agent_persona);
     }
+    record_part(&mut parts, &preamble, "Active persona");
     if !context_agents.is_empty() {
         append_repository_reference(&mut preamble, "Repository context", context_agents);
     }
+    record_part(&mut parts, &preamble, "Repository instructions");
     #[cfg(feature = "archmd")]
     if !context_architecture.is_empty() {
         append_repository_reference(
@@ -278,37 +348,48 @@ fn build_preamble_with_overrides(
             context_architecture,
         );
     }
+    record_part(&mut parts, &preamble, "Repository architecture");
     if !context_prompt.is_empty() {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(context_prompt);
     }
+    record_part(&mut parts, &preamble, "Active prompt");
     if !cwd.is_empty() {
         preamble.push_str("\n\nCurrent working directory: ");
         preamble.push_str(&cwd);
     }
+    record_part(&mut parts, &preamble, "Workspace path");
     for content in &extra_files_content {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(content);
     }
+    record_part(&mut parts, &preamble, "Added files");
     if let Some(appended) = appended {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(appended);
     }
+    record_part(&mut parts, &preamble, "Appended system prompt");
     #[cfg(feature = "memory")]
     {
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
     }
+    record_part(&mut parts, &preamble, "Memory");
     // The active objective. Static for the goal's life so the cached prompt
     // prefix does not move between rounds.
     if let Some(block) = goal_block {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(block);
     }
+    record_part(&mut parts, &preamble, "Active goal");
     if let Some(s) = &suffix {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(s);
     }
-    preamble
+    record_part(&mut parts, &preamble, "Session suffix");
+    PreambleComposition {
+        text: preamble,
+        parts,
+    }
 }
 
 /// Append repository-owned text as quoted reference material. Prefixing every
@@ -329,6 +410,7 @@ fn append_repository_reference(preamble: &mut String, label: &str, content: &str
     preamble.push_str("[end repository reference]");
 }
 
+#[cfg(all(test, feature = "js"))]
 fn build_registered_preamble(
     context: &ContextFiles,
     reasoning_enabled: bool,
@@ -338,7 +420,28 @@ fn build_registered_preamble(
     cli: &Cli,
     goal_block: Option<&str>,
 ) -> String {
-    let mut preamble = build_preamble_with_overrides(
+    compose_registered_preamble(
+        context,
+        reasoning_enabled,
+        workspace_root,
+        sandbox,
+        registered_tools,
+        cli,
+        goal_block,
+    )
+    .text
+}
+
+fn compose_registered_preamble(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    workspace_root: &Path,
+    sandbox: &Sandbox,
+    registered_tools: &[&str],
+    cli: &Cli,
+    goal_block: Option<&str>,
+) -> PreambleComposition {
+    let mut composition = compose_preamble(
         context,
         reasoning_enabled,
         Some(workspace_root),
@@ -349,60 +452,71 @@ fn build_registered_preamble(
     );
     let has = |name: &str| registered_tools.contains(&name);
     if has("js") {
-        preamble.push_str(JS_TOOL_PROMPT);
+        composition.text.push_str(JS_TOOL_PROMPT);
     }
     if has("read") {
-        preamble.push_str(READ_TOOL_PROMPT);
+        composition.text.push_str(READ_TOOL_PROMPT);
     }
     if has("write") {
-        preamble.push_str(WRITE_TOOL_PROMPT);
+        composition.text.push_str(WRITE_TOOL_PROMPT);
     }
     if has("edit") {
-        preamble.push_str(EDIT_TOOL_PROMPT);
+        composition.text.push_str(EDIT_TOOL_PROMPT);
     }
     if has("grep") {
-        preamble.push_str(GREP_TOOL_PROMPT);
+        composition.text.push_str(GREP_TOOL_PROMPT);
     }
     if has("find_files") {
-        preamble.push_str(FIND_FILES_TOOL_PROMPT);
+        composition.text.push_str(FIND_FILES_TOOL_PROMPT);
     }
     if has("list_dir") {
-        preamble.push_str(LIST_DIR_TOOL_PROMPT);
+        composition.text.push_str(LIST_DIR_TOOL_PROMPT);
     }
     if has("todo_write") || has("todo_read") {
-        preamble.push_str(TODO_TOOL_PROMPT);
+        composition.text.push_str(TODO_TOOL_PROMPT);
     }
     if has("task") {
-        preamble.push_str(TASK_TOOL_PROMPT);
+        composition.text.push_str(TASK_TOOL_PROMPT);
     }
     #[cfg(feature = "memory")]
     {
         if has("memory_write") {
-            preamble.push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
+            composition
+                .text
+                .push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
         }
         if has("memory_edit") {
-            preamble.push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
+            composition
+                .text
+                .push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
         }
         if has("memory_search") {
-            preamble.push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
+            composition
+                .text
+                .push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
         }
         if has("memory_read") {
-            preamble.push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
+            composition
+                .text
+                .push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
         }
     }
     #[cfg(feature = "lsp")]
     if has("lsp_diagnostics") {
-        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
+        composition.text.push_str(crate::agent::prompt::LSP_PROMPT);
         if has("edit") || has("write") {
-            preamble.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+            composition
+                .text
+                .push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
         }
     }
     if has("shell")
         && let Some(capability) = sandbox.shell_capability()
     {
-        preamble.push_str(&capability.model_guidance());
+        composition.text.push_str(&capability.model_guidance());
     }
-    preamble
+    record_part(&mut composition.parts, &composition.text, "Tool guidance");
+    composition
 }
 
 fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec<&'static str> {
@@ -455,28 +569,38 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     names
 }
 
-/// Conservatively estimate the registered preamble before provider calibration.
-/// Runtime-unavailable optional tools can make this slightly high. Tool-schema
-/// tokens are folded into the first provider usage report.
-pub fn estimate_overhead(
+/// Capture the exact current composition alongside its cold token estimate.
+/// Diagnostics reuse this snapshot instead of rereading suffix/added files.
+pub(crate) fn estimate_overhead_breakdown(
     context: &ContextFiles,
     reasoning_enabled: bool,
     cli: &Cli,
     cfg: &Config,
     sandbox: &Sandbox,
     goal_block: Option<&str>,
-) -> u64 {
-    let registered_tools = estimated_registered_tools(cli, cfg, sandbox);
-    let preamble = build_registered_preamble(
+) -> (u64, Vec<(&'static str, u64)>) {
+    let tools = estimated_registered_tools(cli, cfg, sandbox);
+    let composition = compose_registered_preamble(
         context,
         reasoning_enabled,
         &context.workspace_root,
         sandbox,
-        &registered_tools,
+        &tools,
         cli,
         goal_block,
     );
-    crate::session::Session::estimate_tokens(&preamble)
+    let total = crate::session::Session::estimate_tokens(&composition.text);
+    let parts = composition
+        .parts
+        .iter()
+        .map(|(label, range)| {
+            (
+                *label,
+                crate::session::Session::estimate_tokens(&composition.text[range.clone()]),
+            )
+        })
+        .collect();
+    (total, parts)
 }
 
 /// Retain only the tools whose names appear in `allowlist`. An empty
@@ -617,8 +741,71 @@ fn register_js_tool_with_status(
     tools.push(Box::new(js_tool));
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent_inner<M: CompletionModel + 'static>(
+    model: M,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    sandbox: Sandbox,
+    read_tracker: tools::ReadTracker,
+    todo_store: tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
+    tool_output_session_id: &str,
+    tool_result_spills: Option<crate::session::ToolResultSpillStore>,
+    reasoning_enabled: bool,
+    temperature: Option<f64>,
+    // Provider-specific extra body params (e.g. OpenRouter `provider.order` to
+    // pin Claude to the Anthropic direct route so `cache_control` is honored).
+    // `None` for providers that need no extra routing.
+    additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "js")]
+    js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+    #[cfg(feature = "js")] js_scratch: crate::extras::js::session::ScratchStore,
+    #[cfg(feature = "skills")] skill_services: Option<
+        Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+) -> Agent<M> {
+    let mut snapshot = None;
+    build_agent_inner_with_snapshot(
+        &mut snapshot,
+        model,
+        cli,
+        cfg,
+        context,
+        workspace,
+        permission,
+        ask_tx,
+        sandbox,
+        read_tracker,
+        todo_store,
+        #[cfg(feature = "goal")]
+        goal_store,
+        tool_output_session_id,
+        tool_result_spills,
+        reasoning_enabled,
+        temperature,
+        additional_params,
+        #[cfg(feature = "js")]
+        js_worker_containment_status,
+        #[cfg(feature = "js")]
+        js_scratch,
+        #[cfg(feature = "skills")]
+        skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static>(
+    context_snapshot: &mut Option<PreambleSnapshot>,
     model: M,
     cli: &Cli,
     cfg: &Config,
@@ -920,7 +1107,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let goal_block = crate::extras::goal::prompt::goal_block(goal_store.snapshot().as_ref());
     #[cfg(not(feature = "goal"))]
     let goal_block: Option<String> = None;
-    let preamble = build_registered_preamble(
+    let composition = compose_registered_preamble(
         context,
         reasoning_enabled,
         workspace_root,
@@ -929,6 +1116,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         cli,
         goal_block.as_deref(),
     );
+    *context_snapshot = Some(composition.snapshot());
+    let preamble = composition.text;
     let builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .max_tokens(cli.resolve_max_tokens(cfg))
@@ -2331,7 +2520,7 @@ mod js_tests {
             let goal = Goal::new("x".repeat(2_000), Vec::new()).unwrap();
             let block = crate::extras::goal::prompt::goal_block(Some(&goal));
 
-            let without = super::super::estimate_overhead(
+            let (without, _) = super::super::estimate_overhead_breakdown(
                 &empty_context(),
                 false,
                 &cli,
@@ -2339,7 +2528,7 @@ mod js_tests {
                 &sandbox,
                 None,
             );
-            let with = super::super::estimate_overhead(
+            let (with, _) = super::super::estimate_overhead_breakdown(
                 &empty_context(),
                 false,
                 &cli,

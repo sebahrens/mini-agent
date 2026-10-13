@@ -656,7 +656,9 @@ pub(crate) enum SubmitAction {
 /// status the driver checks before it relaunches.
 pub(crate) fn allowed_while_running(text: &str) -> bool {
     let t = text.trim_start();
-    t == "/queue"
+    t == "/context"
+        || t.starts_with("/context ")
+        || t == "/queue"
         || t.starts_with("/queue ")
         || t == "/btw"
         || t.starts_with("/btw ")

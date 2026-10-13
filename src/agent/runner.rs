@@ -662,7 +662,11 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    #[cfg(any(feature = "hooks", all(test, feature = "acp")))]
+    #[cfg(any(
+        feature = "hooks",
+        feature = "git-worktree",
+        all(test, feature = "acp")
+    ))]
     pub(crate) fn without_compaction(
         event_rx: mpsc::Receiver<AgentEvent>,
         abort_handle: tokio::task::AbortHandle,
@@ -798,7 +802,7 @@ impl AgentWorkScope {
         self.active_children.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.cancellation.notified();
             if self.is_cancelled() {

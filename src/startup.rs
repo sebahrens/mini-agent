@@ -2960,6 +2960,52 @@ mod tests {
         assert_eq!(plan.response_token_budget, 20);
     }
 
+    #[cfg(feature = "memory")]
+    #[test]
+    fn headless_compaction_plan_keeps_zero_headroom_for_maximum_reserve_and_memory() {
+        let mut session = Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 90;
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "compact_enabled": true,
+            "reserve_tokens": u64::MAX,
+            "keep_recent_tokens": 5
+        }))
+        .unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        for memory in [None, Some(""), Some("captured memory 🙂界")] {
+            let plan = headless_compaction_plan(&session, &cfg, 1, memory)
+                .expect("exhausted headroom must keep the over-budget compaction gate active");
+            assert_eq!(plan.cut_idx, 1);
+            assert_eq!(plan.input_token_budget, 0);
+            assert_eq!(plan.response_token_budget, u64::MAX);
+        }
+        let normal = Config {
+            reserve_tokens: Some(20),
+            ..cfg
+        };
+        let without = headless_compaction_plan(&session, &normal, 1, None).unwrap();
+        let with = headless_compaction_plan(&session, &normal, 1, Some("abcd")).unwrap();
+        assert_eq!(
+            (without.input_token_budget, without.response_token_budget),
+            (80, 20)
+        );
+        assert_eq!(
+            with.input_token_budget,
+            80 - Session::estimate_tokens("abcd")
+        );
+        assert_eq!(
+            with.response_token_budget,
+            20 + Session::estimate_tokens("abcd")
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).unwrap(),
+            before,
+            "planning cannot compact or charge the session"
+        );
+    }
+
     #[test]
     fn headless_compaction_plan_includes_pending_prompt_tokens() {
         // Session well within budget on its own, but pending prompt pushes it over.

@@ -1216,11 +1216,14 @@ pub fn flush_compaction_summary(mem: &Mem, summary: &str, count: Option<usize>) 
 /// Effective compaction reserve including the injected memory block, which the
 /// session's own token accounting (messages only) does not count. Folding the
 /// block's estimate into the reserve makes compaction fire early enough to
-/// leave headroom for the preamble-resident memory.
+/// leave headroom for the preamble-resident memory. An unrepresentable sum
+/// saturates, so a configured maximum can never wrap into additional headroom.
 pub fn effective_reserve(base: u64, memory_block: Option<&str>) -> u64 {
-    base + memory_block
-        .map(crate::session::Session::estimate_tokens)
-        .unwrap_or(0)
+    base.saturating_add(
+        memory_block
+            .map(crate::session::Session::estimate_tokens)
+            .unwrap_or(0),
+    )
 }
 
 // ---------------------------------------------------------------------------

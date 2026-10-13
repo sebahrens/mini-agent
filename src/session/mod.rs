@@ -651,6 +651,10 @@ pub struct Session {
     /// persisted.
     #[serde(skip)]
     pub overhead_tokens: u64,
+    /// Last captured preamble composition, in the same estimator as overhead.
+    /// Runtime diagnostics only; importing a session cannot supply this data.
+    #[serde(skip)]
+    pub(crate) overhead_parts: Vec<(&'static str, u64)>,
     /// Restore point for the most recent `/redo`-able rewind, captured by
     /// [`rewind_to`](Self::rewind_to). Persisted so an immediately restarted
     /// session retains the same one-step undo/redo semantics.
@@ -824,6 +828,7 @@ impl Session {
             git_status: None,
             reasoning_enabled: false,
             overhead_tokens: 0,
+            overhead_parts: Vec::new(),
             rewind_undo: None,
             history_conversion_cache: HistoryConversionCache::default(),
             history_revision: 0,

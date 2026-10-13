@@ -54,6 +54,7 @@ pub(crate) struct GitTool {
     sandbox: Sandbox,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    exact_files: bool,
     #[cfg(test)]
     test_uncontained: bool,
 }
@@ -74,9 +75,30 @@ impl GitTool {
             sandbox,
             permission,
             ask_tx,
+            exact_files: false,
             #[cfg(test)]
             test_uncontained: false,
         })
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub(crate) fn selected_files_only(mut self) -> Self {
+        self.exact_files = true;
+        self
+    }
+
+    fn reject_recursive_paths(&self, paths: &[String]) -> Result<(), ToolError> {
+        if self.exact_files
+            && paths.iter().any(|path| {
+                std::fs::symlink_metadata(self.workspace.root().join(path))
+                    .is_ok_and(|meta| meta.is_dir() || meta.file_type().is_symlink())
+            })
+        {
+            return Err(ToolError::Msg(
+                "selected-file Git mutations refuse directories and symbolic links".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn run(
@@ -483,9 +505,24 @@ impl GitTool {
             .map_err(ToolError::Msg)?;
         let guard = self.filter_guard("stage").await?;
         let before = self.status_snapshot(&guard).await?;
+        self.reject_recursive_paths(&paths)?;
         let expanded_paths = self.expand_stage_paths(&paths).await?;
+        if self.exact_files && expanded_paths.iter().any(|path| !paths.contains(path)) {
+            return Err(ToolError::Msg(
+                "Git selection expanded beyond frozen file operands".into(),
+            ));
+        }
         self.ensure_no_external_filters(&expanded_paths).await?;
-        let mut command = vec!["add".into(), "--".into()];
+        let mut command = if self.exact_files {
+            vec![
+                "update-index".into(),
+                "--add".into(),
+                "--remove".into(),
+                "--".into(),
+            ]
+        } else {
+            vec!["add".into(), "--".into()]
+        };
         command.extend(paths);
         let output = self.run_mutation("stage", guarded(&guard, command)).await?;
         let after = self.status_snapshot(&guard).await?;
@@ -541,11 +578,10 @@ impl GitTool {
 
     async fn commit(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
         reject_irrelevant_fields(&args, true, false, false)?;
-        if !args.paths.is_empty() {
-            return Err(ToolError::Msg(
-                "commit operates on the existing index and does not accept paths".to_string(),
-            ));
-        }
+        // An explicit selection commits only those literal operands, even if
+        // another writer stages an unrelated path after a caller's preview.
+        // The ordinary empty-path operation still commits the existing index.
+        let paths = self.validate_paths(&args.paths, Some("write")).await?;
         let message = args
             .message
             .as_deref()
@@ -565,17 +601,21 @@ impl GitTool {
         // `git commit` itself refreshes the index before writing the tree.
         let guard = self.filter_guard("commit").await?;
         let before = self.status_snapshot(&guard).await?;
+        self.reject_recursive_paths(&paths)?;
+        let mut command = vec![
+            "commit".into(),
+            "--file=-".into(),
+            "--cleanup=verbatim".into(),
+        ];
+        if !paths.is_empty() {
+            command.push("--only".into());
+            command.push("--".into());
+            command.extend(paths);
+        }
         let output = self
             .run_with_input(
                 "commit",
-                guarded(
-                    &guard,
-                    vec![
-                        "commit".into(),
-                        "--file=-".into(),
-                        "--cleanup=verbatim".into(),
-                    ],
-                ),
+                guarded(&guard, command),
                 message.as_bytes().to_vec(),
                 LOCAL_MUTATION_LIMITS,
             )
@@ -763,7 +803,7 @@ impl Tool for GitTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": 128,
-                    "description": "Literal repository-relative paths; never options or globs"
+                    "description": "Literal repository-relative paths; never options or globs. Commit with paths commits only that selection; with no paths it commits the existing index."
                 },
                 "revision": { "type": "string", "description": "Revision for diff, log, or show" },
                 "message": { "type": "string", "maxLength": 16384, "description": "Required commit message for commit only" },
@@ -1035,6 +1075,7 @@ mod tests {
                     .with_workspace_binding(workspace),
                 permission: None,
                 ask_tx: None,
+                exact_files: false,
                 test_uncontained: true,
             }
         }
@@ -1126,6 +1167,44 @@ mod tests {
         assert_eq!(
             repo.git(["log", "-1", "--format=%B"]),
             "subject from stdin\n\nbody remains intact\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_commit_keeps_an_unrelated_staged_file_out_of_the_commit() {
+        let repo = TestRepo::new();
+        repo.write("selected.txt", "selected before\n");
+        repo.write("other.txt", "other before\n");
+        let tool = repo.tool();
+        tool.call(args(
+            GitOperation::Stage,
+            &["selected.txt", "other.txt"],
+            None,
+        ))
+        .await
+        .expect("stage initial files");
+        tool.call(args(GitOperation::Commit, &[], Some("initial")))
+            .await
+            .expect("commit initial index");
+        repo.write("selected.txt", "selected after\n");
+        repo.write("other.txt", "other after\n");
+        // Another writer can stage this after the UI's final status check.
+        // The commit operation itself must enforce the frozen selection.
+        tool.call(args(GitOperation::Stage, &["other.txt"], None))
+            .await
+            .expect("stage unrelated change");
+        let message = "literal $(command); 'quote'\n\nbody";
+        let result = tool
+            .call(args(GitOperation::Commit, &["selected.txt"], Some(message)))
+            .await
+            .expect("commit only selected path");
+        assert_eq!(result["status"], "success");
+        assert_eq!(repo.git(["show", "HEAD:selected.txt"]), "selected after\n");
+        assert_eq!(repo.git(["show", "HEAD:other.txt"]), "other before\n");
+        assert_eq!(repo.git(["diff", "--cached", "--name-only"]), "other.txt\n");
+        assert_eq!(
+            repo.git(["log", "-1", "--format=%B"]),
+            format!("{message}\n")
         );
     }
 

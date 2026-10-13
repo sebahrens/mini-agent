@@ -1420,6 +1420,27 @@ fn effective_reserve_adds_block_estimate() {
     assert!(effective_reserve(1000, Some("tiny")) >= 1000);
 }
 
+#[test]
+fn effective_reserve_saturates_at_the_configured_maximum_without_losing_normal_headroom() {
+    let block = "captured memory 🙂界";
+    let memory_tokens = crate::session::Session::estimate_tokens(block);
+    assert!(memory_tokens > 0);
+    assert_eq!(effective_reserve(0, None), 0);
+    assert_eq!(effective_reserve(u64::MAX, None), u64::MAX);
+    assert_eq!(effective_reserve(u64::MAX, Some("")), u64::MAX);
+    assert_eq!(effective_reserve(0, Some(block)), memory_tokens);
+    assert_eq!(effective_reserve(1000, Some(block)), 1000 + memory_tokens);
+    assert_eq!(
+        effective_reserve(u64::MAX - memory_tokens, Some(block)),
+        u64::MAX
+    );
+    assert_eq!(
+        effective_reserve(u64::MAX - memory_tokens + 1, Some(block)),
+        u64::MAX
+    );
+    assert_eq!(effective_reserve(u64::MAX, Some(block)), u64::MAX);
+}
+
 // ---- compaction summary injected once (mini-agent-vx0yg) -------------------
 
 #[test]

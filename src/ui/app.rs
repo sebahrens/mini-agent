@@ -1242,7 +1242,7 @@ impl<'a> App<'a> {
             crate::extras::goal::prompt::goal_block(ui.session.goal_store.snapshot().as_ref());
         #[cfg(not(feature = "goal"))]
         let goal_block: Option<String> = None;
-        ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
+        let (overhead, parts) = crate::agent::builder::estimate_overhead_breakdown(
             ui.context,
             slash.reasoning_enabled,
             ui.cli,
@@ -1250,6 +1250,8 @@ impl<'a> App<'a> {
             &ui.sandbox,
             goal_block.as_deref(),
         );
+        ui.session.overhead_tokens = overhead;
+        ui.session.overhead_parts = parts;
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
         let marker_path = crate::paths::process_paths()
@@ -1611,6 +1613,8 @@ impl<'a> App<'a> {
         loop {
             self.expire_abandoned_permission()?;
             self.drain_tui_diagnostics()?;
+            #[cfg(feature = "git-worktree")]
+            self.drain_git_observations()?;
             // Every adoption/rebuild path returns here, including a prompt that
             // awaited prebuild and deferred events that immediately continue.
             #[cfg(feature = "mcp")]
@@ -1786,6 +1790,10 @@ impl<'a> App<'a> {
         if let Err(error) = self.run.retire(TEARDOWN_TIMEOUT).await {
             tracing::warn!(%error, "TUI main-run cleanup failed");
         }
+        #[cfg(feature = "git-worktree")]
+        if let Err(error) = self.settle_git_usage() {
+            tracing::warn!(%error,"Git usage persistence during teardown failed");
+        }
         if let Some(prebuild) = self.prebuild.take()
             && let Err(error) = prebuild.retire(TEARDOWN_TIMEOUT).await
         {
@@ -1959,6 +1967,45 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        #[cfg(feature = "git-worktree")]
+        if self.chain.git.pending.is_some() {
+            if matches!(&ev,UserEvent::Key(key) if matches!(key.code,KeyCode::Char('c'|'d'))&&key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.chain.git.pending = None;
+                self.chain.git.editing = false;
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = false;
+                self.discard_interrupted_queue();
+                self.renderer
+                    .write_line("Git proposal cancelled; no command executed", C_AGENT)?;
+                self.refresh()?;
+                return Ok(ControlFlow::Continue(()));
+            }
+            match &ev {
+                UserEvent::Key(key)
+                    if key.code == KeyCode::BackTab
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) => {}
+                UserEvent::Key(key) => {
+                    crate::startup::heap_future(|| self.handle_git_confirmation(*key)).await?;
+                    self.refresh()?;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                UserEvent::Paste(text) => {
+                    if self.chain.git.editing {
+                        self.input.load_text(text);
+                        self.refresh()?;
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
+                UserEvent::Quit => {
+                    self.chain.git.pending = None;
+                    self.chain.git.editing = false;
+                    self.renderer.chain_prompt = None;
+                    self.renderer.chain_but_mode = false;
+                }
+                _ => {}
+            }
+        }
         if self.handle_session_picker_event(&ev).await? {
             return Ok(ControlFlow::Continue(()));
         }
@@ -2502,7 +2549,10 @@ impl<'a> App<'a> {
                 return Ok(());
             }
 
-            if !one_shot && text.starts_with('/') {
+            if !one_shot
+                && (text.starts_with('/')
+                    || crate::ui::slash::split_command(&text).first() == Some(&"/context"))
+            {
                 self.run_slash_command(&text).await?;
             } else if !one_shot && text.starts_with('!') {
                 self.run_bang_command(&text).await?;
@@ -2516,8 +2566,27 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        #[cfg(feature = "git-worktree")]
+        if self.chain.git.work.is_some()
+            && matches!(&event, AgentEvent::Done { .. } | AgentEvent::Error { .. })
+        {
+            return crate::startup::heap_future(|| self.handle_git_terminal(event)).await;
+        }
+
         if matches!(&event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
             self.cancel_pending_permissions();
+        }
+        #[cfg(feature = "git-worktree")]
+        if let Some(work) = self.chain.git.work.as_mut() {
+            match &event {
+                AgentEvent::ToolCall { id, name, .. } => {
+                    work.pending_calls.insert(id.to_string(), name.to_string());
+                }
+                AgentEvent::ToolResult { id, .. } => {
+                    work.pending_calls.remove(id.as_str());
+                }
+                _ => {}
+            }
         }
         let terminal_error = matches!(&event, AgentEvent::Error { .. });
         if terminal_error {
@@ -2774,6 +2843,10 @@ impl<'a> App<'a> {
     }
 
     async fn finalize_turn(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "git-worktree")]
+        if self.chain.git.pending.is_some() {
+            return Ok(());
+        }
         if !self.run.is_running {
             self.settle_success_transaction();
         }
@@ -2863,6 +2936,10 @@ impl<'a> App<'a> {
             tracing::warn!(%error, "TUI failed-run cleanup failed");
         }
         self.cancel_pending_permissions();
+        #[cfg(feature = "git-worktree")]
+        if let Err(error) = self.settle_git_usage() {
+            tracing::warn!(%error,"Git usage persistence after failed run failed");
+        }
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -2885,6 +2962,13 @@ impl<'a> App<'a> {
     }
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "git-worktree")]
+        {
+            self.chain.git.pending = None;
+            self.chain.git.editing = false;
+            self.renderer.chain_prompt = None;
+            self.renderer.chain_but_mode = false;
+        }
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         let validation_active = self.run.cancel_validation();
@@ -2903,6 +2987,8 @@ impl<'a> App<'a> {
             tracing::warn!(%error, "TUI interrupted-run cleanup failed");
         }
         self.cancel_pending_permissions();
+        #[cfg(feature = "git-worktree")]
+        self.settle_git_usage()?;
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -2984,7 +3070,378 @@ impl<'a> App<'a> {
         }
     }
 
+    #[cfg(feature = "git-worktree")]
+    fn show_git_proposal(
+        &mut self,
+        proposal: crate::ui::slash::git::BoundProposal,
+    ) -> anyhow::Result<()> {
+        use crate::ui::slash::git::PreparedAction;
+        anyhow::ensure!(
+            proposal.valid(self.ui.session, &self.ui.workspace),
+            "Git proposal is stale; run the command again"
+        );
+        match &proposal.action {
+            PreparedAction::Commit { paths, message } => {
+                self.renderer.write_line(
+                    "Files requested by write/edit tools this turn (a request may have failed):",
+                    C_TOOL,
+                )?;
+                for path in paths {
+                    self.renderer
+                        .write_line(&format!("  {}", sanitize_output(path)), C_TOOL)?;
+                }
+                self.renderer.write_line(
+                    &format!("Commit message:\n{}", sanitize_output(message)),
+                    C_AGENT,
+                )?;
+            }
+            PreparedAction::PullRequest { title, body } => self.renderer.write_line(
+                &format!(
+                    "PR title: {}\nPR body:\n{}",
+                    sanitize_output(title),
+                    sanitize_output(body)
+                ),
+                C_AGENT,
+            )?,
+        }
+        self.renderer.chain_but_mode = false;
+        self.renderer.chain_prompt = Some(ChainPrompt {
+            question: proposal.action.label().into(),
+        });
+        self.chain.git.pending = Some(proposal);
+        self.refresh()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    fn start_git_work(
+        &mut self,
+        action: crate::ui::slash::git::NativeAction,
+        kind: crate::ui::slash::git::WorkKind,
+        usage: crate::ui::slash::git::UsageLedger,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.run.is_running
+                && self.run.agent_rx.is_none()
+                && self.run.pending_turn.is_none()
+                && self.permission_prompt.is_none(),
+            "finish or stop the current run before a Git command"
+        );
+        self.ui.workspace.validate().map_err(anyhow::Error::msg)?;
+        let (runner, observations) = crate::ui::slash::git::spawn_native(
+            action,
+            self.ui.workspace.clone(),
+            self.ui.sandbox.clone(),
+            self.ui.permission.clone(),
+            self.ui.ask_tx.clone(),
+            self.ui.cfg.resolve_shell_timeout_secs(),
+        );
+        self.chain.git.work = Some(crate::ui::slash::git::Work {
+            session_id: self.ui.session.id.clone(),
+            workspace: self.ui.workspace.clone(),
+            kind,
+            observations,
+            usage,
+            pricing: crate::print::HeadlessPricing::from_session(self.ui.session, self.ui.cfg),
+            provider: self.ui.session.provider.clone(),
+            pending_calls: Default::default(),
+        });
+        self.run.agent_rx = Some(runner.event_rx);
+        self.run.main_abort = Some(runner.abort_handle);
+        self.run.is_running = true;
+        self.renderer.chain_prompt = None;
+        self.renderer.chain_but_mode = false;
+        self.chain.git.editing = false;
+        self.refresh()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn begin_git_command(&mut self, text: &str) -> anyhow::Result<()> {
+        use crate::ui::slash::git::{
+            self, Command, NativeAction, PreparedAction, ProposalKind, WorkKind,
+        };
+        anyhow::ensure!(
+            !self.run.is_running
+                && self.run.agent_rx.is_none()
+                && self.run.pending_turn.is_none()
+                && self.permission_prompt.is_none(),
+            "finish or stop the current run before a Git command"
+        );
+        self.chain.pending = None;
+        self.chain.label_msg = None;
+        self.renderer.chain_prompt = None;
+        self.renderer.chain_but_mode = false;
+        self.chain.git.pending = None;
+        let command = git::parse(text, self.ui.session, self.ui.workspace.root())
+            .map_err(anyhow::Error::msg)?;
+        let usage = git::UsageLedger::default();
+        let kind = match command {
+            Command::Diff(paths) => {
+                return self.start_git_work(NativeAction::Diff { paths }, WorkKind::Diff, usage);
+            }
+            Command::Commit(message) => {
+                let paths = git::latest_turn_paths(self.ui.session, self.ui.workspace.root())
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(message) = message {
+                    let action =
+                        PreparedAction::commit(paths, message).map_err(anyhow::Error::msg)?;
+                    return self.show_git_proposal(git::BoundProposal {
+                        session_id: self.ui.session.id.clone(),
+                        workspace: self.ui.workspace.clone(),
+                        action,
+                    });
+                }
+                anyhow::ensure!(
+                    !paths.is_empty(),
+                    "latest turn has no native edit/write request paths"
+                );
+                ProposalKind::Commit(paths)
+            }
+            Command::PullRequest => ProposalKind::PullRequest,
+        };
+        self.renderer.write_line(
+            "Drafting a Git proposal; review and confirm before any commit or PR runs.",
+            C_TOOL,
+        )?;
+        self.start_git_work(
+            NativeAction::Prepare(git::Generation {
+                kind: kind.clone(),
+                client: self.ui.client.clone(),
+                model: self.ui.session.model.to_string(),
+                config: Arc::new(self.ui.cfg.clone()),
+                session_id: self.ui.session.id.to_string(),
+                usage: usage.clone(),
+            }),
+            WorkKind::Generate(kind),
+            usage,
+        )
+    }
+
+    #[cfg(feature = "git-worktree")]
+    fn drain_git_observations(&mut self) -> anyhow::Result<()> {
+        let Some(work) = self.chain.git.work.as_mut() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            work.session_id == self.ui.session.id
+                && Arc::ptr_eq(&work.workspace, &self.ui.workspace),
+            "Git work identity changed before settlement"
+        );
+        while let Ok(observation) = work.observations.try_recv() {
+            let limit = self.ui.cfg.mutation_diff_options().max_lines;
+            let mut count = 0usize;
+            for line in observation.text.lines().take(limit) {
+                let style = if line.starts_with("@@") {
+                    crate::ui::feed::BlockStyle::DiffHunk
+                } else if line.starts_with('+') && !line.starts_with("+++") {
+                    crate::ui::feed::BlockStyle::DiffAdd
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    crate::ui::feed::BlockStyle::DiffDel
+                } else {
+                    crate::ui::feed::BlockStyle::ToolResult
+                };
+                self.renderer.feed_mut().place_after_anchor(
+                    &observation.id,
+                    style,
+                    sanitize_output(line),
+                );
+                count += 1;
+            }
+            if observation.truncated || observation.text.lines().count() > count {
+                self.renderer.feed_mut().place_after_anchor(
+                    &observation.id,
+                    crate::ui::feed::BlockStyle::ToolResult,
+                    "[more Git diff rows omitted]",
+                );
+            }
+        }
+        self.renderer.invalidate();
+        self.renderer.render_viewport()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    fn settle_git_usage(&mut self) -> anyhow::Result<Option<crate::ui::slash::git::Work>> {
+        if self.run.agent_rx.is_some() {
+            return Ok(None);
+        }
+        let Some(work) = self.chain.git.work.take() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            work.session_id == self.ui.session.id
+                && Arc::ptr_eq(&work.workspace, &self.ui.workspace),
+            "Git work identity changed before settlement"
+        );
+        let usage = self
+            .ui
+            .cfg
+            .normalize_usage(&work.provider, work.usage.take());
+        self.ui.session.charge_usage_delta_at(
+            usage,
+            work.pricing.anthropic_native,
+            work.pricing.input_token_cost,
+            work.pricing.output_token_cost,
+            work.pricing.cache_prices,
+        );
+        for (id, name) in &work.pending_calls {
+            self.ui.session.add_tool_result_with_id(id,name,"Native command interrupted before its result was observed; effects may be partial. Inspect the workspace before retrying.");
+        }
+        self.save_session()?;
+        Ok(Some(work))
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn handle_git_terminal(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        use crate::ui::slash::git::{BoundProposal, PreparedAction, ProposalKind, WorkKind};
+        self.drain_git_observations()?;
+        self.run.is_running = false;
+        self.run.settle(Duration::from_secs(5)).await?;
+        self.run.main_abort = None;
+        let work = self
+            .settle_git_usage()?
+            .ok_or_else(|| anyhow::anyhow!("Git work failed to settle"))?;
+        match event {
+            AgentEvent::Done { response, .. } => match work.kind {
+                WorkKind::Generate(kind) => {
+                    let action = match kind {
+                        ProposalKind::Commit(paths) => {
+                            PreparedAction::generated_commit(paths, &response)
+                        }
+                        ProposalKind::PullRequest => PreparedAction::generated_pr(&response),
+                    };
+                    match action {
+                        Ok(action) => self.show_git_proposal(BoundProposal {
+                            session_id: work.session_id,
+                            workspace: work.workspace,
+                            action,
+                        })?,
+                        Err(error) => self.renderer.write_line(
+                            &format!("Git proposal rejected: {}", sanitize_output(&error)),
+                            C_ERROR,
+                        )?,
+                    }
+                }
+                WorkKind::Execute => {
+                    self.renderer
+                        .write_line(&sanitize_output(&response), C_AGENT)?;
+                    if !response.is_empty() {
+                        self.ui
+                            .session
+                            .add_message(crate::session::MessageRole::Assistant, &response);
+                    }
+                    self.save_session()?;
+                }
+                WorkKind::Diff => {}
+            },
+            AgentEvent::Error { message, .. } => {
+                self.chain.git.pending = None;
+                self.discard_interrupted_queue();
+                self.renderer.write_line(
+                    &format!("Git command failed: {}", sanitize_output(&message)),
+                    C_ERROR,
+                )?;
+            }
+            _ => unreachable!("only terminal Git events are routed here"),
+        }
+        if self.chain.git.pending.is_none() {
+            self.advance_git_queue().await?;
+        }
+        self.refresh()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn advance_git_queue(&mut self) -> anyhow::Result<()> {
+        if let Some(next) = self.run.pending_inputs.pop_front() {
+            self.echo_main_submission(&next)?;
+            self.start_main_run(&next).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn handle_git_confirmation(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        use crate::ui::slash::git::{NativeAction, UsageLedger, WorkKind};
+        if self.chain.git.pending.is_none() {
+            return Ok(false);
+        }
+        if self.chain.git.editing {
+            if key.code == KeyCode::Esc {
+                self.input.discard_draft();
+                self.chain.git.editing = false;
+                let proposal = self.chain.git.pending.take().unwrap();
+                self.show_git_proposal(proposal)?;
+                return Ok(true);
+            }
+            if let Some(note) = self.input.handle_key(key) {
+                let mut proposal = self.chain.git.pending.take().unwrap();
+                if !note.trim().is_empty() {
+                    match proposal.action.clone().with_note(&note) {
+                        Ok(action) => proposal.action = action,
+                        Err(error) => {
+                            self.chain.git.pending = Some(proposal);
+                            self.input.load_text(&note);
+                            self.renderer.write_line(
+                                &format!("Proposal text rejected: {}", sanitize_output(&error)),
+                                C_ERROR,
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                }
+                self.chain.git.editing = false;
+                self.show_git_proposal(proposal)?;
+            }
+            return Ok(true);
+        }
+        if key.kind != crossterm::event::KeyEventKind::Press
+            || !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            return Ok(true);
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                let proposal = self.chain.git.pending.take().unwrap();
+                self.renderer.chain_prompt = None;
+                if !proposal.valid(self.ui.session, &self.ui.workspace) {
+                    self.renderer
+                        .write_line("Git proposal is stale; no command executed", C_ERROR)?;
+                    return Ok(true);
+                }
+                self.start_git_work(
+                    NativeAction::Execute(proposal.action),
+                    WorkKind::Execute,
+                    UsageLedger::default(),
+                )?;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.chain.git.pending = None;
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = false;
+                self.renderer
+                    .write_line("Git proposal declined; no command executed", C_AGENT)?;
+                self.advance_git_queue().await?;
+            }
+            KeyCode::Char('b' | 'B') => {
+                self.chain.git.editing = true;
+                self.renderer.chain_prompt = None;
+                self.renderer.chain_but_mode = true;
+                self.input.discard_draft();
+                self.renderer.write_line("Edit commit message, or append a PR note; Enter previews again, Esc goes back.",C_AGENT)?;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
     async fn start_main_run(&mut self, text: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "git-worktree")]
+        anyhow::ensure!(
+            self.chain.git.work.is_none(),
+            "Git command cleanup is still pending; no next turn admitted"
+        );
         // Preflight: if the pending payload is irreducibly too large, reject
         // locally before any provider I/O or session mutation.
         let text_tokens = crate::session::Session::estimate_tokens(text);
@@ -3366,7 +3823,13 @@ impl<'a> App<'a> {
 
         // The provider may have changed: warm its model list in the
         // background (never blocking the command) and show what is cached.
-        if !is_quit_command(text) {
+        let context_diagnostic = crate::ui::slash::split_command(text).first() == Some(&"/context");
+        // Successful diagnostics cannot enter the generic success settlement:
+        // that saves history and may auto-start a pending first goal round.
+        if context_diagnostic && result.is_ok() {
+            return Ok(());
+        }
+        if !is_quit_command(text) && !context_diagnostic {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
             crate::ui::slash::warm_model_cache(
@@ -3382,7 +3845,9 @@ impl<'a> App<'a> {
         // Keep the measured settlement future out of the command poll frame,
         // including commands that immediately return an exit/error result.
         crate::startup::heap_future(|| self.handle_slash_result(result)).await?;
-        self.save_session()?;
+        if !context_diagnostic {
+            self.save_session()?;
+        }
         Ok(())
     }
 
@@ -3517,6 +3982,26 @@ impl<'a> App<'a> {
                 // Keep the template child future out of the generic slash
                 // result poll frame, which also carries session-resume work.
                 crate::startup::heap_future(|| self.submit_custom_command(command)).await?;
+            }
+            #[cfg(feature = "git-worktree")]
+            Err(e)
+                if e.downcast_ref::<crate::ui::slash::git::DeferredCommand>()
+                    .is_some() =>
+            {
+                let command = e
+                    .downcast::<crate::ui::slash::git::DeferredCommand>()
+                    .unwrap();
+                if let Err(error) =
+                    crate::startup::heap_future(|| self.begin_git_command(&command.0)).await
+                {
+                    self.renderer.write_line(
+                        &format!(
+                            "Git command rejected: {}",
+                            sanitize_output(&error.to_string())
+                        ),
+                        C_ERROR,
+                    )?;
+                }
             }
             Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                 let err_msg = e.to_string();
@@ -7980,5 +8465,1089 @@ mod workspace_session_picker_tests {
         assert!(app.ui.session.generated_title.is_none());
         app.retire_session_title().await.unwrap();
         assert_eq!(app.ui.session.total_input_tokens, 100);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "git-worktree",
+    target_os = "macos",
+    feature = "sandbox"
+))]
+mod git_command_consumer_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    use crate::ui::slash::git::test_support::Repo;
+    fn context<'a>(
+        cli: &'a crate::cli::Cli,
+        cfg: &'a config::Config,
+        session: &'a mut Session,
+        files: &'a mut crate::context::ContextFiles,
+        repo: &Repo,
+    ) -> UiContext<'a> {
+        UiContext::new(
+            cli,
+            cfg,
+            session,
+            files,
+            repo.workspace.clone(),
+            crate::provider::create_client(
+                "git32-fixture",
+                Some("unused-local-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            repo.sandbox(),
+            None,
+        )
+    }
+    fn config() -> config::Config {
+        serde_json::from_value(serde_json::json!({"session_title_model":"off","custom_providers":{"git32-fixture":{"provider_type":"openai","base_url":"http://127.0.0.1:9","api_style":"completions"}}})).unwrap()
+    }
+    fn history(repo: &Repo) -> Session {
+        let mut session = Session::new("git32-fixture", "fixture", 128_000, "");
+        session.working_dir = repo.workspace.root().to_string_lossy().into();
+        session.add_message(crate::session::MessageRole::User, "edit only selected file");
+        session.add_tool_call_with_id(
+            "native-selected-write",
+            "write",
+            &serde_json::json!({"path":"selected.txt"}),
+        );
+        session.add_tool_result_with_id("native-selected-write", "write", "saved selected file");
+        session
+    }
+    async fn key(app: &mut App<'_>, code: KeyCode, modifiers: KeyModifiers) {
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(code, modifiers)))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+    }
+    async fn terminal(app: &mut App<'_>) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while app.run.is_running {
+                let event = app
+                    .run
+                    .agent_rx
+                    .as_mut()
+                    .unwrap()
+                    .recv()
+                    .await
+                    .expect("native actor should terminate");
+                app.handle_agent_event(event).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.run.agent_rx.is_none());
+        assert!(app.chain.git.work.is_none());
+    }
+    #[test]
+    fn actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .name("combined-context-git-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        #[cfg(feature = "hooks")]
+                        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+                        let repo = Repo::seeded().await;
+                        let head = repo.git(&["rev-parse", "HEAD"]).await;
+                        let cli = crate::cli::Cli {
+                            no_session: true,
+                            no_tools: true,
+                            ..Default::default()
+                        };
+                        let cfg = config();
+                        let mut session = history(&repo);
+                        let before = serde_json::to_vec(&session).unwrap();
+                        let mut files =
+                            crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+                        let mut app =
+                            fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+                        let captured = app.ui.workspace.clone();
+                        // App initialization captures runtime overhead, so snapshot afterwards.
+                        let initialized = serde_json::to_vec(app.ui.session).unwrap();
+                        let sender = app.user_tx.clone();
+                        let producer = async move {
+                            for event in [
+                                UserEvent::Paste("  /context  ".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Paste("/commit ONE_MIB_DECLINED".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Key(KeyEvent::new(
+                                    KeyCode::Char('n'),
+                                    KeyModifiers::NONE,
+                                )),
+                                UserEvent::Paste("/context".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                                UserEvent::Paste("/quit".into()),
+                                UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            ] {
+                                sender.send(event).await.unwrap();
+                            }
+                        };
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let (_, result) = tokio::join!(
+                                producer,
+                                crate::startup::heap_future(|| app.run_inner())
+                            );
+                            result
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let rendered = app.renderer.captured_output();
+                        assert!(rendered.contains("Context composition:"));
+                        assert!(rendered.contains("ONE_MIB_DECLINED"));
+                        assert!(rendered.contains("Git proposal declined"));
+                        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), initialized);
+                        assert_eq!(
+                            app.ui.session.messages.len(),
+                            serde_json::from_slice::<Session>(&before)
+                                .unwrap()
+                                .messages
+                                .len()
+                        );
+                        assert!(Arc::ptr_eq(&app.ui.workspace, &captured));
+                        assert!(
+                            app.run.agent.is_none()
+                                && app.run.agent_rx.is_none()
+                                && app.run.main_abort.is_none()
+                        );
+                        assert!(app.chain.git.pending.is_none() && app.chain.git.work.is_none());
+                        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, head);
+                        assert!(
+                            repo.git(&["diff", "--cached", "--name-only"])
+                                .await
+                                .trim()
+                                .is_empty()
+                        );
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_app_commit_confirmation_decline_edit_and_modified_keys_cannot_execute() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let before = repo.git(&["rev-parse", "HEAD"]).await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            ..Default::default()
+        }));
+        app.run_slash_command("/commit literal message")
+            .await
+            .unwrap();
+        assert!(app.chain.git.pending.is_some());
+        assert!(!app.run.is_running);
+        assert!(app.renderer.captured_output().contains("selected.txt"));
+        assert!(app.renderer.captured_output().contains("literal message"));
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL).await;
+        assert!(app.chain.git.pending.is_some());
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).await;
+        assert!(app.chain.git.pending.is_none());
+        assert!(app.renderer.captured_output().contains("declined"));
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        app.run_slash_command("/commit original").await.unwrap();
+        key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE).await;
+        assert!(app.chain.git.editing);
+        assert!(app.renderer.chain_prompt.is_none());
+        assert!(matches!(
+            app.handle_user_event(UserEvent::Paste(
+                "edited literal $(NEVER_EXECUTE) 雪".into()
+            ))
+            .await
+            .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(!app.chain.git.editing);
+        assert!(app.chain.git.pending.is_some());
+        assert!(!app.run.is_running);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).await;
+        terminal(&mut app).await;
+        assert_eq!(
+            repo.git(&["log", "-1", "--format=%B"]).await.trim(),
+            "edited literal $(NEVER_EXECUTE) 雪"
+        );
+        assert_eq!(
+            repo.git(&["show", "--format=", "--name-only", "HEAD"])
+                .await
+                .trim(),
+            "selected.txt"
+        );
+        assert!(app.renderer.captured_output().contains("Committed"));
+    }
+    #[tokio::test]
+    async fn actual_app_git_confirmation_rejects_successor_session_and_rebound_workspace() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let before = repo.git(&["rev-parse", "HEAD"]).await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        for replace_session in [true, false] {
+            app.run_slash_command("/commit captured").await.unwrap();
+            assert!(app.chain.git.pending.is_some());
+            if replace_session {
+                app.ui.session.id = uuid::Uuid::new_v4().to_string().into();
+            } else {
+                app.ui.workspace = Arc::new(
+                    crate::paths::WorkspaceBinding::capture(repo.workspace.root()).unwrap(),
+                );
+            }
+            key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).await;
+            assert!(app.chain.git.pending.is_none());
+            assert!(!app.run.is_running);
+            assert!(app.chain.git.work.is_none());
+            assert!(app.renderer.captured_output().contains("stale"));
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        }
+    }
+    #[tokio::test]
+    async fn actual_app_diff_uses_authoritative_native_rows_without_ansi_injection() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        std::fs::write(
+            repo.directory.path().join("selected.txt"),
+            "selected 雪\u{1b}[31mINERT\n",
+        )
+        .unwrap();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            ..Default::default()
+        }));
+        app.run_slash_command("/diff turn").await.unwrap();
+        terminal(&mut app).await;
+        let painted = app.renderer.captured_output();
+        assert!(painted.contains("+selected 雪INERT"));
+        assert!(painted.contains("-original"));
+        assert!(!painted.contains("\u{1b}[31mINERT"));
+        let calls:Vec<_>=app.ui.session.messages.iter().filter(|m|m.role==crate::session::MessageRole::ToolCall&&m.tool.as_ref().is_some_and(|tool|matches!(tool,crate::session::PersistedToolMessage::Call{name,..} if name=="git"))).collect();
+        assert_eq!(calls.len(), 1);
+        let id = calls[0].tool_call_id.as_deref().unwrap();
+        assert!(
+            app.ui
+                .session
+                .messages
+                .iter()
+                .any(|m| m.role == crate::session::MessageRole::ToolResult
+                    && m.tool_call_id.as_deref() == Some(id))
+        );
+    }
+    #[tokio::test]
+    async fn actual_app_generated_commit_is_tool_free_charged_once_and_requires_confirmation() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let before = repo.git(&["rev-parse", "HEAD"]).await;
+        let mut wire = crate::provider::git_proposal_test_support::Wire::new(
+            r#"{"message":"generated native proposal"}"#,
+        );
+        let cfg = wire.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let mut session = history(&repo);
+        session.provider = "git32-wire".into();
+        session.input_token_cost = 2.0;
+        session.output_token_cost = 4.0;
+        session.calibrated_tokens = 777;
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            repo.workspace.clone(),
+            crate::provider::create_client(
+                "git32-wire",
+                Some("unused-owned-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            repo.sandbox(),
+            None,
+        );
+        let mut app = fixture_app(ui);
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            ..Default::default()
+        }));
+        app.run_slash_command("/commit").await.unwrap();
+        assert!(app.run.is_running);
+        terminal(&mut app).await;
+        let body = wire.body();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(
+            body.get("tools")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(body.to_string().contains("selected.txt"));
+        assert!(body.to_string().contains("selected changed"));
+        assert!(app.chain.git.pending.is_some());
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("generated native proposal")
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        assert!(
+            repo.git(&["diff", "--cached", "--name-only"])
+                .await
+                .is_empty()
+        );
+        assert_eq!(app.ui.session.total_input_tokens, 7);
+        assert_eq!(app.ui.session.total_output_tokens, 5);
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+        assert_eq!(app.ui.session.calibrated_tokens, 777);
+        key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).await;
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+    }
+    #[tokio::test]
+    async fn actual_app_malformed_generated_proposal_keeps_observed_usage_without_effects() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let before = repo.git(&["rev-parse", "HEAD"]).await;
+        let mut wire = crate::provider::git_proposal_test_support::Wire::new(
+            r#"{"message":"never","paths":["unrelated.txt"]}"#,
+        );
+        let cfg = wire.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let mut session = history(&repo);
+        session.provider = "git32-wire".into();
+        session.input_token_cost = 2.0;
+        session.output_token_cost = 4.0;
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            repo.workspace.clone(),
+            crate::provider::create_client(
+                "git32-wire",
+                Some("unused-owned-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            repo.sandbox(),
+            None,
+        );
+        let mut app = fixture_app(ui);
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            ..Default::default()
+        }));
+        app.run_slash_command("/commit").await.unwrap();
+        terminal(&mut app).await;
+        wire.body();
+        assert!(app.chain.git.pending.is_none());
+        assert!(app.renderer.captured_output().contains("proposal rejected"));
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        assert!(
+            repo.git(&["diff", "--cached", "--name-only"])
+                .await
+                .is_empty()
+        );
+        assert_eq!(app.ui.session.total_input_tokens, 7);
+        assert!((app.ui.session.total_cost - 0.000034).abs() < 1e-12);
+    }
+    #[tokio::test]
+    async fn actual_app_native_permission_cancel_settles_call_drops_queue_and_cannot_late_grant() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let before = repo.git(&["rev-parse", "HEAD"]).await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            git_diff: Some(crate::permission::ToolPerm::Simple(
+                crate::permission::Action::Ask,
+            )),
+            ..Default::default()
+        }));
+        let (asks, requests) = tokio::sync::mpsc::channel(4);
+        app.ui.ask_tx = Some(asks.clone());
+        app.ask_rx = Some(requests);
+        app.run_slash_command("/diff turn").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.permission_prompt.is_none() {
+                match tokio::time::timeout(Duration::from_millis(50), app.run_inner()).await {
+                    Err(_) => {}
+                    Ok(result) => panic!("App exited during controlled wait: {result:?}"),
+                }
+            }
+        })
+        .await
+        .expect("native Ask must become visible");
+        assert!(app.renderer.captured_output().contains("git/diff"));
+        assert!(app.run.is_running);
+        app.run
+            .pending_inputs
+            .extend(["STALE_QUEUED_ONE".into(), "STALE_QUEUED_TWO".into()]);
+        app.input.load_text("recoverable native follow-up");
+        app.user_tx
+            .send(UserEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_millis(200), app.run_inner()).await {
+            Err(_) => {}
+            Ok(result) => panic!("App exited during controlled cancel: {result:?}"),
+        }
+        assert!(app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.chain.git.work.is_none() && app.chain.git.pending.is_none());
+        assert!(
+            app.permission_prompt.is_none()
+                && !app.run.is_running
+                && app.run.pending_inputs.is_empty()
+        );
+        assert_eq!(app.input.buffer, "recoverable native follow-up");
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        assert!(
+            app.ui
+                .session
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("STALE_QUEUED"))
+        );
+        let calls: Vec<_> = app
+            .ui
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::ToolCall)
+            .collect();
+        let id = calls.last().unwrap().tool_call_id.as_deref().unwrap();
+        assert!(
+            app.ui
+                .session
+                .messages
+                .iter()
+                .any(|m| m.role == crate::session::MessageRole::ToolResult
+                    && m.tool_call_id.as_deref() == Some(id))
+        );
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("dropped 2 queued inputs")
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
+        assert!(
+            repo.git(&["diff", "--cached", "--name-only"])
+                .await
+                .is_empty()
+        );
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).await;
+        assert!(!app.run.is_running && app.ui.session.permission_allowlist.is_empty());
+    }
+    #[tokio::test]
+    async fn actual_app_generated_pr_requires_preview_and_shell_ask_before_gh() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        repo.gh_stub(
+            "printf '%s\\0' \"$@\" > gh-app-argv; printf '%s\\n' https://example.invalid/pull/32",
+        );
+        let mut wire = crate::provider::git_proposal_test_support::Wire::new(
+            r#"{"title":"PR literal 雪","body":"body $(NEVER_EXECUTE)"}"#,
+        );
+        let cfg = wire.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let mut session = history(&repo);
+        session.provider = "git32-wire".into();
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            repo.workspace.clone(),
+            crate::provider::create_client(
+                "git32-wire",
+                Some("unused-owned-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            repo.sandbox(),
+            None,
+        );
+        let mut app = fixture_app(ui);
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            bash: Some(crate::permission::ToolPerm::Simple(
+                crate::permission::Action::Ask,
+            )),
+            ..Default::default()
+        }));
+        let (asks, requests) = tokio::sync::mpsc::channel(4);
+        app.ui.ask_tx = Some(asks);
+        app.ask_rx = Some(requests);
+        app.run_slash_command("/pr").await.unwrap();
+        terminal(&mut app).await;
+        let body = wire.body();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(
+            body.get("tools")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(app.chain.git.pending.is_some());
+        assert!(app.renderer.captured_output().contains("PR literal 雪"));
+        assert!(!repo.workspace.root().join("gh-app-argv").exists());
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.permission_prompt.is_none() {
+                match tokio::time::timeout(Duration::from_millis(50), app.run_inner()).await {
+                    Err(_) => {}
+                    Ok(result) => panic!("App exited before shell Ask: {result:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!repo.workspace.root().join("gh-app-argv").exists());
+        assert!(app.renderer.captured_output().contains("shell"));
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).await;
+        terminal(&mut app).await;
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("https://example.invalid/pull/32")
+        );
+        let bytes = std::fs::read(repo.workspace.root().join("gh-app-argv")).unwrap();
+        let args: Vec<_> = bytes
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "pr",
+                "create",
+                "--title",
+                "PR literal 雪",
+                "--body",
+                "body $(NEVER_EXECUTE)"
+            ]
+        );
+        assert!(!repo.workspace.root().join("NEVER_EXECUTE").exists());
+        assert_eq!(app.ui.session.total_input_tokens, 7);
+        assert_eq!(app.ui.session.total_output_tokens, 5);
+    }
+    #[tokio::test]
+    async fn actual_app_error_text_cannot_fabricate_a_native_git_command() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        app.handle_slash_result(Err(anyhow::anyhow!("DEFER_GIT:/commit fabricated")))
+            .await
+            .unwrap();
+        assert!(
+            app.chain.git.pending.is_none() && app.chain.git.work.is_none() && !app.run.is_running
+        );
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("DEFER_GIT:/commit fabricated")
+        );
+    }
+    #[tokio::test]
+    async fn actual_app_native_failed_retirement_blocks_new_admission_until_receiver_settles() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        app.ui.permission = Some(repo.checker(crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Allow),
+            git_diff: Some(crate::permission::ToolPerm::Simple(
+                crate::permission::Action::Ask,
+            )),
+            ..Default::default()
+        }));
+        let (asks, mut requests) = tokio::sync::mpsc::channel(4);
+        app.ui.ask_tx = Some(asks);
+        app.run_slash_command("/diff turn").await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut native = app.run.agent_rx.take().unwrap();
+        let call = tokio::time::timeout(Duration::from_secs(2), native.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_agent_event(call).await.unwrap();
+        let (retained, receiver) = tokio::sync::mpsc::channel(1);
+        app.run.agent_rx = Some(receiver);
+        app.abort_main_run().await.unwrap();
+        assert!(app.run.agent_rx.is_some() && app.chain.git.work.is_some());
+        assert!(!app.run.is_running);
+        assert!(app.start_main_run("NEVER_NEW_ADMISSION").await.is_err());
+        assert!(app.begin_git_command("/commit literal").await.is_err());
+        assert!(
+            app.ui
+                .session
+                .messages
+                .iter()
+                .all(|message| message.content != "NEVER_NEW_ADMISSION")
+        );
+        assert!(
+            request
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while native.recv().await.is_some() {}
+        })
+        .await
+        .expect("actual native owner must already be retired");
+        drop(retained);
+        app.run.retire(Duration::from_secs(2)).await.unwrap();
+        app.settle_git_usage().unwrap();
+        assert!(app.run.agent_rx.is_none() && app.chain.git.work.is_none());
+        let id = app
+            .ui
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::session::MessageRole::ToolCall)
+            .unwrap()
+            .tool_call_id
+            .as_deref()
+            .unwrap();
+        assert!(app.ui.session.messages.iter().any(|message| message.role
+            == crate::session::MessageRole::ToolResult
+            && message.tool_call_id.as_deref() == Some(id)));
+        assert!(
+            repo.git(&["diff", "--cached", "--name-only"])
+                .await
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(all(test, not(feature = "git-worktree")))]
+mod git_feature_off_consumer_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+    #[tokio::test]
+    async fn actual_app_feature_off_git_commands_refuse_without_runner_or_proposal() {
+        let root = crate::tests::OwnedTestDirectory::new("git32-feature-off");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cfg:config::Config=serde_json::from_value(serde_json::json!({"session_title_model":"off","retry":{"max_attempts":1},"custom_providers":{"git32-feature-off":{"provider_type":"openrouter","base_url":"http://127.0.0.1:1"}}})).unwrap();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_context_files: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut session = Session::new(
+            "git32-feature-off",
+            "fixture",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            workspace,
+            crate::provider::create_client(
+                "git32-feature-off",
+                Some("unused-owned-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        );
+        let mut app = fixture_app(ui);
+        for command in ["/diff", "/commit literal", "/pr"] {
+            app.run_slash_command(command).await.unwrap();
+            assert!(
+                !app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none()
+            );
+        }
+        assert_eq!(
+            (0..app.renderer.feed().block_count())
+                .filter_map(|index| app.renderer.feed().block_text(index))
+                .filter(|text| text.contains("Git commands require the git-worktree feature"))
+                .count(),
+            3
+        );
+        assert!(app.ui.session.messages.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod context_diagnostic_tests {
+    use super::test_support::fixture_app;
+    use super::*;
+
+    fn saved_files(directory: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut entries: Vec<_> = match std::fs::read_dir(directory) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().file_name()).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("cannot inspect owned persistence root: {error}"),
+        };
+        entries.sort();
+        entries
+    }
+
+    #[tokio::test]
+    async fn actual_context_command_is_pure_cold_and_built_without_provider_requests() {
+        let root = crate::tests::OwnedTestDirectory::new("context-diagnostic-app");
+        let environment = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&environment);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cli = crate::cli::Cli {
+            tools: vec!["read".into()],
+            no_sandbox: true,
+            api_key: Some("owned-unused-key".into()),
+            system_prompt: Some("OVERRIDE_PERSONA".into()),
+            append_system_prompt: Some("CAPTURED_APPEND_界".into()),
+            ..Default::default()
+        };
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({"custom_providers":{"context-local-test":{"provider_type":"openai","base_url":format!("http://{address}/v1"),"api_style":"completions"}}})).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        context.agents = Some("CAPTURED_AGENTS_界".into());
+        context.current_prompt = Some("CAPTURED_PROMPT_界".into());
+        let added = root.path().join("added.md");
+        std::fs::write(&added, "CAPTURED_EXTRA_界").unwrap();
+        context.extra_files.push(added.clone());
+        context
+            .extra_file_contents
+            .insert(added.clone(), Arc::new("CAPTURED_EXTRA_界".into()));
+        let paths = crate::paths::process_paths().unwrap();
+        let suffix = paths.suffix_file();
+        std::fs::create_dir_all(suffix.parent().unwrap()).unwrap();
+        std::fs::write(&suffix, "CAPTURED_SUFFIX_界").unwrap();
+        let mut session = Session::new(
+            "context-local-test",
+            "test-model",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        session.add_message(crate::session::MessageRole::User, "PRIVATE_USER_CONTENT");
+        #[cfg(feature = "goal")]
+        {
+            let mut goal =
+                crate::extras::goal::Goal::new("PENDING_FIRST_ROUND", Vec::new()).unwrap();
+            goal.context_file = Some(root.path().join("UNREAD_PENDING_PLAN.md"));
+            session.goal_store.set(goal, false).unwrap();
+        }
+
+        let ui = UiContext {
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::create_client(
+                "context-local-test",
+                Some("owned-unused-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = fixture_app(ui);
+        let (overhead, parts) = crate::agent::builder::estimate_overhead_breakdown(
+            app.ui.context,
+            false,
+            &cli,
+            &cfg,
+            &app.ui.sandbox,
+            None,
+        );
+        app.ui.session.overhead_tokens = overhead;
+        app.ui.session.overhead_parts = parts;
+        let stored_before = saved_files(&paths.sessions_dir());
+        let before = serde_json::to_vec(app.ui.session).unwrap();
+        let overhead_before = (
+            app.ui.session.overhead_tokens,
+            app.ui.session.overhead_parts.clone(),
+        );
+        app.run.is_running = true;
+        assert_eq!(
+            super::super::classify_submission(true, "/context", &app.ui.context.prompts),
+            super::super::SubmitAction::Run
+        );
+        app.input.load_text(" \t/context");
+        crate::startup::heap_future(|| {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        })
+        .await
+        .unwrap();
+        assert!(app.run.agent.is_none() && app.run.main_abort.is_none());
+        assert!(app.run.pending_inputs.is_empty());
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert_eq!(
+            (
+                app.ui.session.overhead_tokens,
+                app.ui.session.overhead_parts.clone()
+            ),
+            overhead_before
+        );
+        assert_eq!(
+            saved_files(&paths.sessions_dir()),
+            stored_before,
+            "diagnostic must not save session"
+        );
+        let output = app.renderer.captured_output();
+        assert!(output.contains("Context composition:") && output.contains("agent not built"));
+        assert!(!output.contains("PRIVATE_USER_CONTENT"));
+        app.run.is_running = false;
+        let built = {
+            let build_context = app.ui.agent_build_ctx();
+            crate::startup::heap_future(|| build_context.rebuild_agent("test-model", false)).await
+        };
+        let definitions = crate::startup::heap_future(|| built.context_tool_definitions())
+            .await
+            .unwrap();
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name == "read")
+        );
+        let definition_count = definitions.len();
+        let snapshot = built.context_snapshot().unwrap();
+        let preamble = built.context_preamble_for_test();
+        assert_eq!(snapshot.bytes, preamble.len());
+        assert_eq!(snapshot.tokens, Session::estimate_tokens(preamble));
+        let mut cursor = 0;
+        let mut reconstructed = String::new();
+        for ((label, range), (token_label, tokens)) in snapshot.ranges.iter().zip(&snapshot.parts) {
+            assert_eq!(range.start, cursor);
+            assert_eq!(label, token_label);
+            assert!(preamble.is_char_boundary(range.start) && preamble.is_char_boundary(range.end));
+            assert_eq!(*tokens, Session::estimate_tokens(&preamble[range.clone()]));
+            reconstructed.push_str(&preamble[range.clone()]);
+            cursor = range.end;
+        }
+        assert_eq!(cursor, preamble.len());
+        assert_eq!(reconstructed.as_bytes(), preamble.as_bytes());
+        let markers = [
+            "OVERRIDE_PERSONA",
+            "CAPTURED_AGENTS_界",
+            "CAPTURED_PROMPT_界",
+            "CAPTURED_EXTRA_界",
+            "CAPTURED_APPEND_界",
+            "CAPTURED_SUFFIX_界",
+        ];
+        let positions: Vec<_> = markers
+            .iter()
+            .map(|marker| preamble.find(marker).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            snapshot
+                .parts
+                .iter()
+                .any(|(label, _)| *label == "Repository instructions")
+        );
+        let saved_snapshot = snapshot.parts.clone();
+        let saved_tokens = snapshot.tokens;
+        app.run.agent = Some(built);
+        // Changes after build cannot alter the diagnostic or cause a reread.
+        std::fs::remove_file(&suffix).unwrap();
+        std::fs::remove_file(&added).unwrap();
+        #[cfg(unix)]
+        {
+            drop(crate::tests::process_gate::ProcessGate::new(&suffix).unwrap());
+            drop(crate::tests::process_gate::ProcessGate::new(&added).unwrap());
+        }
+        app.renderer.clear_content().unwrap();
+        crate::startup::heap_future(|| app.run_slash_command("/context"))
+            .await
+            .unwrap();
+        let output = app.renderer.captured_output();
+        assert!(output.contains("actual built-agent preamble snapshot"));
+        assert!(output.contains(&format!(
+            "{definition_count} already-registered definitions"
+        )));
+        assert!(
+            app.run.main_abort.is_none() && !app.run.is_running,
+            "read-only diagnostics must not start a pending goal round"
+        );
+
+        assert!(!output.contains("CAPTURED_") && !output.contains("PRIVATE_USER_CONTENT"));
+        assert_eq!(
+            app.run
+                .agent
+                .as_ref()
+                .unwrap()
+                .context_snapshot()
+                .unwrap()
+                .parts,
+            saved_snapshot
+        );
+        assert_eq!(
+            app.run
+                .agent
+                .as_ref()
+                .unwrap()
+                .context_snapshot()
+                .unwrap()
+                .tokens,
+            saved_tokens
+        );
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert!(saved_files(&paths.sessions_dir()) == stored_before);
+        crate::startup::heap_future(|| app.run_slash_command("/context unexpected"))
+            .await
+            .unwrap();
+        assert!(app.renderer.captured_output().contains("usage: /context"));
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                .await
+                .is_err(),
+            "diagnostic must not warm provider cache or make a model request"
+        );
     }
 }

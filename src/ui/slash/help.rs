@@ -77,6 +77,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         "  /memory [status|search|read|write|editor|clear]  manage memory",
     );
     emit(false, "  /clear [/new]          clear the current session");
+    emit(
+        false,
+        "  /context               show context composition and pruning projection",
+    );
     emit(false, "  /provider [name]       show or switch provider");
     emit(
         false,
@@ -174,6 +178,21 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /review [msg]          review code (auto message if omitted)",
     );
+    for (command, description) in [
+        ("/diff [path|turn]", "show a contained Git diff"),
+        (
+            "/commit [message]",
+            "preview latest-turn candidate files; confirm Y/N/B",
+        ),
+        ("/pr", "preview a tool-free PR proposal; confirm Y/N/B"),
+    ] {
+        let suffix = if cfg!(feature = "git-worktree") {
+            ""
+        } else {
+            " (req. 'git-worktree' feature)"
+        };
+        emit(false, &format!("  {command:<22}{description}{suffix}"));
+    }
     emit(
         false,
         "  /compress [/compact]   compress conversation history",
@@ -447,6 +466,24 @@ mod tests {
                     "/help must mention {alias}"
                 );
             }
+        }
+    }
+    #[test]
+    fn git_commands_are_feature_gated_in_completion_but_always_reserved() {
+        let offered = available_commands();
+        let mut lines = Vec::new();
+        help_lines(&mut |_, line| lines.push(line.to_owned()));
+        for name in ["/commit", "/diff", "/pr"] {
+            assert_eq!(offered.contains(&name), cfg!(feature = "git-worktree"));
+            assert!(crate::ui::pickers::list::reserved_command(&name[1..]));
+            let line = lines
+                .iter()
+                .find(|line| line.trim_start().starts_with(&format!("{name} ")))
+                .unwrap();
+            assert_eq!(
+                line.contains("(req. 'git-worktree' feature)"),
+                !cfg!(feature = "git-worktree")
+            );
         }
     }
 }
