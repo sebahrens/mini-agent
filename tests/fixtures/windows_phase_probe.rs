@@ -918,17 +918,51 @@ fn invalid_kill() -> Result<(), &'static str> {
 
 #[allow(unsafe_code)]
 fn invalid_launch(cleanup: u64) -> Result<(), &'static str> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
     let image = std::env::current_exe().map_err(|_| "image_missing")?;
+    let parent_path = image.parent().ok_or("image_parent_missing")?;
+    let parent_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent_path)
+        .map_err(|_| "image_parent_open_failed")?;
+    let metadata = parent_file
+        .metadata()
+        .map_err(|_| "image_parent_query_failed")?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("image_parent_refused");
+    }
+    let parent = cap_std::fs::Dir::from_std_file(parent_file);
+    const MISSING: &str = "phase108-missing.exe";
+    // Fixed sibling only, resolved relative to the retained directory. This is
+    // an inert fixture absence check, not an exact-object executable authority.
+    match parent.open(MISSING) {
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {}
+        Err(_) => return Err("missing_image_absence_error"),
+        Ok(_) => return Err("missing_image_present"),
+    }
+    let image = parent_path.join(MISSING);
     let application: Vec<u16> = image.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut command: Vec<u16> = format!("\"{}\"", image.display())
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    // Deliberately invalid cb, but valid pointers and a fixed inert image.
-    // CREATE_SUSPENDED ensures even unexpected success cannot execute code.
-    let startup = STARTUPINFOW::default();
+    // The previous cb=0 injector was falsified by native Windows accepting it.
+    // Correct cb and a fully-qualified non-null application prevent PATH search.
+    // CREATE_SUSPENDED prevents execution if the absent namespace changes.
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: buffers/output valid, deliberately invalid documented cb only.
+    // SAFETY: fixed owned-fixture sibling path, valid buffers/output/structure;
+    // retained no-share-delete parent remains live throughout the call.
     let launched = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -954,10 +988,12 @@ fn invalid_launch(cleanup: u64) -> Result<(), &'static str> {
             eprintln!("PHASE108 uncertain_cleanup");
             std::process::abort();
         }
+        drop(parent);
         return Err("invalid_launch_succeeded");
     }
-    if unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+    if unsafe { GetLastError() } != ERROR_FILE_NOT_FOUND {
         return Err("unexpected_launch_error");
     }
+    drop(parent);
     Ok(())
 }
