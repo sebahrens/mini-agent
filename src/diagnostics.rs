@@ -252,41 +252,60 @@ impl DoctorReport {
         );
         report.row("LSP compiled", cfg!(feature = "lsp").to_string());
         #[cfg(feature = "lsp")]
-        if let Some(lsp) = cfg.lsp.as_ref().filter(|lsp| lsp.enabled) {
+        if let Some(lsp) = cfg.resolve_lsp() {
+            let automatic = lsp.enabled == crate::config::LspActivation::Auto;
             report.row(
                 "LSP",
-                "enabled; server processes are not started for diagnostics",
+                if automatic {
+                    "auto; server processes are not started for diagnostics"
+                } else {
+                    "enabled; server processes are not started for diagnostics"
+                },
             );
             let servers = crate::extras::lsp::registry::resolve_servers(&lsp.servers);
-            report.row("LSP effective servers", servers.len().to_string());
             if scan_storage {
-                let search = std::env::var_os("PATH");
-                // The normal launcher also ignores relative/empty search roots.
-                // Cap both the source and the number of roots before lookup;
-                // never execute or print a configured command or environment.
-                let search = search.filter(|path| path.len() <= 32 * 1024);
+                let search = std::env::var_os("PATH").filter(|path| path.len() <= 32 * 1024);
                 let roots: Vec<_> = search
                     .as_deref()
                     .map(std::env::split_paths)
                     .into_iter()
                     .flatten()
-                    .take(128)
                     .filter(|p| p.is_absolute())
+                    .take(128)
                     .collect();
                 let bounded_search = std::env::join_paths(roots).ok();
-                for (name, server) in servers.iter().take(MAX_LSP_SERVERS) {
-                    let found = server.command.len() <= 4096
+                let checked = bounded_lsp_checks(&servers, |server| {
+                    server.command.len() <= 4096
                         && crate::extras::executable_search::resolve_service_executable(
                             server.command.as_str(),
                             bounded_search.as_deref(),
                             None,
                         )
-                        .is_ok();
+                        .is_ok()
+                });
+                if automatic {
+                    let available = checked.iter().filter(|(_, found)| *found).count();
+                    report.row(
+                        "LSP effective servers",
+                        if checked.len() < servers.len() {
+                            format!(
+                                "{available}+ (partial; {} of {} candidates checked)",
+                                checked.len(),
+                                servers.len()
+                            )
+                        } else {
+                            available.to_string()
+                        },
+                    );
+                } else {
+                    report.row("LSP effective servers", servers.len().to_string());
+                }
+                for (name, found) in checked {
                     report.row(
                         "LSP executable",
                         format!(
                             "{}: {}",
-                            label(name),
+                            label(&name),
                             if found {
                                 "found; metadata only, launch/handshake not verified"
                             } else {
@@ -297,6 +316,14 @@ impl DoctorReport {
                 }
                 report.row("LSP lookup bounds", "at most 32 servers and 128 PATH roots; no argument or environment values shown");
             } else {
+                report.row(
+                    if automatic {
+                        "LSP candidates (availability not rechecked)"
+                    } else {
+                        "LSP effective servers"
+                    },
+                    servers.len().to_string(),
+                );
                 report.row(
                     "LSP executable lookup",
                     "not performed in TUI; --doctor checks bounded PATH metadata",
@@ -343,6 +370,19 @@ impl DoctorReport {
         }
         report
     }
+}
+
+#[cfg(feature = "lsp")]
+fn bounded_lsp_checks(
+    servers: &[(String, crate::config::types::LspServerConfig)],
+    mut lookup: impl FnMut(&crate::config::types::LspServerConfig) -> bool,
+) -> Vec<(String, bool)> {
+    // Bound BEFORE the first filesystem lookup, not just when rendering.
+    servers
+        .iter()
+        .take(MAX_LSP_SERVERS)
+        .map(|(name, server)| (name.clone(), lookup(server)))
+        .collect()
 }
 
 /// Metadata only, bounded to direct regular entries. Never follow links or
@@ -468,6 +508,112 @@ mod tests {
         assert!(!report.contains("PRIVATE_"));
         assert_eq!(serde_json::to_vec(&session).unwrap(), before);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn lsp44_doctor_bounds_lookup_before_probe_and_checks_each_candidate_once() {
+        let servers: Vec<_> = (0..MAX_LSP_SERVERS + 5)
+            .map(|i| {
+                (
+                    format!("server-{i}"),
+                    crate::config::types::LspServerConfig::default(),
+                )
+            })
+            .collect();
+        let mut probes = 0;
+        let checked = bounded_lsp_checks(&servers, |_| {
+            probes += 1;
+            true
+        });
+        assert_eq!(probes, MAX_LSP_SERVERS);
+        assert_eq!(checked.len(), MAX_LSP_SERVERS);
+        assert_eq!(
+            checked.last().unwrap().0,
+            format!("server-{}", MAX_LSP_SERVERS - 1)
+        );
+        assert!(checked.iter().all(|(_, found)| *found));
+    }
+
+    #[cfg(all(unix, feature = "lsp"))]
+    #[test]
+    fn lsp44_doctor_auto_reports_effective_servers_without_executing_and_busy_view_does_not_probe()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("lsp44-doctor");
+        let binary = root.path().join("PRIVATE_COMMAND_NAME");
+        let marker = root.path().join("executed");
+        std::fs::write(&binary, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            local_data_dir: root.path().join("local"),
+            state_dir: root.path().join("state"),
+            cache_dir: root.path().join("cache"),
+            credentials_dir: root.path().join("credentials"),
+            project_dir: Some(root.path().to_owned()),
+        };
+        let mut lsp = crate::config::types::LspConfig::default();
+        for (name, _) in crate::extras::lsp::registry::builtin_servers() {
+            lsp.servers.insert(
+                name.into(),
+                crate::config::types::LspServerConfig {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        lsp.servers.insert(
+            "fixture".into(),
+            crate::config::types::LspServerConfig {
+                command: binary.to_str().unwrap().into(),
+                ..Default::default()
+            },
+        );
+        let mut cfg = Config {
+            lsp: Some(lsp),
+            ..Default::default()
+        };
+        let cli = Cli {
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let capture = |cfg: &Config, scan| {
+            DoctorReport::capture(&cli, cfg, &paths, None, None, scan).render()
+        };
+        let report = capture(&cfg, true);
+        assert!(report.contains("LSP effective servers: 1"), "{report}");
+        assert!(!report.contains("PRIVATE_COMMAND_NAME"));
+        assert!(!marker.exists());
+        let mut large = cfg.clone();
+        for index in 0..33 {
+            large.lsp.as_mut().unwrap().servers.insert(
+                format!("extra-{index:02}"),
+                crate::config::types::LspServerConfig {
+                    command: binary.to_str().unwrap().into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let limited = capture(&large, true);
+        assert!(
+            limited.contains("LSP effective servers: 32+ (partial; 32 of 34 candidates checked)"),
+            "{limited}"
+        );
+        assert_eq!(limited.matches("LSP executable:").count(), MAX_LSP_SERVERS);
+        assert!(!marker.exists());
+        std::fs::remove_file(&binary).unwrap();
+        let busy = capture(&cfg, false);
+        assert!(
+            busy.contains("LSP candidates (availability not rechecked): 1"),
+            "{busy}"
+        );
+        let missing = capture(&cfg, true);
+        assert!(missing.contains("LSP effective servers: 0"), "{missing}");
+        cfg.lsp.as_mut().unwrap().enabled = false.into();
+        assert!(capture(&cfg, true).contains("LSP: disabled"));
+        assert!(!marker.exists());
     }
 
     #[test]

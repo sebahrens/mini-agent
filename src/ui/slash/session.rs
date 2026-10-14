@@ -56,6 +56,15 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             }
         };
         (content, "JSONL")
+    } else if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        (
+            crate::extras::export::session_to_markdown(ctx.session),
+            "Markdown",
+        )
     } else {
         (crate::extras::export::session_to_html(ctx.session), "HTML")
     };

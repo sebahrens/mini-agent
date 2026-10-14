@@ -33,7 +33,7 @@ or process authority.
 | Permissions and effects | Rust owns every JavaScript external effect. Brokered file, fetch, process, and skill operations are typed, scope-narrowed, permission-checked, bounded, and audited by the parent process. Approval of one operation does not grant unrelated authority. |
 | Sandboxing | Linux, macOS, and Windows use different native containment backends behind the same JavaScript contract. Startup includes live platform checks; if mini-agent cannot prove the required boundary, the affected capability fails closed instead of silently running uncontained. |
 | Learned skills | The optional `skills` build can turn useful JavaScript into immutable, content-addressed local skills. Proposals do not activate themselves: verification, explicit human approval, activation, and promotion are separate lifecycle stages, and quarantine is automatic on directly attributed faults. |
-| Default versus optional | Release binaries include JavaScript execution, sandboxing, MCP, ACP, subagents, worktrees, loops, memory, and the other default features. Learned-skill storage is not included in release archives; install from source with `--features skills` to enable it. |
+| Default versus optional | Release binaries include JavaScript execution, sandboxing, MCP, ACP, subagents, worktrees, loops, memory, LSP diagnostics, lifecycle hooks, image attachments, and the other default features. Learned-skill storage is not included in release archives; install from source with `--features skills` to enable it. |
 | Data and operation | Configuration, sessions, memory, and learned skills are local. The contained JavaScript worker has no direct network access; providers, MCP services, hooks, and shell or fetch operations follow their separately visible configuration, permission, and containment policies. |
 
 The shortest mental model is: **the model decides, JavaScript coordinates, Rust authorizes and
@@ -403,7 +403,7 @@ task-level regression coverage without a live provider.
 ## Feature flags
 
 The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,
-`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, and `agent-skills`. Learned-skill storage is
+`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, and `multimodal`. Learned-skill storage is
 opt-in because it adds SQLite and retrieval dependencies.
 
 Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
@@ -424,7 +424,12 @@ cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.9.
 | `memory` | Persistent project and user memory |
 | `mcp` | MCP client transports and tool discovery |
 | `acp` | Stable Agent Client Protocol server over stdio or authenticated TCP; included by default |
-| `hooks`, `lsp`, `advisor`, `multimodal`, `pdf` | Optional integrations inherited from and built around the ZeroStack core |
+| `lsp` | Default-on automatic discovery of installed language servers; explicit `[lsp] enabled = false` disables it |
+| `hooks` | Included by default; no commands run without hook configuration |
+| `multimodal` | Default image/document message support, subject to provider capabilities |
+| `advisor`, `pdf` | Optional advisor and explicit document-attachment feature alias |
+
+Full release archives use these defaults. Lite archives retain their explicit `--no-default-features` recipe. Automatic LSP discovery checks installed executables and starts each server only when an authorized file operation needs it; nothing is installed or downloaded. `/toggle` lists captured runtime availability.
 
 For the full feature graph, see [Cargo.toml](Cargo.toml).
 

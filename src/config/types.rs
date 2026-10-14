@@ -456,6 +456,55 @@ impl Default for ChainConfig {
     }
 }
 
+/// Backward-compatible explicit activation or automatic executable discovery.
+#[cfg(feature = "lsp")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LspActivation {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[cfg(feature = "lsp")]
+impl From<bool> for LspActivation {
+    fn from(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+}
+
+#[cfg(feature = "lsp")]
+impl Serialize for LspActivation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::On => serializer.serialize_bool(true),
+            Self::Off => serializer.serialize_bool(false),
+        }
+    }
+}
+
+#[cfg(feature = "lsp")]
+impl<'de> Deserialize<'de> for LspActivation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Automatic {
+            Auto,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Activation {
+            Explicit(bool),
+            Automatic(Automatic),
+        }
+        Ok(match Activation::deserialize(deserializer)? {
+            Activation::Explicit(enabled) => enabled.into(),
+            Activation::Automatic(Automatic::Auto) => Self::Auto,
+        })
+    }
+}
+
 /// Configuration for LSP (Language Server Protocol) integration. When
 /// enabled, language servers are spawned lazily for edited files and
 /// diagnostics are fed back to the agent after edits.
@@ -463,7 +512,7 @@ impl Default for ChainConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspConfig {
-    pub enabled: bool,
+    pub enabled: LspActivation,
     /// Per-server overrides or custom servers, keyed by name. An entry with
     /// the same name as a built-in default replaces it.
     pub servers: HashMap<String, LspServerConfig>,

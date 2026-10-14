@@ -1,7 +1,7 @@
 //! Session export, import, and sharing.
 //!
-//! Two interchange formats: a standalone HTML page (human-readable, for
-//! sharing) and JSONL (machine-readable, re-importable via `/import`).
+//! HTML and Markdown transcripts are human-readable; JSONL is machine-readable
+//! and re-importable via `/import`.
 //! Sharing uploads the HTML export as a secret GitHub gist.
 
 use anyhow::{Context, Result};
@@ -545,6 +545,129 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
 /// the CSS braces in the template stay intact.
 const TEMPLATE: &str = include_str!("../../data/session_export.html");
 
+/// Maximum UTF-8 bytes shown for each tool result in a Markdown transcript.
+pub const MAX_MARKDOWN_TOOL_RESULT_BYTES: usize = 16 * 1024;
+
+/// Export the visible transcript, without replay metadata or permission grants.
+/// Bodies remain literal code blocks, including any embedded Markdown or HTML.
+/// Full-output artifacts are referenced, never opened by the exporter.
+pub fn session_to_markdown(session: &Session) -> String {
+    let mut out = String::new();
+    out.push_str("# ");
+    push_markdown_label(&mut out, &session_title(session));
+    out.push_str("\n\n");
+    push_markdown_block(
+        &mut out,
+        "json",
+        &serde_json::json!({
+            "provider": session.provider,
+            "model": session.model,
+            "created_at": session.created_at,
+            "messages": session.messages.len(),
+            "input_tokens": session.total_input_tokens,
+            "output_tokens": session.total_output_tokens,
+            "cost": session.total_cost,
+        })
+        .to_string(),
+    );
+    for message in &session.messages {
+        let (_, label) = role_class_label(message, session);
+        out.push_str("## ");
+        push_markdown_label(&mut out, &label);
+        out.push_str("\n\n");
+        match (&message.role, &message.tool) {
+            (
+                MessageRole::ToolCall | MessageRole::SubagentToolCall,
+                Some(crate::session::PersistedToolMessage::Call { name, arguments }),
+            ) => {
+                let call = serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                    "call_id": message.tool_call_id,
+                });
+                push_markdown_block(
+                    &mut out,
+                    "json",
+                    &serde_json::to_string_pretty(&call)
+                        .expect("persisted JSON tool arguments serialize"),
+                );
+            }
+            (MessageRole::ToolResult, tool) => {
+                let (body, artifact_path) = match tool {
+                    Some(crate::session::PersistedToolMessage::Result {
+                        output,
+                        artifact_path,
+                    }) => (output.as_str(), artifact_path.as_ref()),
+                    _ => (message.content.as_str(), None),
+                };
+                if message.tool_call_id.is_some() || artifact_path.is_some() {
+                    push_markdown_block(
+                        &mut out,
+                        "json",
+                        &serde_json::json!({
+                            "call_id": message.tool_call_id,
+                            "artifact_path": artifact_path,
+                        })
+                        .to_string(),
+                    );
+                }
+                let mut end = body.len().min(MAX_MARKDOWN_TOOL_RESULT_BYTES);
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                push_markdown_block(&mut out, "text", &body[..end]);
+                if end < body.len() {
+                    out.push_str(&format!(
+                        "({} tool-result bytes omitted)\n\n",
+                        body.len() - end
+                    ));
+                }
+            }
+            _ => push_markdown_block(&mut out, "text", &message.content),
+        }
+    }
+    out
+}
+
+fn push_markdown_label(out: &mut String, label: &str) {
+    for character in label.chars() {
+        match character {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\\' | '`' | '*' | '_' | '~' | '[' | ']' | '(' | ')' | '#' | '!' | '|' => {
+                out.push('\\');
+                out.push(character);
+            }
+            character if character.is_control() => out.push(' '),
+            character => out.push(character),
+        }
+    }
+}
+
+fn push_markdown_block(out: &mut String, language: &str, body: &str) {
+    let mut longest = 0;
+    let mut run = 0;
+    for byte in body.bytes() {
+        if byte == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(3.max(longest + 1));
+    out.push_str(&fence);
+    out.push_str(language);
+    out.push('\n');
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&fence);
+    out.push_str("\n\n");
+}
+
 /// Export a session as a standalone, self-contained HTML page. Assistant
 /// messages are rendered from a safe Markdown subset; all other roles are
 /// escaped and shown verbatim.
@@ -776,7 +899,7 @@ fn session_title(session: &Session) -> String {
     if session.name.is_empty() {
         format!(
             "mini-agent session {}",
-            &session.id[..8.min(session.id.len())]
+            session.id.chars().take(8).collect::<String>()
         )
     } else {
         session.name.to_string()

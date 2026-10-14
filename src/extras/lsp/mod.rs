@@ -1,7 +1,8 @@
 //! LSP (Language Server Protocol) integration: spawns language servers for
 //! files the agent edits and feeds diagnostics back into tool results.
 //!
-//! Enabled via `[lsp] enabled = true` (requires the `lsp` cargo feature).
+//! Available servers are detected automatically; explicit `[lsp] enabled = false`
+//! disables integration. Server processes still start only on file interaction.
 //! Everything is fail-open: a missing server binary, a hung handshake, or a
 //! crashed server only means "no diagnostics", never a failed edit.
 
@@ -265,8 +266,63 @@ impl LspManager {
                     .expect("LSP workspace must be a stable directory"),
             ),
         };
-        let root = workspace.root();
         let servers = registry::resolve_servers(&cfg.servers);
+        Self::with_servers(servers, workspace)
+    }
+
+    /// Own the filesystem metadata lookup before registering actual tool schema.
+    /// Explicit on retains the existing configured lazy-server behavior.
+    pub(crate) async fn prepare(
+        cfg: &LspConfig,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Option<Self> {
+        use crate::config::types::LspActivation;
+        match cfg.enabled {
+            LspActivation::Off => None,
+            LspActivation::On => Some(Self::new(cfg, workspace)),
+            LspActivation::Auto => {
+                Self::prepare_automatic(
+                    cfg.servers.clone(),
+                    std::env::var_os("PATH"),
+                    workspace,
+                    crate::agent::runner::AgentWorkScope::new(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn prepare_automatic(
+        configured: HashMap<String, crate::config::types::LspServerConfig>,
+        search: Option<std::ffi::OsString>,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+        scope: Arc<crate::agent::runner::AgentWorkScope>,
+    ) -> Option<Self> {
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        let result = scope
+            .run(async move {
+                // Spawn only after run installs this exact owner, never while
+                // constructing the argument to run.
+                crate::agent::runner::spawn_blocking_scoped(move || {
+                    registry::available_servers(&configured, search.as_deref())
+                })
+                .await
+            })
+            .await;
+        let cancelled = scope.is_cancelled();
+        cleanup.settle().await;
+        let servers = result.ok()?;
+        if cancelled || servers.is_empty() || workspace.validate().is_err() {
+            return None;
+        }
+        Some(Self::with_servers(servers, workspace))
+    }
+
+    fn with_servers(
+        servers: Vec<(String, crate::config::types::LspServerConfig)>,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        let root = workspace.root();
         tracing::debug!(
             "lsp: {} server definitions resolved (root {})",
             servers.len(),
@@ -1055,5 +1111,57 @@ mod retry_tests {
         assert_eq!(capped.retry_after.duration_since(now), SERVER_RETRY_MAX);
         assert!(capped.cooling_down(now));
         assert!(!capped.cooling_down(capped.retry_after));
+    }
+}
+
+#[cfg(test)]
+mod default44_ownership_tests {
+    #[tokio::test]
+    async fn lsp44_cancelled_automatic_preparation_retains_exact_blocking_owner_until_join() {
+        use super::*;
+        let root = crate::tests::OwnedTestDirectory::new("lsp44-held-lookup");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let (scope, started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        let outer = crate::agent::runner::AgentWorkScope::new();
+        let mut preparation = Box::pin(outer.run(LspManager::prepare_automatic(
+            HashMap::new(),
+            None,
+            workspace,
+            scope.clone(),
+        )));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut preparation => panic!("lookup unexpectedly completed: {}", result.is_some()),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+                if started.try_recv().is_ok() { break; }
+            }
+        }).await.unwrap();
+        assert_eq!(scope.active_children(), 1);
+        assert_eq!(
+            outer.active_children(),
+            0,
+            "lookup must belong to the preparation owner"
+        );
+        drop(preparation);
+        assert!(scope.is_cancelled());
+        assert_eq!(
+            scope.active_children(),
+            1,
+            "dropping caller cannot pretend the worker retired"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scope.wait_idle())
+                .await
+                .is_err()
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(scope.active_children(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }

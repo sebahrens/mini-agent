@@ -33,7 +33,7 @@ harness = false
 required-features = ["git-worktree", "sandbox"]
 
 [features]
-default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory', 'agent-skills']
+default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory', 'agent-skills', 'lsp', 'hooks', 'multimodal']
 status-signals = []
 # `--loop` is a goal preset: it sets a goal and the goal driver runs its
 # rounds, so the loop feature cannot be built without it.

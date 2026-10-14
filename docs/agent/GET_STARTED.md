@@ -605,10 +605,13 @@ or separate consent prompt. The local attestation does not test general host fil
 denial; the delivered hosted canaries record those broader observations only for their reference
 runner and do not prove identical ACL visibility on every Windows host.
 
-Everything else above, including ACP editor integration, ships in the default build. A few extras are compiled in
-only when you ask for them: lifecycle hooks (`--features hooks`), a
-second-model advisor (`--features advisor`), image/PDF message attachments
-(`--features multimodal`, or the equivalent `--features pdf` alias). PDF attachments
+Everything else above, including ACP editor integration, lifecycle hooks, LSP diagnostics,
+and image/document message attachments, ships in the default/full build. Hooks do
+nothing without configuration. LSP automatically selects installed language servers
+and starts them lazily; `[lsp] enabled = false` disables it. `/toggle` lists captured
+runtime availability. No server is installed or downloaded. Lite archives keep their
+smaller explicit feature recipe. The second-model advisor remains optional
+(`--features advisor`); `--features pdf` remains an explicit attachment feature alias. PDF attachments
 are sent as raw document messages to a provider that supports them; mini-agent
 does not parse PDFs locally. Attachments must be regular files (or symlinks to
 them), and the 20 MiB limit is enforced while reading, including if a file grows.

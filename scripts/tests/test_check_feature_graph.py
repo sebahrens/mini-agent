@@ -57,6 +57,12 @@ class FeatureGraphTests(unittest.TestCase):
     def test_repository_manifest_encodes_supported_relationships(self) -> None:
         self.assertEqual([], feature_graph.validate_manifest(self.manifest))
 
+    def test_default44_includes_lsp_hooks_media_and_lite_recipe_remains_explicit(self) -> None:
+        self.assertTrue({"lsp", "hooks", "multimodal"}.issubset(self.manifest["features"]["default"]))
+        release = (REPOSITORY_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        commands = re.findall(r"^\s*run: ((?:cargo|cross) build --locked --release --no-default-features --target \$\{\{ matrix.target \}\})$", release, re.MULTILINE)
+        self.assertEqual(3, len(commands), "all native/static/Windows lite recipes remain no-default only")
+
     def test_skills_must_imply_js(self) -> None:
         manifest = copy.deepcopy(self.manifest)
         manifest["features"]["skills"].remove("js")

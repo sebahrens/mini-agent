@@ -1832,7 +1832,7 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
-        let result = self.run_inner().await;
+        let result = crate::startup::heap_future(|| self.run_inner()).await;
         #[cfg(feature = "mcp")]
         let mcp_retirement = self.retire_mcp_work().await;
         if result.is_err() {

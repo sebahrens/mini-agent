@@ -428,13 +428,24 @@ fn lsp_permission_path_rejects_lossy_non_utf8_collision() {
 // ── config ──────────────────────────────────────────────────────────────
 
 #[test]
-fn resolve_lsp_requires_enabled() {
+fn lsp44_resolve_lsp_preserves_auto_and_explicit_off() {
     let mut cfg = crate::config::Config::default();
-    assert!(cfg.resolve_lsp().is_none());
+    assert_eq!(
+        cfg.resolve_lsp().unwrap().enabled,
+        crate::config::types::LspActivation::Auto
+    );
     cfg.lsp = Some(LspConfig::default());
+    assert_eq!(
+        cfg.resolve_lsp().unwrap().enabled,
+        crate::config::types::LspActivation::Auto
+    );
+    cfg.lsp = Some(LspConfig {
+        enabled: false.into(),
+        ..Default::default()
+    });
     assert!(cfg.resolve_lsp().is_none());
     cfg.lsp = Some(LspConfig {
-        enabled: true,
+        enabled: true.into(),
         ..Default::default()
     });
     assert!(cfg.resolve_lsp().is_some());
@@ -2126,4 +2137,83 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
     let tool = LspTool::new(manager, Some(permission(root.path(), config)), None);
     let output = tool.call(LspArgs { path: None }).await.unwrap();
     assert_eq!(output, "No diagnostics.");
+}
+
+#[test]
+fn lsp44_activation_roundtrips_bool_auto_and_rejects_unknown_values() {
+    use crate::config::types::LspActivation;
+    for (value, expected) in [
+        ("true", LspActivation::On),
+        ("false", LspActivation::Off),
+        ("\"auto\"", LspActivation::Auto),
+    ] {
+        let cfg: crate::config::Config =
+            toml::from_str(&format!("[lsp]\nenabled = {value}\n")).unwrap();
+        assert_eq!(cfg.lsp.as_ref().unwrap().enabled, expected);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::config::Config>(json)
+                .unwrap()
+                .lsp
+                .unwrap()
+                .enabled,
+            expected
+        );
+    }
+    for value in ["\"on\"", "\"AUTO\"", "1", "[]", "{}"] {
+        assert!(
+            toml::from_str::<crate::config::Config>(&format!("[lsp]\nenabled = {value}\n"))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp44_auto_path_admission_preserves_overrides_and_ignores_relative_or_oversized_search() {
+    use crate::extras::lsp::registry::available_servers;
+    use std::os::unix::fs::PermissionsExt;
+    let root = crate::tests::OwnedTestDirectory::new("lsp44-path");
+    let binary = root.path().join("rust-analyzer");
+    std::fs::write(&binary, "#!/bin/sh\nexit 99\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let names = |user: &HashMap<String, LspServerConfig>, path: &std::ffi::OsStr| {
+        available_servers(user, Some(path))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&HashMap::new(), root.path().as_os_str()), ["rust"]);
+    assert!(names(&HashMap::new(), std::ffi::OsStr::new(".")).is_empty());
+    assert!(names(&HashMap::new(), std::ffi::OsStr::new(&"x".repeat(32769))).is_empty());
+    let mut user = HashMap::new();
+    user.insert(
+        "rust".into(),
+        LspServerConfig {
+            disabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(names(&user, root.path().as_os_str()).is_empty());
+    user.insert(
+        "rust".into(),
+        LspServerConfig {
+            command: "missing-override".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        names(&user, root.path().as_os_str()).is_empty(),
+        "an unavailable override must not revive builtin"
+    );
+    user.insert(
+        "a-custom".into(),
+        LspServerConfig {
+            command: binary.to_str().unwrap().into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(names(&user, std::ffi::OsStr::new(".")), ["a-custom"]);
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(names(&user, root.path().as_os_str()).is_empty());
 }

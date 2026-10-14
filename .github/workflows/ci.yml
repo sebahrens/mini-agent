@@ -2313,20 +2313,21 @@ jobs:
             'fs::private::windows::operator_config_lease_probe::exact_relative_lease_surviving_mapping_and_data_conflicts: test',
             'fs::private::windows::operator_config_lease_probe::namespace_alias_and_private_metadata_are_observed_before_any_candidate_write: test',
             'fs::private::windows::operator_config_lease_probe::reader_lease_precedes_marker_and_late_marker_refuses_admission: test',
-            'fs::private::windows::operator_config_lease_probe::retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test'
+            'fs::private::windows::operator_config_lease_probe::retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test',
+            'fs::private::windows::operator_config_lease_probe::read_delete_share_zero_distinguishes_data_exclusion_from_mutable_metadata: test'
           )
           $discovered = @(cargo test --locked --bin mini-agent $filter -- --list 2>&1)
           if ($LASTEXITCODE -ne 0) { throw 'Windows MCP lease experiment discovery failed' }
           $actual = @($discovered | Where-Object { $_ -match '^fs::private::windows::operator_config_lease_probe::.*: test$' })
-          if ($actual.Count -ne 4 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
-            throw 'Exact four native Windows MCP lease experiments were not discovered'
+          if ($actual.Count -ne 5 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Exact five native Windows MCP lease experiments were not discovered'
           }
           $native = @(cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1)
           $nativeExit = $LASTEXITCODE
           $native | Write-Output
           if ($nativeExit -ne 0) { throw 'Native Windows MCP lease experiment failed' }
-          if (-not ($native -match '^test result: ok\. 4 passed; 0 failed; 0 ignored;')) {
-            throw 'Native Windows MCP lease experiment did not execute exactly four passing tests'
+          if (-not ($native -match '^test result: ok\. 5 passed; 0 failed; 0 ignored;')) {
+            throw 'Native Windows MCP lease experiment did not execute exactly five passing tests'
           }
 
       - name: Test MCP OAuth credential storage

@@ -5211,36 +5211,15 @@ mod git_proposal_wire_tests {
 mod lsp_health_agent_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn lsp_health_actual_agent_keeps_registered_tool_manager_identity() {
-        let root = crate::tests::OwnedTestDirectory::new("doctor-agent-lsp");
-        let file = root.path().join("main.doctor");
-        std::fs::write(&file, "private document contents").unwrap();
+    async fn lsp44_agent(root: &std::path::Path, cfg: &Config) -> AnyAgent {
         let cli = Cli {
             tools: vec!["lsp_diagnostics".into()],
-            ..Default::default()
-        };
-        let mut lsp = crate::config::types::LspConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        lsp.servers.insert(
-            "fixture".into(),
-            crate::config::types::LspServerConfig {
-                command: format!("mini-agent-doctor-missing-server-{}", uuid::Uuid::new_v4())
-                    .into(),
-                extensions: vec![".doctor".into()],
-                ..Default::default()
-            },
-        );
-        let cfg = Config {
-            lsp: Some(lsp),
             ..Default::default()
         };
         let context = ContextFiles {
             #[cfg(feature = "mcp")]
             mcp_discovery: Default::default(),
-            workspace_root: root.path().to_path_buf(),
+            workspace_root: root.to_path_buf(),
             agents: None,
             instruction_roots: Vec::new(),
             prompts: HashMap::new(),
@@ -5261,12 +5240,12 @@ mod lsp_health_agent_tests {
             architecture: None,
         };
         let client = create_client("ollama", None, &HashMap::new(), None).unwrap();
-        let agent = build_agent_in_workspace(
+        build_agent_in_workspace(
             client.completion_model("offline-unused"),
             &cli,
-            &cfg,
+            cfg,
             &context,
-            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap()),
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root).unwrap()),
             None,
             None,
             Sandbox::new(false, "none"),
@@ -5286,7 +5265,116 @@ mod lsp_health_agent_tests {
             #[cfg(feature = "mcp")]
             None,
         )
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lsp44_actual_auto_builder_registers_only_available_servers_without_starting_them() {
+        use crate::config::types::{LspActivation, LspConfig, LspServerConfig};
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("lsp44-auto-agent");
+        let executable = root.path().join("fixture-server");
+        let marker = root.path().join("started");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\n: > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut lsp = LspConfig::default();
+        for (name, _) in crate::extras::lsp::registry::builtin_servers() {
+            lsp.servers.insert(
+                name.into(),
+                LspServerConfig {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        lsp.servers.insert(
+            "fixture".into(),
+            LspServerConfig {
+                command: executable.to_str().unwrap().into(),
+                extensions: vec![".fixture".into()],
+                ..Default::default()
+            },
+        );
+        for activation in [LspActivation::Auto, LspActivation::Off] {
+            lsp.enabled = activation;
+            let cfg = Config {
+                lsp: Some(lsp.clone()),
+                ..Default::default()
+            };
+            let agent = lsp44_agent(root.path(), &cfg).await;
+            let AnyAgentInner::Ollama(inner) = &agent.inner else {
+                panic!("wrong fixture provider")
+            };
+            let definitions = inner.tool_server_handle.get_tool_defs(None).await.unwrap();
+            let registered = definitions
+                .iter()
+                .any(|definition| definition.name == "lsp_diagnostics");
+            assert_eq!(registered, activation == LspActivation::Auto);
+            if let Some(manager) = agent.lsp_manager() {
+                let snapshot = manager.diagnostic_snapshot();
+                assert_eq!(snapshot.configured_names, ["fixture"]);
+                assert_eq!(snapshot.live_count, Some(0));
+                assert_eq!(snapshot.failure_count, Some(0));
+            }
+            assert!(
+                !marker.exists(),
+                "metadata admission must not execute a server"
+            );
+        }
+        std::fs::remove_file(&executable).unwrap();
+        lsp.enabled = LspActivation::Auto;
+        let agent = lsp44_agent(
+            root.path(),
+            &Config {
+                lsp: Some(lsp),
+                ..Default::default()
+            },
+        )
         .await;
+        assert!(agent.lsp_manager().is_none());
+        let AnyAgentInner::Ollama(inner) = &agent.inner else {
+            panic!("wrong fixture provider")
+        };
+        assert!(
+            !inner
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "lsp_diagnostics")
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn lsp_health_actual_agent_keeps_registered_tool_manager_identity() {
+        let root = crate::tests::OwnedTestDirectory::new("doctor-agent-lsp");
+        let file = root.path().join("main.doctor");
+        std::fs::write(&file, "private document contents").unwrap();
+        let mut lsp = crate::config::types::LspConfig {
+            enabled: true.into(),
+            ..Default::default()
+        };
+        lsp.servers.insert(
+            "fixture".into(),
+            crate::config::types::LspServerConfig {
+                command: format!("mini-agent-doctor-missing-server-{}", uuid::Uuid::new_v4())
+                    .into(),
+                extensions: vec![".doctor".into()],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            lsp: Some(lsp),
+            ..Default::default()
+        };
+        let agent = lsp44_agent(root.path(), &cfg).await;
         let manager = agent.lsp_manager().expect("existing builder manager");
         assert_eq!(manager.diagnostic_snapshot().live_count, Some(0));
         assert_eq!(manager.diagnostic_snapshot().failure_count, Some(0));

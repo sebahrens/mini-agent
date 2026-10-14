@@ -361,6 +361,9 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         ) {
             write_result(ctx.renderer, line);
         }
+        for line in default_runtime_status_lines(ctx.cfg, ctx.agent.as_ref()) {
+            write_result(ctx.renderer, line);
+        }
     } else {
         let new_state =
             match toggle_target(parts[1], parts.get(2).copied(), *ctx.todo_tools_enabled) {
@@ -391,6 +394,52 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+/// Uses only captured configuration and existing manager metadata. No PATH
+/// search, server startup, hook execution, or provider request is performed.
+fn default_runtime_status_lines(
+    cfg: &crate::config::Config,
+    agent: Option<&crate::provider::AnyAgent>,
+) -> Vec<String> {
+    #[cfg(feature = "lsp")]
+    let lsp = if cfg.resolve_lsp().is_none() {
+        "off (configured)".to_string()
+    } else if let Some(agent) = agent {
+        match agent.lsp_manager() {
+            Some(manager) => format!(
+                "on ({} registered servers; processes start lazily)",
+                manager.diagnostic_snapshot().configured_count
+            ),
+            None => "off (no eligible servers or excluded tool)".to_string(),
+        }
+    } else {
+        "not built (availability not checked)".to_string()
+    };
+    #[cfg(not(feature = "lsp"))]
+    let lsp = {
+        let _ = (cfg, agent);
+        "not compiled".to_string()
+    };
+    vec![
+        format!("  lsp     {lsp}"),
+        format!(
+            "  hooks   {}",
+            if cfg!(feature = "hooks") {
+                "compiled (only configured hooks run)"
+            } else {
+                "not compiled"
+            }
+        ),
+        format!(
+            "  media   {}",
+            if cfg!(feature = "multimodal") {
+                "compiled (provider support required)"
+            } else {
+                "not compiled"
+            }
+        ),
+    ]
 }
 
 /// The todo-tools state `/toggle <feature> [on|off]` asks for. `todo` is the
@@ -697,7 +746,7 @@ mod reasoning_tests {
         assert_eq!(toggle_target("TODO", Some("on"), false), Ok(true));
         assert_eq!(toggle_target("todo", None, true), Ok(false));
         assert!(toggle_target("todo", Some("sideways"), true).is_err());
-        for other in ["skills", "js", "mcp"] {
+        for other in ["skills", "js", "mcp", "lsp", "hooks", "media"] {
             let error = toggle_target(other, Some("off"), true).unwrap_err();
             assert!(error.contains(other) && error.contains("todo"), "{error}");
         }
@@ -862,5 +911,46 @@ mod runtime_status_tests {
             );
             assert_eq!(lines.len(), 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod default_runtime44_tests {
+    #[test]
+    fn default_runtime44_listing_reports_build_and_explicit_off_without_probes() {
+        let mut cfg = crate::config::Config::default();
+        let lines = super::default_runtime_status_lines(&cfg, None);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            if cfg!(feature = "lsp") {
+                "  lsp     not built (availability not checked)"
+            } else {
+                "  lsp     not compiled"
+            }
+        );
+        assert!(lines[1].contains(if cfg!(feature = "hooks") {
+            "only configured hooks run"
+        } else {
+            "not compiled"
+        }));
+        assert!(lines[2].contains(if cfg!(feature = "multimodal") {
+            "provider support required"
+        } else {
+            "not compiled"
+        }));
+        #[cfg(feature = "lsp")]
+        {
+            cfg.lsp = Some(crate::config::types::LspConfig {
+                enabled: false.into(),
+                ..Default::default()
+            });
+            assert_eq!(
+                super::default_runtime_status_lines(&cfg, None)[0],
+                "  lsp     off (configured)"
+            );
+        }
+        #[cfg(not(feature = "lsp"))]
+        let _ = &mut cfg;
     }
 }

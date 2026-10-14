@@ -88,8 +88,8 @@ FEATURE_ROWS = (
     row("acp", "acp", ACP_PACKAGES),
     row("goal", "goal", frozenset()),
     row("lsp", "lsp", LSP_PACKAGES),
-    # Opt-in extras that neither the default set nor another focused row
-    # compiles; `lsp` is the only member that activates optional packages.
+    # Explicit no-default composition of default integrations and optional
+    # advisor/PDF; `lsp` is the only member that activates optional packages.
     row("extras", "hooks,advisor,lsp,multimodal,pdf", LSP_PACKAGES),
     row(
         "hooks-js-subagents-skills",

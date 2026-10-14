@@ -1347,11 +1347,11 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
             "if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "shell: pwsh",
             "$filter = 'fs::private::windows::operator_config_lease_probe::'",
             "cargo test --locked --bin mini-agent $filter -- --list 2>&1",
-            "$actual.Count -ne 4", "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
+            "$actual.Count -ne 5", "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
             "'^fs::private::windows::operator_config_lease_probe::.*: test$'",
             "cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1",
             "if ($LASTEXITCODE -ne 0)", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
-            r"'^test result: ok\. 4 passed; 0 failed; 0 ignored;'",
+            r"'^test result: ok\. 5 passed; 0 failed; 0 ignored;'",
         ]:
             if fragment not in step:
                 raise AssertionError("missing exact experiment guard: " + fragment)
@@ -1360,10 +1360,11 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
             "namespace_alias_and_private_metadata_are_observed_before_any_candidate_write",
             "reader_lease_precedes_marker_and_late_marker_refuses_admission",
             "retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts",
+            "read_delete_share_zero_distinguishes_data_exclusion_from_mutable_metadata",
         }
         names = re.findall(r"'fs::private::windows::operator_config_lease_probe::(\w+): test'", step)
-        if len(names) != 4 or set(names) != expected:
-            raise AssertionError("exact four experiments required")
+        if len(names) != 5 or set(names) != expected:
+            raise AssertionError("exact five experiments required")
         if step.count("cargo test ") != 2 or step.count("throw ") != 4:
             raise AssertionError("discovery/result failures must stay closed")
         if any(value in step for value in ["--ignored", "--no-run", "continue-on-error", "cargo build"]):
@@ -1379,16 +1380,17 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
         prefix, suffix = original.split("- name: " + name, 1)
         step, rest = suffix.split("- name:", 1)
         for before, after in [
-            ("$actual.Count -ne 4", "$actual.Count -lt 0"),
+            ("$actual.Count -ne 5", "$actual.Count -lt 0"),
             ("Compare-Object -ReferenceObject $expected -DifferenceObject $actual", "$null"),
             ("--bin mini-agent $filter -- --list", "--bin mini-agent $filter -- --no-run"),
             ("reader_lease_precedes_marker_and_late_marker_refuses_admission: test", "other: test"),
             ("retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test", "other_retirement: test"),
+            ("read_delete_share_zero_distinguishes_data_exclusion_from_mutable_metadata: test", "other_rights: test"),
             ("if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "if: matrix.os == 'windows-latest'"),
             ("--bin mini-agent $filter -- --nocapture", "--bin mini-agent -- --nocapture"),
             ("$nativeExit = $LASTEXITCODE", "$nativeExit = 0"),
             ("if ($nativeExit -ne 0)", "if ($nativeExit -lt 0)"),
-            ("4 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 4 ignored;"),
+            ("5 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 5 ignored;"),
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)

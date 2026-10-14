@@ -657,7 +657,7 @@ async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
         }
         let manager = LspManager::new(
             &LspConfig {
-                enabled: true,
+                enabled: true.into(),
                 servers: HashMap::from([("fixture".into(), server)]),
             },
             workspace.clone(),
@@ -784,7 +784,7 @@ async fn lsp_process_delayed_publication_rejects_changed_source() {
                 }
                 let manager = LspManager::new(
                     &LspConfig {
-                        enabled: true,
+                        enabled: true.into(),
                         servers: HashMap::from([("fixture".into(), server)]),
                     },
                     workspace.clone(),
@@ -883,7 +883,7 @@ async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
     );
     let manager = LspManager::new(
         &LspConfig {
-            enabled: true,
+            enabled: true.into(),
             servers: HashMap::from([("fixture".into(), server)]),
         },
         workspace.clone(),
@@ -941,15 +941,22 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     };
     let fixture = FixtureBuild::compile("tool-diagnostics");
     let workspace = fixture.workspace("workspace").canonicalize().unwrap();
-    let manager = LspManager::new(
+    let lease = fixture.path("tools.lease");
+    let mut server = fixture.config("diagnostics", &lease);
+    server.extensions = vec![".rs".into()];
+    let manager = LspManager::prepare(
         &LspConfig {
-            enabled: true,
-            servers: HashMap::from([(
-                "fixture".into(),
-                fixture.config("diagnostics", &fixture.path("tools.lease")),
-            )]),
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
         },
-        workspace.clone(),
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    )
+    .await
+    .expect("automatic discovery admits the installed fixture");
+    assert_eq!(manager.diagnostic_snapshot().live_count, Some(0));
+    assert!(
+        !lease.exists(),
+        "automatic metadata discovery must not start a process"
     );
     let write = WriteTool::new(None, None, None)
         .with_workspace(workspace.clone())
@@ -963,7 +970,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     let mut stale_results = Vec::new();
     let mut rejected_edits = Vec::new();
     for relative in [false, true] {
-        let name = format!("tool-{relative}.probe");
+        let name = format!("tool-{relative}.rs");
         let path = if relative {
             name
         } else {
@@ -1107,7 +1114,7 @@ async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets()
                 );
                 let manager = LspManager::new(
                     &LspConfig {
-                        enabled: true,
+                        enabled: true.into(),
                         servers: HashMap::from([("fixture".into(), cfg)]),
                     },
                     workspace.clone(),
@@ -1308,7 +1315,7 @@ async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping
     );
     let manager = LspManager::new(
         &LspConfig {
-            enabled: true,
+            enabled: true.into(),
             servers: HashMap::from([("fixture".into(), cfg)]),
         },
         workspace.clone(),
@@ -1397,7 +1404,7 @@ async fn lsp_process_shutdown_drains_publication_before_manager_replacement() {
     let lease = fixture.path("lease");
     let manager = LspManager::new(
         &LspConfig {
-            enabled: true,
+            enabled: true.into(),
             servers: HashMap::from([("fixture".into(), fixture.config("diagnostics", &lease))]),
         },
         workspace,
@@ -1533,7 +1540,7 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
     );
     let manager = LspManager::new(
         &LspConfig {
-            enabled: true,
+            enabled: true.into(),
             servers: HashMap::from([("fixture".into(), cfg)]),
         },
         workspace.clone(),
@@ -1692,7 +1699,7 @@ async fn lsp_process_manager_restarts_stopped_server() {
     );
     let manager = LspManager::new(
         &LspConfig {
-            enabled: true,
+            enabled: true.into(),
             servers: HashMap::from([("fixture".to_string(), server)]),
         },
         workspace.clone(),

@@ -833,9 +833,8 @@ regardless of which prompt or mode is active.
 
 ## Hooks
 
-Requires the `hooks` Cargo feature, which is **default-off** — a prebuilt
-binary or package must have been compiled with `--features hooks` (or
-`--all-features`) for any of this to apply. When the feature isn't compiled
+The default/full binary includes the `hooks` Cargo feature; lite/no-default builds require
+`--features hooks` for any of this to apply. When the feature isn't compiled
 in, none of the flags, files, or `/hooks`/`--hooks-test` commands below exist.
 
 Hooks let external commands observe or gate agent behavior at defined points
@@ -3159,14 +3158,30 @@ diagnostic message bodies are supplied by the configured language server and
 can mention other files, so language-server commands and configuration must
 still be treated as trusted project code.
 
-This integration is behind the non-default `lsp` Cargo feature — build with
-`--features lsp` to enable it.
+The default/full build includes `lsp`. Omitting `[lsp]` or its `enabled` field
+selects automatic discovery, as does `enabled = "auto"`. An agent build checks
+installed executable metadata on an owned blocking worker; absent servers are
+omitted, and no server is started during discovery. If none are available, the
+agent has no `lsp_diagnostics` tool. Explicit `enabled = false` disables LSP;
+`enabled = true` retains configured definitions and lazily reports missing or
+failing servers when used. Built-in overrides and `disabled = true` keep their
+existing precedence. No server is installed or downloaded.
+
+`/toggle` reports the existing agent's registered server count without another
+PATH lookup. A cold agent is labeled unchecked. CLI `/doctor` metadata may check
+PATH for at most 32 candidates, once each; an oversized catalogue reports a
+partial checked count. Busy TUI diagnostics list candidates without checking
+availability or starting processes. Lite/no-default builds require `--features lsp`.
+Lifecycle hooks and multimodal messages also ship in the default/full build;
+hooks remain inert without configuration, and media still requires a supporting
+provider transport/model. These features remain excluded by the unchanged lite
+archive recipe.
 
 ### TOML
 
 ```toml
 [lsp]
-enabled = true
+enabled = "auto"          # omitted also means auto; false disables, true is explicit lazy mode
 
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
@@ -3188,7 +3203,7 @@ extensions = [".my"]
 
 ```yaml
 lsp:
-  enabled: true
+  enabled: auto
   servers:
     rust:
       command: rust-analyzer

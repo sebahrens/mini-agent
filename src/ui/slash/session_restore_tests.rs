@@ -1022,6 +1022,30 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
         std::fs::read_to_string(&exported_path).unwrap(),
         "retain existing export"
     );
+    ctx.session.name = "Markdown export fixture".into();
+    for name in ["transcript.md", "uppercase.MD"] {
+        session::handle(&["/export", name], &mut ctx).await.unwrap();
+        let path = workspace.root().join(name);
+        let markdown = std::fs::read_to_string(&path).unwrap();
+        assert!(markdown.starts_with("# Markdown export fixture\n"));
+        assert!(markdown.contains("## you\n\n```text\nexported conversation\n```"));
+        std::fs::write(&path, "retain existing Markdown export").unwrap();
+        session::handle(&["/export", name], &mut ctx).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "retain existing Markdown export"
+        );
+    }
+    session::handle(&["/export", "transcript.jsonl"], &mut ctx)
+        .await
+        .unwrap();
+    let jsonl = std::fs::read_to_string(workspace.root().join("transcript.jsonl")).unwrap();
+    let imported = crate::extras::export::parse_session_file(&jsonl).unwrap();
+    let crate::extras::export::ParsedSessionFile::Jsonl(imported) = imported else {
+        panic!("expected the existing JSONL export route");
+    };
+    assert_eq!(imported.messages.len(), 1);
+    assert_eq!(imported.messages[0].content, "exported conversation");
     for prefix in ["zerostack", "mini-agent"] {
         let id = uuid::Uuid::new_v4().to_string();
         let header = json!({"type":"session", "format":"zerostack-session-jsonl", "version":1,

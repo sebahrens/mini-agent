@@ -1,6 +1,6 @@
 use crate::extras::export::{
     MAX_SESSION_IMPORT_BYTES, MAX_SESSION_IMPORT_MESSAGES, ParsedSessionFile, parse_jsonl_import,
-    parse_session_file, session_to_html, session_to_jsonl,
+    parse_session_file, session_to_html, session_to_jsonl, session_to_markdown,
 };
 use crate::session::{MessageRole, Session};
 
@@ -15,6 +15,131 @@ fn sample_session() -> Session {
     );
     session.add_tool_result_with_id("call-export", "bash", "total 0");
     session
+}
+
+fn markdown75_blocks(markdown: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, Tag, TagEnd};
+    let mut blocks = Vec::new();
+    let mut block = None;
+    for event in pulldown_cmark::Parser::new(markdown) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => block = Some(String::new()),
+            Event::Text(text) if block.is_some() => block.as_mut().unwrap().push_str(&text),
+            Event::End(TagEnd::CodeBlock) => blocks.push(block.take().unwrap()),
+            _ => {}
+        }
+    }
+    blocks
+}
+
+#[test]
+fn markdown75_preserves_transcript_order_and_structured_tool_arguments() {
+    let mut session = sample_session();
+    session.messages[2].content = "stale display projection".into();
+    let markdown = session_to_markdown(&session);
+    let headings = ["## you", "## test-model", "## tool call", "## tool result"];
+    let mut last = 0;
+    for heading in headings {
+        let position = markdown.find(heading).unwrap();
+        assert!(position > last, "{markdown}");
+        last = position;
+    }
+    let blocks = markdown75_blocks(&markdown);
+    assert_eq!(blocks.len(), 6);
+    assert_eq!(blocks[1], "hello there\n");
+    assert_eq!(blocks[2], "hi! **how** can I help?\n");
+    let call: serde_json::Value = serde_json::from_str(&blocks[3]).unwrap();
+    assert_eq!(call["name"], "bash");
+    assert_eq!(call["arguments"], serde_json::json!({"command": "ls -la"}));
+    assert_eq!(call["call_id"], "call-export");
+    assert_eq!(blocks[5], "total 0\n");
+    assert!(!markdown.contains("stale display projection"));
+
+    let private_session = compacted_session_with_provider_reasoning();
+    let markdown = session_to_markdown(&private_session);
+    assert!(markdown.contains("finished"));
+    assert!(!markdown.contains("opaque-reasoning"));
+    assert!(!markdown.contains("permission_allowlist"));
+}
+
+#[test]
+fn markdown75_nested_fences_and_authored_metadata_remain_literal() {
+    use pulldown_cmark::{Event, Options, Tag};
+    let mut session = Session::new("p", "<b>~~model~~</b>\n# extra", 1000, "");
+    session.name = "<script>~~title~~</script>\n# [link](https://example.invalid)".into();
+    let body = "````\n<script>alert(1)</script>\n```\n![image](https://example.invalid)\n";
+    session.add_message(MessageRole::User, body);
+    session.add_message(MessageRole::Assistant, body);
+    let markdown = session_to_markdown(&session);
+    let blocks = markdown75_blocks(&markdown);
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[1], body);
+    assert_eq!(blocks[2], body);
+    let mut headings = 0;
+    for event in pulldown_cmark::Parser::new_ext(&markdown, Options::ENABLE_STRIKETHROUGH) {
+        match event {
+            Event::Start(Tag::Heading { .. }) => headings += 1,
+            Event::Html(_) | Event::InlineHtml(_) => panic!("active HTML: {markdown}"),
+            Event::Start(Tag::Link { .. } | Tag::Image { .. } | Tag::Strikethrough) => {
+                panic!("authored wrapper escaped a literal body: {markdown}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(headings, 3);
+}
+
+#[test]
+fn markdown75_tool_result_clip_is_utf8_safe_and_does_not_read_artifacts() {
+    use crate::extras::export::MAX_MARKDOWN_TOOL_RESULT_BYTES;
+    let root = crate::tests::OwnedTestDirectory::new("markdown75-artifact");
+    let artifact = root.path().join("full-output.txt");
+    std::fs::write(&artifact, "PRIVATE_ARTIFACT_CONTENT").unwrap();
+    let mut session = Session::new("p", "m", 1000, "");
+    let result = format!("{}🦀TAIL", "a".repeat(MAX_MARKDOWN_TOOL_RESULT_BYTES - 1));
+    session.add_tool_result_with_id("result-id", "read", &result);
+    let message = session.messages.last_mut().unwrap();
+    message.content = "stale result projection".into();
+    if let Some(crate::session::PersistedToolMessage::Result { artifact_path, .. }) =
+        &mut message.tool
+    {
+        *artifact_path = Some(artifact.to_str().unwrap().into());
+    } else {
+        panic!("expected structured result");
+    }
+    let markdown = session_to_markdown(&session);
+    let blocks = markdown75_blocks(&markdown);
+    let metadata: serde_json::Value = serde_json::from_str(&blocks[1]).unwrap();
+    assert_eq!(metadata["call_id"], "result-id");
+    assert_eq!(metadata["artifact_path"], artifact.to_str().unwrap());
+    assert_eq!(
+        blocks[2],
+        format!("{}\n", "a".repeat(MAX_MARKDOWN_TOOL_RESULT_BYTES - 1))
+    );
+    assert!(markdown.contains("(8 tool-result bytes omitted)"));
+    assert!(!markdown.contains("PRIVATE_ARTIFACT_CONTENT"));
+    assert!(!markdown.contains("stale result projection"));
+
+    // Legacy text-only results follow the same bound and keep the short case.
+    session.messages[0].tool = None;
+    session.messages[0].content = "legacy result".into();
+    let markdown = session_to_markdown(&session);
+    assert_eq!(
+        markdown75_blocks(&markdown).last().unwrap(),
+        "legacy result\n"
+    );
+    assert!(!markdown.contains("bytes omitted"));
+}
+
+#[test]
+fn markdown75_empty_session_and_unicode_id_titles_are_safe_for_both_formats() {
+    let mut session = Session::new("p", "m", 1000, "");
+    session.id = "🦀🦀🦀🦀🦀🦀🦀🦀🦀".into();
+    let expected = format!("mini-agent session {}", "🦀".repeat(8));
+    let markdown = session_to_markdown(&session);
+    assert!(markdown.starts_with(&format!("# {expected}\n")));
+    assert_eq!(markdown75_blocks(&markdown).len(), 1);
+    assert!(session_to_html(&session).contains(&expected));
 }
 
 #[test]

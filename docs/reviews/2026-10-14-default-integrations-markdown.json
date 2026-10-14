@@ -1,0 +1,69 @@
+{
+  "base": "c4dd68557cababcb2a19c9331e9499c977858c75",
+  "changes": [
+    "44 default LSP/hooks/multimodal; bool-or-auto activation, owned metadata discovery, capped Doctor and captured toggle status",
+    "75.1 Markdown transcript export; safe literal framing, structured tool data, bounded UTF8 results and no-overwrite real slash handler",
+    "57.1 test-only measured Windows retained read/delete rights probe and exact fifth CI discovery/result guard; production replacement remains Unsupported"
+  ],
+  "sources": {
+    ".github/workflows/ci.yml": "d81a99e797af34005a26be1317c877ed1b9c69ea23b46b40a14b9f449d2163b7",
+    "CHANGELOG.md": "e9cad2da596c013c8ebe8c7dded2a263b7ecf714df85550e150081e713891fdb",
+    "Cargo.toml": "00fae6c12ef080e506b4071ab220b4872efa8ff09baca1432e8e76418ff4e50e",
+    "README.md": "ae84edd740a913a6e2a7823d56badce749a6d0212a8ea852ad5b5b65add1732a",
+    "docs/agent/COMMANDS.md": "776dfae77c863e3034176f84a4631a5891c03c693eb96eff072b775a1795e2ec",
+    "docs/agent/CONFIG.md": "82d4387d9a751865f5a1b6e54e30e7f652c3eed508430d76bf6d366517d12f36",
+    "docs/agent/GET_STARTED.md": "160197dc389ecd7baef37ea49d29058cfef93d62c540041bd7afaaa9d9bf7cbe",
+    "docs/agent/MCP_CONFIGURATION.md": "d17d66104f0891b46978f1939d7995e0faa9190edd9409ea9fc9ec4d98c8f643",
+    "scripts/check_feature_graph.py": "7f698092d9ecf8266810a0bcc4eb94018dfaffd3b502f907a5349790beeb4a0f",
+    "scripts/tests/test_check_feature_graph.py": "f31248860ef398d614f0e7d49e88b910378f65bbf05e9dbce8bff63b43fff6c7",
+    "scripts/tests/test_phase6_ci_workflow.py": "84306dbc4fb4ede85d1a9ee3fbd80794268bbd7745a724281df4faa07a62e487",
+    "src/agent/builder.rs": "ba8b1d2a8918f84601dc38baf7b69022c4043fc7e62bb433bc09ae2bba6e7834",
+    "src/config/mod.rs": "96ae5f7f9270d36c35ac3df7e5101b3c0449f6f6f46d98a33e902ee61b99c1a5",
+    "src/config/types.rs": "4cc8a46561f6c340e71cbbd7e23e9306353cf8193f1f16adde5ad81fb7aa371f",
+    "src/diagnostics.rs": "5d4bf93ae0dc430805ea4d21cb0740debd20dd967ab602e8590f4e13b01140b4",
+    "src/extras/export.rs": "94ecddeefcb7bad8d34b51f6e4ebacd1eb38fac7fa165db34931f1ec3a9e8d25",
+    "src/extras/lsp/mod.rs": "fbefa5d77911d99772805eb626b5f13cf75aee605148b81dcf8b3ef76f063258",
+    "src/extras/lsp/registry.rs": "c78dce7dc81ec3cfb1786ae96293c39ff481f40ce9eac36633f37a3a4ab0960a",
+    "src/fs/private.rs": "a7eb8ecc980af2d5c2fde0635e8b698e17a301707f4b5bce6e4e9396fcc02339",
+    "src/provider.rs": "a0e9998816a516454ca1cc1d15fcfb8a14be96959ca08587fe7c45a7b819da5a",
+    "src/tests/lsp_process_tests.rs": "52eb526d9a6a906c11cb216301d952ca852e11f09ab26c5e60d17efaa54ba9cf",
+    "src/tests/lsp_tests.rs": "ca25479db245a51032a352eaf76fa3ec46f3e70cb79ff6c463448aeb0fa344cd",
+    "src/tests/session_export_tests.rs": "69c6ae45fcec85947bb5261a3edaa0e39ee3f7130c0f337ab1c469f833c696ca",
+    "src/ui/app.rs": "28a767ea08e5957977fe552ca4686166b6d66ee8b3af018dcbac85a9d4620b30",
+    "src/ui/slash/help.rs": "fe4ce9ae37a05f0c1d0986126dba38614d442eb3208ed61151ee0a770bce1acb",
+    "src/ui/slash/session.rs": "915c075b679ba3b9a1140bcd3d2085c80b66df98029ef88b9560d351c29f5214",
+    "src/ui/slash/session_restore_tests.rs": "8ca27904986819c5ee64c3d6fea4410965f1fda67d24ca413ba434036a2d5764",
+    "src/ui/slash/settings.rs": "1427eed46993a760e1a2da6f76355943f1ab5d5c6118c7e267b31b5359bc2361"
+  },
+  "reviewed_patches": {
+    "default44": "c14a410f7937d778fab81d4ca38c56f816d53913e01219ca3bc8cf573681c405",
+    "app_factory": "0583e1cf39d9f78127ab114dd5fc15aa0d8c02d234e914fe150a5cca3eef3033",
+    "markdown75": "1ba6b988837030b6a4014a638a0b1ead83b615d4950ff20e1aa2d938e4811cf0",
+    "windows_rights": "a907a8b86a1035faa3f157f093aefab5bf2b30bd7fac518f8f11f5a7b266540f",
+    "windows_count": "718d2c2d5994f557551e07773c6b43f5703a8fb7109254bfce4c9aa9a9ae4795"
+  },
+  "root_validation": {
+    "focused_initial": "6 PASS, actual slash fixture1 FAIL because test assumed unnamed session; exact title fixture corrected",
+    "integrated": "3 PASS: changed GFM literal metadata, actual slash HTML/MD/JSONL/import/no-overwrite, physical1MiB App",
+    "data_consumers": "5 PASS: exact Windows fifth-count CI2 and feature manifest/release-lite3",
+    "lint": "strict default PASS24.40s",
+    "install": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-wave40-install PASS34.61s",
+    "native_report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-wave40-installed-ud4zidld/report.json",
+    "native_report_sha256": "68ac53c254632668b35d7917cb9753e78b6fdeb0839cbb6116cc296652ae9715",
+    "native": "actual installed1MiB, omittedLSP table, no server before tool, schemaLSP+post-write Rust-path fixture diagnostic,2 completionPOST+separateGET, toggle, quit0/server+thread retired",
+    "binary_sha256": "6c039936e0fb744c0546b28237e05ceee73ddb35ba0c174efd24f0028860fedf"
+  },
+  "reused_evidence": [
+    "default44 final owner hash-bound config6/order4/callers7/held-owner+cap3/changed callers4/headless1, strict and source-data results; overlapping results not counted as unique",
+    "final universal App factory no-default/no-MCP exact1 test PASS on matching compiledsource; older minimal2/strict excluded factory",
+    "Windows measured rights exact native1 PASS run38551277994; old four byte-identical probes retained; no new production guarantee from probe"
+  ],
+  "selection": "Code-indexer owning symbols/callers and physical data-reader confirmation; focused maps in /private/tmp/mini-agent-{default44-final-test-map,markdown75-1-design-test-map}.json. No local full suite/all feature matrix/inventory27/headless sweep.",
+  "limits": [
+    "fresh hosted CI pending after push; no closure based on old c4 CI",
+    "fake rust-analyzer fixture proves path/transport/lifecycle, not Rust grammar analysis",
+    "ACP53/generic ownership7ece and native publication46.4 remain isolated and incomplete",
+    "75 parent still requires /fork and --fork-session; Markdown leaf does not close parent",
+    "57.1 full safe replacement remains unresolved; probe demonstrates mutable ACL/link metadata"
+  ]
+}

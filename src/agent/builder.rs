@@ -905,8 +905,12 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics") {
         None
     } else {
-        cfg.resolve_lsp()
-            .map(|c| crate::extras::lsp::LspManager::new(c, workspace.clone()))
+        match cfg.resolve_lsp() {
+            Some(config) => {
+                crate::extras::lsp::LspManager::prepare(&config, workspace.clone()).await
+            }
+            None => None,
+        }
     };
 
     #[cfg(feature = "lsp")]

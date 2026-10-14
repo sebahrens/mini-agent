@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Full/default builds include LSP, lifecycle hooks, and multimodal messages. LSP
+  automatically selects available installed servers without starting or installing
+  them; explicit off and the lite archive feature recipe remain supported. `/toggle`
+  lists their captured runtime availability.
+
 ### Security
 
 - Linux and macOS sandbox launches refuse existing symlink and hardlink aliases of protected Git

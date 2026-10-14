@@ -82,6 +82,35 @@ pub fn resolve_servers(user: &HashMap<String, LspServerConfig>) -> Vec<(String, 
     servers
 }
 
+/// Metadata-only eligibility under the launcher's existing absolute-PATH rule.
+/// This never starts a server or proves its later handshake will succeed.
+pub(crate) fn available_servers(
+    user: &HashMap<String, LspServerConfig>,
+    search: Option<&std::ffi::OsStr>,
+) -> Vec<(String, LspServerConfig)> {
+    let bounded = search
+        .filter(|value| value.len() <= 32 * 1024)
+        .map(|value| {
+            std::env::split_paths(value)
+                .filter(|path| path.is_absolute())
+                .take(128)
+                .collect::<Vec<_>>()
+        })
+        .and_then(|roots| std::env::join_paths(roots).ok());
+    resolve_servers(user)
+        .into_iter()
+        .filter(|(_, server)| {
+            server.command.len() <= 4096
+                && crate::extras::executable_search::resolve_service_executable(
+                    server.command.as_str(),
+                    bounded.as_deref(),
+                    None,
+                )
+                .is_ok()
+        })
+        .collect()
+}
+
 /// First server claiming this path's extension (case-insensitive, dot
 /// included in configured extensions).
 pub fn server_for_path<'a>(

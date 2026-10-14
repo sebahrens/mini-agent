@@ -872,11 +872,15 @@ impl Config {
             .clamp(1, MAX_SHELL_TIMEOUT_SECS)
     }
 
-    /// LSP configuration, `Some` only when an `[lsp]` table exists with
-    /// `enabled = true`.
+    /// LSP policy only; executable discovery belongs to owned agent preparation.
+    /// An omitted table uses automatic discovery and explicit false stays off.
     #[cfg(feature = "lsp")]
-    pub fn resolve_lsp(&self) -> Option<&types::LspConfig> {
-        self.lsp.as_ref().filter(|l| l.enabled)
+    pub fn resolve_lsp(&self) -> Option<std::borrow::Cow<'_, types::LspConfig>> {
+        match self.lsp.as_ref() {
+            Some(config) if config.enabled == types::LspActivation::Off => None,
+            Some(config) => Some(std::borrow::Cow::Borrowed(config)),
+            None => Some(std::borrow::Cow::Owned(types::LspConfig::default())),
+        }
     }
 
     pub fn resolve_max_grep_results(&self) -> u64 {
