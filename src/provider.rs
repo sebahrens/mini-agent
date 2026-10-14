@@ -19,8 +19,11 @@ use crate::auth::{AuthResolver, ProviderKind, ResolvedCredential};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 
+#[path = "provider_azure.rs"]
+pub(crate) mod azure;
 #[path = "provider_effort.rs"]
 pub(crate) mod effort;
+
 #[cfg(test)]
 #[path = "provider_effort_tests.rs"]
 mod effort_tests;
@@ -128,7 +131,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
+            "Unknown provider: '{}'. Supported: openrouter, openai, azure, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
             name
         )
     })?;
@@ -216,6 +219,7 @@ where
     let name = match config.kind {
         ProviderKind::Anthropic => "ANTHROPIC_BASE_URL",
         ProviderKind::OpenAI => "OPENAI_BASE_URL",
+        ProviderKind::Azure => "AZURE_OPENAI_ENDPOINT",
         _ => return None,
     };
     get_env(name)
@@ -4546,6 +4550,11 @@ where
 {
     let config = resolve_provider_config(provider_name, custom_providers)?;
     let base_url = resolve_base_url_with_env(&config, &get_env);
+    let base_url = if config.kind == ProviderKind::Azure {
+        Some(azure::normalize_endpoint(base_url.as_deref())?)
+    } else {
+        base_url
+    };
 
     let resolver = AuthResolver::new(config.kind)
         .with_cli_key(api_key)
@@ -4562,12 +4571,22 @@ where
     // Bearer auth is exclusive: a configured reqwest default x-api-key must
     // not be merged back into the native SDK's bearer-only request headers.
     let bearer_custom = custom
-        .filter(|_| matches!(&credential, ResolvedCredential::Bearer(_)))
+        .filter(|_| {
+            config.kind == ProviderKind::Azure
+                || matches!(&credential, ResolvedCredential::Bearer(_))
+        })
         .map(|custom| {
             let mut custom = custom.clone();
-            custom
-                .headers
-                .retain(|name, _| !name.eq_ignore_ascii_case("x-api-key"));
+            custom.headers.retain(|name, _| {
+                if config.kind == ProviderKind::Azure {
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "authorization" | "api-key" | "x-api-key"
+                    )
+                } else {
+                    !name.eq_ignore_ascii_case("x-api-key")
+                }
+            });
             custom
         });
     let http_custom = bearer_custom.as_ref().or(custom);
@@ -4578,6 +4597,12 @@ where
         base_url.as_deref(),
     )?;
     match config.kind {
+        ProviderKind::Azure => azure::build_client(
+            credential,
+            base_url.as_deref().expect("Azure endpoint validated"),
+            custom,
+            http_client,
+        ),
         ProviderKind::OpenAI => Ok(AnyClient::OpenAI(build_openai_client(
             key,
             base_url.as_deref(),

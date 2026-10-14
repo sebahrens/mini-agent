@@ -156,13 +156,21 @@ struct Ctx {
 }
 
 fn builtin_provider_names() -> &'static [&'static str] {
-    &["openrouter", "openai", "anthropic", "gemini", "ollama"]
+    &[
+        "openrouter",
+        "openai",
+        "azure",
+        "anthropic",
+        "gemini",
+        "ollama",
+    ]
 }
 
 fn provider_env_var(name: &str) -> &'static str {
     match name {
         "openrouter" => "OPENROUTER_API_KEY",
         "openai" => "OPENAI_API_KEY",
+        "azure" => "AZURE_OPENAI_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "gemini" => "GEMINI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
@@ -195,13 +203,17 @@ fn collect_models(cfg: &Config) -> Vec<(String, QuickModelConfig)> {
     models
 }
 
-fn has_env(env_name: &str) -> bool {
-    if env_name.is_empty() {
-        return false;
-    }
-    std::env::var(env_name)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+fn provider_credential_source(cfg: &Config, name: &str) -> Option<crate::auth::CredentialSource> {
+    let empty = HashMap::new();
+    let providers = cfg.custom_providers.as_ref().unwrap_or(&empty);
+    let provider = crate::provider::resolve_provider_config(name, providers).ok()?;
+    crate::auth::AuthResolver::new(provider.kind)
+        .with_env_override(provider.api_key_env.as_deref())
+        .with_config_keys(cfg.api_keys.as_ref())
+        .with_custom_provider_name(Some(name))
+        .with_credential_isolation(provider.credential_isolation)
+        .credential_source_with_env(|name| std::env::var(name))
+        .ok()
 }
 
 fn masked_key(key: &str) -> String {
@@ -380,17 +392,10 @@ fn render_manage_providers(ctx: &Ctx, selected: usize, confirm_delete: bool) -> 
             } else {
                 "[unknown]".to_string()
             };
-            let env = provider_env_var(name);
-            let cfg_key = ctx
-                .cfg
-                .api_keys
-                .as_ref()
-                .and_then(|k| k.get(name))
-                .filter(|v| !v.is_empty());
-            let key_str = if cfg_key.is_some() || has_env(env) {
-                "key: set"
-            } else {
-                "key: not set"
+            let key_str = match provider_credential_source(&ctx.cfg, name) {
+                Some(crate::auth::CredentialSource::NotRequired) => "key: not required",
+                Some(_) => "key: set",
+                None => "key: not set",
             };
             write_line(
                 row,
@@ -1741,6 +1746,39 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn azure81_setup_source_uses_typed_auth_and_custom_isolation() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[
+            ("AZURE_OPENAI_API_KEY", None),
+            (
+                "AZURE_OPENAI_AD_TOKEN",
+                Some("OWNED_AZURE_SETUP_TOKEN".into()),
+            ),
+            ("OWN_GATEWAY_KEY", None),
+        ]);
+        assert_eq!(
+            provider_credential_source(&Config::default(), "azure"),
+            Some(crate::auth::CredentialSource::Environment(
+                "AZURE_OPENAI_AD_TOKEN".into()
+            ))
+        );
+        let cfg: Config = serde_json::from_value(serde_json::json!({"custom_providers":{"azure":{"provider_type":"azure","base_url":"https://gateway.example/openai/v1"}}})).unwrap();
+        assert_eq!(provider_credential_source(&cfg, "azure"), None);
+        let mut cfg = cfg;
+        cfg.custom_providers
+            .as_mut()
+            .unwrap()
+            .get_mut("azure")
+            .unwrap()
+            .inherit_builtin_key = true;
+        assert_eq!(
+            provider_credential_source(&cfg, "azure"),
+            Some(crate::auth::CredentialSource::Environment(
+                "AZURE_OPENAI_AD_TOKEN".into()
+            ))
+        );
+        assert!(cfg.api_keys.is_none());
+    }
 
     fn wizard(cfg: Config) -> Ctx {
         Ctx {

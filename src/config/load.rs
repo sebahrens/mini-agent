@@ -110,6 +110,10 @@ fn provider_uses_responses_api(cfg: &Config, provider: &str) -> bool {
     let Ok(resolved) = crate::provider::resolve_provider_config(provider, &customs) else {
         return false;
     };
+    if resolved.kind == crate::auth::ProviderKind::Azure {
+        return crate::provider::azure::api_style(customs.get(provider))
+            == crate::config::ApiStyle::Responses;
+    }
     if resolved.kind != crate::auth::ProviderKind::OpenAI {
         return false;
     }
