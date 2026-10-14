@@ -1177,9 +1177,9 @@ validate role and exact text projection; JSONL import remains tolerant of legacy
 rows without token estimates. `print::persist_headless_turn_input` projects the
 actual canonical delta, including intermediate empty Assistant boundaries and
 non-initial User messages. The shared bounded encoder validates typed rows before
-creating directories or claiming a writer. These prerequisites do not enable ACP
-list/load/media handlers or import approvals, instruction receipts or replay
-authority.
+creating directories or claiming a writer. ACP list/load/media handlers use those
+shared validators; importing data never imports approvals, instruction receipts or
+replay authority.
 
 
 ### Installed Windows preflight helper observation
@@ -1273,3 +1273,97 @@ surface and grants no additional tool permission.
 patched SDK's `RequestPatch::append_input` adds ordinary text to the real run
 state before request preparation; unlike `RequestPatch::history`, it is durable
 canonical input rather than a one-request history replacement.
+`session::user` stores ordered canonical text/image content directly in a User
+row. Text-only legacy rows keep their existing serialization. Typed rows cannot
+carry tool identities or mutations, and their text projection must match the
+row. Importing media never reads a path, follows a URI, or installs a grant.
+Images use strict base64 and a closed PNG/JPEG/GIF/WebP MIME set; they are not
+locally decompressed. Independent limits bound block/image counts, text,
+individual and aggregate decoded image bytes, and total encoded prompt bytes.
+Shared bounded Session decode and save validate these rows before use.
+
+`agent::input::PromptInput` separates the literal text used by host prompt gates
+from the exact initial typed User message. Retries reuse that same message;
+continuations retain it in history. Existing String entrypoints remain text-only
+wrappers. A prompt hook that rewrites typed media text is declined visibly
+instead of flattening images or changing their order.
+
+`extras::acp::sessions` exposes bounded, read-only saved-session metadata without
+creating or repairing storage. It uses the shared private catalogue predicate
+and an explicitly owned blocking task. List cursors are bounded offsets, never
+paths. At most 100 retained catalogue rows are paged in batches of 20; truncation
+and skipped-entry counts are reported as metadata rather than claiming a full
+scan. Stored workspace labels are returned as data and are never resolved.
+
+
+### Canonical ACP session input and local commands
+
+`session/user.rs` validates ordered inline text/image data. It caps blocks (128),
+images (8), each decoded image (2 MiB), aggregate decoded images (4 MiB), text
+(1 MiB), and the actual encoded JSON payload (6 MiB) independently. Whole session
+storage remains capped at 8 MiB; combining individually valid maxima does not
+promise that a session fits. Image MIME types are PNG, JPEG, GIF and WebP. URI
+and annotation fields do not open files or fetch resources. Images remain data
+on import, with the canonical role and literal text projection checked before
+save or dispatch. A build without `multimodal` refuses image-bearing input or
+loaded live history visibly; it never flattens or silently discards it. Known
+transport support is checked without guessing a model's capabilities from its
+name. Provider errors remain authoritative for unknown model capabilities.
+
+`agent/input.rs` separates the exact initial typed User message from the literal
+text host hooks use. Interrupted retry and continuation retain that typed
+message. A hook that changes an ordered input's literal projection is refused
+rather than flattening media. The canonical session feed, including ordered
+payloads, participates in native replay consistency hashing.
+
+`extras/acp/sessions.rs` lists bounded metadata and loads exact saved sessions
+through retained private readers without creating or repairing import storage.
+The requested workspace must match; stored workspace labels never select a
+filesystem root. Loaded sessions receive fresh runtime grants, read tracking,
+MCP and skill owners. Saved goals retain objective/progress data but rebuild
+check, judge and context-file authority from current configuration. Checkpoints
+run on owned blocking jobs after model, effect, accounting and MCP retirement;
+the generation remains occupied through publication. Writer claim/publication
+errors are visible and retain observed progress in memory. An unwritable older
+disk checkpoint cannot be updated with an in-memory refusal; no cross-process
+failed-save fence is claimed here.
+
+`extras/acp/commands.rs` recognizes only one original Text block as a local
+command. `/rename` and `/undo` change the canonical session without launching a
+model. Undo removes conversation context, not filesystem effects or billed
+usage. `/compact` summarizes completed context and records actual compaction
+bounds; image pixels are explicitly absent from textual summaries. `/goal` is
+available only with the goal feature. Rendered resource text, images and model
+output never become local-command authority.
+
+
+The editor's `protocolSession.ts` uses public ACP requests and exact session-ID
+notification routing for both new and loaded conversations. Replay buffering
+has independent count and encoded-byte bounds. User cancellation sends
+`session/cancel` while continuing to await the server's terminal response;
+close waits for that ownership boundary before releasing routing. A timed-out
+peer cannot become a successfully switched conversation. The existing process
+owner may then terminate the child; forced termination is not a writer-join
+claim. `Mini Agent: Resume Saved Session` lists the current trusted workspace
+and explicitly selects one saved ID. A busy prompt blocks switching, and no
+saved permission grant or private SDK constructor is adopted.
+
+The focused offline editor-host gate is
+`npm run test:integration -- <candidate.vsix> <target> resume`. It uses the
+existing private VSIX profile and scripted loopback provider, drives the real
+saved-session picker after a process restart, and verifies public load/update
+routing, the same saved ID, original history in the second wire request and
+once-only cumulative usage. `tests/acp_session_parity.rs` separately exercises
+actual stdio ordered image retry/save/load, imported grant removal and feature-off
+refusal at the existing physical 1 MiB process stack budget on Unix.
+
+ACP native turns use the same retained publication barrier, exact typed-model binding,
+actor pairing, canonical ordered-input commit and owned retirement as the main
+frontends, while all output remains ACP JSON-RPC/session updates. The barrier precedes
+SessionStart, MCP and agent preparation. Native-bearing `/undo`, `/compact` and
+`/rename` are visibly refused without changing saved bytes; native automatic compaction
+also refuses before HTTP. Generic ACP sessions retain these local commands. Opaque
+thinking/signatures remain persisted protocol data and are never editor replay text.
+The focused native stdio fixture proves same-process/restart prefix retention and
+closed refusal using inert signatures; it does not assert live-provider signature
+acceptance.

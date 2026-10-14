@@ -1,9 +1,12 @@
 mod accept;
+mod commands;
 pub mod config;
 mod idle;
+mod policy;
+mod sessions;
 mod tls;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -46,25 +49,30 @@ const MAX_ACP_SESSIONS: usize = 64;
 #[cfg(feature = "mcp")]
 const MAX_ACP_CLIENT_MCP_SERVERS: usize = 8;
 
-struct CommittedTurn {
-    messages: Vec<Message>,
-    serialized_bytes: usize,
-}
-
-#[derive(Default)]
 struct SessionHistory {
     #[cfg(feature = "hooks")]
     hooks_started: bool,
+    // One canonical durable graph. Runtime grants/leases are separate and are
+    // never restored from this data owner.
+    session: crate::session::Session,
+    _lease: Option<Arc<SessionLease>>,
+    policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
-    turns: VecDeque<CommittedTurn>,
-    serialized_bytes: usize,
-    summary: Option<String>,
-    /// [`crate::session::compaction_ref`] of the summarizer text behind
-    /// `summary`, so a daily-memory copy of the recap this history already
-    /// replays is left out of the turn's memory block (mini-agent-p9oyv).
-    /// `None` for the emergency recap, which is never written to memory.
-    #[cfg(feature = "memory")]
-    summary_ref: Option<String>,
+    manual_compact: bool,
+}
+
+impl Default for SessionHistory {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "hooks")]
+            hooks_started: false,
+            session: crate::session::Session::new("", "", 32_000, ""),
+            _lease: None,
+            policy: Default::default(),
+            pending_question: None,
+            manual_compact: false,
+        }
+    }
 }
 
 impl SessionHistory {
@@ -74,106 +82,90 @@ impl SessionHistory {
     fn snapshot(&self) -> Vec<Message> {
         self.snapshot_with_tool_result_retention(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS)
     }
-
     fn snapshot_with_tool_result_retention(&self, keep_recent: usize) -> Vec<Message> {
-        let mut messages = self
-            .turns
-            .iter()
-            .flat_map(|turn| turn.messages.iter().cloned())
-            .collect::<Vec<_>>();
-        if let Some(summary) = self.summary.as_ref() {
-            messages.insert(
-                0,
-                Message::assistant(format!("[Recap of earlier ACP turns]\n{summary}")),
-            );
-        }
-        let result_count = messages
-            .iter()
-            .map(|message| match message {
-                Message::User { content } => content
-                    .iter()
-                    .filter(|item| matches!(item, rig::message::UserContent::ToolResult(_)))
-                    .count(),
-                Message::Assistant { .. } | Message::System { .. } => 0,
+        crate::agent::runner::convert_canonical_history_with_tool_result_retention(
+            &self.session,
+            keep_recent,
+        )
+    }
+    #[cfg(test)]
+    fn commit_completed_turn(&mut self, prompt: &str, interactions: Vec<Message>) {
+        let response = interactions
+            .last()
+            .and_then(|message| match message {
+                Message::Assistant { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|item| match item {
+                            rig::message::AssistantContent::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
             })
-            .sum::<usize>();
-        let mut remaining_to_clear = result_count.saturating_sub(keep_recent);
-        for message in &mut messages {
-            let Message::User { content } = message else {
-                continue;
-            };
-            for item in content.iter_mut() {
-                if remaining_to_clear == 0 {
-                    break;
+            .unwrap_or_default();
+        crate::print::persist_headless_turn(&mut self.session, prompt, &response, &interactions);
+    }
+    fn live_start(&self) -> usize {
+        self.session.compacted_context().1
+    }
+    fn user_starts(&self) -> Vec<usize> {
+        self.session
+            .messages
+            .iter()
+            .enumerate()
+            .skip(self.live_start())
+            .filter_map(|(index, message)| {
+                (message.role == crate::session::MessageRole::User).then_some(index)
+            })
+            .collect()
+    }
+    fn live_bytes(&self) -> usize {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                if self.0 > MAX_ACP_HISTORY_BYTES {
+                    return Err(std::io::Error::other("ACP live history byte bound"));
                 }
-                let rig::message::UserContent::ToolResult(result) = item else {
-                    continue;
-                };
-                result.content = rig::OneOrMany::one(rig::message::ToolResultContent::text(
-                    crate::session::CLEARED_TOOL_RESULT_NOTICE,
-                ));
-                remaining_to_clear -= 1;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
-        messages
+        let mut count = Count(0);
+        let _ = serde_json::to_writer(&mut count, &self.session.messages[self.live_start()..]);
+        count.0
     }
-
     #[cfg(feature = "hooks")]
     fn record_hook_context(&mut self, notices: Vec<String>) {
-        if notices.is_empty() {
-            return;
+        for notice in notices {
+            self.session
+                .add_message(crate::session::MessageRole::System, &notice);
         }
-        let messages = notices
-            .into_iter()
-            .map(Message::assistant)
-            .collect::<Vec<_>>();
-        let serialized_bytes = serde_json::to_vec(&messages)
-            .map_or(MAX_ACP_HISTORY_BYTES.saturating_add(1), |bytes| bytes.len());
-        self.serialized_bytes = self.serialized_bytes.saturating_add(serialized_bytes);
-        self.turns.push_back(CommittedTurn {
-            messages,
-            serialized_bytes,
-        });
-    }
-
-    fn commit_completed_turn(&mut self, prompt: &str, interactions: Vec<Message>) {
-        let mut messages = Vec::with_capacity(interactions.len() + 1);
-        let notices = interactions
-            .iter()
-            .take_while(|message| matches!(message, Message::System { .. }))
-            .count();
-        messages.extend(interactions[..notices].iter().map(|message| match message {
-            Message::System { content } => Message::assistant(content.clone()),
-            _ => unreachable!(),
-        }));
-        messages.push(Message::user(prompt));
-        messages.extend(interactions.into_iter().skip(notices));
-
-        // Rig messages are serializable. Treat an unexpected serialization failure
-        // as oversized so history remains bounded instead of retaining it forever.
-        let serialized_bytes = serde_json::to_vec(&messages)
-            .map(|encoded| encoded.len())
-            .unwrap_or(MAX_ACP_HISTORY_BYTES.saturating_add(1));
-        self.serialized_bytes = self.serialized_bytes.saturating_add(serialized_bytes);
-        self.turns.push_back(CommittedTurn {
-            messages,
-            serialized_bytes,
-        });
     }
 
     fn needs_compaction(&self) -> bool {
-        self.turns.len() > MAX_ACP_HISTORY_TURNS
-            || self
-                .serialized_bytes
-                .saturating_add(self.summary.as_ref().map_or(0, String::len))
-                > MAX_ACP_HISTORY_BYTES
+        (self.manual_compact && self.live_start() < self.session.messages.len())
+            || self.user_starts().len() > MAX_ACP_HISTORY_TURNS
+            || self.live_bytes() > MAX_ACP_HISTORY_BYTES
     }
-
-    /// Reduce history to its retention bounds, carrying successful summaries
-    /// between passes. Cancellation drops the pending summary and returns None;
-    /// only completed passes may have changed history at that point. Otherwise
-    /// returns the summed summarizer usage of every successful pass, which the
-    /// turn's goal round counts as its own spend (mini-agent-i6q98).
+    fn next_cut(&self) -> usize {
+        if self.manual_compact {
+            return self.session.messages.len();
+        }
+        let starts = self.user_starts();
+        if starts.is_empty() {
+            return self.session.messages.len();
+        }
+        let excess = starts.len().saturating_sub(MAX_ACP_HISTORY_TURNS).max(1);
+        starts
+            .get(excess)
+            .copied()
+            .unwrap_or(self.session.messages.len())
+    }
     async fn compact_with<F, Fut>(
         &mut self,
         control: &TurnControl,
@@ -184,136 +176,109 @@ impl SessionHistory {
         F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
         Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
     {
-        const SUMMARY_ALLOWANCE: usize = 16 * 1024;
-        if control.is_cancelled() {
-            return None;
-        }
         let mut usage = crate::event::UsageDelta::default();
-
-        // A provider may summarize only a leading prefix within its request
-        // budget. Each successful pass removes at least one complete turn;
-        // zero progress and failures take the bounded emergency path instead.
+        #[cfg(feature = "goal")]
+        if let Some(goal) = goal_store {
+            self.session.goal_store = goal.clone();
+        }
         while self.needs_compaction() {
-            let mut selected_turns = 0usize;
-            let mut selected_bytes = 0usize;
-            while selected_turns < self.turns.len()
-                && (self.turns.len().saturating_sub(selected_turns) > MAX_ACP_HISTORY_TURNS
-                    || self
-                        .serialized_bytes
-                        .saturating_sub(selected_bytes)
-                        .saturating_add(SUMMARY_ALLOWANCE)
-                        > MAX_ACP_HISTORY_BYTES)
-            {
-                selected_bytes =
-                    selected_bytes.saturating_add(self.turns[selected_turns].serialized_bytes);
-                selected_turns += 1;
+            if control.is_cancelled() {
+                return None;
             }
-
-            let mut cumulative_messages = Vec::with_capacity(selected_turns);
-            let mut serialized = Vec::new();
-            for turn in self.turns.iter().take(selected_turns) {
-                for message in &turn.messages {
-                    let content = serde_json::to_string(message)
-                        .unwrap_or_else(|_| "[unserializable ACP message]".to_string());
-                    let role = match message {
-                        Message::User { .. } => crate::session::MessageRole::User,
-                        Message::Assistant { .. } => crate::session::MessageRole::Assistant,
-                        Message::System { .. } => crate::session::MessageRole::System,
-                    };
-                    serialized.push(crate::session::SessionMessage {
-                        recorded_diff: None,
-                        user: None,
-                        role,
-                        estimated_tokens: crate::session::Session::estimate_tokens(&content),
-                        content: content.into(),
-                        tool_call_id: None,
-                        tool: None,
-                    });
+            let cut = self.next_cut();
+            let previous = self.session.compacted_context().0.map(str::to_owned);
+            let mut messages = self.session.messages[self.live_start()..cut].to_vec();
+            // Text summaries can retain the fact an image was supplied, never
+            // infer pixels or turn the opaque base64 into instruction text.
+            for message in &mut messages {
+                if let Some(user) = &message.user {
+                    let image_count = user
+                        .blocks()
+                        .iter()
+                        .filter(|block| {
+                            matches!(block, crate::session::user::UserBlock::Image { .. })
+                        })
+                        .count();
+                    if image_count > 0 {
+                        message.content = format!("{}\n[{} image attachments supplied; pixels not represented in this text summary]", message.content, image_count).into();
+                        message.user = None;
+                    }
                 }
-                cumulative_messages.push(serialized.len());
             }
-
-            let summarized = tokio::select! {
+            let result = tokio::select! {
                 biased;
                 _ = control.cancelled() => return None,
-                result = summarize(serialized, self.summary.clone()) => result,
+                result = summarize(messages, previous) => result,
             };
-            let crate::provider::CompactionOutput {
-                summary,
-                messages_included,
-                usage: pass_usage,
-                ..
-            } = match summarized {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!(%error, "ACP history summarization failed; evicting oldest complete turns");
+            let output = match result {
+                Ok(output) if output.messages_included > 0 => output,
+                _ => {
                     self.emergency_compact();
                     return Some(usage);
                 }
             };
-            usage = usage.saturating_add(pass_usage);
-            let turns_included = cumulative_messages
-                .iter()
-                .take_while(|count| **count <= messages_included)
-                .count();
-            if turns_included == 0 {
-                tracing::warn!(
-                    "ACP history summary did not cover a complete turn; evicting oldest complete turns"
+            if let Some(run) = crate::spend::run::Run::current() {
+                self.session.charge_usage_delta_at(
+                    output.usage,
+                    run.prices.anthropic_native,
+                    run.prices.input.unwrap_or(0.0),
+                    run.prices.output.unwrap_or(0.0),
+                    crate::pricing::CachePrices {
+                        read: run.prices.cache_read,
+                        write: run.prices.cache_write,
+                        write_1h: run.prices.cache_write_1h,
+                        split_required: run.prices.cache_split_required,
+                    },
                 );
+            }
+            usage = usage.saturating_add(output.usage);
+            let consumed = self
+                .live_start()
+                .saturating_add(output.messages_included)
+                .min(cut);
+            // A partial summarizer prefix must finish a complete User-started
+            // interval; otherwise take the explicit bounded emergency recap.
+            let completed_cut = self
+                .user_starts()
+                .into_iter()
+                .filter(|start| *start > self.live_start() && *start <= consumed)
+                .max()
+                .or_else(|| (consumed == self.session.messages.len()).then_some(consumed));
+            let Some(completed_cut) = completed_cut else {
                 self.emergency_compact();
                 return Some(usage);
-            }
-            for _ in 0..turns_included {
-                if let Some(turn) = self.turns.pop_front() {
-                    self.serialized_bytes =
-                        self.serialized_bytes.saturating_sub(turn.serialized_bytes);
-                }
-            }
-            #[cfg(feature = "memory")]
-            {
-                self.summary_ref = Some(crate::session::compaction_ref(&summary));
-            }
-            // A summarizer may drop anything in the turns it replaces, so the
-            // objective is restated from the record rather than hoped for.
-            #[cfg(feature = "goal")]
-            let summary =
-                match goal_store.and_then(crate::extras::goal::GoalStore::critical_context) {
-                    Some(goal_context) => format!("{summary}\n\n{goal_context}"),
-                    None => summary,
-                };
-            self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
+            };
+            self.session.compress(output.summary, completed_cut, 0);
+            self.manual_compact = false;
         }
         Some(usage)
     }
-
-    /// The reference of the recap this history replays, which the turn's
-    /// memory block must not repeat.
     #[cfg(feature = "memory")]
     fn active_compaction_ref(&self) -> Option<String> {
-        self.summary.as_ref()?;
-        self.summary_ref.clone()
+        self.session.active_compaction_ref().map(str::to_owned)
     }
-
     fn emergency_compact(&mut self) {
-        self.summary = Some(Self::EMERGENCY_RECAP.to_string());
-        #[cfg(feature = "memory")]
-        {
-            self.summary_ref = None;
-        }
+        self.manual_compact = false;
         while self.needs_compaction() {
-            let Some(turn) = self.turns.pop_front() else {
+            let cut = self.next_cut();
+            if cut == 0 {
                 break;
-            };
-            self.serialized_bytes = self.serialized_bytes.saturating_sub(turn.serialized_bytes);
+            }
+            self.session
+                .compress(Self::EMERGENCY_RECAP.to_owned(), cut, 0);
         }
     }
 }
 
 fn acp_capabilities() -> AgentCapabilities {
-    // Session history is intentionally process-local; session/load is unsupported.
-    AgentCapabilities::new().session_capabilities(
-        SessionCapabilities::new().close(Some(SessionCloseCapabilities::new())),
-    )
+    AgentCapabilities::new()
+        .prompt_capabilities(PromptCapabilities::new().image(cfg!(feature = "multimodal")))
+        .load_session(true)
+        .session_capabilities(
+            SessionCapabilities::new()
+                .list(Some(SessionListCapabilities::new()))
+                .close(Some(SessionCloseCapabilities::new())),
+        )
 }
 
 fn acp_protocol_version() -> ProtocolVersion {
@@ -627,7 +592,60 @@ fn acp_hook_root_claims() -> Option<Arc<HookRootClaims>> {
     None
 }
 
+#[derive(Default)]
+struct SessionLeases {
+    ids: StdMutex<HashSet<SessionId>>,
+    #[cfg(test)]
+    storage_scope_for_test: StdMutex<Option<Arc<crate::agent::runner::AgentWorkScope>>>,
+}
+
+struct SessionLease {
+    id: SessionId,
+    owner: Arc<SessionLeases>,
+    writer: std::sync::atomic::AtomicBool,
+}
+
+impl SessionLeases {
+    fn reserve(
+        self: &Arc<Self>,
+        id: SessionId,
+    ) -> Result<Arc<SessionLease>, agent_client_protocol::Error> {
+        crate::paths::validate_portable_component(&id.to_string()).map_err(|_| {
+            agent_client_protocol::Error::new(-32602, "invalid ACP session identity")
+        })?;
+        let mut ids = lock_unpoisoned(&self.ids);
+        if ids.contains(&id) {
+            return Err(agent_client_protocol::Error::new(
+                -32000,
+                "ACP session identity is already owned",
+            ));
+        }
+        if ids.len() >= MAX_ACP_SESSIONS {
+            return Err(agent_client_protocol::Error::new(
+                -32000,
+                "ACP session capacity is full",
+            ));
+        }
+        ids.insert(id.clone());
+        Ok(Arc::new(SessionLease {
+            id,
+            owner: self.clone(),
+            writer: Default::default(),
+        }))
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if self.writer.load(Ordering::Acquire) {
+            crate::session::lock::release_session(&self.id.to_string());
+        }
+        lock_unpoisoned(&self.owner.ids).remove(&self.id);
+    }
+}
+
 struct AcpState {
+    leases: Arc<SessionLeases>,
     idle: Arc<idle::Idle>,
     cli: Cli,
     cfg: Config,
@@ -1074,6 +1092,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
         cli,
         cfg,
         context,
+        leases: Arc::default(),
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
@@ -1136,9 +1155,39 @@ async fn connect_agent(
         .on_receive_request(
             {
                 let state = state.clone();
+                move |req: ListSessionsRequest, responder, _cx| {
+                    let state = state.clone();
+                    async move { sessions::handle_list(req, responder, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                move |req: LoadSessionRequest, responder, cx| {
+                    let state = state.clone();
+                    async move { sessions::handle_load(req, responder, cx, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
                 move |req: NewSessionRequest, responder, cx| {
                     let state = state.clone();
                     async move { handle_new_session(req, responder, cx, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                move |req: SetSessionModeRequest, responder, cx| {
+                    let state = state.clone();
+                    async move { handle_set_session_mode(req, responder, cx, &state).await }
                 }
             },
             on_receive_request!(),
@@ -1278,45 +1327,72 @@ async fn handle_initialize(
 async fn handle_new_session(
     req: NewSessionRequest,
     responder: Responder<NewSessionResponse>,
-    _cx: ConnectionTo<Client>,
+    cx: ConnectionTo<Client>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
+    if !req.additional_directories.is_empty() {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            "additional ACP workspace directories are not supported",
+        ));
+    }
+
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
     #[cfg(feature = "mcp")]
     let client_mcp_servers = client_mcp_servers(state, &req.mcp_servers)?;
     #[cfg(not(feature = "mcp"))]
     client_mcp_servers(state, &req.mcp_servers)?;
-    let workspace_root = workspace.root();
-    let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-
-    tracing::info!(
-        "ACP new session: {} (cwd: {})",
-        session_id,
-        workspace_root.display()
+    let lease = state.leases.reserve(session_id.clone())?;
+    let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
+    let canonical = crate::session::Session::new(
+        &provider,
+        &model,
+        state.cfg.resolve_context_window(
+            &provider,
+            &model,
+            &crate::config::quick_models_map(&state.cfg),
+        ),
+        "",
     );
+    let modes = install_session(
+        state,
+        session_id.clone(),
+        workspace,
+        canonical,
+        lease,
+        #[cfg(feature = "mcp")]
+        client_mcp_servers,
+    )
+    .await?;
 
+    commands::announce(&session_id, &cx)?;
+    let resp = NewSessionResponse::new(session_id).modes(modes);
+    responder.respond(resp)
+}
+
+/// Install one canonical data owner with entirely fresh runtime authority.
+async fn install_session(
+    state: &AcpState,
+    session_id: SessionId,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    mut canonical: crate::session::Session,
+    lease: Arc<SessionLease>,
+    #[cfg(feature = "mcp")] client_mcp_servers: ClientMcpServers,
+) -> Result<Option<SessionModeState>, agent_client_protocol::Error> {
+    let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let context = state
         .context
         .for_workspace_binding(state.cli.resolve_no_context_files(&state.cfg), &workspace);
-    workspace.validate().map_err(|error| {
+    workspace.validate().map_err(|_| {
         agent_client_protocol::Error::new(
             -32602,
-            format!("ACP session cwd changed while loading context: {error}"),
+            "ACP workspace changed during context preparation",
         )
     })?;
-
-    let mut sessions = state.sessions.lock().await;
-    if sessions.len() >= MAX_ACP_SESSIONS {
-        return Err(agent_client_protocol::Error::new(
-            -32000,
-            "ACP session capacity is full",
-        ));
-    }
-
     let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
-    let spend = crate::spend::run::Run::for_new_session(
+    let initial_spend = crate::spend::run::Run::for_new_session(
         &session_id.to_string(),
         &provider,
         &model,
@@ -1324,36 +1400,144 @@ async fn handle_new_session(
         Some(state.cli.resolve_model(&state.cfg).as_str()),
     )
     .map_err(|_| agent_client_protocol::Error::new(-32602, "invalid USD budget configuration"))?;
+    canonical.id = session_id.to_string().into();
+    canonical.working_dir = workspace.root().to_string_lossy().into_owned().into();
+    canonical.provider = provider;
+    canonical.model = model;
+    canonical.input_token_cost = initial_spend.prices.input.unwrap_or(0.0);
+    canonical.output_token_cost = initial_spend.prices.output.unwrap_or(0.0);
+    canonical.input_output_prices_known =
+        Some(initial_spend.prices.input.is_some() && initial_spend.prices.output.is_some());
+    canonical.set_cache_prices(crate::pricing::CachePrices {
+        read: initial_spend.prices.cache_read,
+        write: initial_spend.prices.cache_write,
+        write_1h: initial_spend.prices.cache_write_1h,
+        split_required: initial_spend.prices.cache_split_required,
+    });
+    #[cfg(feature = "goal")]
+    if let Some(saved) = canonical.goal_store.snapshot() {
+        // Goal commands, judge endpoint and file-context authority come only
+        // from this installation, never from an imported session record.
+        let mut restored = crate::extras::goal::Goal::configured(
+            saved.objective.clone(),
+            saved.criteria.clone(),
+            crate::extras::goal::GoalDefaults {
+                cfg: &state.cfg,
+                provider: &canonical.provider,
+                model: &canonical.model,
+            },
+        )
+        .map_err(|_| agent_client_protocol::Error::new(-32602, "saved ACP goal is invalid"))?;
+        restored.id = saved.id;
+        restored.status = saved.status;
+        restored.paused_reason = saved.paused_reason;
+        restored.progress = saved.progress;
+        restored.reports = saved.reports;
+        restored.history = saved.history;
+        restored.created_at = saved.created_at;
+        restored.updated_at = saved.updated_at;
+        // A stored verdict remains display data, not a newly verified verdict.
+        restored.last_verdict = None;
+        canonical.goal_store = Default::default();
+        canonical.goal_store.set(restored, true).map_err(|_| {
+            agent_client_protocol::Error::new(-32602, "saved ACP goal could not be restored")
+        })?;
+    }
+    // Imported totals seed the same account; existing uncertainty stays conservative.
+    let spend = crate::spend::run::Run::for_session(
+        &mut canonical,
+        &state.cfg,
+        crate::spend::RequestKind::Turn,
+    );
+    canonical.permission_allowlist.clear();
+    canonical.rewind_undo = None;
+    if !state.cli.no_session {
+        claim_writer(lease.clone()).await?;
+    }
+    let authority =
+        crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg)
+            .map_err(|_| agent_client_protocol::Error::new(-32602, "invalid execution authority"))?
+            .0;
+    let policy = policy::SessionPolicy::new(
+        authority.mode,
+        authority.tools_enabled && authority.permission_checks_enabled,
+    );
+    let modes = policy.modes();
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
+    let pending_question = canonical.pending_question.clone();
+    let read_tracker = canonical.read_tracker.clone();
+    let todo_store = canonical.todos.clone();
+    #[cfg(feature = "goal")]
+    let goal_store = canonical.goal_store.clone();
+    let mut sessions = state.sessions.lock().await;
     sessions.insert(
         session_id.clone(),
         SessionState {
             spend,
-            history: Arc::new(Mutex::new(SessionHistory::default())),
+            history: Arc::new(Mutex::new(SessionHistory {
+                #[cfg(feature = "hooks")]
+                hooks_started: false,
+                session: canonical,
+                _lease: Some(lease),
+                policy,
+                pending_question,
+                manual_compact: false,
+            })),
             workspace,
             context: Arc::new(context),
             turns: turns.clone(),
-            read_tracker: crate::agent::tools::ReadTracker::new(
-                state.cfg.deny_repeated_reads.unwrap_or(true),
-            ),
-            todo_store: crate::agent::tools::TodoStore::default(),
+            read_tracker,
+            todo_store,
             #[cfg(feature = "goal")]
-            goal_store: crate::extras::goal::GoalStore::default(),
+            goal_store,
             sandbox,
             #[cfg(feature = "js")]
-            js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
+            js_session_state: Default::default(),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
             client_mcp_servers: Arc::new(client_mcp_servers),
         },
     );
-    lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
+    lock_unpoisoned(&state.cancel_routes).insert(session_id, turns);
     state.idle.sessions_changed(sessions.len());
-    drop(sessions);
+    Ok(modes)
+}
 
-    let resp = NewSessionResponse::new(session_id);
-    responder.respond(resp)
+async fn claim_writer(lease: Arc<SessionLease>) -> Result<(), agent_client_protocol::Error> {
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    #[cfg(test)]
+    let scope = lock_unpoisoned(&lease.owner.storage_scope_for_test)
+        .clone()
+        .unwrap_or(scope);
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let result = scope
+        .run(async move {
+            crate::agent::runner::spawn_blocking_scoped(move || {
+                anyhow::ensure!(
+                    !crate::paths::artifact_disabled("sessions"),
+                    "session persistence is disabled"
+                );
+                anyhow::ensure!(
+                    crate::session::lock::claim_session(&lease.id.to_string())?
+                        == crate::session::lock::SessionClaim::Owned,
+                    "session already has another writer"
+                );
+                lease.writer.store(true, Ordering::Release);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        })
+        .await;
+    cleanup.settle().await;
+    result
+        .map_err(|_| agent_client_protocol::Error::new(-32603, "session writer task failed"))?
+        .map_err(|_| {
+            agent_client_protocol::Error::new(
+                -32000,
+                "could not claim exclusive session persistence",
+            )
+        })
 }
 
 #[cfg(feature = "mcp")]
@@ -1536,6 +1720,46 @@ fn with_client_mcp_servers<'a>(
     std::borrow::Cow::Owned(merged)
 }
 
+async fn handle_set_session_mode(
+    req: SetSessionModeRequest,
+    responder: Responder<SetSessionModeResponse>,
+    cx: ConnectionTo<Client>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&req.session_id)
+        .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
+    let turns = lock_unpoisoned(&session.turns);
+    if !turns.queue.is_empty() {
+        return Err(agent_client_protocol::Error::new(
+            -32000,
+            "ACP session already has an active prompt",
+        ));
+    }
+    session
+        .workspace
+        .validate()
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    let history = session
+        .history
+        .try_lock()
+        .map_err(|_| agent_client_protocol::Error::new(-32000, "ACP session history is busy"))?;
+    history
+        .policy
+        .set_mode(req.mode_id.0.as_ref())
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
+    drop(history);
+    drop(turns);
+    drop(sessions);
+    cx.send_notification(SessionNotification::new(
+        req.session_id,
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(req.mode_id)),
+    ))?;
+    responder.respond(SetSessionModeResponse::new())
+}
+
 async fn handle_close_session(
     req: CloseSessionRequest,
     responder: Responder<CloseSessionResponse>,
@@ -1716,7 +1940,8 @@ async fn handle_prompt(
 
     tracing::info!("ACP prompt for session {}", session_id);
 
-    let prompt_text = render_prompt_blocks(&req.prompt)?;
+    let command = commands::classify(&req.prompt)?;
+    let prompt_input = parse_prompt_blocks(&req.prompt)?;
 
     let snapshot = {
         let sessions = state.sessions.lock().await;
@@ -1834,7 +2059,8 @@ async fn handle_prompt(
                     crate::startup::heap_future(|| {
                         run_prompt(
                             &state,
-                            &prompt_text,
+                            &prompt_input,
+                            command,
                             session_id,
                             history,
                             workspace,
@@ -1874,6 +2100,122 @@ async fn handle_prompt(
             })?
         }
     })
+}
+
+fn parse_prompt_blocks(
+    blocks: &[ContentBlock],
+) -> Result<crate::agent::input::PromptInput, agent_client_protocol::Error> {
+    use crate::session::user::{MAX_USER_BLOCKS, MAX_USER_TEXT_BYTES};
+    if blocks.len() > MAX_USER_BLOCKS {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            "ACP prompt has too many content blocks",
+        ));
+    }
+    if !blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+    {
+        let text = render_prompt_blocks(blocks)?;
+        if text.len() > MAX_USER_TEXT_BYTES {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                "ACP prompt text exceeds the byte limit",
+            ));
+        }
+        return Ok(crate::agent::input::PromptInput::text(text));
+    }
+    #[cfg(not(feature = "multimodal"))]
+    return Err(agent_client_protocol::Error::new(
+        -32602,
+        "image ACP prompts require the multimodal feature",
+    ));
+    #[cfg(feature = "multimodal")]
+    {
+        use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
+        let mut content = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            match block {
+                ContentBlock::Image(image) => {
+                    let mime_type = ImageMime::parse(&image.mime_type).ok_or_else(|| {
+                        agent_client_protocol::Error::new(-32602, "unsupported ACP image MIME type")
+                    })?;
+                    // The inline data is authoritative. URI/annotations/meta are
+                    // display metadata, never a fetch or file-read request.
+                    content.push(UserBlock::Image {
+                        data: image.data.clone(),
+                        mime_type,
+                    });
+                }
+                _ => content.push(UserBlock::Text {
+                    text: render_prompt_blocks(std::slice::from_ref(block))?,
+                }),
+            }
+        }
+        let user = PersistedUserMessage::new(content)
+            .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
+        Ok(crate::agent::input::PromptInput::user(user))
+    }
+}
+
+#[cfg(test)]
+mod typed_prompt_tests {
+    use super::*;
+    #[test]
+    fn acp53_image_prompt_feature_policy_is_explicit_and_nonfetching() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("before 雪")),
+            ContentBlock::Image(
+                ImageContent::new("aW5lcnQ=", "image/png")
+                    .uri("file:///private/inert-never-opened.png"),
+            ),
+            ContentBlock::Text(TextContent::new("after $HOME /undo")),
+        ];
+        #[cfg(not(feature = "multimodal"))]
+        assert!(parse_prompt_blocks(&blocks).is_err());
+        #[cfg(feature = "multimodal")]
+        {
+            let prompt = parse_prompt_blocks(&blocks).unwrap();
+            assert_eq!(prompt.literal_text(), "before 雪\nafter $HOME /undo");
+            let expected = crate::session::user::PersistedUserMessage::new(vec![
+                crate::session::user::UserBlock::Text {
+                    text: "before 雪".into(),
+                },
+                crate::session::user::UserBlock::Image {
+                    data: "aW5lcnQ=".into(),
+                    mime_type: crate::session::user::ImageMime::Png,
+                },
+                crate::session::user::UserBlock::Text {
+                    text: "after $HOME /undo".into(),
+                },
+            ])
+            .unwrap();
+            assert_eq!(prompt.to_message(), expected.to_message());
+        }
+    }
+    #[test]
+    fn acp53_prompt_text_and_block_limits_precede_runner_admission() {
+        assert!(
+            parse_prompt_blocks(&vec![
+                ContentBlock::Text(TextContent::new("x"));
+                crate::session::user::MAX_USER_BLOCKS + 1
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_prompt_blocks(&[ContentBlock::Text(TextContent::new(
+                "x".repeat(crate::session::user::MAX_USER_TEXT_BYTES + 1)
+            ))])
+            .is_err()
+        );
+        let text = "literal $HOME @file /undo 雪";
+        assert_eq!(
+            parse_prompt_blocks(&[ContentBlock::Text(TextContent::new(text))])
+                .unwrap()
+                .to_message(),
+            Message::user(text)
+        );
+    }
 }
 
 fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
@@ -2201,12 +2543,18 @@ async fn drive_question_request(
     let _ = question.reply.send(answer);
 }
 
+struct BridgePolicy {
+    policy: policy::SessionPolicy,
+    permission: Option<crate::permission::checker::PermCheck>,
+}
+
 async fn drive_permission_bridge(
     cx: ConnectionTo<Client>,
     _activity: idle::Activity,
     session_id: SessionId,
     mut ask_rx: crate::permission::ask::AskReceiver,
     control: Arc<TurnControl>,
+    runtime_policy: Option<BridgePolicy>,
     // Milliseconds this turn spent waiting on the user. A goal's time bound
     // measures how long the agent worked, not how long the person took to
     // answer, so the round subtracts this from its wall clock.
@@ -2217,6 +2565,7 @@ async fn drive_permission_bridge(
     const OPT_ALLOW_ONCE: &str = "allow_once";
     const OPT_ALLOW_ALWAYS: &str = "allow_always";
     const OPT_DENY: &str = "deny";
+    const OPT_DENY_ALWAYS: &str = "deny_always";
 
     loop {
         let ask = tokio::select! {
@@ -2294,7 +2643,7 @@ async fn drive_permission_bridge(
             tool_call_id.clone(),
             ToolCallUpdateFields::new().title(title).content(content),
         );
-        let options = vec![
+        let mut options = vec![
             PermissionOption::new(
                 OPT_ALLOW_ONCE,
                 "Allow once",
@@ -2308,6 +2657,13 @@ async fn drive_permission_bridge(
             .meta(allow_always_meta),
             PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
         ];
+        if runtime_policy.is_some() {
+            options.push(PermissionOption::new(
+                OPT_DENY_ALWAYS,
+                "Deny this exact request for this session",
+                PermissionOptionKind::RejectAlways,
+            ));
+        }
         let req = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
 
         #[cfg(feature = "goal")]
@@ -2324,7 +2680,8 @@ async fn drive_permission_bridge(
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        let (decision, notice) = match response {
+        let mut choice = None;
+        let (mut decision, mut notice) = match response {
             None => (UserDecision::Deny, "Permission request cancelled"),
             Some(Ok(resp)) => match resp.outcome {
                 RequestPermissionOutcome::Cancelled => {
@@ -2333,9 +2690,20 @@ async fn drive_permission_bridge(
                 RequestPermissionOutcome::Selected(sel) => {
                     let id = sel.option_id.0.as_ref();
                     if id == OPT_ALLOW_ALWAYS {
+                        let entries = std::iter::once(suggested.clone())
+                            .chain(ask.additional_allow_patterns.iter().cloned())
+                            .map(|pattern| (ask.tool.to_string(), pattern))
+                            .collect();
+                        choice = Some(policy::Choice::Allow(entries));
                         (UserDecision::AllowAlways(suggested), "Permission approved")
                     } else if id == OPT_ALLOW_ONCE {
                         (UserDecision::AllowOnce, "Permission approved")
+                    } else if id == OPT_DENY_ALWAYS && runtime_policy.is_some() {
+                        choice = Some(policy::Choice::Deny(
+                            ask.tool.to_string(),
+                            ask.input.clone(),
+                        ));
+                        (UserDecision::Deny, "Exact request denied for this session")
                     } else {
                         (UserDecision::Deny, "Permission denied")
                     }
@@ -2347,6 +2715,25 @@ async fn drive_permission_bridge(
                 (UserDecision::Deny, "Permission request failed")
             }
         };
+        if control.is_cancelled() || ask.reply.is_closed() {
+            choice = None;
+            decision = UserDecision::Deny;
+            notice = "Permission request cancelled";
+        } else if let (Some(runtime), Some(selected)) = (&runtime_policy, &choice)
+            && !runtime.policy.can_record(selected)
+        {
+            choice = None;
+            decision = UserDecision::Deny;
+            notice = "Session permission choice capacity exceeded";
+        }
+        if let (Some(runtime), Some(policy::Choice::Deny(tool, input))) = (&runtime_policy, &choice)
+            && let Some(permission) = &runtime.permission
+        {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .add_session_exact_deny(tool, input);
+        }
         // This lifecycle represents the approval request, not the underlying
         // effect. Ordinary tool calls remain owned by the runner's result event.
         if synthetic_tool_call_id {
@@ -2368,7 +2755,20 @@ async fn drive_permission_bridge(
                 tracing::warn!("ACP failed to settle synthetic permission tool call: {error}");
             }
         }
-        let _ = ask.reply.send(decision);
+        // Notification serialization and checker locking are synchronous, but
+        // another owned task may still cancel or abandon this reply meanwhile.
+        if control.is_cancelled() || ask.reply.is_closed() {
+            decision = UserDecision::Deny;
+            choice = None;
+        }
+        // Successful delivery is the accepted selection boundary. Later turn
+        // cancellation does not revoke an already-delivered human choice.
+        if ask.reply.send(decision).is_ok()
+            && let (Some(runtime), Some(choice)) = (&runtime_policy, choice)
+            && let Err(error) = runtime.policy.record(choice)
+        {
+            tracing::error!("ACP session choice could not be retained: {error}");
+        }
     }
     // Drain remaining buffered asks as Deny after control cancelled.
     while let Ok(ask) = ask_rx.try_recv() {
@@ -2383,7 +2783,7 @@ fn respond_terminal(
     responder: Responder<PromptResponse>,
     reason: StopReason,
 ) -> Result<(), agent_client_protocol::Error> {
-    registration.settle();
+    let _ = registration.complete_and_settle();
     responder.respond(PromptResponse::new(reason))
 }
 
@@ -2399,7 +2799,8 @@ fn respond_terminal_error(
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
-    prompt_text: &str,
+    prompt_input: &crate::agent::input::PromptInput,
+    command: Option<commands::Command>,
     session_id: SessionId,
     mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
@@ -2417,6 +2818,98 @@ async fn run_prompt(
     control: Arc<TurnControl>,
     registration: &TurnRegistration,
 ) -> Result<(), agent_client_protocol::Error> {
+    if let Some(command) = command.as_ref() {
+        let mutates_native_context = match command {
+            commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
+                true
+            }
+            #[cfg(feature = "goal")]
+            commands::Command::Goal(arguments) => !arguments.is_empty() && arguments != "status",
+        };
+        if crate::session::native_publication::is_native_bearing(&history.session)
+            && mutates_native_context
+        {
+            return respond_terminal_error(
+                registration,
+                responder,
+                "native session changes require a new ACP session".into(),
+            );
+        }
+        let line = match command {
+            commands::Command::Undo => {
+                let removed = crate::ui::slash::undo_last(&mut history.session);
+                Some(format!(
+                    "Removed {removed} conversation records; files and billed usage remain unchanged."
+                ))
+            }
+            commands::Command::Rename(name) => {
+                history.session.name = name.as_str().into();
+                Some(format!("Session renamed to {name}."))
+            }
+            #[cfg(feature = "goal")]
+            commands::Command::Goal(arguments) => {
+                if arguments.is_empty() || arguments == "status" {
+                    Some(goal_store.snapshot().map_or_else(
+                        || "No goal is set.".into(),
+                        |goal| format!("Goal ({}): {}", goal.status.label(), goal.objective),
+                    ))
+                } else if arguments == "clear" {
+                    goal_store.clear();
+                    Some("Goal cleared.".into())
+                } else {
+                    let goal = match crate::extras::goal::Goal::configured(
+                        arguments.clone(),
+                        Vec::new(),
+                        crate::extras::goal::GoalDefaults {
+                            cfg: &state.cfg,
+                            provider: &history.session.provider,
+                            model: &history.session.model,
+                        },
+                    ) {
+                        Ok(goal) => goal,
+                        Err(_) => {
+                            return respond_terminal_error(
+                                registration,
+                                responder,
+                                "invalid ACP goal".into(),
+                            );
+                        }
+                    };
+                    if goal_store.set(goal, false).is_err() {
+                        return respond_terminal_error(
+                            registration,
+                            responder,
+                            "an unfinished ACP goal already exists".into(),
+                        );
+                    }
+                    Some("Goal created.".into())
+                }
+            }
+            commands::Command::Compact => {
+                history.manual_compact = true;
+                None
+            }
+        };
+        if let Some(line) = line {
+            if !registration.control.complete() {
+                return respond_terminal(registration, responder, StopReason::Cancelled);
+            }
+            if !state.cli.no_session && sessions::checkpoint(&history).await.is_err() {
+                return respond_terminal_error(
+                    registration,
+                    responder,
+                    "ACP command checkpoint failed; observed progress remains in memory".into(),
+                );
+            }
+            cx.send_notification(SessionNotification::new(
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(line),
+                ))),
+            ))?;
+            return respond_terminal(registration, responder, StopReason::EndTurn);
+        }
+    }
     #[cfg(all(not(test), feature = "mcp"))]
     let mut mcp_manager = None;
     #[cfg(all(test, feature = "mcp"))]
@@ -2434,30 +2927,40 @@ async fn run_prompt(
     let blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(feature = "goal")]
     let round_started = std::time::Instant::now();
+    let run = crate::spend::run::Run::current();
+    let usage_before = run
+        .as_ref()
+        .map_or_else(Default::default, |run| run.accepted_usage());
+    let pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
     history.pending_question = None;
-    let result = execute_prompt(
-        state,
-        prompt_text,
-        session_id.clone(),
-        &mut history,
-        workspace,
-        context,
-        read_tracker,
-        todo_store,
-        #[cfg(feature = "goal")]
-        goal_store,
-        sandbox,
-        #[cfg(feature = "js")]
-        js_session_state,
-        #[cfg(feature = "skills")]
-        skill_services,
-        cx.clone(),
-        control,
-        #[cfg(feature = "mcp")]
-        &mut mcp_manager,
-        #[cfg(feature = "goal")]
-        blocked_ms.clone(),
-    )
+    let mut native_owner = None;
+    let result = crate::startup::heap_future(|| {
+        execute_prompt(
+            state,
+            prompt_input,
+            matches!(command, Some(commands::Command::Compact)),
+            session_id.clone(),
+            &mut history,
+            &mut native_owner,
+            workspace,
+            context,
+            read_tracker,
+            todo_store.clone(),
+            #[cfg(feature = "goal")]
+            goal_store,
+            sandbox,
+            #[cfg(feature = "js")]
+            js_session_state,
+            #[cfg(feature = "skills")]
+            skill_services,
+            cx.clone(),
+            control,
+            #[cfg(feature = "mcp")]
+            &mut mcp_manager,
+            #[cfg(feature = "goal")]
+            blocked_ms.clone(),
+        )
+    })
     .await;
     // Keep the history lock and generation registered until every per-prompt
     // server is closed, including cancellation during agent/runner preparation.
@@ -2465,8 +2968,11 @@ async fn run_prompt(
     if let Some(manager) = mcp_manager {
         manager.shutdown().await;
     }
-    let mut outcome = result?;
-    if !registration.complete_and_settle() {
+    let mut outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => return respond_terminal_error(registration, responder, error.to_string()),
+    };
+    if !registration.control.complete() {
         outcome.reason = StopReason::Cancelled;
         outcome.error = None;
         outcome.question = None;
@@ -2531,10 +3037,92 @@ async fn run_prompt(
     };
 
     history.pending_question = outcome.question.clone();
-    if let Some(progress) = outcome.progress
-        && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
+    history.session.pending_question = outcome.question.clone();
+    history.session.todos = todo_store;
+    #[cfg(feature = "goal")]
     {
-        history.commit_completed_turn(prompt_text, progress);
+        history.session.goal_store = goal_store_for_gate;
+    }
+    let usage = run.as_ref().map_or_else(Default::default, |run| {
+        run.accepted_usage().nonnegative_difference(usage_before)
+    });
+    let response = outcome
+        .progress
+        .as_ref()
+        .and_then(|progress| progress.last())
+        .and_then(|message| match message {
+            Message::Assistant { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        rig::message::AssistantContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if let Some(owner) = native_owner.as_mut() {
+        use crate::session::native_replay::RetiredNativeOutcome;
+        owner.outcome = if outcome.reason == StopReason::EndTurn
+            && outcome.error.is_none()
+            && outcome.question.is_none()
+        {
+            RetiredNativeOutcome::Completed
+        } else if outcome.question.is_some() {
+            RetiredNativeOutcome::LiveToolReply
+        } else {
+            RetiredNativeOutcome::Incomplete
+        };
+        if let Some(binding) = &owner.binding
+            && let Err(reason) = binding.commit_canonical_input_into_with_outcome(
+                &mut history.session,
+                prompt_input,
+                &response,
+                outcome.progress.as_deref().unwrap_or(&[]),
+                usage,
+                pricing,
+                owner.outcome,
+            )
+        {
+            outcome.error = Some(reason.to_string());
+        }
+    } else {
+        if let Some(progress) = outcome.progress.as_ref()
+            && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
+            && crate::print::persist_headless_turn_input(
+                &mut history.session,
+                prompt_input,
+                &response,
+                progress,
+            )
+            .is_err()
+        {
+            outcome.error = Some("canonical ACP user content could not be retained".into());
+        }
+        history.session.charge_usage_delta_at(
+            usage,
+            pricing.anthropic_native,
+            pricing.input_token_cost,
+            pricing.output_token_cost,
+            pricing.cache_prices,
+        );
+    }
+    // Auxiliary requests belong to the same canonical financial checkpoint;
+    // their separately captured receipt prices are never re-estimated here.
+    history.session.total_cost = history
+        .session
+        .total_cost
+        .max(history.session.spend_account.snapshot().recorded_spend());
+    if let Some(mut owner) = native_owner {
+        if let Err(error) = owner.finish(&mut history.session).await {
+            outcome.error = Some(error.to_string());
+        }
+    } else if !state.cli.no_session
+        && let Err(error) = sessions::checkpoint(&history).await
+    {
+        outcome.error = Some(error.to_string());
     }
 
     // Report the decision twice: as a thought chunk a person can read, and as
@@ -2777,9 +3365,11 @@ impl PromptOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn execute_prompt(
     state: &AcpState,
-    prompt_text: &str,
+    prompt_input: &crate::agent::input::PromptInput,
+    compact_only: bool,
     session_id: SessionId,
     history: &mut SessionHistory,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
@@ -2796,6 +3386,7 @@ async fn execute_prompt(
     // Filled by the permission bridge with the time the user held this turn.
     #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<PromptOutcome, agent_client_protocol::Error> {
+    let prompt_text = prompt_input.literal_text();
     if control.is_cancelled() {
         return Ok(PromptOutcome::cancelled(None));
     }
@@ -2807,6 +3398,9 @@ async fn execute_prompt(
     {
         return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
     }
+    // The relay reads the same session-local store the actual tool mutates.
+    // Tool output and arguments are display data, never a second TODO source.
+    let plan_store = todo_store.clone();
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
@@ -2827,6 +3421,7 @@ async fn execute_prompt(
             cx,
             control,
             paused_runner,
+            plan_store,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -2862,6 +3457,7 @@ async fn execute_prompt(
             cx,
             control,
             event_rx,
+            plan_store,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -2869,7 +3465,7 @@ async fn execute_prompt(
     }
 
     let workspace_root = workspace.root();
-    let authority =
+    let mut authority =
         match crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -2877,6 +3473,9 @@ async fn execute_prompt(
             }
         }
         .0;
+    if let Some(mode) = history.policy.mode() {
+        authority.mode = mode;
+    }
     let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_with_cli_at(
         &state.cli,
         &state.cfg,
@@ -2884,6 +3483,7 @@ async fn execute_prompt(
         Some(workspace_root.to_path_buf()),
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    history.policy.apply(&permission);
     if let Some(rx) = ask_rx {
         tokio::spawn(state.idle.admit()?.track(drive_permission_bridge(
             cx.clone(),
@@ -2891,6 +3491,10 @@ async fn execute_prompt(
             session_id.clone(),
             rx,
             control.clone(),
+            Some(BridgePolicy {
+                policy: history.policy.clone(),
+                permission: permission.clone(),
+            }),
             #[cfg(feature = "goal")]
             blocked_ms,
         )));
@@ -2910,6 +3514,42 @@ async fn execute_prompt(
             return Ok(PromptOutcome::failed(error.to_string()));
         }
     };
+
+    let native = matches!(&client, crate::provider::AnyClient::Anthropic(_))
+        || crate::session::native_publication::is_native_bearing(&history.session);
+    if native && history.needs_compaction() {
+        return Ok(PromptOutcome::failed(
+            "native history cannot be compacted in place; start a new ACP session".into(),
+        ));
+    }
+    let work_scope = crate::agent::runner::AgentWorkScope::new();
+    #[cfg(feature = "hooks")]
+    work_scope.set_hook_execution_root(workspace.root());
+    if native {
+        let ticket = if crate::session::native_publication::startup_requires_publication(
+            &history.session,
+            matches!(&client, crate::provider::AnyClient::Anthropic(_)),
+            state.cli.no_session,
+        )
+        .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
+        {
+            Some(
+                crate::session::native_publication::begin_owned(&mut history.session, &work_scope)
+                    .await
+                    .map_err(|error| {
+                        agent_client_protocol::Error::new(-32603, error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        *native_owner = Some(crate::provider::NativeRunOwner::with_scope(
+            ticket,
+            work_scope.clone(),
+        ));
+    }
+    #[cfg(feature = "hooks")]
+    let mut owned_startup_context = None;
 
     // Goal calibration uses the compaction's usage too. Financial receipts
     // belong to this ACP logical session and survive prompt cancellation.
@@ -2948,8 +3588,9 @@ async fn execute_prompt(
                 Some(&goal_store_for_compaction),
                 move |messages, previous_summary| {
                     let observed = observed.clone();
+                    let provider_str = provider_str.clone();
                     async move {
-                        compaction_client
+                        let mut output = compaction_client
                             .compress_messages_observed(
                                 compaction_model,
                                 &messages,
@@ -2960,7 +3601,9 @@ async fn execute_prompt(
                                 compaction_retry,
                                 observed,
                             )
-                            .await
+                            .await?;
+                        output.usage = state.cfg.normalize_usage(&provider_str, output.usage);
+                        Ok(output)
                     }
                 },
             )
@@ -2983,6 +3626,16 @@ async fn execute_prompt(
         #[cfg(not(feature = "goal"))]
         let _ = usage;
     }
+    if compact_only {
+        return Ok(PromptOutcome {
+            reason: StopReason::EndTurn,
+            question: None,
+            progress: None,
+            error: None,
+            #[cfg(feature = "goal")]
+            usage: compaction_usage.into(),
+        });
+    }
     // Refreshed after compaction, so the recap this turn replays is the one
     // whose daily-memory copy is left out of the block.
     #[cfg(feature = "memory")]
@@ -3004,11 +3657,6 @@ async fn execute_prompt(
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
-    let work_scope = crate::agent::runner::AgentWorkScope::new();
-    // Hooks dispatched by this turn (prompt submit, tools, stop, subagents)
-    // run against this session's workspace, independent of other sessions.
-    #[cfg(feature = "hooks")]
-    work_scope.set_hook_execution_root(workspace.root());
     #[cfg(feature = "hooks")]
     let prior_history = {
         if !history.hooks_started {
@@ -3041,7 +3689,11 @@ async fn execute_prompt(
                 else {
                     return Ok(PromptOutcome::cancelled(None));
                 };
-                history.record_hook_context(notices.into_notices());
+                if native {
+                    owned_startup_context = Some(notices);
+                } else {
+                    history.record_hook_context(notices.into_notices());
+                }
             }
             history.hooks_started = true;
         }
@@ -3103,16 +3755,60 @@ async fn execute_prompt(
         return Ok(PromptOutcome::cancelled(None));
     };
 
-    #[cfg(feature = "memory")]
-    let agent = agent.with_memory_placement(crate::session::MemoryPlacement::Messages);
+    let file_checkpoints = history.session.file_checkpoints.recorder(
+        &history.session.id,
+        history.session.messages.len(),
+        state.cli.no_session,
+    );
     let agent = agent
+        .with_main_session(&state.cfg, &history.session)
+        .with_file_checkpoints(file_checkpoints.clone())
         .with_spend(crate::spend::run::Run::current())
         .with_question_turn(Some(crate::question::QuestionTurn::default()));
+    let (agent, prior_history) = if let Some(owner) = native_owner.as_mut() {
+        use crate::session::native_replay::ReplayBoundary;
+        let boundary = match history.session.native_history_snapshot() {
+            Some(saved) => saved
+                .saved_boundary()
+                .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?,
+            None => ReplayBoundary::CompletedTurn,
+        };
+        #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+        let (agent, mut binding) = agent
+            .bind_native_turn(
+                &history.session,
+                prior_history.into(),
+                boundary,
+                crate::provider::RecordedToolIds::Canonical,
+            )
+            .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?;
+        #[cfg(feature = "hooks")]
+        if let Some(context) = owned_startup_context.take() {
+            binding
+                .append_owned_startup_context(&mut history.session, context)
+                .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?;
+            file_checkpoints.rebase_turn(history.session.messages.len());
+        }
+        owner
+            .progress(&mut history.session)
+            .await
+            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
+        if let Some(ticket) = &mut owner.ticket {
+            binding
+                .pair_publication(&history.session, ticket)
+                .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
+        }
+        let prior_history = binding.history();
+        owner.binding = Some(binding);
+        (agent, prior_history)
+    } else {
+        (agent, prior_history.into())
+    };
     let Some(paused_runner) = run_owned_pre_run(
         &control,
         &work_scope,
-        agent.spawn_runner_paused_in_scope(
-            prompt_text.to_string(),
+        agent.spawn_runner_paused_input_in_scope(
+            prompt_input.clone(),
             prior_history,
             state.cfg.retry.clone(),
             #[cfg(feature = "hooks")]
@@ -3130,6 +3826,7 @@ async fn execute_prompt(
         cx,
         control,
         paused_runner,
+        plan_store,
         #[cfg(feature = "goal")]
         (&state.cfg, &usage_provider),
     )
@@ -3198,6 +3895,7 @@ async fn relay_paused_runner(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
+    plan_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     #[cfg(any(feature = "hooks", feature = "memory"))]
@@ -3207,13 +3905,22 @@ async fn relay_paused_runner(
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
-        return cancelled_after_runner(&mut runner.event_rx).await;
+        let mut last_plan = Vec::new();
+        return cancelled_after_runner_with_plan(
+            &mut runner.event_rx,
+            &session_id,
+            &cx,
+            &plan_store,
+            &mut last_plan,
+        )
+        .await;
     }
     let outcome = relay_prompt_events(
         session_id,
         cx,
         control,
         runner.event_rx,
+        plan_store,
         #[cfg(feature = "goal")]
         usage_provider,
     )
@@ -3249,20 +3956,78 @@ fn add_goal_usage(
         .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
 }
 
+/// Publish only the actual session store. A denied or failed `todo_write`
+/// leaves it unchanged, and a successful empty replacement clears the plan.
+fn relay_plan_if_changed(
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    store: &crate::agent::tools::TodoStore,
+    previous: &mut Vec<crate::agent::tools::todo::TodoItem>,
+) {
+    let current = store.snapshot();
+    if current == *previous {
+        return;
+    }
+    let entries = current
+        .iter()
+        .take(crate::agent::tools::todo::MAX_TODO_ITEMS)
+        .map(|item| {
+            let priority = match item.priority.as_str() {
+                "high" => PlanEntryPriority::High,
+                "low" => PlanEntryPriority::Low,
+                _ => PlanEntryPriority::Medium,
+            };
+            let status = match item.status.as_str() {
+                "in_progress" => PlanEntryStatus::InProgress,
+                "completed" => PlanEntryStatus::Completed,
+                _ => PlanEntryStatus::Pending,
+            };
+            let mut entry = PlanEntry::new(
+                item.content
+                    .chars()
+                    .take(crate::agent::tools::todo::MAX_TODO_CONTENT_CHARS)
+                    .collect::<String>(),
+                priority,
+                status,
+            );
+            // ACP v1 has no cancelled status. Preserve the actual status as
+            // metadata rather than presenting abandoned work as completed.
+            if item.status == "cancelled" {
+                entry.meta = Some(serde_json::Map::from_iter([(
+                    "mini-agent-status".to_owned(),
+                    serde_json::json!("cancelled"),
+                )]));
+            }
+            entry
+        })
+        .collect();
+    let notification =
+        SessionNotification::new(session_id.clone(), SessionUpdate::Plan(Plan::new(entries)));
+    match cx.send_notification(notification) {
+        Ok(()) => *previous = current,
+        Err(error) => tracing::warn!(%error, "ACP failed to send plan notification"),
+    }
+}
+
 async fn relay_prompt_events(
     session_id: SessionId,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    plan_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
+    let mut last_plan = Vec::new();
+    relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
     loop {
         let event = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return cancelled_after_runner(&mut rx).await;
+                return cancelled_after_runner_with_plan(
+                    &mut rx, &session_id, &cx, &plan_store, &mut last_plan,
+                ).await;
             }
             event = rx.recv() => event,
         };
@@ -3365,6 +4130,7 @@ async fn relay_prompt_events(
                 if let Err(e) = cx.send_notification(notif) {
                     tracing::warn!("ACP failed to send tool result notification: {}", e);
                 }
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
             }
             AgentEvent::ToolLoop { name, message } => {
                 let text = format!("loop guard ({name}): {message}");
@@ -3426,7 +4192,14 @@ async fn relay_prompt_events(
             | AgentEvent::CompactionBoundary { .. } => {
                 tracing::error!("interactive-only compaction boundary reached ACP");
                 control.cancel();
-                return cancelled_after_runner(&mut rx).await;
+                return cancelled_after_runner_with_plan(
+                    &mut rx,
+                    &session_id,
+                    &cx,
+                    &plan_store,
+                    &mut last_plan,
+                )
+                .await;
             }
             AgentEvent::AwaitingUser {
                 question,
@@ -3435,6 +4208,7 @@ async fn relay_prompt_events(
                 // Closing this receiver waits for the exact run and its owned
                 // effects. A future ordinary user prompt gets a fresh slot.
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
                     question: Some(*question),
@@ -3446,6 +4220,7 @@ async fn relay_prompt_events(
             }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
                     question: None,
@@ -3460,6 +4235,7 @@ async fn relay_prompt_events(
                 interactions,
             } => {
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::Refusal,
                     question: None,
@@ -3471,6 +4247,20 @@ async fn relay_prompt_events(
             }
         }
     }
+}
+
+/// Cancellation can win after a tool mutates its store but before the relay
+/// consumes its result event. Publish that actual final state after draining.
+async fn cancelled_after_runner_with_plan(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    store: &crate::agent::tools::TodoStore,
+    previous: &mut Vec<crate::agent::tools::todo::TodoItem>,
+) -> PromptOutcome {
+    let outcome = cancelled_after_runner(rx).await;
+    relay_plan_if_changed(session_id, cx, store, previous);
+    outcome
 }
 
 async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> PromptOutcome {
@@ -3778,7 +4568,9 @@ mod history_tests {
         assert!(!count_snapshot.contains(&Message::user("user-0")));
         assert!(
             count_snapshot[0]
-                == Message::assistant("[Recap of earlier ACP turns]\norigin user-0 assistant-0")
+                == Message::assistant(
+                    "[Recap of my prior work in this conversation]\norigin user-0 assistant-0"
+                )
         );
         assert!(count_snapshot.contains(&Message::user(format!("user-{MAX_ACP_HISTORY_TURNS}"))));
 
@@ -3801,7 +4593,9 @@ mod history_tests {
             .unwrap();
         assert!(
             by_bytes.snapshot()[0]
-                == Message::assistant("[Recap of earlier ACP turns]\noversized origin retained"),
+                == Message::assistant(
+                    "[Recap of my prior work in this conversation]\noversized origin retained"
+                ),
             "a single oversized turn must be replaced by its bounded recap"
         );
     }
@@ -3859,7 +4653,9 @@ mod history_tests {
             let snapshot = history.snapshot_with_tool_result_retention(0);
             assert_eq!(
                 snapshot[0],
-                Message::assistant("[Recap of earlier ACP turns]\ncovered through turn 2")
+                Message::assistant(
+                    "[Recap of my prior work in this conversation]\ncovered through turn 2"
+                )
             );
             assert_eq!(snapshot[1..], retained);
         }
@@ -3929,7 +4725,9 @@ mod history_tests {
                 expected.drain(..2);
                 expected.insert(
                     0,
-                    Message::assistant("[Recap of earlier ACP turns]\nfirst pass recap"),
+                    Message::assistant(
+                        "[Recap of my prior work in this conversation]\nfirst pass recap",
+                    ),
                 );
             }
             let control = TurnControl::new();
@@ -4040,7 +4838,7 @@ mod history_tests {
             assert_eq!(
                 history.snapshot(),
                 vec![Message::assistant(format!(
-                    "[Recap of earlier ACP turns]\n{}",
+                    "[Recap of my prior work in this conversation]\n{}",
                     SessionHistory::EMERGENCY_RECAP
                 ))]
             );
@@ -4178,6 +4976,187 @@ mod protocol_tests {
         }
     }
 
+    async fn acp53_poll_storage_until_held<F: std::future::Future>(
+        work: &mut std::pin::Pin<Box<F>>,
+        started: &mut std::sync::mpsc::Receiver<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            loop {
+                tokio::select! {
+                    _ = work.as_mut() => panic!("storage returned before held worker"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+                }
+                if started.try_recv().is_ok() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_checkpoint_drop_keeps_lease_and_blocking_job_until_actual_retirement() {
+        let leases = Arc::new(SessionLeases::default());
+        let id = SessionId::new(format!("checkpoint-{}", uuid::Uuid::new_v4()));
+        let lease = leases.reserve(id.clone()).unwrap();
+        lease.writer.store(true, Ordering::Release);
+        let (scope, mut started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        *lock_unpoisoned(&leases.storage_scope_for_test) = Some(scope.clone());
+        let mut history = SessionHistory {
+            _lease: Some(lease),
+            ..Default::default()
+        };
+        // Validate fails before any artifact/path/claim. No global test roots
+        // or production credential/storage namespace is opened by this control.
+        history.session.add_user_message(
+            crate::session::user::PersistedUserMessage::new(vec![
+                crate::session::user::UserBlock::Text {
+                    text: "authored".into(),
+                },
+            ])
+            .unwrap(),
+        );
+        history.session.messages.last_mut().unwrap().content = "mismatched".into();
+        let mut work = Box::pin(sessions::checkpoint(&history));
+        acp53_poll_storage_until_held(&mut work, &mut started).await;
+        assert_eq!(scope.active_children(), 1);
+        drop(work);
+        drop(history);
+        assert!(scope.is_cancelled());
+        assert!(
+            lock_unpoisoned(&leases.ids).contains(&id),
+            "writer lease retired before blocked checkpoint"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scope.wait_idle())
+                .await
+                .is_err()
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(scope.active_children(), 0);
+        assert!(!lock_unpoisoned(&leases.ids).contains(&id));
+    }
+
+    #[tokio::test]
+    async fn acp53_checkpoint_settlement_waits_for_the_exact_admitted_blocking_job() {
+        let leases = Arc::new(SessionLeases::default());
+        let lease = leases
+            .reserve(SessionId::new(format!(
+                "checkpoint-{}",
+                uuid::Uuid::new_v4()
+            )))
+            .unwrap();
+        lease.writer.store(true, Ordering::Release);
+        let (scope, mut started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        *lock_unpoisoned(&leases.storage_scope_for_test) = Some(scope.clone());
+        let mut history = SessionHistory {
+            _lease: Some(lease),
+            ..Default::default()
+        };
+        history.session.add_user_message(
+            crate::session::user::PersistedUserMessage::new(vec![
+                crate::session::user::UserBlock::Text {
+                    text: "authored".into(),
+                },
+            ])
+            .unwrap(),
+        );
+        history.session.messages.last_mut().unwrap().content = "mismatched".into();
+        let mut work = Box::pin(sessions::checkpoint(&history));
+        acp53_poll_storage_until_held(&mut work, &mut started).await;
+        assert_eq!(scope.active_children(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), work.as_mut())
+                .await
+                .is_err()
+        );
+        drop(release);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), work)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(scope.active_children(), 0);
+        assert!(
+            scope.is_cancelled(),
+            "normal settlement closes scope admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_list_handler_drop_keeps_discovery_owned_until_gate_release() {
+        let root = crate::tests::OwnedTestDirectory::new("acp53-held-list");
+        let requested = root.path().join("missing-workspace");
+        let fixture: PromptFixture =
+            Arc::new(|_, _| Box::pin(async { panic!("storage test must not invoke a provider") }));
+        let state = fixture_state(fixture);
+        let (scope, started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        *lock_unpoisoned(&state.leases.storage_scope_for_test) = Some(scope.clone());
+        let gate = Arc::new(StdMutex::new(Some((started, release))));
+        let server = Agent.builder().on_receive_request(
+            {
+                let state = state.clone();
+                let scope = scope.clone();
+                let gate = gate.clone();
+                move |req: ListSessionsRequest, responder, _cx| {
+                    let state = state.clone();
+                    let scope = scope.clone();
+                    let (mut started, release) = lock_unpoisoned(&gate).take().unwrap();
+                    async move {
+                        let mut work = Box::pin(sessions::handle_list(req, responder, &state));
+                        acp53_poll_storage_until_held(&mut work, &mut started).await;
+                        assert_eq!(scope.active_children(), 1);
+                        drop(work);
+                        assert!(scope.is_cancelled());
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), scope.wait_idle())
+                                .await
+                                .is_err()
+                        );
+                        drop(release);
+                        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+                            .await
+                            .unwrap();
+                        assert_eq!(scope.active_children(), 0);
+                        Ok(())
+                    }
+                }
+            },
+            on_receive_request!(),
+        );
+        Client
+            .builder()
+            .connect_with(server, async move |cx| {
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        cx.send_request(ListSessionsRequest::new().cwd(requested))
+                            .block_task()
+                    )
+                    .await
+                    .is_err(),
+                    "dropped actual responder cannot report a catalogue"
+                );
+                // Drive the server through its owned assertions after response drop.
+                tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(state.sessions.lock().await.is_empty());
+        assert!(lock_unpoisoned(&state.leases.ids).is_empty());
+    }
+
     #[cfg(feature = "hooks")]
     #[test]
     fn protocol_workspace_fixture_restores_the_hook_workspace_before_cleanup() {
@@ -4188,6 +5167,65 @@ mod protocol_tests {
             assert_eq!(crate::extras::hooks::active_workspace(), workspace.path());
         }
         assert_eq!(crate::extras::hooks::active_workspace(), expected);
+    }
+
+    #[test]
+    fn acp53_session_identity_stays_reserved_until_last_history_owner_retires() {
+        let leases = Arc::new(SessionLeases::default());
+        let id = SessionId::new("same-record");
+        for invalid in ["", "../record", "CON", &"x".repeat(256)] {
+            assert!(leases.reserve(SessionId::new(invalid)).is_err());
+        }
+        assert!(lock_unpoisoned(&leases.ids).is_empty());
+        let pending = leases.reserve(id.clone()).unwrap();
+        assert!(
+            leases.reserve(id.clone()).is_err(),
+            "parallel imports cannot share one writer"
+        );
+        let history = Arc::new(Mutex::new(SessionHistory {
+            _lease: Some(pending),
+            ..Default::default()
+        }));
+        let retiring_turn = history.clone();
+        drop(history); // Simulate removal from the loaded session map.
+        assert!(
+            leases.reserve(id.clone()).is_err(),
+            "close cannot redirect the retiring writer"
+        );
+        drop(retiring_turn);
+        let replacement = leases.reserve(id.clone()).unwrap();
+        assert_eq!(lock_unpoisoned(&leases.ids).len(), 1);
+        drop(replacement);
+        assert!(lock_unpoisoned(&leases.ids).is_empty());
+    }
+
+    #[test]
+    fn acp53_pending_and_retiring_session_owners_share_the_loaded_capacity() {
+        let leases = Arc::new(SessionLeases::default());
+        let mut reservations = (0..MAX_ACP_SESSIONS)
+            .map(|n| {
+                leases
+                    .reserve(SessionId::new(format!("record-{n}")))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let extra = SessionId::new("extra");
+        assert!(leases.reserve(extra.clone()).is_err());
+        let retiring = reservations[0].clone();
+        drop(reservations.remove(0));
+        assert!(
+            leases.reserve(extra.clone()).is_err(),
+            "a retiring owner still occupies its slot"
+        );
+        drop(retiring);
+        let admitted = leases.reserve(extra.clone()).unwrap();
+        assert_eq!(lock_unpoisoned(&leases.ids).len(), MAX_ACP_SESSIONS);
+        drop(admitted);
+        drop(reservations);
+        assert!(lock_unpoisoned(&leases.ids).is_empty());
+        // An import that fails before insertion releases both identity and slot.
+        drop(leases.reserve(extra.clone()).unwrap());
+        assert!(leases.reserve(extra).is_ok());
     }
 
     #[test]
@@ -4208,12 +5246,202 @@ mod protocol_tests {
         assert!(render_prompt_blocks(&[ContentBlock::Text(TextContent::new("  "))]).is_err());
     }
 
+    #[tokio::test]
+    async fn acp53_actual_local_commands_mutate_the_canonical_session_without_a_runner() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let state = fixture_state(Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(vec![AgentEvent::Done {
+                    response: "answer".into(),
+                    interactions: vec![Message::assistant("answer")],
+                }])
+            })
+        }));
+        let inspect = state.clone();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client.builder().on_receive_notification(async move |notification: SessionNotification, _cx| {
+            sink.lock().unwrap().push(notification); Ok(())
+        }, agent_client_protocol::on_receive_notification!()).connect_with(InMemoryAgent(state), async move |cx| {
+            let id = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?.session_id;
+            cx.send_request(prompt(id.clone(), "ordinary")).block_task().await?;
+            let before = inspect.sessions.lock().await[&id].history.lock().await.session.messages.len();
+            assert_eq!(before, 2);
+            cx.send_request(prompt(id.clone(), "/rename literal $HOME @file")).block_task().await?;
+            {
+                let sessions = inspect.sessions.lock().await;
+                let history = sessions[&id].history.lock().await;
+                assert_eq!(history.session.name, "literal $HOME @file");
+                assert_eq!(history.session.messages.len(), before);
+            }
+            cx.send_request(prompt(id.clone(), "/undo")).block_task().await?;
+            assert!(inspect.sessions.lock().await[&id].history.lock().await.session.messages.is_empty());
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            assert!(updates.lock().unwrap().iter().any(|notice| matches!(&notice.update, SessionUpdate::AvailableCommandsUpdate(commands) if commands.available_commands.iter().any(|command| command.name == "rename"))));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "local commands cannot launch a model runner");
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_local_checkpoint_failure_replies_without_closing_the_connection() {
+        let mut state = fixture_state(Arc::new(|_, _| {
+            Box::pin(async { panic!("local commands must not invoke a model") })
+        }));
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let id = Client
+            .builder()
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                Ok(cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id)
+            })
+            .await
+            .unwrap();
+        // The same admitted Session has no claimed disk writer in --no-session
+        // mode. Requiring persistence now provides a deterministic real
+        // checkpoint failure without touching private/user filesystem roots.
+        Arc::get_mut(&mut state)
+            .expect("connection retired its state owner")
+            .cli
+            .no_session = false;
+        let inspect = state.clone();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let error = cx
+                    .send_request(prompt(id.clone(), "/rename retained local name"))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("ACP command checkpoint failed"),
+                    "{error}"
+                );
+                #[cfg(feature = "goal")]
+                {
+                    for (text, expected) in [
+                        (
+                            "/goal first bounded goal".to_owned(),
+                            "ACP command checkpoint failed",
+                        ),
+                        (
+                            "/goal replacement goal".to_owned(),
+                            "an unfinished ACP goal already exists",
+                        ),
+                        (
+                            format!(
+                                "/goal {}",
+                                "x".repeat(crate::extras::goal::MAX_OBJECTIVE_CHARS + 1)
+                            ),
+                            "invalid ACP goal",
+                        ),
+                    ] {
+                        let error = cx
+                            .send_request(prompt(id.clone(), &text))
+                            .block_task()
+                            .await
+                            .unwrap_err();
+                        assert!(error.to_string().contains(expected), "{error}");
+                        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await?;
+                    }
+                }
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    inspect.sessions.lock().await[&id]
+                        .history
+                        .lock()
+                        .await
+                        .session
+                        .name,
+                    "retained local name"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn acp53_loaded_goal_rebuilds_execution_authority_from_current_configuration() {
+        let state = fixture_state(Arc::new(|_, _| {
+            Box::pin(async { Err("unused runner".into()) })
+        }));
+        let workspace = ProtocolTempDir::new();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(workspace.path()).unwrap());
+        let id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let lease = state.leases.reserve(id.clone()).unwrap();
+        let saved = crate::session::Session::new("untrusted-label", "untrusted-model", 128_000, "");
+        let mut goal = crate::extras::goal::Goal::configured(
+            "retained objective",
+            Vec::new(),
+            crate::extras::goal::GoalDefaults {
+                cfg: &state.cfg,
+                provider: "openai",
+                model: "fixture",
+            },
+        )
+        .unwrap();
+        goal.context_file = Some(workspace.path().join("must-not-be-read"));
+        goal.progress.rounds = 7;
+        saved.goal_store.set(goal, false).unwrap();
+        install_session(
+            &state,
+            id.clone(),
+            binding,
+            saved,
+            lease,
+            #[cfg(feature = "mcp")]
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let sessions = state.sessions.lock().await;
+        let stored = sessions[&id].goal_store.snapshot().unwrap();
+        assert_eq!(stored.objective, "retained objective");
+        assert_eq!(stored.progress.rounds, 7);
+        assert!(
+            stored.context_file.is_none(),
+            "saved path cannot become read authority"
+        );
+        assert!(stored.checks.is_empty());
+        assert!(stored.last_verdict.is_none());
+        assert!(
+            sessions[&id]
+                .history
+                .lock()
+                .await
+                .session
+                .goal_store
+                .snapshot()
+                .unwrap()
+                .context_file
+                .is_none()
+        );
+    }
+
     fn fixture_state(prompt_fixture: PromptFixture) -> Arc<AcpState> {
         Arc::new(AcpState {
             idle: idle::Idle::new(None).unwrap(),
-            cli: Cli::default(),
+            cli: Cli {
+                no_session: true,
+                ..Cli::default()
+            },
             cfg: Config::default(),
             context: crate::context::load(true),
+            leases: Arc::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -4230,9 +5458,13 @@ mod protocol_tests {
     fn runner_fixture_state(runner_fixture: RunnerFixture) -> Arc<AcpState> {
         Arc::new(AcpState {
             idle: idle::Idle::new(None).unwrap(),
-            cli: Cli::default(),
+            cli: Cli {
+                no_session: true,
+                ..Cli::default()
+            },
             cfg: Config::default(),
             context: crate::context::load(true),
+            leases: Arc::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -4252,9 +5484,13 @@ mod protocol_tests {
     ) -> Arc<AcpState> {
         Arc::new(AcpState {
             idle: idle::Idle::new(None).unwrap(),
-            cli: Cli::default(),
+            cli: Cli {
+                no_session: true,
+                ..Cli::default()
+            },
             cfg: Config::default(),
             context: crate::context::load(true),
+            leases: Arc::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -4293,6 +5529,7 @@ mod protocol_tests {
             },
             cfg: Config::default(),
             context: crate::context::load(true),
+            leases: Arc::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
@@ -4425,6 +5662,276 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn acp53_actual_mode_rpc_is_session_local_and_unknown_modes_leave_it_unchanged() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { unreachable!() }));
+        let state = fixture_state(fixture);
+        let retained = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink = updates.clone();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::CurrentModeUpdate(update) = notification.update {
+                        sink.lock()
+                            .unwrap()
+                            .push(update.current_mode_id.to_string());
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let first = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?;
+                let second = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                assert_eq!(first.modes.as_ref().unwrap().available_modes.len(), 6);
+                let initial = second.modes.unwrap().current_mode_id.to_string();
+                cx.send_request(SetSessionModeRequest::new(
+                    first.session_id.clone(),
+                    SessionModeId::new("readonly"),
+                ))
+                .block_task()
+                .await?;
+                assert!(
+                    cx.send_request(SetSessionModeRequest::new(
+                        first.session_id.clone(),
+                        SessionModeId::new("none")
+                    ))
+                    .block_task()
+                    .await
+                    .is_err()
+                );
+                let sessions = retained.sessions.lock().await;
+                assert_eq!(
+                    sessions[&first.session_id]
+                        .history
+                        .lock()
+                        .await
+                        .policy
+                        .mode(),
+                    Some(crate::permission::SecurityMode::ReadOnly)
+                );
+                assert_eq!(
+                    sessions[&second.session_id]
+                        .history
+                        .lock()
+                        .await
+                        .policy
+                        .mode()
+                        .unwrap()
+                        .to_string(),
+                    initial
+                );
+                drop(sessions);
+                cx.send_request(CloseSessionRequest::new(first.session_id))
+                    .block_task()
+                    .await?;
+                cx.send_request(CloseSessionRequest::new(second.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*updates.lock().unwrap(), vec!["readonly"]);
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_mode_rpc_refuses_an_admitted_pending_turn() {
+        struct Release(Arc<Notify>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let fixture: PromptFixture = {
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(vec![done("settled", vec![Message::assistant("settled")])])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let retained = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client.builder().connect_with(InMemoryAgent(state), async move |cx| {
+            let _release_on_exit = Release(release.clone());
+            let created = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+            let initial = created.modes.unwrap().current_mode_id.to_string();
+            let pending = cx.send_request(prompt(created.session_id.clone(), "pending")).block_task();
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut pending => panic!("prompt ended before the owned pending gate: {result:?}"),
+            }
+            assert!(cx.send_request(SetSessionModeRequest::new(created.session_id.clone(), SessionModeId::new("readonly")))
+                .block_task().await.is_err());
+            {
+                let sessions = retained.sessions.lock().await;
+                assert!(sessions[&created.session_id].history.try_lock().is_err());
+            }
+            release.notify_one();
+            assert_eq!(pending.await?.stop_reason, StopReason::EndTurn);
+            {
+                let sessions = retained.sessions.lock().await;
+                assert_eq!(sessions[&created.session_id].history.lock().await.policy.mode().unwrap().to_string(), initial);
+            }
+            cx.send_request(SetSessionModeRequest::new(created.session_id.clone(), SessionModeId::new("readonly")))
+                .block_task().await?;
+            cx.send_request(CloseSessionRequest::new(created.session_id)).block_task().await?;
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_permission_selections_rebuild_only_the_selected_session_choice() {
+        use crate::permission::{
+            PermissionConfigs, SecurityMode,
+            ask::{AskRequest, UserDecision},
+            checker::{CheckResult, PermissionChecker},
+        };
+        let root = crate::tests::OwnedTestDirectory::new("acp53-rpc-choice");
+        let target = root
+            .path()
+            .join("exact*.txt")
+            .to_string_lossy()
+            .into_owned();
+        for selected in ["allow_always", "deny_always", "unadvertised"] {
+            let policy = policy::SessionPolicy::new(SecurityMode::Guarded, true);
+            let retained = policy.clone();
+            let permission = Some(Arc::new(StdMutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::default(),
+                    SecurityMode::Guarded,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
+            let agent = Agent
+                .builder()
+                .on_receive_request(
+                    async |_: InitializeRequest, responder, _cx| {
+                        responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                    },
+                    on_receive_request!(),
+                )
+                .with_spawned(move |cx| async move {
+                    drive_permission_bridge(
+                        cx,
+                        idle::Activity::default(),
+                        SessionId::new("choice"),
+                        ask_rx,
+                        Arc::new(TurnControl::new()),
+                        Some(BridgePolicy { policy, permission }),
+                        #[cfg(feature = "goal")]
+                        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    )
+                    .await;
+                    Ok(())
+                });
+            let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            let input = target.clone();
+            let connection = Client
+                .builder()
+                .on_receive_request(
+                    move |request: RequestPermissionRequest, responder, _cx| {
+                        requests.send((request, responder)).unwrap();
+                        async { Ok(()) }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(agent, async move |_cx| {
+                    let (reply, receiver) = tokio::sync::oneshot::channel();
+                    ask_tx
+                        .send(
+                            AskRequest {
+                                tool: "write".into(),
+                                input,
+                                tool_call_id: Some("current".into()),
+                                agent_name: None,
+                                suggested_pattern: None,
+                                additional_allow_patterns: Vec::new(),
+                                reply,
+                            }
+                            .into(),
+                        )
+                        .await
+                        .unwrap();
+                    let (request, responder) = incoming.recv().await.unwrap();
+                    assert!(
+                        request
+                            .options
+                            .iter()
+                            .any(|option| option.kind == PermissionOptionKind::RejectAlways)
+                    );
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            selected,
+                        )),
+                    ))?;
+                    Ok(receiver.await.unwrap())
+                });
+            let decision = tokio::time::timeout(Duration::from_secs(5), connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(decision, UserDecision::AllowAlways(_)),
+                selected == "allow_always"
+            );
+            let next = Some(Arc::new(StdMutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::default(),
+                    SecurityMode::Guarded,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            retained.apply(&next);
+            let result = next
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .check_bound_path("write", &target);
+            assert_eq!(
+                matches!(result, CheckResult::Allowed),
+                selected == "allow_always"
+            );
+            assert_eq!(
+                matches!(result, CheckResult::Denied(_)),
+                selected == "deny_always"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn allow_always_meta_names_the_exact_session_rule_it_installs() {
         use crate::permission::ask::{AskRequest, UserDecision};
 
@@ -4450,6 +5957,7 @@ mod protocol_tests {
                     SessionId::new("allow-always-meta"),
                     ask_rx,
                     control,
+                    None,
                     #[cfg(feature = "goal")]
                     Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 )
@@ -4599,6 +6107,7 @@ mod protocol_tests {
                             SessionId::new("permission-test"),
                             ask_rx,
                             bridge_control,
+                            None,
                             #[cfg(feature = "goal")]
                             Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         )
@@ -4798,6 +6307,276 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn acp53_cancelled_relay_publishes_actual_store_after_owned_drain() {
+        use rig::tool::Tool;
+
+        struct CancelledRelay {
+            store: crate::agent::tools::TodoStore,
+            rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+            entered: Arc<Notify>,
+        }
+        impl ConnectTo<Client> for CancelledRelay {
+            async fn connect_to(
+                self,
+                client: impl ConnectTo<Agent>,
+            ) -> Result<(), agent_client_protocol::Error> {
+                let rx = Arc::new(StdMutex::new(Some(self.rx)));
+                Agent
+                    .builder()
+                    .on_receive_request(
+                        move |req: PromptRequest, responder: Responder<PromptResponse>, cx| {
+                            let rx = rx.lock().unwrap().take().unwrap();
+                            let store = self.store.clone();
+                            let entered = self.entered.clone();
+                            async move {
+                                let control = Arc::new(TurnControl::new());
+                                control.cancel();
+                                entered.notify_one();
+                                let outcome = relay_prompt_events(
+                                    req.session_id,
+                                    cx,
+                                    control,
+                                    rx,
+                                    store,
+                                    #[cfg(feature = "goal")]
+                                    (&Config::default(), "openai"),
+                                )
+                                .await;
+                                responder.respond(PromptResponse::new(outcome.reason))
+                            }
+                        },
+                        on_receive_request!(),
+                    )
+                    .connect_to(client)
+                    .await
+            }
+        }
+        let store = crate::agent::tools::TodoStore::default();
+        let entered = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let connection = Client.builder().on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                sink.lock().unwrap().push(notification);
+                Ok(())
+            }, agent_client_protocol::on_receive_notification!(),
+        ).connect_with(CancelledRelay { store: store.clone(), rx, entered: entered.clone() }, async move |cx| {
+            let session = SessionId::new("cancelled-plan");
+            let response = cx.send_request(prompt(session.clone(), "cancelled")).block_task();
+            tokio::pin!(response);
+            tokio::select! {
+                _ = entered.notified() => {}
+                outcome = &mut response => panic!("cancelled relay must still drain: {outcome:?}"),
+            }
+            assert!(updates.lock().unwrap().is_empty());
+            let output = crate::agent::tools::todo::WriteTodoList::new_with_store(None, None, store.clone())
+                .call(crate::agent::tools::todo::TodoWriteArgs { todos: vec![crate::agent::tools::todo::TodoItem {
+                    content: "actual write before drained result".to_owned(),
+                    status: "in_progress".into(), priority: "high".into(),
+                }] }).await.unwrap();
+            tx.send(AgentEvent::ToolResult { id: "cancelled-todo".into(), name: "todo_write".into(),
+                output: output.into(), is_error: false, images: Vec::new() }).await.unwrap();
+            tx.send(done("settled", vec![Message::assistant("settled")])).await.unwrap();
+            drop(tx);
+            assert_eq!(response.await?.stop_reason, StopReason::Cancelled);
+            // The terminal response fences its prior queued final Plan update.
+            let updates = updates.lock().unwrap();
+            assert_eq!(updates.len(), 1, "{updates:?}");
+            assert_eq!(updates[0].session_id, session);
+            let SessionUpdate::Plan(plan) = &updates[0].update else { panic!("expected final plan") };
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].content, store.snapshot()[0].content);
+            assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_todo_tool_relays_store_changes_clears_and_session_isolation() {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let stores = Arc::new(StdMutex::new(HashMap::<
+            String,
+            crate::agent::tools::TodoStore,
+        >::new()));
+        let fixture: RunnerFixture = {
+            let stores = stores.clone();
+            Arc::new(move |prompt, history| {
+                let store = stores.lock().unwrap().get(&prompt).unwrap().clone();
+                Box::pin(async move {
+                    let todos = match prompt.as_str() {
+                        "clear" => serde_json::json!([]),
+                        "denied" => serde_json::json!([{
+                            "content": "FORGED_DENIED_PLAN", "status": "pending", "priority": "high"
+                        }]),
+                        "invalid" => serde_json::json!([{
+                            "content": "FORGED_INVALID_PLAN", "status": "invalid", "priority": "high"
+                        }]),
+                        "isolated" => serde_json::json!([{
+                            "content": "SECOND_SESSION_ONLY", "status": "pending", "priority": "medium"
+                        }]),
+                        _ => serde_json::json!([
+                            {"content":"inspect", "status":"pending", "priority":"high"},
+                            {"content":"implement", "status":"in_progress", "priority":"medium"},
+                            {"content":"verify", "status":"completed", "priority":"low"},
+                            {"content":"abandoned", "status":"cancelled", "priority":"low"}
+                        ]),
+                    };
+                    let permission = (prompt == "denied").then(|| {
+                        let mut checker = crate::permission::checker::PermissionChecker::new(
+                            &crate::permission::PermissionConfigs::default(),
+                            crate::permission::SecurityMode::Yolo,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        checker.add_session_exact_deny("todo_write", "");
+                        Arc::new(StdMutex::new(checker))
+                    });
+                    let model = rig::test_utils::MockCompletionModel::from_stream_turns(vec![
+                        vec![
+                            rig::test_utils::MockStreamEvent::tool_call(
+                                "todo-call",
+                                "todo_write",
+                                serde_json::json!({"todos": todos}),
+                            ),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ],
+                        vec![
+                            rig::test_utils::MockStreamEvent::text("settled"),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ],
+                    ]);
+                    let agent = rig::agent::AgentBuilder::new(model)
+                        .tool(crate::agent::tools::todo::WriteTodoList::new_with_store(
+                            permission, None, store,
+                        ))
+                        .add_hook(crate::agent::runner::ToolLoopGuard)
+                        .default_max_turns(2)
+                        .build();
+                    crate::agent::runner::spawn_agent_paused(
+                        agent,
+                        prompt,
+                        history,
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    )
+                })
+            })
+        };
+        let state = runner_fixture_state(fixture);
+        let inspect_state = state.clone();
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let ledger_root = crate::tests::OwnedTestDirectory::new("acp53-plan-owned-ledger");
+        let ledger = Arc::new(crate::spend::Ledger::new(ledger_root.path()));
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client.builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                }, agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let first = cx.send_request(NewSessionRequest::new(cwd.clone())).block_task().await?.session_id;
+                let second = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?.session_id;
+                let (first_store, second_store) = {
+                    let mut sessions = inspect_state.sessions.lock().await;
+                    // Inject a real owned ledger and known zero prices for the
+                    // mock provider's actual SDK request account. No ambient
+                    // path override or production admission bypass is needed.
+                    for id in [&first, &second] {
+                        sessions.get_mut(id).unwrap().spend = crate::spend::run::Run::fixture(
+                            crate::spend::Account::new(&id.to_string(), None, 0.0).unwrap(),
+                            ledger.clone(),
+                            &id.to_string(),
+                            crate::spend::PriceSnapshot::capture(Some((0.0, 0.0)), Default::default(), false),
+                        );
+                    }
+                    (sessions[&first].todo_store.clone(), sessions[&second].todo_store.clone())
+                };
+                for case in ["update", "denied", "invalid", "clear"] {
+                    stores.lock().unwrap().insert(case.to_owned(), first_store.clone());
+                }
+                stores.lock().unwrap().insert("isolated".to_owned(), second_store.clone());
+                for case in ["update", "denied", "invalid", "clear", "isolated"] {
+                    let session = if case == "isolated" { &second } else { &first };
+                    let outcome = cx.send_request(prompt(session.clone(), case)).block_task().await?;
+                    assert_eq!(outcome.stop_reason, StopReason::EndTurn, "{case}");
+                    // Fence queued updates through the actual connection before
+                    // draining. All effects and the runner have settled above.
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                    let updates = std::mem::take(&mut *notifications.lock().unwrap());
+                    let plans = updates.iter().filter_map(|notification| {
+                        if let SessionUpdate::Plan(plan) = &notification.update {
+                            assert_eq!(&notification.session_id, session);
+                            Some(plan)
+                        } else { None }
+                    }).collect::<Vec<_>>();
+                    match case {
+                        "clear" => {
+                            assert_eq!(plans.len(), 2);
+                            assert_eq!(plans[0].entries.len(), 4);
+                            assert!(plans[1].entries.is_empty());
+                            assert!(first_store.is_empty());
+                        }
+                        "isolated" => {
+                            assert_eq!(plans.len(), 1);
+                            assert_eq!(plans[0].entries[0].content, "SECOND_SESSION_ONLY");
+                            assert!(first_store.is_empty());
+                            assert_eq!(second_store.snapshot().len(), 1);
+                        }
+                        _ => {
+                            assert_eq!(plans.len(), 1, "{case}: {plans:?}; actual updates: {updates:?}; actual store: {:?}", first_store.snapshot());
+                            let entries = &plans[0].entries;
+                            assert_eq!(entries.iter().map(|entry| entry.content.as_str()).collect::<Vec<_>>(),
+                                ["inspect", "implement", "verify", "abandoned"]);
+                            assert_eq!(entries[0].priority, PlanEntryPriority::High);
+                            assert_eq!(entries[1].priority, PlanEntryPriority::Medium);
+                            assert_eq!(entries[2].priority, PlanEntryPriority::Low);
+                            assert_eq!(entries[0].status, PlanEntryStatus::Pending);
+                            assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
+                            assert_eq!(entries[2].status, PlanEntryStatus::Completed);
+                            assert_eq!(entries[3].status, PlanEntryStatus::Pending);
+                            assert_eq!(entries[3].meta.as_ref().unwrap()["mini-agent-status"], "cancelled");
+                            assert_eq!(first_store.snapshot().len(), 4);
+                            assert!(second_store.is_empty());
+                            if case != "update" {
+                                assert!(updates.iter().any(|notification| matches!(&notification.update,
+                                    SessionUpdate::ToolCallUpdate(update) if update.fields.status == Some(ToolCallStatus::Failed))),
+                                    "actual typed tool failure must remain failed: {updates:?}");
+                                let expected = if case == "denied" {
+                                    "Permission denied"
+                                } else {
+                                    "todo_write rejected"
+                                };
+                                assert!(updates.iter().any(|notification| matches!(&notification.update,
+                                    SessionUpdate::ToolCallUpdate(update) if serde_json::to_string(&update.fields.content).unwrap().contains(expected))),
+                                    "{case} must reach the actual tool refusal: {updates:?}");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn in_memory_protocol_preserves_history_isolation_rollback_and_tool_ids() {
         let observed = Arc::new(StdMutex::new(Vec::<(String, Vec<Message>)>::new()));
         let answered_from_context = Arc::new(AtomicBool::new(false));
@@ -4892,7 +6671,14 @@ mod protocol_tests {
                     .block_task()
                     .await?;
                 assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
-                assert!(!initialized.agent_capabilities.load_session);
+                assert!(initialized.agent_capabilities.load_session);
+                assert!(
+                    initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .list
+                        .is_some()
+                );
                 assert!(
                     initialized
                         .agent_capabilities
@@ -4951,7 +6737,7 @@ mod protocol_tests {
                         .block_task()
                         .await
                         .is_err(),
-                    "unadvertised load_session must also be rejected on the wire"
+                    "load must not replace an identity whose existing runtime lease is still owned"
                 );
                 Ok(())
             })
@@ -8701,7 +10487,11 @@ mod goal_acp_tests {
             })
             .await;
 
-        let summary = history.summary.clone().expect("history was summarized");
+        let summary = history
+            .session
+            .compacted_context()
+            .0
+            .expect("history was summarized");
         assert!(
             summary.contains("finish the migration"),
             "the objective must survive ACP compaction: {summary}"
@@ -8727,8 +10517,9 @@ mod goal_acp_tests {
             .await;
         assert!(
             !history
-                .summary
-                .clone()
+                .session
+                .compacted_context()
+                .0
                 .unwrap_or_default()
                 .contains("already done")
         );
@@ -8797,6 +10588,7 @@ mod question_transport_tests {
                         SessionId::new("question-rpc"),
                         receiver,
                         control,
+                        None,
                         #[cfg(feature = "goal")]
                         Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     )

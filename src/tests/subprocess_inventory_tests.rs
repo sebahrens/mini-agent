@@ -790,6 +790,50 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // ACP AvailableCommand constructors build protocol descriptions, not processes.
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(\"compact\", \"Summarize the completed session context\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(\"rename\", \"Rename this saved session\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "commands.push(AvailableCommand::new(",
+        1,
+        "NON-PROCESS",
+    ),
+    // ACP protocol statuses and the Bedrock HTTP response builder are data.
+    (
+        "src/extras/acp/sessions.rs",
+        ".status(ToolCallStatus::Completed)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/sessions.rs",
+        ".status(ToolCallStatus::Pending),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_bedrock.rs",
+        ".status(response.status())",
+        1,
+        "NON-PROCESS",
+    ),
     // ReadImage serializes already admitted image data; no process terminal.
     (
         "src/agent/tools/read.rs",
@@ -1806,6 +1850,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // TodoItem status data in the exact cancellation relay fixture below.
+    (
+        "src/extras/acp/mod.rs",
+        "status: \"in_progress\".into(), priority: \"high\".into(),",
+        1,
+        "NON-PROCESS",
+    ),
     // Reviewed local HookOutput fixture calls inside exact matches! contexts.
     (
         "src/extras/hooks/dispatcher.rs",
@@ -3818,6 +3869,12 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/acp/mod.rs",
         &[
+            // Full tokio::select! tree: actual TodoStore write and channel relay,
+            // with a TodoItem status field, no process construction or terminal.
+            (
+                "5e6b7deef53c9bbc937e9b5f2643396b1eb7a0dd176f3db52719403e9047f84e",
+                1,
+            ),
             (
                 "f916c2d7ba7a437738651f8bb303850276f6a20d3e50b876e924540be5a586e5",
                 1,
@@ -4493,6 +4550,48 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(\"compact\", \"Summarize the completed session context\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(\"rename\", \"Rename this saved session\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "commands.push(AvailableCommand::new(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/sessions.rs",
+        ".status(ToolCallStatus::Completed)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/sessions.rs",
+        ".status(ToolCallStatus::Pending),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_bedrock.rs",
+        ".status(response.status())",
+        1,
+        "NON-PROCESS",
+    ),
     // ReadImage serializes already admitted image data; no process terminal.
     (
         "src/agent/tools/read.rs",

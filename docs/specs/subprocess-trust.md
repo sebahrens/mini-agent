@@ -13,6 +13,14 @@ Seatbelt capability matrices for model-generated actions.
 
 ## Instruction-skill regression inventory
 
+ACP command announcements construct protocol `AvailableCommand` descriptions;
+saved-session replay uses typed `ToolCallStatus` builders. Bedrock credential
+HTTP uses an HTTP response builder and response-status getter. Their exact status
+sites are `NON-PROCESS` in both checked catalogues. The ACP cancellation fixture's
+TodoItem status field is also data, with its complete `tokio::select!` token tree
+pinned by digest and occurrence. These classifications add no process authority;
+the scanner and process-creation negative controls are unchanged.
+
 The actual instruction list/pin App regression creates one owned1MiB Rust thread
 and joins it before fixture cleanup. Its exact `std::thread::Builder` spawn is
 non-process data in the checked inventory. The shared instruction compositor moves

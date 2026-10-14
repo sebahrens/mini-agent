@@ -478,8 +478,9 @@ created through the same private storage helper (`0600` / protected DACL).
 - A save of a session whose lock another process holds is refused with an
   error instead of overwriting that process's turns, tool records, cost, and
   goal progress.
-- `--no-session` runs never save and take no lock. ACP sessions are
-  process-local and are not persisted, so they need no lock.
+- `--no-session` runs never save and take no lock. Persisted ACP sessions
+  claim the same exclusive writer lock before installation; a conflicting
+  writer is refused rather than silently forked or saved without ownership.
 - The operating system releases the lock when the owner exits or crashes. A
   leftover `.lock` file is inert and is never deleted, because unlinking a lock
   file another process has open would let two owners lock different files.
@@ -2632,28 +2633,68 @@ work the turn completed is still committed to the session history. Tool calls
 that fail, are denied, or whose outcome is unknown are reported with tool-call
 status `failed` instead of `completed`.
 
-Each new ACP session also owns an independent in-memory conversation history.
-Only completed turns are committed: the user prompt, correlated structured tool
-call/result messages, and the terminal assistant response are retained together.
+Each ACP session owns one canonical `Session` history. Accepted user content,
+correlated structured tool call/results, observed usage and terminal assistant
+content are retained together, including accepted progress before cancellation.
 The next prompt receives that committed history before its current user message.
-History is bounded to 128 complete turns and 2 MiB of serialized Rig messages;
+Live history is bounded to 128 user-started intervals and 2 MiB of serialized
+canonical messages;
 before an over-bound history is reused, the ordinary provider-backed rolling
-summarizer replaces the oldest complete turns with a bounded recap. A
-compaction failure refuses that prompt without discarding the task origin. The
-process retains at most 64 ACP
-sessions. Because ACP exposes no session-close notification, creating a 65th
-session is rejected rather than silently invalidating any live session. Each
+summarizer replaces the oldest complete intervals with a bounded recap and
+records actual compaction metadata. Failure or zero progress uses an explicitly
+labelled emergency recap; original durable rows remain archived. The process
+retains at most 64 ACP sessions, counting pending loads and retiring owners.
+Creating a 65th session is rejected rather than silently invalidating a live session. Each
 session accepts one active prompt; a concurrent prompt for the same session is
 rejected instead of queued. Protocol dispatch and work in other sessions remain
-independent. History is not persisted across server restarts, and the agent
-therefore neither advertises nor handles ACP `session/load`.
+independent. Unless `--no-session` is set, checkpoints save through the shared
+private storage after model, effect, accounting and MCP retirement. Writer or
+save failure is visible; accepted progress remains in memory. No claim is made
+that an unwritable older disk checkpoint was updated by a failed save.
+
+`session/list` exposes bounded private metadata; `session/load` imports an exact
+saved ID in its matching captured workspace and replays literal history as ACP
+updates. Stored paths do not select a filesystem root. Import never restores
+permission choices, read proofs, hidden redo, instruction receipts or a question
+waiter. The VS Code command **Mini Agent: Resume Saved Session** selects from this
+workspace catalogue, closes the old conversation, and uses public ACP load/prompt
+requests with exact session-ID update routing. An active prompt blocks switching.
+
+Available commands are `/compact`, `/undo`, `/rename` and, with the goal feature,
+`/goal`. Only one original Text block can select a local command; resources,
+images and model output remain data. Undo removes conversation context, not files
+or billed usage. Native signed-history compatibility changes remain visibly
+refused until an explicit supported recovery boundary is available.
+
+With `multimodal`, ordered inline PNG/JPEG/GIF/WebP images reach the provider and
+persist in the canonical User row. URI metadata is never fetched. Limits are
+128 blocks, 8 images, 2 MiB per decoded image, 4 MiB of decoded images, 1 MiB of
+text, and 6 MiB of actual encoded payload; each cap applies independently. Shared
+session storage is limited to 8 MiB and 100,000 messages. Feature-off builds
+refuse image input and saved image history before dispatch, retaining stored
+data. The SDK's transport and provider error handling remain authoritative for
+unknown model capabilities; no model-name capability inference is used.
+
+ACP clients receive per-session permission modes when ordinary tools and
+permission checks are enabled. `session/set_mode` changes that session only
+while it is idle; an active generation, an unknown mode, or disabled checks
+refuses the change. It retains the existing sandbox and tool eligibility.
+`AllowAlways` and `RejectAlways` choices last for this running session, with
+bounded scopes and exact literal denials; they are not saved or imported.
+
+The session's actual todo store produces ACP `Plan` updates after tool results
+and final runner settlement, including cancellation. Rejected writes retain
+the prior plan; clearing it publishes an empty plan. Cancelled tasks retain
+`mini-agent-status: cancelled` metadata because ACP v1 has no cancelled status.
+See [the runtime policy contract](../specs/acp-session-runtime-policy.md).
 
 ACP `session/cancel` stops the active turn for that session and
 returns `cancelled` from its original `session/prompt` request. Cancellation is
 generation-tagged: duplicate notifications are idempotent, a notification after
 completion cannot abort a later prompt, and a runner attached after an early
-cancellation is aborted immediately. Cancelled turns commit no user, tool, or
-assistant history. Dropping the original prompt request has the same effect.
+cancellation is aborted immediately. Cancellation retains already accepted
+canonical progress and usage after owned retirement; an unstarted turn adds no
+invented history. Dropping the original prompt request has the same effect.
 Concurrent prompts for one session are rejected while its turn is active, so an
 untagged duplicate cancellation cannot be redirected to queued work. Other
 sessions remain independent and continue normally.

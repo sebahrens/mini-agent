@@ -131,6 +131,25 @@ describe('Conversation', () => {
   });
 });
 
+describe('saved conversation adoption', () => {
+  it('refuses adoption during a prompt and adopts only after retirement', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const original: ConversationSession = { prompt: vi.fn(async () => { await gate; return 'end_turn' as const; }), close: vi.fn(async () => undefined) };
+    const restored = fakeSession(['end_turn']);
+    const conversation = new Conversation(async () => original);
+    const first = conversation.prompt('first', vi.fn(), new AbortController().signal);
+    await vi.waitFor(() => expect(original.prompt).toHaveBeenCalledOnce());
+    await expect(conversation.adopt(restored)).rejects.toThrow(/settle/);
+    expect(original.close).not.toHaveBeenCalled();
+    release(); await first;
+    await conversation.adopt(restored);
+    await conversation.prompt('resumed', vi.fn(), new AbortController().signal);
+    expect(original.close).toHaveBeenCalledOnce();
+    expect(restored.prompt).toHaveBeenCalledOnce();
+  });
+});
+
 describe('SerialTransitionQueue', () => {
   it('runs transitions in call order even when the first is still pending', async () => {
     const queue = new SerialTransitionQueue();

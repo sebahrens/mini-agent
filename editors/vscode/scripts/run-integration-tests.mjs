@@ -5,9 +5,9 @@ import { join, resolve } from 'node:path';
 import { downloadAndUnzipVSCode, runTests, runVSCodeCommand } from '@vscode/test-electron';
 import { TARGETS } from './platform.mjs';
 
-const [, , vsixArgument, target] = process.argv;
-if (!vsixArgument || !TARGETS[target]) {
-  throw new Error('Usage: node scripts/run-integration-tests.mjs <candidate.vsix> <target>');
+const [, , vsixArgument, target, testScenario = 'smoke'] = process.argv;
+if (!vsixArgument || !TARGETS[target] || !['smoke', 'resume'].includes(testScenario)) {
+  throw new Error('Usage: node scripts/run-integration-tests.mjs <candidate.vsix> <target> [smoke|resume]');
 }
 
 const platform = target === 'win32-x64'
@@ -40,6 +40,11 @@ writeFileSync(fixtureFile, 'OFFLINE_IDE_FIXTURE\n');
 mkdirSync(testExtension);
 mkdirSync(configRoot, { mode: 0o700 });
 const provider = createServer(async (request, response) => {
+  if (request.method === 'GET') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{"data":[]}');
+    return;
+  }
   let body = '';
   for await (const chunk of request) { body += chunk.toString(); }
   const payload = JSON.parse(body);
@@ -54,11 +59,14 @@ const provider = createServer(async (request, response) => {
     messages: payload.messages?.length ?? 0,
     scenario,
     toolResult: payload.messages?.findLast(message => message.role === 'tool')?.content,
+    ...(testScenario === 'resume' ? { messageHistory: payload.messages } : {}),
   }) + '\n');
   const chunk = (delta, finishReason) => JSON.stringify({
     id: 'offline-ide-turn', object: 'chat.completion.chunk', created: 0,
     model: 'offline-ide',
     choices: [{ index: 0, delta, finish_reason: finishReason }],
+    ...(testScenario === 'resume' && finishReason === 'stop'
+      ? { usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 } } : {}),
   });
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   if (scenario?.startsWith('PERMISSION_')) {
@@ -82,6 +90,7 @@ writeFileSync(join(configRoot, 'config.toml'), [
   'provider = "offline-ide"',
   'model = "offline-ide"',
   'max_tokens = 256',
+  'session_title_model = "off"',
   'default_permission_mode = "restrictive"',
   '[custom_providers.offline-ide]',
   'provider_type = "openai"',
@@ -112,10 +121,16 @@ try {
     vscodeExecutablePath,
     platform: options.platform,
     extensionDevelopmentPath: testExtension,
-    extensionTestsPath: resolve(extensionRoot, 'test/integration.cjs'),
+    extensionTestsPath: resolve(extensionRoot, testScenario === 'resume' ? 'test/resume.integration.cjs' : 'test/integration.cjs'),
     launchArgs: [workspace, '--disable-workspace-trust', ...profileArgs],
     extensionTestsEnv: {
       MINI_AGENT_HOME: configRoot,
+      ZS_CONFIG_DIR: configRoot,
+      ZS_DATA_DIR: configRoot,
+      ZS_LOCAL_DATA_DIR: configRoot,
+      ZS_STATE_DIR: configRoot,
+      ZS_CACHE_DIR: configRoot,
+      ZS_CREDENTIALS_DIR: configRoot,
       MINI_AGENT_VSIX_PROFILE_ROOT: join(profileRoot, 'extensions'),
       MINI_AGENT_IDE_PROVIDER_EVENTS: providerEvents,
       MINI_AGENT_IDE_FIXTURE_KEY: 'unused-local-fixture-key',

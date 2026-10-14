@@ -39,6 +39,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('mini-agent.start', () => cmdStart(context)),
     vscode.commands.registerCommand('mini-agent.stop', () => cmdStop()),
     vscode.commands.registerCommand('mini-agent.restart', () => cmdRestart(context)),
+    vscode.commands.registerCommand('mini-agent.resume', async () => { const active = await ensureSession(context); await active?.resumeSavedSession(); }),
     vscode.commands.registerCommand('mini-agent.selectFolder', () => cmdSelectFolder(context)),
     vscode.commands.registerCommand('mini-agent.openConfig', () => cmdOpenConfig()),
     vscode.commands.registerCommand('mini-agent.showOutput', () => showOutput()),

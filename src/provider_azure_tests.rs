@@ -209,7 +209,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
 
 fn reply(style: ApiStyle, step: usize) -> String {
     if style == ApiStyle::Responses {
-        let output = if step == 0 {
+        let response_item = if step == 0 {
             json!({"type":"function_call","id":"fc_azure","call_id":"call-azure","name":Probe::NAME,"arguments":"{}","status":"completed"})
         } else {
             json!({"type":"message","id":"msg_azure","role":"assistant","status":"completed","content":[{"type":"output_text","text":"AZURE_DONE","annotations":[]}]})
@@ -224,8 +224,8 @@ fn reply(style: ApiStyle, step: usize) -> String {
             } else {
                 String::new()
             },
-            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":output}),
-            json!({"type":"response.completed","sequence_number":1,"response":{"id":format!("resp_azure_{step}"),"object":"response","created_at":0,"status":"completed","model":"owned-deployment","output":[output],"tools":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}})
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":response_item}),
+            json!({"type":"response.completed","sequence_number":1,"response":{"id":format!("resp_azure_{step}"),"object":"response","created_at":0,"status":"completed","model":"owned-deployment","output":[response_item],"tools":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}})
         )
     } else {
         let delta = if step == 0 {

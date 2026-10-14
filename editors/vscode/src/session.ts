@@ -6,7 +6,6 @@ import {
   Conversation,
   type ConversationSession,
   SerialTransitionQueue,
-  SessionUnavailableError,
 } from './conversation';
 import {
   LineRingBuffer,
@@ -16,6 +15,7 @@ import {
   withRecentStderr,
 } from './diagnostics';
 import { log } from './log';
+import { SessionUpdateRouter, type PublicProtocolSession } from './protocolSession';
 
 type SessionState = 'stopped' | 'starting' | 'running' | 'stopping';
 
@@ -32,68 +32,6 @@ function requireTrustedWorkspace(): void {
   if (!vscode.workspace.isTrusted) { throw trustedWorkspaceError(); }
 }
 
-class AcpProtocolSession implements ConversationSession {
-  private prompting = false;
-
-  constructor(
-    private readonly session: acp.ActiveSession,
-    private readonly client: acp.ClientContext,
-  ) {}
-
-  async prompt(
-    text: string,
-    onUpdate: (update: acp.SessionUpdate) => void,
-    signal: AbortSignal,
-  ): Promise<acp.StopReason> {
-    if (signal.aborted) { return 'cancelled'; }
-    requireTrustedWorkspace();
-    this.prompting = true;
-    let cancellationSent = false;
-    const cancel = (): void => {
-      if (cancellationSent) { return; }
-      cancellationSent = true;
-      void this.client.notify(acp.methods.agent.session.cancel, {
-        sessionId: this.session.sessionId,
-      }).catch(error => log.warn(`ACP cancellation failed: ${errorMessage(error)}`));
-    };
-    signal.addEventListener('abort', cancel, { once: true });
-
-    try {
-      // ActiveSession forwards typed updates and queues the final prompt response.
-      void this.session.prompt(text, { cancellationSignal: signal }).catch(() => undefined);
-      for (;;) {
-        const message = await this.session.nextUpdate();
-        if (message.kind === 'stop') { return message.stopReason; }
-        onUpdate(message.update);
-      }
-    } catch (error) {
-      if (isUnknownSession(error)) { throw new SessionUnavailableError(); }
-      throw error;
-    } finally {
-      signal.removeEventListener('abort', cancel);
-      this.prompting = false;
-    }
-  }
-
-  async close(): Promise<void> {
-    if (this.prompting) {
-      try {
-        await this.client.notify(acp.methods.agent.session.cancel, {
-          sessionId: this.session.sessionId,
-        });
-      } catch (error) {
-        log.warn(`ACP cancellation during close failed: ${errorMessage(error)}`);
-      }
-    }
-    try {
-      await this.client.request(acp.methods.agent.session.close, {
-        sessionId: this.session.sessionId,
-      }, { cancellationSignal: AbortSignal.timeout(5000) });
-    } finally {
-      this.session.dispose();
-    }
-  }
-}
 
 function extensionVersion(context: vscode.ExtensionContext): string {
   const manifest = context.extension.packageJSON as Record<string, unknown>;
@@ -106,6 +44,8 @@ export class AgentSession {
   private proc: cp.ChildProcessWithoutNullStreams | undefined;
   private connection: acp.ClientConnection | undefined;
   private client: acp.ClientContext | undefined;
+  private readonly updates = new SessionUpdateRouter();
+  private supportsLoad = false;
   private state: SessionState = 'stopped';
   private readonly transitions = new SerialTransitionQueue();
   private readonly statusBar: vscode.StatusBarItem;
@@ -228,6 +168,7 @@ export class AgentSession {
     const output = Writable.toWeb(proc.stdin) as WritableStream<Uint8Array>;
     const input = Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>;
     const app = acp.client({ name: 'mini-agent-vscode' })
+      .onNotification(acp.methods.client.session.update, notification => this.updates.receive(notification.params))
       .onRequest(acp.methods.client.session.requestPermission, request => (
         this.requestPermission(request.params, request.signal)
       ));
@@ -241,6 +182,7 @@ export class AgentSession {
         clientCapabilities: {},
         clientInfo: { name: 'mini-agent-vscode', version: extensionVersion(this.context) },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
+      this.supportsLoad = initialized.agentCapabilities?.loadSession === true;
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
       requireTrustedWorkspace();
       this.setState('running');
@@ -265,16 +207,53 @@ export class AgentSession {
       await this.stop();
       throw trustedWorkspaceError();
     }
-    const session = await client.buildSession(this.folder.uri.fsPath).start({
-      cancellationSignal: AbortSignal.timeout(10_000),
+    this.updates.begin();
+    try {
+      const response = await client.request(acp.methods.agent.session.new, { cwd: this.folder.uri.fsPath, mcpServers: [] },
+        { cancellationSignal: AbortSignal.timeout(10_000) });
+      requireTrustedWorkspace();
+      const session = this.updates.finish(client, response.sessionId);
+      log.info(`ACP session created: ${session.sessionId}`);
+      return session;
+    } catch (error) { this.updates.reset(); throw error; }
+  }
+
+  async resumeSavedSession(): Promise<void> {
+    await this.start();
+    return this.transitions.run(async () => {
+      requireTrustedWorkspace();
+      if (this.conversation.isPrompting) { throw new Error('Wait for the current prompt to settle before resuming a saved session.'); }
+      const client = this.client;
+      if (!client || !this.supportsLoad) { throw new Error('This agent does not support saved ACP sessions.'); }
+      const response = await client.request(acp.methods.agent.session.list, { cwd: this.folder.uri.fsPath },
+        { cancellationSignal: AbortSignal.timeout(10_000) });
+      const items = response.sessions.slice(0, 100).map(row => ({
+        label: safeSessionLabel(row.title ?? row.sessionId),
+        description: row.sessionId,
+        sessionId: row.sessionId,
+      }));
+      if (items.length === 0) { void vscode.window.showInformationMessage('No saved Mini Agent sessions exist for this workspace.'); return; }
+      const selected = await vscode.window.showQuickPick(items, { placeHolder: 'Resume a saved Mini Agent session in this workspace' });
+      if (!selected) { return; }
+      requireTrustedWorkspace();
+      if (this.conversation.isPrompting) { throw new Error('The current prompt is still active; saved session was not loaded.'); }
+      await this.conversation.close();
+      this.updates.begin(selected.sessionId);
+      let attached: PublicProtocolSession | undefined;
+      try {
+        await client.request(acp.methods.agent.session.load, { sessionId: selected.sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
+          { cancellationSignal: AbortSignal.timeout(10_000) });
+        requireTrustedWorkspace();
+        attached = this.updates.finish(client, selected.sessionId);
+        await this.conversation.adopt(attached);
+        log.info(`ACP saved session resumed: ${selected.sessionId}`);
+      } catch (error) {
+        this.updates.reset();
+        if (attached) { await attached.close().catch(() => undefined); }
+        else { await client.request(acp.methods.agent.session.close, { sessionId: selected.sessionId }, { cancellationSignal: AbortSignal.timeout(5000) }).catch(() => undefined); }
+        throw error;
+      }
     });
-    if (!vscode.workspace.isTrusted) {
-      session.dispose();
-      await this.stop();
-      throw trustedWorkspaceError();
-    }
-    log.info(`ACP session created: ${session.sessionId}`);
-    return new AcpProtocolSession(session, client);
   }
 
   private onError(proc: cp.ChildProcessWithoutNullStreams, error: Error): void {
@@ -309,6 +288,7 @@ export class AgentSession {
     this.connection = undefined;
     this.client = undefined;
     this.proc = undefined;
+    this.updates.reset();
     this.conversation.invalidate();
     this.setState('stopped');
   }
@@ -376,11 +356,6 @@ export class AgentSession {
   }
 }
 
-function isUnknownSession(error: unknown): boolean {
-  return error instanceof acp.RequestError
-    && error.code === -32602
-    && error.message.includes('unknown ACP session');
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -405,4 +380,13 @@ async function terminate(proc: cp.ChildProcess): Promise<void> {
     proc.kill('SIGTERM');
     if (proc.exitCode !== null) { finish(); }
   });
+}
+
+function safeSessionLabel(value: string): string {
+  return Array.from(value).slice(0, 200).map(character => {
+    const code = character.codePointAt(0) ?? 0;
+    return code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x61c
+      || code === 0x200e || code === 0x200f || (code >= 0x202a && code <= 0x202e)
+      || (code >= 0x2066 && code <= 0x2069) ? '?' : character;
+  }).join('').replace(/\$\(/gu, '$ (');
 }

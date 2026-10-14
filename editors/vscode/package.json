@@ -1,7 +1,7 @@
 {
   "name": "mini-agent",
   "displayName": "Mini Agent",
-  "description": "Mini Agent — AI coding agent with ACP stdio integration",
+  "description": "Mini Agent \u2014 AI coding agent with ACP stdio integration",
   "version": "1.9.4",
   "publisher": "mini-agent",
   "license": "GPL-3.0-only",
@@ -13,8 +13,15 @@
     "vscode": "^1.91.0",
     "node": ">=20.0.0"
   },
-  "categories": ["AI", "Chat", "Other"],
-  "extensionKind": ["workspace", "ui"],
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -53,6 +60,10 @@
       {
         "command": "mini-agent.showOutput",
         "title": "Mini Agent: Show Output"
+      },
+      {
+        "command": "mini-agent.resume",
+        "title": "Mini Agent: Resume Saved Session"
       }
     ],
     "configuration": {
@@ -66,7 +77,13 @@
         },
         "mini-agent.logLevel": {
           "type": "string",
-          "enum": ["error", "warn", "info", "debug", "trace"],
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
           "default": "info",
           "description": "Log verbosity for the mini-agent output channel.",
           "scope": "machine"

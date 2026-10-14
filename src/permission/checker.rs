@@ -1771,6 +1771,25 @@ impl PermissionChecker {
         }
     }
 
+    /// A user-selected session denial is an ordinary deny rule, so every
+    /// checker consumer (including walkers and hooks) keeps deny precedence.
+    #[cfg(feature = "acp")]
+    pub(crate) fn add_session_exact_deny(&mut self, tool: &str, input: &str) {
+        let tool = canonical_permission_tool(tool);
+        let pattern = if is_path_tool_name(tool) {
+            let absolute = resolve_absolute(input, &self.working_dir);
+            Pattern::new_literal_path(&normalize_path(Path::new(&absolute)).to_string_lossy())
+        } else {
+            Pattern::new_literal(input)
+        };
+        for name in std::iter::once(tool).chain(permission_tool_aliases(tool).iter().copied()) {
+            self.rules
+                .entry(name.to_string())
+                .or_default()
+                .push((pattern.clone(), Action::Deny));
+        }
+    }
+
     pub(crate) fn replace_session_allowlist(&mut self, entries: &[(String, String)]) {
         self.session_allowlist.clear();
         self.last_call = None;

@@ -1,0 +1,44 @@
+{
+  "beads": ["mini-agent-i7ro6.53", "mini-agent-3mr5k"],
+  "accepted_source": {
+    "commit": "0d35efca",
+    "patch_sha256": "13b46fe2e8b0f13d64de1f79d444d8f6bac366896c89156f57ebf028964bd707",
+    "integration": "Three-way application to4ab095ae was clean. Eighteen unchanged files match the accepted manifest. CONFIG retains Bedrock; the native integration test and runtime-policy documentation intentionally extend acceptance."
+  },
+  "review": {
+    "findings": [],
+    "scope": "Reuse accepted canonical ACP consumer, storage, modes, Plan, media and editor reviews; inspect the new native lifecycle and current Main integration delta.",
+    "contracts": [
+      "Persist canonical sessions; implement bounded public list/load with history replay and fresh runtime policy. Session identity/capacity leases include pending and retiring owners.",
+      "Typed mode selection, bounded exact session choices and RejectAlways preserve ordinary deny precedence and never import grants.",
+      "Local commands require the original sole text block. Plan updates come from actual TodoStore state; ordered image inputs require the compiled feature and retain retry identity.",
+      "Native ACP establishes publication before hooks/MCP/preparation, pairs the actual paused actor and commits typed canonical input after retirement through the ACP event sink.",
+      "Native history/rename/goal mutation refusals leave saved bytes unchanged and keep the protocol connection alive. No fresh-context recovery is introduced.",
+      "Live SDK lifecycle IDs pair live notifications; canonical model IDs pair saved history, replay notifications and provider tool-result requests.",
+      "Process inventory changes classify exact protocol/HTTP data and one full fixture macro digest. Scanner behavior and process negative controls remain unchanged."
+    ]
+  },
+  "validation": {
+    "indexed_selection": "File-qualified execute_prompt caller plus accepted ACP session/storage/native/permission/editor test map; physical defining files and integration delta verified.",
+    "reused_owner": "22 current handlers/storage controls;2 public protocol/cancellation callers; generic/native actual stdio controls; current feature-off refusal;27 editor tests and typecheck; unchanged10-file installed VSCode resume/picker/process-restart proof.",
+    "new_native_cargo_test": "One exact actual stdio control PASS1.09s: permitted Read, four requests, both same-process turns, restart/load/third turn, exact call/result pairs, opaque replay, unchanged static prefix, usage80/20 and unchanged bytes on refused commands.",
+    "installed_native": {
+      "passed": true,
+      "seconds": 0.96,
+      "stack_bytes": 1048576,
+      "binary_sha256": "9ad1213100f23e570671a191ea54037d654e0d0812f89db93dd1d2095c6639f3",
+      "method": "Reuse the compiled integration fixture against the installed production bytes at its existing executable path; SHA equality with the installed file verified before and after. No recompilation or extra driver.",
+      "log": "/private/tmp/mini-agent-acp53-installed-native-read.log"
+    },
+    "inventory": "All27 inventory controls pass across the scoped runs, including the creation-boundary guard and macro/alias/guard negative controls; final2 updated catalogue checks PASS7.70s. Azure actual wire fixture also passes. Initial failed catalogue/discovery results are not counted as passes.",
+    "strict_all_targets": "PASS55.24s; includes the newly integrated unconditional AWS dependencies and changed tests.",
+    "required_debug_install": "PASS25.19s; /private/tmp/mini-agent-acp53-merged-install/bin/mini-agent",
+    "external_provider_calls": 0
+  },
+  "limits": [
+    "Inert provider signatures prove retention and request construction, not paid cryptographic acceptance.",
+    "The installed editor proof is reused for unchanged editor code; current server behavior has new actual stdio evidence.",
+    "Native local rewrites retain the existing frontend restriction; other providers keep generic command behavior.",
+    "Full hosted source CI remains pending, and ala40.12 and57.1 remain separate unfinished issues."
+  ]
+}

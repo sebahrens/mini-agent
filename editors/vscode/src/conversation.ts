@@ -64,6 +64,17 @@ export class Conversation {
     }
   }
 
+  get isPrompting(): boolean { return this.prompting; }
+
+  async adopt(session: ConversationSession): Promise<void> {
+    if (this.prompting) { throw new Error('Wait for the current ACP prompt to settle before resuming a saved session.'); }
+    this.prompting = true;
+    try {
+      if (this.session) { await this.session.close(); }
+      this.session = session;
+    } finally { this.prompting = false; }
+  }
+
   async close(): Promise<void> {
     const session = this.session;
     this.session = undefined;

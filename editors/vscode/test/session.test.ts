@@ -13,6 +13,8 @@ const statusBar = vi.hoisted(() => ({
 const ui = vi.hoisted(() => ({
   showErrorMessage: vi.fn(),
   showWarningMessage: vi.fn(),
+  showInformationMessage: vi.fn(),
+  showQuickPick: vi.fn(),
 }));
 const logMock = vi.hoisted(() => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
@@ -28,6 +30,8 @@ vi.mock('vscode', () => ({
     createStatusBarItem: vi.fn(() => statusBar),
     showErrorMessage: ui.showErrorMessage,
     showWarningMessage: ui.showWarningMessage,
+    showInformationMessage: ui.showInformationMessage,
+    showQuickPick: ui.showQuickPick,
   },
 }));
 vi.mock('../src/log', () => ({ log: logMock }));
@@ -35,11 +39,78 @@ vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
   return { ...actual, spawn: spawnMock };
 });
+
+describe('AgentSession saved-session public adapter', () => {
+  it('closes the previous conversation before loading the selected saved identity and reuses it for the next prompt', async () => {
+    successfulProbe();
+    const child = new FakeProtocolProcess();
+    spawnMock.mockReturnValueOnce(child);
+    const calls: string[] = [];
+    const agent = {
+      request: vi.fn(async (method: string, params: Record<string, unknown>) => {
+        calls.push(`${method}:${params.sessionId ?? ''}`);
+        switch (method) {
+          case 'initialize': return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+          case 'session/new': return { sessionId: 'previous-session' };
+          case 'session/list': return { sessions: [{ sessionId: 'saved-session', cwd: '/workspace', title: 'Saved\u061c$(command)' }] };
+          case 'session/prompt': return { stopReason: 'end_turn' };
+          default: return {};
+        }
+      }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    ui.showQuickPick.mockImplementationOnce(async (items: { sessionId: string; label: string }[]) => {
+      expect(items[0]?.label).toBe('Saved?$ (command)');
+      return items[0];
+    });
+    const session = makeSession();
+    try {
+      await session.prompt('first', vi.fn(), new AbortController().signal);
+      await session.resumeSavedSession();
+      await session.prompt('continue', vi.fn(), new AbortController().signal);
+      expect(calls).toEqual([
+        'initialize:', 'session/new:', 'session/prompt:previous-session',
+        'session/list:', 'session/close:previous-session', 'session/load:saved-session',
+        'session/prompt:saved-session',
+      ]);
+      expect(agent.request).toHaveBeenCalledWith('session/load', {
+        sessionId: 'saved-session', cwd: '/workspace', mcpServers: [],
+      }, expect.anything());
+    } finally { await session.stop(); session.dispose(); }
+  });
+
+  it('does not list or load while the current prompt owns retirement', async () => {
+    successfulProbe();
+    const child = new FakeProtocolProcess();
+    spawnMock.mockReturnValueOnce(child);
+    const response = held<{ stopReason: 'end_turn' }>();
+    const agent = {
+      request: vi.fn((method: string) => {
+        if (method === 'initialize') { return Promise.resolve({ protocolVersion: 1, agentCapabilities: { loadSession: true } }); }
+        if (method === 'session/new') { return Promise.resolve({ sessionId: 'busy-session' }); }
+        if (method === 'session/prompt') { return response.promise; }
+        return Promise.resolve({});
+      }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    const session = makeSession();
+    const prompting = session.prompt('held', vi.fn(), new AbortController().signal);
+    try {
+      await vi.waitFor(() => expect(agent.request.mock.calls.some(call => call[0] === 'session/prompt')).toBe(true));
+      await expect(session.resumeSavedSession()).rejects.toThrow(/current prompt to settle/);
+      expect(agent.request.mock.calls.some(call => call[0] === 'session/list' || call[0] === 'session/load')).toBe(false);
+      response.release({ stopReason: 'end_turn' });
+      await prompting;
+    } finally { response.release({ stopReason: 'end_turn' }); await prompting; await session.stop(); session.dispose(); }
+  });
+});
 vi.mock('@agentclientprotocol/sdk', async () => {
   const actual = await vi.importActual<typeof import('@agentclientprotocol/sdk')>('@agentclientprotocol/sdk');
   return {
     ...actual,
-    client: vi.fn(() => ({ onRequest: () => ({ connect: protocol.connect }) })),
+    client: vi.fn(() => { const builder = { onNotification: () => builder, onRequest: () => builder, connect: protocol.connect }; return builder; }),
     ndJsonStream: vi.fn(() => ({})),
   };
 });
@@ -334,12 +405,10 @@ describe('AgentSession ACP trust transitions', () => {
     successfulProbe();
     const child = new FakeProtocolProcess();
     spawnMock.mockReturnValueOnce(child);
-    const newSession = held<{ sessionId: string; dispose: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn> }>();
-    const active = { sessionId: 'held-session', dispose: vi.fn(), prompt: vi.fn() };
-    const startSession = vi.fn(() => newSession.promise);
+    const newSession = held<{ sessionId: string }>();
     const agent = {
-      request: vi.fn(async () => ({ protocolVersion: 1 })),
-      buildSession: vi.fn(() => ({ start: startSession })),
+      request: vi.fn((method: string) => method === 'session/new' ? newSession.promise : Promise.resolve({ protocolVersion: 1 })),
+      notify: vi.fn(async () => undefined),
     };
     const connection = { agent, close: vi.fn() };
     protocol.connect.mockReturnValue(connection);
@@ -347,13 +416,12 @@ describe('AgentSession ACP trust transitions', () => {
     await session.start();
 
     const prompting = session.prompt('should not dispatch', vi.fn(), new AbortController().signal);
-    await vi.waitFor(() => expect(startSession).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(agent.request.mock.calls.some(call => call[0] === 'session/new')).toBe(true));
     trust.isTrusted = false;
-    newSession.release(active);
+    newSession.release({ sessionId: 'held-session' });
 
     await expect(prompting).rejects.toThrow(/trusted workspace/);
-    expect(active.dispose).toHaveBeenCalledOnce();
-    expect(active.prompt).not.toHaveBeenCalled();
+    expect(agent.request.mock.calls.some(call => call[0] === 'session/prompt')).toBe(false);
     expect(connection.close).toHaveBeenCalled();
     expect(child.kill).toHaveBeenCalled();
     await session.stop();
