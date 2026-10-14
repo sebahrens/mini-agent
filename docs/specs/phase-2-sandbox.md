@@ -491,3 +491,29 @@ restriction mask.
 - UI for editing allow-lists
 - portable/learned skill libraries (Phase 3)
 - proposal/admission or evidence lifecycle (Phases 4–5)
+
+### Explicit Windows installed preflight diagnostics
+
+The internal installed-binary sandbox self-check emits
+`WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1` on stderr after the exact preflight
+helper, profile recovery and root disposition have settled. Ordinary cached
+availability and direct-command verification emit no such records. The collector
+performs no diagnostic I/O during launch, polling or cleanup and adds no process
+poll, retry, permission, grant or capability.
+
+Records use closed stage/category identifiers only: prior recovery, setup,
+prepared helper, spawn, observed exit or run deadline, initial/terminal reap,
+recovery, root disposition, completed availability and retained cached result.
+Late successful/nonzero/unknown exits differ from a still-running helper observed
+by the existing reaper. Each elapsed/deadline-slack integer is capped at 60,000 ms;
+`capped=true` reports clipping. At most sixteen observations plus one fixed
+saturation record are retained per call. No argv, path, SID, environment,
+request/response payload, command output or credential is captured.
+
+The existing five-second run deadline, five-second reap budget and fresh
+five-second profile recovery ceiling remain unchanged. The setup/build work is
+inside the run budget; synchronous OS process creation is checked before entry
+but is not made interruptible by these diagnostics. A timeout remains closed.
+The two source-free native diagnostic controls, existing real timeout/tree-reap
+control and installed three-probe gate establish the owning validation scope;
+new behavior requires actual Windows execution, not a compiled-out macOS test.

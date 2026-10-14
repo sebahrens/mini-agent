@@ -1462,5 +1462,82 @@ cargo() {
                 self.assertNotEqual(result.returncode, 0)
 
 
+class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
+    @staticmethod
+    def validate(workflow: str, source: str) -> None:
+        job = job_body(workflow, "windows-general-sandbox-policy")
+        native = job.split("name: Test native general-sandbox policy and recovery", 1)[1].split("- name:", 1)[0]
+        for item in [
+            "preflight_diagnostics_bound_closed_timing_and_late_exit_categories",
+            "preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data",
+            "timed_out_general_preflight_reaps_tree_and_removes_recovery_state",
+            ".Count -ne 1", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
+            r"'^test result: ok\. 40 passed; 0 failed; 0 ignored;'",
+        ]:
+            if item not in native:
+                raise AssertionError("missing native diagnostic execution guard: " + item)
+        probe = job.split("name: Attest write, authority, desktop, and parent-owned Job boundaries", 1)[1]
+        for item in [
+            "foreach ($attempt in 1..3)", "--mini-agent-windows-sandbox-runtime-check 2>&1",
+            "$probeExit = $LASTEXITCODE", "if ($probeExit -ne 0)",
+            "$diagnostics.Count -lt 1 -or $diagnostics.Count -gt 34",
+            "[int]$match.Groups[3].Value -gt 60000", "[int]$match.Groups[4].Value -gt 60000",
+            "if (-not $match.Success", " stage=finished category=available ", " stage=cached category=available ",
+            "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular", "breakaway=denied", "network=denied",
+        ]:
+            if item not in probe:
+                raise AssertionError("missing installed diagnostic guard: " + item)
+        direct = source.split("pub(crate) fn verify_direct_command(", 1)[1].split("\nfn build_helper(", 1)[0]
+        normalized = re.sub(r"\s+", "", direct)
+        for item in [
+            "run_bounded_preflight_helper(&mutcommand,run_deadline,cleanup_deadline,None)",
+            "run_deadline=started+Duration::from_secs(3)",
+            "cleanup_deadline=run_deadline+Duration::from_secs(3)",
+            ".stdout(Stdio::null())", ".stderr(Stdio::null())",
+        ]:
+            if item not in normalized:
+                raise AssertionError("ordinary direct-command diagnostic scope changed: " + item)
+        if any(item in direct for item in ["PreflightDiagnostics::new", "record_preflight", "println!", "write_all"]):
+            raise AssertionError("ordinary direct command must not collect or emit self-check diagnostics")
+        for item in [
+            "const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(5);",
+            "const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);",
+            "general_sandbox_preflight_observed(None)",
+        ]:
+            if item not in source:
+                raise AssertionError("production deadline/silent scope changed: " + item)
+
+    def test_native_and_installed_closed_diagnostics_are_required(self) -> None:
+        self.validate(WORKFLOW.read_text(), (REPOSITORY_ROOT / "src/sandbox/windows.rs").read_text())
+
+    def test_native_guard_waivers_and_unbounded_installed_records_are_rejected(self) -> None:
+        original = WORKFLOW.read_text()
+        source = (REPOSITORY_ROOT / "src/sandbox/windows.rs").read_text()
+        for before, after in [
+            ("preflight_diagnostics_bound_closed_timing_and_late_exit_categories", "missing_bound_test"),
+            ("preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data", "missing_cache_test"),
+            ("40 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 40 ignored;"),
+            ("$probeExit = $LASTEXITCODE", "$probeExit = 0"),
+            ("$diagnostics.Count -gt 34", "$diagnostics.Count -lt 0"),
+            ("[int]$match.Groups[3].Value -gt 60000", "[int]$match.Groups[3].Value -lt 0"),
+            (" stage=cached category=available ", " ignored-cache-observation "),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(original.replace(before, after), source)
+
+    def test_direct_verification_remains_silent_with_unchanged_deadlines(self) -> None:
+        workflow = WORKFLOW.read_text()
+        original = (REPOSITORY_ROOT / "src/sandbox/windows.rs").read_text()
+        prefix, tail = original.split("pub(crate) fn verify_direct_command(", 1)
+        body, rest = tail.split("\nfn build_helper(", 1)
+        for before, after in [
+            ("cleanup_deadline, None", "cleanup_deadline, diagnostics"),
+            ("Duration::from_secs(3)", "Duration::from_secs(30)"),
+            (".stderr(Stdio::null())", ".stderr(Stdio::piped())"),
+        ]:
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                self.validate(workflow, prefix + "pub(crate) fn verify_direct_command(" + body.replace(before, after) + "\nfn build_helper(" + rest)
+
+
 if __name__ == "__main__":
     unittest.main()

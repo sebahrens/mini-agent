@@ -735,9 +735,25 @@ pub(crate) fn cached_is_available() -> Option<bool> {
 }
 
 fn general_sandbox_preflight() -> &'static Result<(), String> {
+    general_sandbox_preflight_observed(None)
+}
+
+fn general_sandbox_preflight_observed(
+    diagnostics: Option<&PreflightDiagnostics>,
+) -> &'static Result<(), String> {
     cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
         let started = Instant::now();
-        let result = run_production_preflight();
+        let result = run_production_preflight(diagnostics);
+        record_preflight(
+            diagnostics,
+            PreflightStage::Finished,
+            if result.is_ok() {
+                PreflightCategory::Available
+            } else {
+                PreflightCategory::Unavailable
+            },
+            None,
+        );
         tracing::debug!(
             phase = "windows_general_appcontainer_preflight",
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -834,23 +850,225 @@ impl Drop for TemporaryPreflightRoot {
     }
 }
 
-fn run_production_preflight() -> Result<(), String> {
+// Only the explicit installed self-check collects these source-free diagnostics.
+// There is no diagnostic I/O while a helper or its cleanup is still unsettled.
+const MAX_PREFLIGHT_DIAGNOSTIC_EVENTS: usize = 16;
+const MAX_PREFLIGHT_DIAGNOSTIC_MS: u128 = 60_000;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreflightStage {
+    PriorRecovery,
+    PriorRecoveryReady,
+    Setup,
+    Prepared,
+    Spawn,
+    SpawnReturned,
+    Observe,
+    RunDeadline,
+    ReapInitial,
+    ReapTerminal,
+    Recovery,
+    RecoveryFinished,
+    RootDisposition,
+    Finished,
+    Cached,
+}
+impl PreflightStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PriorRecovery => "prior_recovery",
+            Self::PriorRecoveryReady => "prior_recovery_ready",
+            Self::Setup => "setup",
+            Self::Prepared => "prepared",
+            Self::Spawn => "spawn",
+            Self::SpawnReturned => "spawn_returned",
+            Self::Observe => "observe",
+            Self::RunDeadline => "run_deadline",
+            Self::ReapInitial => "reap_initial",
+            Self::ReapTerminal => "reap_terminal",
+            Self::Recovery => "recovery",
+            Self::RecoveryFinished => "recovery_finished",
+            Self::RootDisposition => "root_disposition",
+            Self::Finished => "finished",
+            Self::Cached => "cached",
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreflightCategory {
+    Begin,
+    Ok,
+    Error,
+    Running,
+    ExitSuccess,
+    ExitFailure,
+    ExitUnknown,
+    LateSuccess,
+    LateFailure,
+    LateUnknown,
+    Deadline,
+    Retained,
+    Available,
+    Unavailable,
+}
+impl PreflightCategory {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Running => "running",
+            Self::ExitSuccess => "exit_success",
+            Self::ExitFailure => "exit_failure",
+            Self::ExitUnknown => "exit_unknown",
+            Self::LateSuccess => "late_success",
+            Self::LateFailure => "late_failure",
+            Self::LateUnknown => "late_unknown",
+            Self::Deadline => "deadline",
+            Self::Retained => "retained",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+    fn exit(status: ExitStatus, late: bool) -> Self {
+        match (status.code(), late) {
+            (Some(0), false) => Self::ExitSuccess,
+            (Some(_), false) => Self::ExitFailure,
+            (None, false) => Self::ExitUnknown,
+            (Some(0), true) => Self::LateSuccess,
+            (Some(_), true) => Self::LateFailure,
+            (None, true) => Self::LateUnknown,
+        }
+    }
+}
+struct PreflightDiagnosticEvent {
+    stage: PreflightStage,
+    category: PreflightCategory,
+    elapsed_ms: u32,
+    slack_ms: u32,
+    capped: bool,
+}
+struct PreflightDiagnostics {
+    started: Instant,
+    events: std::cell::RefCell<Vec<PreflightDiagnosticEvent>>,
+    saturated: std::cell::Cell<bool>,
+}
+impl PreflightDiagnostics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            events: std::cell::RefCell::new(Vec::with_capacity(MAX_PREFLIGHT_DIAGNOSTIC_EVENTS)),
+            saturated: std::cell::Cell::new(false),
+        }
+    }
+    fn record(
+        &self,
+        stage: PreflightStage,
+        category: PreflightCategory,
+        deadline: Option<Instant>,
+    ) {
+        self.record_elapsed(
+            stage,
+            category,
+            self.started.elapsed(),
+            deadline.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            }),
+        );
+    }
+    fn record_elapsed(
+        &self,
+        stage: PreflightStage,
+        category: PreflightCategory,
+        elapsed: Duration,
+        slack: Duration,
+    ) {
+        let mut events = self.events.borrow_mut();
+        if events.len() == MAX_PREFLIGHT_DIAGNOSTIC_EVENTS {
+            self.saturated.set(true);
+            return;
+        }
+        events.push(PreflightDiagnosticEvent {
+            stage,
+            category,
+            elapsed_ms: elapsed.as_millis().min(MAX_PREFLIGHT_DIAGNOSTIC_MS) as u32,
+            slack_ms: slack.as_millis().min(MAX_PREFLIGHT_DIAGNOSTIC_MS) as u32,
+            capped: elapsed.as_millis() > MAX_PREFLIGHT_DIAGNOSTIC_MS
+                || slack.as_millis() > MAX_PREFLIGHT_DIAGNOSTIC_MS,
+        });
+    }
+    fn cached_if_empty(&self, available: bool) {
+        let empty = self.events.borrow().is_empty();
+        if empty {
+            self.record(
+                PreflightStage::Cached,
+                if available {
+                    PreflightCategory::Available
+                } else {
+                    PreflightCategory::Unavailable
+                },
+                None,
+            );
+        }
+    }
+    fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for event in self.events.borrow().iter() {
+            writeln!(text, "WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1 stage={} category={} elapsed_ms={} slack_ms={} capped={}", event.stage.name(), event.category.name(), event.elapsed_ms, event.slack_ms, event.capped).expect("String formatting cannot fail");
+        }
+        if self.saturated.get() {
+            text.push_str("WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1 stage=bounded category=retained elapsed_ms=0 slack_ms=0 capped=true\n");
+        }
+        text
+    }
+}
+fn record_preflight(
+    diagnostics: Option<&PreflightDiagnostics>,
+    stage: PreflightStage,
+    category: PreflightCategory,
+    deadline: Option<Instant>,
+) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record(stage, category, deadline);
+    }
+}
+
+fn run_production_preflight(diagnostics: Option<&PreflightDiagnostics>) -> Result<(), String> {
+    record_preflight(
+        diagnostics,
+        PreflightStage::PriorRecovery,
+        PreflightCategory::Begin,
+        None,
+    );
     let temp_root = canonical_preflight_temp_root()?;
     recover_preserved_preflight_roots(
         &temp_root,
         next_general_preflight_recovery_deadline(Instant::now()),
     )?;
+    record_preflight(
+        diagnostics,
+        PreflightStage::PriorRecoveryReady,
+        PreflightCategory::Ok,
+        None,
+    );
     let started = Instant::now();
     let run_deadline = started + GENERAL_PREFLIGHT_RUN_TIMEOUT;
     let reap_deadline = run_deadline + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
-    run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline)
+    run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline, diagnostics)
 }
 
 fn run_production_preflight_owned_in(
     temp_root: &Path,
     run_deadline: Instant,
     reap_deadline: Instant,
+    diagnostics: Option<&PreflightDiagnostics>,
 ) -> Result<(), String> {
+    record_preflight(
+        diagnostics,
+        PreflightStage::Setup,
+        PreflightCategory::Begin,
+        Some(run_deadline),
+    );
     let mut root = TemporaryPreflightRoot::create(temp_root)?;
     let workspace = root.path().join("workspace");
     let cache = root.path().join("cache");
@@ -889,7 +1107,14 @@ fn run_production_preflight_owned_in(
             .as_std_mut()
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let status = run_bounded_preflight_helper(&mut command, run_deadline, reap_deadline)?;
+        record_preflight(
+            diagnostics,
+            PreflightStage::Prepared,
+            PreflightCategory::Ok,
+            Some(run_deadline),
+        );
+        let status =
+            run_bounded_preflight_helper(&mut command, run_deadline, reap_deadline, diagnostics)?;
         if !status.success() || !inside_file.exists() || outside_file.exists() {
             return Err("production AppContainer preflight denied its declared boundary".into());
         }
@@ -899,7 +1124,23 @@ fn run_production_preflight_owned_in(
     // Recovery gets its own bounded window after the helper has been reaped. Reusing the reap
     // deadline here can leave no time to revoke ACLs or delete the ephemeral profile.
     let recovery_deadline = next_general_preflight_recovery_deadline(Instant::now());
+    record_preflight(
+        diagnostics,
+        PreflightStage::Recovery,
+        PreflightCategory::Begin,
+        Some(recovery_deadline),
+    );
     let recovery = recover_preflight_profiles(&cache, recovery_deadline);
+    record_preflight(
+        diagnostics,
+        PreflightStage::RecoveryFinished,
+        if recovery.is_ok() {
+            PreflightCategory::Ok
+        } else {
+            PreflightCategory::Error
+        },
+        Some(recovery_deadline),
+    );
     let removal = if recovery.is_ok() {
         root.remove()
     } else {
@@ -907,6 +1148,18 @@ fn run_production_preflight_owned_in(
         root.retain_recovery_state();
         Ok(())
     };
+    record_preflight(
+        diagnostics,
+        PreflightStage::RootDisposition,
+        if recovery.is_err() {
+            PreflightCategory::Retained
+        } else if removal.is_ok() {
+            PreflightCategory::Ok
+        } else {
+            PreflightCategory::Error
+        },
+        None,
+    );
     match (operation, recovery, removal) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(()), Ok(())) => Err(error),
@@ -1298,19 +1551,53 @@ fn run_bounded_preflight_helper(
     command: &mut tokio::process::Command,
     run_deadline: Instant,
     cleanup_deadline: Instant,
+    diagnostics: Option<&PreflightDiagnostics>,
 ) -> Result<ExitStatus, String> {
+    record_preflight(
+        diagnostics,
+        PreflightStage::Spawn,
+        PreflightCategory::Begin,
+        Some(run_deadline),
+    );
     let mut child = command
         .as_std_mut()
         .spawn_guarded_until(run_deadline)
-        .map_err(|error| format!("sandbox: start production AppContainer preflight: {error}"))?;
+        .map_err(|error| {
+            record_preflight(
+                diagnostics,
+                PreflightStage::SpawnReturned,
+                PreflightCategory::Error,
+                Some(run_deadline),
+            );
+            format!("sandbox: start production AppContainer preflight: {error}")
+        })?;
+    record_preflight(
+        diagnostics,
+        PreflightStage::SpawnReturned,
+        PreflightCategory::Ok,
+        Some(run_deadline),
+    );
     loop {
         if Instant::now() >= run_deadline {
-            terminate_and_reap_owned_helper(&mut child, cleanup_deadline)?;
+            record_preflight(
+                diagnostics,
+                PreflightStage::RunDeadline,
+                PreflightCategory::Deadline,
+                Some(run_deadline),
+            );
+            terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)?;
             return Err("sandbox: Windows general AppContainer preflight timed out".into());
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                return if Instant::now() < run_deadline {
+                let timely = Instant::now() < run_deadline;
+                record_preflight(
+                    diagnostics,
+                    PreflightStage::Observe,
+                    PreflightCategory::exit(status, !timely),
+                    Some(run_deadline),
+                );
+                return if timely {
                     Ok(status)
                 } else {
                     Err("sandbox: Windows general AppContainer preflight timed out".into())
@@ -1318,10 +1605,17 @@ fn run_bounded_preflight_helper(
             }
             Ok(None) => {}
             Err(error) => {
+                record_preflight(
+                    diagnostics,
+                    PreflightStage::Observe,
+                    PreflightCategory::Error,
+                    Some(run_deadline),
+                );
                 let poll_error =
                     format!("sandbox: poll production AppContainer preflight: {error}");
                 return Err(
-                    match terminate_and_reap_owned_helper(&mut child, cleanup_deadline) {
+                    match terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)
+                    {
                         Ok(()) => poll_error,
                         Err(cleanup) => format!("{poll_error}; {cleanup}"),
                     },
@@ -1338,14 +1632,34 @@ fn run_bounded_preflight_helper(
 fn terminate_and_reap_owned_helper(
     child: &mut Child,
     cleanup_deadline: Instant,
+    diagnostics: Option<&PreflightDiagnostics>,
 ) -> Result<(), String> {
     let mut first_error = None;
+    let mut recorded_initial = false;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
+                if !recorded_initial {
+                    record_preflight(
+                        diagnostics,
+                        PreflightStage::ReapInitial,
+                        PreflightCategory::exit(status, false),
+                        Some(cleanup_deadline),
+                    );
+                }
                 let wait = child.wait().map_err(|error| {
                     format!("sandbox: finish reaping timed-out AppContainer helper: {error}")
                 });
+                record_preflight(
+                    diagnostics,
+                    PreflightStage::ReapTerminal,
+                    if wait.is_ok() {
+                        PreflightCategory::exit(status, false)
+                    } else {
+                        PreflightCategory::Error
+                    },
+                    Some(cleanup_deadline),
+                );
                 return match (first_error, wait) {
                     (None, Ok(_)) => Ok(()),
                     (Some(error), Ok(_)) => Err(error),
@@ -1353,8 +1667,27 @@ fn terminate_and_reap_owned_helper(
                     (Some(error), Err(wait)) => Err(format!("{error}; {wait}")),
                 };
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if !recorded_initial {
+                    record_preflight(
+                        diagnostics,
+                        PreflightStage::ReapInitial,
+                        PreflightCategory::Running,
+                        Some(cleanup_deadline),
+                    );
+                    recorded_initial = true;
+                }
+            }
             Err(error) => {
+                if !recorded_initial {
+                    record_preflight(
+                        diagnostics,
+                        PreflightStage::ReapInitial,
+                        PreflightCategory::Error,
+                        Some(cleanup_deadline),
+                    );
+                    recorded_initial = true;
+                }
                 first_error.get_or_insert_with(|| {
                     format!("sandbox: poll timed-out AppContainer helper: {error}")
                 });
@@ -1462,7 +1795,7 @@ pub(crate) fn verify_direct_command(
     let started = Instant::now();
     let run_deadline = started + Duration::from_secs(3);
     let cleanup_deadline = run_deadline + Duration::from_secs(3);
-    let status = run_bounded_preflight_helper(&mut command, run_deadline, cleanup_deadline)?;
+    let status = run_bounded_preflight_helper(&mut command, run_deadline, cleanup_deadline, None)?;
     if status.success() {
         Ok(())
     } else {
@@ -5080,7 +5413,15 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
     let _ = std::fs::remove_dir_all(&base);
     for _ in 0..2 {
-        general_sandbox_preflight()
+        let diagnostics = PreflightDiagnostics::new();
+        let result = general_sandbox_preflight_observed(Some(&diagnostics));
+        diagnostics.cached_if_empty(result.is_ok());
+        // Emit only after the exact helper/recovery owner has settled. No I/O
+        // from this collector can consume the five-second launch/reap budgets.
+        std::io::stderr()
+            .write_all(diagnostics.render().as_bytes())
+            .map_err(|_| "write closed Windows preflight diagnostics failed".to_string())?;
+        result
             .as_ref()
             .map_err(|error| format!("cached production AppContainer preflight failed: {error}"))?;
     }
@@ -5825,6 +6166,76 @@ mod tests {
             &read_roots,
             &write_roots,
         )
+    }
+
+    #[test]
+    fn preflight_diagnostics_bound_closed_timing_and_late_exit_categories() {
+        use std::os::windows::process::ExitStatusExt;
+        let diagnostics = PreflightDiagnostics::new();
+        for _ in 0..MAX_PREFLIGHT_DIAGNOSTIC_EVENTS + 8 {
+            diagnostics.record_elapsed(
+                PreflightStage::Observe,
+                PreflightCategory::exit(ExitStatus::from_raw(0), true),
+                Duration::from_secs(u64::MAX),
+                Duration::from_secs(u64::MAX),
+            );
+        }
+        let text = diagnostics.render();
+        assert_eq!(text.lines().count(), MAX_PREFLIGHT_DIAGNOSTIC_EVENTS + 1);
+        assert!(text.len() < 4096);
+        assert!(
+            text.lines()
+                .all(|line| line.starts_with("WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1 "))
+        );
+        assert!(text.contains(
+            "stage=observe category=late_success elapsed_ms=60000 slack_ms=60000 capped=true"
+        ));
+        assert!(
+            text.contains("stage=bounded category=retained elapsed_ms=0 slack_ms=0 capped=true")
+        );
+        assert!(
+            PreflightCategory::exit(ExitStatus::from_raw(19), false)
+                == PreflightCategory::ExitFailure
+        );
+        assert!(
+            PreflightCategory::exit(ExitStatus::from_raw(19), true)
+                == PreflightCategory::LateFailure
+        );
+        assert!(
+            PreflightCategory::exit(ExitStatus::from_raw(0), false)
+                == PreflightCategory::ExitSuccess
+        );
+    }
+
+    #[test]
+    fn preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data() {
+        for result in [
+            Ok(()),
+            Err("CANARY_PRIVATE_ARG_PATH_SID_ENV_PAYLOAD".to_string()),
+        ] {
+            let cache = OnceLock::new();
+            let initialized = PreflightDiagnostics::new();
+            let first = cached_general_sandbox_availability(&cache, || {
+                initialized.record(PreflightStage::Setup, PreflightCategory::Begin, None);
+                result.clone()
+            });
+            initialized.cached_if_empty(first.is_ok());
+            assert!(initialized.render().contains("stage=setup category=begin"));
+            let retained = PreflightDiagnostics::new();
+            let second = cached_general_sandbox_availability(&cache, || {
+                panic!("retained self-check must not rerun its probe")
+            });
+            retained.cached_if_empty(second.is_ok());
+            assert_eq!(retained.events.borrow().len(), 1);
+            assert!(retained.render().contains(if result.is_ok() {
+                "stage=cached category=available"
+            } else {
+                "stage=cached category=unavailable"
+            }));
+            assert!(!initialized.render().contains("CANARY_PRIVATE"));
+            assert!(!retained.render().contains("CANARY_PRIVATE"));
+            assert_eq!(first, second);
+        }
     }
 
     #[test]
@@ -7054,8 +7465,25 @@ mod tests {
         wait_for_probe_file(&tree_ready).expect("descendant must become ready");
 
         let cleanup_deadline = Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
-        terminate_and_reap_owned_helper(&mut child, cleanup_deadline)
+        let diagnostics = PreflightDiagnostics::new();
+        terminate_and_reap_owned_helper(&mut child, cleanup_deadline, Some(&diagnostics))
             .expect("reap exact timed-out helper");
+        assert!(
+            diagnostics
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event.stage == PreflightStage::ReapInitial
+                    && event.category == PreflightCategory::Running)
+        );
+        assert!(diagnostics.events.borrow().iter().any(|event| event.stage
+            == PreflightStage::ReapTerminal
+            && matches!(
+                event.category,
+                PreflightCategory::ExitSuccess
+                    | PreflightCategory::ExitFailure
+                    | PreflightCategory::ExitUnknown
+            )));
         let proof = parse_crash_cleanup_proof(&cleanup_ready)
             .expect("timed-out helper must leave bounded recovery proof");
         recover_preflight_profiles(&cache, cleanup_deadline)
