@@ -1,0 +1,111 @@
+{
+  "base": "d22318447d70dcba31f3ffc6e76882c86b721693",
+  "scope": "2 cfg(test)+skills constructor defaults and one internal-fixture documentation row; no production behavior",
+  "repair_patch_sha256": "b66fce886f599dfdef924f20b8290025da592b3084709b5cbb27a1b06f335afe",
+  "validation": {
+    "rust": {
+      "command": "CARGO_TARGET_DIR=/private/tmp/mini-agent-ci-d223-skills-target cargo test --locked --offline --no-default-features --features skills --bin mini-agent -- the_recorded_javascript_comes_from_the_matching_tool_call_record a_result_record_alone_is_reported_by_its_role --test-threads=1",
+      "status": "2PASS",
+      "log": "/private/tmp/mini-agent-d223-distill-owning.log",
+      "result": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3420 filtered out; finished in 0.00s"
+      ],
+      "log_sha256": "83e17486165299af9fbf565b4566b98778ef690b2d640aab7a3f54e81a090a8d"
+    },
+    "python": {
+      "command": "python3 -m unittest scripts.tests.test_check_package_metadata.EnvironmentReferenceTests.test_environment_table_covers_explicit_source_reads_and_indirect_public_controls",
+      "result": "1PASS1.10s",
+      "log": "/private/tmp/mini-agent-d223-env-table-owning.log",
+      "log_sha256": "c55d9db48982230666bfe76dc025a8fb35606d1d1aec6d36a649b4833eda4c7f"
+    }
+  },
+  "failed_jobs": [
+    {
+      "job": 116110787961,
+      "name": "fmt",
+      "log": "/private/tmp/mini-agent-d223-job-116110787961.log",
+      "sha256": "0e8fe830374d65cbe2bc004091265b65912f64703e700d0708edbeedc0058be9",
+      "group": "environment-reference test-only documentation"
+    },
+    {
+      "job": 116110867726,
+      "name": "harness-regression",
+      "log": "/private/tmp/mini-agent-d223-job-116110867726.log",
+      "sha256": "3cfecf428cebf1f857eb8fa2ea49abdc108b707e891a2642ea42eb660bd527c3",
+      "group": "same2 cfg(skills) fixture missing images fields; containment/harness not reached"
+    },
+    {
+      "job": 116110867957,
+      "name": "all-features",
+      "log": "/private/tmp/mini-agent-d223-job-116110867957.log",
+      "sha256": "177c87a0a54e33bb86c513025ac0487c59f3d3197dabfcc19833e875089bdcc4",
+      "group": "same2 cfg(skills) fixture missing images fields; containment/harness not reached"
+    },
+    {
+      "job": 116110868103,
+      "name": "windows-worker-launcher-unit",
+      "log": "/private/tmp/mini-agent-d223-job-116110868103.log",
+      "sha256": "2d656f718c32cdfe143760da8ec44425ad1b8d58fd2190bbb1bcdc032792ba58",
+      "group": "same2 cfg(skills) fixture missing images fields; containment/harness not reached"
+    },
+    {
+      "job": 116110868271,
+      "name": "linux-sandbox-policy",
+      "log": "/private/tmp/mini-agent-d223-job-116110868271.log",
+      "sha256": "8ad8def19aab9c83892798e8a953350dec1a32cb0ac6adb495d58f664bb65a72",
+      "group": "same2 cfg(skills) fixture missing images fields; containment/harness not reached"
+    },
+    {
+      "job": 116110868569,
+      "name": "macos-worker-containment-gate macos15",
+      "log": "/private/tmp/mini-agent-d223-job-116110868569.log",
+      "sha256": "1861eff94690275e5f04bc1e2e9bd10bf46767a384bc1514adba5f7c9a75e429",
+      "group": "same2 cfg(skills) fixture missing images fields; containment/harness not reached"
+    },
+    {
+      "job": 116110869080,
+      "name": "platform-paths Windows mcp",
+      "log": "/private/tmp/mini-agent-d223-job-116110869080.log",
+      "sha256": "9206dbd464db934a723b184ac32c08207af5b761310640471862d065ea044604",
+      "group": "actual Windows session second-save platform-publication AccessDenied"
+    }
+  ],
+  "profile_correction": {
+    "before": "sha2@0.11.0",
+    "after": "sha2@0.11",
+    "reason": "Unrestricted cargo install may resolve sha2 0.11.1; partial package ID matches the 0.11 family while excluding 0.10. cargo pkgid --offline sha2@0.11 resolves locked 0.11.0.",
+    "application_opt_level": 0,
+    "release_unchanged": true
+  },
+  "native_windows_candidate": {
+    "run": 38638972148,
+    "general_job": 116110867817,
+    "general_result": "success",
+    "default_compile_job": 116110868523,
+    "default_compile_result": "success",
+    "prepared_ms": [
+      89,
+      92,
+      111
+    ],
+    "exit_success_ms": [
+      255,
+      258,
+      277
+    ],
+    "remaining_5s_budget_ms": [
+      4745,
+      4742,
+      4723
+    ],
+    "limits": "Original intermittent failing stage not reproduced; .108.2 stays open. This is actual candidate budget evidence, not a claim of universal CI success."
+  },
+  "review": {
+    "findings": [],
+    "checks": [
+      "Empty images retains text-only fixture contract and assertions",
+      "Internal environment fixture row adds no production environment read",
+      "Partial package ID retains exact SHA-256 proofs and original deadlines"
+    ]
+  }
+}

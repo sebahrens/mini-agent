@@ -1083,6 +1083,7 @@ mod tests {
                 Some("call-target"),
                 Some(PersistedToolMessage::Result {
                     output: CompactString::new("6"),
+                    images: Vec::new(),
                     artifact_path: None,
                 }),
             ),
@@ -1138,6 +1139,7 @@ mod tests {
             Some("call-target"),
             Some(PersistedToolMessage::Result {
                 output: CompactString::new("6"),
+                images: Vec::new(),
                 artifact_path: None,
             }),
         )];
