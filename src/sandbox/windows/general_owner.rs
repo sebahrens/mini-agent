@@ -625,7 +625,7 @@ mod tests {
         use crate::sandbox::{
             BackgroundJobStatus, CommandStatus, Sandbox, SupportCommandAudit, SupportCommandLimits,
         };
-        use crate::spend::{Account, PriceSnapshot, ledger::Ledger, run::Run};
+        use crate::spend::{Account, Ledger, PriceSnapshot, run::Run};
         use futures::FutureExt;
         // Third case is the actual helper guard primitive, not an assertion
         // that this inert PowerShell command creates an AppContainer.
@@ -636,7 +636,7 @@ mod tests {
             let state = root.path().join("state");
             crate::fs::ensure_private_directory(&state).unwrap();
             let id = uuid::Uuid::new_v4().to_string();
-            let account = Account::new(&id, Some(1.0), 0.0);
+            let account = Account::new(&id, Some(1.0), 0.0).unwrap();
             let run = Run::fixture(
                 account.clone(),
                 Arc::new(Ledger::new(state)),
