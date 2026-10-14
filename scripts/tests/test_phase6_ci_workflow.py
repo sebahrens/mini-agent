@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import shlex
 from pathlib import Path
@@ -274,7 +275,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("--no-default-features --features js,sandbox", step)
         self.assertIn("--exact --nocapture", step)
         self.assertIn("grep -qi 'skipping'", step)
-        self.assertIn("test result: ok. 1 passed", step)
+        self.assertIn(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", step)
+        self.assertIn('grep -Fxq "test $test_name ... ok" <<< "$output"', step)
         for test_name, source in self.SEATBELT_GENERAL_SANDBOX_TESTS.items():
             with self.subTest(test=test_name):
                 self.assertEqual(1, step.count(f"'{test_name}'"))
@@ -1345,11 +1347,11 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
             "if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "shell: pwsh",
             "$filter = 'fs::private::windows::operator_config_lease_probe::'",
             "cargo test --locked --bin mini-agent $filter -- --list 2>&1",
-            "$actual.Count -ne 3", "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
+            "$actual.Count -ne 4", "Compare-Object -ReferenceObject $expected -DifferenceObject $actual",
             "'^fs::private::windows::operator_config_lease_probe::.*: test$'",
             "cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1",
             "if ($LASTEXITCODE -ne 0)", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
-            r"'^test result: ok\. 3 passed; 0 failed; 0 ignored;'",
+            r"'^test result: ok\. 4 passed; 0 failed; 0 ignored;'",
         ]:
             if fragment not in step:
                 raise AssertionError("missing exact experiment guard: " + fragment)
@@ -1357,10 +1359,11 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
             "exact_relative_lease_surviving_mapping_and_data_conflicts",
             "namespace_alias_and_private_metadata_are_observed_before_any_candidate_write",
             "reader_lease_precedes_marker_and_late_marker_refuses_admission",
+            "retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts",
         }
         names = re.findall(r"'fs::private::windows::operator_config_lease_probe::(\w+): test'", step)
-        if len(names) != 3 or set(names) != expected:
-            raise AssertionError("exact three experiments required")
+        if len(names) != 4 or set(names) != expected:
+            raise AssertionError("exact four experiments required")
         if step.count("cargo test ") != 2 or step.count("throw ") != 4:
             raise AssertionError("discovery/result failures must stay closed")
         if any(value in step for value in ["--ignored", "--no-run", "continue-on-error", "cargo build"]):
@@ -1376,20 +1379,87 @@ class WindowsMcpOperatorLeaseExperimentCiTests(unittest.TestCase):
         prefix, suffix = original.split("- name: " + name, 1)
         step, rest = suffix.split("- name:", 1)
         for before, after in [
-            ("$actual.Count -ne 3", "$actual.Count -lt 0"),
+            ("$actual.Count -ne 4", "$actual.Count -lt 0"),
             ("Compare-Object -ReferenceObject $expected -DifferenceObject $actual", "$null"),
             ("--bin mini-agent $filter -- --list", "--bin mini-agent $filter -- --no-run"),
             ("reader_lease_precedes_marker_and_late_marker_refuses_admission: test", "other: test"),
+            ("retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test", "other_retirement: test"),
             ("if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'", "if: matrix.os == 'windows-latest'"),
             ("--bin mini-agent $filter -- --nocapture", "--bin mini-agent -- --nocapture"),
             ("$nativeExit = $LASTEXITCODE", "$nativeExit = 0"),
             ("if ($nativeExit -ne 0)", "if ($nativeExit -lt 0)"),
-            ("3 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 3 ignored;"),
+            ("4 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 4 ignored;"),
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
         with self.assertRaises(AssertionError):
             self.validate(original.replace(name, "Removed native experiment"))
+
+
+class MacosExactOutputGuardTests(unittest.TestCase):
+    def run_guard(
+        self, case: str,
+        step_name: str = "Require the real Seatbelt general command sandbox on this runner",
+    ) -> subprocess.CompletedProcess[str]:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        body = job_body(workflow, "macos-worker-containment-gate")
+        name = "name: " + step_name
+        step = body.split(name, 1)[1].split("- name:", 1)[0]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1])
+        # Exercise the actual workflow shell. Padding follows the early success
+        # match, so an early-exiting consumer exposes a producer SIGPIPE.
+        cargo = r"""
+cargo() {
+  status=0
+  result='ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2719 filtered out; finished in 0.15s'
+  name="${test_name:-extras::js::tests::worker_containment::macos_js_worker_containment}"
+  outcome=ok
+  case "$GUARD_CASE" in
+    missing) result='ok. 0 passed; 0 failed; 0 ignored'; outcome=missing ;;
+    wrong_name) name=unrelated::test ;;
+    wrong_count) result='ok. 2 passed; 0 failed; 0 ignored' ;;
+    ignored) result='ok. 0 passed; 0 failed; 1 ignored'; outcome=ignored ;;
+    failed) result='FAILED. 0 passed; 1 failed; 0 ignored'; outcome=FAILED; status=101 ;;
+    skipped) printf '%s\n' 'skipping: controlled unavailable Seatbelt' ;;
+  esac
+  printf 'test %s ... %s\n' "$name" "$outcome"
+  printf 'test result: %s\n' "$result"
+  cat "$GUARD_PADDING"
+  return "$status"
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="mini-agent-macos-output-guard-") as root:
+            padding = Path(root) / "padding.txt"
+            padding.write_text(("nonmatching output after the result\n" * 8192), encoding="utf-8")
+            environment = dict(
+                os.environ, GUARD_CASE=case, GUARD_PADDING=str(padding),
+                GITHUB_ENV=str(Path(root) / "github-env"),
+            )
+            return subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", cargo + script],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+    def test_large_passing_output_does_not_fail_under_pipefail(self) -> None:
+        for step in [
+            "Require the real Seatbelt general command sandbox on this runner",
+            "Confirm the worker profile denies named FIFOs on this runner",
+            "Confirm the Seatbelt facts behind the one-time worker image",
+        ]:
+            with self.subTest(step=step):
+                result = self.run_guard("passed", step)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_wrong_failed_ignored_and_skipped_results_are_rejected(self) -> None:
+        for case in ["missing", "wrong_name", "wrong_count", "ignored", "failed", "skipped"]:
+            with self.subTest(case=case):
+                result = self.run_guard(case)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

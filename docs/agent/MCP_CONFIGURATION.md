@@ -121,6 +121,17 @@ candidate write. These results do not implement configuration transactions,
 crash recovery, trust approval or Windows existing-file add/remove support.
 The ordinary workspace compare-and-replace restriction remains unchanged.
 
+A further test-only retirement experiment uses a retained DELETE/read Share0
+handle and no-replace native rename, with a full surviving read-only view after
+both its creator and mapping handles close. It tests private and public inert
+sources, preserves every old byte, and separately refuses destination collisions,
+new hardlinks and changed private ACLs before any retirement. A specifically
+reported mapped-object conflict rejects that attempted operation; other native
+errors fail the test. A no-mapping positive rules out invalid helper access.
+These controlled checks do not establish an atomic metadata lock or a production
+transaction. Different application state overrides, bootstrap/feature-off reader
+obstruction, exact journal discoverability and crash recovery remain unresolved.
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and

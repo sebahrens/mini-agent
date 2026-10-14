@@ -1067,19 +1067,20 @@ jobs:
           output=$(cargo test --locked --no-default-features --features js \
             "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
           printf '%s\n' "$output"
-          if printf '%s\n' "$output" | grep -q 'skipping:'; then
+          if grep -q 'skipping:' <<< "$output"; then
             echo 'PHASE6_NAMED_FIFO=skipped-seatbelt-unusable' >> "$GITHUB_ENV"
             echo "named-FIFO regression skipped instead of running under Seatbelt" >&2
             exit 1
           fi
-          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"
           echo 'PHASE6_NAMED_FIFO=denied' >> "$GITHUB_ENV"
 
       # The general command sandbox (Sandbox::wrap_command on Seatbelt) and
       # parent-brokered JS spawn have real-backend tests that return early
       # when Seatbelt preflight is denied. MINI_AGENT_REQUIRE_REAL_SANDBOX=1
       # turns that early return into a panic, and any 'skipping' output or a
-      # missing pass also fails the step, so a runner where Seatbelt is
+      # missing pass also fails the step. Direct stdin avoids a printf/grep SIGPIPE
+      # under pipefail after an early match. A runner where Seatbelt is
       # unusable cannot report these tests green (mini-agent-dw9ru).
       - name: Require the real Seatbelt general command sandbox on this runner
         shell: bash
@@ -1102,11 +1103,12 @@ jobs:
               echo "$test_name failed with status $status" >&2
               exit "$status"
             fi
-            if printf '%s\n' "$output" | grep -qi 'skipping'; then
+            if grep -qi 'skipping' <<< "$output"; then
               echo "$test_name skipped instead of running under Seatbelt" >&2
               exit 1
             fi
-            if ! printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'; then
+            if ! grep -Fxq "test $test_name ... ok" <<< "$output" \
+              || ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"; then
               echo "$test_name did not run and pass exactly once" >&2
               exit 1
             fi
@@ -1126,7 +1128,7 @@ jobs:
             extras::js::tests::worker_containment::macos_js_worker_containment \
             -- --exact --ignored --nocapture --test-threads=1 2>&1)
           printf '%s\n' "$output"
-          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"
 
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
@@ -2288,20 +2290,21 @@ jobs:
           $expected = @(
             'fs::private::windows::operator_config_lease_probe::exact_relative_lease_surviving_mapping_and_data_conflicts: test',
             'fs::private::windows::operator_config_lease_probe::namespace_alias_and_private_metadata_are_observed_before_any_candidate_write: test',
-            'fs::private::windows::operator_config_lease_probe::reader_lease_precedes_marker_and_late_marker_refuses_admission: test'
+            'fs::private::windows::operator_config_lease_probe::reader_lease_precedes_marker_and_late_marker_refuses_admission: test',
+            'fs::private::windows::operator_config_lease_probe::retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test'
           )
           $discovered = @(cargo test --locked --bin mini-agent $filter -- --list 2>&1)
           if ($LASTEXITCODE -ne 0) { throw 'Windows MCP lease experiment discovery failed' }
           $actual = @($discovered | Where-Object { $_ -match '^fs::private::windows::operator_config_lease_probe::.*: test$' })
-          if ($actual.Count -ne 3 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
-            throw 'Exact three native Windows MCP lease experiments were not discovered'
+          if ($actual.Count -ne 4 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Exact four native Windows MCP lease experiments were not discovered'
           }
           $native = @(cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1)
           $nativeExit = $LASTEXITCODE
           $native | Write-Output
           if ($nativeExit -ne 0) { throw 'Native Windows MCP lease experiment failed' }
-          if (-not ($native -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) {
-            throw 'Native Windows MCP lease experiment did not execute exactly three passing tests'
+          if (-not ($native -match '^test result: ok\. 4 passed; 0 failed; 0 ignored;')) {
+            throw 'Native Windows MCP lease experiment did not execute exactly four passing tests'
           }
 
       - name: Test MCP OAuth credential storage

@@ -1871,6 +1871,326 @@ mod windows {
             assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
         }
 
+        // Separate candidate: retire the old object rather than altering bytes
+        // visible to a surviving read-only view. None of this is a config writer.
+        struct FullReadOnlyView {
+            mapping: Mapping,
+            length: usize,
+        }
+        impl FullReadOnlyView {
+            fn new(file: &std::fs::File) -> Self {
+                let length = file.metadata().unwrap().len() as usize;
+                assert_eq!(length, OLD.len());
+                // SAFETY: held owned inert file contains exactly OLD; PAGE_READONLY
+                // creates no writable capability and the mapped extent is bounded.
+                let handle = unsafe {
+                    CreateFileMappingW(file.as_raw_handle().cast(), null(), 2, 0, 0, null())
+                };
+                assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+                let mut mapping = Mapping {
+                    view: null_mut(),
+                    handle: Some(handle),
+                };
+                // SAFETY: the live mapping covers this exact initialized extent.
+                mapping.view = unsafe { MapViewOfFile(handle, 4, 0, 0, length) };
+                assert!(
+                    !mapping.view.is_null(),
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                mapping.close_mapping_handle();
+                Self { mapping, length }
+            }
+            fn bytes(&self) -> Vec<u8> {
+                // SAFETY: this live PAGE_READONLY view was mapped for length bytes
+                // above, and no probe writes or truncates its original object.
+                unsafe { std::slice::from_raw_parts(self.mapping.view.cast::<u8>(), self.length) }
+                    .to_vec()
+            }
+        }
+
+        #[derive(Debug)]
+        enum RetirementConflict {
+            LinksOrType,
+            PrivateMetadata,
+            Owner,
+            Identity,
+            Content,
+            NameCollision,
+            ReadOnlyMapping,
+            Native(std::io::Error),
+        }
+        fn validate_retirement(
+            fixture: &Fixture,
+            lease: &std::fs::File,
+            private: bool,
+        ) -> Result<(), RetirementConflict> {
+            let info =
+                information(lease.as_raw_handle().cast()).map_err(RetirementConflict::Native)?;
+            if info.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+                || info._number_of_links != 1
+            {
+                return Err(RetirementConflict::LinksOrType);
+            }
+            ensure_current_owner(lease.as_raw_handle().cast())
+                .map_err(|_| RetirementConflict::Owner)?;
+            if private {
+                validate_checked(lease).map_err(|_| RetirementConflict::PrivateMetadata)?;
+            }
+            let named = relative_open(&fixture.directory, LEAF, FILE_READ_ATTRIBUTES, ALL_SHARES)
+                .map_err(RetirementConflict::Native)?;
+            crate::fs::ensure_same_file(
+                Path::new(LEAF),
+                &fixture.expected,
+                &crate::fs::checked_file_metadata(&named).map_err(RetirementConflict::Native)?,
+            )
+            .map_err(|_| RetirementConflict::Identity)?;
+            crate::fs::ensure_same_file(
+                Path::new(LEAF),
+                &fixture.expected,
+                &crate::fs::checked_file_metadata(lease).map_err(RetirementConflict::Native)?,
+            )
+            .map_err(|_| RetirementConflict::Identity)?;
+            if held_bytes(lease).map_err(RetirementConflict::Native)? != OLD {
+                return Err(RetirementConflict::Content);
+            }
+            Ok(())
+        }
+        fn retire_checked(
+            fixture: &Fixture,
+            lease: &std::fs::File,
+            target: &str,
+            private: bool,
+        ) -> Result<(), RetirementConflict> {
+            validate_retirement(fixture, lease, private)?;
+            crate::fs::windows_rename_open_file_relative(
+                &fixture.directory,
+                lease,
+                std::ffi::OsStr::new(target),
+                false,
+            )
+            .map_err(|error| {
+                use windows_sys::Win32::Foundation::{
+                    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_USER_MAPPED_FILE,
+                };
+                match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => {
+                        RetirementConflict::NameCollision
+                    }
+                    Some(ERROR_USER_MAPPED_FILE) => RetirementConflict::ReadOnlyMapping,
+                    _ => RetirementConflict::Native(error),
+                }
+            })
+        }
+        fn set_inert_public_acl(file: &std::fs::File) {
+            let user = current_user_sid_string().unwrap();
+            let text = wide(OsStr::new(&format!(
+                "D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;WD)"
+            )));
+            let mut raw = null_mut();
+            // SAFETY: the owned NUL-terminated SDDL and writable descriptor
+            // pointer live through conversion. SecurityDescriptor owns the
+            // resulting allocation and frees it on every subsequent exit.
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        text.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut raw,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            let descriptor = SecurityDescriptor(raw);
+            // SAFETY: this exact owned inert file has WRITE_DAC access. The
+            // descriptor keeps its ACL live through SetSecurityInfo; null owner
+            // and group pointers preserve ownership. Only its protected DACL
+            // is deliberately changed for the controlled refusal experiment.
+            assert_eq!(
+                unsafe {
+                    SetSecurityInfo(
+                        file.as_raw_handle().cast(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        descriptor.dacl().unwrap(),
+                        null_mut(),
+                    )
+                },
+                0
+            );
+        }
+        fn inert_record(fixture: &Fixture, name: &str, bytes: &[u8]) {
+            let mut file = create_private_file(&fixture.root.path().join(name)).unwrap();
+            prepare_new_private_file(&file).unwrap();
+            validate_checked(&file).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        #[test]
+        fn retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts() {
+            const RETIRED: &str = "inert-retired-record";
+            const NEW: &[u8] = b"{\"inert\":\"new-private-record\"}";
+            for private in [true, false] {
+                let fixture = Fixture::new();
+                if !private {
+                    let acl = fixture
+                        .open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, ALL_SHARES)
+                        .unwrap();
+                    set_inert_public_acl(&acl);
+                    assert_eq!(
+                        validate_checked(&acl).unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    drop(acl);
+                }
+                let file = fixture.open(GENERIC_READ, ALL_SHARES).unwrap();
+                let view = FullReadOnlyView::new(&file);
+                drop(file);
+                assert_eq!(view.bytes(), OLD);
+                // No writable access: this experiment only retires the original link.
+                let lease = fixture
+                    .open(GENERIC_READ | DELETE | READ_CONTROL, 0)
+                    .unwrap();
+                validate_retirement(&fixture, &lease, private).unwrap();
+                match retire_checked(&fixture, &lease, RETIRED, private) {
+                    Ok(()) => {
+                        assert!(!fixture.root.path().join(LEAF).exists());
+                        let retired = relative_open(
+                            &fixture.directory,
+                            RETIRED,
+                            FILE_READ_ATTRIBUTES,
+                            ALL_SHARES,
+                        )
+                        .unwrap();
+                        crate::fs::ensure_same_file(
+                            Path::new(RETIRED),
+                            &fixture.expected,
+                            &crate::fs::checked_file_metadata(&retired).unwrap(),
+                        )
+                        .unwrap();
+                        drop(retired);
+                        // New bytes go only to a distinct new private object. This is
+                        // inert namespace experimentation, not a production transaction.
+                        inert_record(&fixture, LEAF, NEW);
+                        let new = relative_open(
+                            &fixture.directory,
+                            LEAF,
+                            GENERIC_READ | READ_CONTROL,
+                            ALL_SHARES,
+                        )
+                        .unwrap();
+                        validate_checked(&new).unwrap();
+                        assert_eq!(held_bytes(&new).unwrap(), NEW);
+                        assert!(
+                            crate::fs::ensure_same_file(
+                                Path::new(LEAF),
+                                &fixture.expected,
+                                &crate::fs::checked_file_metadata(&new).unwrap(),
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(view.bytes(), OLD);
+                        assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                        eprintln!("MCP57_1_RETIREMENT=RetiredOldViewPreserved private={private}");
+                        drop(new);
+                    }
+                    Err(RetirementConflict::ReadOnlyMapping) => {
+                        // A specifically mapped-object conflict rejects this candidate
+                        // operation; there is no rename/in-place fallback.
+                        assert!(!fixture.root.path().join(RETIRED).exists());
+                        assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                        assert_eq!(view.bytes(), OLD);
+                        eprintln!("MCP57_1_RETIREMENT=MappedRetirementExcluded private={private}");
+                    }
+                    Err(RetirementConflict::Native(error)) => {
+                        panic!("unexpected native retirement failure: {error}")
+                    }
+                    Err(other) => panic!("unexpected retirement authority conflict: {other:?}"),
+                }
+                drop(lease);
+                drop(view);
+                drop(fixture);
+            }
+
+            // Native no-mapping positive rules out a vacuous mapped conflict
+            // caused by invalid DELETE rights or an invalid retained rename ABI.
+            let fixture = Fixture::new();
+            let lease = fixture
+                .open(GENERIC_READ | DELETE | READ_CONTROL, 0)
+                .unwrap();
+            retire_checked(&fixture, &lease, RETIRED, true).unwrap();
+            assert_eq!(held_bytes(&lease).unwrap(), OLD);
+            assert!(!fixture.root.path().join(LEAF).exists());
+            drop(lease);
+            assert_eq!(
+                std::fs::read(fixture.root.path().join(RETIRED)).unwrap(),
+                OLD
+            );
+            drop(fixture);
+
+            let fixture = Fixture::new();
+            inert_record(&fixture, RETIRED, b"inert destination collision");
+            let lease = fixture
+                .open(GENERIC_READ | DELETE | READ_CONTROL, 0)
+                .unwrap();
+            assert!(matches!(
+                retire_checked(&fixture, &lease, RETIRED, true),
+                Err(RetirementConflict::NameCollision)
+            ));
+            assert_eq!(held_bytes(&lease).unwrap(), OLD);
+            assert_eq!(
+                std::fs::read(fixture.root.path().join(RETIRED)).unwrap(),
+                b"inert destination collision"
+            );
+            drop(lease);
+            assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+            drop(fixture);
+
+            let fixture = Fixture::new();
+            let lease = fixture
+                .open(GENERIC_READ | DELETE | READ_CONTROL, 0)
+                .unwrap();
+            validate_retirement(&fixture, &lease, true).unwrap();
+            let alias = fixture.root.path().join("inert-alias");
+            std::fs::hard_link(fixture.root.path().join(LEAF), &alias).unwrap();
+            assert!(matches!(
+                retire_checked(&fixture, &lease, RETIRED, true),
+                Err(RetirementConflict::LinksOrType)
+            ));
+            assert!(!fixture.root.path().join(RETIRED).exists());
+            assert_eq!(held_bytes(&lease).unwrap(), OLD);
+            drop(lease);
+            std::fs::remove_file(alias).unwrap();
+            assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+            drop(fixture);
+
+            let fixture = Fixture::new();
+            let lease = fixture
+                .open(GENERIC_READ | DELETE | READ_CONTROL, 0)
+                .unwrap();
+            validate_retirement(&fixture, &lease, true).unwrap();
+            let acl = fixture
+                .open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, ALL_SHARES)
+                .unwrap();
+            set_inert_public_acl(&acl);
+            assert!(matches!(
+                retire_checked(&fixture, &lease, RETIRED, true),
+                Err(RetirementConflict::PrivateMetadata)
+            ));
+            assert!(!fixture.root.path().join(RETIRED).exists());
+            assert_eq!(held_bytes(&lease).unwrap(), OLD);
+            apply_private_dacl(acl.as_raw_handle().cast(), false).unwrap();
+            drop(acl);
+            validate_retirement(&fixture, &lease, true).unwrap();
+            drop(lease);
+            assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+            eprintln!("MCP57_1_RETIREMENT_CONFLICTS=NameCollision,LinksOrType,PrivateMetadata");
+        }
+
         #[test]
         fn reader_lease_precedes_marker_and_late_marker_refuses_admission() {
             let fixture = Fixture::new();
