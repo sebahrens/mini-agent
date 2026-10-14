@@ -132,6 +132,18 @@ These controlled checks do not establish an atomic metadata lock or a production
 transaction. Different application state overrides, bootstrap/feature-off reader
 obstruction, exact journal discoverability and crash recovery remain unresolved.
 
+A separate exact-rights control tests `GENERIC_READ | DELETE | READ_CONTROL`
+with Share0, rather than inferring its behavior from the older writable lease.
+It covers existing/new read, write and delete handles, actual unlink, and a
+full surviving writable view after both creator handles close. If that view
+is admitted, it must demonstrate changed leased inert bytes and explicitly
+reject stable-content authority. Hardlink and protected-DACL changes before
+and during the exact lease remain distinct observed metadata conflicts.
+Every object is owned, inert and retired by retained file/view/root owners;
+no product configuration, marker, journal, permission or fallback is changed.
+The four prior native experiments remain unchanged. The added control requires
+its own exact native Windows discovery/execution before any new kernel claim.
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and

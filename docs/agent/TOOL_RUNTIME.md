@@ -1022,3 +1022,23 @@ per-thread guard restores its predecessor on success or unwind. Captured cursor
 and clear commands use Crossterm’s public ANSI serializer, without querying or
 executing native console commands. Native picker geometry/stdout calls and errors
 remain unchanged outside that test capture.
+
+`session::storage::load_session_exact_read_only` imports data through two
+host-retained roots. It validates the application-private directory and file
+without creating or repairing them, rejects links and changed identity, reads
+at most 8 MiB plus one detection byte, and requires the requested portable ID
+and current workspace. Saved labels and approvals do not create runtime grants;
+the frontend constructs fresh permissions/instruction services separately.
+All Session reads/serialization use the same 8 MiB ceiling. Saves encode once
+through a bounded byte writer, so shared-owner changes cannot evade a separate
+size-count pass. Malformed snapshots
+produce a bounded static parse error; oversize saves refuse before creating or
+replacing a session artifact. Native replay compatibility remains a separate
+actual-model/controller check.
+
+The Windows test-only read-only import control broadens the actual session file
+and captured private root DACL separately. The real importer must refuse each
+without repairing its ACL, replacing an object, writing bytes or creating an
+artifact. Exact DACL/identity/bytes checks and a restored healthy import guard
+the negative against a broken fixture. This requires native Windows execution;
+Unix mode tests and the healthy import alone do not establish that contract.

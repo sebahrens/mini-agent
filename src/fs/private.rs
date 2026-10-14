@@ -2191,6 +2191,242 @@ mod windows {
             eprintln!("MCP57_1_RETIREMENT_CONFLICTS=NameCollision,LinksOrType,PrivateMetadata");
         }
 
+        /// Exact retirement rights, independently of the older read/write lease.
+        /// Every mutation is confined to bounded, owned inert bytes and metadata.
+        #[test]
+        fn read_delete_share_zero_distinguishes_data_exclusion_from_mutable_metadata() {
+            const ACCESS: u32 = GENERIC_READ | DELETE | READ_CONTROL;
+            struct FullWritableView {
+                mapping: Mapping,
+                length: usize,
+            }
+            impl FullWritableView {
+                fn new(file: &std::fs::File) -> Self {
+                    let length = file.metadata().unwrap().len() as usize;
+                    assert_eq!(length, OLD.len());
+                    // SAFETY: the held owned inert file has read/write access and
+                    // exactly OLD.len() initialized bytes. PAGE_READWRITE grants
+                    // only this controlled experiment a writable mapped view.
+                    let handle = unsafe {
+                        CreateFileMappingW(file.as_raw_handle().cast(), null(), 4, 0, 0, null())
+                    };
+                    assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+                    let mut mapping = Mapping {
+                        view: null_mut(),
+                        handle: Some(handle),
+                    };
+                    // SAFETY: the owned live mapping covers exactly length bytes.
+                    // Mapping retires the view on every normal or unwinding exit.
+                    mapping.view = unsafe { MapViewOfFile(handle, 2, 0, 0, length) };
+                    assert!(
+                        !mapping.view.is_null(),
+                        "{}",
+                        std::io::Error::last_os_error()
+                    );
+                    mapping.close_mapping_handle();
+                    Self { mapping, length }
+                }
+                fn bytes(&self) -> Vec<u8> {
+                    // SAFETY: the retained initialized full-length view remains
+                    // mapped; this experiment never truncates the original file.
+                    unsafe {
+                        std::slice::from_raw_parts(self.mapping.view.cast::<u8>(), self.length)
+                    }
+                    .to_vec()
+                }
+                fn write_inert(&mut self, bytes: &[u8]) {
+                    assert_eq!(bytes.len(), self.length);
+                    // SAFETY: PAGE_READWRITE view covers this exact extent. The
+                    // source is a separate bounded owned/static inert buffer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            self.mapping.view.cast::<u8>(),
+                            self.length,
+                        );
+                    }
+                }
+            }
+            #[derive(Debug)]
+            enum RightsObservation {
+                DataOpenExcluded,
+                WritableViewExcluded,
+                WritableViewAdmittedRejectStableContent,
+                AliasMutableRejectSingleLink,
+                DaclMutableRejectPrivatePolicy,
+            }
+
+            // Existing data/delete handles, even with all sharing enabled,
+            // must exclude admission of the exact retirement tuple.
+            for access in [
+                GENERIC_READ,
+                GENERIC_WRITE,
+                DELETE,
+                GENERIC_READ | GENERIC_WRITE,
+            ] {
+                let fixture = Fixture::new();
+                let held = fixture.open(access, ALL_SHARES).unwrap();
+                expect_sharing_conflict(fixture.open(ACCESS, 0));
+                drop(held);
+                let lease = fixture.open(ACCESS, 0).unwrap();
+                validate_retirement(&fixture, &lease, true).unwrap();
+                // New data/delete opens and actual unlink cannot cross Share0.
+                for attempted in [
+                    GENERIC_READ,
+                    GENERIC_WRITE,
+                    DELETE,
+                    GENERIC_READ | GENERIC_WRITE,
+                ] {
+                    expect_sharing_conflict(fixture.open(attempted, ALL_SHARES));
+                }
+                let unlink = std::fs::remove_file(fixture.root.path().join(LEAF)).unwrap_err();
+                assert_eq!(unlink.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+                validate_retirement(&fixture, &lease, true).unwrap();
+                assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                eprintln!(
+                    "MCP57_1_READ_DELETE_DATA={:?}",
+                    RightsObservation::DataOpenExcluded
+                );
+                drop(lease);
+                assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+            }
+
+            let fixture = Fixture::new();
+            let file = fixture
+                .open(GENERIC_READ | GENERIC_WRITE, ALL_SHARES)
+                .unwrap();
+            let mut view = FullWritableView::new(&file);
+            drop(file); // The original data AND mapping handles are now closed.
+            let mut changed = OLD.to_vec();
+            changed[0] = b'[';
+            view.write_inert(&changed);
+            assert_eq!(
+                view.bytes(),
+                changed,
+                "surviving full view must remain writable"
+            );
+            view.write_inert(OLD);
+            assert_eq!(view.bytes(), OLD);
+            let observed = match fixture.open(ACCESS, 0) {
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+                    assert_eq!(view.bytes(), OLD);
+                    RightsObservation::WritableViewExcluded
+                }
+                Ok(lease) => {
+                    validate_retirement(&fixture, &lease, true).unwrap();
+                    // If admitted, demonstrate the specific invariant violation:
+                    // retained mapped writes change the leased preimage. Reject
+                    // that candidate; there is no operator/config publication.
+                    view.write_inert(&changed);
+                    assert_eq!(held_bytes(&lease).unwrap(), changed);
+                    assert!(matches!(
+                        validate_retirement(&fixture, &lease, true),
+                        Err(RetirementConflict::Content)
+                    ));
+                    view.write_inert(OLD);
+                    validate_retirement(&fixture, &lease, true).unwrap();
+                    drop(lease);
+                    RightsObservation::WritableViewAdmittedRejectStableContent
+                }
+            };
+            eprintln!("MCP57_1_READ_DELETE_WRITABLE_VIEW={observed:?}");
+            assert_eq!(view.bytes(), OLD);
+            drop(view);
+            let lease = fixture.open(ACCESS, 0).unwrap();
+            validate_retirement(&fixture, &lease, true).unwrap();
+            drop(lease);
+
+            // Native4 already observed alias/DACL mutation during this tuple.
+            // Keep before/after timing separate, and prove each actual admitted
+            // mutation is refused by the candidate validator before any write.
+            for before_lease in [true, false] {
+                let fixture = Fixture::new();
+                let alias = fixture.root.path().join("inert-rights-alias");
+                if before_lease {
+                    std::fs::hard_link(fixture.root.path().join(LEAF), &alias).unwrap();
+                }
+                let lease = fixture.open(ACCESS, 0).unwrap();
+                if !before_lease {
+                    validate_retirement(&fixture, &lease, true).unwrap();
+                    std::fs::hard_link(fixture.root.path().join(LEAF), &alias).unwrap();
+                }
+                assert_eq!(
+                    information(lease.as_raw_handle().cast())
+                        .unwrap()
+                        ._number_of_links,
+                    2
+                );
+                assert!(matches!(
+                    validate_retirement(&fixture, &lease, true),
+                    Err(RetirementConflict::LinksOrType)
+                ));
+                let named_alias = relative_open(
+                    &fixture.directory,
+                    "inert-rights-alias",
+                    FILE_READ_ATTRIBUTES,
+                    ALL_SHARES,
+                )
+                .unwrap();
+                crate::fs::ensure_same_file(
+                    Path::new(LEAF),
+                    &fixture.expected,
+                    &crate::fs::checked_file_metadata(&named_alias).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                eprintln!(
+                    "MCP57_1_READ_DELETE_ALIAS before_lease={before_lease} observation={:?}",
+                    RightsObservation::AliasMutableRejectSingleLink
+                );
+                drop(named_alias);
+                drop(lease);
+                std::fs::remove_file(alias).unwrap();
+                let lease = fixture.open(ACCESS, 0).unwrap();
+                validate_retirement(&fixture, &lease, true).unwrap();
+                drop(lease);
+
+                let fixture = Fixture::new();
+                let metadata = fixture
+                    .open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, ALL_SHARES)
+                    .unwrap();
+                if before_lease {
+                    set_inert_public_acl(&metadata);
+                }
+                let lease = fixture.open(ACCESS, 0).unwrap();
+                if !before_lease {
+                    validate_retirement(&fixture, &lease, true).unwrap();
+                    // A newly opened metadata-only handle is admitted, too;
+                    // Share0 has not made WRITE_DAC inaccessible.
+                    let fresh_metadata = fixture
+                        .open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, ALL_SHARES)
+                        .unwrap();
+                    set_inert_public_acl(&fresh_metadata);
+                    drop(fresh_metadata);
+                }
+                assert_eq!(
+                    validate_checked(&lease).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert!(matches!(
+                    validate_retirement(&fixture, &lease, true),
+                    Err(RetirementConflict::PrivateMetadata)
+                ));
+                assert_eq!(held_bytes(&lease).unwrap(), OLD);
+                eprintln!(
+                    "MCP57_1_READ_DELETE_DACL before_lease={before_lease} observation={:?}",
+                    RightsObservation::DaclMutableRejectPrivatePolicy
+                );
+                // Restore only this controlled owned inert object's ACL while
+                // the exact retained lease is live, then prove healthy state.
+                apply_private_dacl(metadata.as_raw_handle().cast(), false).unwrap();
+                validate_retirement(&fixture, &lease, true).unwrap();
+                drop(lease);
+                drop(metadata);
+                assert_eq!(std::fs::read(fixture.root.path().join(LEAF)).unwrap(), OLD);
+            }
+        }
+
         #[test]
         fn reader_lease_precedes_marker_and_late_marker_refuses_admission() {
             let fixture = Fixture::new();
@@ -2349,6 +2585,141 @@ mod windows {
         assert!(prepare_new_private_file(&file).is_err());
         assert_eq!(dacl_sddl(&linked, false).unwrap(), before);
         assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    /// Exercise the real importer, not just the shared private ACL matcher.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn readonly_session_import_refuses_broadened_file_and_root_dacl_without_repair() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        let root = crate::tests::OwnedTestDirectory::new("readonly-import-native-dacl");
+        let state = root.path().join("state");
+        ensure_directory(&state).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let sessions = crate::paths::WorkspaceBinding::capture(&state).unwrap();
+        sessions.validate_private_root().unwrap();
+        let mut original = crate::session::Session::new("saved-label", "data-model", 32_000, "");
+        original.working_dir = workspace.root().to_string_lossy().into();
+        original.add_message(crate::session::MessageRole::User, "inert saved history");
+        let path = state.join(format!("{}.json", original.id));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        atomic_create(&path, &bytes).unwrap();
+        let file_dacl = dacl_sddl(&path, false).unwrap();
+        let root_dacl = dacl_sddl(&state, true).unwrap();
+        let load = || {
+            crate::session::storage::load_session_exact_read_only(
+                &sessions,
+                &original.id,
+                &workspace,
+            )
+        };
+        let positive = load().unwrap().unwrap();
+        assert_eq!(positive.messages[0].content, "inert saved history");
+        assert!(positive.permission_allowlist.is_empty());
+        let user = current_user_sid_string().unwrap();
+        let text = wide(OsStr::new(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;WD)"
+        )));
+        let mut raw = null_mut();
+        // SAFETY: owned NUL-terminated SDDL and initialized out pointer remain
+        // live through conversion; SecurityDescriptor retires LocalAlloc data.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = SecurityDescriptor(raw);
+        for (target, directory) in [(&path, false), (&state, true)] {
+            let handle = open_handle(
+                target,
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        FILE_ATTRIBUTE_NORMAL
+                    },
+                None,
+            )
+            .unwrap();
+            // SAFETY: successful CreateFileW returned the unique owned handle;
+            // File closes it before the retained directories/root on every exit.
+            let metadata = unsafe { std::fs::File::from_raw_handle(handle) };
+            ensure_current_owner(handle).unwrap();
+            let identity = crate::fs::checked_file_metadata(&metadata).unwrap();
+            // SAFETY: only this test-owned inert object is modified. The live
+            // descriptor owns its ACL, null owner/group preserve identity, and
+            // the held metadata handle has WRITE_DAC. No production repair.
+            assert_eq!(
+                unsafe {
+                    SetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        descriptor.dacl().unwrap(),
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                validate_checked_object(&metadata, directory)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied,
+            );
+            let broadened = dacl_sddl(target, directory).unwrap();
+            let healthy = if directory { &root_dacl } else { &file_dacl };
+            assert!(
+                broadened != *healthy,
+                "controlled DACL must actually change"
+            );
+            let denied = load().unwrap_err();
+            assert_eq!(
+                denied
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "actual readonly importer must refuse this invalid private policy",
+            );
+            assert!(
+                dacl_sddl(target, directory).unwrap() == broadened,
+                "readonly import must leave the broadened DACL unchanged",
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
+            ensure_current_owner(metadata.as_raw_handle()).unwrap();
+            crate::fs::ensure_same_file(
+                target,
+                &identity,
+                &crate::fs::checked_path_metadata(target).unwrap(),
+            )
+            .unwrap();
+            // Restore only this deliberately modified owned inert image; a
+            // healthy import after each refusal rules out fixture/API vacuity.
+            apply_private_dacl(handle, directory).unwrap();
+            validate_checked_object(&metadata, directory).unwrap();
+            assert!(dacl_sddl(&path, false).unwrap() == file_dacl);
+            assert!(dacl_sddl(&state, true).unwrap() == root_dacl);
+            let restored = load().unwrap().unwrap();
+            assert_eq!(restored.id, original.id);
+            assert_eq!(restored.messages[0].content, "inert saved history");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            eprintln!(
+                "ACP53_READONLY_DACL directory={directory} refused=true unchanged=true restored_positive=true"
+            );
+            drop(metadata);
+        }
     }
 
     #[test]

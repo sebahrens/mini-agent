@@ -5,6 +5,108 @@ use uuid::Uuid;
 
 use crate::session::Session;
 
+pub(crate) const MAX_SESSION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SESSION_MESSAGES: usize = 100_000;
+
+/// Decode only bounded data. Provider/workspace compatibility and fresh runtime
+/// grants belong to the host's import controller, never saved labels.
+pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
+    anyhow::ensure!(
+        json.len() <= MAX_SESSION_BYTES,
+        "persisted session exceeds the 8 MiB limit"
+    );
+    let session: Session = serde_json::from_str(json)
+        .map_err(|_| anyhow::anyhow!("invalid persisted session JSON"))?;
+    anyhow::ensure!(
+        session.messages.len() <= MAX_SESSION_MESSAGES,
+        "persisted session exceeds the message limit"
+    );
+    Ok(session)
+}
+
+fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        session.messages.len() <= MAX_SESSION_MESSAGES,
+        "persisted session exceeds the message limit"
+    );
+    struct BoundedJson(Vec<u8>);
+    impl std::io::Write for BoundedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .len()
+                .checked_add(bytes.len())
+                .filter(|size| *size <= MAX_SESSION_BYTES)
+                .ok_or_else(|| {
+                    std::io::Error::other("persisted session exceeds the 8 MiB limit")
+                })?;
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Encode shared task/account owners once. A separate count pass would not
+    // constrain a second snapshot if one of those owners changed meanwhile.
+    let mut json = BoundedJson(Vec::new());
+    serde_json::to_writer(&mut json, session)?;
+    String::from_utf8(json.0).map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))
+}
+
+/// Exact, noncreating and nonrepairing import. Both retained directories are
+/// supplied by the host; stored working_dir is compared as text, never opened.
+#[cfg(any(feature = "acp", test))]
+pub(crate) fn load_session_exact_read_only(
+    sessions_root: &crate::paths::WorkspaceBinding,
+    requested_id: &str,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> anyhow::Result<Option<Session>> {
+    crate::paths::validate_portable_component(requested_id)?;
+    sessions_root.validate_private_root()?;
+    workspace.validate().map_err(anyhow::Error::msg)?;
+    let relative = PathBuf::from(format!("{requested_id}.json"));
+    let mut file = match sessions_root.open_regular_relative(&relative) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    crate::fs::validate_private_file(&file)?;
+    let identity = crate::fs::checked_file_metadata(&file)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_SESSION_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SESSION_BYTES,
+        "persisted session exceeds the 8 MiB limit"
+    );
+    crate::fs::validate_private_file(&file)?;
+    let current = sessions_root.open_regular_relative(&relative)?;
+    crate::fs::validate_private_file(&current)?;
+    crate::fs::ensure_same_file(
+        &sessions_root.logical_relative_path(&relative)?,
+        &identity,
+        &crate::fs::checked_file_metadata(&current)?,
+    )?;
+    sessions_root.validate_private_root()?;
+    workspace.validate().map_err(anyhow::Error::msg)?;
+    let json = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))?;
+    let mut session = decode_session_json(json)?;
+    anyhow::ensure!(
+        session.id == requested_id,
+        "persisted session identity mismatch"
+    );
+    anyhow::ensure!(
+        super::catalogue::same_workspace(&session.working_dir, workspace),
+        "persisted session belongs to another workspace"
+    );
+    // Import history/task data, never explicit grants or concealed redo.
+    session.permission_allowlist.clear();
+    session.rewind_undo = None;
+    Ok(Some(session))
+}
+
 fn session_dir() -> PathBuf {
     app_paths().sessions_dir()
 }
@@ -48,7 +150,13 @@ fn read_private_string(path: &Path) -> anyhow::Result<String> {
         anyhow::anyhow!("refusing unsafe session file {}: {}", path.display(), error)
     })?;
     let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    file.by_ref()
+        .take((MAX_SESSION_BYTES + 1) as u64)
+        .read_to_string(&mut content)?;
+    anyhow::ensure!(
+        content.len() <= MAX_SESSION_BYTES,
+        "persisted session exceeds the 8 MiB limit"
+    );
     Ok(content)
 }
 
@@ -87,6 +195,7 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     if disabled("sessions") {
         return Ok(());
     }
+    let json = serialize_bounded_session(session)?;
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
     let path = session_path(&session.id)?;
@@ -103,7 +212,6 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
             tracing::warn!("session lock for {} unavailable: {}", session.id, error);
         }
     }
-    let json = serde_json::to_string(session)?;
     let json_len = json.len();
     atomic_write(&path, &json)?;
     tracing::debug!(
@@ -233,7 +341,7 @@ fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<
             return None;
         }
     };
-    match serde_json::from_str::<Session>(&json) {
+    match decode_session_json(&json) {
         Ok(session) => Some(session),
         Err(error) => {
             skipped.note(path, &error);
@@ -294,7 +402,7 @@ pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {
             let json = read_private_string(&path)?;
-            let session: Session = serde_json::from_str(&json)
+            let session = decode_session_json(&json)
                 .map_err(|error| anyhow::anyhow!("invalid persisted session {id}: {error}"))?;
             anyhow::ensure!(
                 session.id == id,
@@ -473,7 +581,7 @@ pub fn find_recent_sessions_for_workspace(
         if std::fs::canonicalize(saved).ok().as_deref() != Some(workspace.as_path()) {
             continue;
         }
-        match serde_json::from_str::<Session>(&json) {
+        match decode_session_json(&json) {
             Ok(session) => matches.push(session),
             Err(error) => {
                 skipped.note(&path, &error);
@@ -534,4 +642,206 @@ pub fn load_theme_name() -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     value.get("theme")?.as_str().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod readonly_import_tests {
+    use super::*;
+    use crate::paths::WorkspaceBinding;
+
+    fn snapshot(
+        root: &crate::tests::OwnedTestDirectory,
+    ) -> (
+        std::sync::Arc<WorkspaceBinding>,
+        WorkspaceBinding,
+        Session,
+        PathBuf,
+    ) {
+        let state = root.path().join("state");
+        crate::paths::ensure_private_directory(&state).unwrap();
+        let workspace = std::sync::Arc::new(WorkspaceBinding::capture(root.path()).unwrap());
+        let sessions = WorkspaceBinding::capture(&state).unwrap();
+        let mut session = Session::new("untrusted-label", "data-model", 32_000, "");
+        session.working_dir = workspace.root().to_string_lossy().into();
+        session.add_message(crate::session::MessageRole::User, "literal saved history");
+        session
+            .permission_allowlist
+            .push(crate::session::PermissionAllowEntry {
+                tool: "write".into(),
+                pattern: "**".into(),
+            });
+        let path = state.join(format!("{}.json", session.id));
+        crate::fs::private_atomic_write_sync(
+            &path,
+            serde_json::to_string(&session).unwrap().as_bytes(),
+        )
+        .unwrap();
+        (workspace, sessions, session, path)
+    }
+
+    #[test]
+    fn readonly_session_import_is_exact_bounded_and_never_recreates_grants_or_missing_artifacts() {
+        let root = crate::tests::OwnedTestDirectory::new("readonly-session-import");
+        let (workspace, sessions, mut original, path) = snapshot(&root);
+        let before = crate::fs::checked_path_metadata(&path).unwrap();
+        let loaded = load_session_exact_read_only(&sessions, &original.id, &workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.id, original.id);
+        assert_eq!(loaded.messages[0].content, "literal saved history");
+        assert!(loaded.permission_allowlist.is_empty());
+        assert!(loaded.rewind_undo.is_none());
+        crate::fs::ensure_same_file(
+            &path,
+            &before,
+            &crate::fs::checked_path_metadata(&path).unwrap(),
+        )
+        .unwrap();
+        let absent = uuid::Uuid::new_v4().to_string();
+        assert!(
+            load_session_exact_read_only(&sessions, &absent, &workspace)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!sessions.root().join(format!("{absent}.json")).exists());
+        assert!(load_session_exact_read_only(&sessions, "../credentials", &workspace).is_err());
+        original.id = uuid::Uuid::new_v4().to_string().into();
+        crate::fs::private_atomic_write_sync(
+            &path,
+            serde_json::to_string(&original).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            load_session_exact_read_only(&sessions, &loaded.id, &workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        original.id = loaded.id.clone();
+        original.working_dir = sessions.root().to_string_lossy().into();
+        crate::fs::private_atomic_write_sync(
+            &path,
+            serde_json::to_string(&original).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            load_session_exact_read_only(&sessions, &loaded.id, &workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("another workspace")
+        );
+        crate::fs::private_atomic_write_sync(&path, &vec![b' '; MAX_SESSION_BYTES + 1]).unwrap();
+        assert!(
+            load_session_exact_read_only(&sessions, &loaded.id, &workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_session_import_refuses_unsafe_file_and_root_without_permission_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = crate::tests::OwnedTestDirectory::new("readonly-session-policy");
+        let (workspace, sessions, original, path) = snapshot(&root);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_session_exact_read_only(&sessions, &original.id, &workspace).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = sessions.root().join("hardlink.json");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(load_session_exact_read_only(&sessions, &original.id, &workspace).is_err());
+        std::fs::remove_file(alias).unwrap();
+        std::fs::set_permissions(sessions.root(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(load_session_exact_read_only(&sessions, &original.id, &workspace).is_err());
+        assert_eq!(
+            std::fs::metadata(sessions.root()).unwrap().mode() & 0o777,
+            0o755
+        );
+        std::fs::set_permissions(sessions.root(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(root.path().join("outside.json"), &path).unwrap();
+        assert!(load_session_exact_read_only(&sessions, &original.id, &workspace).is_err());
+    }
+
+    #[test]
+    fn session_storage_global_limit_refuses_before_creating_and_keeps_errors_static() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-bound");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let mut session = Session::new("provider", "model", 32_000, "");
+        session.add_message(
+            crate::session::MessageRole::User,
+            &"x".repeat(MAX_SESSION_BYTES),
+        );
+        assert!(
+            serialize_bounded_session(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert!(
+            save_session(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert!(!root.path().join("state").exists());
+        let path = session_path(&session.id).unwrap();
+        let previous =
+            serde_json::to_string(&Session::new("provider", "model", 32_000, "previous")).unwrap();
+        atomic_write(&path, &previous).unwrap();
+        assert!(
+            save_session(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        // UTF-8 source size is not the encoded size: escaped content must be
+        // checked as it is written, before the existing snapshot is replaced.
+        session.messages.clear();
+        session.add_message(
+            crate::session::MessageRole::User,
+            &"\"".repeat(MAX_SESSION_BYTES / 2),
+        );
+        assert!(session.messages[0].content.len() < MAX_SESSION_BYTES);
+        assert!(
+            save_session(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        let oversized = serde_json::to_string(&session).unwrap();
+        assert!(
+            decode_session_json(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert_eq!(
+            decode_session_json("{\"messages\": [\"opaque-secret\"]}")
+                .unwrap_err()
+                .to_string(),
+            "invalid persisted session JSON"
+        );
+    }
 }
