@@ -1,0 +1,50 @@
+{
+  "bead": "mini-agent-i7ro6.81.1",
+  "owner_source": "1496df1c1cbe250e6879d02348251a9a6bbdf5b7",
+  "owner_patch_sha256": "8c767fc73127ca778b046a67fd76849a4f1801861b695e9aef14738ab13c440f",
+  "review": {
+    "findings": [],
+    "integration": "Reviewed conflict hunks retain the Bedrock additions; all current non-conflicting memory and CI changes remain. Auth, Azure adapter, setup and provider docs match the accepted owner source exactly. The combined provider diff is only the intended Bedrock additions.",
+    "contracts": [
+      "Claude native Messages bodies and SSE remain in the existing Anthropic SDK protocol, including signed replay and cache accounting.",
+      "Request-scoped SigV4 signs the exact buffered body; API keys and SDK credentials remain typed and origin-bound.",
+      "Credential acquisition and HTTP bodies have explicit time/byte bounds and use separate strict TLS without model headers.",
+      "Optional credential_process is disabled and selected direct/indirect process profiles are explicitly rejected before fallback or dispatch.",
+      "Custom routes require explicit inheritance for the default AWS chain; secrets stay out of diagnostics."
+    ]
+  },
+  "validation": {
+    "selection": "Owner indexed auth, shared HTTP, native classification, pricing/session and listing callers; root file-qualified send_streaming callers and physical provider-factory delta.",
+    "owner_reused": "62 distinct affected tests and all-target strict Clippy; unchanged shared HTTP, credential, auth, cache/pricing and listing source proofs.",
+    "merged_tests": {
+      "passed": 7,
+      "failed": 0,
+      "seconds": 1.03,
+      "scope": "Five Bedrock owning tests plus actual Azure wire and native memory-update contracts.",
+      "log": "/private/tmp/mini-agent-bedrock-memory-merged-tests.log"
+    },
+    "required_debug_install": {
+      "passed": true,
+      "seconds": 40.29,
+      "log": "/private/tmp/mini-agent-bedrock-memory-merged-install.log"
+    },
+    "installed_native": {
+      "passed": true,
+      "binary_sha256": "303ddacadd628b26c4510505add38c167318b7280cbccbf80da9c33d1723b6ad",
+      "stack_bytes": 1048576,
+      "independently_verified_sigv4_requests": 3,
+      "permitted_reads": 1,
+      "healthy_saves": 2,
+      "usage": [30, 6],
+      "normal_quit": 0,
+      "external_calls": 0,
+      "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-bedrock81-installed-td7t7gmd/report.json"
+    }
+  },
+  "limits": [
+    "Bedrock Claude native Messages only; other Bedrock model families are separate protocols.",
+    "Optional credential_process is explicitly unsupported.",
+    "Local fixtures do not claim actual AWS account or cloud acceptance.",
+    "Unconditional AWS dependency changes require the full hosted feature/platform CI aggregate; that broader result remains pending."
+  ]
+}
