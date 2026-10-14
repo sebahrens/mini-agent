@@ -1,0 +1,30 @@
+{
+  "base": "3e8e3bf357bce92a7e279f9a524e248ea7c45822",
+  "scope": "Test-policy corrections after Windows preflight observer refactor; no production behavior change.",
+  "changes": [
+    "Follow root validation through prepare_launch_request before serialization and helper construction.",
+    "Check unchanged deadline/poll-error cleanup in wait_bounded_preflight_child and exact wrapper delegation.",
+    "Classify four exact preflight_witness sites and both inert borrowed-command parameters in independent ownership table."
+  ],
+  "preserved": [
+    "Inventory scanner and negative cross-family controls unchanged",
+    "No new blanket ownership family",
+    "Original production deadlines, sandbox policy and process creation unchanged"
+  ],
+  "validation": [
+    {
+      "test": "windows_appcontainer_source_covers_general_process_security_contract",
+      "result": "PASS",
+      "log": "/private/tmp/mini-agent-3e8-policy-corrections-final.log",
+      "qualification": "The other ownership reader in this earlier invocation failed and was subsequently corrected."
+    },
+    {
+      "test": "current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes",
+      "result": "PASS",
+      "log": "/private/tmp/mini-agent-3e8-policy-ownership-final.log",
+      "command": "cargo test --bin mini-agent --features advisor --locked --offline -- current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes --test-threads=1"
+    }
+  ],
+  "reuse": "Unchanged production debug install and strict checks recorded in 2026-10-14-session-forks-runtime-fixes.json; worktree regression evidence in 2026-10-14-worktree-clean-status.json.",
+  "ci": "New-head hosted CI remains required; no green claim from these scoped local passes."
+}

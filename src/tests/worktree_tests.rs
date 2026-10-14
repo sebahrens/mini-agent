@@ -232,7 +232,7 @@ mod tests {
         );
     }
 
-    fn git_stdout<I, S>(repo: &Path, args: I) -> String
+    fn git_output<I, S>(repo: &Path, args: I) -> std::process::Output
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -248,7 +248,17 @@ mod tests {
             "fixture git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+        output
+    }
+
+    fn git_stdout<I, S>(repo: &Path, args: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        String::from_utf8_lossy(&git_output(repo, args).stdout)
+            .trim()
+            .to_string()
     }
 
     fn optional_test_ref_exists(repo: &Path, reference: &str) -> bool {
@@ -1273,6 +1283,65 @@ mod tests {
         // The fixture is live: an ordinary commit runs the hooks.
         git(repo.path(), ["commit", "--allow-empty", "-m", "unhardened"]);
         assert!(markers.join("pre-commit").exists(), "fixture hook inert");
+    }
+
+    /// mini-agent-gesi4.3: exercise the exact hardened status query used by
+    /// the App dirty prompt, retaining its bytes instead of parsing command prose.
+    #[tokio::test]
+    async fn linked_worktree_status_matches_native_git_for_clean_and_all_dirty_states() {
+        let repo = TempRepo::new("clean linked status");
+        let worktree = repo.path().with_extension("linked");
+        git(
+            repo.path(),
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("status-fixture"),
+                worktree.as_os_str(),
+            ],
+        );
+        let query = ["status", "--porcelain", "--untracked-files=all"];
+        async fn observe(path: &Path, args: &[&str], case: &str, dirty: bool) {
+            let external = git_output(path, args);
+            let hardened =
+                run_git_with_limits_for_test(path, args, crate::git::runner::QUERY_LIMITS)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                hardened.stdout, external.stdout,
+                "{case}: native hardened/external status bytes differ; hardened stderr={:?}, external stderr={:?}",
+                hardened.stderr, external.stderr
+            );
+            assert_eq!(
+                !hardened.stdout.is_empty(),
+                dirty,
+                "{case}: exact status bytes={:?}",
+                hardened.stdout
+            );
+            assert_eq!(worktree_has_uncommitted(path).await, Ok(dirty), "{case}");
+            println!(
+                "gesi4.3 {case}: external stdout={:?} stderr={:?}; hardened stdout={:?} stderr={:?}",
+                external.stdout, external.stderr, hardened.stdout, hardened.stderr
+            );
+        }
+        observe(&worktree, &query, "clean linked", false).await;
+        std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
+        observe(&worktree, &query, "unstaged tracked", true).await;
+        git(&worktree, ["add", "tracked.txt"]);
+        observe(&worktree, &query, "staged tracked", true).await;
+        git(&worktree, ["commit", "-m", "fixture staged state"]);
+        observe(&worktree, &query, "committed linked", false).await;
+        std::fs::write(worktree.join("untracked.txt"), "untracked\n").unwrap();
+        observe(&worktree, &query, "untracked", true).await;
+        std::fs::remove_file(worktree.join("untracked.txt")).unwrap();
+        observe(
+            &worktree,
+            &query,
+            "clean after removing owned untracked",
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -4988,6 +4988,32 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    // Explicit installed self-check observer: one joined Rust writer, same
+    // fixed production helper constructor/creation boundary; no new target.
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "command: tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "let mut command = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
@@ -5019,10 +5045,11 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     ("src/sandbox/windows.rs", ".status()", 1, "TEST-ONLY"),
+    // The observed preflight split adds a second inert borrowed-command parameter.
     (
         "src/sandbox/windows.rs",
         "command: &mut tokio::process::Command,",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (

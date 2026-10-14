@@ -5638,17 +5638,28 @@ mod sandbox_tests {
         assert!(!role_diagnostic.contains(".display()"));
         assert!(!role_diagnostic.contains("to_string_lossy"));
         let parent_request = source
-            .split("fn build_helper_with_ready_and_roots(")
+            .split("fn prepare_launch_request(")
             .nth(1)
-            .and_then(|source| source.split("fn collect_read_roots(").next())
-            .expect("Windows parent request builder missing");
+            .and_then(|source| source.split("fn build_helper_with_ready_and_roots(").next())
+            .expect("Windows parent request preparation missing");
         let parent_policy = parent_request
             .find("validate_explicit_root_policy(")
             .expect("parent root-policy validation missing");
         let request_publish = parent_request
-            .find("let request = LaunchRequest")
+            .find("Ok(LaunchRequest {")
             .expect("Windows launch request publication missing");
         assert!(parent_policy < request_publish);
+        let parent_transport = source
+            .split("fn build_helper_with_ready_and_roots(")
+            .nth(1)
+            .and_then(|source| source.split("fn collect_read_roots(").next())
+            .expect("Windows parent request transport missing");
+        let prepare = parent_transport.find("prepare_launch_request(").unwrap();
+        let encode = parent_transport
+            .find("serde_json::to_vec(&request)")
+            .unwrap();
+        let launch = parent_transport.find("Command::new(executable)").unwrap();
+        assert!(prepare < encode && encode < launch);
         let helper = source
             .split("fn run_helper()")
             .nth(1)
@@ -5738,13 +5749,21 @@ mod sandbox_tests {
         let bounded_helper = source
             .split("fn run_bounded_preflight_helper(")
             .nth(1)
-            .and_then(|source| source.split("fn terminate_and_reap_owned_helper(").next())
+            .and_then(|source| source.split("fn spawn_preflight_helper(").next())
             .expect("bounded Windows production helper missing");
+        assert!(
+            bounded_helper.contains("spawn_preflight_helper(command, run_deadline, diagnostics)?")
+        );
+        assert!(bounded_helper.contains(
+            "wait_bounded_preflight_child(&mut child, run_deadline, cleanup_deadline, diagnostics)"
+        ));
+        let wait = source
+            .split("fn wait_bounded_preflight_child(")
+            .nth(1)
+            .and_then(|source| source.split("fn terminate_and_reap_owned_helper(").next())
+            .expect("bounded Windows helper retirement owner missing");
         assert_eq!(
-            bounded_helper
-                .matches(
-                    "terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)",
-                )
+            wait.matches("terminate_and_reap_owned_helper(child, cleanup_deadline, diagnostics)")
                 .count(),
             2,
             "deadline and poll failure must both clean up the owned helper"

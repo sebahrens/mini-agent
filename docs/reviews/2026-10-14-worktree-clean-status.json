@@ -1,0 +1,80 @@
+{
+  "bead": "mini-agent-gesi4.3",
+  "outcome": "Verified current behavior with regression coverage; historical dirty-report cause remains unreproduced. No production/policy change.",
+  "base": "a2697b06",
+  "current_main_binary_source": "3e8e3bf357bce92a7e279f9a524e248ea7c45822",
+  "changes": [
+    "Expose the existing test Git helper raw Output without changing its command/old trimmed-string wrapper.",
+    "Add actual native hardened-query clean/staged/unstaged/untracked linked-worktree regression."
+  ],
+  "index": {
+    "state": "/private/tmp/mini-agent-worktree43-indexer",
+    "session": "e4a82789-2117-42de-984f-a33430898d57",
+    "trace": "/private/tmp/mini-agent-worktree43-full-trace.txt"
+  },
+  "test_selection": {
+    "defining_symbols": [
+      "extras/git_worktree::worktree_has_uncommitted",
+      "extras/git_worktree::has_uncommitted_changes_at",
+      "extras/git_worktree::run_query",
+      "git/runner::GitRunner::run",
+      "App::handle_worktree_merge"
+    ],
+    "confirmed_callers": "App pre-prompt and post-auto-commit exact status checks; missing status fails closed. Existing direct_merge source-text consumer included.",
+    "command": "CARGO_TARGET_DIR=/private/tmp/mini-agent-worktree43-target cargo test --locked --offline --bin mini-agent -- linked_worktree_status_matches_native_git_for_clean_and_all_dirty_states worktree_status_errors_fail_closed direct_merge_uses_the_typed_supervised_transaction --test-threads=1 --nocapture",
+    "result": "3 PASS; new six-state raw byte equality covers actual hardened Git runner; no broader suite or feature row required for test-only git-worktree module.",
+    "log": "/private/tmp/mini-agent-worktree43-owning.log",
+    "sha256": "8f6f80137450605cb4fcc9f36b76d897b09e68eb9272cd0b6fbef7aa6ff7df42"
+  },
+  "native": {
+    "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-38wsvlc3/report.json",
+    "report_sha256": "29f27572e2f56d97ec4682c850afff93cbdb8d95a41845fff6ef0ecb8b8b3c62",
+    "driver": "/private/tmp/mini-agent-worktree43-native.py",
+    "driver_sha256": "6c9e46d6c180d47b09220617043967182b0514c6a6c091ddfc6c534a59eb2915",
+    "result": {
+      "root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-38wsvlc3",
+      "binary": "/private/tmp/mini-agent-wave46-final-install/bin/mini-agent",
+      "binary_sha256": "ff3240a0d7748b179b4ae6f1c4b45b423b3ba694ac812d569ec07ecd8b8373cf",
+      "historical_cause": "unreproduced; current acceptance only",
+      "main_before_launch": {
+        "stdout_hex": "",
+        "stderr_hex": ""
+      },
+      "upstream": "origin/main",
+      "source_before_merge": {
+        "stdout_hex": "",
+        "stderr_hex": ""
+      },
+      "main_after_merge": {
+        "stdout_hex": "",
+        "stderr_hex": ""
+      },
+      "passed": true,
+      "physical_stack_bytes": null,
+      "stack_mode": "unchanged platform default",
+      "dirty_prompt": false,
+      "auto_commit_prompt": false,
+      "exact_target_bytes": true,
+      "source_worktree_and_branch_removed": true,
+      "provider_posts": 0,
+      "normal_quit": 0,
+      "cleanup_errors": []
+    }
+  },
+  "source_identity": {
+    "src/git/runner.rs": "52b4527181252ce0ec5e102fbd9cefbaf4fcf6ebbb89815e3d4ef21d8ad098b5",
+    "src/extras/git_worktree/mod.rs": "77b3f34ec9cf4d18496f693431bb8654358baa62a878a5f25a38541a2997274a",
+    "App::handle_worktree_merge": "b0d49909606b5f8e74fb2430200dc7d49a20c8cb5ce9afa90705065244edee8b",
+    "current_main_comparison": "Both full Git modules and exact App merge method are byte-identical to current Main; reused Root required debug install/strict of unchanged production."
+  },
+  "review": {
+    "adversarial": "Dirty states remain true, errors refuse; no hook/filter or sandbox weakening. Every fixture file/process is owned; native uses actual /worktree rebind and local origin/main.",
+    "reliability": "Exact raw stdout/stderr retained; query errors cannot become clean; normal native quit and cleanup clean.",
+    "testing": "Clean/staged/unstaged/untracked/clean-again states; actual complete local merge without prompt; original historical cause explicitly unclaimed.",
+    "findings": []
+  },
+  "retained_limits": [
+    "The first two native attempts used an invalid overlapping config/cache root and correctly refused Git; their original report/log/driver artifacts are retained.",
+    "The separate physical1MiB creation overflow is tracked by mini-agent-i7ro6.116; platform-default merge pass does not prove1MiB. Failed binary retained /private/tmp/mini-agent-worktree116-failed-binary."
+  ]
+}
