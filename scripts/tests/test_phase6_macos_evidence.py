@@ -184,7 +184,12 @@ class Phase6MacosEvidenceTests(unittest.TestCase):
             step,
         )
         self.assertIn("--exact --ignored", step)
-        self.assertIn("grep -q 'test result: ok. 1 passed'", step)
+        self.assertIn(
+            "grep -Eq '^test result: ok\\. 1 passed; 0 failed; 0 ignored;'"
+            ' <<< "$output"',
+            step,
+        )
+        self.assertNotIn("| grep", step)
 
     def test_the_workflow_uses_the_generator_instead_of_hard_coded_fields(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
