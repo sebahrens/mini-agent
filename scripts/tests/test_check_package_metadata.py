@@ -1229,18 +1229,24 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
         repository = SCRIPT.parents[1]
         read_text = Path.read_text
 
-        def missing_default_feature(path: Path, *args, **kwargs) -> str:
-            text = read_text(path, *args, **kwargs)
-            if path == repository / "README.md":
-                return text.replace("and `agent-skills`.", "", 1)
-            return text
+        for feature in ["agent-skills", "lsp", "hooks", "multimodal"]:
+            with self.subTest(feature=feature):
+                def missing_default_feature(path: Path, *args, **kwargs) -> str:
+                    text = read_text(path, *args, **kwargs)
+                    if path == repository / "README.md":
+                        start = text.index("The default build enables")
+                        end = text.index("Learned-skill storage", start)
+                        paragraph = text[start:end]
+                        self.assertIn(f"`{feature}`", paragraph)
+                        return text[:start] + paragraph.replace(f"`{feature}`", "", 1) + text[end:]
+                    return text
 
-        with mock.patch.object(Path, "read_text", missing_default_feature):
-            errors = CHECK_PACKAGE_METADATA.validate_file_fragments(repository, "mini-agent")
+                with mock.patch.object(Path, "read_text", missing_default_feature):
+                    errors = CHECK_PACKAGE_METADATA.validate_file_fragments(repository, "mini-agent")
 
-        self.assertEqual(1, len(errors))
-        self.assertIn("README.md is missing required text", errors[0])
-        self.assertIn("`agent-skills`", errors[0])
+                self.assertEqual(1, len(errors))
+                self.assertIn("README.md is missing required text", errors[0])
+                self.assertIn(f"`{feature}`", errors[0])
 
     def test_checked_in_package_recipes_install_compliance_documents(self) -> None:
         self.assertEqual(

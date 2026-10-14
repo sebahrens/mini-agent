@@ -1274,7 +1274,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every binary release archive use the executable name\n`{binary}`.",
-            "The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, and `agent-skills`.",
+            "The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, and `multimodal`.",
             f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh | bash -s -- --release X.Y.Z",
             f"gh attestation verify mini-agent-<arch>-<os>.tar.gz --repo {CANONICAL_REPOSITORY}",
         ),
