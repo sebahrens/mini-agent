@@ -639,7 +639,7 @@ mod tests {
             let account = Account::new(&id, Some(1.0), 0.0).unwrap();
             let run = Run::fixture(
                 account.clone(),
-                Arc::new(Ledger::new(state)),
+                Arc::new(Ledger::new(&state)),
                 &id,
                 PriceSnapshot::capture(Some((1.0, 1.0)), Default::default(), false),
             );
