@@ -34,7 +34,7 @@ use futures::StreamExt;
 use tracing::{Instrument, info_span, span::Id};
 
 use super::{
-    completion::{Agent, DynamicContextStore, PreparedCompletionRequest},
+    completion::{Agent, DynamicContextStore, BuiltCompletionRequest},
     hook::{
         AgentHook, Flow, HookContext, HookStack, InvalidToolCallHookAction, RequestPatch, StepEvent,
     },
@@ -687,8 +687,12 @@ where
         None => {
             let mut effective_tool_call = tool_call.clone();
             effective_tool_call.function.arguments = effective_args;
+            // SDK-owned per-run hook state is explicit and overrides any caller key.
+            // Other application extensions (budget/question) remain unchanged.
+            let mut captured_extensions = tool_extensions.clone();
+            captured_extensions.insert(ctx.scratchpad().clone());
             let exec = tool_server
-                .call_tool_structured(tool_name, &args, tool_extensions)
+                .call_tool_structured(tool_name, &args, &captured_extensions)
                 .await;
             (exec, ToolExecution::Executed(Box::new(effective_tool_call)))
         }
@@ -718,6 +722,7 @@ where
             .on_event(
                 ctx,
                 StepEvent::ToolResult {
+                    tool_id: &tool_call.id,
                     tool_name,
                     tool_call_id: tool_call.call_id.as_deref(),
                     internal_call_id,
@@ -905,13 +910,13 @@ where
         runner: &'a AgentRunner<M>,
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
-        prepared: PreparedCompletionRequest<M>,
+        prepared: BuiltCompletionRequest<M>,
         chat_span: tracing::Span,
         _agent_span: &'a tracing::Span,
         current_prompt: Message,
     ) -> DriveStream<'a, M::Response> {
         Box::pin(async_stream::stream! {
-            let resp = match prepared.builder.send().instrument(chat_span.clone()).await {
+            let resp = match prepared.model.completion(prepared.request).instrument(chat_span.clone()).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     yield Err(StreamingError::from(err));

@@ -1892,6 +1892,7 @@ fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
         mcp_discovery: Default::default(),
         workspace_root: owner.path().to_path_buf(),
         agents: None,
+        instruction_roots: Vec::new(),
         prompts: Default::default(),
         current_prompt: None,
         current_prompt_name: None,

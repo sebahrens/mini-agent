@@ -56,6 +56,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                 mcp_discovery: Default::default(),
                 workspace_root: workspace.root().to_path_buf(),
                 agents: None,
+                instruction_roots: Vec::new(),
                 prompts: Default::default(),
                 current_prompt: None,
                 current_prompt_name: None,

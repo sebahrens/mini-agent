@@ -11,6 +11,16 @@ targets Linux and macOS; x86-64 Windows also has a release MSI. JavaScript actio
 feature contract on all three systems, while each platform uses and reports its own containment
 assurance; see the repository README and architecture overview for those guarantees.
 
+Repository guidance can live in root `AGENTS.md` / `CLAUDE.md`, personal
+`CLAUDE.local.md`, or nested copies loaded when native file tools first touch a
+directory. An authored `@path` (or `@{path with spaces}`) includes a bounded file
+inside the same captured root. Local, nested and included project guidance needs
+project trust and read Allow authority. `/context` shows captured filenames and
+sizes without their bodies. `--no-context-files` disables loading, including in
+readonly BTW and Task agents. See [context limits and review](CONFIG.md)
+for details. A mutation denied pending instruction review has made no change;
+the agent must receive and review the native notice before deliberately retrying.
+
 ## 1. Installation
 
 You can build from source or use the shell installer. The shell installer requires a

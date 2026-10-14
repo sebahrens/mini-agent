@@ -9,6 +9,7 @@ use crate::session::storage;
 
 pub mod agents;
 pub(crate) mod commands;
+pub(crate) mod instructions;
 pub mod prompts;
 pub mod themes;
 
@@ -165,6 +166,8 @@ pub struct ContextFiles {
     /// Workspace used for project context and relative agent tool paths.
     pub workspace_root: PathBuf,
     pub agents: Option<String>,
+    /// Authored root snapshots preserve include origin; diagnostics never reread them.
+    pub(crate) instruction_roots: Vec<instructions::InstructionRoot>,
     pub prompts: HashMap<String, String>,
     pub current_prompt: Option<String>,
     pub current_prompt_name: Option<String>,
@@ -298,13 +301,14 @@ impl ContextFiles {
         workspace: &crate::paths::WorkspaceBinding,
     ) -> Self {
         let mut context = self.clone();
-        let (agents, architecture) = if no_context_files {
-            (None, None)
+        let (agents, architecture, instruction_roots) = if no_context_files {
+            (None, None, Vec::new())
         } else {
             walk_bound_context_files(workspace)
         };
         context.workspace_root = workspace.root().to_path_buf();
         context.agents = agents;
+        context.instruction_roots = instruction_roots;
         context.prompts = prompts::load_for_workspace_binding(workspace);
         context.agent_definitions = agents::load_for_workspace_binding(workspace);
         if context
@@ -345,29 +349,43 @@ impl ContextFiles {
 
 fn walk_bound_context_files(
     workspace: &crate::paths::WorkspaceBinding,
-) -> (Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<instructions::InstructionRoot>,
+) {
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
+    let mut roots = Vec::new();
     let mut budget = ContextBudget::default();
-    if let Some(content) = load_file(&storage::agents_path())
-        .and_then(|(content, truncated)| budget.admit("global AGENTS.md", content, truncated))
+    let global = storage::agents_path();
+    if let Some((content, truncated, binding, relative, identity)) =
+        load_captured_global_file(&global)
+        && let Some(content) = budget.admit("global AGENTS.md", content, truncated)
     {
+        roots.push(
+            instructions::InstructionRoot::global(binding, relative, &content)
+                .with_identity(identity),
+        );
         agent_parts.push(format!("# Global AGENTS.md\n{content}"));
     }
     #[cfg(feature = "archmd")]
-    if let Some(content) = load_file(&storage::architecture_path())
-        .and_then(|(content, truncated)| budget.admit("global ARCHITECTURE.md", content, truncated))
+    if let Some((content, truncated, _, _, _)) =
+        load_captured_global_file(&storage::architecture_path())
+        && let Some(content) = budget.admit("global ARCHITECTURE.md", content, truncated)
     {
         arch_parts.push(format!("# Global ARCHITECTURE.md\n{content}"));
     }
+    // The retained root is the entire walk. Ambient parents are intentionally
+    // excluded, including when their lexical spelling is a symlink ancestor.
     let names = if cfg!(feature = "archmd") {
         &["AGENTS.md", "CLAUDE.md", "ARCHITECTURE.md"][..]
     } else {
         &["AGENTS.md", "CLAUDE.md"][..]
     };
-    for (dir, name, content, truncated) in
-        workspace.read_ancestor_files(names, MAX_ANCESTOR_CONTEXT_BYTES)
+    for (_, name, content, truncated, identity) in
+        workspace.read_root_context_files(names, MAX_ANCESTOR_CONTEXT_BYTES)
     {
         let Some(content) = budget.admit(&name, content, truncated) else {
             continue;
@@ -376,16 +394,48 @@ fn walk_bound_context_files(
             #[cfg(feature = "archmd")]
             arch_parts.push(format!(
                 "# ARCHITECTURE.md ({})\n{}",
-                dir.display(),
+                workspace.root().display(),
                 content
             ));
         } else {
-            agent_parts.push(format!("# {} ({})\n{}", name, dir.display(), content));
+            let Ok(root) =
+                instructions::InstructionRoot::workspace(workspace, PathBuf::from(&name), &content)
+            else {
+                continue;
+            };
+            roots.push(root.with_identity(identity));
+            agent_parts.push(format!(
+                "# {} ({})\n{}",
+                name,
+                workspace.root().display(),
+                content
+            ));
         }
     }
-    let agents = (!agent_parts.is_empty()).then(|| agent_parts.join("\n\n"));
-    let architecture = (!arch_parts.is_empty()).then(|| arch_parts.join("\n\n"));
-    (agents, architecture)
+    (
+        (!agent_parts.is_empty()).then(|| agent_parts.join("\n\n")),
+        (!arch_parts.is_empty()).then(|| arch_parts.join("\n\n")),
+        roots,
+    )
+}
+fn load_captured_global_file(
+    path: &Path,
+) -> Option<(
+    String,
+    bool,
+    Arc<crate::paths::WorkspaceBinding>,
+    PathBuf,
+    crate::fs::CheckedMetadata,
+)> {
+    let binding = Arc::new(crate::paths::WorkspaceBinding::capture(path.parent()?).ok()?);
+    let relative = PathBuf::from(path.file_name()?);
+    let file = binding.open_regular_relative(&relative).ok()?;
+    let identity = crate::fs::checked_file_metadata(&file).ok()?;
+    let (content, truncated) = crate::paths::read_utf8_prefix(file, MAX_ANCESTOR_CONTEXT_BYTES)
+        .ok()
+        .flatten()?;
+    binding.validate().ok()?;
+    Some((content, truncated, binding, relative, identity))
 }
 
 pub fn load(no_context_files: bool) -> ContextFiles {
@@ -403,8 +453,8 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     if let Err(e) = themes::ensure_global() {
         tracing::warn!("failed to install default themes: {e}");
     }
-    let (agents, arch_candidate) = if no_context_files {
-        (None, None)
+    let (agents, arch_candidate, instruction_roots) = if no_context_files {
+        (None, None, Vec::new())
     } else {
         walk_context_files(workspace_root)
     };
@@ -431,6 +481,7 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default(),
         agents,
+        instruction_roots,
         prompts: prompt_map,
         current_prompt: None,
         current_prompt_name: None,
@@ -448,15 +499,6 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
         #[cfg(feature = "archmd")]
         architecture,
     }
-}
-
-/// A context file read up to [`MAX_ANCESTOR_CONTEXT_BYTES`]:
-/// `(content, truncated)`. Never reads an oversized file whole.
-fn load_file(path: &PathBuf) -> Option<(String, bool)> {
-    let file = std::fs::File::open(path).ok()?;
-    crate::paths::read_utf8_prefix(file, MAX_ANCESTOR_CONTEXT_BYTES)
-        .ok()
-        .flatten()
 }
 
 /// Maximum total bytes of context files (global and repository AGENTS.md,
@@ -512,68 +554,44 @@ impl ContextBudget {
 /// Reads context only from the explicitly selected workspace root. Global
 /// application context is loaded separately; parent directories outside the
 /// workspace capability must never influence the prompt.
-fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<String>) {
-    let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
-    #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
-    let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
+fn walk_context_files(
+    workspace_root: Option<&Path>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<instructions::InstructionRoot>,
+) {
+    if let Some(workspace) =
+        workspace_root.and_then(|root| crate::paths::WorkspaceBinding::capture(root).ok())
+    {
+        return walk_bound_context_files(&workspace);
+    }
+    let mut roots = Vec::new();
     let mut budget = ContextBudget::default();
-
-    let global_agents = storage::agents_path();
-    if let Some(content) = load_file(&global_agents)
-        .and_then(|(content, truncated)| budget.admit("global AGENTS.md", content, truncated))
-    {
-        agent_parts.push(format!("# Global AGENTS.md\n{}", content));
-    }
-
+    let agents = load_captured_global_file(&storage::agents_path()).and_then(
+        |(content, truncated, binding, relative, identity)| {
+            budget
+                .admit("global AGENTS.md", content, truncated)
+                .map(|content| {
+                    roots.push(
+                        instructions::InstructionRoot::global(binding, relative, &content)
+                            .with_identity(identity),
+                    );
+                    format!("# Global AGENTS.md\n{content}")
+                })
+        },
+    );
     #[cfg(feature = "archmd")]
-    {
-        let global_arch = storage::architecture_path();
-        if let Some(content) = load_file(&global_arch).and_then(|(content, truncated)| {
-            budget.admit("global ARCHITECTURE.md", content, truncated)
-        }) {
-            arch_parts.push(format!("# Global ARCHITECTURE.md\n{}", content));
-        }
-    }
-
-    if let Some(cwd) = workspace_root {
-        let mut current = Some(cwd);
-        while let Some(dir) = current {
-            for name in &["AGENTS.md", "CLAUDE.md"] {
-                let path = dir.join(name);
-                if let Some(content) = load_file(&path)
-                    .and_then(|(content, truncated)| budget.admit(name, content, truncated))
-                {
-                    agent_parts.push(format!("# {} ({})\n{}", name, dir.display(), content));
-                }
-            }
-            #[cfg(feature = "archmd")]
-            {
-                let path = dir.join("ARCHITECTURE.md");
-                if let Some(content) = load_file(&path).and_then(|(content, truncated)| {
-                    budget.admit("ARCHITECTURE.md", content, truncated)
-                }) {
-                    arch_parts.push(format!(
-                        "# ARCHITECTURE.md ({})\n{}",
-                        dir.display(),
-                        content
-                    ));
-                }
-            }
-            current = None;
-        }
-    }
-
-    let agents = if agent_parts.is_empty() {
-        None
-    } else {
-        Some(agent_parts.join("\n\n"))
-    };
-    let architecture = if arch_parts.is_empty() {
-        None
-    } else {
-        Some(arch_parts.join("\n\n"))
-    };
-    (agents, architecture)
+    let architecture = load_captured_global_file(&storage::architecture_path()).and_then(
+        |(content, truncated, _, _, _)| {
+            budget
+                .admit("global ARCHITECTURE.md", content, truncated)
+                .map(|content| format!("# Global ARCHITECTURE.md\n{content}"))
+        },
+    );
+    #[cfg(not(feature = "archmd"))]
+    let architecture = None;
+    (agents, architecture, roots)
 }
 
 #[cfg(test)]
@@ -591,7 +609,7 @@ mod repository_context_tests {
         std::fs::write(parent.join("AGENTS.md"), "PARENT_CONTEXT_MARKER").unwrap();
         std::fs::write(workspace.join("AGENTS.md"), "WORKSPACE_CONTEXT_MARKER").unwrap();
 
-        let (agents, _) = walk_context_files(Some(&workspace));
+        let (agents, _, _) = walk_context_files(Some(&workspace));
 
         let agents = agents.expect("workspace AGENTS.md should be loaded");
         assert!(agents.contains("WORKSPACE_CONTEXT_MARKER"));
@@ -637,7 +655,7 @@ mod repository_context_tests {
         )
         .unwrap();
 
-        let (agents, _) = walk_context_files(Some(&workspace));
+        let (agents, _, _) = walk_context_files(Some(&workspace));
         let agents = agents.expect("the file is loaded, truncated");
         assert!(
             agents.len() <= MAX_ANCESTOR_CONTEXT_BYTES + 256,
@@ -647,7 +665,7 @@ mod repository_context_tests {
         assert!(agents.ends_with(CONTEXT_TRUNCATION_NOTICE));
 
         let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
-        let (agents, _) = walk_bound_context_files(&binding);
+        let (agents, _, _) = walk_bound_context_files(&binding);
         let agents = agents.expect("the bound loader truncates too");
         assert!(
             agents.len() <= MAX_ANCESTOR_CONTEXT_BYTES + 256,

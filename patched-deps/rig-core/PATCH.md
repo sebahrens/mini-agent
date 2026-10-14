@@ -176,3 +176,29 @@ verify fixed declarations, normal Ask allow/deny, hidden-call and invalid-query
 refusal, result redaction/termination, forged textual references, and pre-HTTP
 prefix collisions. Inert signatures are continuity witnesses, not cryptographic
 or paid-server acceptance. Full application replay/frontier work remains separate.
+
+## Prepared request observation and canonical tool-result IDs (mini-agent-i7ro6.63)
+
+`StepEvent::CompletionRequestPrepared` borrows the actual typed completion request
+after request patches, tool constraints and normal preparation. Its default hook
+behavior is no-op. It is observe-only: Continue proceeds to existing model
+dispatch; Terminate follows ordinary prompt cancellation. It does not imply the
+typed request is final provider JSON when raw additional parameters override
+transcript fields. Streaming and blocking calls use the same preparation seam;
+no extra request, usage observation or receipt is created.
+
+`PreparedCompletionRequest::build` retains the original public builder API and
+validation, exposing a private built model/request bundle to the driver.
+Canonical `StepEvent::ToolResult.tool_id` borrows `ToolCall.id` from the exact
+invocation. `internal_call_id` and optional provider `tool_call_id` retain their
+meanings; no name/argument/order matching or replay/grant authority is introduced.
+Concrete, erased and stacked hooks forward these values unchanged.
+
+Native tool invocations receive the existing run-owned HookContext scratchpad
+as an additive `ToolCallExtensions` value. Other extensions remain intact;
+there is no ambient registry. Instruction receipts and reviewed state remain
+inside that runner's scratchpad and reflect only effective post-hook result
+bytes. Successful loading acknowledges nothing. Application loopback controls
+cover denied mutation -> canonical next request -> accepted response -> effect,
+copied sibling histories, redaction, spill, pruning, cancellation and pre-dispatch
+authority revocation. Two actual consumer paths use explicit 1 MiB Rust threads.

@@ -2507,6 +2507,34 @@ Context files (global and workspace `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.
 share a 512 KiB budget. A file that does not fit in what remains is truncated with a
 visible notice rather than loaded whole, and files after the budget is spent are skipped.
 
+Root `CLAUDE.local.md` and authored `@path` or `@{path with spaces}` includes are
+captured at agent construction. Native `read`, `edit`, `write` and `notebook_edit`
+also load `AGENTS.md`, `CLAUDE.md` and `CLAUDE.local.md` from directories under
+the captured workspace on first touch. `/context` lists captured source metadata;
+it never displays instruction bodies or rereads their files. Native readonly
+BTW and Task agents follow the same policy. `--no-context-files` disables this
+loading in all those agents.
+
+Project local, nested and included sources require the existing project-config
+trust and current read Allow authority. Approval uses the existing exact config
+path/content fingerprint and covers subsequently captured instruction bytes;
+unchecked Ask/Deny fails with a bounded error instead of requesting an implicit
+grant. Author includes remain inside their original global or workspace root,
+reject symlinks and multiple hard links, and use at most four include levels,
+32 files per traversal and 16 KiB per UTF-8 source. New sources share at most
+128 KiB and the remainder of the old 512 KiB context budget after JSON escaping;
+earlier root content retains priority. Physical file aliases and include cycles
+are deduplicated while preserving the first authored scope/order.
+
+A first mutation can return "Mutation not executed" with a private instruction
+notice. It changes no file and grants no permission: only a subsequent accepted
+request containing that exact native notice enables instruction-reviewed retry.
+Cancellation, pruned history and another runner's copied result do not count as
+review. Each source's captured bytes stay stable until agent rebuild, while
+current root identity, project trust and read authority are checked again before
+disclosure or mutation. Transcript-overriding parameters are refused when they
+would invalidate this delivery; unrelated parameters retain their normal policy.
+
 ACP context includes managed global files and context files in the captured
 workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or
 `ARCHITECTURE.md` from ambient parent directories, because those parents are

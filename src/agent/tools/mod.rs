@@ -187,6 +187,7 @@ pub(crate) fn validate_workspace_binding(
 pub(crate) struct ReadTracker {
     deny_repeated_reads: bool,
     tracked: std::sync::Arc<Mutex<Vec<TrackedRead>>>,
+    pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +233,7 @@ impl ReadTracker {
         Self {
             deny_repeated_reads,
             tracked: std::sync::Arc::new(Mutex::new(Vec::new())),
+            instructions: None,
         }
     }
 
@@ -430,6 +432,8 @@ use crate::permission::checker::{CheckResult, PermCheck};
 pub enum ToolError {
     #[error("{0}")]
     Msg(String),
+    #[error("{0}")]
+    ContextReview(crate::context::instructions::ContextNotice),
 }
 
 impl From<io::Error> for ToolError {

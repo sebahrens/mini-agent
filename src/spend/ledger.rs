@@ -587,7 +587,9 @@ mod tests {
     #[test]
     fn spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent() {
         let root = crate::tests::OwnedTestDirectory::new("spend-ledger");
-        let ledger = Ledger::new(root.path());
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
         assert_eq!(ledger.summary().unwrap().all_time.records, 0);
         assert!(
             !ledger.path.exists(),
@@ -668,7 +670,9 @@ mod tests {
     #[test]
     fn spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge() {
         let root = crate::tests::OwnedTestDirectory::new("spend-ledger-tail");
-        let ledger = Ledger::new(root.path());
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
         crate::fs::private_atomic_create_sync(&ledger.path, b"{\"crash\":").unwrap();
         let account = Account::new("s", Some(10.0), 0.0).unwrap();
         account.observe(&receipt(RequestKind::Turn)).unwrap();

@@ -3,6 +3,9 @@
 #[path = "provider_effort_replay_probe.rs"]
 mod replay_probe;
 
+#[path = "context/instruction_wire_tests.rs"]
+mod instruction_wire_tests;
+
 #[path = "provider_cache_tests.rs"]
 mod cache_tests;
 
@@ -23,6 +26,11 @@ struct Wire {
 
 impl Wire {
     fn new(responses: Vec<(bool, String)>) -> Self {
+        Self::at_path(responses, "/v1/messages")
+    }
+
+    fn at_path(responses: Vec<(bool, String)>, path: &str) -> Self {
+        let expected_request = format!("POST {path} HTTP/1.1\r\n");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -67,7 +75,7 @@ impl Wire {
                     headers.push(byte[0]);
                 }
                 let headers = String::from_utf8(headers).unwrap();
-                assert!(headers.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+                assert!(headers.starts_with(&expected_request), "{headers}");
                 let length: usize = headers
                     .lines()
                     .find_map(|line| {
@@ -97,8 +105,12 @@ impl Wire {
     }
 
     fn client(&self) -> AnyClient {
+        self.client_for("anthropic")
+    }
+
+    fn client_for(&self, provider_type: &str) -> AnyClient {
         let config: Config = serde_json::from_value(json!({
-            "custom_providers":{"effort-probe":{"provider_type":"anthropic","base_url":self.base}}
+            "custom_providers":{"effort-probe":{"provider_type":provider_type,"base_url":self.base}}
         }))
         .unwrap();
         create_client(

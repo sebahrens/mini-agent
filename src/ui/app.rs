@@ -4363,20 +4363,28 @@ impl<'a> App<'a> {
         let temperature =
             crate::config::resolve_temperature(self.ui.cli, self.ui.cfg, &self.ui.session.model);
         let extra_body = crate::config::resolve_extra_body(self.ui.cfg, &self.ui.session.model);
-        let btw_agent = crate::provider::build_btw_agent(
-            model,
-            self.ui.cli,
-            self.ui.cfg,
-            self.ui.context,
-            &self.ui.workspace,
-            &self.ui.permission,
-            &self.ui.ask_tx,
-            &self.ui.session.id,
-            self.ui.session.tool_result_spills.clone(),
-            self.slash.reasoning_enabled,
-            temperature,
-            extra_body,
-        );
+        let btw_agent = crate::startup::heap_future(|| {
+            crate::provider::build_btw_agent(
+                model,
+                self.ui.cli,
+                self.ui.cfg,
+                self.ui.context,
+                &self.ui.workspace,
+                self.run
+                    .agent
+                    .as_ref()
+                    .and_then(crate::provider::AnyAgent::context_snapshot)
+                    .and_then(|snapshot| snapshot.instruction_sources.clone()),
+                &self.ui.permission,
+                &self.ui.ask_tx,
+                &self.ui.session.id,
+                self.ui.session.tool_result_spills.clone(),
+                self.slash.reasoning_enabled,
+                temperature,
+                extra_body,
+            )
+        })
+        .await;
         let runner = btw_agent
             .with_spend_for_session(self.ui.session, self.ui.cfg, crate::spend::RequestKind::Btw)
             .spawn_btw(
@@ -10235,6 +10243,22 @@ mod context_diagnostic_tests {
         assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
         assert_eq!(saved_files(&paths.sessions_dir()), stored_before);
         app.run.is_running = false;
+        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::write(
+            root.path().join(".zerostack/config.toml"),
+            "model='test-model'\n",
+        )
+        .unwrap();
+        crate::config::load::trust_project_config(
+            &root.path().join(".zerostack/config.toml"),
+            &paths.project_config_trust_file(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("CLAUDE.local.md"),
+            "PRIVATE_LOCAL_INSTRUCTION_BODY",
+        )
+        .unwrap();
         let built = {
             let build_context = app.ui.agent_build_ctx();
             crate::startup::heap_future(|| build_context.rebuild_agent("test-model", false)).await
@@ -10250,6 +10274,17 @@ mod context_diagnostic_tests {
         let definition_count = definitions.len();
         let snapshot = built.context_snapshot().unwrap();
         let preamble = built.context_preamble_for_test();
+        assert!(preamble.contains("PRIVATE_LOCAL_INSTRUCTION_BODY"));
+        assert_eq!(
+            snapshot
+                .instruction_sources
+                .as_ref()
+                .unwrap()
+                .diagnostics()
+                .unwrap()
+                .source_count,
+            1
+        );
         assert_eq!(snapshot.bytes, preamble.len());
         assert_eq!(snapshot.tokens, Session::estimate_tokens(preamble));
         let mut cursor = 0;
@@ -10289,10 +10324,15 @@ mod context_diagnostic_tests {
         // Changes after build cannot alter the diagnostic or cause a reread.
         std::fs::remove_file(&suffix).unwrap();
         std::fs::remove_file(&added).unwrap();
+        std::fs::remove_file(root.path().join("CLAUDE.local.md")).unwrap();
         #[cfg(unix)]
         {
             drop(crate::tests::process_gate::ProcessGate::new(&suffix).unwrap());
             drop(crate::tests::process_gate::ProcessGate::new(&added).unwrap());
+            drop(
+                crate::tests::process_gate::ProcessGate::new(&root.path().join("CLAUDE.local.md"))
+                    .unwrap(),
+            );
         }
         app.renderer.clear_content().unwrap();
         crate::startup::heap_future(|| app.run_slash_command("/context"))
@@ -10300,6 +10340,8 @@ mod context_diagnostic_tests {
             .unwrap();
         let output = app.renderer.captured_output();
         assert!(output.contains("actual built-agent preamble snapshot"));
+        assert!(output.contains("CLAUDE.local.md"));
+        assert!(!output.contains("PRIVATE_LOCAL_INSTRUCTION_BODY"));
         assert!(output.contains(&format!(
             "{definition_count} already-registered definitions"
         )));

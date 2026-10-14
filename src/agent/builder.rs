@@ -171,6 +171,8 @@ pub(crate) struct PreambleSnapshot {
     pub(crate) parts: Vec<(&'static str, u64)>,
     pub(crate) ranges: Vec<(&'static str, std::ops::Range<usize>)>,
     pub(crate) bytes: usize,
+    pub(crate) instruction_sources:
+        Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
 }
 
 struct PreambleComposition {
@@ -194,6 +196,7 @@ impl PreambleComposition {
                 .collect(),
             ranges: self.parts.clone(),
             bytes: self.text.len(),
+            instruction_sources: None,
         }
     }
 }
@@ -786,6 +789,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "lsp")]
         &mut lsp_manager,
         model,
+        crate::context::instructions::InstructionProtocol::Unverified,
         cli,
         cfg,
         context,
@@ -819,6 +823,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     context_snapshot: &mut Option<PreambleSnapshot>,
     #[cfg(feature = "lsp")] diagnostic_lsp: &mut Option<crate::extras::lsp::LspManager>,
     model: M,
+    instruction_protocol: crate::context::instructions::InstructionProtocol,
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
@@ -853,6 +858,24 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     {
         tracing::warn!(%error, "failed to bind current session tool-output reads");
     }
+    let instructions = (!cli.resolve_no_context_files(cfg)).then(|| {
+        crate::context::instructions::WorkspaceInstructions::new(
+            workspace.clone(),
+            permission.clone(),
+            instruction_protocol,
+        )
+    });
+    if let Some(instructions) = &instructions {
+        let old_bytes = context.agents.as_ref().map_or(0, String::len);
+        #[cfg(feature = "archmd")]
+        let old_bytes =
+            old_bytes.saturating_add(context.architecture.as_ref().map_or(0, String::len));
+        instructions
+            .prepare_initial(context.instruction_roots.clone(), old_bytes)
+            .await;
+    }
+    let mut read_tracker = read_tracker;
+    read_tracker.instructions = instructions.clone();
     let workspace_root = workspace.root();
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
     let tools_enabled = !cli.resolve_no_tools(cfg);
@@ -1030,7 +1053,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 ask_tx.clone(),
                 cfg.deny_repeated_reads.unwrap_or(true),
             )
-            .with_workspace_binding(workspace.clone());
+            .with_workspace_binding(workspace.clone())
+            .with_workspace_instructions(instructions.clone())
+            .with_response_max_tokens(cli.resolve_max_tokens(cfg));
             #[cfg(feature = "js")]
             let task_tool = if js_tool_enabled {
                 task_tool.with_read_only_js(sandbox.clone(), js_worker_containment_status.clone())
@@ -1273,7 +1298,6 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     let goal_block = crate::extras::goal::prompt::goal_block(goal_store.snapshot().as_ref());
     #[cfg(not(feature = "goal"))]
     let goal_block: Option<String> = None;
-    #[allow(unused_mut)]
     let mut composition = compose_registered_preamble(
         context,
         reasoning_enabled,
@@ -1292,7 +1316,34 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             "Deferred MCP tool index",
         );
     }
-    *context_snapshot = Some(composition.snapshot());
+    if let Some(instructions) = &instructions {
+        let overlay = instructions.initial_overlay();
+        if !overlay.is_empty()
+            || ["read", "write", "edit", "notebook_edit"]
+                .iter()
+                .any(|name| registered_tools.contains(name))
+        {
+            composition
+                .text
+                .push_str(crate::context::instructions::POLICY);
+            record_part(
+                &mut composition.parts,
+                &composition.text,
+                "Workspace instruction policy",
+            );
+        }
+        if !overlay.is_empty() {
+            composition.text.push_str(&overlay);
+            record_part(
+                &mut composition.parts,
+                &composition.text,
+                "Root instruction includes",
+            );
+        }
+    }
+    let mut snapshot = composition.snapshot();
+    snapshot.instruction_sources = instructions.clone();
+    *context_snapshot = Some(snapshot);
     let preamble = composition.text;
     #[cfg(feature = "mcp")]
     let model = model.with_deferred_tools(native_declarations);
@@ -1324,6 +1375,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     if registered_tools.contains(&"advisor") {
         builder = builder.add_hook(crate::extras::advisor::AdvisorContextHook);
     }
+    builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
+        instructions,
+    ));
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
     }
@@ -1378,12 +1432,14 @@ const BTW_MAX_TURNS: usize = 8;
 /// project context for reference, NO tools, and a single turn. Never mutates the
 /// session.
 #[allow(clippy::too_many_arguments)]
-pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
+pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     model: M,
+    instruction_protocol: crate::context::instructions::InstructionProtocol,
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
     workspace: &Arc<crate::paths::WorkspaceBinding>,
+    captured_instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     tool_output_session_id: &str,
@@ -1400,6 +1456,29 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
             .bind_tool_output_session(tool_output_session_id)
     {
         tracing::warn!(%error, "failed to bind current session tool-output reads");
+    }
+    let cold = captured_instructions.is_none();
+    let instructions = (!cli.resolve_no_context_files(cfg)).then(|| {
+        captured_instructions
+            .map(|service| service.for_protocol(instruction_protocol))
+            .unwrap_or_else(|| {
+                crate::context::instructions::WorkspaceInstructions::new(
+                    workspace.clone(),
+                    permission.clone(),
+                    instruction_protocol,
+                )
+            })
+    });
+    if let Some(service) = &instructions
+        && cold
+    {
+        let old_bytes = context.agents.as_ref().map_or(0, String::len);
+        #[cfg(feature = "archmd")]
+        let old_bytes =
+            old_bytes.saturating_add(context.architecture.as_ref().map_or(0, String::len));
+        service
+            .prepare_initial(context.instruction_roots.clone(), old_bytes)
+            .await;
     }
     let cwd = workspace.root().display().to_string();
 
@@ -1442,6 +1521,14 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&s);
     }
 
+    if let Some(service) = &instructions {
+        let overlay = service.initial_overlay();
+        if !cli.resolve_no_tools(cfg) || !overlay.is_empty() {
+            preamble.push_str(crate::context::instructions::POLICY);
+            preamble.push_str(&overlay);
+        }
+    }
+
     let max_tokens = cli.resolve_max_tokens(cfg);
 
     // Honor --no-tools: fall back to a pure-context, single-turn answer.
@@ -1456,7 +1543,11 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
         if let Some(temp) = temperature {
             builder = builder.temperature(temp);
         }
-        return builder.build();
+        return builder
+            .add_hook(crate::context::instructions::WorkspaceInstructionHook(
+                instructions,
+            ))
+            .build();
     }
 
     // Read-only tools only (read/grep/find_files/list_dir): a side question can
@@ -1468,7 +1559,8 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     let max_grep_results = cfg.resolve_max_grep_results();
     let max_find_results = cfg.resolve_max_find_results();
     let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
-    let read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
+    let mut read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
+    read_tracker.instructions = instructions.clone();
     let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
         Box::new(
             tools::ReadTool::new_with_tracker(
@@ -1507,6 +1599,10 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
             Some(tool_result_spills),
         ));
 
+    builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
+        instructions,
+    ));
+
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
     }
@@ -1538,6 +1634,7 @@ mod extra_file_tests {
             mcp_discovery: Default::default(),
             workspace_root: std::path::PathBuf::from("."),
             agents: None,
+            instruction_roots: Vec::new(),
             prompts: HashMap::new(),
             current_prompt: None,
             current_prompt_name: None,
@@ -1953,6 +2050,7 @@ mod js_tests {
             mcp_discovery: Default::default(),
             workspace_root: std::path::PathBuf::from("."),
             agents: None,
+            instruction_roots: Vec::new(),
             prompts: HashMap::new(),
             current_prompt: None,
             current_prompt_name: None,
@@ -2536,10 +2634,12 @@ mod js_tests {
         );
         let agent = build_btw_agent_inner(
             fake_model("btw"),
+            crate::context::instructions::InstructionProtocol::Unverified,
             &crate::cli::Cli::default(),
             &crate::config::Config::default(),
             &empty_context(),
             &workspace,
+            None,
             &None,
             &None,
             "btw-test",
@@ -2547,7 +2647,8 @@ mod js_tests {
             false,
             None,
             None,
-        );
+        )
+        .await;
         let names = agent
             .tool_server_handle
             .get_tool_defs(None)

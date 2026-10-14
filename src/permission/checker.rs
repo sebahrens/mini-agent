@@ -2206,7 +2206,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Resolve symlinks in the existing portion of a path while permitting a
 /// non-existent suffix. Errors other than a missing path fail closed.
-fn resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
     fn resolve(path: &Path, symlink_depth: usize) -> Option<PathBuf> {
         if symlink_depth > 40 {
             return None;

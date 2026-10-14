@@ -1406,8 +1406,12 @@ mod windows {
                 validate_checked(&file).unwrap();
                 file.write_all(OLD).unwrap();
                 file.sync_all().unwrap();
-                let expected = crate::fs::checked_file_metadata(&file).unwrap();
                 drop(file);
+                // CheckedMetadata retains a duplicate of its supplied handle.
+                // Pin identity without leaving the initializer's writable
+                // handle alive and falsifying every ShareAccess=0 experiment.
+                let metadata = relative_open(&directory, LEAF, 0, ALL_SHARES).unwrap();
+                let expected = crate::fs::checked_file_metadata(&metadata).unwrap();
                 Self {
                     directory,
                     root,

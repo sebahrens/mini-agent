@@ -1092,6 +1092,12 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         }
     }
 
+    /// Consume the builder once, retaining its exact model and built request.
+    pub(crate) fn into_model_and_request(self) -> (M, CompletionRequest) {
+        let model = self.model.clone();
+        (model, self.build())
+    }
+
     /// Sends the completion request to the completion model provider and returns the completion response.
     pub async fn send(self) -> Result<CompletionResponse<M::Response>, CompletionError> {
         let model = self.model.clone();

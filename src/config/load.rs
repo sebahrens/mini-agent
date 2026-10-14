@@ -1798,7 +1798,6 @@ pub(crate) fn project_config_is_trusted_in_workspace(
     project_config_is_trusted_in_workspace_mode(paths, workspace, true)
 }
 
-#[cfg(feature = "mcp")]
 pub(crate) fn project_config_is_trusted_in_workspace_readonly(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,

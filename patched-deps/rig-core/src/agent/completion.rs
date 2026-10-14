@@ -40,6 +40,23 @@ pub(crate) struct PreparedCompletionRequest<M: CompletionModel> {
     pub(crate) output_tool_name: Option<String>,
 }
 
+/// The exact built request observed by hooks and then moved into dispatch.
+pub(crate) struct BuiltCompletionRequest<M: CompletionModel> {
+    pub(crate) model: M,
+    pub(crate) request: crate::completion::CompletionRequest,
+    pub(crate) executable_tool_names: BTreeSet<String>,
+    pub(crate) allowed_tool_names: BTreeSet<String>,
+    pub(crate) output_tool_name: Option<String>,
+}
+
+impl<M: CompletionModel> PreparedCompletionRequest<M> {
+    pub(crate) fn build(self) -> BuiltCompletionRequest<M> {
+        let (model, request) = self.builder.into_model_and_request();
+        BuiltCompletionRequest { model, request, executable_tool_names: self.executable_tool_names,
+            allowed_tool_names: self.allowed_tool_names, output_tool_name: self.output_tool_name }
+    }
+}
+
 /// Base name of the synthetic output tool used by [`OutputMode::Tool`].
 const DEFAULT_OUTPUT_TOOL_NAME: &str = "final_result";
 

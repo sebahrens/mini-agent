@@ -1,6 +1,6 @@
 use crate::{
     OneOrMany,
-    agent::completion::{PreparedCompletionRequest, build_prepared_completion_request},
+    agent::completion::{BuiltCompletionRequest, build_prepared_completion_request},
     agent::hook::{
         AgentHook, HookContext, HookStack, InvalidToolCallHookAction, StepEvent, StepEventKind,
     },
@@ -416,7 +416,7 @@ where
         runner: &'a AgentRunner<M>,
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
-        prepared: PreparedCompletionRequest<M>,
+        prepared: BuiltCompletionRequest<M>,
         chat_span: tracing::Span,
         agent_span: &'a tracing::Span,
         prompt: Message,
@@ -547,6 +547,12 @@ where
                             break 'outer;
                         }
                     };
+                    let prepared = prepared.build();
+                    if let Some(reason) = observe_flow(runner.hooks.on_event(&hook_ctx,
+                        StepEvent::CompletionRequestPrepared { request: &prepared.request, turn }).await) {
+                        yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
+                        break 'outer;
+                    }
                     run.set_output_tool_name(prepared.output_tool_name.clone());
 
                     let mut turn_stream = source.run_model_turn(
@@ -983,15 +989,15 @@ where
         runner: &'a AgentRunner<M>,
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
-        prepared: PreparedCompletionRequest<M>,
+        prepared: BuiltCompletionRequest<M>,
         chat_span: tracing::Span,
         agent_span: &'a tracing::Span,
         current_prompt: Message,
     ) -> DriveStream<'a, M::StreamingResponse> {
         Box::pin(async_stream::stream! {
             let mut stream = match prepared
-                .builder
-                .stream()
+                .model
+                .stream(prepared.request)
                 .instrument(chat_span.clone())
                 .await
             {

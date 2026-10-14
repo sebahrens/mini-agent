@@ -651,3 +651,11 @@ joins it before fixture teardown. Its exact `.spawn(|| {` occurrence is
 owned loopback fixture and ordinary runner, adds no subprocess launch or
 creation-boundary exemption, and does not change the scanner or its negative
 controls.
+
+Context63 native wire regressions create and join one exact fixed-stack Rust
+thread shared by two 1 MiB consumer controls. Its `.spawn(move || ...)` site is
+`NON-PROCESS` in both checked catalogues. Assertions on captured model output,
+usage fields and renderer text are classified by exact source line and complete
+macro digest/count; they do not create a process. No inventory scanner or
+unknown-context negative control is weakened. All HTTP fixture threads retain
+their existing bounded timeout, stop flag and unconditional join ownership.

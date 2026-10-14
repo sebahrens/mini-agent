@@ -1087,7 +1087,10 @@ pub(crate) fn current_work_cancellation() -> Option<AgentWorkCancellation> {
         .ok()
 }
 
-#[cfg(feature = "mcp")]
+pub(crate) fn has_current_work_scope() -> bool {
+    AGENT_WORK_SCOPE.try_with(|_| ()).is_ok()
+}
+
 pub(crate) fn current_work_scope_is_cancelled() -> bool {
     AGENT_WORK_SCOPE
         .try_with(|scope| scope.is_cancelled())

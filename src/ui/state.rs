@@ -602,6 +602,7 @@ mod retirement_tests {
                     mcp_discovery: Default::default(),
                     workspace_root: workspace.root().to_path_buf(),
                     agents: None,
+                    instruction_roots: Vec::new(),
                     prompts: Default::default(),
                     current_prompt: None,
                     current_prompt_name: None,

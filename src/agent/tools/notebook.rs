@@ -461,7 +461,11 @@ impl NotebookTool {
             publication_cancellation: None,
         }
     }
-    async fn apply(&self, args: NotebookArgs) -> Result<MutationOutcome, ToolError> {
+    async fn apply(
+        &self,
+        args: NotebookArgs,
+        extensions: &ToolCallExtensions,
+    ) -> Result<MutationOutcome, ToolError> {
         args.validate()?;
         super::validate_workspace_binding(Some(&self.workspace))?;
         let target = super::resolve_tool_target(Some(&self.workspace), &args.path);
@@ -521,6 +525,12 @@ impl NotebookTool {
         } else {
             check_perm_path(&self.permission, &self.ask_tx, "notebook_edit", &identity).await?
         };
+        if let Some(instructions) = &self.tracker.instructions {
+            let instruction_target = bound.as_deref().unwrap_or(Path::new(&identity));
+            instructions
+                .before_mutation(instruction_target, extensions)
+                .await?;
+        }
         let limit = self.limit;
         let transform_args = args.clone();
         let (before, after, base) = crate::agent::runner::spawn_blocking_scoped(move || {
@@ -624,14 +634,18 @@ impl Tool for NotebookTool {
         "cell_type":{"type":"string","enum":["code","markdown","raw"],"description":"Insert only; default code"}},"required":["path","mode"]})
     }
     async fn call(&self, args: NotebookArgs) -> Result<String, ToolError> {
-        Ok(self.apply(args).await?.output)
+        Ok(self.apply(args, &ToolCallExtensions::new()).await?.output)
     }
     async fn call_structured(
         &self,
         args: NotebookArgs,
-        _extensions: &ToolCallExtensions,
+        extensions: &ToolCallExtensions,
     ) -> Result<ToolReturn<String>, ToolError> {
-        Ok(self.apply(args).await?.into_return())
+        match self.apply(args, extensions).await {
+            Ok(outcome) => Ok(outcome.into_return()),
+            Err(ToolError::ContextReview(notice)) => Ok(notice.not_executed()),
+            Err(error) => Err(error),
+        }
     }
 }
 

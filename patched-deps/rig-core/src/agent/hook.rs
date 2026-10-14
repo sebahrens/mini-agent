@@ -468,6 +468,13 @@ pub enum StepEvent<'a, M: CompletionModel> {
         /// One-based index of this model call within the run.
         turn: usize,
     },
+    /// After all request patches and builder normalization, before dispatch.
+    /// Observe-only (Continue/Terminate); it never modifies the built request.
+    /// Provider raw additional parameters may still override wire fields.
+    CompletionRequestPrepared {
+        request: &'a crate::completion::CompletionRequest,
+        turn: usize,
+    },
     /// After a non-streaming completion response is received. Suppressed for
     /// turns recovered by invalid tool-call repair, skip, or retry. Honors
     /// [`Flow::Continue`] and [`Flow::Terminate`]. The medium-specific
@@ -548,6 +555,9 @@ pub enum StepEvent<'a, M: CompletionModel> {
     /// structured result throughout, so a redaction hook cannot mask the true
     /// outcome from a later policy hook (see the module docs).
     ToolResult {
+        /// Canonical ToolCall.id used by the corresponding history result.
+        /// Distinct from the Rig invocation ID and optional provider call_id.
+        tool_id: &'a str,
         /// Name of the tool that was called.
         tool_name: &'a str,
         /// Provider-supplied tool call ID, when available.
@@ -627,6 +637,8 @@ impl<M: CompletionModel> Copy for StepEvent<'_, M> {}
 pub enum StepEventKind {
     /// [`StepEvent::CompletionCall`].
     CompletionCall,
+    /// [`StepEvent::CompletionRequestPrepared`].
+    CompletionRequestPrepared,
     /// [`StepEvent::CompletionResponse`].
     CompletionResponse,
     /// [`StepEvent::ModelTurnFinished`].
@@ -650,6 +662,7 @@ impl<M: CompletionModel> StepEvent<'_, M> {
     pub fn kind(&self) -> StepEventKind {
         match self {
             StepEvent::CompletionCall { .. } => StepEventKind::CompletionCall,
+            StepEvent::CompletionRequestPrepared { .. } => StepEventKind::CompletionRequestPrepared,
             StepEvent::CompletionResponse { .. } => StepEventKind::CompletionResponse,
             StepEvent::ModelTurnFinished { .. } => StepEventKind::ModelTurnFinished,
             StepEvent::InvalidToolCall(_) => StepEventKind::InvalidToolCall,
@@ -1544,6 +1557,7 @@ where
             // result and are passed unchanged to every hook — a rewrite alters
             // only the model-visible text, never the outcome a later policy sees.
             StepEvent::ToolResult {
+                tool_id,
                 tool_name,
                 tool_call_id,
                 internal_call_id,
@@ -1556,6 +1570,7 @@ where
                 for hook in &self.hooks {
                     let result_for_hook = effective.as_deref().unwrap_or(result);
                     let per_hook = StepEvent::ToolResult {
+                        tool_id,
                         tool_name,
                         tool_call_id,
                         internal_call_id,

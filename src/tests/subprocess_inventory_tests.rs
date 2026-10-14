@@ -878,6 +878,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    // Exact owned/joined context63 1MiB Rust thread, never an OS process.
+    (
+        "src/context/instruction_wire_tests.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
     ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
@@ -1641,6 +1648,43 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Exact captured model/text data assertions in context63 controls.
+    (
+        "src/context/instruction_wire_tests.rs",
+        "assert_eq!(output.output, \"settled\");",
+        5,
+        "NON-PROCESS",
+    ),
+    (
+        "src/context/instruction_wire_tests.rs",
+        "assert_eq!(output.usage.input_tokens, 30);",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/context/instruction_wire_tests.rs",
+        "assert_eq!(output.usage.output_tokens, 6);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/context/instruction_wire_tests.rs",
+        "assert_eq!(output.usage.input_tokens, 40);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(output.contains(\"CLAUDE.local.md\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "assert!(!output.contains(\"PRIVATE_LOCAL_INSTRUCTION_BODY\"));",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact async-only MCP HTTP fixture and HTTP response status tuple.
     (
         "src/ui/mcp_admin_app_tests.rs",
@@ -2888,6 +2932,41 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Complete tokens of the exact context63 captured data macros above.
+    (
+        "src/context/instruction_wire_tests.rs",
+        &[
+            (
+                "44642c1e0454c2b57a294a0b5bd0d9d87ebc97b2be6aebde3f3b10d19bd685ce",
+                5,
+            ),
+            (
+                "6b8e867d2f431f5da86fdfddf89759c0e0e802e7142a215f4d19a787bece77d1",
+                3,
+            ),
+            (
+                "d82ef98c4e099c2e164a0c13e9a5d9a9a30d7ef5f94fdfa6fc0b3b1b9f9a7431",
+                1,
+            ),
+            (
+                "fa87a3f6afc6fa92116daf109f77491f05c3e91f14e9ad807043e86a95f1e22b",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/ui/app.rs",
+        &[
+            (
+                "61dd8af08a9e7661a5207ba550156aed195fb2a47f14cb75add9e1c15c627697",
+                1,
+            ),
+            (
+                "43305cca706e54401a6a08040bbfb1d130e038a57445352dc83baf4ee2c13935",
+                1,
+            ),
+        ],
+    ),
     (
         "src/ui/mcp_admin_app_tests.rs",
         &[(
@@ -4371,6 +4450,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/provider_effort_replay_probe.rs",
         ".spawn(|| {",
+        1,
+        "NON-PROCESS",
+    ),
+    // Exact owned/joined context63 1MiB Rust thread, never an OS process.
+    (
+        "src/context/instruction_wire_tests.rs",
+        ".spawn(move || {",
         1,
         "NON-PROCESS",
     ),

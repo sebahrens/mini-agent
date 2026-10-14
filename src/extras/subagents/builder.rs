@@ -20,6 +20,7 @@ pub(crate) struct SubagentAuthorization {
     ask_tx: Option<AskSender>,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     deny_repeated_reads: bool,
+    instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
     #[cfg(feature = "js")]
     read_only_js: Option<ReadOnlyJsAuthorization>,
 }
@@ -72,6 +73,7 @@ impl SubagentAuthorization {
             ask_tx,
             workspace: None,
             deny_repeated_reads,
+            instructions: None,
             #[cfg(feature = "js")]
             read_only_js: None,
         }
@@ -82,6 +84,14 @@ impl SubagentAuthorization {
         workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     ) -> Self {
         self.workspace = workspace;
+        self
+    }
+
+    pub(crate) fn with_workspace_instructions(
+        mut self,
+        instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
+    ) -> Self {
+        self.instructions = instructions;
         self
     }
 
@@ -149,7 +159,8 @@ impl SubagentAuthorization {
         max_list_dir_entries: Option<u64>,
         selected: Option<&[AgentTool]>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
-        let read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
+        let mut read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
+        read_tracker.instructions = self.instructions.clone();
         let read = tools::ReadTool::new_with_tracker(
             self.permission.clone(),
             self.ask_tx.clone(),
@@ -225,7 +236,9 @@ pub(crate) fn subagent_memory_tools(
 #[allow(clippy::too_many_arguments)]
 fn build_explore_agent_inner<M: CompletionModel + 'static>(
     model: M,
+    protocol: crate::context::instructions::InstructionProtocol,
     max_turns: usize,
+    max_tokens: u64,
     max_text_file_size: u64,
     max_read_lines: u64,
     max_grep_results: u64,
@@ -244,12 +257,23 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     >,
 ) -> Agent<M> {
     let suffix = crate::session::storage::load_suffix();
-    let preamble = build_explore_preamble(
+    let mut preamble = build_explore_preamble(
         #[cfg(feature = "archmd")]
         architecture,
         specialization,
         suffix.as_deref(),
     );
+
+    let mut captured = authorization.clone();
+    captured.instructions = authorization
+        .instructions
+        .as_ref()
+        .map(|service| service.for_protocol(protocol));
+    let authorization = &captured;
+    if let Some(service) = &authorization.instructions {
+        preamble.push_str(crate::context::instructions::POLICY);
+        preamble.push_str(&service.initial_overlay());
+    }
 
     let tools = authorization.filesystem_tools(
         max_text_file_size,
@@ -326,6 +350,7 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .default_max_turns(max_turns)
+        .max_tokens(max_tokens)
         .tools(tools)
         .add_hook(crate::agent::runner::ToolLoopGuard);
     #[cfg(feature = "skills")]
@@ -338,6 +363,10 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         uuid::Uuid::new_v4().to_string(),
         None,
+    ));
+
+    builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
+        authorization.instructions.clone(),
     ));
 
     if let Some(params) =
@@ -391,6 +420,7 @@ pub(crate) async fn build_explore_agent(
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> AnyAgent {
+    let max_tokens = crate::cli::Cli::default().resolve_max_tokens(cfg);
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
     let max_grep_results = cfg.resolve_subagent_max_grep_results();
@@ -408,7 +438,9 @@ pub(crate) async fn build_explore_agent(
     let inner = match model {
         AnyModel::OpenRouter(m, _) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
             m,
+            crate::context::instructions::InstructionProtocol::Chat,
             max_turns,
+            max_tokens,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -426,7 +458,9 @@ pub(crate) async fn build_explore_agent(
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(build_explore_agent_inner(
                 m,
+                crate::context::instructions::InstructionProtocol::Responses,
                 max_turns,
+                max_tokens,
                 max_text_file_size,
                 max_read_lines,
                 max_grep_results,
@@ -443,7 +477,9 @@ pub(crate) async fn build_explore_agent(
             )),
             OpenAiModel::Completions(m) => OpenAiAgent::Completions(build_explore_agent_inner(
                 m,
+                crate::context::instructions::InstructionProtocol::Chat,
                 max_turns,
+                max_tokens,
                 max_text_file_size,
                 max_read_lines,
                 max_grep_results,
@@ -461,7 +497,9 @@ pub(crate) async fn build_explore_agent(
         }),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner(
             m,
+            crate::context::instructions::InstructionProtocol::Anthropic,
             max_turns,
+            max_tokens,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -478,7 +516,9 @@ pub(crate) async fn build_explore_agent(
         )),
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner(
             m,
+            crate::context::instructions::InstructionProtocol::Gemini,
             max_turns,
+            max_tokens,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -495,7 +535,9 @@ pub(crate) async fn build_explore_agent(
         )),
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner(
             m,
+            crate::context::instructions::InstructionProtocol::Ollama,
             max_turns,
+            max_tokens,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -548,7 +590,9 @@ mod js_isolation_tests {
         ]]);
         let agent = build_explore_agent_inner(
             model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,
@@ -584,7 +628,9 @@ mod js_isolation_tests {
         ]]);
         let agent = build_explore_agent_inner(
             model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,
@@ -621,7 +667,9 @@ mod js_isolation_tests {
         ]]);
         let narrowed = build_explore_agent_inner(
             narrowed_model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,
@@ -684,7 +732,9 @@ mod js_isolation_tests {
         ]]);
         let agent = build_explore_agent_inner(
             model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,
@@ -719,7 +769,9 @@ mod js_isolation_tests {
         ]]);
         let narrowed = build_explore_agent_inner(
             narrowed_model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,
@@ -794,7 +846,9 @@ mod tests {
             let authorization = parent_authorization(fixture.path(), None);
             let child = super::build_explore_agent_inner(
                 model,
+                crate::context::instructions::InstructionProtocol::Unverified,
                 2,
+                16_384,
                 1024 * 1024,
                 100,
                 100,
@@ -1259,7 +1313,9 @@ mod provider_param_tests {
     ) -> serde_json::Value {
         let agent = build_explore_agent_inner(
             model,
+            crate::context::instructions::InstructionProtocol::Unverified,
             2,
+            16_384,
             1024 * 1024,
             1_000,
             1_000,

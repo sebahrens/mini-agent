@@ -14,6 +14,7 @@ fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
         mcp_discovery: Default::default(),
         workspace_root: std::env::current_dir().unwrap(),
         agents: None,
+        instruction_roots: Vec::new(),
         prompts: prompts
             .iter()
             .map(|(name, content)| (name.to_string(), content.to_string()))

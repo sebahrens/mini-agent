@@ -43,6 +43,8 @@ pub(crate) struct ContextDiagnostic {
     clearing: usize,
     compact_enabled: bool,
     mid_turn_threshold: Option<u64>,
+    instructions: Option<crate::context::instructions::InstructionDiagnostics>,
+    instruction_state: &'static str,
 }
 
 impl ContextDiagnostic {
@@ -187,6 +189,14 @@ impl ContextDiagnostic {
             clearing: session.tool_results_cleared_for_retention(keep),
             compact_enabled: cfg.compact_enabled.unwrap_or(false),
             mid_turn_threshold,
+            instructions: actual
+                .and_then(|snapshot| snapshot.instruction_sources.as_ref())
+                .and_then(|service| service.diagnostics()),
+            instruction_state: match actual {
+                None => "unavailable (cold agent)",
+                Some(snapshot) if snapshot.instruction_sources.is_none() => "disabled",
+                Some(_) => "busy (snapshot metadata unavailable)",
+            },
         }
     }
 
@@ -210,6 +220,39 @@ impl ContextDiagnostic {
             writeln!(
                 text,
                 "Captured preamble: {bytes} bytes in {parts} exact ranges"
+            )
+            .unwrap();
+        }
+        if let Some(instructions) = &self.instructions {
+            writeln!(text, "Workspace instruction snapshots: {} sources; {} newly retained bytes; {} load failures; {} notice results",
+                instructions.source_count, instructions.retained_bytes,
+                instructions.failed_directories + usize::from(instructions.initial_failed),
+                instructions.delivered_notices).unwrap();
+            for (path, scope, project, bytes) in &instructions.sources {
+                writeln!(
+                    text,
+                    "  {}: {} ({} bytes; scope={})",
+                    if *project { "workspace" } else { "global" },
+                    bounded_label(&path.to_string_lossy()),
+                    bytes,
+                    bounded_label(&scope.to_string_lossy())
+                )
+                .unwrap();
+            }
+            if instructions.source_count > instructions.sources.len() {
+                writeln!(
+                    text,
+                    "  {} more captured sources omitted",
+                    instructions.source_count - instructions.sources.len()
+                )
+                .unwrap();
+            }
+            writeln!(text,"Snapshot metadata only; loaded sources and notice counts are not runner delivery acknowledgements.").unwrap();
+        } else {
+            writeln!(
+                text,
+                "Workspace instruction snapshots: {}",
+                self.instruction_state
             )
             .unwrap();
         }
@@ -458,6 +501,7 @@ mod tests {
             parts: session.overhead_parts.clone(),
             ranges: vec![("System prompt", 0..1)],
             bytes: 1,
+            instruction_sources: None,
         };
         let calibrated = ContextDiagnostic::capture(
             &session,
@@ -744,5 +788,39 @@ mod tests {
             diagnostic.rows.iter().map(|row| row.tokens).sum::<i128>(),
             i128::from(diagnostic.total)
         );
+    }
+    #[test]
+    fn context63_source_report_sanitizes_bounds_and_does_not_change_context_totals() {
+        let session = Session::new("fixture", "model", 1024, "context-metadata");
+        let mut diagnostic = report(&session);
+        diagnostic.instructions = Some(crate::context::instructions::InstructionDiagnostics {
+            sources: vec![(
+                std::path::PathBuf::from(format!("name\n\u{1b}[31m{}", "界".repeat(200))),
+                std::path::PathBuf::from("scope\u{202e}\r\n"),
+                true,
+                42,
+            )],
+            source_count: 33,
+            retained_bytes: 84,
+            failed_directories: 1,
+            initial_failed: true,
+            delivered_notices: 5,
+        });
+        let rendered = diagnostic.render();
+        assert!(
+            rendered
+                .contains("33 sources; 84 newly retained bytes; 2 load failures; 5 notice results")
+        );
+        assert!(rendered.contains("32 more captured sources omitted"));
+        assert!(rendered.contains("not runner delivery acknowledgements"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.len() < 8192);
+        assert_eq!(
+            diagnostic.rows.iter().map(|row| row.tokens).sum::<i128>(),
+            i128::from(session.effective_context_tokens())
+        );
+        assert_eq!(diagnostic.total, session.effective_context_tokens());
     }
 }

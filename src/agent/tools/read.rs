@@ -192,6 +192,37 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
+        self.call_with_extensions(args, &rig::tool::ToolCallExtensions::new())
+            .await
+    }
+    async fn call_with_extensions(
+        &self,
+        args: ReadArgs,
+        extensions: &rig::tool::ToolCallExtensions,
+    ) -> Result<String, ToolError> {
+        Ok(self.call_structured(args, extensions).await?.output)
+    }
+    async fn call_structured(
+        &self,
+        args: ReadArgs,
+        extensions: &rig::tool::ToolCallExtensions,
+    ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
+        let mut notice = None;
+        let output = self.read_inner(args, extensions, &mut notice).await?;
+        Ok(match notice {
+            Some(notice) => notice.read_result(output),
+            None => rig::tool::ToolReturn::success(output),
+        })
+    }
+}
+
+impl ReadTool {
+    async fn read_inner(
+        &self,
+        args: ReadArgs,
+        extensions: &rig::tool::ToolCallExtensions,
+        notice: &mut Option<crate::context::instructions::ContextNotice>,
+    ) -> Result<String, ToolError> {
         let notebook_view =
             !args.raw_notebook && super::notebook::is_notebook(Path::new(&args.path));
         let limit = args.limit.unwrap_or(self.max_lines as usize);
@@ -251,6 +282,14 @@ impl Tool for ReadTool {
                     .open_tool_output_file(resolved)
             })
         });
+        if let Some(instructions) = &self.read_tracker.instructions {
+            let instruction_target = if bound_workspace.is_some() {
+                relative
+            } else {
+                resolved.as_deref().unwrap_or(&requested)
+            };
+            *notice = instructions.notice(instruction_target, extensions).await?;
+        }
         let file = if let Some(file) = capability_file {
             tokio::fs::File::from_std(file)
         } else if let Some(file) = spill_file {

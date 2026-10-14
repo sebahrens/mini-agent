@@ -187,20 +187,30 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        self.apply(args).await.map(|result| result.output)
+        self.apply(args, &ToolCallExtensions::new())
+            .await
+            .map(|result| result.output)
     }
 
     async fn call_structured(
         &self,
         args: WriteArgs,
-        _extensions: &ToolCallExtensions,
+        extensions: &ToolCallExtensions,
     ) -> Result<ToolReturn<String>, ToolError> {
-        self.apply(args).await.map(MutationOutcome::into_return)
+        match self.apply(args, extensions).await {
+            Ok(result) => Ok(result.into_return()),
+            Err(ToolError::ContextReview(notice)) => Ok(notice.not_executed()),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl WriteTool {
-    async fn apply(&self, args: WriteArgs) -> Result<MutationOutcome, ToolError> {
+    async fn apply(
+        &self,
+        args: WriteArgs,
+        extensions: &ToolCallExtensions,
+    ) -> Result<MutationOutcome, ToolError> {
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
         let requested = target.requested;
@@ -229,6 +239,9 @@ impl WriteTool {
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
                     .await?;
+            if let Some(instructions) = &self.read_tracker.instructions {
+                instructions.before_mutation(relative, extensions).await?;
+            }
             let mut preview_before = None;
             let mut created = false;
             match workspace.open_relative(relative) {
@@ -329,6 +342,9 @@ impl WriteTool {
         )
         .await?;
 
+        if let Some(instructions) = &self.read_tracker.instructions {
+            instructions.before_mutation(path, extensions).await?;
+        }
         let mut preview_before = None;
         let existing = if path.exists() {
             tracing::warn!("tool write file exists: path={}", expanded);

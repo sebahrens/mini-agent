@@ -69,7 +69,6 @@ pub(crate) struct WorkspaceBinding {
     root: PathBuf,
     directory: std::fs::File,
     capability: cap_std::fs::Dir,
-    ancestors: Vec<(PathBuf, cap_std::fs::Dir)>,
     identity: crate::fs::CheckedMetadata,
 }
 
@@ -103,15 +102,10 @@ impl WorkspaceBinding {
                 "workspace path is not a directory",
             ));
         }
-        // ACP sessions deliberately omit ambient parent context. Retaining
-        // only the captured workspace capability prevents a coherently
-        // reparented ancestor chain from injecting instructions after capture.
-        let ancestors = vec![(root.clone(), capability.try_clone()?)];
         Ok(Self {
             root,
             directory,
             capability,
-            ancestors,
             identity: metadata,
         })
     }
@@ -388,19 +382,26 @@ impl WorkspaceBinding {
     /// Each named context file in the workspace, read up to `max_bytes`:
     /// `(directory, name, content, truncated)`. A file that is not UTF-8 is
     /// skipped; one larger than `max_bytes` is never read whole.
-    pub(crate) fn read_ancestor_files(
+    pub(crate) fn read_root_context_files(
         &self,
         names: &[&str],
         max_bytes: usize,
-    ) -> Vec<(PathBuf, String, String, bool)> {
+    ) -> Vec<(PathBuf, String, String, bool, crate::fs::CheckedMetadata)> {
         let mut files = Vec::new();
-        for (path, directory) in &self.ancestors {
-            for name in names {
-                if let Ok(file) = open_file_no_follow(directory, OsStr::new(name))
-                    && let Ok(Some((content, truncated))) = read_utf8_prefix(file, max_bytes)
-                {
-                    files.push((path.clone(), (*name).to_string(), content, truncated));
-                }
+        // Only the retained root is eligible. No ambient ancestor is opened,
+        // and regular-only opens reject FIFO replacements without blocking.
+        for name in names {
+            if let Ok(file) = open_file_no_follow_impl(&self.capability, OsStr::new(name), true)
+                && let Ok(identity) = crate::fs::checked_file_metadata(&file)
+                && let Ok(Some((content, truncated))) = read_utf8_prefix(file, max_bytes)
+            {
+                files.push((
+                    self.root.clone(),
+                    (*name).to_string(),
+                    content,
+                    truncated,
+                    identity,
+                ));
             }
         }
         files
@@ -1084,9 +1085,17 @@ mod workspace_binding_tests {
         std::fs::write(root.join("AGENTS.md"), "workspace instruction").unwrap();
 
         let binding = WorkspaceBinding::capture(&root).unwrap();
-        let context = binding.read_ancestor_files(&["AGENTS.md"], 1024);
+        let context = binding.read_root_context_files(&["AGENTS.md"], 1024);
         assert_eq!(
-            context,
+            context
+                .iter()
+                .map(|(root, name, content, truncated, _)| (
+                    root.clone(),
+                    name.clone(),
+                    content.clone(),
+                    *truncated
+                ))
+                .collect::<Vec<_>>(),
             vec![(
                 root.clone(),
                 "AGENTS.md".to_string(),
@@ -1094,7 +1103,14 @@ mod workspace_binding_tests {
                 false
             )]
         );
-        let capped = binding.read_ancestor_files(&["AGENTS.md"], 9);
+        let current = crate::fs::checked_file_metadata(
+            &binding
+                .open_regular_relative(Path::new("AGENTS.md"))
+                .unwrap(),
+        )
+        .unwrap();
+        crate::fs::ensure_same_file(&root.join("AGENTS.md"), &context[0].4, &current).unwrap();
+        let capped = binding.read_root_context_files(&["AGENTS.md"], 9);
         assert_eq!(capped[0].2, "workspace");
         assert!(capped[0].3);
 

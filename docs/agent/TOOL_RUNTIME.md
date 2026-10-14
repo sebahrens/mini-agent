@@ -798,3 +798,58 @@ is unchanged. Provider stream-stall timeouts remain independent.
 when it stops; it has no parked idle listener. Active rounds, validation and
 judge requests are never terminated by `--idle-exit`, and their stop outcomes
 and persistence keep their existing semantics.
+
+### Nested workspace instruction delivery
+
+`src/context/instructions.rs` owns captured instruction sources and private
+native-tool notice metadata. Its delivery acknowledgement is runner-local in
+Rig's existing hook scratchpad, carried explicitly to native tools. The
+prepared-request hook is observe-only and runs after merged request patches;
+accepted model turns acknowledge only notices present in that exact request.
+A mutation denied pending instruction review has made no change and carries no
+mutation diff. Read permission and target overwrite proof remain independent.
+Reused canonical tool IDs retire earlier private receipts before the new
+effective result is considered, so copied result bytes cannot restore a pruned
+receipt. Canonical IDs are correlation data, not permission or replay authority.
+
+Readonly native `/btw` and Task child agents use the same captured instruction
+source service, with their actual provider protocol selected separately. Each
+SDK invocation keeps its own delivery acknowledgements. Task-only parents still
+capture the service; `--no-context-files` explicitly disables it for all native
+file-tool consumers. Readonly children retain their existing narrowed tools and
+permission, spend, cancellation and clarification ownership. Native child
+requests also receive the configured response `max_tokens` (the normal 16384
+default); a captured parent CLI ceiling and a narrower child configuration limit
+both remain in force. This fixes native Anthropic child requests previously
+rejected before HTTP for a missing required response limit.
+
+Initial `CLAUDE.local.md` and authored `@path` / `@{path with spaces}` includes are
+captured from each root instruction file's original retained directory. Includes
+stay within that root, never follow symlinks or multiply-linked files, use at
+most four include levels and 32 visited files, and reject missing explicit
+includes or invalid/oversized UTF-8. A source is at most 16 KiB; newly captured
+sources use at most 128 KiB and the remainder of the existing combined 512 KiB
+context-file budget, measured after JSON escaping. Existing root context keeps
+its earlier budget priority. Cycles and repeated canonical paths are deduplicated
+without changing authored include or outer-to-inner scope order. Ambient parents
+are not loaded. Global includes keep their captured global origin. Project
+local/include sources require the existing exact project-config trust and
+side-effect-free read Allow authority; unchecked Ask/Deny sources never prompt
+for an implicit grant. Initial snapshots revalidate that authority before
+provider dispatch without rereading instruction bodies.
+
+Each lazy notice, including its JSON and framing, is capped at 16 KiB. An
+oversized notice fails visibly without enabling a mutation. Ordinary result
+redaction or spilling can also make a notice unavailable for acknowledgement;
+the instruction hook never restores removed bytes or bypasses those limits.
+Gemini's documented `systemInstruction` and `system_instruction` aliases are
+both transcript overrides. Responses' closed request-parameter type discards
+unknown `input`/`instructions` extras, and Ollama keeps extras within options;
+the guard follows actual typed backend behavior rather than key-name guesses.
+
+`/context` inspects only bounded metadata from the actual agent's source cache:
+source paths, origin/scope, byte counts, fixed failure counts and notice count.
+It never opens files, displays instruction bodies, or treats loaded snapshots or
+notice counts as delivery acknowledgements. Busy metadata is unavailable rather
+than blocking the UI. Snapshots remain stable until agent rebuild; changing or
+revoking source authority cannot authorize a later mutation from stale delivery.

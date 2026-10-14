@@ -3210,6 +3210,7 @@ async fn build_openai_agent(
                 #[cfg(feature = "lsp")]
                 diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Responses,
                 cli,
                 cfg,
                 context,
@@ -3247,6 +3248,7 @@ async fn build_openai_agent(
                 #[cfg(feature = "lsp")]
                 diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Chat,
                 cli,
                 cfg,
                 context,
@@ -3357,6 +3359,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "lsp")]
                 &mut diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Chat,
                 cli,
                 cfg,
                 context,
@@ -3423,6 +3426,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "lsp")]
                 &mut diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Anthropic,
                 cli,
                 cfg,
                 context,
@@ -3456,6 +3460,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "lsp")]
                 &mut diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Gemini,
                 cli,
                 cfg,
                 context,
@@ -3489,6 +3494,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "lsp")]
                 &mut diagnostic_lsp,
                 m,
+                crate::context::instructions::InstructionProtocol::Ollama,
                 cli,
                 cfg,
                 context,
@@ -3811,12 +3817,15 @@ mod startup_capability_tests {
 
 /// Builds the isolated, tool-less `/btw` agent for the active provider.
 #[allow(clippy::too_many_arguments)]
-pub fn build_btw_agent(
+pub async fn build_btw_agent(
     model: AnyModel,
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    captured_instructions: Option<
+        std::sync::Arc<crate::context::instructions::WorkspaceInstructions>,
+    >,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     tool_output_session_id: &str,
@@ -3826,100 +3835,138 @@ pub fn build_btw_agent(
     extra_body: Option<serde_json::Value>,
 ) -> AnyAgent {
     let inner = match model {
-        AnyModel::OpenRouter(m, routing) => {
-            AnyAgentInner::OpenRouter(builder::build_btw_agent_inner(
-                m,
-                cli,
-                cfg,
-                context,
-                workspace,
-                permission,
-                ask_tx,
-                tool_output_session_id,
-                tool_result_spills.clone(),
-                reasoning_enabled,
-                temperature,
-                merge_extra_body(routing, extra_body),
-            ))
-        }
-        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
-            OpenAiModel::Responses(m) => OpenAiAgent::Responses(builder::build_btw_agent_inner(
-                m,
-                cli,
-                cfg,
-                context,
-                workspace,
-                permission,
-                ask_tx,
-                tool_output_session_id,
-                tool_result_spills.clone(),
-                reasoning_enabled,
-                temperature,
-                openai_responses_extra_body(
-                    extra_body,
-                    tool_output_session_id,
-                    cfg.reasoning.as_ref(),
-                ),
-            )),
-            OpenAiModel::Completions(m) => {
-                OpenAiAgent::Completions(builder::build_btw_agent_inner(
+        AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
                     m,
+                    crate::context::instructions::InstructionProtocol::Chat,
                     cli,
                     cfg,
                     context,
                     workspace,
+                    captured_instructions.clone(),
                     permission,
                     ask_tx,
                     tool_output_session_id,
                     tool_result_spills.clone(),
                     reasoning_enabled,
                     temperature,
-                    openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
-                ))
-            }
+                    merge_extra_body(routing, extra_body),
+                )
+            })
+            .await,
+        ),
+        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
+            OpenAiModel::Responses(m) => OpenAiAgent::Responses(
+                crate::startup::heap_future(|| {
+                    builder::build_btw_agent_inner(
+                        m,
+                        crate::context::instructions::InstructionProtocol::Responses,
+                        cli,
+                        cfg,
+                        context,
+                        workspace,
+                        captured_instructions.clone(),
+                        permission,
+                        ask_tx,
+                        tool_output_session_id,
+                        tool_result_spills.clone(),
+                        reasoning_enabled,
+                        temperature,
+                        openai_responses_extra_body(
+                            extra_body,
+                            tool_output_session_id,
+                            cfg.reasoning.as_ref(),
+                        ),
+                    )
+                })
+                .await,
+            ),
+            OpenAiModel::Completions(m) => OpenAiAgent::Completions(
+                crate::startup::heap_future(|| {
+                    builder::build_btw_agent_inner(
+                        m,
+                        crate::context::instructions::InstructionProtocol::Chat,
+                        cli,
+                        cfg,
+                        context,
+                        workspace,
+                        captured_instructions.clone(),
+                        permission,
+                        ask_tx,
+                        tool_output_session_id,
+                        tool_result_spills.clone(),
+                        reasoning_enabled,
+                        temperature,
+                        openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
+                    )
+                })
+                .await,
+            ),
         }),
-        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(builder::build_btw_agent_inner(
-            m,
-            cli,
-            cfg,
-            context,
-            workspace,
-            permission,
-            ask_tx,
-            tool_output_session_id,
-            tool_result_spills.clone(),
-            reasoning_enabled,
-            temperature,
-            extra_body,
-        )),
-        AnyModel::Gemini(m) => AnyAgentInner::Gemini(builder::build_btw_agent_inner(
-            m,
-            cli,
-            cfg,
-            context,
-            workspace,
-            permission,
-            ask_tx,
-            tool_output_session_id,
-            tool_result_spills.clone(),
-            reasoning_enabled,
-            temperature,
-            extra_body,
-        )),
-        AnyModel::Ollama(m) => AnyAgentInner::Ollama(builder::build_btw_agent_inner(
-            m,
-            cli,
-            cfg,
-            context,
-            workspace,
-            permission,
-            ask_tx,
-            tool_output_session_id,
-            tool_result_spills,
-            reasoning_enabled,
-            temperature,
-            extra_body,
-        )),
+        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Anthropic,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    captured_instructions.clone(),
+                    permission,
+                    ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills.clone(),
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                )
+            })
+            .await,
+        ),
+        AnyModel::Gemini(m) => AnyAgentInner::Gemini(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Gemini,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    captured_instructions.clone(),
+                    permission,
+                    ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills.clone(),
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                )
+            })
+            .await,
+        ),
+        AnyModel::Ollama(m) => AnyAgentInner::Ollama(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Ollama,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    captured_instructions.clone(),
+                    permission,
+                    ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                )
+            })
+            .await,
+        ),
     };
     AnyAgent::without_skills(inner)
 }
@@ -4879,6 +4926,7 @@ mod lsp_health_agent_tests {
             mcp_discovery: Default::default(),
             workspace_root: root.path().to_path_buf(),
             agents: None,
+            instruction_roots: Vec::new(),
             prompts: HashMap::new(),
             current_prompt: None,
             current_prompt_name: None,

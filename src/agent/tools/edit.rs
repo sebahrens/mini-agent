@@ -1049,20 +1049,30 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
-        self.apply(args).await.map(|result| result.output)
+        self.apply(args, &ToolCallExtensions::new())
+            .await
+            .map(|result| result.output)
     }
 
     async fn call_structured(
         &self,
         args: EditArgs,
-        _extensions: &ToolCallExtensions,
+        extensions: &ToolCallExtensions,
     ) -> Result<ToolReturn<String>, ToolError> {
-        self.apply(args).await.map(MutationOutcome::into_return)
+        match self.apply(args, extensions).await {
+            Ok(outcome) => Ok(outcome.into_return()),
+            Err(ToolError::ContextReview(notice)) => Ok(notice.not_executed()),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl EditTool {
-    async fn apply(&self, args: EditArgs) -> Result<MutationOutcome, ToolError> {
+    async fn apply(
+        &self,
+        args: EditArgs,
+        extensions: &ToolCallExtensions,
+    ) -> Result<MutationOutcome, ToolError> {
         // Reject an unusable argument combination before opening or reading the
         // target: an invalid mode must never allocate a large file first.
         if args.block.is_none() && (args.file_crc.is_none() || args.edits.is_none()) {
@@ -1140,6 +1150,16 @@ impl EditTool {
             check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?
         };
 
+        if let Some(instructions) = &self.read_tracker.instructions {
+            let instruction_target = if bound_workspace.is_some() {
+                relative
+            } else {
+                std::path::Path::new(&path)
+            };
+            instructions
+                .before_mutation(instruction_target, extensions)
+                .await?;
+        }
         let mut file = if let Some(file) = capability_file {
             tokio::fs::File::from_std(file)
         } else {

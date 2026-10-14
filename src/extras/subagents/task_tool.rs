@@ -474,6 +474,8 @@ pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
+    response_max_tokens: Option<u64>,
     #[cfg(feature = "archmd")]
     architecture: Option<String>,
     deny_repeated_reads: bool,
@@ -496,6 +498,8 @@ impl TaskTool {
             permission,
             ask_tx,
             workspace: None,
+            instructions: None,
+            response_max_tokens: None,
             #[cfg(feature = "archmd")]
             architecture: None,
             deny_repeated_reads,
@@ -504,6 +508,25 @@ impl TaskTool {
             #[cfg(feature = "js")]
             read_only_js: None,
         }
+    }
+
+    pub(crate) fn with_response_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.response_max_tokens = Some(max_tokens);
+        self
+    }
+
+    fn effective_response_max_tokens(&self, config: &crate::config::Config) -> u64 {
+        let configured = crate::cli::Cli::default().resolve_max_tokens(config);
+        self.response_max_tokens
+            .map_or(configured, |ceiling| ceiling.min(configured))
+    }
+
+    pub(crate) fn with_workspace_instructions(
+        mut self,
+        instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
+    ) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     #[cfg(feature = "js")]
@@ -651,6 +674,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
             })
             .map_err(|err| ToolError::Msg(err.to_string()))?;
+        let mut config = config;
+        config.max_tokens = Some(self.effective_response_max_tokens(&config));
         let limits = limits.validate()?;
         let prompts = prepare_task_prompts(&args, limits)?;
 
@@ -771,7 +796,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             self.ask_tx.clone(),
             self.deny_repeated_reads,
         )
-        .with_workspace_binding(self.workspace.clone());
+        .with_workspace_binding(self.workspace.clone())
+        .with_workspace_instructions(self.instructions.clone());
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, containment_status)) = read_only_js {
             authorization.with_read_only_js(sandbox, containment_status, &config)
@@ -3096,5 +3122,30 @@ mod tests {
         let result = truncate_total_bytes("記憶".repeat(100).as_str(), 64, "…[cut]");
         assert!(result.len() <= 64);
         assert!(result.ends_with("…[cut]"));
+    }
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::TaskTool;
+    #[test]
+    fn native_child_response_limit_preserves_parent_cli_ceiling_and_config_narrowing() {
+        let cfg = crate::config::Config {
+            max_tokens: Some(90),
+            ..Default::default()
+        };
+        let inherited = TaskTool::new(None, None, true).with_response_max_tokens(37);
+        assert_eq!(inherited.effective_response_max_tokens(&cfg), 37);
+        let narrower = crate::config::Config {
+            max_tokens: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(inherited.effective_response_max_tokens(&narrower), 20);
+        let uncapped = TaskTool::new(None, None, true);
+        assert_eq!(uncapped.effective_response_max_tokens(&cfg), 90);
+        assert_eq!(
+            uncapped.effective_response_max_tokens(&Default::default()),
+            crate::cli::Cli::default().resolve_max_tokens(&Default::default())
+        );
     }
 }
