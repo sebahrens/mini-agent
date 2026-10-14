@@ -15,6 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Update rustls to 0.23.46, including upstream fixes for unauthenticated key-exchange
+  hints, session debug output, and early application data on ECH rejection.
+
 - Linux and macOS sandbox launches refuse existing symlink and hardlink aliases of protected Git
   metadata, including bounded inspection of protected-directory descendants and external linked
   worktree metadata. In-workspace gitfile target directories are pinned against rename while

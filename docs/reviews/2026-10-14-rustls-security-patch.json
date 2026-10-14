@@ -1,0 +1,37 @@
+{
+  "bead": "mini-agent-i7ro6.113",
+  "base": "e51733b43501f2a7a2deaa4a56e631db05c8597a",
+  "change": "Only the locked rustls package version and checksum change, from 0.23.45 to 0.23.46; changelog records upstream security fixes.",
+  "upstream_release": "https://github.com/rustls/rustls/releases/tag/v%2F0.23.46",
+  "upstream_key_exchange_fix": "https://github.com/rustls/rustls/pull/3355",
+  "test_selection": {
+    "method": "Code-indexer locates provider transport controls and manifest/packaging consumers; physical reads and cargo tree complete dependency/data boundaries omitted by the symbol graph. The direct ACP TLS implementation uses native-tls, not rustls.",
+    "default_tests": [
+      "extras::acp::tls::tests::tls_peer_with_matching_channel_binding_is_accepted_and_session_is_encrypted",
+      "extras::acp::tls::tests::relayed_response_bound_to_another_certificate_is_rejected",
+      "extras::acp::tls::tests::plaintext_peer_cannot_authenticate_to_a_tls_listener",
+      "tests::provider_tests::provider_redirects_preserve_origin_headers_and_hop_limit",
+      "tests::provider_tests::anthropic_bearer_factory_sends_only_typed_auth_and_preserves_sdk_defaults"
+    ],
+    "default_result": "5 passed, 0 failed; 1.24 seconds after compilation",
+    "minimal_test": "tests::provider_tests::provider_redirects_preserve_origin_headers_and_hop_limit",
+    "minimal_result": "1 passed, 0 failed; 0.02 seconds after compilation",
+    "feature_reason": "cargo tree --edges normal -i rustls has no normal dependency path on this host. cargo tree -e features -i rustls identifies the rig-core default dev-dependency enabling reqwest rustls. The default provider tests compile and exercise that unified HTTP boundary. No distinct minimal rustls feature family was established; the completed minimal run is recorded, not required as another gate.",
+    "selection_correction": "The three completed ACP TLS controls were over-selected: they use native-tls and are not evidence for the rustls fix. They will not be repeated or counted as required tests for this patch. Application implementations and feature graph are unchanged, so no unrelated module or full local suite is rerun.",
+    "limits": "The retained provider controls verify integration/auth/redirect behavior under the changed dev dependency resolution; they do not reproduce upstream's malicious key-exchange hint attack. The upstream patch and advisory resolution establish that fix separately.",
+    "packaging": "scripts/third_party_licenses.py derives package versions and license files from locked Cargo metadata; there is no root checked-in inventory version to update. No generator or license policy change."
+  },
+  "other_checks": {
+    "advisories": "cargo deny --locked check advisories: advisories ok; no suppression",
+    "install": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-rustls113-install: passed",
+    "format": "cargo fmt: passed",
+    "hosted_ci": "Fresh source CI must be observed separately before CI-dependent closure."
+  },
+  "evidence": {
+    "default_log": {"path": "/private/tmp/mini-agent-rustls113-transport.log", "sha256": "ecf464073fb9088b791b0f1dd6eeaaa1853ee0b0ad19fd3e020e7462a944937c"},
+    "minimal_log": {"path": "/private/tmp/mini-agent-rustls113-minimal.log", "sha256": "abb425a853897992658b7efa7048689df60d90a85329eccbdfa2a4b9d775f755"},
+    "advisory_log": {"path": "/private/tmp/mini-agent-rustls113-advisories.log", "sha256": "799fc05e6513bf365cc7565ea51cc5cb9ca6690b1cd1fe7777339be83437131b"},
+    "install_log": {"path": "/private/tmp/mini-agent-rustls113-install.log", "sha256": "4cf348612a089dde13a60f9a2ec13da9143bbcc81065c6de00b72f858a681018"},
+    "installed_binary": {"path": "/private/tmp/mini-agent-rustls113-install/bin/mini-agent", "sha256": "4550799e2d8f88aca92077de95eca4e9667af6abc75429ff22f05d3c79c219e4"}
+  }
+}
