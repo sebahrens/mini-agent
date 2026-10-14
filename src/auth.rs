@@ -6,6 +6,7 @@ use std::env::VarError;
 pub enum ProviderKind {
     OpenRouter,
     OpenAI,
+    Azure,
     Anthropic,
     Gemini,
     Ollama,
@@ -16,6 +17,7 @@ impl ProviderKind {
         match name.to_lowercase().as_str() {
             "openrouter" => Some(Self::OpenRouter),
             "openai" | "custom" => Some(Self::OpenAI), // "custom" is an alias for OpenAI client
+            "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
             "anthropic" => Some(Self::Anthropic),
             "gemini" | "google" => Some(Self::Gemini),
             "ollama" => Some(Self::Ollama),
@@ -268,18 +270,23 @@ impl AuthResolver {
             ));
         }
 
-        // Anthropic's native token is a second environment credential, after
-        // the designated API-key env and before config keys. An isolated route
-        // or explicitly designated alternate key env cannot inherit it.
-        if self.provider_kind == ProviderKind::Anthropic
-            && custom.is_none()
+        // Bearer credentials are selected by their declared source, never by
+        // inspecting a secret. Isolated gateways and alternate key envs cannot
+        // inherit the vendor's token.
+        let bearer_env = match self.provider_kind {
+            ProviderKind::Anthropic => Some("ANTHROPIC_AUTH_TOKEN"),
+            ProviderKind::Azure => Some("AZURE_OPENAI_AD_TOKEN"),
+            _ => None,
+        };
+        if custom.is_none()
             && self.api_key_env_override.is_none()
-            && let Ok(token) = get_env("ANTHROPIC_AUTH_TOKEN")
+            && let Some(name) = bearer_env
+            && let Ok(token) = get_env(name)
             && !token.is_empty()
         {
             return Ok((
                 ResolvedCredential::Bearer(token),
-                CredentialSource::Environment("ANTHROPIC_AUTH_TOKEN".into()),
+                CredentialSource::Environment(name.into()),
             ));
         }
 
@@ -371,6 +378,7 @@ impl ProviderKind {
     pub fn env_var_name(self) -> &'static str {
         match self {
             ProviderKind::OpenAI => "OPENAI_API_KEY",
+            ProviderKind::Azure => "AZURE_OPENAI_API_KEY",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::Ollama => "OLLAMA_API_KEY",
@@ -384,6 +392,9 @@ impl ProviderKind {
     pub fn builtin_endpoint(self) -> &'static str {
         match self {
             ProviderKind::OpenAI => "https://api.openai.com/v1",
+            // Azure has no shared tenant endpoint. Explicit custom routes
+            // cannot receive a vendor-key exemption by matching an example.
+            ProviderKind::Azure => "",
             ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
             ProviderKind::Ollama => "http://localhost:11434",
@@ -408,6 +419,7 @@ impl ProviderKind {
         match self {
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::OpenAI => "openai",
+            ProviderKind::Azure => "azure",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",

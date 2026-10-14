@@ -1,10 +1,10 @@
 ---
-description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
+description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
 ---
 
 # Providers
 
-mini-agent supports five built-in providers and allows custom provider
+mini-agent supports six built-in providers and allows custom provider
 definitions for OpenAI-compatible endpoints.
 
 ## Built-in Providers
@@ -13,6 +13,7 @@ definitions for OpenAI-compatible endpoints.
 | ---------- | ------------------- | --------------------------- |
 | OpenRouter | `openrouter`        | `OPENROUTER_API_KEY`        |
 | OpenAI     | `openai`            | `OPENAI_API_KEY`            |
+| Azure OpenAI | `azure` / `azure-openai` | `AZURE_OPENAI_API_KEY` |
 | Anthropic  | `anthropic`         | `ANTHROPIC_API_KEY`         |
 | Gemini     | `gemini` / `google` | `GEMINI_API_KEY`            |
 | Ollama     | `ollama`            | (no key required)           |
@@ -45,6 +46,54 @@ Startup and `/provider <name>` use the same default resolver: the configured
 quick model in alphabetical alias order, then the built-in defaults above.
 An explicit `--model` or `/model` selection still overrides these defaults.
 
+## Azure OpenAI
+
+Select `provider = "azure"` and set `AZURE_OPENAI_ENDPOINT` to your resource URL
+(for example `https://example.openai.azure.com`). A URL already ending in
+`/openai/v1` also works. Set the model to your **deployment name**, rather than
+assuming it is the underlying model's public ID. Azure has no shared deployment
+default; configure one explicitly:
+
+```toml
+provider = "azure"
+model = "my-gpt-deployment"
+```
+
+Authenticate with `AZURE_OPENAI_API_KEY`, `--api-key`, or `api_keys.azure`. These
+send the `api-key` header. Alternatively supply an existing Microsoft Entra access
+token in `AZURE_OPENAI_AD_TOKEN`; it sends only `Authorization: Bearer ...`.
+CLI keys override environment credentials, the API-key environment variable
+precedes the bearer-token variable, and environment credentials precede config
+keys. `OPENAI_API_KEY` is never borrowed. Obtain/refresh Entra tokens through your
+normal identity tooling; mini-agent does not log in or modify your cloud account.
+
+Azure defaults to its v1 **Responses API**. A named route may select v1 Chat
+Completions explicitly:
+
+```toml
+[custom_providers.azure-chat]
+provider_type = "azure"
+base_url = "https://example.openai.azure.com/openai/v1"
+api_key_env = "MY_AZURE_RESOURCE_KEY"
+api_style = "completions"
+model = "my-chat-deployment"
+```
+
+Custom routes keep the existing credential isolation policy. Their own key
+environment variable/config entry is required unless `inherit_builtin_key = true`
+explicitly grants use of Azure credentials. Typed Azure auth replaces competing
+custom auth headers. Both APIs preserve streaming tools, usage accounting,
+reasoning controls and the existing connection/inactivity deadlines. The legacy
+`/openai/deployments/...` API is a different endpoint and is rejected by this v1
+kind. Existing `provider_type = "openai"` recipes retain their behavior.
+
+The implementation in `src/provider_azure.rs` supplies tenant routing and typed
+auth while reusing the SDK's OpenAI v1 converters and `ProviderHttpClient`.
+[Microsoft's v1 reference](https://learn.microsoft.com/en-us/rest/api/aifoundry/azureopenai/responses)
+documents the endpoint and credential headers; its
+[starter guide](https://learn.microsoft.com/en-us/azure/developer/ai/get-started-azure-openai-starter-kit)
+explains deployment names and Entra token scope.
+
 ## Provider Recipes
 
 - [MiniMax](providers/Minimax.md)
@@ -75,7 +124,7 @@ the `custom_providers` key in the config file:
 
 | Field                         | Type    | Description                                                                                                                                                                   |
 | ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider_type`               | string  | Must be one of the built-in provider types (`openrouter`, `openai`, `anthropic`, `gemini`, `ollama`).                                                                         |
+| `provider_type`               | string  | Must be one of the built-in provider types (`openrouter`, `openai`, `azure`, `anthropic`, `gemini`, `ollama`).                                                                         |
 | `base_url`                    | string  | The API base URL.                                                                                                                                                             |
 | `api_key_env`                 | string  | Optional. Name of an environment variable holding the API key. Falls back to the provider-kind default if not set.                                                            |
 | `api_style`                   | string  | Optional. For OpenAI-based providers: `"responses"` (Responses API) or `"completions"` (Chat Completions). Custom providers always have a `base_url`, so this defaults to `"completions"`; set it explicitly for a Responses-only endpoint. |
