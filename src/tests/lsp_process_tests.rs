@@ -28,9 +28,8 @@ fn close_stdin() {
     unsafe extern "C" {
         fn close(fd: i32) -> i32;
     }
-    unsafe {
-        close(0);
-    }
+    // SAFETY: this fixture owns fd0, and drops its buffered reader first.
+    assert_eq!(unsafe { close(0) }, 0, "fixture stdin close failed");
 }
 
 #[cfg(windows)]
@@ -41,9 +40,9 @@ fn close_stdin() {
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
     const STD_INPUT_HANDLE: u32 = -10_i32 as u32;
-    unsafe {
-        CloseHandle(GetStdHandle(STD_INPUT_HANDLE));
-    }
+    // SAFETY: only this fixture's retained standard-input handle is closed.
+    assert_ne!(unsafe { CloseHandle(GetStdHandle(STD_INPUT_HANDLE)) }, 0,
+        "fixture stdin close failed");
 }
 
 fn read_frame(reader: &mut impl BufRead) -> Option<String> {
@@ -1590,6 +1589,25 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
     fixture.cleanup().await;
 }
 
+#[cfg(unix)]
+#[test]
+fn lsp_pipe_peer_closed_witness_requires_last_reader_departure() {
+    use crate::extras::lsp::client::pipe_reader_closed_for_test;
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let inherited_reader = reader.try_clone().unwrap();
+    assert!(!pipe_reader_closed_for_test(&writer).unwrap());
+    drop(reader);
+    assert!(!pipe_reader_closed_for_test(&writer).unwrap());
+    writer.write_all(b"document").unwrap();
+    drop(inherited_reader);
+    assert!(pipe_reader_closed_for_test(&writer).unwrap());
+    assert_eq!(
+        writer.write_all(b"document").unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
 #[tokio::test]
 async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
     let fixture = FixtureBuild::compile("broken-stdin");
@@ -1607,14 +1625,48 @@ async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
         .await
         .expect("fixture must initialize before closing stdin");
     let parent_pid = wait_for_pid(&lease).await;
-    wait_for_file(&closed).await;
+    #[cfg(unix)]
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let marker = wait_for_file(&closed).await;
+    // An unrelated fork can retain the anonymous pipe's reader until exec,
+    // even after this exact server closes fd0. Observe actual peer departure
+    // before the original first-sync assertion; never retry sync_document.
+    #[cfg(unix)]
+    let peer_closed = tokio::time::timeout_at(ready_deadline, async {
+        loop {
+            if client.stdin_reader_closed_for_test().await? {
+                return Ok::<_, std::io::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    #[cfg(not(unix))]
+    let peer_closed = Ok::<_, tokio::time::error::Elapsed>(Ok::<_, std::io::Error>(()));
 
+    let ready = matches!(peer_closed, Ok(Ok(())));
     let document = read_stable_document(&source).await.unwrap();
-    assert!(client.sync_document(&source, document).await.is_none());
-    assert!(client.is_stopped());
+    let sync = if ready {
+        client.sync_document(&source, document).await
+    } else {
+        None
+    };
+    let stopped_by_write = client.is_stopped();
+    // Retire the exact owner even when a readiness/write assertion fails.
+    client.shutdown().await;
     assert_process_reaped(parent_pid).await;
     drop(client);
     fixture.cleanup().await;
+    assert_eq!(marker, "closed");
+    assert!(
+        ready,
+        "stdin peer did not retire within the existing fixture bound: {peer_closed:?}"
+    );
+    assert!(
+        sync.is_none(),
+        "the first sync to a pipe with no readers succeeded"
+    );
+    assert!(stopped_by_write, "failed write did not stop the transport");
 }
 
 #[tokio::test]

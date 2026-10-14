@@ -28,6 +28,33 @@ pub(crate) struct Document {
     content: crate::fs::ContentDigest,
 }
 
+/// Observe the kernel pipe state without writing a probe frame. A fixture's
+/// close marker does not exclude a reader inherited by another fork before exec.
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
+pub(crate) fn pipe_reader_closed_for_test(
+    writer: &impl std::os::fd::AsRawFd,
+) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: writer.as_raw_fd(),
+        // Request write-side observation; Darwin's pipe poll reports its
+        // final-reader hangup on this direction, without performing a write.
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: the caller retains the writer for this nonblocking syscall;
+    // descriptor is one initialized, writable pollfd and no fd is transferred.
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::other("fixture pipe descriptor is invalid"));
+    }
+    // Linux reports POLLERR; Darwin reports POLLHUP for this write-end state.
+    Ok(descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+}
+
 /// Capture identity from the same authorized handle that supplies the text.
 pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Document> {
     let identity = crate::fs::checked_tokio_file_metadata(&file).await?;
@@ -794,6 +821,12 @@ impl LspClient {
             release: gate,
         });
         (received, release)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn stdin_reader_closed_for_test(&self) -> std::io::Result<bool> {
+        let stdin = self.stdin.lock().await;
+        pipe_reader_closed_for_test(&*stdin)
     }
 
     #[cfg(test)]

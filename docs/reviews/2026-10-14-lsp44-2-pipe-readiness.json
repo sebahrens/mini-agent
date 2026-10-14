@@ -1,0 +1,26 @@
+{
+  "bead": "mini-agent-i7ro6.44.2",
+  "patch": "/private/tmp/mini-agent-lsp44-2-final-owned.patch",
+  "patch_sha256": "590e8da7659886c315355b3dca413b2529fcd71eb134fdc8f3253f01240af119",
+  "root_review": "Read both files and actual causal report. Test-only kernel peer-closure witness requests POLLOUT but accepts only ERR/HUP, never writes readiness probes or retries the first sync. Original8-byte source, terminal-on-first-write-failure assertion, stop snapshot before explicit cleanup, exact reaping and existing5s readiness deadline retained. Unix helper is cfg(test); inert fixture close results are now checked on Unix and Windows.",
+  "causal": {
+    "path": "/private/tmp/mini-agent-lsp44-2-causal-ii0ea6os/report.json",
+    "sha256": "b56ba38b43e6c6f35f8e823865d80c326533c350afd32e66ca5dfa008e7116f7",
+    "result": {
+      "source_sha256": "52eb526d9a6a906c11cb216301d952ca852e11f09ab26c5e60d17efaa54ba9cf",
+      "root": "/private/tmp/mini-agent-lsp44-2-causal-ii0ea6os",
+      "assertions": {
+        "first_write_after_exact_fixture_closed_marker_succeeds_with_foreign_read_endpoint": true,
+        "same_write_after_actual_last_reader_retirement_fails_epipe": true,
+        "fixture_remained_live_for_both_writes": true
+      },
+      "poll_events_after_reader_retirement": 16,
+      "after_retirement_errno": 32,
+      "passed": true,
+      "helper_retired": true
+    }
+  },
+  "validation": "Owning two final failed-stdin/last-reader controls PASS and unchanged real positive protocol control PASS reused; exact owner test map /private/tmp/mini-agent-lsp44-2-final-owned-indexed-test-map.json.",
+  "reuse": "No production behavior or dependency change. Prior combined debug install and native74/116 evidence remain applicable; no production reinstall or unrelated feature sweep for this test-only successor.",
+  "remaining": "Fresh hosted Linux/macOS parallel acceptance required before closure; historical CI foreign-reader PID not identified, causal mechanism controlled and reproduced."
+}
