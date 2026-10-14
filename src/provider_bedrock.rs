@@ -91,7 +91,7 @@ impl BedrockAuth {
                 Some(key)
             }
             ResolvedCredential::AwsDefaultChain => None,
-            ResolvedCredential::Bearer(_) => {
+            ResolvedCredential::Bearer(_) | ResolvedCredential::GoogleAdc => {
                 anyhow::bail!("Bedrock native Messages uses an API key or AWS SDK credentials")
             }
         };
@@ -335,7 +335,7 @@ impl ProviderBuilder for BedrockBuilder {
     where
         H: http_client::HttpClientExt,
     {
-        Ok(rig::providers::anthropic::client::AnthropicExt)
+        Ok(rig::providers::anthropic::client::AnthropicExt::default())
     }
 }
 

@@ -15,7 +15,90 @@ use crate::{
 // Main Anthropic Client
 // ================================================================
 #[derive(Debug, Default, Clone)]
-pub struct AnthropicExt;
+pub struct AnthropicExt {
+    pub(crate) vertex: Option<VertexRoute>,
+}
+
+/// Fixed Claude publisher route. This is request composition data, never an
+/// authentication or imported-history authority.
+#[derive(Debug, Clone)]
+pub struct VertexRoute {
+    project: String,
+    location: String,
+}
+
+impl VertexRoute {
+    pub fn new(project: &str, location: &str) -> http_client::Result<Self> {
+        if !Self::valid_segment(project) || !Self::valid_segment(location) {
+            return Err(http_client::Error::Instance(Box::new(
+                std::io::Error::other("invalid Vertex project or location"),
+            )));
+        }
+        Ok(Self {
+            project: project.into(),
+            location: location.into(),
+        })
+    }
+
+    pub fn valid_segment(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'@'))
+    }
+
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    pub fn path(&self, model: &str, streaming: bool) -> http_client::Result<String> {
+        if !Self::valid_segment(model) {
+            return Err(http_client::Error::Instance(Box::new(
+                std::io::Error::other("invalid Vertex model ID"),
+            )));
+        }
+        let action = if streaming {
+            "streamRawPredict"
+        } else {
+            "rawPredict"
+        };
+        Ok(format!(
+            "/v1/projects/{}/locations/{}/publishers/anthropic/models/{model}:{action}",
+            self.project, self.location
+        ))
+    }
+
+    /// Parse only the exact SDK streaming path, including safe unencoded IDs.
+    pub fn streaming_model(path: &str) -> Option<&str> {
+        let parts: Vec<_> = path.split('/').collect();
+        if parts.len() != 10
+            || parts[0] != ""
+            || parts[1] != "v1"
+            || parts[2] != "projects"
+            || parts[4] != "locations"
+            || parts[6] != "publishers"
+            || parts[7] != "anthropic"
+            || parts[8] != "models"
+            || !Self::valid_segment(parts[3])
+            || !Self::valid_segment(parts[5])
+        {
+            return None;
+        }
+        let model = parts[9].strip_suffix(":streamRawPredict")?;
+        Self::valid_segment(model).then_some(model)
+    }
+}
+
+impl AnthropicExt {
+    pub fn vertex(route: VertexRoute) -> Self {
+        Self {
+            vertex: Some(route),
+        }
+    }
+}
 
 impl Provider for AnthropicExt {
     type Builder = AnthropicBuilder;
@@ -91,7 +174,7 @@ impl ProviderBuilder for AnthropicBuilder {
     where
         H: HttpClientExt,
     {
-        Ok(AnthropicExt)
+        Ok(AnthropicExt::default())
     }
 
     fn finish<H>(

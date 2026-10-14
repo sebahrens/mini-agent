@@ -41,6 +41,10 @@ pub(crate) const ANTHROPIC_RAW_CONTENT_KEY: &str = "anthropic_content";
 pub trait AnthropicCompatibleProvider: Provider {
     const PROVIDER_NAME: &'static str;
 
+    fn vertex_route(&self) -> Option<&super::client::VertexRoute> {
+        None
+    }
+
     fn default_max_tokens(model: &str) -> Option<u64> {
         let _ = model;
         None
@@ -49,6 +53,10 @@ pub trait AnthropicCompatibleProvider: Provider {
 
 impl AnthropicCompatibleProvider for super::client::AnthropicExt {
     const PROVIDER_NAME: &'static str = "anthropic";
+
+    fn vertex_route(&self) -> Option<&super::client::VertexRoute> {
+        self.vertex.as_ref()
+    }
 
     fn default_max_tokens(model: &str) -> Option<u64> {
         default_max_tokens_for_model(model)
@@ -2762,12 +2770,20 @@ where
             );
         }
 
+        let request = if self.client.ext().vertex_route().is_some() {
+            let mut body = serde_json::to_value(&request)?;
+            self.apply_vertex_body(&mut body)?;
+            serde_json::to_vec(&body)?
+        } else {
+            // Preserve ordinary Anthropic's existing serialization and explicit
+            // additional-parameter precedence byte for byte.
+            serde_json::to_vec(&request)?
+        };
+        let path = self.native_request_path(false)?;
         async move {
-            let request: Vec<u8> = serde_json::to_vec(&request)?;
-
             let req = self
                 .client
-                .post("/v1/messages")?
+                .post(&path)?
                 .body(request)
                 .map_err(|e| CompletionError::HttpError(e.into()))?;
 

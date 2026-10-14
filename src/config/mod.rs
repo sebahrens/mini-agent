@@ -654,7 +654,11 @@ impl Config {
             .unwrap_or(provider);
         matches!(
             crate::auth::ProviderKind::from_name(kind_name),
-            Some(crate::auth::ProviderKind::Anthropic | crate::auth::ProviderKind::Bedrock)
+            Some(
+                crate::auth::ProviderKind::Anthropic
+                    | crate::auth::ProviderKind::Bedrock
+                    | crate::auth::ProviderKind::Vertex
+            )
         )
     }
 

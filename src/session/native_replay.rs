@@ -710,8 +710,15 @@ impl NativeDomain {
             .endpoint
             .parse::<http::Uri>()
             .map_err(|_| RestartReason::ChangedDomain)?;
-        let actual =
-            Self::from_native_view(&endpoint, &serde_json::json!({"model": self.request_model}))?;
+        let probe =
+            if rig::providers::anthropic::client::VertexRoute::streaming_model(endpoint.path())
+                .is_some()
+            {
+                serde_json::json!({"anthropic_version":"vertex-2023-10-16"})
+            } else {
+                serde_json::json!({"model": self.request_model})
+            };
+        let actual = Self::from_native_view(&endpoint, &probe)?;
         if actual != *self {
             return Err(RestartReason::ChangedDomain);
         }
@@ -736,13 +743,26 @@ impl NativeDomain {
         {
             return Err(RestartReason::ChangedDomain);
         }
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .filter(|model| {
-                !model.is_empty() && model.len() <= 512 && !model.chars().any(char::is_control)
-            })
-            .ok_or(RestartReason::ChangedDomain)?;
+        let vertex_model =
+            rig::providers::anthropic::client::VertexRoute::streaming_model(uri.path());
+        let model = if let Some(model) = vertex_model {
+            if body.get("model").is_some()
+                || body
+                    .get("anthropic_version")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("vertex-2023-10-16")
+            {
+                return Err(RestartReason::ChangedDomain);
+            }
+            model
+        } else {
+            body.get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| {
+                    !model.is_empty() && model.len() <= 512 && !model.chars().any(char::is_control)
+                })
+                .ok_or(RestartReason::ChangedDomain)?
+        };
         Ok(Self {
             endpoint,
             request_model: model.to_string(),
@@ -1544,5 +1564,35 @@ mod active_refusal_tests {
             serde_json::from_str(&serde_json::to_string(&older).unwrap()).unwrap();
         assert_eq!(imported.refusal(), Some(RestartReason::UnavailableSource));
         assert!(!imported.ready());
+    }
+}
+
+#[cfg(test)]
+mod vertex81_domain_tests {
+    use super::*;
+    #[test]
+    fn vertex81_native_domain_uses_exact_route_without_inventing_wire_model() {
+        let endpoint: http::Uri = "https://us-east5-aiplatform.googleapis.com/v1/projects/owned/locations/us-east5/publishers/anthropic/models/claude-owned@20260101:streamRawPredict".parse().unwrap();
+        let body = serde_json::json!({"anthropic_version":"vertex-2023-10-16","messages":[]});
+        let domain = NativeDomain::from_native_view(&endpoint, &body).unwrap();
+        assert_eq!(domain.request_model, "claude-owned@20260101");
+        domain.validate_saved().unwrap();
+        let mut saved = domain.clone();
+        saved.request_model = "other".into();
+        assert_eq!(saved.validate_saved(), Err(RestartReason::ChangedDomain));
+        for body in [
+            serde_json::json!({"model":"claude-owned@20260101","anthropic_version":"vertex-2023-10-16"}),
+            serde_json::json!({"anthropic_version":"wrong"}),
+            serde_json::json!({}),
+        ] {
+            assert!(NativeDomain::from_native_view(&endpoint, &body).is_err());
+        }
+        for bad in [
+            endpoint.to_string().replace("/anthropic/", "/google/"),
+            endpoint.to_string().replace("claude-owned@20260101", ".."),
+            format!("{endpoint}?private=secret"),
+        ] {
+            assert!(NativeDomain::from_native_view(&bad.parse().unwrap(), &body).is_err());
+        }
     }
 }

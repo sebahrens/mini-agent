@@ -4883,12 +4883,12 @@ mod history_tests {
         crate::extras::memory::flush_compaction_summary(&mem, summary, Some(2));
         crate::extras::memory::flush_compaction_summary(&mem, "an unrelated summary", None);
         let block = mem.context_block_excluding(Some(&reference)).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!block.contains(summary), "{block}");
         assert!(block.contains("an unrelated summary"), "{block}");
 
-        // The emergency recap was never written to memory, so nothing is
-        // excluded on its behalf.
+        // Canonical Session compaction gives every replayed recap an identity,
+        // including the emergency recap. It has no daily-log copy to exclude;
+        // the prior recap is no longer replayed and must become visible again.
         history.commit_completed_turn(
             &"v".repeat(MAX_ACP_HISTORY_BYTES),
             vec![Message::assistant("newer answer")],
@@ -4902,7 +4902,20 @@ mod history_tests {
             )
             .await
             .unwrap();
-        assert_eq!(history.active_compaction_ref(), None);
+        let emergency_reference = history
+            .active_compaction_ref()
+            .expect("emergency recap reference");
+        assert_eq!(
+            emergency_reference,
+            crate::session::compaction_ref(SessionHistory::EMERGENCY_RECAP)
+        );
+        assert_ne!(emergency_reference, reference);
+        let block = mem
+            .context_block_excluding(Some(&emergency_reference))
+            .unwrap();
+        assert!(block.contains(summary), "{block}");
+        assert!(block.contains("an unrelated summary"), "{block}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -17,6 +17,7 @@ pub struct ProviderHttpClient(std::sync::Arc<ProviderBackend>);
 struct ProviderBackend {
     client: reqwest::Client,
     identity: std::sync::Arc<()>,
+    vertex: Option<std::sync::Arc<crate::provider::vertex::VertexAuth>>,
     bedrock: Option<std::sync::Arc<crate::provider::bedrock::BedrockAuth>>,
 }
 
@@ -38,6 +39,7 @@ impl ProviderHttpClient {
             client,
             identity: std::sync::Arc::new(()),
             bedrock: None,
+            vertex: None,
         }))
     }
     pub(crate) fn with_bedrock(
@@ -48,6 +50,19 @@ impl ProviderHttpClient {
             client,
             identity: std::sync::Arc::new(()),
             bedrock: Some(auth),
+            vertex: None,
+        }))
+    }
+
+    pub(crate) fn with_vertex(
+        client: reqwest::Client,
+        auth: std::sync::Arc<crate::provider::vertex::VertexAuth>,
+    ) -> Self {
+        Self(std::sync::Arc::new(ProviderBackend {
+            client,
+            identity: std::sync::Arc::new(()),
+            bedrock: None,
+            vertex: Some(auth),
         }))
     }
 
@@ -56,6 +71,9 @@ impl ProviderHttpClient {
         mut request: Request<Bytes>,
     ) -> http_client::Result<reqwest::RequestBuilder> {
         if let Some(auth) = &self.0.bedrock {
+            auth.prepare(&mut request).await?;
+        }
+        if let Some(auth) = &self.0.vertex {
             auth.prepare(&mut request).await?;
         }
         let (parts, body) = request.into_parts();
@@ -193,7 +211,7 @@ impl HttpClientExt for ProviderHttpClient {
     where
         U: From<Bytes> + Send + 'static,
     {
-        let requires_signed_body = self.0.bedrock.is_some();
+        let requires_signed_body = self.0.bedrock.is_some() || self.0.vertex.is_some();
         let (parts, body) = request.into_parts();
         let request = self
             .0

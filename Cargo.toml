@@ -2,7 +2,7 @@
 # Root package is an implicit member; explicit "." overrides nested exclusions.
 members = []
 # The licensed SDK snapshot is a dependency, not another production target.
-exclude = ["spike", "patched-deps/rig-core"]
+exclude = ["spike", "patched-deps/rig-core", "patched-deps/google-cloud-auth"]
 resolver = "2"
 
 [workspace.metadata.dependency-policy]
@@ -164,6 +164,8 @@ aws-smithy-runtime-api = { version = "1.19.0", features = ["client", "http-1x"] 
 aws-smithy-types = "1.8.1"
 aws-types = "1.6.0"
 aws-runtime = { version = "1.10.0", default-features = false }
+google-cloud-auth = { version = "=1.17.0", path = "patched-deps/google-cloud-auth", default-features = false }
+rustls = { version = "0.23.38", default-features = false, features = ["ring"] }
 
 # Static release archives target musl. Build OpenSSL from source for those
 # targets so both full and no-default-features binaries link without host libs.

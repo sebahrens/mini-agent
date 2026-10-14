@@ -1,0 +1,120 @@
+{
+  "beads": [
+    "mini-agent-i7ro6.81.2"
+  ],
+  "integration_base": "96596f9fdd9a5ad0225172613a3a30c78337c0f9",
+  "owner_commit": "650f91a8b79e6ccdeb90377e62b4ba9dd8207dde",
+  "owner_patch_sha256": "1344b66db738b03b17f91253f23c59d7bbb5efedc9fe8cd0199d569d0cf036be",
+  "merge_evidence": {
+    "implementation_and_test_files_identical": 73,
+    "owner_files": 74,
+    "only_owner_difference": "docs/agent/CONFIG.md preserves already-delivered ACP persistence/runtime policy"
+  },
+  "review": {
+    "bead": "mini-agent-i7ro6.81.2",
+    "commit": "650f91a8b79e6ccdeb90377e62b4ba9dd8207dde",
+    "base": "a4748c6d0768771ef5c427f901ecd594c793b8f7",
+    "review": "One consolidated adversarial/reliability/testing review; identified serialization and same-origin redirect issues corrected with local controls. No unresolved source findings.",
+    "checked": [
+      "Official ADC source and refresh behavior retained; optional executable ADC rejected before cache construction, including nested impersonation sources",
+      "SDK refresh is client-lifetime-owned; whole worker races last receiver close and every token-provider future is capped at 30 seconds. Turn waiters have a separate 30-second bound; no credential response byte-cap claim",
+      "Model auth is bound to selected origin and exact project/location/Claude publisher paths before ADC acquisition; Vertex redirects disabled; competing custom auth/quota headers stripped",
+      "Typed SDK final rawPredict and streamRawPredict URL/body composition is the same view used by native capture, with no HTTP JSON rewrite or invented wire model",
+      "Vertex fixed model/version overrides fail before HTTP; ordinary Anthropic blocking serialization remains byte-for-byte on its existing owner",
+      "Native saved schema and publication authority unchanged; actual absent Vertex body model derives only from exact validated route plus version",
+      "Both official SDK trees remain dependencies outside workspace membership; only three Google source files differ from official source, preserved license and explicit attribution",
+      "Actual ADC refresh, quota preservation, held-fetch cancellation, controlled deadline, token mode, tools/SSE/usage, blocking call and redirected-project rejection verified using owned local fixtures",
+      "Installed 1 MiB-stack real PTY used actual official ADC grant once, three exact rawPredict POSTs, two healthy native saves, signature replay once, unchanged system/tools, read once, usage30/6 and normal quit0"
+    ],
+    "test_map": {
+      "indexed_owners": "/private/tmp/mini-agent-vertex81-final-indexed-map.json",
+      "logs": [
+        "/private/tmp/mini-agent-vertex81-final-owning.log",
+        "/private/tmp/mini-agent-vertex81-affected.log",
+        "/private/tmp/mini-agent-vertex81-review-fix.log"
+      ],
+      "distinct_relevant_rust_tests": 124,
+      "names": "/private/tmp/mini-agent-vertex81-tests-passed.json",
+      "python_policy_boundary_tests": 11,
+      "policy": "/private/tmp/mini-agent-vertex81-policy.log",
+      "clippy": "/private/tmp/mini-agent-vertex81-final-clippy.log",
+      "install": "/private/tmp/mini-agent-vertex81-final-install.log",
+      "licenses": "/private/tmp/mini-agent-vertex81-THIRD_PARTY_LICENSES",
+      "resolved_license_packages": 418,
+      "metadata": "/private/tmp/mini-agent-vertex81-metadata.json",
+      "scope": "Changed unconditional dependency/shared HTTP/native composition justified strict all-target lint, exact owning/auth/HTTP/native/composition caller tests and installed native contract. No mini-agent cfg boundary or sandbox/process implementation changed; no extra feature row/full suite. Unchanged results reused after bounded fixes.",
+      "proof": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-vertex81-installed-r0691fqc/report.json",
+      "driver": "/private/tmp/mini-agent-vertex81-installed.py"
+    },
+    "vendor": {
+      "upstream_hashes": "/private/tmp/mini-agent-vertex81-auth-upstream-hashes.json",
+      "semantic_patch": "/private/tmp/mini-agent-vertex81-google-semantic.patch",
+      "changed_upstream_files": [
+        "src/token_cache.rs",
+        "src/credentials.rs",
+        "src/lib.rs"
+      ],
+      "source_package_checksum": "ac9870b8ea484519aa8601e14886f2efc148ea490034e43d04bef1d246170cc9"
+    },
+    "limits": [
+      "Vertex Claude only; no translation of other Vertex model families",
+      "Explicit GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION and exact Vertex model ID required",
+      "Executable ADC credential sources deliberately unsupported; standard ADC sources and supplied access tokens supported",
+      "Credential HTTP uses upstream SDK response collection; no byte-cap claim",
+      "No cloud/paid calls or account/token changes; local owned fake credentials and endpoints only",
+      "Copilot81.4 remains open, Azure81.3 and Bedrock81.1 exported separately"
+    ],
+    "primary_sources": [
+      "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude",
+      "https://docs.rs/google-cloud-auth/1.17.0/google_cloud_auth/credentials/struct.Builder.html"
+    ]
+  },
+  "validation": {
+    "reused": "Owner 124 distinct affected Rust tests, 11 Python policy controls, strict all-target lint, 418 license packages; no new mini-agent cfg or sandbox/process implementation changes",
+    "merged_bin_tests": {
+      "passed": 13,
+      "failed": 0,
+      "duration_seconds": 8.17,
+      "scope": "vertex81 owners, exact ACP memory CI repair, two current process-inventory source readers",
+      "log": "/private/tmp/mini-agent-vertex81-merged-tests.log"
+    },
+    "debug_install": {
+      "command": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-vertex81-merged-install",
+      "seconds": 45.13,
+      "log": "/private/tmp/mini-agent-vertex81-merged-install.log"
+    },
+    "installed_vertex": {
+      "binary": "/private/tmp/mini-agent-vertex81-merged-install/bin/mini-agent",
+      "binary_sha256": "555a96fecec4d33eb1c0979711e75dcea5b568d19f5e0542cb6e4c784efa31bf",
+      "stack_bytes": 1048576,
+      "external_calls": 0,
+      "passed": true,
+      "posts": 3,
+      "adc_token_fetches": 1,
+      "healthy_saves": 2,
+      "usage": [
+        30,
+        6
+      ],
+      "normal_quit": 0,
+      "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-vertex81-installed-ze7g47it/home/sessions/d17f32ee-b97a-47c2-bc6c-b33d0bebc402.json",
+      "errors": []
+    },
+    "installed_acp_native": {
+      "passed": true,
+      "seconds": 0.75,
+      "log": "/private/tmp/mini-agent-vertex81-merged-acp-native.log",
+      "scope": "Existing compiled exact stdio fixture invoked hash-identical installed production binary; real permitted Read, canonical/signed replay and restart/load. Install/target SHA checked before and after. No recompilation."
+    }
+  },
+  "ci_repair": {
+    "failed_run": 38654816622,
+    "failed_job": 116162017732,
+    "test": "extras::acp::history_tests::acp_memory_block_excludes_the_recap_history_replays",
+    "cause": "Stale pre-canonical expectation that an emergency recap had no identity",
+    "change": "Test-only exact emergency hash and distinct prior hash assertions; both real memory summaries must remain visible when excluding the unflushed emergency recap. Production unchanged.",
+    "patch_sha256": "4aef3514076f4c314de5cbbab41a05de01176e09c9b9186a9e12799eb0e998e5",
+    "log": "/private/tmp/mini-agent-965-parallel-smoke.log"
+  },
+  "status": "Root scoped source/installed acceptance passed; fresh aggregate CI required after push"
+}

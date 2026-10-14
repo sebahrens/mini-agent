@@ -163,6 +163,7 @@ impl DoctorReport {
                     Ok(CredentialSource::AwsDefaultChain) => {
                         "AWS SDK credential chain (resolved on request; values omitted)".into()
                     }
+                    Ok(CredentialSource::GoogleAdc) => "Google Application Default Credentials (resolved on request; values omitted)".into(),
                     Err(_) => "missing; configure this route's credentials".into(),
                 }
             }

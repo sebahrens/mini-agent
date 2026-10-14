@@ -50,6 +50,18 @@ class DependencyPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(policy.PolicyError, "pinned maintained SDK path"):
                     policy.validate_patched_sdk_workspace(altered)
 
+    def test_google_adc_patch_and_dependency_only_membership_are_required(self) -> None:
+        cargo = policy.load_toml(REPOSITORY_ROOT / "Cargo.toml")
+        for field, value in (("version", "1"), ("path", "registry"), ("default-features", True)):
+            altered = copy.deepcopy(cargo)
+            altered["dependencies"]["google-cloud-auth"][field] = value
+            with self.assertRaisesRegex(policy.PolicyError, "Google ADC"):
+                policy.validate_patched_sdk_workspace(altered)
+        altered = copy.deepcopy(cargo)
+        altered["workspace"]["exclude"].remove("patched-deps/google-cloud-auth")
+        with self.assertRaisesRegex(policy.PolicyError, "outside workspace membership"):
+            policy.validate_patched_sdk_workspace(altered)
+
     def test_fake_denied_license_fails(self) -> None:
         self.assertTrue(
             policy.dependency_is_denied(

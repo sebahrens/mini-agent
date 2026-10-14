@@ -272,3 +272,23 @@ after the complete correlated tool batch. Original text results and IDs remain
 in place; ambiguous/incomplete image batches fail before HTTP. Anthropic's native
 image tool-result conversion is unchanged. Host canonical image validation,
 permission and native capture limits remain outside this adapter.
+
+## Vertex Claude native rawPredict (mini-agent-i7ro6.81.2)
+
+`anthropic::client::{AnthropicExt, VertexRoute}` carries an optional fixed
+project/location route. Existing Anthropic-compatible extensions keep the
+original Messages mode. The typed completion and streaming composers share
+safe route construction, move the fixed model to rawPredict/streamRawPredict,
+set `anthropic_version` to `vertex-2023-10-16`, and omit the body's model.
+Model/version overrides fail before transport. `replay_request_body` and
+`replay_endpoint` expose the same final composition used by actual streaming
+HTTP, rather than a body transformed later by an authentication adapter.
+The response decoder, canonical native block ordering, hooks, cancellation and
+accounting retain their existing owners. This routing structure grants no
+credential or imported publication authority.
+
+Local application controls in `src/provider_vertex_tests.rs` exercise ADC and
+supplied bearer wire requests, actual tools/SSE/usage, fixed-route override
+rejection and destination isolation. Native domain tests retain the existing
+saved schema while deriving Vertex's absent body model from its exact path.
+Official contract: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude

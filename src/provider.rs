@@ -25,6 +25,8 @@ pub(crate) mod azure;
 pub(crate) mod bedrock;
 #[path = "provider_effort.rs"]
 pub(crate) mod effort;
+#[path = "provider_vertex.rs"]
+pub(crate) mod vertex;
 
 #[cfg(test)]
 #[path = "provider_effort_tests.rs"]
@@ -133,7 +135,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, azure, bedrock, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
+            "Unknown provider: '{}'. Supported: openrouter, openai, azure, bedrock, vertex, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
             name
         )
     })?;
@@ -4388,10 +4390,31 @@ pub(crate) fn build_http_client(
     custom: Option<&CustomProviderConfig>,
     base_url: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
+    build_http_client_with_route_policy(
+        provider_name,
+        danger_accept_invalid_certs,
+        custom,
+        base_url,
+        false,
+    )
+}
+
+fn build_http_client_with_route_policy(
+    provider_name: &str,
+    danger_accept_invalid_certs: bool,
+    custom: Option<&CustomProviderConfig>,
+    base_url: Option<&str>,
+    fixed_route: bool,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(resolve_connect_timeout(custom))
         .read_timeout(resolve_stream_idle_timeout(custom))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            // Vertex credentials bind an exact publisher/project/location path;
+            // following even a same-origin redirect would bypass that owner.
+            if fixed_route {
+                return attempt.stop();
+            }
             // Gateway credentials can live in arbitrary custom headers, which
             // reqwest's fixed sensitive-header list does not remove on redirect.
             if attempt
@@ -4552,6 +4575,11 @@ where
 {
     let config = resolve_provider_config(provider_name, custom_providers)?;
     let base_url = resolve_base_url_with_env(&config, &get_env);
+    let vertex_route = if config.kind == ProviderKind::Vertex {
+        Some(vertex::route(&get_env)?)
+    } else {
+        None
+    };
     let bedrock_region = if config.kind == ProviderKind::Bedrock {
         Some(bedrock::region(&get_env)?)
     } else {
@@ -4561,6 +4589,11 @@ where
         Some(bedrock::endpoint(
             base_url.as_deref(),
             bedrock_region.as_deref().expect("Bedrock region validated"),
+        )?)
+    } else if config.kind == ProviderKind::Vertex {
+        Some(vertex::endpoint(
+            base_url.as_deref(),
+            vertex_route.as_ref().expect("Vertex route validated"),
         )?)
     } else if config.kind == ProviderKind::Azure {
         Some(azure::normalize_endpoint(base_url.as_deref())?)
@@ -4584,16 +4617,22 @@ where
     // not be merged back into the native SDK's bearer-only request headers.
     let bearer_custom = custom
         .filter(|_| {
-            matches!(config.kind, ProviderKind::Azure | ProviderKind::Bedrock)
-                || matches!(&credential, ResolvedCredential::Bearer(_))
+            matches!(
+                config.kind,
+                ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex
+            ) || matches!(&credential, ResolvedCredential::Bearer(_))
         })
         .map(|custom| {
             let mut custom = custom.clone();
             custom.headers.retain(|name, _| {
-                if matches!(config.kind, ProviderKind::Azure | ProviderKind::Bedrock) {
+                if matches!(
+                    config.kind,
+                    ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex
+                ) {
                     !matches!(
                         name.to_ascii_lowercase().as_str(),
                         "authorization"
+                            | "x-goog-user-project"
                             | "api-key"
                             | "x-api-key"
                             | "x-amz-security-token"
@@ -4608,13 +4647,20 @@ where
             custom
         });
     let http_custom = bearer_custom.as_ref().or(custom);
-    let http_client = build_http_client(
+    let http_client = build_http_client_with_route_policy(
         provider_name,
         config.danger_accept_invalid_certs,
         http_custom,
         base_url.as_deref(),
+        config.kind == ProviderKind::Vertex,
     )?;
     match config.kind {
+        ProviderKind::Vertex => vertex::build_client(
+            credential,
+            base_url.as_deref().expect("Vertex endpoint validated"),
+            vertex_route.expect("Vertex route validated"),
+            http_client,
+        ),
         ProviderKind::Bedrock => bedrock::build_client(
             credential,
             base_url.as_deref().expect("Bedrock endpoint validated"),
@@ -4690,7 +4736,7 @@ impl rig::client::ProviderBuilder for AnthropicBearerBuilder {
     where
         H: rig::http_client::HttpClientExt,
     {
-        Ok(anthropic::client::AnthropicExt)
+        Ok(anthropic::client::AnthropicExt::default())
     }
     fn finish<H>(
         &self,
@@ -4712,8 +4758,8 @@ fn build_anthropic_client(
     http: reqwest::Client,
 ) -> anyhow::Result<AnyClient> {
     match credential {
-        ResolvedCredential::AwsDefaultChain => {
-            anyhow::bail!("Anthropic cannot use AWS credentials")
+        ResolvedCredential::AwsDefaultChain | ResolvedCredential::GoogleAdc => {
+            anyhow::bail!("Anthropic cannot use cloud credential chains")
         }
         ResolvedCredential::ApiKey(key) => {
             build_provider_client!(anthropic::Client, Anthropic, key, base_url, http)

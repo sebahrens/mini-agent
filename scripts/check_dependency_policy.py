@@ -170,6 +170,19 @@ def validate_patched_sdk_workspace(cargo: dict[str, Any]) -> None:
     )
 
 
+    google_path = "patched-deps/google-cloud-auth"
+    google = cargo.get("dependencies", {}).get("google-cloud-auth", {})
+    require(
+        google.get("version") == "=1.17.0" and google.get("path") == google_path
+        and google.get("default-features") is False,
+        "Google ADC must use its pinned maintained SDK path without optional default features",
+    )
+    require(
+        google_path in workspace.get("exclude", []),
+        "patched Google ADC must remain outside workspace membership",
+    )
+
+
 def validate_policy(root: Path, *, today: dt.date | None = None) -> None:
     today = today or dt.date.today()
     cargo = load_toml(root / "Cargo.toml")

@@ -161,6 +161,7 @@ fn builtin_provider_names() -> &'static [&'static str] {
         "openai",
         "azure",
         "bedrock",
+        "vertex",
         "anthropic",
         "gemini",
         "ollama",
@@ -173,6 +174,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "azure" => "AZURE_OPENAI_API_KEY",
         "bedrock" => "AWS_BEARER_TOKEN_BEDROCK",
+        "vertex" => "VERTEX_ACCESS_TOKEN",
         "anthropic" => "ANTHROPIC_API_KEY",
         "gemini" => "GEMINI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
@@ -397,6 +399,7 @@ fn render_manage_providers(ctx: &Ctx, selected: usize, confirm_delete: bool) -> 
             let key_str = match provider_credential_source(&ctx.cfg, name) {
                 Some(crate::auth::CredentialSource::NotRequired) => "key: not required",
                 Some(crate::auth::CredentialSource::AwsDefaultChain) => "auth: AWS SDK chain",
+                Some(crate::auth::CredentialSource::GoogleAdc) => "auth: Google ADC",
                 Some(_) => "key: set",
                 None => "key: not set",
             };

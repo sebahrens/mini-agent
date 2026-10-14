@@ -308,14 +308,50 @@ where
                 CompletionError::RequestError("`max_tokens` must be set for Anthropic".into())
             })?;
         self.prepare_deferred_request(&mut completion_request)?;
-        create_streaming_request_body(
+        let mut body = create_streaming_request_body(
             request_model,
             completion_request,
             max_tokens,
             self.prompt_caching,
             self.automatic_caching,
             self.automatic_caching_ttl.clone(),
-        )
+        )?;
+        self.apply_vertex_body(&mut body)?;
+        Ok(body)
+    }
+
+    pub(crate) fn apply_vertex_body(&self, body: &mut Value) -> Result<(), CompletionError> {
+        if self.client.ext().vertex_route().is_some() {
+            if body.get("model").and_then(Value::as_str) != Some(self.model.as_str()) {
+                return Err(CompletionError::RequestError(
+                    "Vertex request cannot override its fixed route model".into(),
+                ));
+            }
+            let body = body.as_object_mut().ok_or_else(|| {
+                CompletionError::RequestError("invalid Vertex request body".into())
+            })?;
+            if body
+                .get("anthropic_version")
+                .is_some_and(|v| v != "vertex-2023-10-16")
+            {
+                return Err(CompletionError::RequestError(
+                    "Vertex request cannot override anthropic_version".into(),
+                ));
+            }
+            body.remove("model");
+            body.insert(
+                "anthropic_version".into(),
+                Value::String("vertex-2023-10-16".into()),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_request_path(&self, streaming: bool) -> Result<String, CompletionError> {
+        match self.client.ext().vertex_route() {
+            Some(route) => Ok(route.path(&self.model, streaming)?),
+            None => Ok("/v1/messages".into()),
+        }
     }
 
     /// True only when this actual model applies the SDK's manual marker
@@ -329,7 +365,7 @@ where
     /// must first reject credential-bearing URI forms.
     pub fn replay_endpoint(&self) -> Result<http::Uri, CompletionError> {
         self.client
-            .post("/v1/messages")?
+            .post(&self.native_request_path(true)?)?
             .uri_ref()
             .cloned()
             .ok_or_else(|| CompletionError::RequestError("invalid native request endpoint".into()))
@@ -378,7 +414,7 @@ where
 
         let req = self
             .client
-            .post("/v1/messages")?
+            .post(&self.native_request_path(true)?)?
             .body(body)
             .map_err(http_client::Error::Protocol)?;
 

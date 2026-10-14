@@ -55,12 +55,12 @@ impl ApiKey for AzureAuth {
                     (HeaderName::from_static("api-key"), value)
                 })
                 .map_err(Into::into),
-            ResolvedCredential::AwsDefaultChain => Err(rig::http_client::Error::Instance(
-                Box::new(std::io::Error::new(
+            ResolvedCredential::AwsDefaultChain | ResolvedCredential::GoogleAdc => Err(
+                rig::http_client::Error::Instance(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Azure cannot use AWS credentials",
-                )),
-            )),
+                    "Azure cannot use cloud credential chains",
+                ))),
+            ),
             ResolvedCredential::Bearer(token) => {
                 rig::http_client::make_auth_header(token).map(|(name, mut value)| {
                     value.set_sensitive(true);

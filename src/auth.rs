@@ -8,6 +8,7 @@ pub enum ProviderKind {
     OpenAI,
     Azure,
     Bedrock,
+    Vertex,
     Anthropic,
     Gemini,
     Ollama,
@@ -20,6 +21,7 @@ impl ProviderKind {
             "openai" | "custom" => Some(Self::OpenAI), // "custom" is an alias for OpenAI client
             "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
             "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
+            "vertex" | "vertex-ai" => Some(Self::Vertex),
             "anthropic" => Some(Self::Anthropic),
             "gemini" | "google" => Some(Self::Gemini),
             "ollama" => Some(Self::Ollama),
@@ -104,6 +106,7 @@ pub enum ResolvedCredential {
     ApiKey(String),
     Bearer(String),
     AwsDefaultChain,
+    GoogleAdc,
 }
 
 /// The selected credential's origin, containing no credential bytes.
@@ -114,13 +117,14 @@ pub enum CredentialSource {
     Config(String),
     NotRequired,
     AwsDefaultChain,
+    GoogleAdc,
 }
 
 impl ResolvedCredential {
     pub fn secret(&self) -> &str {
         match self {
             Self::ApiKey(value) | Self::Bearer(value) => value,
-            Self::AwsDefaultChain => "",
+            Self::AwsDefaultChain | Self::GoogleAdc => "",
         }
     }
 }
@@ -131,6 +135,7 @@ impl std::fmt::Debug for ResolvedCredential {
             Self::ApiKey(_) => "ApiKey([REDACTED])",
             Self::Bearer(_) => "Bearer([REDACTED])",
             Self::AwsDefaultChain => "AwsDefaultChain",
+            Self::GoogleAdc => "GoogleAdc",
         })
     }
 }
@@ -253,10 +258,7 @@ impl AuthResolver {
                     .as_deref()
                     .unwrap_or_else(|| self.env_var_name())
             );
-            return Ok((
-                ResolvedCredential::ApiKey(key.clone()),
-                CredentialSource::Cli,
-            ));
+            return Ok((self.explicit_credential(key.clone()), CredentialSource::Cli));
         }
 
         // Priority 2: Environment variable. Custom providers only ever read
@@ -271,7 +273,7 @@ impl AuthResolver {
             && !key.is_empty()
         {
             return Ok((
-                ResolvedCredential::ApiKey(key),
+                self.explicit_credential(key),
                 CredentialSource::Environment(env_var.into()),
             ));
         }
@@ -310,7 +312,7 @@ impl AuthResolver {
                         && let Some(key) = lookup(name)
                     {
                         return Ok((
-                            ResolvedCredential::ApiKey(key),
+                            self.explicit_credential(key),
                             CredentialSource::Config(name.into()),
                         ));
                     }
@@ -318,7 +320,7 @@ impl AuthResolver {
                 None => {
                     if let Some(key) = lookup(self.provider_slug()) {
                         return Ok((
-                            ResolvedCredential::ApiKey(key),
+                            self.explicit_credential(key),
                             CredentialSource::Config(self.provider_slug().into()),
                         ));
                     }
@@ -326,7 +328,7 @@ impl AuthResolver {
                         && let Some(key) = lookup(name)
                     {
                         return Ok((
-                            ResolvedCredential::ApiKey(key),
+                            self.explicit_credential(key),
                             CredentialSource::Config(name.into()),
                         ));
                     }
@@ -344,6 +346,13 @@ impl AuthResolver {
                 ResolvedCredential::AwsDefaultChain,
                 CredentialSource::AwsDefaultChain,
             ));
+        }
+
+        if self.provider_kind == ProviderKind::Vertex
+            && custom.is_none()
+            && self.api_key_env_override.is_none()
+        {
+            return Ok((ResolvedCredential::GoogleAdc, CredentialSource::GoogleAdc));
         }
 
         // Ollama doesn't require an API key
@@ -376,6 +385,14 @@ impl AuthResolver {
         }
     }
 
+    fn explicit_credential(&self, value: String) -> ResolvedCredential {
+        if self.provider_kind == ProviderKind::Vertex {
+            ResolvedCredential::Bearer(value)
+        } else {
+            ResolvedCredential::ApiKey(value)
+        }
+    }
+
     fn env_var_name(&self) -> &'static str {
         self.provider_kind.env_var_name()
     }
@@ -398,6 +415,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "OPENAI_API_KEY",
             ProviderKind::Azure => "AZURE_OPENAI_API_KEY",
             ProviderKind::Bedrock => "AWS_BEARER_TOKEN_BEDROCK",
+            ProviderKind::Vertex => "VERTEX_ACCESS_TOKEN",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::Ollama => "OLLAMA_API_KEY",
@@ -413,7 +431,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "https://api.openai.com/v1",
             // Azure has no shared tenant endpoint. Explicit custom routes
             // cannot receive a vendor-key exemption by matching an example.
-            ProviderKind::Azure | ProviderKind::Bedrock => "",
+            ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex => "",
             ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
             ProviderKind::Ollama => "http://localhost:11434",
@@ -440,6 +458,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "openai",
             ProviderKind::Azure => "azure",
             ProviderKind::Bedrock => "bedrock",
+            ProviderKind::Vertex => "vertex",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",

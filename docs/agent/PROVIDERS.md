@@ -1,10 +1,10 @@
 ---
-description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, AWS Bedrock, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
+description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, AWS Bedrock, Vertex AI Claude, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
 ---
 
 # Providers
 
-mini-agent supports seven built-in providers and allows custom provider
+mini-agent supports eight built-in providers and allows custom provider
 definitions for OpenAI-compatible endpoints.
 
 ## Built-in Providers
@@ -15,6 +15,7 @@ definitions for OpenAI-compatible endpoints.
 | OpenAI     | `openai`            | `OPENAI_API_KEY`            |
 | Azure OpenAI | `azure` / `azure-openai` | `AZURE_OPENAI_API_KEY` |
 | AWS Bedrock (Claude) | `bedrock` / `aws-bedrock` | AWS SDK chain or `AWS_BEARER_TOKEN_BEDROCK` |
+| Vertex AI (Claude) | `vertex` / `vertex-ai` | Google ADC or `VERTEX_ACCESS_TOKEN` |
 | Anthropic  | `anthropic`         | `ANTHROPIC_API_KEY`         |
 | Gemini     | `gemini` / `google` | `GEMINI_API_KEY`            |
 | Ollama     | `ollama`            | (no key required)           |
@@ -392,3 +393,65 @@ OpenRouter models keep their provider-native caching behavior.
 | `--max-tokens`      | —             | Maximum response tokens             |
 | `--temperature`     | —             | Model temperature (0.0–2.0)         |
 | `--max-agent-turns` | —             | Maximum agent turns per response    |
+
+## Vertex AI Claude
+
+Select `provider = "vertex"` (alias `vertex-ai`) and configure the exact Claude
+Vertex model ID, including its version suffix when required. Set
+`GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`; `global` uses
+`aiplatform.googleapis.com`, and regional locations use
+`LOCATION-aiplatform.googleapis.com`. There is no assumed deployment/model default.
+
+```toml
+provider = "vertex"
+model = "claude-sonnet-4-5@20250929"
+```
+
+Without an explicit token, the official Google Cloud Auth SDK uses Application
+Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the platform's standard
+well-known gcloud ADC file, then metadata credentials. Standard user refresh,
+service-account, impersonation and workload identity credential sources remain
+SDK-owned. Configure identities with your normal Google tooling; mini-agent does
+not log in or modify an account. Alternatively supply an existing access token
+through `VERTEX_ACCESS_TOKEN`, `--api-key`, or `api_keys.vertex`. Those declared
+sources always mean a bearer token; no secret-prefix inference is used. CLI,
+environment and config precedence follows the other providers. Anthropic and
+Gemini keys are never borrowed.
+
+The native SDK sends Claude Messages to
+`/v1/projects/PROJECT/locations/LOCATION/publishers/anthropic/models/MODEL:streamRawPredict`
+(or `:rawPredict` for blocking calls). Its typed composer sets
+`anthropic_version = "vertex-2023-10-16"` and omits the body `model` field. The
+native capture observes that exact composed body and URL, preserving thinking,
+tool identity/order, system/tools, cache accounting and canonical replay. A
+per-request override cannot change the fixed route model or Vertex version.
+This kind supports Claude, rather than translating other Vertex model families.
+
+Custom Vertex routes accept an origin-only `base_url`, use the same project and
+location environment variables, and require their own token unless
+`inherit_builtin_key = true` explicitly grants ADC/built-in token access. Model
+auth is bound to the selected origin and exact publisher/project/location path;
+redirects are disabled, and competing custom authorization and quota-project headers are removed. SDK quota
+project headers are preserved for ADC credentials. Auth HTTP is independent of
+model endpoint headers and TLS exceptions.
+
+Refresh belongs to the credential client's lifetime. Cancelling a model turn
+cancels its credential waiter; cached refresh work remains available to other
+turns using that client. The pinned SDK amendment cancels a held refresh/sleep
+when the last client drops and caps every token-provider fetch at 30 seconds.
+The owning request also bounds its waiter to 30 seconds. Credential response
+bytes use the upstream SDK behavior; no byte-cap guarantee is claimed.
+Executable ADC credential sources, including nested impersonation sources, are
+explicitly unsupported and rejected before refresh construction. Use a standard
+non-executable ADC source or supply an existing access token.
+
+`src/provider_vertex.rs` owns route/auth selection; the typed rawPredict composer
+is a bounded amendment in the maintained Rig SDK. Official Google Cloud Auth
+1.17.0 is pinned in `patched-deps/google-cloud-auth` with source/license attribution
+and the lifetime amendment described in its `UPSTREAM.md`. Both SDK trees must be
+included in Corresponding Source and third-party license inventory.
+
+Google's [Claude request contract](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude)
+documents the publisher route and Vertex body version. The official
+[ADC builder](https://docs.rs/google-cloud-auth/1.17.0/google_cloud_auth/credentials/struct.Builder.html)
+documents source selection and scopes.
