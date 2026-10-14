@@ -1650,7 +1650,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/mcp_admin_app_tests.rs",
-        "let (status, body) = if redirect.is_some() { (\"307 Temporary Redirect\", String::new()) }",
+        "let (status, body) = if anthropic_request {",
         1,
         "NON-PROCESS",
     ),
@@ -2891,7 +2891,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/ui/mcp_admin_app_tests.rs",
         &[(
-            "28fe326e751f2fcbbd8a13e23e1a733ced05adfdbb3e4f370663a0425a9afcfc",
+            "523c9c17d8bf92e6dfeeb73177d8ef9fd174d1406a081b1418ef1c825ff40a13",
             1,
         )],
     ),

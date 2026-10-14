@@ -764,6 +764,14 @@ retirement after both a waiting and an already-exited leader. The existing Windo
 GH lane discovers exactly two prototype tests before running all five ordinary permission
 and foreground-result acceptance cases.
 
+The prototype retains the actual helper process handle after checking its Job
+membership. Retirement requires both zero Job accounting and the descendant
+handle's termination signal within the same five-second boundary. Job termination
+initiates asynchronous process shutdown; zero accounting alone cannot replace
+the retained process witness. Assertion unwinding retains those same capabilities
+through bounded cleanup. This corrected prototype still requires hosted native
+execution; it does not relax the ordinary Shell cancellation assertion.
+
 This module is an experiment for mini-agent-i7ro6.108. Production disabled Shell does not
 yet use it; the observed descendant-settlement gap remains open. A successful prototype
 does not prove production integration or atomic recovery from a parent crash between

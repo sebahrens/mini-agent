@@ -706,7 +706,14 @@ where
     // tool-end / model-visible output for the same reason.) The hook still
     // observes the tool's actual output via `result` and the structured
     // classification via `outcome` / `extensions`.
-    match flow_into_tool_result(
+    let mut references = (!synthetic && matches!(exec.outcome, ToolOutcome::Success))
+        .then(|| {
+            exec.extensions
+                .get::<crate::tool::ToolReferences>()
+                .cloned()
+        })
+        .flatten();
+    let mut outcome = match flow_into_tool_result(
         hooks
             .on_event(
                 ctx,
@@ -735,6 +742,9 @@ where
             ))
         }
         ToolResultDecision::Replace(replacement) => {
+            // A result rewrite controls ALL model-visible content. Metadata is
+            // observable by hooks, but cannot bypass a redaction with refs.
+            references = None;
             // The hook replaced the model-visible result. Record the outcome and
             // the replacement (the raw output was never recorded on the span
             // before the hook ran) and log only that a rewrite happened — never
@@ -786,7 +796,24 @@ where
             };
             Ok(ToolCallOutcome { content, execution })
         }
+    }?;
+    if let Some(references) = references
+        && let UserContent::ToolResult(result) = &mut outcome.content
+    {
+        let mut content: Vec<_> = result.content.iter().cloned().collect();
+        for name in references.names() {
+            content.push(crate::message::ToolResultContent::Text(
+                crate::message::Text {
+                    text: String::new(),
+                    additional_params: Some(serde_json::json!({
+                        crate::tool::NATIVE_TOOL_REFERENCE_KEY: name,
+                    })),
+                },
+            ));
+        }
+        result.content = crate::OneOrMany::many(content).expect("tool result remains nonempty");
     }
+    Ok(outcome)
 }
 
 /// Record the structured tool [`ToolOutcome`] onto the `execute_tool` span. Kept

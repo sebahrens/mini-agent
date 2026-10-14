@@ -3,6 +3,61 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Whether this server's schemas enter the initial model request. Discovery
+/// changes advertisement only; it never grants permission to call a tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum McpDefer {
+    Eager,
+    Deferred,
+    #[default]
+    Auto,
+}
+
+impl McpDefer {
+    pub(crate) const AUTO_THRESHOLD: usize = 32;
+
+    pub(crate) const fn is_auto(value: &Self) -> bool {
+        matches!(value, Self::Auto)
+    }
+
+    pub(crate) const fn resolves_deferred(self, total_tools: usize) -> bool {
+        match self {
+            Self::Eager => false,
+            Self::Deferred => true,
+            Self::Auto => total_tools > Self::AUTO_THRESHOLD,
+        }
+    }
+}
+
+impl Serialize for McpDefer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Eager => serializer.serialize_bool(false),
+            Self::Deferred => serializer.serialize_bool(true),
+            Self::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for McpDefer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Boolean(bool),
+            Text(String),
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Boolean(false) => Ok(Self::Eager),
+            Wire::Boolean(true) => Ok(Self::Deferred),
+            Wire::Text(value) if value == "auto" => Ok(Self::Auto),
+            _ => Err(serde::de::Error::custom(
+                "MCP defer must be true, false or auto",
+            )),
+        }
+    }
+}
+
 /// Immutable identity for an MCP server registered by zerostack itself.
 ///
 /// Its value is opaque outside this module, its constructors are crate-private,
@@ -54,6 +109,8 @@ impl TrustedMcpServer {
 pub enum McpServerConfig {
     Command {
         command: String,
+        #[serde(default, skip_serializing_if = "McpDefer::is_auto")]
+        defer: McpDefer,
         #[serde(default)]
         args: Vec<String>,
         /// Working directory for the service. When omitted, the connection
@@ -78,6 +135,8 @@ pub enum McpServerConfig {
     },
     Url {
         url: String,
+        #[serde(default, skip_serializing_if = "McpDefer::is_auto")]
+        defer: McpDefer,
         /// Explicitly permit only pinned loopback endpoints, never private LANs.
         #[serde(default, skip_serializing_if = "is_false")]
         allow_local: bool,
@@ -117,6 +176,13 @@ impl McpStdioNetwork {
 }
 
 impl McpServerConfig {
+    pub(crate) const fn defer(&self) -> McpDefer {
+        match self {
+            Self::Command { defer, .. } | Self::Url { defer, .. } => *defer,
+            Self::BuiltIn { .. } => McpDefer::Auto,
+        }
+    }
+
     pub(crate) fn built_in(identity: TrustedMcpServer, headers: HashMap<String, String>) -> Self {
         Self::BuiltIn { identity, headers }
     }

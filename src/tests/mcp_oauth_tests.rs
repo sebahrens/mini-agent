@@ -764,6 +764,7 @@ fn oauth_config_round_trips_through_serde() {
     let cfg = McpServerConfig::Url {
         allow_local: false,
         url: "https://example.com/mcp".to_string(),
+        defer: Default::default(),
         headers: Default::default(),
         oauth: Some(OAuthConfig::Enabled(true)),
     };

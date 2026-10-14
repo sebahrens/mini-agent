@@ -1,6 +1,7 @@
 mod bounded_http;
 pub mod client;
 pub mod config;
+pub(crate) mod deferred;
 mod egress;
 pub(crate) mod health;
 pub mod oauth;
@@ -77,6 +78,7 @@ pub struct McpClientManager {
     /// Exact count from the last captured effective catalogue, independent of
     /// retained live handles and bounded diagnostic origin rows.
     configured_count: Option<usize>,
+    deferred_view: Mutex<std::sync::Weak<deferred::DiscoveryView>>,
 }
 
 impl McpClientManager {
@@ -98,7 +100,22 @@ impl McpClientManager {
             origins: Default::default(),
             origins_omitted: false,
             configured_count: None,
+            deferred_view: Mutex::new(std::sync::Weak::new()),
         }
+    }
+
+    pub(crate) fn capture_deferred_view(&self, view: &Arc<deferred::DiscoveryView>) {
+        *self
+            .deferred_view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(view);
+    }
+    pub(crate) fn deferred_status(&self, server_name: &str) -> Option<(usize, usize)> {
+        self.deferred_view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()?
+            .server_counts(server_name)
     }
 
     pub(crate) fn health_snapshot(&self) -> health::HealthSnapshot {
@@ -371,6 +388,11 @@ impl McpClientManager {
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;
                 let source_proof = handle.source_proof.clone();
+                let liveness = Arc::downgrade(&handle.liveness);
+                let live_peer = peer.clone();
+                let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    liveness.upgrade().is_some() && !live_peer.is_transport_closed()
+                });
                 let attempt = self
                     .health
                     .begin(&server_name, health::AttemptKind::Catalogue);
@@ -383,7 +405,14 @@ impl McpClientManager {
                         Err(_) => health::AttemptOutcome::Failed,
                     };
                     attempt.finish(outcome);
-                    (server_name, trusted_identity, source_proof, peer, result)
+                    (
+                        server_name,
+                        trusted_identity,
+                        source_proof,
+                        client_is_live,
+                        peer,
+                        result,
+                    )
                 }
             })
             .collect();
@@ -391,7 +420,7 @@ impl McpClientManager {
         let results = futures::future::join_all(futs).await;
 
         let mut all_tools = Vec::new();
-        for (server_name, trusted_identity, source_proof, peer, result) in results {
+        for (server_name, trusted_identity, source_proof, client_is_live, peer, result) in results {
             match result {
                 Ok(tools) => {
                     tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
@@ -412,6 +441,7 @@ impl McpClientManager {
                             server_name: server_name.clone(),
                             trusted_identity,
                             source_proof: source_proof.clone(),
+                            client_is_live: client_is_live.clone(),
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
                             model_description,
@@ -730,6 +760,7 @@ mod tests {
     /// with a non-zero code (simulates a server that refuses to connect).
     fn failing_config() -> McpServerConfig {
         McpServerConfig::Command {
+            defer: Default::default(),
             command: if cfg!(windows) {
                 "cmd".to_string()
             } else {

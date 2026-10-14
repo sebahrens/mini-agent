@@ -507,6 +507,24 @@ async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     if parts.len() > 1 {
         let name = parts[1].trim();
         if let Some(handle) = mgr.handles.iter().find(|h| h.server_name == name) {
+            let defer = ctx
+                .cfg
+                .mcp_servers
+                .as_ref()
+                .and_then(|servers| servers.get(name))
+                .map_or(crate::extras::mcp::config::McpDefer::Auto, |server| {
+                    server.defer()
+                });
+            write_ok(ctx.renderer, format!("schema loading: {defer:?}"));
+            if let Some((deferred, enabled)) = mgr.deferred_status(name) {
+                write_ok(
+                    ctx.renderer,
+                    format!(
+                        "last active build: {deferred} deferred schemas, {enabled} enabled by search"
+                    ),
+                );
+            }
+
             match handle.list_tools().await {
                 Ok(tools) => {
                     if tools.is_empty() {

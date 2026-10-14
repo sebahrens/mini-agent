@@ -277,7 +277,7 @@ where
 {
     pub(crate) async fn stream(
         &self,
-        completion_request: CompletionRequest,
+        mut completion_request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse<StreamingCompletionResponse>, CompletionError>
     {
         let request_model = completion_request
@@ -314,6 +314,7 @@ where
             ));
         };
 
+        self.prepare_deferred_request(&mut completion_request)?;
         let body = create_streaming_request_body(
             request_model,
             completion_request,

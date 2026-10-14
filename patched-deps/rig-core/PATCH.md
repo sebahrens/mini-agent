@@ -127,3 +127,52 @@ field provides exact correlation without guessing from tool names or callback
 order. No tool execution, Flow, result, billing, or transport behavior changes.
 The application native capture fixture verifies both real canonical tool-use
 IDs, absent optional IDs, and distinct internal IDs on actual SDK calls.
+
+## Non-owning tool-server handle (mini-agent-i7ro6.59)
+
+`ToolServerHandle::downgrade` and `WeakToolServerHandle::upgrade` expose only a
+weak reference to the existing tool-server state. A registered discovery tool
+can publish an exact selected tool through an upgraded handle during its call
+without creating a server-to-tool ownership cycle. No new registry, retrieval,
+lock or dispatch policy is introduced. Existing structured dispatch clones the
+tool under a scoped read lock and releases that lock before awaiting the tool,
+so publication during a call can acquire the ordinary write lock. Application
+tests exercise bounded publication during actual structured dispatch and
+confirm the weak reference expires after the owning server is dropped.
+
+`ToolServerHandle::append_toolset_if` extends that same seam with a synchronous
+admission predicate under the existing write lock. The predicate runs after
+waiting for the lock; rejection publishes no definitions. The accepted batch
+is installed without another await or partial publication. The predicate must
+not re-enter the server. Application controls hold the real write lock during
+actual structured discovery, then cancel, drop or revoke the pending request
+and assert zero definitions and activation changes; a current request publishes
+normally. The existing prepared-request allowed-name snapshot remains unchanged
+and prevents later publication from widening an already received model response.
+
+## Native deferred tool references (mini-agent-i7ro6.59)
+
+`CompletionModel::deferred_tool_loading` defaults to generic dynamic discovery.
+Native Anthropic models use their actual requested model identifier to select
+supported immutable deferred declarations or eager fallback. A model retains
+the host-captured catalogue through `with_deferred_tools`; streaming and blocking
+request preparation exclude activated duplicate definitions, append identical
+native deferred declarations, and reject conflicting raw prefix controls before
+HTTP. This does not register executable tools or preserve unrelated mutations.
+
+A successful executed search attaches bounded `ToolReferences`. The SDK runner
+projects their names only after the result hook keeps the result, retaining its
+ordinary text and exact tool-use ID. Rewrite/terminate suppress projection.
+Reserved generic Text replay metadata bridges those typed names to native
+`tool_reference` blocks. The ordinary multimodal output parser creates only
+text/images, never this metadata. Replay references outside the captured
+catalogue fail before HTTP; no reference installs an executable or a grant.
+The other providers' search behavior remains unchanged. Existing completed
+native reasoning projection and output-config merge are preserved.
+
+The official [custom search contract](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+requires every reference's definition at top level. Application fake-wire tests
+verify fixed declarations, normal Ask allow/deny, hidden-call and invalid-query
+refusal, result redaction/termination, forged textual references, and pre-HTTP
+prefix collisions. Inert signatures are continuity witnesses, not cryptographic
+or paid-server acceptance. Full application replay/frontier work remains separate.

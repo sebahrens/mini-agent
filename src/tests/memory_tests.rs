@@ -1888,6 +1888,8 @@ fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
     let (owner, m) = memory62_fixture();
     let _env = memory62_environment(&owner);
     let mut context = crate::context::ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: owner.path().to_path_buf(),
         agents: None,
         prompts: Default::default(),

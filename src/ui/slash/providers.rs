@@ -1071,6 +1071,8 @@ mod model_pricing_tests {
             } }
         })).unwrap();
         let mut context = crate::context::ContextFiles {
+            #[cfg(feature = "mcp")]
+            mcp_discovery: Default::default(),
             workspace_root: workspace.root().to_path_buf(),
             agents: None,
             prompts: Default::default(),

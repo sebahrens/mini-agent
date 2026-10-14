@@ -49,6 +49,7 @@ pub struct McpClientHandle {
     pub trusted_identity: Option<TrustedMcpServer>,
     pub running_service: RunningService<RoleClient, ()>,
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
+    pub(crate) liveness: std::sync::Arc<()>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -468,6 +469,7 @@ impl McpClientHandle {
                     trusted_identity: config.trusted_identity(),
                     running_service,
                     source_proof: None,
+                    liveness: std::sync::Arc::new(()),
                 })
             }
             McpServerConfig::Url {
@@ -599,6 +601,7 @@ impl McpClientHandle {
             trusted_identity: None,
             running_service,
             source_proof: None,
+            liveness: std::sync::Arc::new(()),
         })
     }
 

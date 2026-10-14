@@ -100,6 +100,11 @@ revoked source cannot reuse an earlier loaded catalogue to start a server.
 Private publication initializes only a newly created, empty, single-link
 temporary file with the explicit current Windows user owner and protected DACL
 before writing bytes; existing destinations retain strict validation.
+The Windows reader compares the actual binary ACL trustees with the current
+token SID and Local System. It requires a protected DACL with exactly two
+uninherited full-file-access allow entries and rejects other trustees or rights.
+SDDL account aliases in diagnostics do not confer authority; owner, regular-file
+and single-link checks remain independent requirements.
 
 On Windows, edits to an existing configuration currently fail closed because
 the retained workspace writer does not support atomic compare-and-replace.
@@ -125,3 +130,80 @@ RPC. A changed or revoked source sends no tool call; reconnect captures the new
 approved definition. These checks confer no permission grants and do not repair
 private files. Explicit manually constructed originless clients retain their
 existing behavior.
+
+## Deferred tool schemas
+
+A server accepts `defer: true`, `defer: false`, or `defer: "auto"` (the default).
+Automatic mode defers schemas when the total accepted MCP catalogue exceeds
+32 tools. The explicit CLI tool ceiling is applied first. `false` preserves
+eager loading; `true` defers even a small catalogue. Built-in servers use
+automatic mode and retain their sealed connection identity.
+
+```json
+{"mcp_servers":{"example":{"url":"https://example.invalid/mcp","defer":"auto"}}}
+```
+
+On generic providers, the first model request receives `mcp_search` and a bounded
+JSON names index, rather than every deferred schema. `mcp_search {"query":"tool name or words"}`
+uses deterministic name/description matching over the captured catalogue. It
+returns at most eight names, descriptions and schemas, limited to 128 KiB total,
+and publishes those exact schemas for subsequent model requests. Queries are
+limited to 2 KiB and 32 words; invalid or oversized input fails explicitly. The
+names index is limited to 64 KiB and labels omitted names; search still considers
+the complete bounded catalogue. Existing 4 KiB description/16 KiB schema limits
+remain unchanged.
+
+Search changes no permissions. Enabled tools retain the original captured
+client, ordinary Ask/deny policy, hook invocation identity, cost admission,
+concurrency lane and structured result extensions. A model cannot call a hidden
+tool in the same response as its search: the SDK validates calls against the
+immutable definitions advertised for that response before executing siblings.
+The next generic request advertises the newly enabled schema. Omitting `mcp_search`
+from an explicit CLI tool ceiling keeps the admitted MCP tools eager; tools
+outside that ceiling remain unavailable. Discovery never widens the ceiling.
+
+Activation lasts across agent rebuilds within the same logical session,
+workspace binding and unchanged catalogue and search eligibility. An eager,
+empty, no-tools or search-ineligible rebuild retires earlier discovery state;
+restoring a wider CLI ceiling does not resurrect old enabled schemas. New
+sessions, imported/forked identities, changed catalogues and replaced workspaces
+start without activation.
+No activation or approval authority is serialized into a saved session.
+A retired client or revoked selected configuration is refused before ordinary
+Ask and again immediately before the actual RPC after an answer.
+
+`/mcp` reports the configured loading mode and cached deferred/enabled counts
+from the last retained discovery build without an RPC. `/mcp <server>` includes
+that loading state alongside its ordinary tool list. These observations do not
+prove current source authority or install grants. Retired build counts are
+omitted; the manager keeps only a weak diagnostic reference.
+
+Generic discovery changes a provider's tools prefix and makes no fixed tokenizer
+savings claim. For supported native Anthropic Messages models, all captured MCP
+definitions instead stay in an immutable top-level tools array with
+`defer_loading: true`. Successful search projects bounded native `tool_reference`
+blocks from typed host metadata; ordinary tool strings cannot create them.
+Deferral reduces model context, not HTTP definition payload. Older or unknown
+native model identifiers explicitly retain eager schemas and report that choice.
+The current supported native families follow the official
+[tool-search model contract](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool).
+
+Native discovery validates references against the captured catalogue, refuses
+raw model/system/messages overrides and conflicting raw tool names before HTTP,
+and preserves ordinary CLI ceilings, hooks, Ask/deny and source/cost checks.
+SDK result redaction or termination cannot force references into the next body.
+Native loopback controls compare raw tools/system bytes across actual requests,
+including unchanged manual and automatic one-hour cache markers, and complete signed
+blocks; they do not verify signatures cryptographically or claim paid-server
+acceptance. Broader saved application reasoning replay and unrelated prefix
+changes remain under `mini-agent-i7ro6.46`. The deterministic builder estimator
+measures reduction only for its controlled generic schema fixture.
+
+[`deferred.rs`](../../src/extras/mcp/deferred.rs) owns bounded runtime activation,
+matching and schema publication. Its tool-server binding is weak: a registered
+search tool cannot retain its own server after its agent retires. Publication
+uses the existing SDK tool-server write lock, with cancellation, source and
+client admission checked after acquiring it, immediately before the atomic
+batch. A cancelled lock wait or revoked candidate publishes neither schemas
+nor activation names. No separate invocation registry, paid embeddings or
+semantic retrieval service is introduced.

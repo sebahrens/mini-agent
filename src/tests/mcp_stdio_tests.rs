@@ -365,6 +365,7 @@ impl FixtureBuild {
             env.insert("MCP_FIXTURE_TOOL_NAME".to_string(), tool_name.to_string());
         }
         McpServerConfig::Command {
+            defer: Default::default(),
             command,
             args,
             cwd: None,
@@ -702,6 +703,7 @@ async fn mcp_command_transport_uses_the_explicit_workspace() {
     std::fs::create_dir_all(&workspace).unwrap();
     let config = McpServerConfig::Command {
         command: fixture.executable.display().to_string(),
+        defer: Default::default(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::from([("MCP_FIXTURE_MODE".to_string(), "normal".to_string())]),
@@ -731,6 +733,7 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
 
     let missing = McpServerConfig::Command {
         command: "mini-agent-mcp-fixture-that-does-not-exist".to_string(),
+        defer: Default::default(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),

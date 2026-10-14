@@ -235,6 +235,8 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
         "replacement-fixture": {"provider_type":"openai", "base_url":endpoint, "api_style":"completions"}
     }})).unwrap();
     let mut context = ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace.root().to_path_buf(),
         agents: None,
         prompts: Default::default(),
@@ -540,6 +542,8 @@ async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent(
     }))
     .unwrap();
     let mut context = ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace.root().to_path_buf(),
         agents: None,
         prompts: Default::default(),
@@ -643,6 +647,8 @@ async fn share_requires_confirmation_before_uploading() {
     ]);
     let cfg = Config::default();
     let mut context = ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace.root().to_path_buf(),
         agents: None,
         prompts: Default::default(),
@@ -775,6 +781,8 @@ async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
     ]);
     let cfg = Config::default();
     let mut context = ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace.root().to_path_buf(),
         agents: None,
         prompts: Default::default(),
@@ -929,6 +937,8 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
     ]);
     let cfg = Config::default();
     let mut context = ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace.root().to_path_buf(),
         agents: None,
         prompts: Default::default(),

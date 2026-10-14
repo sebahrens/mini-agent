@@ -17,19 +17,31 @@ fn private_file_error() -> std::io::Error {
 }
 
 #[cfg(any(windows, test))]
-fn closed_private_dacl(sddl: &str, owner_sid: &str) -> bool {
-    let Some(body) = sddl.strip_prefix("D:") else {
-        return false;
-    };
-    let Some((flags, aces)) = body.split_once('(') else {
-        return false;
-    };
-    if !matches!(flags, "P" | "PAI" | "PAR" | "PAIAR" | "PARAI") {
-        return false;
-    }
-    let user = format!("A;;FA;;;{owner_sid})");
-    let system = "A;;FA;;;SY)";
-    aces == format!("{user}({system}") || aces == format!("{system}({user}")
+#[derive(Clone, Copy)]
+struct PrivateAce {
+    kind: u8,
+    flags: u8,
+    mask: u32,
+    current_user: bool,
+    system: bool,
+}
+
+/// The closed policy is structural. Trustee spellings in SDDL are not identity:
+/// Windows can render the current user's numeric SID using an account alias.
+#[cfg(any(windows, test))]
+fn closed_private_acl(protected: bool, aces: &[PrivateAce]) -> bool {
+    const ACCESS_ALLOWED: u8 = 0;
+    const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+    protected
+        && aces.len() == 2
+        && aces.iter().all(|ace| {
+            ace.kind == ACCESS_ALLOWED
+                && ace.flags == 0
+                && ace.mask == FILE_ALL_ACCESS
+                && (ace.current_user || ace.system)
+        })
+        && aces.iter().any(|ace| ace.current_user)
+        && aces.iter().any(|ace| ace.system)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -559,6 +571,7 @@ mod windows {
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> Bool;
+        #[cfg(test)]
         fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
             security_descriptor: *mut c_void,
             string_sd_revision: Dword,
@@ -1165,44 +1178,75 @@ mod windows {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
         let _descriptor = LocalAllocation(descriptor);
-        let mut sddl = null_mut();
-        let mut length = 0;
-        if unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut sddl,
-                &mut length,
-            )
-        } == 0
+        validate_private_dacl(descriptor)
+    }
+
+    fn validate_private_dacl(descriptor: *mut c_void) -> std::io::Result<()> {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, GetAce, GetSecurityDescriptorControl, IsValidAcl, IsValidSid,
+            IsWellKnownSid, SE_DACL_PROTECTED, WinLocalSystemSid,
+        };
+        let mut control = 0;
+        let mut revision = 0;
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        // SAFETY: descriptor is the live allocation returned by GetSecurityInfo
+        // or ConvertStringSecurityDescriptorToSecurityDescriptorW. Both native
+        // queries borrow it; it remains retained for all ACL/ACE/SID reads below.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+            || present == 0
+            || dacl.is_null()
+            || unsafe { IsValidAcl(dacl.cast()) } == 0
         {
-            return Err(std::io::Error::last_os_error());
-        }
-        let _sddl = LocalAllocation(sddl.cast());
-        if sddl.is_null() || length == 0 || length > 2048 {
             return Err(super::private_file_error());
         }
-        // Win32 reports allocation size, which may exceed string length.
-        // Read initialized characters only, stopping at NUL within that bound.
-        let mut units = Vec::new();
-        let mut terminated = false;
-        for offset in 0..length as usize {
-            let unit = unsafe { *sddl.add(offset) };
-            if unit == 0 {
-                terminated = true;
-                break;
+        let dacl = dacl.cast::<windows_sys::Win32::Security::ACL>();
+        if unsafe { (*dacl).AceCount } != 2 {
+            return Err(super::private_file_error());
+        }
+        with_current_user_sid(|current| {
+            let mut aces = Vec::with_capacity(2);
+            for index in 0..2 {
+                let mut raw = null_mut();
+                if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
+                    return Err(super::private_file_error());
+                }
+                // IsValidAcl/GetAce establish this ACE's bounded allocation.
+                // Check the complete SID extent before any SID API may read it;
+                // callback/object ACEs and appended data are not our closed policy.
+                let header = unsafe { &*raw.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+                let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+                let size = usize::from(header.AceSize);
+                if header.AceType != 0 || size < sid_offset + 8 {
+                    return Err(super::private_file_error());
+                }
+                let sid = unsafe { raw.cast::<u8>().add(sid_offset) };
+                let subauthorities = unsafe { *sid.add(1) };
+                if subauthorities > 15 || size != sid_offset + 8 + usize::from(subauthorities) * 4 {
+                    return Err(super::private_file_error());
+                }
+                if unsafe { IsValidSid(sid.cast()) } == 0 {
+                    return Err(super::private_file_error());
+                }
+                let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+                aces.push(super::PrivateAce {
+                    kind: header.AceType,
+                    flags: header.AceFlags,
+                    mask: ace.Mask,
+                    current_user: unsafe { EqualSid(sid.cast(), current) } != 0,
+                    system: unsafe { IsWellKnownSid(sid.cast(), WinLocalSystemSid) } != 0,
+                });
             }
-            units.push(unit);
-        }
-        if !terminated {
-            return Err(super::private_file_error());
-        }
-        let value = String::from_utf16(&units).map_err(|_| super::private_file_error())?;
-        if !super::closed_private_dacl(&value, &current_user_sid_string()?) {
-            return Err(super::private_file_error());
-        }
-        Ok(())
+            if super::closed_private_acl(control & SE_DACL_PROTECTED != 0, &aces) {
+                Ok(())
+            } else {
+                Err(super::private_file_error())
+            }
+        })
     }
 
     pub(crate) fn open_checked(
@@ -1876,7 +1920,6 @@ mod windows {
             let observed = information(diagnostic.as_raw_handle() as Handle).unwrap();
             let owner = ensure_current_owner(diagnostic.as_raw_handle() as Handle).is_ok();
             let dacl = dacl_sddl(&published_path, false).unwrap();
-            let current_user = current_user_sid_string().unwrap();
             eprintln!(
                 "MCP_PRIVATE_TEMP_DIAGNOSTIC attributes={:#x} regular={} reparse={} links={} current_owner={} closed_dacl={} dacl={}",
                 observed.file_attributes,
@@ -1884,7 +1927,7 @@ mod windows {
                 observed.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 observed._number_of_links,
                 owner,
-                super::closed_private_dacl(&dacl, &current_user),
+                validate_checked(&diagnostic).is_ok(),
                 dacl.chars().take(2048).collect::<String>(),
             );
         }
@@ -1894,6 +1937,38 @@ mod windows {
         )
         .unwrap();
         ensure_current_owner(published.as_raw_handle() as Handle).unwrap();
+        // Exercise the same binary descriptor gate with actual native SIDs.
+        // SDDL rendering may alias a numeric current-user SID; admission still
+        // compares the actual trustee identity rather than accepting an alias.
+        let user = current_user_sid_string().unwrap();
+        for (sddl, expected) in [
+            (format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})"), true),
+            (format!("D:P(A;;FA;;;{user})(A;;FA;;;SY)"), true),
+            (format!("D:(A;;FA;;;SY)(A;;FA;;;{user})"), false),
+            (format!("D:P(A;;FA;;;WD)(A;;FA;;;SY)"), false),
+            (format!("D:P(A;ID;FA;;;SY)(A;;FA;;;{user})"), false),
+            (format!("D:P(A;;FR;;;SY)(A;;FA;;;{user})"), false),
+            (
+                format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;BU)"),
+                false,
+            ),
+        ] {
+            let mut raw = null_mut();
+            let text = wide(OsStr::new(&sddl));
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        text.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut raw,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            let descriptor = SecurityDescriptor(raw);
+            assert_eq!(validate_private_dacl(descriptor.0).is_ok(), expected);
+        }
         assert_eq!(
             std::fs::read(root.path().join("published.json")).unwrap(),
             b"{}"
@@ -2068,24 +2143,55 @@ mod checked_tests {
     use super::*;
     #[test]
     fn spend_private_dacl_requires_closed_current_user_system_protected_access() {
-        let user = "S-1-5-21-111-222-333-1001";
-        assert!(closed_private_dacl(
-            &format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})"),
-            user
-        ));
-        assert!(closed_private_dacl(
-            &format!("D:PAI(A;;FA;;;{user})(A;;FA;;;SY)"),
-            user
-        ));
+        let user = PrivateAce {
+            kind: 0,
+            flags: 0,
+            mask: 0x001f_01ff,
+            current_user: true,
+            system: false,
+        };
+        let system = PrivateAce {
+            current_user: false,
+            system: true,
+            ..user
+        };
+        assert!(closed_private_acl(true, &[user, system]));
+        assert!(closed_private_acl(true, &[system, user]));
+        assert!(!closed_private_acl(false, &[user, system]));
         for bad in [
-            format!("D:(A;;FA;;;SY)(A;;FA;;;{user})"),
-            format!("D:P(A;;FA;;;WD)(A;;FA;;;{user})"),
-            format!("D:P(A;ID;FA;;;SY)(A;;FA;;;{user})"),
-            format!("D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;BU)"),
-            "D:P".to_owned(),
+            PrivateAce { kind: 1, ..user },
+            PrivateAce {
+                flags: 0x10,
+                ..user
+            },
+            PrivateAce { flags: 1, ..user },
+            PrivateAce {
+                mask: 0x0012_0089,
+                ..user
+            },
+            PrivateAce {
+                mask: 0x1000_0000,
+                ..user
+            },
+            PrivateAce {
+                current_user: false,
+                system: false,
+                ..user
+            },
         ] {
-            assert!(!closed_private_dacl(&bad, user), "{bad}");
+            assert!(!closed_private_acl(true, &[system, bad]));
         }
+        assert!(!closed_private_acl(true, &[]));
+        assert!(!closed_private_acl(true, &[user]));
+        assert!(!closed_private_acl(true, &[user, system, user]));
+        assert!(!closed_private_acl(true, &[user, user]));
+        assert!(!closed_private_acl(true, &[system, system]));
+        // A System-owned process still has exactly its user and System rights.
+        let same = PrivateAce {
+            system: true,
+            ..user
+        };
+        assert!(closed_private_acl(true, &[same, same]));
     }
     #[cfg(any(unix, windows))]
     #[test]

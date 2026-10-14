@@ -20,6 +20,8 @@ use crate::extras::mcp::McpClientManager;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::Sandbox;
+#[cfg(feature = "mcp")]
+use sha2::Digest;
 
 fn registered_shell_capability<'a>(
     cli: &Cli,
@@ -60,6 +62,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "lsp_diagnostics"
             | "skills_search"
             | "ask_user_question"
+            | "mcp_search"
     )
 }
 
@@ -854,6 +857,20 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
     let tools_enabled = !cli.resolve_no_tools(cfg);
     let shell_tool_enabled = registered_shell_capability(cli, cfg, &sandbox).is_some();
+    #[cfg(feature = "mcp")]
+    let search_binding = crate::extras::mcp::deferred::SearchBinding::default();
+    #[cfg(feature = "mcp")]
+    let native_loading = model.deferred_tool_loading();
+    #[cfg(feature = "mcp")]
+    let search_binding = search_binding.with_native_references(
+        native_loading == rig::completion::DeferredToolLoading::NativeReferences,
+    );
+    #[cfg(feature = "mcp")]
+    let mut native_declarations = Vec::new();
+    #[cfg(feature = "mcp")]
+    let mut discovery_index = String::new();
+    #[cfg(feature = "mcp")]
+    let mut search_registered = false;
     #[cfg(feature = "js")]
     let js_tool_enabled = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "lsp")]
@@ -870,6 +887,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     }
 
     let all_tools = if !tools_enabled {
+        #[cfg(feature = "mcp")]
+        context.mcp_discovery.retire(tool_output_session_id);
         None
     } else {
         let max_text_file_size = cfg.max_text_file_size;
@@ -998,6 +1017,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let mut all_tools: Vec<Box<dyn rig::tool::ToolDyn>> = base_tools.into_vec();
         #[cfg(all(feature = "hooks", feature = "mcp"))]
         let mut mcp_hook_identities = std::collections::HashMap::new();
+        #[cfg(feature = "mcp")]
+        let mut deferred_metadata = std::collections::HashMap::new();
+        #[cfg(feature = "mcp")]
+        let mut catalogue_fingerprint = sha2::Sha256::new();
 
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
@@ -1054,7 +1077,56 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
             let mcp_tools =
                 collect_mcp_tools(manager, permission.clone(), ask_tx.clone(), timeouts).await;
+            let mcp_tools: Vec<_> = mcp_tools
+                .into_iter()
+                .filter(|tool| {
+                    cli.tools.is_empty()
+                        || cli
+                            .tools
+                            .iter()
+                            .any(|name| canonical_tool_name(name) == rig::tool::ToolDyn::name(tool))
+                })
+                .collect();
+            let total = mcp_tools.len();
+            let mut native_eager_fallback = false;
             for t in mcp_tools {
+                let name = rig::tool::ToolDyn::name(&t);
+                let definition = rig::completion::ToolDefinition {
+                    name: name.clone(),
+                    description: rig::tool::ToolDyn::description(&t),
+                    parameters: rig::tool::ToolDyn::parameters(&t),
+                };
+                let source_key = t
+                    .source_proof
+                    .as_deref()
+                    .map(crate::extras::mcp::project::ServerSourceProof::fingerprint);
+                let record = serde_json::to_vec(&(&definition, &source_key, &t.server_name))
+                    .expect("MCP catalogue metadata serializes");
+                catalogue_fingerprint.update((record.len() as u64).to_le_bytes());
+                catalogue_fingerprint.update(record);
+                let deferred = cfg
+                    .mcp_servers
+                    .as_ref()
+                    .and_then(|servers| servers.get(t.server_name.as_str()))
+                    .map_or(
+                        crate::extras::mcp::config::McpDefer::Auto,
+                        crate::extras::mcp::config::McpServerConfig::defer,
+                    )
+                    .resolves_deferred(total);
+                catalogue_fingerprint.update([u8::from(deferred)]);
+                native_eager_fallback |=
+                    deferred && native_loading == rig::completion::DeferredToolLoading::Eager;
+                if deferred && native_loading != rig::completion::DeferredToolLoading::Eager {
+                    deferred_metadata.insert(
+                        name,
+                        (
+                            definition,
+                            t.source_proof.clone(),
+                            t.client_is_live.clone(),
+                            t.server_name.to_string(),
+                        ),
+                    );
+                }
                 #[cfg(feature = "hooks")]
                 mcp_hook_identities.insert(
                     rig::tool::ToolDyn::name(&t),
@@ -1064,6 +1136,14 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     },
                 );
                 all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
+            }
+            if native_eager_fallback {
+                manager.push_tool_notice("The requested native model does not support MCP tool references; selected MCP schemas remain eager.".into());
+            }
+            if !deferred_metadata.is_empty() {
+                all_tools.push(Box::new(crate::extras::mcp::deferred::McpSearch(
+                    search_binding.clone(),
+                )));
             }
         }
 
@@ -1121,6 +1201,66 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
 
         let all_tools = tools::concurrency::bind(all_tools);
 
+        #[cfg(feature = "mcp")]
+        let all_tools = {
+            let mut eager = Vec::new();
+            let mut entries = Vec::new();
+            search_registered = all_tools.iter().any(|tool| tool.name() == "mcp_search");
+            for tool in all_tools {
+                let name = tool.name();
+                // Without an admitted discovery tool, the admitted MCP tools
+                // remain eager with their original wrappers and permissions.
+                if search_registered
+                    && let Some((definition, source, is_live, server_name)) =
+                        deferred_metadata.remove(&name)
+                {
+                    entries.push(crate::extras::mcp::deferred::DeferredEntry {
+                        server_name,
+                        definition,
+                        source,
+                        is_live,
+                        tool: Arc::from(tool),
+                    });
+                } else {
+                    eager.push(tool);
+                }
+            }
+            // Rekey even an eager/empty or search-ineligible catalogue, so a
+            // later rebuild cannot resurrect schemas from an intervening CLI
+            // ceiling or loading mode. Only the same retained generation may
+            // restore activation; no state is serialized.
+            catalogue_fingerprint.update([u8::from(search_registered)]);
+            let fingerprint = crate::hex::encode_lower(catalogue_fingerprint.finalize());
+            match context
+                .mcp_discovery
+                .capture(tool_output_session_id, &workspace, fingerprint)
+            {
+                Ok(activation) if search_registered && !entries.is_empty() => {
+                    let view = Arc::new(crate::extras::mcp::deferred::DiscoveryView::new(
+                        activation, entries,
+                    ));
+                    if let Some(manager) = mcp_manager {
+                        manager.capture_deferred_view(&view);
+                    }
+                    discovery_index = view.compact_index();
+                    if native_loading == rig::completion::DeferredToolLoading::NativeReferences {
+                        native_declarations = view.definitions();
+                    }
+                    eager.extend(view.initially_active());
+                    search_binding
+                        .set_view(view)
+                        .expect("new per-build MCP search binding");
+                }
+                Ok(_) => {}
+                Err(message) => {
+                    if let Some(manager) = mcp_manager {
+                        manager.push_tool_notice(message.into());
+                    }
+                }
+            }
+            eager
+        };
+
         Some(all_tools)
     };
 
@@ -1133,7 +1273,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     let goal_block = crate::extras::goal::prompt::goal_block(goal_store.snapshot().as_ref());
     #[cfg(not(feature = "goal"))]
     let goal_block: Option<String> = None;
-    let composition = compose_registered_preamble(
+    #[allow(unused_mut)]
+    let mut composition = compose_registered_preamble(
         context,
         reasoning_enabled,
         workspace_root,
@@ -1142,8 +1283,19 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         cli,
         goal_block.as_deref(),
     );
+    #[cfg(feature = "mcp")]
+    if !discovery_index.is_empty() {
+        composition.text.push_str(&discovery_index);
+        record_part(
+            &mut composition.parts,
+            &composition.text,
+            "Deferred MCP tool index",
+        );
+    }
     *context_snapshot = Some(composition.snapshot());
     let preamble = composition.text;
+    #[cfg(feature = "mcp")]
+    let model = model.with_deferred_tools(native_declarations);
     let builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .max_tokens(cli.resolve_max_tokens(cfg))
@@ -1178,10 +1330,17 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     if let Some(temp) = temperature {
         builder = builder.temperature(temp);
     }
-    match all_tools {
+    let agent = match all_tools {
         Some(tools) => builder.tools(tools).build(),
         None => builder.build(),
+    };
+    #[cfg(feature = "mcp")]
+    if search_registered {
+        search_binding
+            .set_server(agent.tool_server_handle.downgrade())
+            .expect("new per-build MCP search binding");
     }
+    agent
 }
 
 /// Dedicated system prompt for the `/btw` side-assistant. Deliberately NOT the
@@ -1375,6 +1534,8 @@ mod extra_file_tests {
 
     fn empty_ctx() -> ContextFiles {
         ContextFiles {
+            #[cfg(feature = "mcp")]
+            mcp_discovery: Default::default(),
             workspace_root: std::path::PathBuf::from("."),
             agents: None,
             prompts: HashMap::new(),
@@ -1788,6 +1949,8 @@ mod js_tests {
 
     fn empty_context() -> ContextFiles {
         ContextFiles {
+            #[cfg(feature = "mcp")]
+            mcp_discovery: Default::default(),
             workspace_root: std::path::PathBuf::from("."),
             agents: None,
             prompts: HashMap::new(),

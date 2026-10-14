@@ -152,6 +152,22 @@ impl App<'_> {
                     }
                 ));
             }
+            let defer = cfg
+                .mcp_servers
+                .as_ref()
+                .and_then(|servers| servers.get(&name))
+                .map_or(crate::extras::mcp::config::McpDefer::Auto, |server| {
+                    server.defer()
+                });
+            rows.push(format!("    schema loading: {defer:?}"));
+            if let Some((deferred, enabled)) = self
+                .ui
+                .mcp_manager
+                .as_ref()
+                .and_then(|manager| manager.deferred_status(&name))
+            {
+                rows.push(format!("    last active build: {deferred} deferred schemas, {enabled} enabled by search"));
+            }
             if let Some(observed) = health.servers.get(&name) {
                 for (kind, attempt) in [
                     ("connection", observed.connection),

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::RwLock;
 
@@ -149,7 +149,25 @@ impl ToolServer {
 #[derive(Clone)]
 pub struct ToolServerHandle(Arc<RwLock<ToolServerState>>);
 
+/// A non-owning reference to an existing tool server. This lets a registered
+/// discovery tool publish definitions to its own server without retaining an
+/// ownership cycle. It carries no tools or registration state of its own.
+#[derive(Clone)]
+pub struct WeakToolServerHandle(Weak<RwLock<ToolServerState>>);
+
+impl WeakToolServerHandle {
+    /// Upgrade only while the owning agent/tool server is still alive.
+    pub fn upgrade(&self) -> Option<ToolServerHandle> {
+        self.0.upgrade().map(ToolServerHandle)
+    }
+}
+
 impl ToolServerHandle {
+    /// Obtain a non-owning reference to this exact server.
+    pub fn downgrade(&self) -> WeakToolServerHandle {
+        WeakToolServerHandle(Arc::downgrade(&self.0))
+    }
+
     /// Register a new static tool. Re-registering an existing name replaces
     /// the implementation (last wins) and keeps its position.
     pub async fn add_tool(&self, tool: impl ToolDyn + 'static) -> Result<(), ToolServerError> {
@@ -165,12 +183,27 @@ impl ToolServerHandle {
     /// [`Self::get_tool_defs`]. Existing names are replaced (last wins) and
     /// keep their position.
     pub async fn append_toolset(&self, toolset: ToolSet) -> Result<(), ToolServerError> {
+        self.append_toolset_if(toolset, || true).await.map(|_| ())
+    }
+
+    /// Publish one batch only when caller-owned admission still holds AFTER
+    /// acquiring the existing registry lock. The synchronous predicate must
+    /// not re-enter this server. There is no suspension between admission and
+    /// registration, so cancellation cannot publish a partial batch.
+    pub async fn append_toolset_if(
+        &self,
+        toolset: ToolSet,
+        admission: impl FnOnce() -> bool + Send,
+    ) -> Result<bool, ToolServerError> {
         let mut state = self.0.write().await;
+        if !admission() {
+            return Ok(false);
+        }
         for name in toolset.ordered_names() {
             push_unique_name(&mut state.static_tool_names, name.clone());
         }
         state.toolset.add_tools(toolset);
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a tool by name from both the toolset and the static list.

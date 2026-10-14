@@ -138,6 +138,7 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
         }
         McpServerConfig::Url {
             url: target,
+            defer: Default::default(),
             allow_local: local,
             headers: HashMap::new(),
             oauth: None,
@@ -148,6 +149,7 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
         }
         McpServerConfig::Command {
             command: target,
+            defer: Default::default(),
             args: positional[2..].to_vec(),
             cwd: None,
             env: HashMap::new(),

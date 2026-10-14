@@ -58,6 +58,34 @@ impl ServerSourceProof {
                 self.origin.as_ref(),
             )
     }
+
+    /// Opaque runtime comparison only; never emitted as a credential or model
+    /// result, and never replaces the current source/trust revalidation.
+    pub(crate) fn fingerprint(&self) -> String {
+        let origin = self.origin.as_ref().map(|origin| {
+            (
+                &origin.source,
+                origin.selected,
+                &origin.inactive,
+                &origin.digest,
+            )
+        });
+        // Built-in registrations intentionally cannot be serialized into user
+        // config. Compare their closed identity and headers only in this
+        // private runtime hash, never by weakening that serde boundary.
+        let mut server = match self.server.as_ref() {
+            Some(McpServerConfig::BuiltIn { identity, headers }) => {
+                serde_json::json!({"builtin_endpoint":identity.endpoint(),"headers":headers})
+            }
+            Some(server) => serde_json::to_value(server).expect("authored MCP config serializes"),
+            None => serde_json::Value::Null,
+        };
+        server.sort_all_objects();
+        digest(
+            &serde_json::to_string(&(&self.name, server, origin, self.declared_source))
+                .expect("captured MCP comparison metadata serializes"),
+        )
+    }
 }
 
 pub(crate) fn digest(content: &str) -> String {

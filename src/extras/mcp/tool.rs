@@ -32,6 +32,7 @@ pub struct McpTool {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
+    pub(crate) client_is_live: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     pub definition: rmcp::model::Tool,
     pub(super) model_description: String,
     pub(super) model_parameters: serde_json::Value,
@@ -202,9 +203,10 @@ impl ToolDyn for McpTool {
         let call_timeout = self.call_timeout;
         let spill_scope = self.spill_scope.clone();
         let source_proof = self.source_proof.clone();
+        let client_is_live = self.client_is_live.clone();
 
         Box::pin(async move {
-            ensure_source_current(source_proof.as_deref())?;
+            ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
             let coaching = check_mcp_perm(
                 &permission,
@@ -224,9 +226,20 @@ impl ToolDyn for McpTool {
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
 
+            // Hook/permission waits may also outlive this run's financial or
+            // clarification admission. Financial preparation can suspend, so
+            // source/client and question admission follow it at actual RPC.
+            crate::spend::run::admit_current_effect()
+                .await
+                .map_err(|error| {
+                    ToolError::ToolCallError(Box::new(McpToolError(error.to_string().into())))
+                })?;
+            if let Some(required) = crate::question::required() {
+                return Err(ToolError::ToolCallError(Box::new(required)));
+            }
             // Permission/hook waits may outlive the approved source revision.
             // Recheck immediately before the exact retained peer receives RPC.
-            ensure_source_current(source_proof.as_deref())?;
+            ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
             let result = call_tool_bounded(&peer, params, call_timeout)
                 .await
                 .map_err(|e| {
@@ -294,6 +307,18 @@ impl ToolDyn for McpTool {
             })
         })
     }
+}
+
+fn ensure_client_current(
+    proof: Option<&super::project::ServerSourceProof>,
+    client_is_live: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(), ToolError> {
+    if !client_is_live() {
+        return Err(ToolError::ToolCallError(Box::new(McpToolError(
+            "MCP connection retired; reconnect before calling tools".into(),
+        ))));
+    }
+    ensure_source_current(proof)
 }
 
 fn ensure_source_current(

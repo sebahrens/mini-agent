@@ -20,6 +20,28 @@
 //! classifies its own error type via [`Tool::classify_error`] and can return
 //! richer outcomes/metadata via [`Tool::call_structured`] and [`ToolReturn`].
 
+/// Successful, host-owned discovery metadata. Strings returned by a tool are
+/// never parsed as references. This exception projects only these bounded names
+/// into native tool-result content; it grants no executable registration.
+#[derive(Clone, Debug)]
+pub struct ToolReferences(Vec<String>);
+impl ToolReferences {
+    pub fn new(names: Vec<String>) -> Option<Self> {
+        (names.len() <= 8
+            && names.iter().all(|name| {
+                !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+            }))
+        .then_some(Self(names))
+    }
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// Reserved replay data emitted only from typed successful discovery metadata.
+#[doc(hidden)]
+pub const NATIVE_TOOL_REFERENCE_KEY: &str = "rig_native_tool_reference";
+
 pub mod builtin;
 mod extensions;
 mod result;

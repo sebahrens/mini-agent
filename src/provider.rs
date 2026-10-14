@@ -4875,6 +4875,8 @@ mod lsp_health_agent_tests {
             ..Default::default()
         };
         let context = ContextFiles {
+            #[cfg(feature = "mcp")]
+            mcp_discovery: Default::default(),
             workspace_root: root.path().to_path_buf(),
             agents: None,
             prompts: HashMap::new(),

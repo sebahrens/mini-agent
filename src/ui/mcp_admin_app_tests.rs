@@ -6,6 +6,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// owned loopback server. The listener and all accepted sockets are joined.
 struct Server {
     address: std::net::SocketAddr,
+    provider_streams: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    catalogue_count: Arc<std::sync::atomic::AtomicUsize>,
+    anthropic_prefix: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    native_raw_prefixes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     changed: Arc<tokio::sync::Notify>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -21,6 +25,16 @@ impl Server {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
+        let catalogue_count = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let counted_catalogue = catalogue_count.clone();
+        let provider_streams = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::new(),
+        ));
+        let scripted_streams = provider_streams.clone();
+        let anthropic_prefix = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let expected_prefix = anthropic_prefix.clone();
+        let native_raw_prefixes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_raw_prefixes = native_raw_prefixes.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let changed = Arc::new(tokio::sync::Notify::new());
         let (stop, mut stopping) = tokio::sync::oneshot::channel();
@@ -45,6 +59,10 @@ impl Server {
                         let (mut stream, _) = accepted.unwrap();
                         accepted_count.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
                         let seen = seen.clone();
+                        let scripted_streams = scripted_streams.clone();
+                        let expected_prefix = expected_prefix.clone();
+                        let captured_raw_prefixes = captured_raw_prefixes.clone();
+                        let counted_catalogue = counted_catalogue.clone();
                         let signal = signal.clone();
                         let rejecting = rejecting.clone();
                         let redirecting = redirecting.clone();
@@ -75,7 +93,33 @@ impl Server {
                             let method = request["method"].as_str().unwrap_or("");
                             if hold_initialization && method == "initialize" { std::future::pending::<()>().await; }
                             let redirect = if method == "initialize" { redirecting.lock().unwrap().clone() } else { None };
-                            let (status, body) = if redirect.is_some() { ("307 Temporary Redirect", String::new()) }
+                            let anthropic_request = first.starts_with("POST /v1/messages ");
+                            if anthropic_request {
+                                #[derive(serde::Deserialize)]
+                                struct RawPrefix<'a> {
+                                    #[serde(borrow)] system: &'a serde_json::value::RawValue,
+                                    #[serde(borrow)] tools: &'a serde_json::value::RawValue,
+                                }
+                                let prefix: RawPrefix<'_> = serde_json::from_slice(&bytes[header_end..header_end+count]).unwrap();
+                                captured_raw_prefixes.lock().unwrap().push((prefix.system.get().into(),prefix.tools.get().into()));
+                            }
+                            let provider_request = first.starts_with("POST /v1/chat/completions ") || anthropic_request;
+                            let (status, body) = if anthropic_request {
+                                let mut prefix = expected_prefix.lock().unwrap();
+                                let current = serde_json::json!({"system":request["system"],"tools":request["tools"]});
+                                if prefix.is_none() {
+                                    *prefix = Some(current);
+                                    ("200 OK",scripted_streams.lock().unwrap().pop_front().expect("owned Anthropic first response"))
+                                } else if prefix.as_ref() != Some(&current) {
+                                    // Deterministic documented-prefix witness, not
+                                    // cryptographic verification or a paid server.
+                                    ("400 Bad Request",serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":"owned-native-prefix-change before replayed thinking"}}).to_string())
+                                } else {
+                                    ("200 OK",scripted_streams.lock().unwrap().pop_front().expect("bounded unchanged-prefix native response"))
+                                }
+                            } else if provider_request {
+                                ("200 OK", scripted_streams.lock().unwrap().pop_front().expect("every owned provider request must have a bounded scripted response"))
+                            } else if redirect.is_some() { ("307 Temporary Redirect", String::new()) }
                             else if !first.starts_with("POST /mcp ") || method == "initialize" && rejecting.swap(false, std::sync::atomic::Ordering::AcqRel) {
                                 ("405 Method Not Allowed", String::new())
                             } else if request.get("id").is_none() {
@@ -83,7 +127,12 @@ impl Server {
                             } else {
                                 let result = match method {
                                     "initialize" => serde_json::json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"owned57","version":"1"}}),
-                                    "tools/list" => serde_json::json!({"tools":[{"name":"owned_echo","description":"owned test echo","inputSchema":{"type":"object","properties":{}}}]}),
+                                    "tools/list" => {
+                                        let count = counted_catalogue.load(std::sync::atomic::Ordering::Acquire);
+                                        assert!(count <= 128);
+                                        if count == 1 { serde_json::json!({"tools":[{"name":"owned_echo","description":"owned test echo","inputSchema":{"type":"object","properties":{}}}]}) }
+                                        else { serde_json::json!({"tools": (0..count).map(|index| serde_json::json!({"name":format!("owned_{index:02}"),"description":"captured description ".repeat(64),"inputSchema":{"type":"object","properties":{"value":{"type":"string","description":"captured schema ".repeat(64)}}}})).collect::<Vec<_>>()}) }
+                                    },
                                     "tools/call" => serde_json::json!({"content":[{"type":"text","text":"actual owned echo"}]}),
                                     _ => serde_json::json!({}),
                                 };
@@ -95,7 +144,8 @@ impl Server {
                                 std::fs::write(path, content).unwrap();
                             }
                             let location = redirect.map(|url| format!("Location: {url}\r\n")).unwrap_or_default();
-                            let response = format!("HTTP/1.1 {status}\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let content_type = if provider_request { "text/event-stream" } else { "application/json" };
+                            let response = format!("HTTP/1.1 {status}\r\n{location}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             // A cancelled client is an expected fixture teardown.
                             let _ = stream.write_all(response.as_bytes()).await;
                         });
@@ -112,6 +162,10 @@ impl Server {
         });
         Self {
             address,
+            provider_streams,
+            catalogue_count,
+            anthropic_prefix,
+            native_raw_prefixes,
             requests,
             changed,
             stop: Some(stop),
@@ -536,6 +590,99 @@ async fn actual_connected_mcp_tool_refuses_revoked_source_before_rpc() {
 }
 
 #[tokio::test]
+async fn actual_retired_mcp_connection_cannot_dispatch_or_prompt_again() {
+    use rig::tool::ToolDyn;
+    let root = crate::tests::OwnedTestDirectory::new("mcp-retired-generation");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+    let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true}}})
+        .to_string();
+    crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), raw.as_bytes()).unwrap();
+    config::approve_project_mcp(
+        &paths,
+        &workspace,
+        &crate::extras::mcp::project::digest(&raw),
+    )
+    .unwrap();
+    let cfg = config::mcp_config_in_workspace_at(
+        &workspace,
+        base.provenance.global_file.as_ref().unwrap(),
+    )
+    .unwrap();
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let permission = Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs {
+                glob: crate::permission::PermissionConfig {
+                    default: Some(crate::permission::Action::Ask),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap(),
+    ));
+    let (ask, mut questions) = tokio::sync::mpsc::channel(4);
+    let tools = manager
+        .collect_tools_with_timeouts(Some(permission.clone()), Some(ask), Default::default())
+        .await;
+    assert_eq!(tools.len(), 1);
+    let mut call = tools[0].call("{}".into());
+    let request = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = &mut call => panic!("current connection must request ordinary Ask before RPC: {result:?}"),
+            request = questions.recv() => request.unwrap().into_permission(),
+        }
+    }).await.unwrap();
+    assert_eq!(request.tool, "mcp_tool");
+    assert_eq!(request.input, "mcp_tool:owned:owned_echo");
+    request
+        .reply
+        .send(crate::permission::ask::UserDecision::AllowOnce)
+        .unwrap();
+    let positive = tokio::time::timeout(Duration::from_secs(3), call)
+        .await
+        .unwrap();
+    let calls = server.method_count("tools/call");
+    manager.shutdown().await;
+    let stale = tokio::time::timeout(Duration::from_secs(3), tools[0].call("{}".into())).await;
+    let final_calls = server.method_count("tools/call");
+    let no_prompt = questions.try_recv().is_err();
+    let no_grant = matches!(
+        permission
+            .lock()
+            .unwrap()
+            .check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"),
+        crate::permission::checker::CheckResult::Ask
+    );
+    drop(tools);
+    server.assert_no_provider_request();
+    server.finish().await;
+    assert!(positive.unwrap().contains("actual owned echo"));
+    assert_eq!(calls, 1);
+    assert!(
+        stale
+            .expect("retired call must resolve without waiting for an answer")
+            .unwrap_err()
+            .to_string()
+            .contains("connection retired")
+    );
+    assert_eq!(
+        final_calls, calls,
+        "retired exact connection must make zero extra RPCs"
+    );
+    assert!(no_prompt);
+    assert!(no_grant);
+}
+
+#[tokio::test]
 async fn actual_connected_mcp_source_revocation_during_ordinary_ask_refuses_rpc() {
     use rig::tool::ToolDyn;
     let root = crate::tests::OwnedTestDirectory::new("mcp-call-source-ask");
@@ -714,6 +861,7 @@ async fn retained_source_revoked_after_endpoint_lookup_makes_zero_connections() 
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
     let cfg = crate::extras::mcp::config::McpServerConfig::Url {
         url: server.url(),
+        defer: Default::default(),
         allow_local: true,
         headers: Default::default(),
         oauth: None,
@@ -1425,4 +1573,1343 @@ async fn actual_doctor_tracks_live_add_remove_catalogue_without_reloading_or_rpc
     assert!(app.ui.session.permission_allowlist.is_empty());
     app.teardown().await;
     server.finish().await;
+}
+
+/// Exercise production builder wrappers and the SDK's captured per-request
+/// allowed-name set. All MCP effects reach the owned real transport; the model
+/// carrier captures complete actual CompletionRequests without external I/O.
+#[tokio::test]
+async fn actual_deferred_builder_next_request_advertises_schema_but_same_response_cannot_call_hidden_tool()
+ {
+    use crate::tests::fake_model::{MockCompletionModel, MockStreamEvent};
+    use futures::FutureExt;
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    for same_response in [false, true] {
+        let root = crate::tests::OwnedTestDirectory::new("mcp-deferred-requests");
+        let _environment = environment(root.path());
+        let server = Server::new(false).await;
+        let base = config(root.path(), &server);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+        let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true,"defer":true}}}).to_string();
+        crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), raw.as_bytes())
+            .unwrap();
+        config::approve_project_mcp(
+            &paths,
+            &workspace,
+            &crate::extras::mcp::project::digest(&raw),
+        )
+        .unwrap();
+        let cfg = config::mcp_config_in_workspace_at(
+            &workspace,
+            base.provenance.global_file.as_ref().unwrap(),
+        )
+        .unwrap();
+        let manager =
+            crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+        let permission = Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs {
+                    glob: crate::permission::PermissionConfig {
+                        default: Some(crate::permission::Action::Ask),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                crate::permission::SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let (ask, mut questions) = tokio::sync::mpsc::channel(4);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["mcp_search".into(), "owned_echo".into()],
+            ..Default::default()
+        };
+        let context = crate::context::load_for_workspace(true, Some(root.path()));
+        let mut initial = vec![MockStreamEvent::tool_call(
+            "search-provider-id",
+            "mcp_search",
+            serde_json::json!({"query":"owned_echo"}),
+        )];
+        if same_response {
+            initial.push(MockStreamEvent::tool_call(
+                "hidden-provider-id",
+                "owned_echo",
+                serde_json::json!({}),
+            ));
+        }
+        initial.push(MockStreamEvent::final_response_with_default_usage());
+        let mut turns = vec![initial];
+        if !same_response {
+            turns.push(vec![
+                MockStreamEvent::tool_call(
+                    "effect-provider-id",
+                    "owned_echo",
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        turns.push(vec![
+            MockStreamEvent::text("owned terminal"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let agent = crate::agent::builder::build_agent_inner(
+            model.clone(),
+            &cli,
+            &cfg,
+            &context,
+            workspace.clone(),
+            Some(permission.clone()),
+            Some(ask),
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace),
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
+            "owned-deferred-session",
+            None,
+            false,
+            None,
+            None,
+            #[cfg(feature = "js")]
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                reason: "MCP-only fixture does not start a JS worker".into(),
+            },
+            #[cfg(feature = "js")]
+            crate::extras::js::session::ScratchStore::default(),
+            #[cfg(feature = "skills")]
+            None,
+            Some(&manager),
+        )
+        .await;
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let assertions = std::panic::AssertUnwindSafe(async {
+            let retry = crate::retry::RetryConfig::default();
+            let mut turn = Box::pin(scope.run(crate::agent::runner::run_print(&agent, "discover then call", false, &retry, None, Vec::new(), #[cfg(feature = "hooks")] None)));
+            if !same_response {
+                let request = tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::select! {
+                        result = &mut turn => panic!("activated real tool must still require ordinary Ask: {result:?}"),
+                        request = questions.recv() => request.unwrap().into_permission(),
+                    }
+                }).await.unwrap();
+                assert_eq!(request.tool, "mcp_tool");
+                assert_eq!(request.input, "mcp_tool:owned:owned_echo");
+                assert_eq!(server.method_count("tools/call"), 0);
+                let requests = model.requests();
+                assert_eq!(requests.len(), 2, "the effect must occur only after the next actual model request");
+                assert_eq!(requests[0].tools.iter().map(|definition| definition.name.as_str()).collect::<Vec<_>>(), ["mcp_search"]);
+                assert_eq!(requests[1].tools.iter().map(|definition| definition.name.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["mcp_search", "owned_echo"]));
+                let schema = requests[1].tools.iter().find(|definition| definition.name == "owned_echo").unwrap();
+                assert_eq!(schema.parameters, serde_json::json!({"type":"object","properties":{}}));
+                request.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), &mut turn).await.unwrap();
+            if !same_response { assert_eq!(result.unwrap().0, "owned terminal"); }
+            let requests = model.requests();
+            assert_eq!(requests[0].tools.iter().map(|definition| definition.name.as_str()).collect::<Vec<_>>(), ["mcp_search"]);
+            assert_eq!(server.method_count("tools/call"), usize::from(!same_response));
+            assert!(questions.try_recv().is_err(), "same-response hidden tool must neither prompt nor send RPC");
+            assert!(matches!(permission.lock().unwrap().check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"), crate::permission::checker::CheckResult::Ask));
+            if same_response {
+                assert!(agent.tool_server_handle.get_tool_defs(None).await.unwrap().iter().all(|definition| definition.name == "mcp_search"), "an abandoned response must not execute its search sibling");
+            }
+        }).catch_unwind().await;
+        scope.cancellation_handle().cancel();
+        tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+            .await
+            .expect("owned test work must settle even after an assertion failure");
+        drop(agent);
+        manager.shutdown().await;
+        server.assert_no_provider_request();
+        server.finish().await;
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Native OpenAI converter and the production MCP wrappers share the same
+/// serialized request proof. The only network peer is this owned fixture.
+#[tokio::test]
+async fn actual_native_provider_wire_defers_schema_until_next_request_and_rejects_same_response_hidden_call()
+ {
+    for same_response in [false, true] {
+        native_deferred_wire_case(same_response, None, false).await;
+    }
+}
+
+#[cfg(all(feature = "hooks", unix))]
+#[tokio::test]
+async fn actual_activated_mcp_native_wire_preserves_hook_rewrite_redaction_and_denial() {
+    for hook in ["rewrite", "deny"] {
+        native_deferred_wire_case(false, Some(hook), false).await;
+    }
+}
+
+#[tokio::test]
+async fn actual_activated_mcp_native_wire_preserves_canonical_cost_cap_before_effect() {
+    native_deferred_wire_case(false, None, true).await;
+}
+
+async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost_cap: bool) {
+    use futures::FutureExt;
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    fn completion(tool_calls: Vec<serde_json::Value>, text: Option<&str>) -> String {
+        let delta = match text {
+            Some(text) => serde_json::json!({"role":"assistant","content":text}),
+            None => serde_json::json!({"role":"assistant","tool_calls":tool_calls}),
+        };
+        let first = serde_json::json!({"id":"owned-model-response","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+        let end = serde_json::json!({"id":"owned-model-response","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":{},"finish_reason":if text.is_some(){"stop"}else{"tool_calls"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
+        format!("data: {first}\n\ndata: {end}\n\ndata: [DONE]\n\n")
+    }
+    fn call(index: usize, id: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    }
+    {
+        let root = crate::tests::OwnedTestDirectory::new("mcp-deferred-native-wire");
+        let _environment = environment(root.path());
+        #[cfg(all(feature = "hooks", unix))]
+        if let Some(mode) = hook {
+            use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust};
+            let handler = |text: &str| HookHandler {
+                kind: "command".into(),
+                command: Some("/bin/sh".into()),
+                args: Some(vec!["-c".into(), text.into()]),
+                timeout: Some(3),
+                is_async: false,
+                condition: None,
+                once: false,
+                trust: HookTrust::Trusted,
+                env: Default::default(),
+            };
+            let pre = if mode == "deny" {
+                r#"printf '%s\n' '{"permissionDecision":"deny","reason":"owned deferred hook denial"}'"#
+            } else {
+                r#"printf '%s\n' '{"updatedInput":{"owned_hook_argument":"actual"}}'"#
+            };
+            let hooks = std::collections::HashMap::from([
+                (
+                    "PreToolUse".into(),
+                    vec![HookGroup {
+                        matcher: Some("mcp__owned__owned_echo".into()),
+                        hooks: vec![handler(pre)],
+                    }],
+                ),
+                (
+                    "PostToolUse".into(),
+                    vec![HookGroup {
+                        matcher: Some("mcp__owned__owned_echo".into()),
+                        hooks: vec![handler(
+                            r#"printf '%s\n' '{"redactions":["actual owned echo"]}'"#,
+                        )],
+                    }],
+                ),
+            ]);
+            crate::extras::hooks::init_dispatcher(
+                crate::extras::hooks::dispatcher::HookDispatcher::from_config_with_backend_and_root(&hooks,"none",root.path()).unwrap()
+            );
+        }
+        let denied_by_hook = hook == Some("deny");
+        let server = Server::new(false).await;
+        let base = config(root.path(), &server);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+        let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true,"defer":true}}}).to_string();
+        crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), raw.as_bytes())
+            .unwrap();
+        config::approve_project_mcp(
+            &paths,
+            &workspace,
+            &crate::extras::mcp::project::digest(&raw),
+        )
+        .unwrap();
+        let cfg = config::mcp_config_in_workspace_at(
+            &workspace,
+            base.provenance.global_file.as_ref().unwrap(),
+        )
+        .unwrap();
+        let manager =
+            crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+        let permission = Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs {
+                    glob: crate::permission::PermissionConfig {
+                        default: Some(crate::permission::Action::Ask),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                crate::permission::SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let (ask, mut questions) = tokio::sync::mpsc::channel(4);
+        let mut initial = vec![call(
+            0,
+            "wire-search",
+            "mcp_search",
+            serde_json::json!({"query":"owned_echo"}),
+        )];
+        if same_response {
+            initial.push(call(1, "wire-hidden", "owned_echo", serde_json::json!({})));
+        }
+        server
+            .provider_streams
+            .lock()
+            .unwrap()
+            .push_back(completion(initial, None));
+        if !same_response {
+            server
+                .provider_streams
+                .lock()
+                .unwrap()
+                .push_back(completion(
+                    vec![call(0, "wire-effect", "owned_echo", serde_json::json!({}))],
+                    None,
+                ));
+            if !cost_cap {
+                server
+                    .provider_streams
+                    .lock()
+                    .unwrap()
+                    .push_back(completion(Vec::new(), Some("native owned terminal")));
+            }
+        }
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["mcp_search".into(), "owned_echo".into()],
+            ..Default::default()
+        };
+        let context = crate::context::load_for_workspace(true, Some(root.path()));
+        let client = crate::provider::create_client(
+            "mcp57",
+            Some("owned-inert-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let crate::provider::AnyModel::OpenAI(crate::provider::OpenAiModel::Completions(model)) =
+            client.completion_model("owned-model")
+        else {
+            panic!("owned fixture must use the native OpenAI completions converter");
+        };
+        let agent = crate::agent::builder::build_agent_inner(
+            model,
+            &cli,
+            &cfg,
+            &context,
+            workspace.clone(),
+            Some(permission.clone()),
+            Some(ask),
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace),
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
+            "owned-native-deferred-session",
+            None,
+            false,
+            None,
+            None,
+            #[cfg(feature = "js")]
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                reason: "MCP-only fixture does not start a JS worker".into(),
+            },
+            #[cfg(feature = "js")]
+            crate::extras::js::session::ScratchStore::default(),
+            #[cfg(feature = "skills")]
+            None,
+            Some(&manager),
+        )
+        .await;
+        let mut diagnostic_context = context.clone();
+        let mut diagnostic_session = Session::new(
+            "mcp57",
+            "owned-model",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        let mut diagnostic_app = app(
+            root.path(),
+            &cli,
+            &cfg,
+            &mut diagnostic_session,
+            &mut diagnostic_context,
+        );
+        diagnostic_app.ui.mcp_manager = Some(manager);
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let ledger = Arc::new(crate::spend::Ledger::new(&root.path().join("state")));
+        let spend = cost_cap.then(|| {
+            crate::spend::run::Run::fixture(
+                crate::spend::Account::new("owned-discovery-cap", Some(14.0), 0.0).unwrap(),
+                ledger.clone(),
+                "owned-discovery-cap",
+                crate::spend::PriceSnapshot::capture(
+                    Some((1_000_000.0, 0.0)),
+                    Default::default(),
+                    false,
+                ),
+            )
+        });
+        #[cfg(feature = "hooks")]
+        scope.set_hook_execution_root(root.path());
+        let assertions = std::panic::AssertUnwindSafe(async {
+            let retry = crate::retry::RetryConfig::default();
+            let mut turn = Box::pin(crate::spend::run::scope(spend.clone(),scope.run(crate::agent::runner::run_print(&agent, "discover then call", false, &retry, None, Vec::new(), #[cfg(feature = "hooks")] None))));
+            if !same_response && !denied_by_hook && !cost_cap {
+                let request = tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::select! {
+                        result = &mut turn => panic!("native activated tool still needs ordinary Ask: {result:?}"),
+                        request = questions.recv() => request.unwrap().into_permission(),
+                    }
+                }).await.unwrap();
+                assert_eq!(request.tool, "mcp_tool");
+                assert_eq!(request.input, "mcp_tool:owned:owned_echo");
+                assert_eq!(server.method_count("tools/call"), 0);
+                let wire = server.requests.lock().unwrap().iter().filter(|(route,_)| route.starts_with("POST /v1/chat/completions ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
+                assert_eq!(wire.len(),2);
+                assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(),["mcp_search"]);
+                let names = wire[1]["tools"].as_array().unwrap().iter().map(|tool|tool["function"]["name"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(names,std::collections::BTreeSet::from(["mcp_search","owned_echo"]));
+                let echo = wire[1]["tools"].as_array().unwrap().iter().find(|tool|tool["function"]["name"]=="owned_echo").unwrap();
+                assert_eq!(echo["function"]["parameters"],serde_json::json!({"type":"object","properties":{}}));
+                request.reply.send(crate::permission::ask::UserDecision::AllowOnce).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), &mut turn).await.unwrap();
+            if same_response {
+                assert!(result.expect_err("unadvertised hidden wire call must be rejected").to_string().contains("owned_echo"));
+            } else if cost_cap {
+                assert!(result.expect_err("canonical second response exhausts the cap before MCP effect").to_string().contains(crate::spend::run::BUDGET_STOP));
+                let run = spend.as_ref().unwrap();
+                assert_eq!((run.accepted_usage().input_tokens,run.accepted_usage().output_tokens),(14,6));
+                assert_eq!(run.account.snapshot().recorded_spend(),14.0);
+                assert!(!run.account.snapshot().tracking_error && !run.account.has_pending());
+                let totals = ledger.summary().unwrap().all_time;
+                assert_eq!((totals.records,totals.input_tokens,totals.output_tokens),(2,14,6));
+                assert_eq!(totals.known_cost,14.0);
+            } else {
+                let (answer,usage,_) = result.unwrap();
+                assert_eq!(answer,"native owned terminal");
+                assert_eq!((usage.input_tokens,usage.output_tokens),(21,9));
+            }
+            let cached_calls = server.method_count("tools/list");
+            assert_eq!(diagnostic_app.ui.mcp_manager.as_ref().unwrap().deferred_status("owned"), Some((1, usize::from(!same_response))));
+            assert_eq!(server.method_count("tools/list"), cached_calls, "cached deferred status must not perform an RPC");
+            command(&mut diagnostic_app, "/mcp").await;
+            let rendered = diagnostic_app.renderer.captured_output();
+            assert!(rendered.contains("schema loading: Deferred"));
+            assert!(rendered.contains(&format!("1 deferred schemas, {} enabled by search",usize::from(!same_response))));
+            assert_eq!(server.method_count("tools/list"),cached_calls,"actual cached status command must not query the server");
+            assert!(questions.try_recv().is_err());
+            assert_eq!(server.method_count("tools/call"),usize::from(!same_response && !denied_by_hook && !cost_cap));
+            assert!(server.provider_streams.lock().unwrap().is_empty());
+            assert!(matches!(permission.lock().unwrap().check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"), crate::permission::checker::CheckResult::Ask));
+            let wire = server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/chat/completions ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
+            assert_eq!(wire.len(),if same_response{1}else if cost_cap{2}else{3});
+            if let Some(mode) = hook {
+                let calls = server.requests.lock().unwrap().iter().filter(|(_,body)|body["method"]=="tools/call").map(|(_,body)|body.clone()).collect::<Vec<_>>();
+                let model_tool_results = serde_json::to_string(&wire[2]["messages"]).unwrap();
+                if mode == "deny" {
+                    assert!(calls.is_empty());
+                    assert!(model_tool_results.contains("owned deferred hook denial"));
+                } else {
+                    assert_eq!(calls.len(),1);
+                    assert_eq!(calls[0]["params"]["arguments"],serde_json::json!({"owned_hook_argument":"actual"}));
+                    assert!(model_tool_results.contains("[REDACTED]"));
+                    assert!(!model_tool_results.contains("actual owned echo"));
+                }
+            }
+            let prefix = serde_json::to_string(&wire[0]["messages"]).unwrap();
+            assert!(prefix.contains("<mcp_tool_index>") && prefix.contains("owned_echo"), "compact index must reach the actual native request system prefix");
+            assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(),["mcp_search"]);
+        }).catch_unwind().await;
+        scope.cancellation_handle().cancel();
+        tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+            .await
+            .expect("wire fixture work must settle");
+        drop(agent);
+        assert_eq!(
+            diagnostic_app
+                .ui
+                .mcp_manager
+                .as_ref()
+                .unwrap()
+                .deferred_status("owned"),
+            None,
+            "manager status must not retain a strong discovery/SDK owner"
+        );
+        let manager = diagnostic_app.ui.mcp_manager.take().unwrap();
+        diagnostic_app.retire_mcp_work().await.unwrap();
+        drop(diagnostic_app);
+        manager.shutdown().await;
+        server.finish().await;
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Complete actual builder/SDK requests, not hand-calculated threshold input.
+/// The deterministic estimator proves this fixture's reduced schema footprint;
+/// it does not claim a provider tokenizer or signed-cache-prefix hit rate.
+#[tokio::test]
+async fn actual_builder_auto_threshold_cli_ceiling_and_deferred_token_estimate() {
+    use crate::tests::fake_model::{MockCompletionModel, MockStreamEvent};
+    use futures::FutureExt;
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let mut deferred_estimate = None;
+    let mut eager_estimate = None;
+    for (defer, count, selected, search, expected_count) in [
+        (serde_json::json!("auto"), 32, false, true, 32),
+        (serde_json::json!("auto"), 33, false, true, 1),
+        (serde_json::json!(false), 33, false, true, 33),
+        (serde_json::json!(true), 33, false, true, 1),
+        (serde_json::json!("auto"), 33, true, true, 1),
+        (serde_json::json!(true), 33, true, false, 1),
+        (serde_json::json!(true), 33, false, false, 33),
+    ] {
+        let root = crate::tests::OwnedTestDirectory::new("mcp-builder-threshold");
+        let _environment = environment(root.path());
+        let server = Server::new(false).await;
+        server
+            .catalogue_count
+            .store(count, std::sync::atomic::Ordering::Release);
+        let base = config(root.path(), &server);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+        let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true,"defer":defer}}}).to_string();
+        crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), raw.as_bytes())
+            .unwrap();
+        config::approve_project_mcp(
+            &paths,
+            &workspace,
+            &crate::extras::mcp::project::digest(&raw),
+        )
+        .unwrap();
+        let cfg = config::mcp_config_in_workspace_at(
+            &workspace,
+            base.provenance.global_file.as_ref().unwrap(),
+        )
+        .unwrap();
+        let manager =
+            crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+        let mut tools = if selected {
+            vec!["owned_00".into()]
+        } else {
+            (0..count)
+                .map(|index| format!("owned_{index:02}"))
+                .collect()
+        };
+        if search {
+            tools.push("mcp_search".into());
+        }
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools,
+            ..Default::default()
+        };
+        let context = crate::context::load_for_workspace(true, Some(root.path()));
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("counted terminal"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = deferred_mock_agent(
+            model.clone(),
+            &cli,
+            &cfg,
+            &context,
+            &workspace,
+            &manager,
+            "owned-threshold-session",
+        )
+        .await;
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let assertions = std::panic::AssertUnwindSafe(async {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                scope.run(crate::agent::runner::run_print(
+                    &agent,
+                    "measure definitions",
+                    false,
+                    &crate::retry::RetryConfig::default(),
+                    None,
+                    Vec::new(),
+                    #[cfg(feature = "hooks")]
+                    None,
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.0, "counted terminal");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1);
+            let definitions = &requests[0].tools;
+            // Rig prepends the preamble as a System message and deliberately
+            // clears the separate preamble field before invoking the carrier.
+            let actual_prefix = serde_json::to_string(&requests[0].chat_history).unwrap();
+            assert_eq!(
+                definitions.len(),
+                expected_count,
+                "defer={defer} count={count} selected={selected} search={search}"
+            );
+            let deferred = search
+                && !selected
+                && (defer == serde_json::json!(true)
+                    || defer == serde_json::json!("auto") && count > 32);
+            if deferred {
+                assert_eq!(definitions[0].name, "mcp_search");
+                let preamble = &actual_prefix;
+                assert!(preamble.contains("owned_00") && preamble.contains("owned_32"));
+                assert!(
+                    !preamble.contains("captured description")
+                        && !preamble.contains("captured schema")
+                );
+            }
+            if selected && defer == serde_json::json!("auto") {
+                assert_eq!(
+                    definitions[0].name, "owned_00",
+                    "CLI ceiling is applied before the automatic threshold"
+                );
+            }
+            if !search {
+                let expected: Vec<_> = if selected {
+                    vec!["owned_00".to_owned()]
+                } else {
+                    (0..count)
+                        .map(|index| format!("owned_{index:02}"))
+                        .collect()
+                };
+                assert_eq!(
+                    definitions
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "excluding discovery must retain exactly the CLI-admitted MCP schemas eagerly"
+                );
+                assert!(!actual_prefix.contains("<mcp_tool_index>"));
+            }
+            if count == 33 && !selected {
+                let serialized = serde_json::to_string(definitions).unwrap();
+                let estimate =
+                    Session::estimate_tokens(&format!("{}\n{}", actual_prefix, serialized));
+                if defer == serde_json::json!("auto") {
+                    deferred_estimate = Some(estimate);
+                }
+                if defer == serde_json::json!(false) {
+                    eager_estimate = Some(estimate);
+                }
+            }
+            assert_eq!(server.method_count("tools/call"), 0);
+            assert!(server.provider_streams.lock().unwrap().is_empty());
+            server.assert_no_provider_request();
+        })
+        .catch_unwind()
+        .await;
+        scope.cancellation_handle().cancel();
+        tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+            .await
+            .unwrap();
+        drop(agent);
+        manager.shutdown().await;
+        server.finish().await;
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+    assert!(
+        deferred_estimate.unwrap() * 4 < eager_estimate.unwrap(),
+        "this bounded schema fixture must reduce estimated context by more than75%"
+    );
+}
+
+async fn deferred_mock_agent(
+    model: crate::tests::fake_model::MockCompletionModel,
+    cli: &crate::cli::Cli,
+    cfg: &config::Config,
+    context: &crate::context::ContextFiles,
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
+    manager: &crate::extras::mcp::McpClientManager,
+    session_id: &str,
+) -> rig::agent::Agent<crate::tests::fake_model::MockCompletionModel> {
+    crate::agent::builder::build_agent_inner(
+        model.clone(),
+        cli,
+        cfg,
+        context,
+        workspace.clone(),
+        None,
+        None,
+        crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone()),
+        crate::agent::tools::ReadTracker::new(true),
+        crate::agent::tools::TodoStore::default(),
+        #[cfg(feature = "goal")]
+        crate::extras::goal::GoalStore::default(),
+        session_id,
+        None,
+        false,
+        None,
+        None,
+        #[cfg(feature = "js")]
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+            backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+            assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            reason: "MCP-only fixture does not start a JS worker".into(),
+        },
+        #[cfg(feature = "js")]
+        crate::extras::js::session::ScratchStore::default(),
+        #[cfg(feature = "skills")]
+        None,
+        Some(manager),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn actual_deferred_builder_rebuild_retains_only_same_catalogue_session_and_workspace() {
+    use crate::tests::fake_model::{MockCompletionModel, MockStreamEvent};
+    use futures::FutureExt;
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("mcp-discovery-rebuild");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+    let raw = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true,"defer":true}}}).to_string();
+    crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), raw.as_bytes()).unwrap();
+    config::approve_project_mcp(
+        &paths,
+        &workspace,
+        &crate::extras::mcp::project::digest(&raw),
+    )
+    .unwrap();
+    let cfg = config::mcp_config_in_workspace_at(
+        &workspace,
+        base.provenance.global_file.as_ref().unwrap(),
+    )
+    .unwrap();
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let cli = crate::cli::Cli {
+        no_session: true,
+        tools: vec!["mcp_search".into(), "owned_echo".into()],
+        ..Default::default()
+    };
+    let context = crate::context::load_for_workspace(true, Some(root.path()));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let assertions = std::panic::AssertUnwindSafe(async {
+        for (index, session_id, new_binding, hide_search, discover, expected) in [
+            (0, "rebuild-owned", false, false, true, 1),
+            (1, "rebuild-owned", false, false, false, 2),
+            (2, "rebuild-foreign", false, false, false, 1),
+            (3, "rebuild-owned", false, true, false, 1),
+            (4, "rebuild-owned", false, false, false, 1),
+            (5, "rebuild-owned", false, false, true, 1),
+            (6, "rebuild-owned", true, false, false, 1),
+            (7, "rebuild-owned", false, false, true, 1),
+            (8, "rebuild-owned", false, false, false, 0),
+            (9, "rebuild-owned", false, false, false, 1),
+            (10, "rebuild-owned", false, false, true, 1),
+            (11, "rebuild-owned", false, false, false, 1),
+            (12, "rebuild-owned", false, false, false, 1),
+        ] {
+            let selected = if new_binding {
+                Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap())
+            } else {
+                workspace.clone()
+            };
+            let mut selected_cli = cli.clone();
+            selected_cli.no_tools = index == 8;
+            let mut selected_cfg = cfg.clone();
+            if index == 11 {
+                let crate::extras::mcp::config::McpServerConfig::Url { defer, .. } = selected_cfg
+                    .mcp_servers
+                    .as_mut()
+                    .unwrap()
+                    .get_mut("owned")
+                    .unwrap()
+                else {
+                    panic!("owned URL fixture");
+                };
+                *defer = crate::extras::mcp::config::McpDefer::Eager;
+            }
+            if hide_search {
+                selected_cli.tools = vec!["owned_echo".into()];
+            }
+            let mut turns = Vec::new();
+            if discover {
+                turns.push(vec![
+                    MockStreamEvent::tool_call(
+                        "owned-rebuild-search",
+                        "mcp_search",
+                        serde_json::json!({"query":"owned_echo"}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ]);
+            }
+            turns.push(vec![
+                MockStreamEvent::text("rebuild terminal"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+            let model = MockCompletionModel::from_stream_turns(turns);
+            // Clone the actual retained ContextFiles, as production rebuilds do.
+            let rebuilt_context = context.clone();
+            let agent = deferred_mock_agent(
+                model.clone(),
+                &selected_cli,
+                &selected_cfg,
+                &rebuilt_context,
+                &selected,
+                &manager,
+                session_id,
+            )
+            .await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                scope.run(crate::agent::runner::run_print(
+                    &agent,
+                    "rebuild",
+                    false,
+                    &crate::retry::RetryConfig::default(),
+                    None,
+                    Vec::new(),
+                    #[cfg(feature = "hooks")]
+                    None,
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.0, "rebuild terminal");
+            let requests = model.requests();
+            assert_eq!(requests.len(), if discover { 2 } else { 1 }, "case {index}");
+            assert_eq!(
+                requests[0].tools.len(),
+                expected,
+                "case {index} must bind exactly current session/catalogue/workspace"
+            );
+            if hide_search {
+                assert_eq!(requests[0].tools[0].name, "owned_echo");
+            }
+            if discover {
+                assert_eq!(requests[1].tools.len(), 2);
+            }
+            assert_eq!(
+                server.method_count("tools/call"),
+                0,
+                "schema activation never executes candidates"
+            );
+            drop(agent);
+        }
+        server.assert_no_provider_request();
+    })
+    .catch_unwind()
+    .await;
+    scope.cancellation_handle().cancel();
+    tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+        .await
+        .expect("owned rebuild work must settle");
+    manager.shutdown().await;
+    server.finish().await;
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A deterministic reproduction of the documented native prefix restriction.
+/// The endpoint compares concrete SDK request bodies; canary signatures are
+/// deliberately inert and no cryptographic/server acceptance is claimed.
+async fn native_deferred_case(case: &str) {
+    let deny = case == "deny";
+    let eager = case == "eager";
+    let requested_model = if eager {
+        "claude-opus-4-1"
+    } else {
+        "claude-opus-5-5"
+    };
+    let no_effect = matches!(case, "invalid" | "same-response" | "redact" | "terminate");
+    use futures::FutureExt;
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("mcp-anthropic-prefix-witness");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let global = base.provenance.global_file.as_ref().unwrap();
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(global).unwrap()).unwrap();
+    raw["custom_providers"]["mcp57"] = serde_json::json!({"provider_type":"anthropic","base_url":format!("http://{}",server.address)});
+    crate::fs::private_atomic_write_sync(global, raw.to_string().as_bytes()).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let paths = crate::paths::AppPaths::from_process(Some(root.path().to_path_buf())).unwrap();
+    let project = serde_json::json!({"mcpServers":{"owned":{"url":server.url(),"allow_local":true,"defer":true}}}).to_string();
+    crate::fs::private_atomic_create_sync(&root.path().join(".mcp.json"), project.as_bytes())
+        .unwrap();
+    config::approve_project_mcp(
+        &paths,
+        &workspace,
+        &crate::extras::mcp::project::digest(&project),
+    )
+    .unwrap();
+    let cfg = config::mcp_config_in_workspace_at(&workspace, global).unwrap();
+    let mut manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let cli = crate::cli::Cli {
+        no_session: true,
+        tools: vec!["mcp_search".into(), "owned_echo".into()],
+        ..Default::default()
+    };
+    let context = crate::context::load_for_workspace(true, Some(root.path()));
+    let client = crate::provider::create_client(
+        "mcp57",
+        Some("owned-inert-key"),
+        &cfg.custom_providers_map(),
+        None,
+    )
+    .unwrap();
+    let crate::provider::AnyModel::Anthropic(model) = client.completion_model(requested_model)
+    else {
+        panic!("owning exact native Anthropic converter required");
+    };
+    let model = if case == "cached-1h" {
+        model.with_automatic_caching_1h()
+    } else {
+        model
+    };
+    let mut events = vec![
+        serde_json::json!({"type":"message_start","message":{"id":"owned-anthropic-search","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"owned canonical thought"}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"owned-inert-signature"}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"owned-search-call","name":"mcp_search","input":{}}}),
+        serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"owned_echo\"}"}}),
+        serde_json::json!({"type":"content_block_stop","index":1}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":3}}),
+        serde_json::json!({"type":"message_stop"}),
+    ];
+    if eager {
+        events[0]["message"]["model"] = serde_json::json!(requested_model);
+        events[5]["content_block"]["name"] = serde_json::json!("owned_echo");
+        events[6]["delta"]["partial_json"] = serde_json::json!("{}");
+    }
+    if case == "invalid" {
+        events[6]["delta"]["partial_json"] = serde_json::json!("{\"query\":\"\"}");
+    }
+    if case == "same-response" {
+        events.splice(8..8, [
+                serde_json::json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"owned-hidden-call","name":"owned_echo","input":{}}}),
+                serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                serde_json::json!({"type":"content_block_stop","index":2}),
+            ]);
+    }
+    let stream = events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    fn sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+    server.provider_streams.lock().unwrap().extend([
+        stream,
+        sse(&[
+            serde_json::json!({"type":"message_start","message":{"id":"owned-anthropic-echo","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"owned-echo-call","name":"owned_echo","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":3}}),
+            serde_json::json!({"type":"message_stop"}),
+        ]),
+        sse(&[
+            serde_json::json!({"type":"message_start","message":{"id":"owned-anthropic-done","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"owned native terminal"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}),
+            serde_json::json!({"type":"message_stop"}),
+        ]),
+    ]);
+    if eager || no_effect && case != "same-response" {
+        server.provider_streams.lock().unwrap().remove(1);
+    }
+    let permission = Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs {
+                glob: crate::permission::PermissionConfig {
+                    default: Some(crate::permission::Action::Ask),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap(),
+    ));
+    let (ask, mut questions) = tokio::sync::mpsc::channel(4);
+    let mut agent = crate::agent::builder::build_agent_inner(
+        model,
+        &cli,
+        &cfg,
+        &context,
+        workspace.clone(),
+        Some(permission.clone()),
+        Some(ask),
+        crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace),
+        crate::agent::tools::ReadTracker::new(true),
+        crate::agent::tools::TodoStore::default(),
+        #[cfg(feature = "goal")]
+        crate::extras::goal::GoalStore::default(),
+        "owned-anthropic-deferred",
+        None,
+        true,
+        None,
+        Some(if eager {
+            serde_json::json!({"thinking":{"type":"enabled","budget_tokens":1024}})
+        } else {
+            serde_json::json!({"thinking":{"type":"adaptive"}})
+        }),
+        #[cfg(feature = "js")]
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+            backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+            assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            reason: "MCP-only native witness".into(),
+        },
+        #[cfg(feature = "js")]
+        crate::extras::js::session::ScratchStore::default(),
+        #[cfg(feature = "skills")]
+        None,
+        Some(&manager),
+    )
+    .await;
+    struct ReferencePolicy(bool);
+    impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for ReferencePolicy {
+        async fn on_event(
+            &self,
+            _: &rig::agent::HookContext,
+            event: rig::agent::StepEvent<'_, M>,
+        ) -> rig::agent::Flow {
+            if matches!(
+                event,
+                rig::agent::StepEvent::ToolResult {
+                    tool_name: "mcp_search",
+                    ..
+                }
+            ) {
+                if self.0 {
+                    rig::agent::Flow::terminate("owned discovery termination")
+                } else {
+                    rig::agent::Flow::rewrite_result("owned redacted discovery")
+                }
+            } else {
+                rig::agent::Flow::Continue
+            }
+        }
+    }
+    if matches!(case, "redact" | "terminate") {
+        agent.hooks.push(ReferencePolicy(case == "terminate"));
+    }
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let assertions = std::panic::AssertUnwindSafe(async {
+        let retry = crate::retry::RetryConfig::default();
+        let turn = scope.run(crate::agent::runner::run_print(&agent,"discover",false,&retry,None,Vec::new(),#[cfg(feature = "hooks")] None));
+        tokio::pin!(turn);
+        if !no_effect {
+            let request = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    result = &mut turn => panic!("native activated tool requires actual Ask: {result:?}"),
+                    request = questions.recv() => request.unwrap().into_permission(),
+                }
+            }).await.unwrap();
+            assert_eq!(request.tool,"mcp_tool");
+            assert_eq!(request.input,"mcp_tool:owned:owned_echo");
+            assert_eq!(server.method_count("tools/call"),0);
+            request.reply.send(if deny { crate::permission::ask::UserDecision::Deny } else { crate::permission::ask::UserDecision::AllowOnce }).unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), &mut turn).await.unwrap();
+        if matches!(case, "same-response" | "terminate") {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(if case == "terminate" {"owned discovery termination"} else {"UnknownToolCall"}), "{error}");
+        } else { assert_eq!(result.unwrap().0,"owned native terminal"); }
+        let wire = server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/messages ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
+        assert_eq!(wire.len(),if matches!(case,"same-response" | "terminate") {1} else if no_effect || eager {2} else {3}, "{case}");
+        let raw_prefixes=server.native_raw_prefixes.lock().unwrap();
+        assert_eq!(raw_prefixes.len(),wire.len());
+        assert!(raw_prefixes.iter().all(|prefix|prefix==&raw_prefixes[0]),"native system/tools bytes changed: {case}");
+        assert!(server.anthropic_prefix.lock().unwrap().is_some());
+        if eager {
+            assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect::<Vec<_>>(),["owned_echo"]);
+            assert!(wire[0]["tools"][0].get("defer_loading").is_none());
+            assert!(manager.take_notices().iter().any(|notice| notice.contains("remain eager")));
+        } else {
+            assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect::<Vec<_>>(),["mcp_search","owned_echo"]);
+            assert_eq!(wire[0]["tools"][1]["defer_loading"],true);
+            assert!(wire[0]["tools"][0].get("defer_loading").is_none());
+        }
+        let expected_marker = if case == "cached-1h" {serde_json::json!({"type":"ephemeral","ttl":"1h"})} else {serde_json::json!({"type":"ephemeral"})};
+        let native_tools = wire[0]["tools"].as_array().unwrap();
+        let cacheable = native_tools.iter().filter(|tool|tool["defer_loading"]!=true).collect::<Vec<_>>();
+        assert_eq!(cacheable.last().unwrap()["cache_control"],expected_marker);
+        assert_eq!(native_tools.iter().filter(|tool|tool.get("cache_control").is_some()).count(),1);
+        assert!(native_tools.iter().filter(|tool|tool["defer_loading"]==true).all(|tool|tool.get("cache_control").is_none()));
+        assert_eq!(wire[0]["system"].as_array().unwrap().last().unwrap()["cache_control"],expected_marker);
+        if case == "cached-1h" {
+            assert_eq!(wire[0]["cache_control"],expected_marker);
+        }
+        for request in wire.iter().skip(1) {
+            assert_eq!(wire[0]["cache_control"],request["cache_control"],"{case}");
+            assert_eq!(wire[0]["tools"],request["tools"],"{case}");
+            assert_eq!(wire[0]["system"],request["system"],"{case}");
+        }
+        if wire.len() > 1 {
+            let results = wire[1]["messages"].as_array().unwrap().iter().flat_map(|message| message["content"].as_array().unwrap()).filter(|block|block["type"]=="tool_result").collect::<Vec<_>>();
+            assert_eq!(results.len(),1);
+            assert_eq!(results[0]["tool_use_id"],"owned-search-call");
+            let references = results[0]["content"].as_array().unwrap().iter().filter(|block|block["type"]=="tool_reference").collect::<Vec<_>>();
+            if no_effect || eager { assert!(references.is_empty(),"{case}"); }
+            else { assert_eq!(references,vec![&serde_json::json!({"type":"tool_reference","tool_name":"owned_echo"})]); }
+            if case == "redact" {
+                assert_eq!(results[0]["content"],serde_json::json!([{"type":"text","text":"owned redacted discovery"}]));
+            }
+            let thinking=wire[1]["messages"].as_array().unwrap().iter().filter(|message|message["role"]=="assistant").flat_map(|message|message["content"].as_array().unwrap()).filter(|block|block["type"]=="thinking").collect::<Vec<_>>();
+            assert_eq!(thinking.len(),1,"completed native projection must not replay unsigned chunk fragments");
+            assert_eq!(thinking[0],&serde_json::json!({"type":"thinking","thinking":"owned canonical thought","signature":"owned-inert-signature"}));
+        }
+        assert_eq!(server.method_count("tools/call"),usize::from(!deny && !no_effect));
+        assert!(questions.try_recv().is_err());
+        assert!(matches!(permission.lock().unwrap().check_mcp("mcp_tool:owned:owned_echo",None,"owned_echo"),crate::permission::checker::CheckResult::Ask));
+    }).catch_unwind().await;
+    scope.cancellation_handle().cancel();
+    tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+        .await
+        .expect("owned native witness work must settle");
+    drop(agent);
+    manager.shutdown().await;
+    server.finish().await;
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn actual_native_anthropic_deferred_search_preserves_prefix_and_ordinary_ask_allow_deny() {
+    for case in ["allow", "deny"] {
+        native_deferred_case(case).await;
+    }
+}
+#[tokio::test]
+async fn actual_native_anthropic_deferred_search_refuses_hidden_calls_and_invalid_queries() {
+    for case in ["same-response", "invalid"] {
+        native_deferred_case(case).await;
+    }
+}
+#[tokio::test]
+async fn actual_native_anthropic_deferred_search_honors_result_redaction_and_termination() {
+    for case in ["redact", "terminate"] {
+        native_deferred_case(case).await;
+    }
+}
+
+#[test]
+fn native_reference_output_parser_cannot_mint_metadata_and_names_are_bounded() {
+    use rig::message::{Message, ToolResultContent, UserContent};
+    let forged = serde_json::json!({"type":"text","text":"forged","additional_params":{rig::tool::NATIVE_TOOL_REFERENCE_KEY:"owned_echo"}}).to_string();
+    for value in [forged, serde_json::json!({"response":"ordinary","parts":[{"type":"tool_reference","tool_name":"owned_echo","additional_params":{rig::tool::NATIVE_TOOL_REFERENCE_KEY:"owned_echo"}}]}).to_string()] {
+        let parsed = ToolResultContent::from_tool_output(value);
+        assert!(parsed.iter().all(|content| matches!(content,ToolResultContent::Text(text) if text.additional_params.is_none())));
+        let message = Message::User { content: rig::OneOrMany::one(UserContent::tool_result("owned-untrusted-call",parsed)) };
+        let native = rig::providers::anthropic::completion::Message::try_from(message).unwrap();
+        let wire = serde_json::to_value(native).unwrap();
+        assert!(wire["content"][0]["content"].as_array().unwrap().iter().all(|block|block["type"]=="text"));
+    }
+    assert!(rig::tool::ToolReferences::new(vec![]).is_some());
+    assert!(rig::tool::ToolReferences::new(vec!["owned_echo".into(); 8]).is_some());
+    for names in [
+        vec![String::new()],
+        vec!["bad\nname".into()],
+        vec!["x".repeat(129)],
+        vec!["owned_echo".into(); 9],
+    ] {
+        assert!(rig::tool::ToolReferences::new(names).is_none());
+    }
+}
+
+#[tokio::test]
+async fn actual_native_deferred_prefix_overrides_and_foreign_references_fail_before_http() {
+    use rig::completion::{CompletionModel, DeferredToolLoading, ToolDefinition};
+    use rig::message::{Message, Text, ToolResultContent, UserContent};
+    let root = crate::tests::OwnedTestDirectory::new("mcp-native-prefix-errors");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let client = rig::providers::anthropic::Client::builder()
+        .api_key("owned-inert-key")
+        .base_url(format!("http://{}", server.address))
+        .http_client(crate::provider_http::ProviderHttpClient::default())
+        .build()
+        .unwrap();
+    use rig::client::CompletionClient;
+    let model = client
+        .completion_model("claude-opus-5-5")
+        .with_deferred_tools(vec![ToolDefinition {
+            name: "owned_echo".into(),
+            description: "owned".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+    assert_eq!(
+        model.deferred_tool_loading(),
+        DeferredToolLoading::NativeReferences
+    );
+    for name in [
+        "claude-opus-4-1",
+        "claude-opus-5-unknown",
+        "claude-opus-4-6-custom",
+        "display-alias",
+    ] {
+        assert_eq!(
+            client.completion_model(name).deferred_tool_loading(),
+            DeferredToolLoading::Eager
+        );
+    }
+    let mut requests = Vec::new();
+    for extra in [
+        serde_json::json!({"model":"other"}),
+        serde_json::json!({"system":"other"}),
+        serde_json::json!({"messages":[]}),
+        serde_json::json!({"tools":[{"name":"owned_echo"}]}),
+        serde_json::json!({"tools":{}}),
+        serde_json::json!(false),
+    ] {
+        requests.push(
+            model
+                .completion_request("owned")
+                .max_tokens(64)
+                .additional_params(extra)
+                .build(),
+        );
+    }
+    requests.push(
+        model
+            .completion_request("owned")
+            .max_tokens(64)
+            .model("claude-opus-4-1")
+            .build(),
+    );
+    for marker in [serde_json::json!("foreign_tool"), serde_json::json!({})] {
+        let result = UserContent::tool_result(
+            "owned-imported-id",
+            rig::OneOrMany::one(ToolResultContent::Text(Text {
+                text: String::new(),
+                additional_params: Some(
+                    serde_json::json!({rig::tool::NATIVE_TOOL_REFERENCE_KEY:marker}),
+                ),
+            })),
+        );
+        requests.push(
+            model
+                .completion_request("owned")
+                .max_tokens(64)
+                .message(Message::User {
+                    content: rig::OneOrMany::one(result),
+                })
+                .build(),
+        );
+    }
+    let assertions = std::panic::AssertUnwindSafe(async {
+        let invalid_model = client
+            .completion_model("claude-opus-5-5")
+            .with_deferred_tools(vec![ToolDefinition {
+                name: "x".repeat(129),
+                description: "owned".into(),
+                parameters: serde_json::json!({}),
+            }]);
+        let invalid_request = invalid_model
+            .completion_request("owned")
+            .max_tokens(64)
+            .build();
+        let error = match tokio::time::timeout(
+            Duration::from_secs(3),
+            invalid_model.stream(invalid_request),
+        )
+        .await
+        .unwrap()
+        {
+            Ok(_) => panic!("invalid captured declaration must fail before HTTP"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid captured native tool-reference name")
+        );
+        for request in requests {
+            let error = match tokio::time::timeout(Duration::from_secs(3), model.stream(request))
+                .await
+                .unwrap()
+            {
+                Ok(_) => panic!("conflicting native prefix must fail before HTTP"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("captured")
+                    || error.to_string().contains("Deferred native model changed")
+                    || error.to_string().contains("Native deferred request extras")
+                    || error.to_string().contains("Invalid native tools override"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            server.accepted.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+    });
+    use futures::FutureExt;
+    let assertions = assertions.catch_unwind().await;
+    server.finish().await;
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn actual_native_anthropic_unsupported_model_keeps_eager_schema_and_ordinary_ask() {
+    native_deferred_case("eager").await;
+}
+
+#[tokio::test]
+async fn actual_native_anthropic_deferred_cache_markers_keep_selected_one_hour_prefix() {
+    native_deferred_case("cached-1h").await;
 }

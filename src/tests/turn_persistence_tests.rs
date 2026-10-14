@@ -52,6 +52,8 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
             // Empty explicit context: this handler test must not load personal
             // prompts, credentials, memory, or contact a provider.
             let mut context = crate::context::ContextFiles {
+                #[cfg(feature = "mcp")]
+                mcp_discovery: Default::default(),
                 workspace_root: workspace.root().to_path_buf(),
                 agents: None,
                 prompts: Default::default(),

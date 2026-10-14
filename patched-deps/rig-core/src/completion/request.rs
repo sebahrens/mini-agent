@@ -610,7 +610,27 @@ impl AddAssign for Usage {
 /// Trait defining a completion model that can be used to generate completion responses.
 /// This trait is meant to be implemented by the user to define a custom completion model,
 /// either from a third party provider (e.g.: OpenAI) or a local model.
+/// How a native request represents discovery of a captured tool catalogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredToolLoading {
+    /// Runtime schemas may be added between requests.
+    Dynamic,
+    /// Declare every captured schema once and return native tool references.
+    NativeReferences,
+    /// The requested native model cannot use deferred references; declare eagerly.
+    Eager,
+}
+
 pub trait CompletionModel: Clone + WasmCompatSend + WasmCompatSync {
+    fn deferred_tool_loading(&self) -> DeferredToolLoading {
+        DeferredToolLoading::Dynamic
+    }
+
+    /// Install host-captured declarations. This never registers executable tools.
+    fn with_deferred_tools(self, _tools: Vec<ToolDefinition>) -> Self {
+        self
+    }
+
     /// The raw response type returned by the underlying completion model.
     type Response: WasmCompatSend + WasmCompatSync + Serialize + DeserializeOwned;
     /// The raw response type returned by the underlying completion model when streaming.

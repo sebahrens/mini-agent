@@ -1463,6 +1463,7 @@ fn client_mcp_servers(
                 stdio.name.clone(),
                 McpServerConfig::Command {
                     command: stdio.command.to_string_lossy().into_owned(),
+                    defer: Default::default(),
                     args: stdio.args.clone(),
                     cwd: None,
                     env: stdio
@@ -5213,6 +5214,7 @@ mod protocol_tests {
                 McpServerConfig::Url {
                     allow_local: false,
                     url: "https://configured.example/mcp".to_string(),
+                    defer: Default::default(),
                     headers: HashMap::new(),
                     oauth: None,
                 },

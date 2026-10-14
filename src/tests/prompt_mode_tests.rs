@@ -10,6 +10,8 @@ use crate::ui::{PromptModeOutcome, apply_main_agent, apply_prompt_mode};
 
 fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
     ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: std::env::current_dir().unwrap(),
         agents: None,
         prompts: prompts

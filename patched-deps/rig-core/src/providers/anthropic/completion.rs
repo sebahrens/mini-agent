@@ -948,6 +948,7 @@ fn anthropic_document_additional_params(
 pub enum ToolResultContent {
     Text { text: String },
     Image { source: ImageSource },
+    ToolReference { tool_name: String },
 }
 
 impl FromStr for ToolResultContent {
@@ -1242,8 +1243,17 @@ impl TryFrom<message::Message> for Message {
                     }) => Ok(Content::ToolResult {
                         tool_use_id: id,
                         content: content.try_map(|content| match content {
-                            message::ToolResultContent::Text(message::Text { text, .. }) => {
-                                Ok(ToolResultContent::Text { text })
+                            message::ToolResultContent::Text(message::Text { text, additional_params }) => {
+                                match additional_params.as_ref().and_then(|params|
+                                    params.get(crate::tool::NATIVE_TOOL_REFERENCE_KEY)) {
+                                    None => Ok(ToolResultContent::Text { text }),
+                                    Some(serde_json::Value::String(name))
+                                        if crate::tool::ToolReferences::new(vec![name.clone()]).is_some() => {
+                                            Ok(ToolResultContent::ToolReference { tool_name: name.clone() })
+                                        }
+                                    Some(_) => Err(MessageError::ConversionError(
+                                        "Invalid native tool reference replay data".into())),
+                                }
                             }
                             message::ToolResultContent::Image(image) => {
                                 let DocumentSourceKind::Base64(data) = image.data else {
@@ -1456,6 +1466,14 @@ impl TryFrom<Content> for message::AssistantContent {
 impl From<ToolResultContent> for message::ToolResultContent {
     fn from(content: ToolResultContent) -> Self {
         match content {
+            ToolResultContent::ToolReference { tool_name } => {
+                message::ToolResultContent::Text(message::Text {
+                    text: String::new(),
+                    additional_params: Some(
+                        serde_json::json!({crate::tool::NATIVE_TOOL_REFERENCE_KEY: tool_name}),
+                    ),
+                })
+            }
             ToolResultContent::Text { text, .. } => message::ToolResultContent::text(text),
             ToolResultContent::Image { source } => match source {
                 ImageSource::Base64 { data, media_type } => {
@@ -1596,6 +1614,8 @@ pub struct GenericCompletionModel<Ext = super::client::AnthropicExt, T = reqwest
     /// TTL for automatic caching. `None` uses the API default (5 minutes).
     /// Set to `Some(CacheTtl::OneHour)` for a 1-hour TTL.
     pub automatic_caching_ttl: Option<CacheTtl>,
+    /// Immutable host-captured catalogue; not a runtime executable registry.
+    deferred_tools: std::sync::Arc<[completion::ToolDefinition]>,
 }
 
 /// Anthropic completion model.
@@ -1621,6 +1641,7 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            deferred_tools: Default::default(),
         }
     }
 
@@ -1633,7 +1654,109 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            deferred_tools: Default::default(),
         }
+    }
+
+    /// Project the captured catalogue before either native request path. Raw
+    /// tool overrides cannot shadow a declaration. Activated registry entries
+    /// are excluded from HTTP tools; their executable/permission owners remain
+    /// in the ordinary ToolServer.
+    pub(super) fn prepare_deferred_request(
+        &self,
+        request: &mut completion::CompletionRequest,
+    ) -> Result<(), CompletionError> {
+        for message in request.chat_history.iter() {
+            if let message::Message::User { content } = message {
+                for content in content.iter() {
+                    if let message::UserContent::ToolResult(result) = content {
+                        for content in result.content.iter() {
+                            if let message::ToolResultContent::Text(text) = content
+                                && let Some(reference) =
+                                    text.additional_params.as_ref().and_then(|params| {
+                                        params.get(crate::tool::NATIVE_TOOL_REFERENCE_KEY)
+                                    })
+                                && !reference.as_str().is_some_and(|name| {
+                                    self.deferred_tools.iter().any(|tool| tool.name == name)
+                                })
+                            {
+                                return Err(CompletionError::RequestError(
+                                    "Native tool reference is outside the captured catalogue"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.deferred_tools.is_empty() {
+            return Ok(());
+        }
+        if request
+            .model
+            .as_ref()
+            .is_some_and(|model| model != &self.model)
+        {
+            return Err(CompletionError::RequestError(
+                "Deferred native model changed".into(),
+            ));
+        }
+        if self
+            .deferred_tools
+            .iter()
+            .any(|tool| crate::tool::ToolReferences::new(vec![tool.name.clone()]).is_none())
+        {
+            return Err(CompletionError::RequestError(
+                "Invalid captured native tool-reference name".into(),
+            ));
+        }
+        let owns = |name: &str| self.deferred_tools.iter().any(|tool| tool.name == name);
+        request.tools.retain(|tool| !owns(&tool.name));
+        let mut extras = request
+            .additional_params
+            .take()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if extras.is_null() {
+            extras = serde_json::json!({});
+        }
+        let map = extras.as_object_mut().ok_or_else(|| {
+            CompletionError::RequestError("Native deferred request extras must be an object".into())
+        })?;
+        if ["model", "system", "messages"]
+            .iter()
+            .any(|key| map.contains_key(*key))
+        {
+            return Err(CompletionError::RequestError(
+                "Raw native prefix override conflicts with captured deferred catalogue".into(),
+            ));
+        }
+        let mut tools = match map.remove("tools") {
+            None => Vec::new(),
+            Some(value) => {
+                serde_json::from_value::<Vec<serde_json::Value>>(value).map_err(|_| {
+                    CompletionError::RequestError("Invalid native tools override".into())
+                })?
+            }
+        };
+        if tools.iter().any(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(owns)
+        }) {
+            return Err(CompletionError::RequestError(
+                "Raw tool override conflicts with captured deferred catalogue".into(),
+            ));
+        }
+        tools.extend(self.deferred_tools.iter().map(|tool| {
+            serde_json::json!({
+                "name": tool.name, "description": tool.description,
+                "input_schema": tool.parameters, "defer_loading": true,
+            })
+        }));
+        map.insert("tools".into(), serde_json::Value::Array(tools));
+        request.additional_params = Some(extras);
+        Ok(())
     }
 
     /// Enable manual prompt caching.
@@ -1736,6 +1859,39 @@ fn default_max_tokens_for_model(model: &str) -> Option<u64> {
 
 fn default_max_tokens_with_fallback(model: &str) -> u64 {
     default_max_tokens_for_model(model).unwrap_or(2_048)
+}
+
+/// Native tool-search model contract, not a frontend/display alias. Unknown
+/// or older native models keep eager declarations. No beta is introduced.
+fn supports_native_tool_references(model: &str) -> bool {
+    [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+    ]
+    .iter()
+    .any(|prefix| {
+        model == *prefix
+            || model
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|snapshot| {
+                    snapshot.len() == 8 && snapshot.bytes().all(|byte| byte.is_ascii_digit())
+                })
+    })
 }
 
 pub(super) fn supports_mid_conversation_system_messages(model: &str) -> bool {
@@ -2543,10 +2699,24 @@ where
         true
     }
 
+    fn deferred_tool_loading(&self) -> completion::DeferredToolLoading {
+        if supports_native_tool_references(&self.model) {
+            completion::DeferredToolLoading::NativeReferences
+        } else {
+            completion::DeferredToolLoading::Eager
+        }
+    }
+
+    fn with_deferred_tools(mut self, tools: Vec<completion::ToolDefinition>) -> Self {
+        self.deferred_tools = tools.into();
+        self
+    }
+
     async fn completion(
         &self,
         mut completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        self.prepare_deferred_request(&mut completion_request)?;
         let request_model = completion_request
             .model
             .clone()

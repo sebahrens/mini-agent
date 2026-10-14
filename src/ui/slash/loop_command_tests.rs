@@ -38,6 +38,8 @@ fn fixture_root(label: &str) -> FixtureRoot {
 
 fn context_for(root: &std::path::Path) -> ContextFiles {
     ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: root.to_path_buf(),
         agents: None,
         prompts: Default::default(),

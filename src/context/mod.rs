@@ -181,6 +181,11 @@ pub struct ContextFiles {
     pub extra_file_contents: HashMap<PathBuf, Arc<String>>,
     pub one_shot_restore: Option<ActiveContextSelection>,
     pub chain_declined: Vec<String>,
+    /// Runtime-only discovery metadata, shared by captured context clones.
+    /// Session IDs, binding identity and source/schema fingerprints partition
+    /// this state; imported history never contains tool activation authority.
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp_discovery: crate::extras::mcp::deferred::DiscoverySessions,
     #[cfg(feature = "memory")]
     pub memory: Option<String>,
     #[cfg(feature = "archmd")]
@@ -419,6 +424,8 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     #[cfg(feature = "memory")]
     let memory = crate::extras::memory::Mem::open().context_block();
     ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
         workspace_root: workspace_root
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())

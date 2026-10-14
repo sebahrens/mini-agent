@@ -52,6 +52,14 @@ threads and join them before fixture teardown. Their exact `.spawn(|| ...)` and
 checked inventory and Windows creation-boundary catalogue; all process
 negative controls remain unchanged.
 
+## Native MCP discovery fixture inventory
+
+The native Anthropic extension to the owned MCP HTTP fixture retains the same
+joined Tokio actor and HTTP-status data tuple. Its exact non-process status
+expression and structural macro digest are refreshed in the checked inventory.
+No process launch, broad exemption or scanner change is introduced; all existing
+negative controls remain required.
+
 ## App integration inventory
 
 The fixed 1 MiB App picker, ordinary-event and combined context/Git confirmation
@@ -489,7 +497,10 @@ The owned MCP live-operation HTTP fixture uses a Tokio `JoinSet::spawn` for
 accepted sockets and a string `status` tuple for its HTTP response. Neither
 creates a native process. Its exact source expressions, occurrence counts and
 full enclosing `tokio::select!` token-context digest are `NON-PROCESS`; the
-fixture owns and joins its socket tasks, including cancellation. No scanner
+fixture owns and joins its socket tasks, including cancellation. The deferred
+MCP wire fixture extends that same response tuple with scripted local OpenAI SSE
+responses and a bounded tool catalogue; its exact status-expression and whole
+select-context digest are refreshed, with no native process added. No scanner
 rules or production subprocess classifications are relaxed.
 The task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
