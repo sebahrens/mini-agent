@@ -202,7 +202,7 @@ class WindowsGhCiTests(unittest.TestCase):
 
     def test_suspended_job_prototype_is_exact_and_cannot_replace_pr_acceptance(self):
         body = validate_native_step((ROOT / ".github/workflows/ci.yml").read_text())
-        required_guards = ["$prototypeActual.Count -ne 2", "Compare-Object -ReferenceObject $prototypeExpected -DifferenceObject $prototypeActual", "$prototypeExit -ne 0", "^test result: ok\\. 2 passed; 0 failed; 0 ignored;", "--bin mini-agent $prototypeFilter -- --ignored --list", "--bin mini-agent $prototypeFilter -- --ignored --nocapture --test-threads=1"]
+        required_guards = ["$prototypeActual.Count -ne 3", "Compare-Object -ReferenceObject $prototypeExpected -DifferenceObject $prototypeActual", "$prototypeExit -ne 0", "^test result: ok\\. 3 passed; 0 failed; 0 ignored;", "--bin mini-agent $prototypeFilter -- --ignored --list", "--bin mini-agent $prototypeFilter -- --ignored --nocapture --test-threads=1"]
         def require_prototype_guards(candidate):
             for required in required_guards:
                 if required not in candidate:
@@ -212,12 +212,42 @@ class WindowsGhCiTests(unittest.TestCase):
             with self.subTest(guard=required), self.assertRaises(AssertionError):
                 require_prototype_guards(body.replace(required, "removed prototype guard"))
         names = set(re.findall(r"general_process_prototype_tests::(\w+): test", body))
-        self.assertEqual(names, {"windows_general_suspended_job_cancel_and_leader_exit_retire_exact_descendant", "windows_general_suspended_job_setup_failures_never_execute_helper"})
+        self.assertEqual(names, {"windows_general_suspended_job_cancel_and_leader_exit_retire_exact_descendant", "windows_general_suspended_job_setup_failures_never_execute_helper", "windows_general_job_zero_limit_preserves_snapshot_and_refuses_new_descendants"})
         self.assertLess(body.index("$prototypeResult ="), body.index("--bin mini-agent $filter -- --ignored --nocapture"))
         source = (ROOT / "src/tests/windows_foreground_job_tests.rs").read_text()
         for required in ["creation_guard()", "CREATE_SUSPENDED", "AssignProcessToJobObject(family.job.raw(), process)", "GetProcessIdOfThread(thread.raw())", "ResumeThread(thread.raw()) } != 1", "family.retire().await.unwrap()", "active_job_processes(&family.job).unwrap(), 0"]:
             self.assertIn(required, source)
         self.assertIn("Production Shell does not use this owner", source)
+
+    def test_zero_limit_probe_requires_actual_membership_launch_and_signal_evidence(self):
+        source = (ROOT / "src/tests/windows_foreground_job_tests.rs").read_text()
+        probe = source.split("async fn windows_general_job_zero_limit_preserves_snapshot_and_refuses_new_descendants()", 1)[1].split("\n#[tokio::test]", 1)[0]
+        def require_evidence(candidate):
+            compact = re.sub(r"\s+", " ", candidate)
+            for required in [
+                "limits.BasicLimitInformation.ActiveProcessLimit = 0;",
+                "checked.BasicLimitInformation.LimitFlags, limits.BasicLimitInformation.LimitFlags",
+                "checked.BasicLimitInformation.ActiveProcessLimit, 0",
+                "active_job_processes(&family.job).unwrap(), 2",
+                "WaitForSingleObject(process, 0)", "WAIT_TIMEOUT", "WAIT_OBJECT_0",
+                "[void]$next.Start()", "NativeErrorCode.ToString",
+                'std::fs::read_to_string(result_path).unwrap(), "1816"',
+                "JobObjectBasicProcessIdList", "(list.assigned, list.returned), (2, 2)",
+                "assert_eq!(list.ids, expected)", "family.retire().await.unwrap()",
+                "active_job_processes(&family.job).unwrap(), 0", "catch_unwind()",
+            ]:
+                if required not in compact:
+                    raise AssertionError("missing zero-limit native witness: " + required)
+        require_evidence(probe)
+        for before, after in [
+            ("ActiveProcessLimit = 0", "ActiveProcessLimit = 2"),
+            ('"1816"', '"started"'),
+            ("(list.assigned, list.returned), (2, 2)", "(list.assigned, list.returned), (0, 0)"),
+            ("WaitForSingleObject(process, 0)", "ignored_signal(process)"),
+            ("family.retire().await.unwrap()", "family.not_retired()"),
+        ]:
+            with self.subTest(guard=before), self.assertRaises(AssertionError):
+                require_evidence(probe.replace(before, after))
 
     def test_missing_or_weakened_discovery_controls_are_rejected(self):
         original = (ROOT / ".github/workflows/ci.yml").read_text()

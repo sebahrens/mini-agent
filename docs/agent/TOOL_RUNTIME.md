@@ -761,7 +761,7 @@ The test-only module `src/tests/windows_foreground_job_tests.rs`, registered und
 kill-on-close Job, and resumed only after an exact initial-thread and membership check.
 Its owned inert GH image exercises setup failure, cancellation before resume, and family
 retirement after both a waiting and an already-exited leader. The existing Windows CI
-GH lane discovers exactly two prototype tests before running all five ordinary permission
+GH lane discovers exactly three prototype tests before running all five ordinary permission
 and foreground-result acceptance cases.
 
 The prototype retains the actual helper process handle after checking its Job
@@ -771,6 +771,14 @@ initiates asynchronous process shutdown; zero accounting alone cannot replace
 the retained process witness. Assertion unwinding retains those same capabilities
 through bounded cleanup. This corrected prototype still requires hosted native
 execution; it does not relax the ordinary Shell cancellation assertion.
+
+The third test experiments with a retirement-only active-process limit of zero.
+It requires the two existing members to remain alive and enumerable, rejects a
+new actual .NET child launch with `ERROR_NOT_ENOUGH_QUOTA`, then checks both
+retained process signals and zero Job accounting after retirement. This is a
+candidate membership-snapshot fence, not a production policy. Until hosted
+Windows proves every witness, its behavior remains unverified and production
+must not assume zero is supported or that it prevents a new-child race.
 
 This module is an experiment for mini-agent-i7ro6.108. Production disabled Shell does not
 yet use it; the observed descendant-settlement gap remains open. A successful prototype

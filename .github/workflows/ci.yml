@@ -691,15 +691,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Suspended general Job prototype discovery failed' }
             $prototypeActual = @($prototypeListing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^sandbox::windows::general_process_prototype_tests::.*: test$' } | Sort-Object)
             $prototypeExpected = @(
+              'sandbox::windows::general_process_prototype_tests::windows_general_job_zero_limit_preserves_snapshot_and_refuses_new_descendants: test'
               'sandbox::windows::general_process_prototype_tests::windows_general_suspended_job_cancel_and_leader_exit_retire_exact_descendant: test'
               'sandbox::windows::general_process_prototype_tests::windows_general_suspended_job_setup_failures_never_execute_helper: test'
             ) | Sort-Object
             $prototypeDifference = @(Compare-Object -ReferenceObject $prototypeExpected -DifferenceObject $prototypeActual)
-            if ($prototypeActual.Count -ne 2 -or $prototypeDifference.Count -ne 0) { throw 'Expected exact two suspended general Job prototypes' }
+            if ($prototypeActual.Count -ne 3 -or $prototypeDifference.Count -ne 0) { throw 'Expected exact three suspended general Job prototypes' }
             $prototypeResult = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $prototypeFilter -- --ignored --nocapture --test-threads=1)
             $prototypeExit = $LASTEXITCODE
             $prototypeResult | ForEach-Object { Write-Host $_ }
-            if ($prototypeExit -ne 0 -or -not ($prototypeResult -match '^test result: ok\. 2 passed; 0 failed; 0 ignored;')) { throw 'Suspended general Job native prototype failed' }
+            if ($prototypeExit -ne 0 -or -not ($prototypeResult -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) { throw 'Suspended general Job native prototype failed' }
             & cargo test --locked --no-default-features --features $features --bin mini-agent $filter -- --ignored --nocapture --test-threads=1
             if ($LASTEXITCODE -ne 0) { throw 'Native Windows GH argv/result/Job proof failed' }
           } finally {

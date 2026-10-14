@@ -9,8 +9,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessIdOfThread, GetThreadId, OpenThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    GetProcessId, GetProcessIdOfThread, GetThreadId, OpenThread, SuspendThread,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 #[derive(Clone, Copy)]
@@ -265,12 +265,6 @@ impl Fixture {
         Self(root)
     }
     fn command(&self, wait_for_child: bool) -> Command {
-        let shell = super::super::ShellCapability::resolve(
-            "powershell.exe",
-            self.0.path(),
-            std::env::var_os("PATH").as_deref(),
-        )
-        .expect("native PowerShell required");
         let script = format!(
             "$i=[System.Diagnostics.ProcessStartInfo]::new();$i.FileName=($ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath+'\\fixture bin 雪\\gh.exe');$i.Arguments='pr create --title inert --body inert';$i.UseShellExecute=$false;$p=[System.Diagnostics.Process]::new();$p.StartInfo=$i;try{{if(-not $p.Start()){{exit 9}};{}}}finally{{$p.Dispose()}}",
             if wait_for_child {
@@ -279,13 +273,22 @@ impl Fixture {
                 "exit 0"
             }
         );
+        self.command_with_script(&script)
+    }
+    fn command_with_script(&self, script: &str) -> Command {
+        let shell = super::super::ShellCapability::resolve(
+            "powershell.exe",
+            self.0.path(),
+            std::env::var_os("PATH").as_deref(),
+        )
+        .expect("native PowerShell required");
         let mut command = Command::new(shell.executable());
         command.args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &script,
+            script,
         ]);
         command
             .current_dir(child_process_path(self.0.path()))
@@ -324,6 +327,172 @@ impl Fixture {
             "prototype retain descendant",
         )
         .unwrap()
+    }
+}
+
+/// Experimental retirement fence only: no production command uses a zero
+/// active-process limit until the native membership and signal proof passes.
+#[tokio::test]
+#[ignore = "requires guarded native Windows GH fixture discovery"]
+async fn windows_general_job_zero_limit_preserves_snapshot_and_refuses_new_descendants() {
+    use futures::FutureExt;
+
+    let fixture = Fixture::new();
+    // Typed .NET constructors avoid PowerShell cmdlet autoload. All paths and
+    // operands are fixed owned-fixture data; no GitHub or Git operation runs.
+    let script = "$root=$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath;\
+        $i=[System.Diagnostics.ProcessStartInfo]::new();\
+        $i.FileName=($root+'\\fixture bin 雪\\gh.exe');\
+        $i.Arguments='pr create --title inert --body inert';$i.UseShellExecute=$false;\
+        $p=[System.Diagnostics.Process]::new();$p.StartInfo=$i;\
+        if(-not $p.Start()){exit 9};\
+        $clock=[System.Diagnostics.Stopwatch]::StartNew();\
+        while(-not [System.IO.File]::Exists($root+'\\fence-go')){\
+            if($clock.ElapsedMilliseconds -ge 15000){exit 8};\
+            [System.Threading.Thread]::Sleep(10)};\
+        $next=[System.Diagnostics.Process]::new();$next.StartInfo=$i;\
+        $result='started';try{[void]$next.Start()}\
+        catch [System.ComponentModel.Win32Exception]{\
+            $result=$_.Exception.NativeErrorCode.ToString([System.Globalization.CultureInfo]::InvariantCulture)}\
+        finally{$next.Dispose()};\
+        [System.IO.File]::WriteAllText($root+'\\fence-result.part',$result);\
+        [System.IO.File]::Move($root+'\\fence-result.part',$root+'\\fence-result');\
+        while($clock.ElapsedMilliseconds -lt 15000){[System.Threading.Thread]::Sleep(10)};\
+        $p.Dispose();exit 7";
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let mut family = SuspendedFamily::spawn(
+        fixture.command_with_script(script),
+        Fault::None,
+        &scope.cancellation_handle(),
+        |_| {},
+    )
+    .unwrap();
+    let assertions = std::panic::AssertUnwindSafe(async {
+        let descendant = fixture.ready().await;
+        family.retain_descendant(&descendant).unwrap();
+        let argv_before = std::fs::read(fixture.0.path().join("gh-argv.json")).unwrap();
+        // Retain independently of Tokio's leader wait/reap representation.
+        let leader = Handle(
+            unsafe {
+                std::os::windows::io::BorrowedHandle::borrow_raw(family.child.raw_handle().unwrap())
+            }
+            .try_clone_to_owned()
+            .unwrap(),
+        );
+        assert_eq!(active_job_processes(&family.job).unwrap(), 2);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 0;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    family.job.raw(),
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of_val(&limits) as u32,
+                )
+            },
+            0,
+            "candidate zero-limit retirement fence must be supported"
+        );
+        let mut checked = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        assert_ne!(
+            unsafe {
+                QueryInformationJobObject(
+                    family.job.raw(),
+                    JobObjectExtendedLimitInformation,
+                    (&mut checked as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of_val(&checked) as u32,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            checked.BasicLimitInformation.LimitFlags,
+            limits.BasicLimitInformation.LimitFlags
+        );
+        assert_eq!(checked.BasicLimitInformation.ActiveProcessLimit, 0);
+        assert_eq!(active_job_processes(&family.job).unwrap(), 2);
+        for process in [leader.raw(), descendant.raw()] {
+            assert_eq!(
+                unsafe { WaitForSingleObject(process, 0) },
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT
+            );
+        }
+        std::fs::write(fixture.0.path().join("fence-go"), b"owned fork attempt").unwrap();
+        let result_path = fixture.0.path().join("fence-result");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !result_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native zero-limit fork result must settle within its own bound");
+        assert_eq!(
+            std::fs::read_to_string(result_path).unwrap(),
+            "1816",
+            "candidate fence must reject the actual new process with ERROR_NOT_ENOUGH_QUOTA"
+        );
+        // Fixed capacity covers exactly the two held fixture processes. A
+        // truncated or changed membership list rejects this candidate proof.
+        #[repr(C)]
+        struct Pair {
+            assigned: u32,
+            returned: u32,
+            ids: [usize; 2],
+        }
+        let mut list = Pair {
+            assigned: 0,
+            returned: 0,
+            ids: [0; 2],
+        };
+        assert_ne!(
+            unsafe {
+                QueryInformationJobObject(
+                    family.job.raw(),
+                    windows_sys::Win32::System::JobObjects::JobObjectBasicProcessIdList,
+                    (&mut list as *mut Pair).cast(),
+                    size_of_val(&list) as u32,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!((list.assigned, list.returned), (2, 2));
+        list.ids.sort_unstable();
+        let mut expected =
+            [
+                family.child.id().unwrap() as usize,
+                unsafe { GetProcessId(descendant.raw()) } as usize,
+            ];
+        expected.sort_unstable();
+        assert_eq!(list.ids, expected);
+        assert_eq!(
+            std::fs::read(fixture.0.path().join("gh-argv.json")).unwrap(),
+            argv_before
+        );
+        assert!(!fixture.0.path().join("gh-late").exists());
+        family.retire().await.unwrap();
+        assert_eq!(active_job_processes(&family.job).unwrap(), 0);
+        for process in [leader.raw(), descendant.raw()] {
+            assert_eq!(unsafe { WaitForSingleObject(process, 0) }, WAIT_OBJECT_0);
+        }
+        std::fs::write(
+            fixture.0.path().join("gh-release"),
+            b"after exact settlement",
+        )
+        .unwrap();
+        assert!(!fixture.0.path().join("gh-late").exists());
+    })
+    .catch_unwind()
+    .await;
+    // Assertion failure cannot abandon the exact family or its fixture root.
+    family.retire().await.unwrap();
+    drop(family);
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
     }
 }
 
