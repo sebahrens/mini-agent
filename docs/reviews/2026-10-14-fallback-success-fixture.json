@@ -1,0 +1,28 @@
+{
+  "bead": "mini-agent-i7ro6.44.3",
+  "base": "bf38e1b0665bbbf0bfbc7d98cc7fcfbd41b1dd1a",
+  "failure": {
+    "run": 38572395918,
+    "job": 115888107648,
+    "test": "tests::shell_mode_tests::implicit_unavailable_default_clears_ambient_credentials",
+    "observed": "TimedOut instead of Completed at original line73;3942 passed/1 failed/7 ignored",
+    "log": "/private/tmp/mini-agent-ci-bf38-macos-parallel.log"
+  },
+  "change": "Only credential-isolation success fixture uses5s timeout via local CommandLimits update. SHORT_LIMITS300ms and output4096/4096/6144 stay unchanged. Production Sandbox, environment clearing, permission/containment and all success assertions unchanged.",
+  "test_selection": {
+    "method": "Code-indexer exact owning function, SHORT_LIMITS symbol and complete18 usage hits; focused physical owning fixture read disambiguates effect oflocal limit.",
+    "filter": "tests::shell_mode_tests::implicit_unavailable_default_clears_ambient_credentials --exact",
+    "row": "default onmacOS, matching failedCIcfg",
+    "reason": "One test-only scheduling-budget delta; no cfg/production caller changes. No full shell/module/feature/JS/native containment suite rerun.",
+    "reuse": "Unchanged300ms timeout/cancel/output controls passed in samecurrent-source failedMacparallel run; required Root113 debuginstall is on identicalproduction source (114and44.3 test-only).",
+    "limits": "Local focused proof does not establish hostedparallel success or wholeCIgreen."
+  },
+  "gates": {
+    "fmt": "PASS",
+    "owning": "PASS1 test,0failed,.02s;18.38s compile",
+    "log": "/private/tmp/mini-agent-fallback443-owning.log",
+    "log_sha256": "5f9456fffcf2267ace56f21a65721fea555d565c9952efac9f5164e0cb99ce49",
+    "source_delta_sha256": "b51d156eb04c6390070885475d75a6d2767938854572d09f861fedc239d39450"
+  },
+  "ci": "Fresh pushed source CI must still be observed; Windows helper postspawn timeout unresolved108.2."
+}

@@ -62,10 +62,17 @@ async fn implicit_unavailable_default_clears_ambient_credentials() {
     )]);
     let sandbox = Sandbox::new(false, "missing-default").with_unavailable_default_fallback();
 
+    // This success control proves credential isolation, not a 300 ms launch
+    // deadline. Keep hosted-runner scheduling bounded independently of the
+    // short limits used by the timeout controls below.
+    let success_limits = CommandLimits {
+        timeout: Duration::from_secs(5),
+        ..SHORT_LIMITS
+    };
     let output = sandbox
         .output_command_with_limits(
             "test -z \"${MINI_AGENT_FALLBACK_SECRET+x}\" && printf clean",
-            SHORT_LIMITS,
+            success_limits,
         )
         .await
         .unwrap();
