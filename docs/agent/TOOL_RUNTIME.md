@@ -1222,3 +1222,13 @@ canonical limits apply: 2 MiB per image, 4 MiB total and eight images per turn.
 The transaction retains attachments for rollback when preparation or a
 zero-progress turn fails. Active hooks, spend and permission admission use the
 same typed runner path; a text hook cannot rewrite an ordered image prompt.
+
+### Image results from `read`
+
+The default multimodal build returns admitted PNG/JPEG/GIF/WebP files as an
+image block plus dimensions/size summary, with a 5 MiB regular-file cap and
+1..8000 pixel dimensions. The same captured file/read permission is used; image
+reads grant no raw text overwrite proof. Known text-only models and unsupported
+transport formats return an explicit error. Exact image data survives canonical
+save/reload and backend tool follow-ups, within existing native/session envelope
+limits. See [Image reads](IMAGE_READ.md) for protocol, capability and replay limits.

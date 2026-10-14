@@ -16,6 +16,8 @@ use rig::completion::CompletionModel;
 /// this same context must be inherited rather than replaced.
 #[derive(Clone)]
 pub(crate) struct SubagentAuthorization {
+    #[cfg(feature = "multimodal")]
+    image_support: tools::read_image::ImageReadSupport,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
@@ -69,6 +71,8 @@ impl SubagentAuthorization {
         deny_repeated_reads: bool,
     ) -> Self {
         Self {
+            #[cfg(feature = "multimodal")]
+            image_support: tools::read_image::ImageReadSupport::default(),
             permission,
             ask_tx,
             workspace: None,
@@ -160,6 +164,10 @@ impl SubagentAuthorization {
         selected: Option<&[AgentTool]>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         let mut read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
+        #[cfg(feature = "multimodal")]
+        {
+            read_tracker.image_support = self.image_support;
+        }
         read_tracker.instructions = self.instructions.clone();
         let read = tools::ReadTool::new_with_tracker(
             self.permission.clone(),
@@ -431,6 +439,17 @@ pub(crate) async fn build_explore_agent(
         persona.provider_extra_body.clone(),
         &uuid::Uuid::new_v4().to_string(),
     );
+    #[cfg(feature = "multimodal")]
+    let authorization = {
+        let mut authorization = authorization;
+        let image_params = persona
+            .additional_params
+            .as_ref()
+            .filter(|params| params.get("model").is_some())
+            .or(provider_params.as_ref());
+        authorization.image_support = model.image_read_support(image_params);
+        authorization
+    };
     #[cfg(feature = "agent-skills")]
     let instructions = authorization.workspace.as_ref().and_then(|workspace| {
         crate::paths::process_paths().ok().map(|paths| {

@@ -264,3 +264,11 @@ opaque blocks without inventing answer text; a private reload receives an
 actor-backed saved boundary separately. The official [stop-reason contract](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
 distinguishes natural `end_turn` from token limits and paused tool work.
 This carrier is not saved runtime ownership, permissions, or billing metadata.
+
+Image-read tool results preserve literal hybrid response text and use native
+OpenAI Responses function-output image content. Text-only tool-role transports
+(Chat Completions, OpenRouter, Ollama, Gemini) append image user content only
+after the complete correlated tool batch. Original text results and IDs remain
+in place; ambiguous/incomplete image batches fail before HTTP. Anthropic's native
+image tool-result conversion is unchanged. Host canonical image validation,
+permission and native capture limits remain outside this adapter.

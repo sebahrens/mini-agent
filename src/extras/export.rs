@@ -624,6 +624,7 @@ pub fn session_to_markdown(session: &Session) -> String {
                     Some(crate::session::PersistedToolMessage::Result {
                         output,
                         artifact_path,
+                        ..
                     }) => (output.as_str(), artifact_path.as_ref()),
                     _ => (message.content.as_str(), None),
                 };

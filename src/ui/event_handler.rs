@@ -214,11 +214,11 @@ pub async fn handle_agent_event(
             }
         }
         AgentEvent::ToolResult {
-            id, name, output, ..
+            id, name, output, images, ..
         } => {
             let (_, artifact) = ui
                 .session
-                .add_tool_result_with_id_and_artifact(&id, &name, &output);
+                .add_tool_result_with_images(&id, &name, &output, images);
             if let (Some(pending), Some(path)) = (run.pending_turn.as_mut(), artifact) {
                 pending.record_tool_output(path);
             }

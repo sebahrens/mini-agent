@@ -68,7 +68,7 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
     select(.value.modalities.output | index("text"))
     | select((.key | ascii_downcase) as $id | (deny | any(. as $d | $id | contains($d))) | not)
     | recent($c);
-  def entry: {id: .value.id, name: .value.name, context: (.value.limit.context // null)};
+  def entry: {id: .value.id, name: .value.name, context: (.value.limit.context // null), image_input: (.value.modalities.input | if type == "array" then index("image") != null else null end)};
   def priced_entry: entry + {
     input_price: (.value.cost.input // null),
     output_price: (.value.cost.output // null),

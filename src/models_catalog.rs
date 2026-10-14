@@ -21,6 +21,8 @@ const CATALOG_JSON: &str = include_str!("../data/models.json");
 
 #[derive(serde::Deserialize)]
 struct RawModel {
+    #[serde(default)]
+    image_input: Option<bool>,
     id: String,
     name: String,
     context: Option<u32>,
@@ -34,8 +36,38 @@ struct RawModel {
     cache_write_price: Option<f64>,
 }
 
-static CATALOG: LazyLock<HashMap<String, Vec<ModelEntry>>> =
-    LazyLock::new(|| parse_catalog(CATALOG_JSON));
+struct Catalog {
+    entries: HashMap<String, Vec<ModelEntry>>,
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+    image_input: HashMap<String, HashMap<String, bool>>,
+}
+static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
+    let raw: HashMap<String, Vec<RawModel>> =
+        serde_json::from_str(CATALOG_JSON).unwrap_or_default();
+    let image_input = raw
+        .into_iter()
+        .map(|(provider, models)| {
+            (
+                provider,
+                models
+                    .into_iter()
+                    .filter_map(|model| model.image_input.map(|image| (model.id, image)))
+                    .collect(),
+            )
+        })
+        .collect();
+    Catalog {
+        entries: parse_catalog(CATALOG_JSON),
+        image_input,
+    }
+});
+
+/// Explicit immutable input modality for an exact embedded provider/model ID.
+/// Unknown gateways remain unknown; this lookup does not guess from model names.
+#[cfg(feature = "multimodal")]
+pub(crate) fn model_image_input(provider: &str, model: &str) -> Option<bool> {
+    CATALOG.image_input.get(provider)?.get(model).copied()
+}
 
 fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
     let raw: HashMap<String, Vec<RawModel>> = match serde_json::from_str(json) {
@@ -71,7 +103,7 @@ fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
 /// Baked model entries for a provider, or `None` when the provider is not in the
 /// catalog (custom gateways, ollama — those resolve live).
 pub fn catalog_entries(provider: &str) -> Option<&'static [ModelEntry]> {
-    CATALOG.get(provider).map(|v| v.as_slice())
+    CATALOG.entries.get(provider).map(|v| v.as_slice())
 }
 
 #[cfg(test)]

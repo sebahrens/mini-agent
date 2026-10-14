@@ -698,6 +698,7 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
     let Some(PersistedToolMessage::Result {
         output: replay,
         artifact_path,
+        ..
     }) = &s.messages[0].tool
     else {
         panic!("tool result must retain a structured replay payload")

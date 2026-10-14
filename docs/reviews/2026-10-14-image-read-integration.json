@@ -1,0 +1,106 @@
+{
+  "scope": "Complete image-read feature .64 integrated with current native checkpoint owner; actual supported provider request bodies, canonical replay and bounded admission.",
+  "base": "e6206a7ae893beb4444d5388e2365078fb2a5e10",
+  "owner_patch_sha256": "eebc34b1fd5b70885b2892bc9af15065eae15bb524342b297e65fec92ecf641d",
+  "reviewer": "root",
+  "review": "Read all functional owned diffs across44files and full owning tests;311 catalogue entries compared programmatically after removal of only image_input, preserving every prior field and order. Read6actual typed provider paths and native exact-tail matcher, same admitted FD/permission flow, no text overwrite proof, effective notice receipt, canonical import bounds and feature-off refusal. Existing full-stream image decoding remains provider-owned.",
+  "manual_combination": [
+    "Native host validation and final history host snapshot preserved around image-tail matcher",
+    "Native frontend test additions retained while image probe appended",
+    "Current clipboard/worktree UI fields and additive runtime documentation preserved"
+  ],
+  "root_corrections": [
+    "Reject borrowed aggregate image/count envelope before any image clone/decode",
+    "Missing catalogue input modality is null/unknown; explicit text-only is false",
+    "Actual malformed/incomplete/orphan/duplicate image correlation refuses before any HTTP connection",
+    "Hybrid parser exact literal strings and object shape regression controls"
+  ],
+  "source_sha256": {
+    "data/models.json": "f22489fa626c052c5524a86cb810272cf11fd2f1489283b4ef1a480dcc0018f9",
+    "docs/agent/TOOL_RUNTIME.md": "b391ffc386ab685f6116e5ab3bc19e3cf1a6be9acbe2243b3480398fad77f9e8",
+    "patched-deps/rig-core/PATCH.md": "558e65d6c92d641627b865feaf659d2b8972088a702e6bdac41e85d7dbe0fe4e",
+    "patched-deps/rig-core/src/completion/message.rs": "985a6b7289a51d6b3915681e8ae453498ee878f1faf0b3530e3d54700365e722",
+    "patched-deps/rig-core/src/providers/gemini/completion.rs": "e341cb288c9372891565b5590d6b9197a9878a84a6d3d488f7097226760755fe",
+    "patched-deps/rig-core/src/providers/ollama.rs": "8f13511fcf634d702f7ac7420128c637a3b7c4d2871dcfe170c39eba3745d62f",
+    "patched-deps/rig-core/src/providers/openai/completion/mod.rs": "fd049feaf784eb2964030ae6729b8f26319d609ec9ce2f2942c7b53b5e016191",
+    "patched-deps/rig-core/src/providers/openai/responses_api/mod.rs": "da2e408ebf82df2feea1a5a4c4b8dc7d4ab44fd35beb050b719f2a02bc2f3cef",
+    "patched-deps/rig-core/src/providers/openrouter/completion.rs": "a06bb46b013f8d59a2793f058d6680fa5a0f18108ef27fc7f69ebb83f8c8126e",
+    "scripts/gen-models-catalog.sh": "9a77383be9b264c042add0d9c6c680a2543216a1895a84a97e93e620312251b0",
+    "scripts/tests/test_models_catalog_cache_prices.py": "007de97db6059c01737ee9636a524bc7fc354125042fd89215520c1029bf7f49",
+    "src/agent/builder.rs": "f66dcd4a7c0a60e656ceae95adff72883364378a386a94dc46aa7b659bb204c4",
+    "src/agent/input.rs": "b9d4177836bd40cbddce6813f9b6a814e457cf7b9fbcf3bc63e32c3e6bbabfa3",
+    "src/agent/runner.rs": "061952cd77e35b94f504ceae80f5e027a29422ac7dca70ccce6185e21c87360e",
+    "src/agent/tools/mod.rs": "1e364cedbc3e46bdda9b8a66b0ca840df7e23509da9263fd4b44a650a98dc3a6",
+    "src/agent/tools/read.rs": "b44bcbff255b346ffd4387790045405be23d16f7713b8b23bed8a73327f70d5f",
+    "src/context/instruction_wire_tests.rs": "d1ac9ac6e3f1aad8a9270bf994b4a48c1a0ebd79ec6d62d4029f0bd166f85d66",
+    "src/context/instructions.rs": "cd8f014d4ff488d7eba47aceee2680d0f44c44c6f5b69c36c7bc6a33ff1364fc",
+    "src/event.rs": "cf8b6a400745ba09c262b0c612fcf62a0fbd69d09045e2270a5256a77cda53b0",
+    "src/extras/acp/mod.rs": "cdf6975411bc3aa439d02a16026c2158e75e775a1dc3c451878711a34f6d5b0f",
+    "src/extras/export.rs": "a3472327158c4f0cfc3c8574d6f2b828a7ffb19d12251f6f8d9354c5d3fa756c",
+    "src/extras/subagents/builder.rs": "463dbe54d427339b87676b3e2ad53b7f921484fbb908f8586a966c6cd0cd6e7d",
+    "src/models_catalog.rs": "d13724d66d76a204c7d57edad656c9026a6bb205c7eb1078efca47ada4ec8382",
+    "src/print.rs": "6b62f4ad74e5f204840644cfc650632c335d4944fcf75a4bd50bf5b3b8718d79",
+    "src/provider.rs": "c88e148b37ecbadc63958831559d74d53c4f01ccf32071de144f231b23b0843d",
+    "src/provider_effort_replay_probe.rs": "6168030333497c57a4107bdeeae7603b41c0efd9fc871900418212d8c5691caa",
+    "src/session/mod.rs": "5bcdc18040360534dc6b8de4c5f1036cf30134e8a83e1e9836884a1070c062e6",
+    "src/session/user.rs": "2d5da986a5ded6820bea118c3432199d8de4b3b407d0fb0f32dc9f60a567bec1",
+    "src/tests/mod.rs": "33b24fde4aca1534ccaa305c4ec8ad51b2870b9b36c43eb118003712f08d2a1a",
+    "src/tests/session_storage_tests.rs": "8ca5ba7f500bb2974e8ba5b284c80a5842609c2b29e1f4b5078a01bf3788d472",
+    "src/tests/turn_persistence_tests.rs": "23d31e8d832176081174017a7db807feaba6935c84e5aecebbb3ef60f14314f7",
+    "src/ui/app.rs": "447e09a5cabfff220155d443aeb6f02004ca9523842f0aa46119be2f83600849",
+    "src/ui/event_handler.rs": "76686215fd0bb208f593bc1d6db1d933b9d63e112f124f8acccc21462bb3950d",
+    "src/ui/slash/git.rs": "331100c14617f51dcff4b3cc7c336f626669b51a2076e84f35392d5d65305f98",
+    "docs/agent/IMAGE_READ.md": "e4fc396465aa0a198f39fe51427f29893e53587e8742e7e18da6937c15621eb3",
+    "src/agent/tools/read_image.rs": "e0d4537df670d6ce1ef139b4940c4188dcbff59d13b285a2631f5a3af2d1b1da",
+    "src/session/tool_image.rs": "7200dbdb02dcec284ab6240b6890ec10b3a8733dfc38d90ec8798f13923bdf80",
+    "src/tests/image_read_tests.rs": "eb4e2a74d05416e0fa7280d15921ca578da4907e6f46161e6fbd7b0b787736b7",
+    "src/agent/tools/fixtures/read-image64/3x2.jpg": "3faefa567f0f846eaee9322f75af0c0f461e79df78db8afe00ec16b3ceb81bd0",
+    "src/agent/tools/fixtures/read-image64/3x2.png": "96a441f2694c0e877af35d34a7124503ebbccebb5efd181a4c99bd6aa4c7b7bb",
+    "src/agent/tools/fixtures/read-image64/3x2-alpha.webp": "c4b317ad47a1cf622ff8e831a4c399b7b6d02b9c5b6c4ad19729c8944db5c661",
+    "src/agent/tools/fixtures/read-image64/3x2-lossless.webp": "63ec533410976b68190c6e16751cd0c1579ba150fb9f69c457b8c05cf18fba38",
+    "src/agent/tools/fixtures/read-image64/3x2.gif": "8f634c42cdfacce3ec6f6f8e7c81f7643082fd3b166e0e3130a2e124ec5b4330",
+    "src/agent/tools/fixtures/read-image64/3x2-lossy.webp": "b61fedec5372c259e19567b387ec0c37b22ae9ff6504321d38b7cc259b01634a"
+  },
+  "results": {
+    "current_combined_default_advisor": "16 PASS0.62s, including six actual provider bodies, native image-tail save/reload and exact tamper refusals, instruction rewrite/effect, actual ReadTool6formats, current native headless1MiB and affected live event/headless canonical callers",
+    "generator": "1 PASS; true/false/unknown projection and prior cache prices",
+    "owner_minimal": "5PASS reused for unchanged feature-off read/dispatch path and canonical import; Root envelope bound is feature-independent and exercised in current default tests",
+    "owner_text_callers": "4PASS reused, unchanged text/CRC/notebook code and assertions",
+    "strict": "PASS48.49s; cargo clippy --locked --features advisor --all-targets -- -D warnings",
+    "required_install": "PASS35.90s; cargo install --path . --debug --locked --offline --features advisor",
+    "installed_actual_consumers": {
+      "binary": "/private/tmp/mini-agent-wave49-install/bin/mini-agent",
+      "binary_sha256": "974b01754849784f67499034a2d3a3b6650272cfa54e2be36fb4a9b889f14815",
+      "stack_bytes": 1048576,
+      "fixture_sha256": "96a441f2694c0e877af35d34a7124503ebbccebb5efd181a4c99bd6aa4c7b7bb",
+      "external_provider_calls": 0,
+      "passed": true,
+      "headless_posts": 2,
+      "tui_posts": 3,
+      "next_user_turn_preserves_image": true,
+      "normal_quit": 0,
+      "persisted_tool_images": [
+        "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-image64-installed-3wg7mlck/home/sessions/f08e4874-25cc-4a08-b2d0-7b1b072d28e5.json"
+      ],
+      "errors": []
+    },
+    "installed_driver_settlement": "Initial driver sent /quit on visible streamed text before model settlement; retained saved Session proves both assistant completions. Driver now awaits exact persisted assistant before next Enter and /quit, under original25s readiness and15s quit deadlines. Same installed binary passes headless2POST+TUI3POST and normal exit0."
+  },
+  "cache_diagnosis": {
+    "red": "Four current-source protocol/text/receipt controls initially exposed old SDK behavior",
+    "proof": "Root dependency dep-info referenced agent-worktrees/session-fork75-a269 despite correct Main metadata",
+    "fix": "cargo clean -p rig-core only; isolated target rule added to AGENTS and bd remember",
+    "green": "Current16 PASS after rig-core explicitly recompiled from Main; current test dep-info has no foreign worktree paths"
+  },
+  "protocol_sources": [
+    "https://developers.openai.com/api/reference/resources/responses/methods/create",
+    "https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls",
+    "https://ai.google.dev/gemini-api/docs/function-calling"
+  ],
+  "limits": [
+    "Provider request body/contract proofs use owned offline fixtures; no paid model quality or vision inference claim",
+    "Header validation is bounded and does not decompress pixels",
+    "Existing2MiB native frame/4MiB payload/8MiB Session limits remain;5MiB raw file is not5MiB native replay guarantee",
+    "Full effort/native frontend/ACP/session persistence beads stay separately tracked"
+  ]
+}

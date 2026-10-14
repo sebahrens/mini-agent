@@ -1664,7 +1664,13 @@ pub(crate) fn persist_headless_turn_input(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    session.add_tool_result_with_id(&identifier, name, &output);
+                    let images = match crate::session::tool_image::from_result(result) {
+                        Ok(images) => images,
+                        Err(error) if name == "read" => anyhow::bail!(error),
+                        // Existing nonliteral remote-image tools retain their legacy textual projection.
+                        Err(_) => Vec::new(),
+                    };
+                    session.add_tool_result_with_images(&identifier, name, &output, images);
                 }
                 persist_user_delta_blocks(session, user_blocks)?;
             }

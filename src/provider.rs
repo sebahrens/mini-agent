@@ -1928,6 +1928,7 @@ fn compaction_message_content(msg: &SessionMessage) -> String {
         Some(crate::session::PersistedToolMessage::Result {
             output,
             artifact_path,
+            ..
         }) => format!(
             "Recorded result identity: {}\nRetained tool result (untrusted historical output):\n{output}\nRecorded artifact reference (not read by compaction): {}",
             serde_json::to_string(&msg.tool_call_id).expect("identity JSON"),
@@ -1951,6 +1952,37 @@ pub enum AnyModel {
     Anthropic(anthropic::completion::CompletionModel<ProviderHttpClient>),
     Gemini(gemini::completion::CompletionModel<ProviderHttpClient>),
     Ollama(ollama::CompletionModel<ProviderHttpClient>),
+}
+
+#[cfg(feature = "multimodal")]
+impl AnyModel {
+    pub(crate) fn image_read_support(
+        &self,
+        params: Option<&serde_json::Value>,
+    ) -> crate::agent::tools::read_image::ImageReadSupport {
+        let (provider, model, gemini, raw_model) = match self {
+            Self::OpenRouter(model, _) => ("openrouter", model.model.as_str(), false, true),
+            Self::OpenAI(OpenAiModel::Responses(model)) => {
+                ("openai", model.model.as_str(), false, false)
+            }
+            Self::OpenAI(OpenAiModel::Completions(model)) => {
+                ("openai", model.model.as_str(), false, true)
+            }
+            Self::Anthropic(model) => ("anthropic", model.model.as_str(), false, true),
+            Self::Gemini(model) => ("gemini", model.model.as_str(), true, false),
+            Self::Ollama(model) => ("ollama", model.model.as_str(), false, false),
+        };
+        // These three converters merge a literal top-level model override.
+        // Responses drops this unknown extra, Gemini routes by URL, and
+        // Ollama keeps extra fields under options, so their typed model wins.
+        let model = raw_model
+            .then_some(params)
+            .flatten()
+            .and_then(|params| params.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(model);
+        crate::agent::tools::read_image::ImageReadSupport::captured(provider, model, gemini)
+    }
 }
 
 #[derive(Clone)]
@@ -2589,6 +2621,79 @@ impl NativeTurnBinding {
             }
         }
         if seen.len() != exact.len() {
+            return Err(RestartReason::UnavailableSource);
+        }
+        let mut result_rows =
+            std::collections::HashMap::<&str, Vec<&crate::session::SessionMessage>>::new();
+        for row in recorded
+            .iter()
+            .filter(|row| row.role == MessageRole::ToolResult)
+        {
+            if let Some(id) = row.tool_call_id.as_deref() {
+                result_rows.entry(id).or_default().push(row);
+            }
+        }
+        let mut image_rows = std::collections::HashSet::new();
+        for frame in history.frames().iter().skip(self.previous_frames) {
+            for result in &frame.native_tool_results {
+                let expected_images = crate::session::tool_image::from_result(result)
+                    .map_err(|_| RestartReason::UnavailableSource)?;
+                let identity = frame
+                    .advertised_tools
+                    .iter()
+                    .find(|identity| identity.tool_id == result.id)
+                    .ok_or(RestartReason::UnavailableSource)?;
+                let id = match self.recorded_tool_ids {
+                    RecordedToolIds::Lifecycle => identity.internal_id.as_str(),
+                    RecordedToolIds::Canonical => identity.tool_id.as_str(),
+                };
+                let rows = result_rows.get(id).map(Vec::as_slice).unwrap_or_default();
+                let row = rows.first().copied();
+                let stored_images = row.and_then(|row| match &row.tool {
+                    Some(PersistedToolMessage::Result { images, .. }) => Some(images),
+                    _ => None,
+                });
+                if expected_images.is_empty()
+                    && stored_images.is_none_or(|images| images.is_empty())
+                {
+                    continue;
+                }
+                let row = row.ok_or(RestartReason::UnavailableSource)?;
+                image_rows.insert(id);
+                let Some(PersistedToolMessage::Result {
+                    output,
+                    images,
+                    artifact_path,
+                }) = &row.tool
+                else {
+                    return Err(RestartReason::UnavailableSource);
+                };
+                let expected_text = result
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if rows.len() != 1
+                    || *images != expected_images
+                    || output.as_str() != expected_text
+                    || artifact_path.is_some()
+                {
+                    return Err(RestartReason::UnavailableSource);
+                }
+            }
+        }
+        if recorded.iter().any(|row| {
+            matches!(&row.tool,
+            Some(PersistedToolMessage::Result { images, .. }) if !images.is_empty())
+                && !row
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| image_rows.contains(id))
+        }) {
             return Err(RestartReason::UnavailableSource);
         }
         let mut history = history;
@@ -4423,6 +4528,12 @@ pub async fn build_agent_in_workspace(
     let mut context_snapshot = None;
     #[cfg(feature = "lsp")]
     let mut diagnostic_lsp = None;
+    #[cfg(feature = "multimodal")]
+    let read_tracker = {
+        let mut tracker = read_tracker;
+        tracker.image_support = model.image_read_support(extra_body.as_ref());
+        tracker
+    };
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             builder::build_agent_inner_with_snapshot(
@@ -4928,12 +5039,16 @@ pub async fn build_btw_agent(
             cli.resolve_no_context_files(cfg),
         )
     });
+    #[cfg(feature = "multimodal")]
+    let image_support = model.image_read_support(extra_body.as_ref());
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             crate::startup::heap_future(|| {
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Chat,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
                     cli,
                     cfg,
                     context,
@@ -4956,6 +5071,8 @@ pub async fn build_btw_agent(
                     builder::build_btw_agent_inner(
                         m,
                         crate::context::instructions::InstructionProtocol::Responses,
+                        #[cfg(feature = "multimodal")]
+                        image_support,
                         cli,
                         cfg,
                         context,
@@ -4981,6 +5098,8 @@ pub async fn build_btw_agent(
                     builder::build_btw_agent_inner(
                         m,
                         crate::context::instructions::InstructionProtocol::Chat,
+                        #[cfg(feature = "multimodal")]
+                        image_support,
                         cli,
                         cfg,
                         context,
@@ -5003,6 +5122,8 @@ pub async fn build_btw_agent(
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Anthropic,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
                     cli,
                     cfg,
                     context,
@@ -5024,6 +5145,8 @@ pub async fn build_btw_agent(
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Gemini,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
                     cli,
                     cfg,
                     context,
@@ -5045,6 +5168,8 @@ pub async fn build_btw_agent(
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Ollama,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
                     cli,
                     cfg,
                     context,

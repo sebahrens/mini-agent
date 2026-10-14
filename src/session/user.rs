@@ -47,7 +47,7 @@ impl ImageMime {
             Self::Webp => "image/webp",
         }
     }
-    fn sdk(&self) -> rig::message::ImageMediaType {
+    pub(crate) fn sdk(&self) -> rig::message::ImageMediaType {
         use rig::message::ImageMediaType;
         match self {
             Self::Png => ImageMediaType::PNG,

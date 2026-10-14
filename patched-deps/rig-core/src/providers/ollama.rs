@@ -426,7 +426,9 @@ impl TryFrom<(&str, CompletionRequest)> for OllamaCompletionRequest {
     type Error = CompletionError;
 
     fn try_from((model, req): (&str, CompletionRequest)) -> Result<Self, Self::Error> {
-        let chat_history = req.chat_history_with_documents();
+        let chat_history = crate::completion::message::bridge_tool_result_images(
+            req.chat_history_with_documents(),
+        )?;
         let model = req.model.clone().unwrap_or_else(|| model.to_string());
         if req.tool_choice.is_some() {
             tracing::warn!("WARNING: `tool_choice` not supported for Ollama");

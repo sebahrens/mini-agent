@@ -3158,3 +3158,146 @@ fn effort46_actual_headless_frontend_on_one_mib() {
 async fn effort46_actual_headless_frontend_reaps_held_async_session_end_before_publication() {
     native_headless_frontend_control(false, false, false, true).await;
 }
+
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn image_read64_native_exact_tool_image_tail_is_bound_and_reloadable() {
+    use crate::session::{
+        PersistedToolMessage,
+        native_replay::{ReplayBoundary, RestartReason, RetiredNativeOutcome},
+    };
+    let root = crate::tests::OwnedTestDirectory::new("image64-native-tail");
+    std::fs::write(
+        root.path().join("pixel.png"),
+        include_bytes!("agent/tools/fixtures/read-image64/3x2.png"),
+    )
+    .unwrap();
+    let first = start()
+        + &thinking(0, "", "image-signature")
+        + &redacted(1)
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_image64","name":"read","input":{}}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"pixel.png\"}"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":2}),
+        )
+        + &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}),
+        )
+        + &event("message_stop", json!({"type":"message_stop"}));
+    let wire = Wire::new(vec![
+        (true, first),
+        (true, start() + &text(0, "image observed") + &finish()),
+    ]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let mut tracker = crate::agent::tools::ReadTracker::new(true);
+    tracker.image_support = crate::agent::tools::read_image::ImageReadSupport::captured(
+        "anthropic",
+        "claude-opus-5-5",
+        false,
+    );
+    let read = crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 100, tracker)
+        .with_workspace(root.path());
+    let mut session = crate::session::Session::new("native-test", "claude-opus-5-5", 32_000, "");
+    let prices = crate::print::HeadlessPricing::from_session(&session, &Config::default());
+    let (agent, binding) = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("Immutable image policy")
+            .max_tokens(1000)
+            .default_max_turns(2)
+            .tool(read)
+            .build(),
+    ))
+    .bind_native_turn(
+        &session,
+        Vec::<Message>::new().into(),
+        ReplayBoundary::CompletedTurn,
+        crate::provider::RecordedToolIds::Canonical,
+    )
+    .unwrap();
+    let retry = RetryConfig {
+        max_attempts: 1,
+        ..Default::default()
+    };
+    let turn = crate::startup::heap_future(|| {
+        agent.run_print_with_output(
+            "inspect pixel",
+            crate::print::HeadlessOutputPolicy::legacy(false, true),
+            &retry,
+            binding.history(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+    })
+    .await;
+    assert!(turn.failure.is_none(), "{:?}", turn.failure);
+    assert_eq!(
+        binding.commit_canonical_into_with_outcome(
+            &mut session,
+            "inspect pixel",
+            &turn.response,
+            &turn.interactions,
+            turn.usage.into(),
+            prices,
+            RetiredNativeOutcome::Completed
+        ),
+        Ok(true)
+    );
+    assert_eq!(session.total_input_tokens, 20);
+    let restored =
+        crate::session::storage::decode_session_json(&serde_json::to_string(&session).unwrap())
+            .unwrap();
+    let native = restored
+        .native_restore_history(
+            crate::session::native_replay::HistoryProtocol::AnthropicMessages,
+            ReplayBoundary::CompletedTurn,
+        )
+        .unwrap();
+    assert!(
+        serde_json::to_string(&native)
+            .unwrap()
+            .contains("image/png")
+    );
+    let mut missing = session.clone();
+    let row=missing.messages.iter_mut().find(|row|matches!(&row.tool,Some(PersistedToolMessage::Result {images,..}) if !images.is_empty())).unwrap();
+    let Some(PersistedToolMessage::Result { images, .. }) = &mut row.tool else {
+        unreachable!()
+    };
+    images.clear();
+    assert_eq!(
+        binding.attach_accepted_into(
+            &mut missing,
+            binding.capture.as_ref().unwrap(),
+            RetiredNativeOutcome::Completed
+        ),
+        Err(RestartReason::UnavailableSource)
+    );
+    let mut wrong = session.clone();
+    let row=wrong.messages.iter_mut().find(|row|matches!(&row.tool,Some(PersistedToolMessage::Result {images,..}) if !images.is_empty())).unwrap();
+    let Some(PersistedToolMessage::Result { images, .. }) = &mut row.tool else {
+        unreachable!()
+    };
+    images.push(images[0].clone());
+    assert_eq!(
+        binding.attach_accepted_into(
+            &mut wrong,
+            binding.capture.as_ref().unwrap(),
+            RetiredNativeOutcome::Completed
+        ),
+        Err(RestartReason::UnavailableSource)
+    );
+    let requests = wire.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["system"], requests[1]["system"]);
+    assert!(requests[1].to_string().contains("image-signature"));
+    assert!(requests[1].to_string().contains("image/png"));
+}

@@ -16,6 +16,7 @@ pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
 pub(crate) mod read;
+pub(crate) mod read_image;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
 pub(crate) mod todo;
@@ -186,6 +187,8 @@ pub(crate) fn validate_workspace_binding(
 /// policy boundary, even within the same process.
 #[derive(Clone, Debug)]
 pub(crate) struct ReadTracker {
+    #[cfg(feature = "multimodal")]
+    pub(crate) image_support: read_image::ImageReadSupport,
     deny_repeated_reads: bool,
     tracked: std::sync::Arc<Mutex<Vec<TrackedRead>>>,
     pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
@@ -235,6 +238,8 @@ impl ReadTracker {
             deny_repeated_reads,
             tracked: std::sync::Arc::new(Mutex::new(Vec::new())),
             instructions: None,
+            #[cfg(feature = "multimodal")]
+            image_support: read_image::ImageReadSupport::default(),
         }
     }
 

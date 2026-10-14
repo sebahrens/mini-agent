@@ -6,6 +6,7 @@ pub(crate) mod native_publication;
 pub(crate) mod native_replay;
 pub mod storage;
 pub mod title;
+pub(crate) mod tool_image;
 pub(crate) mod user;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -220,6 +221,16 @@ impl TryFrom<UncheckedSessionMessage> for SessionMessage {
 
 impl SessionMessage {
     pub(crate) fn validate_user(&self) -> Result<(), &'static str> {
+        if let Some(PersistedToolMessage::Result { images, .. }) = &self.tool {
+            tool_image::validate_images(images)?;
+            if !images.is_empty()
+                && (self.role != MessageRole::ToolResult
+                    || self.tool_call_id.as_ref().is_none_or(|id| id.is_empty())
+                    || self.user.is_some())
+            {
+                return Err("canonical tool images do not match their session row");
+            }
+        }
         if let Some(user) = &self.user {
             user.validate()?;
             if self.role != MessageRole::User
@@ -244,6 +255,9 @@ pub enum PersistedToolMessage {
     },
     Result {
         output: CompactString,
+        /// Literal image bytes, separate from the bounded human-readable preview.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<tool_image::PersistedToolImage>,
         /// Separately persisted full output for a truncated result. Kept in
         /// the durable session so live-context pruning can retain a recorded
         /// recovery path without parsing marker-like text from the tool.
@@ -1401,6 +1415,16 @@ impl Session {
         name: &str,
         output: &str,
     ) -> (String, Option<std::path::PathBuf>) {
+        self.add_tool_result_with_images(id, name, output, Vec::new())
+    }
+
+    pub(crate) fn add_tool_result_with_images(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<tool_image::PersistedToolImage>,
+    ) -> (String, Option<std::path::PathBuf>) {
         let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
         let artifact_path = artifact
             .as_ref()
@@ -1411,6 +1435,7 @@ impl Session {
             (!id.is_empty()).then_some(id),
             Some(PersistedToolMessage::Result {
                 output: CompactString::new(replay_output),
+                images,
                 artifact_path,
             }),
         );

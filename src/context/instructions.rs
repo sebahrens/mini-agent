@@ -182,6 +182,7 @@ struct RootMetadata {
 }
 #[derive(Clone, Debug)]
 struct Receipt {
+    image_result: bool,
     name: String,
     id: String,
     internal_id: String,
@@ -891,6 +892,7 @@ impl WorkspaceInstructions {
 #[derive(Clone, Debug)]
 pub struct ContextNotice {
     output: String,
+    image_result: bool,
     sources: BTreeSet<String>,
 }
 impl std::fmt::Display for ContextNotice {
@@ -913,8 +915,35 @@ impl ContextNotice {
         }
         Ok(Self {
             output,
+            image_result: false,
             sources: sources.into_iter().map(|source| source.id).collect(),
         })
+    }
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn for_image_result(mut self) -> Self {
+        self.image_result = true;
+        self
+    }
+    fn effective_text<'a>(&self, output: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        if !self.image_result {
+            return Some(std::borrow::Cow::Borrowed(output));
+        }
+        // The private image marker is minted by the admitted native read only.
+        // Borrow/skip image data: never allocate another copy of its base64 body.
+        if output.len() > 8 * 1024 * 1024 {
+            return None;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope<'a> {
+            #[serde(borrow)]
+            response: std::borrow::Cow<'a, str>,
+            #[serde(rename = "parts")]
+            _parts: serde::de::IgnoredAny,
+        }
+        serde_json::from_str::<Envelope<'_>>(output)
+            .ok()
+            .map(|value| value.response)
     }
     pub(crate) fn read_result(self, output: String) -> ToolReturn<String> {
         let output = format!("{output}\n\n{}", self.output);
@@ -979,7 +1008,9 @@ impl<M: CompletionModel> AgentHook<M> for WorkspaceInstructionHook {
                 if let Some(notice) = extensions.get::<ContextNotice>() {
                     // Never restore pre-redaction or pre-spill bytes. Only an intact
                     // effective result can create a delivery receipt for this runner.
-                    if !result.ends_with(&notice.output)
+                    if !notice
+                        .effective_text(result)
+                        .is_some_and(|text| text.ends_with(&notice.output))
                         || [tool_id, internal_call_id].iter().any(|id| id.len() > 1024)
                         || tool_call_id.is_some_and(|id| id.len() > 1024)
                     {
@@ -991,6 +1022,7 @@ impl<M: CompletionModel> AgentHook<M> for WorkspaceInstructionHook {
                             return false;
                         }
                         delivery.receipts.push(Receipt {
+                            image_result: notice.image_result,
                             name: tool_name.to_owned(),
                             id: tool_id.to_owned(),
                             internal_id: internal_call_id.to_owned(),
@@ -1113,6 +1145,7 @@ pub(crate) fn effective_context_result_visible(
 ) -> bool {
     const SENTINEL: &str = "effective-skill-context-result";
     let receipt = Receipt {
+        image_result: false,
         name: name.into(),
         id: id.into(),
         internal_id: internal_id.into(),
@@ -1169,13 +1202,22 @@ fn visible_sources(request: &CompletionRequest, receipts: &[Receipt]) -> BTreeSe
                     let Some(call) = call else {
                         continue;
                     };
-                    if tool_result.content.len() != 1 {
-                        continue;
-                    }
                     let ToolResultContent::Text(text) = tool_result.content.first() else {
                         continue;
                     };
                     for receipt in receipts {
+                        let content_shape = if receipt.image_result {
+                            tool_result.content.len() == 2
+                                && matches!(
+                                    tool_result.content.iter().nth(1),
+                                    Some(ToolResultContent::Image(_))
+                                )
+                        } else {
+                            tool_result.content.len() == 1
+                        };
+                        if !content_shape {
+                            continue;
+                        }
                         if receipt.internal_id.is_empty() || call.function.name != receipt.name {
                             continue;
                         }

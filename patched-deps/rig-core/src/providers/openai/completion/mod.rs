@@ -1735,7 +1735,9 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
             supports_response_format,
             supports_tools,
         } = params;
-        let chat_history = req.chat_history_with_documents();
+        let chat_history = crate::completion::message::bridge_tool_result_images(
+            req.chat_history_with_documents(),
+        )?;
 
         let CoreCompletionRequest {
             model: request_model,

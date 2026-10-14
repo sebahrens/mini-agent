@@ -1476,6 +1476,7 @@ async fn finalize_interactive_tool_calls(
                 id: CompactString::from(call.internal_call_id),
                 name: CompactString::from(call.name),
                 output: CompactString::from(UNKNOWN_TOOL_OUTCOME),
+                images: Vec::new(),
                 is_error: true,
             })
             .await;
@@ -2317,7 +2318,7 @@ fn convert_history_uncached(
             }
             MessageRole::ToolResult => {
                 let structured = match (&msg.tool_call_id, &msg.tool) {
-                    (Some(id), Some(PersistedToolMessage::Result { output, .. }))
+                    (Some(id), Some(PersistedToolMessage::Result { output, images, .. }))
                         if open_call_ids.contains(id.as_str())
                             && !completed_call_ids.contains(id.as_str()) =>
                     {
@@ -2337,7 +2338,14 @@ fn convert_history_uncached(
                             id: identity.item_id,
                             call_id: (!canonical_none_call_ids.contains(id.as_str()))
                                 .then_some(identity.call_id),
-                            content: OneOrMany::one(ToolResultContent::text(output.to_string())),
+                            content: OneOrMany::many(
+                                std::iter::once(ToolResultContent::text(output.to_string())).chain(
+                                    images
+                                        .iter()
+                                        .map(|image| ToolResultContent::Image(image.to_rig())),
+                                ),
+                            )
+                            .expect("text result is nonempty"),
                         }))
                     }
                     _ => None,
@@ -3234,11 +3242,26 @@ where
                         goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
                         let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
                         let is_error = take_tool_failure(&internal_call_id);
+                        let images = match crate::session::tool_image::from_result(&tool_result) {
+                            Ok(images) => images,
+                            Err(error) if tool_name == "read" => {
+                                let _ = event_tx
+                                    .send(AgentEvent::error_with(
+                                        CompactString::from(error),
+                                        completed_so_far!(),
+                                    ))
+                                    .await;
+                                return;
+                            }
+                            // Preserve legacy text projection of nonliteral remote image tools.
+                            Err(_) => Vec::new(),
+                        };
                         let _ = event_tx
                             .send(AgentEvent::ToolResult {
                                 id: CompactString::from(internal_call_id),
                                 name: tool_name.clone(),
                                 output: CompactString::from(output),
+                                images,
                                 is_error,
                             })
                             .await;

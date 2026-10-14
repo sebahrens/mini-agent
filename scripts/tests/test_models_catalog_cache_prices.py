@@ -24,8 +24,9 @@ class ModelCatalogCachePriceTests(unittest.TestCase):
             fixture = root / "api.json"
             fixture.write_text(json.dumps({
                 "anthropic": {"models": {
-                    "priced": {**common, "id": "priced", "cost": {
+                    "priced": {**common, "id": "priced", "modalities": {"input": ["text", "image"], "output": ["text"]}, "cost": {
                         "input": 4, "output": 20, "cache_read": 0, "cache_write": 5}},
+                    "text-only": {**common, "id": "text-only", "modalities": {"input": ["text"], "output": ["text"]}, "cost": {"input": 1, "output": 2}},
                     "legacy": {**common, "id": "legacy", "cost": {
                         "input": 3, "output": 15}},
                 }},
@@ -46,6 +47,9 @@ class ModelCatalogCachePriceTests(unittest.TestCase):
             self.assertIsNone(generated["legacy"]["cache_read_price"])
             self.assertIsNone(generated["legacy"]["cache_write_price"])
             self.assertEqual(generated["priced"]["input_price"], 4)
+            self.assertIs(generated["priced"]["image_input"], True)
+            self.assertIsNone(generated["legacy"]["image_input"])
+            self.assertIs(generated["text-only"]["image_input"], False)
 
 
 if __name__ == "__main__":

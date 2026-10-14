@@ -275,10 +275,22 @@ where
 pub struct ToolResult {
     /// The call ID of a tool (this should be linked to the call ID for a tool call, otherwise an error will be received)
     call_id: String,
-    /// The result of a tool call.
-    output: String,
+    /// Text keeps its legacy JSON string shape; image results use native content blocks.
+    output: FunctionOutput,
     /// The status of a tool call (if used in a completion request, this should always be Completed)
     status: ToolStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum FunctionOutput {
+    Text(String),
+    Content(Vec<UserContent>),
+}
+impl From<String> for FunctionOutput {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
 }
 
 impl From<Message> for InputItem {
@@ -317,7 +329,7 @@ impl From<Message> for InputItem {
                 role: None,
                 input: InputContent::FunctionCallOutput(ToolResult {
                     call_id: tool_call_id,
-                    output,
+                    output: output.into(),
                     status: ToolStatus::Completed,
                 }),
             },
@@ -358,25 +370,72 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                 ..
                             },
                         ) => {
-                            for tool_result_content in tool_content {
-                                let crate::completion::message::ToolResultContent::Text(Text {
-                                    text,
-                                    ..
-                                }) = tool_result_content
-                                else {
-                                    return Err(CompletionError::ProviderError(
-                                        "The OpenAI Responses API only supports text tool results"
-                                            .to_string(),
-                                    ));
-                                };
+                            let has_image = tool_content.iter().any(|part| {
+                                matches!(part, crate::message::ToolResultContent::Image(_))
+                            });
+                            if has_image {
+                                let mut blocks = Vec::with_capacity(tool_content.len());
+                                for part in tool_content {
+                                    match part {
+                                        crate::message::ToolResultContent::Text(text) => {
+                                            blocks.push(UserContent::InputText { text: text.text })
+                                        }
+                                        crate::message::ToolResultContent::Image(image) => {
+                                            use crate::message::MimeType;
+                                            let mime =
+                                                image.media_type.as_ref().ok_or_else(|| {
+                                                    CompletionError::ProviderError(
+                                                        "Tool image requires a MIME type".into(),
+                                                    )
+                                                })?;
+                                            let url = match image.data {
+                                                DocumentSourceKind::Base64(data) => format!(
+                                                    "data:{};base64,{data}",
+                                                    mime.to_mime_type()
+                                                ),
+                                                DocumentSourceKind::Url(url) => url,
+                                                _ => {
+                                                    return Err(CompletionError::ProviderError(
+                                                        "Tool image source is unsupported".into(),
+                                                    ));
+                                                }
+                                            };
+                                            blocks.push(UserContent::InputImage {
+                                                image_url: url,
+                                                detail: image.detail.unwrap_or_default(),
+                                            });
+                                        }
+                                    }
+                                }
                                 items.push(InputItem {
                                     role: None,
                                     input: InputContent::FunctionCallOutput(ToolResult {
-                                        call_id: require_call_id(call_id.clone(), "Tool result")?,
-                                        output: text,
+                                        call_id: require_call_id(call_id, "Tool result")?,
+                                        output: FunctionOutput::Content(blocks),
                                         status: ToolStatus::Completed,
                                     }),
                                 });
+                            } else {
+                                for tool_result_content in tool_content {
+                                    let crate::completion::message::ToolResultContent::Text(Text {
+                                        text,
+                                        ..
+                                    }) = tool_result_content
+                                    else {
+                                        unreachable!("image branch handled above")
+                                    };
+                                    items.push(InputItem {
+                                        role: None,
+                                        input: InputContent::FunctionCallOutput(ToolResult {
+                                            call_id: require_call_id(
+                                                call_id.clone(),
+                                                "Tool result",
+                                            )?,
+                                            output: text.into(),
+                                            status: ToolStatus::Completed,
+                                        }),
+                                    });
+                                }
                             }
                         }
                         crate::message::UserContent::Document(Document {

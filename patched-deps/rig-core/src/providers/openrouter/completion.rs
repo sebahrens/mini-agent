@@ -1354,7 +1354,9 @@ impl TryFrom<OpenRouterRequestParams<'_>> for OpenrouterCompletionRequest {
             request: req,
             strict_tools,
         } = params;
-        let chat_history = req.chat_history_with_documents();
+        let chat_history = crate::completion::message::bridge_tool_result_images(
+            req.chat_history_with_documents(),
+        )?;
         let model = req.model.clone().unwrap_or_else(|| model.to_string());
 
         let mut full_history: Vec<Message> = match &req.preamble {

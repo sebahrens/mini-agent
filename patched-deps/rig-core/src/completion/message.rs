@@ -934,7 +934,12 @@ impl ToolResultContent {
                 let mut results: Vec<ToolResultContent> = Vec::new();
 
                 if let Some(response) = json.get("response") {
-                    results.push(ToolResultContent::Text(Text::new(response.to_string())));
+                    results.push(ToolResultContent::Text(Text::new(
+                        response
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| response.to_string()),
+                    )));
                 }
 
                 if let Some(parts) = json.get("parts").and_then(|p| p.as_array()) {
@@ -1436,4 +1441,132 @@ mod tests {
         let roundtrip: Message = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(roundtrip, message);
     }
+}
+
+/// Adapt image tool results for protocols whose tool role accepts only text.
+/// Every original result/ID stays in place; image user content is appended only
+/// after all calls from that assistant batch have returned. No tool is executed
+/// and image data is never interpreted as a path or fetched by this adapter.
+pub(crate) fn bridge_tool_result_images(
+    messages: Vec<Message>,
+) -> Result<Vec<Message>, MessageError> {
+    if !messages.iter().any(|message| matches!(message, Message::User { content } if content.iter().any(|part| matches!(part, UserContent::ToolResult(result) if result.content.iter().any(|part| matches!(part, ToolResultContent::Image(_))))))) {
+        return Ok(messages);
+    }
+    let error = || {
+        MessageError::ConversionError(
+            "Image tool result has incomplete or ambiguous call correlation".into(),
+        )
+    };
+    let mut aliases = std::collections::BTreeMap::<String, String>::new();
+    let mut pending = std::collections::BTreeSet::<String>::new();
+    let mut images = Vec::new();
+    let mut output = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            Message::Assistant { ref content, .. } => {
+                if !images.is_empty() {
+                    return Err(error());
+                }
+                aliases.clear();
+                pending.clear();
+                for part in content.iter() {
+                    if let AssistantContent::ToolCall(call) = part {
+                        if !pending.insert(call.id.clone()) {
+                            return Err(error());
+                        }
+                        for alias in
+                            std::iter::once(call.id.as_str()).chain(call.call_id.as_deref())
+                        {
+                            if aliases
+                                .insert(alias.to_owned(), call.id.clone())
+                                .is_some_and(|prior| prior != call.id)
+                            {
+                                return Err(error());
+                            }
+                        }
+                    }
+                }
+                output.push(message);
+            }
+            Message::User { content } => {
+                let mut parts = Vec::with_capacity(content.len());
+                for part in content {
+                    match part {
+                        UserContent::ToolResult(mut result) => {
+                            let has_image = result
+                                .content
+                                .iter()
+                                .any(|part| matches!(part, ToolResultContent::Image(_)));
+                            let identity = aliases.get(&result.id).cloned();
+                            if has_image
+                                && (identity.is_none()
+                                    || result
+                                        .call_id
+                                        .as_ref()
+                                        .is_some_and(|id| aliases.get(id) != identity.as_ref()))
+                            {
+                                return Err(error());
+                            }
+                            if let Some(identity) = identity {
+                                if !pending.remove(&identity) && (has_image || !images.is_empty()) {
+                                    return Err(error());
+                                }
+                            }
+                            let mut text = Vec::new();
+                            for item in result.content {
+                                match item {
+                                    ToolResultContent::Text(value) => {
+                                        text.push(ToolResultContent::Text(value))
+                                    }
+                                    ToolResultContent::Image(image) => {
+                                        images.push(UserContent::Text(Text::new(format!(
+                                            "Image returned by tool call {}:",
+                                            serde_json::to_string(
+                                                result.call_id.as_ref().unwrap_or(&result.id)
+                                            )
+                                            .expect("literal tool ID")
+                                        ))));
+                                        images.push(UserContent::Image(image));
+                                    }
+                                }
+                            }
+                            if text.is_empty() {
+                                text.push(ToolResultContent::Text(Text::new(
+                                    "Image returned; see the image content after this tool batch.",
+                                )));
+                            }
+                            result.content = OneOrMany::many(text).expect("nonempty tool text");
+                            parts.push(UserContent::ToolResult(result));
+                        }
+                        other => {
+                            if !images.is_empty() && !pending.is_empty() {
+                                return Err(error());
+                            }
+                            parts.push(other);
+                        }
+                    }
+                }
+                output.push(Message::User {
+                    content: OneOrMany::many(parts).map_err(|_| error())?,
+                });
+                if pending.is_empty() && !images.is_empty() {
+                    output.push(Message::User {
+                        content: OneOrMany::many(std::mem::take(&mut images))
+                            .expect("nonempty image bridge"),
+                    });
+                }
+            }
+            other => {
+                if !images.is_empty() {
+                    return Err(error());
+                }
+                output.push(other);
+            }
+        }
+    }
+    if !images.is_empty() {
+        return Err(error());
+    }
+    Ok(output)
 }

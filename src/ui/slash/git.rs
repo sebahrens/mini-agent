@@ -956,6 +956,7 @@ async fn emit_call<
             id: id.into(),
             name: name.into(),
             output: output.into(),
+            images: Vec::new(),
             is_error,
         })
         .await

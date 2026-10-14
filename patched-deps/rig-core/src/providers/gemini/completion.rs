@@ -200,7 +200,9 @@ where
 pub(crate) fn create_request_body(
     completion_request: CompletionRequest,
 ) -> Result<GenerateContentRequest, CompletionError> {
-    let chat_history = completion_request.chat_history_with_documents();
+    let chat_history = crate::completion::message::bridge_tool_result_images(
+        completion_request.chat_history_with_documents(),
+    )?;
 
     let CompletionRequest {
         model: _,

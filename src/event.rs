@@ -101,6 +101,8 @@ pub enum AgentEvent {
         id: CompactString,
         name: CompactString,
         output: CompactString,
+        /// Validated literal image content, bound to this exact correlated result.
+        images: Vec<crate::session::tool_image::PersistedToolImage>,
         /// The tool failed, was denied, or its outcome is unknown. Clients that
         /// report tool status (ACP) mark such calls failed.
         #[cfg_attr(not(feature = "acp"), allow(dead_code))]

@@ -36,5 +36,17 @@
       "log": "/private/tmp/mini-agent-wave47-lsp-marker-final.log",
       "command": "cargo test --bin mini-agent --features advisor --locked --offline -- lsp_process_broken_stdin_is_terminal_and_reaped lsp_pipe_peer_closed_witness_requires_last_reader_departure --test-threads=1"
     }
+  },
+  "fresh_hosted_acceptance": {
+    "head": "55632dfd2bcaf73dbe5be5db462ba282575dd0a4",
+    "run": 38626337491,
+    "linux_job": 116068116430,
+    "macos_job": 116068116421,
+    "both_jobs": "success",
+    "exact_controls": [
+      "lsp_pipe_peer_closed_witness_requires_last_reader_departure: PASS on both",
+      "lsp_process_broken_stdin_is_terminal_and_reaped: PASS on both"
+    ],
+    "source_scope": "Later native checkpoint and image patches do not change LSP source. Prior unrelated Windows preflight failure is independently tracked."
   }
 }

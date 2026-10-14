@@ -157,6 +157,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     id: "lifecycle-1".into(),
                     name: "read".into(),
                     output: "fn main() {}".into(),
+                    images: Vec::new(),
                     is_error: false,
                 },
                 #[cfg(feature = "subagents")]
@@ -217,6 +218,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                 session.messages[2].tool,
                 Some(PersistedToolMessage::Result {
                     output: "fn main() {}".into(),
+                    images: Vec::new(),
                     artifact_path: None,
                 })
             );
@@ -357,6 +359,7 @@ fn headless_turn_persists_tool_records_before_assistant_message() {
         session.messages[2].tool,
         Some(PersistedToolMessage::Result {
             output: "fn main() {}".into(),
+            images: Vec::new(),
             artifact_path: None,
         })
     );

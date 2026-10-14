@@ -1465,6 +1465,7 @@ const BTW_MAX_TURNS: usize = 8;
 pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     model: M,
     instruction_protocol: crate::context::instructions::InstructionProtocol,
+    #[cfg(feature = "multimodal")] image_support: tools::read_image::ImageReadSupport,
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
@@ -1592,6 +1593,10 @@ pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     let max_find_results = cfg.resolve_max_find_results();
     let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
     let mut read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
+    #[cfg(feature = "multimodal")]
+    {
+        read_tracker.image_support = image_support;
+    }
     read_tracker.instructions = instructions.clone();
     let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
         Box::new(
@@ -2685,6 +2690,8 @@ mod js_tests {
         let agent = build_btw_agent_inner(
             fake_model("btw"),
             crate::context::instructions::InstructionProtocol::Unverified,
+            #[cfg(feature = "multimodal")]
+            crate::agent::tools::read_image::ImageReadSupport::default(),
             &crate::cli::Cli::default(),
             &crate::config::Config::default(),
             &empty_context(),

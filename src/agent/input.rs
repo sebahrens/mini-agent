@@ -48,7 +48,7 @@ pub(crate) fn history_has_images(history: &[rig::message::Message]) -> bool {
     history.iter().any(|message| match message {
         rig::message::Message::User { content } => content
             .iter()
-            .any(|block| matches!(block, rig::message::UserContent::Image(_))),
+            .any(|block| matches!(block, rig::message::UserContent::Image(_)) || matches!(block, rig::message::UserContent::ToolResult(result) if result.content.iter().any(|part| matches!(part, rig::message::ToolResultContent::Image(_))))),
         rig::message::Message::Assistant { .. } | rig::message::Message::System { .. } => false,
     })
 }

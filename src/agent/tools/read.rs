@@ -174,7 +174,7 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
+            "{text} PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
         )
     }
 
@@ -208,11 +208,39 @@ impl Tool for ReadTool {
         extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
         let mut notice = None;
-        let output = self.read_inner(args, extensions, &mut notice).await?;
-        Ok(match notice {
+        #[cfg(feature = "multimodal")]
+        let mut image = None;
+        let output = self
+            .read_inner(
+                args,
+                extensions,
+                &mut notice,
+                #[cfg(feature = "multimodal")]
+                &mut image,
+            )
+            .await?;
+        #[cfg(feature = "multimodal")]
+        let notice = notice.map(|notice| {
+            if image.is_some() {
+                notice.for_image_result()
+            } else {
+                notice
+            }
+        });
+        let result = match notice {
             Some(notice) => notice.read_result(output),
             None => rig::tool::ToolReturn::success(output),
-        })
+        };
+        #[cfg(feature = "multimodal")]
+        let result = if let Some(image) = image {
+            rig::tool::ToolReturn {
+                output: image.output(&result.output),
+                ..result
+            }
+        } else {
+            result
+        };
+        Ok(result)
     }
 }
 
@@ -222,6 +250,7 @@ impl ReadTool {
         args: ReadArgs,
         extensions: &rig::tool::ToolCallExtensions,
         notice: &mut Option<crate::context::instructions::ContextNotice>,
+        #[cfg(feature = "multimodal")] image: &mut Option<super::read_image::ImageRead>,
     ) -> Result<String, ToolError> {
         let notebook_view =
             !args.raw_notebook && super::notebook::is_notebook(Path::new(&args.path));
@@ -351,6 +380,62 @@ impl ReadTool {
             });
         }
 
+        let mut reader = BufReader::new(file);
+        #[cfg(not(feature = "multimodal"))]
+        if super::read_image::ImageFormat::from_magic(reader.fill_buf().await?).is_some() {
+            return Err(ToolError::Msg(
+                "Image reads require the multimodal feature".into(),
+            ));
+        }
+        #[cfg(feature = "multimodal")]
+        if let Some(format) = super::read_image::ImageFormat::from_magic(reader.fill_buf().await?) {
+            use base64::Engine;
+            use tokio::io::AsyncReadExt;
+            self.read_tracker
+                .image_support
+                .check(format)
+                .map_err(|message| ToolError::Msg(message.into()))?;
+            if args.offset.is_some() || args.limit.is_some() {
+                return Err(ToolError::Msg(
+                    "Image reads do not accept text line offset/limit; read the whole image".into(),
+                ));
+            }
+            let cap = super::read_image::MAX_IMAGE_BYTES;
+            if !metadata.is_file() || metadata.len() > cap as u64 {
+                return Err(ToolError::Msg(
+                    "Image reads require a regular file no larger than 5 MiB".into(),
+                ));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            reader
+                .take((cap + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > cap {
+                return Err(ToolError::Msg(
+                    "Image grew beyond the 5 MiB input limit".into(),
+                ));
+            }
+            let info = super::read_image::inspect(&bytes)
+                .map_err(|message| ToolError::Msg(message.into()))?
+                .ok_or_else(|| ToolError::Msg("Image signature changed during the read".into()))?;
+            self.read_tracker.untrack_read_path(&permission_path);
+            let summary = format!(
+                "Image: {path} ({}; {} x {}; {} bytes)",
+                info.format.mime(),
+                info.width,
+                info.height,
+                info.bytes
+            );
+            *image = Some(super::read_image::ImageRead {
+                mime: info.format.mime(),
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            });
+            return Ok(match coaching {
+                Some(coaching) => format!("{coaching}\n\n{summary}"),
+                None => summary,
+            });
+        }
         let file_size = metadata.len();
         let explicitly_bounded = args.offset.is_some() || args.limit.is_some();
         if file_size > self.max_text_file_size && !explicitly_bounded {
@@ -370,7 +455,6 @@ impl ReadTool {
         let scan_to_eof = !oversized || es == EditSystem::Hashedit;
         let hashedit = es == EditSystem::Hashedit;
         let requested_end = offset.saturating_add(limit);
-        let mut reader = BufReader::new(file);
         let mut excerpt_lines: Vec<String> = Vec::with_capacity(limit.min(256));
         let mut excerpt_bytes = 0_u64;
         let mut total_lines = 0_usize;

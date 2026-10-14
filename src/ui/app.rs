@@ -9324,6 +9324,7 @@ mod mutation_consumer_tests {
                 id: "actual".into(),
                 name: "write".into(),
                 output: result.output.as_str().into(),
+                images: Vec::new(),
                 is_error: false,
             },
         ] {

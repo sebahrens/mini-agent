@@ -41,6 +41,8 @@ Run production crate commands from the repository root:
   or unresolved review findings, not merely because another gate or bead reached completion.
 - Parallel agents must coordinate Cargo runs: do not build different feature rows in the same
   target directory while a test binary runs, because integration tests use that shared binary.
+- Give each checkout its own target directory. Reusing a target directory across worktrees can
+  leave dependency fingerprints pointing at another checkout and silently reuse stale SDK code.
 - Never use `git checkout`, `git restore`, `git reset`, `git stash`, or `git clean` to repair another
   agent's in-progress edits in the shared checkout.
 

@@ -1875,3 +1875,90 @@ async fn context63_actual_cancelled_response_cannot_acknowledge_notice_or_start_
     );
     assert_eq!(outcomes.lock().unwrap().first(), Some(&true));
 }
+
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn image_read64_native_image_receipt_is_effective_and_rewrite_cannot_adopt() {
+    #[derive(Clone)]
+    struct Rewrite(bool);
+    impl<M: CompletionModel> AgentHook<M> for Rewrite {
+        async fn on_event(&self, _: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            if self.0
+                && matches!(
+                    event,
+                    StepEvent::ToolResult {
+                        tool_name: "read",
+                        ..
+                    }
+                )
+            {
+                return Flow::rewrite_result("[image result redacted]");
+            }
+            Flow::cont()
+        }
+    }
+    for rewritten in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.tracker.image_support = crate::agent::tools::read_image::ImageReadSupport::captured(
+            "anthropic",
+            "claude-fable-5-1",
+            false,
+        );
+        std::fs::write(
+            fixture.workspace.root().join("nested/pixel.png"),
+            include_bytes!("../agent/tools/fixtures/read-image64/3x2.png"),
+        )
+        .unwrap();
+        let read = crate::agent::tools::ReadTool::new_with_tracker(
+            None,
+            None,
+            None,
+            100,
+            fixture.tracker.clone(),
+        )
+        .with_workspace_binding(fixture.workspace.clone());
+        // The first read has an intact private instruction notice. The next
+        // accepted response may acknowledge only the actual effective result.
+        let wire = Wire::new(vec![
+            (
+                false,
+                tool_response(1, "read", json!({"path":"nested/pixel.png"})),
+            ),
+            (false, response(2, true)),
+            (false, response(3, false)),
+        ]);
+        let AnyModel::Anthropic(model) = wire.client().completion_model("claude-fixture") else {
+            unreachable!()
+        };
+        let mut tools = fixture.tools();
+        tools.extend(crate::agent::tools::concurrency::bind(vec![Box::new(read)]));
+        let agent = rig::agent::AgentBuilder::new(model)
+            .preamble(POLICY)
+            .max_tokens(1000)
+            .default_max_turns(3)
+            .tools(tools)
+            .add_hook(Rewrite(rewritten))
+            .add_hook(WorkspaceInstructionHook(Some(fixture.instructions.clone())))
+            .build();
+        let result = agent
+            .prompt("inspect the image, then follow its captured instructions")
+            .extended_details()
+            .await
+            .unwrap();
+        assert_eq!(result.output, "settled");
+        assert_eq!(
+            fixture.workspace.root().join("nested/effect.txt").exists(),
+            !rewritten
+        );
+        let requests = wire.finish();
+        let followup = requests[1].to_string();
+        if rewritten {
+            assert!(followup.contains("[image result redacted]"));
+            assert!(!followup.contains("NESTED_INSTRUCTION_BEFORE_EFFECT"));
+            assert!(!followup.contains("image/png"));
+        } else {
+            assert!(followup.contains("NESTED_INSTRUCTION_BEFORE_EFFECT"));
+            assert!(followup.contains("image/png"));
+        }
+    }
+}
