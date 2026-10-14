@@ -1438,13 +1438,68 @@ pub(crate) fn persist_headless_turn(
     response: &str,
     interactions: &[Message],
 ) {
-    session.add_message(MessageRole::User, prompt);
+    if let Err(error) = persist_headless_turn_input(
+        session,
+        &crate::agent::input::PromptInput::text(prompt.to_owned()),
+        response,
+        interactions,
+    ) {
+        tracing::warn!(%error, "canonical user-content projection was incomplete");
+    }
+}
+
+fn persist_user_delta_blocks(
+    session: &mut Session,
+    mut blocks: Vec<crate::session::user::UserBlock>,
+) -> anyhow::Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    if blocks.len() == 1 && matches!(blocks[0], crate::session::user::UserBlock::Text { .. }) {
+        let crate::session::user::UserBlock::Text { text } = blocks.remove(0) else {
+            unreachable!()
+        };
+        session.add_message(MessageRole::User, &text);
+    } else {
+        let user =
+            crate::session::user::PersistedUserMessage::new(blocks).map_err(anyhow::Error::msg)?;
+        session.add_user_message(user);
+    }
+    Ok(())
+}
+
+/// Canonical initial User bytes and subsequent SDK User deltas share one
+/// durable Session graph. This does not create receipts or runtime authority.
+pub(crate) fn persist_headless_turn_input(
+    session: &mut Session,
+    prompt: &crate::agent::input::PromptInput,
+    response: &str,
+    interactions: &[Message],
+) -> anyhow::Result<()> {
+    if let Some(user) = prompt.persisted_user() {
+        session.add_user_message(user.clone());
+    } else {
+        session.add_message(MessageRole::User, prompt.literal_text());
+    }
     let mut tool_names: HashMap<String, &str> = HashMap::new();
     let mut pending_reasoning: Vec<PersistedReasoning> = Vec::new();
     let mut pending_text = String::new();
-    for interaction in interactions {
+    for (index, interaction) in interactions.iter().enumerate() {
         match interaction {
             Message::Assistant { content, .. } => {
+                if index + 1 < interactions.len()
+                    && content.iter().all(
+                        |item| matches!(item, AssistantContent::Text(text) if text.text.is_empty()),
+                    )
+                {
+                    if !pending_text.is_empty() {
+                        session.add_message(
+                            MessageRole::Assistant,
+                            &std::mem::take(&mut pending_text),
+                        );
+                    }
+                    session.add_message(MessageRole::Assistant, "");
+                }
                 for item in content.iter() {
                     match item {
                         AssistantContent::Reasoning(reasoning) => {
@@ -1489,11 +1544,55 @@ pub(crate) fn persist_headless_turn(
                 }
             }
             Message::User { content } => {
+                if !pending_text.is_empty() {
+                    session.add_message(MessageRole::Assistant, &std::mem::take(&mut pending_text));
+                }
                 pending_reasoning.clear();
+                let mut user_blocks = Vec::new();
                 for item in content.iter() {
                     let UserContent::ToolResult(result) = item else {
+                        match item {
+                            UserContent::Text(text) => {
+                                user_blocks.push(crate::session::user::UserBlock::Text {
+                                    text: text.text.clone(),
+                                })
+                            }
+                            UserContent::Image(image) => {
+                                let rig::message::DocumentSourceKind::Base64(data) = &image.data
+                                else {
+                                    anyhow::bail!("unsupported canonical user image source");
+                                };
+                                anyhow::ensure!(
+                                    image.detail.is_none() && image.additional_params.is_none(),
+                                    "unsupported canonical user image options"
+                                );
+                                let mime_type = match image.media_type {
+                                    Some(rig::message::ImageMediaType::PNG) => {
+                                        crate::session::user::ImageMime::Png
+                                    }
+                                    Some(rig::message::ImageMediaType::JPEG) => {
+                                        crate::session::user::ImageMime::Jpeg
+                                    }
+                                    Some(rig::message::ImageMediaType::GIF) => {
+                                        crate::session::user::ImageMime::Gif
+                                    }
+                                    Some(rig::message::ImageMediaType::WEBP) => {
+                                        crate::session::user::ImageMime::Webp
+                                    }
+                                    _ => {
+                                        anyhow::bail!("unsupported canonical user image MIME type")
+                                    }
+                                };
+                                user_blocks.push(crate::session::user::UserBlock::Image {
+                                    data: data.clone(),
+                                    mime_type,
+                                });
+                            }
+                            _ => anyhow::bail!("unsupported canonical user content"),
+                        }
                         continue;
                     };
+                    persist_user_delta_blocks(session, std::mem::take(&mut user_blocks))?;
                     let identifier =
                         persisted_call_identifier(result.call_id.as_deref(), result.id.as_str())
                             .to_string();
@@ -1512,6 +1611,7 @@ pub(crate) fn persist_headless_turn(
                         .join("\n");
                     session.add_tool_result_with_id(&identifier, name, &output);
                 }
+                persist_user_delta_blocks(session, user_blocks)?;
             }
             Message::System { .. } => {}
         }
@@ -1520,7 +1620,10 @@ pub(crate) fn persist_headless_turn(
     // carries.
     if !response.is_empty() {
         session.add_message(MessageRole::Assistant, response);
+    } else if !pending_text.is_empty() {
+        session.add_message(MessageRole::Assistant, &pending_text);
     }
+    Ok(())
 }
 
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";

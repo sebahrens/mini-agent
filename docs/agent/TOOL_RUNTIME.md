@@ -1117,3 +1117,26 @@ revocation. Existing manager DNS/handshake/per-effect gates and ordinary MCP
 permissions are unchanged. Diagnostic origin labels never confer launch authority.
 
 `src/config/finite.rs` performs a bounded, allocation-free read-only serde traversal before CLI/project JSON normalization. Every serialized non-finite float is refused with a static value-redacted error; neither a base policy nor an overlay can turn into JSON null and erase a cap. It creates no second configuration/value, grant, writer, or effect owner.
+
+`session::storage::load_session_exact_read_only` imports data through two
+host-retained roots. It validates the application-private directory and file
+without creating or repairing them, rejects links and changed identity, reads
+at most 8 MiB plus one detection byte, and requires the requested portable ID
+and current workspace. Saved labels and approvals do not create runtime grants;
+the frontend constructs fresh permissions/instruction services separately.
+All Session reads/serialization use the same 8 MiB ceiling. Saves encode once
+through a bounded byte writer, so shared-owner changes cannot evade a separate
+size-count pass. Malformed snapshots
+produce a bounded static parse error; oversize saves refuse before creating or
+replacing a session artifact. Native replay compatibility remains a separate
+actual-model/controller check.
+
+The shared `session::user` schema and `agent::input::PromptInput` retain ordered
+bounded text/image data separately from literal instruction text. Typed rows
+validate role and exact text projection; JSONL import remains tolerant of legacy
+rows without token estimates. `print::persist_headless_turn_input` projects the
+actual canonical delta, including intermediate empty Assistant boundaries and
+non-initial User messages. The shared bounded encoder validates typed rows before
+creating directories or claiming a writer. These prerequisites do not enable ACP
+list/load/media handlers or import approvals, instruction receipts or replay
+authority.

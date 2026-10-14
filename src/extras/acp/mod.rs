@@ -194,6 +194,7 @@ impl SessionHistory {
                     };
                     serialized.push(crate::session::SessionMessage {
                         recorded_diff: None,
+                        user: None,
                         role,
                         estimated_tokens: crate::session::Session::estimate_tokens(&content),
                         content: content.into(),

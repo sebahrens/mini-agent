@@ -193,6 +193,7 @@ fn profile(
 }
 fn history(length: usize) -> Vec<SessionMessage> {
     vec![SessionMessage {
+        user: None,
         recorded_diff: None,
         role: MessageRole::User,
         content: "x".repeat(length).into(),

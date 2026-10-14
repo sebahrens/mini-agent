@@ -1020,6 +1020,7 @@ mod tests {
         tool: Option<PersistedToolMessage>,
     ) -> SessionMessage {
         SessionMessage {
+            user: None,
             recorded_diff: None,
             role,
             content: CompactString::new(""),

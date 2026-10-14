@@ -94,6 +94,10 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
             line["recorded_diff"] =
                 serde_json::to_value(diff).context("serialize mutation preview")?;
         }
+        if let Some(user) = &msg.user {
+            msg.validate_user().map_err(anyhow::Error::msg)?;
+            line["user"] = serde_json::to_value(user)?;
+        }
         let line = line.to_string();
         if line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
             anyhow::bail!("session message exceeds the JSONL line limit");
@@ -124,7 +128,26 @@ struct ImportMessage {
     #[serde(default)]
     tool: Option<crate::session::PersistedToolMessage>,
     #[serde(default)]
+    user: Option<crate::session::user::PersistedUserMessage>,
+    #[serde(default)]
     recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
+}
+
+impl ImportMessage {
+    fn validate_user(&self) -> Result<()> {
+        if let Some(user) = &self.user {
+            anyhow::ensure!(
+                self.role == MessageRole::User
+                    && self.tool.is_none()
+                    && self.tool_call_id.is_none()
+                    && self.recorded_diff.is_none()
+                    && self.content.as_str() == user.literal_text(),
+                "invalid imported user content projection"
+            );
+            user.validate().map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -471,10 +494,12 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         }
         let message: ImportMessage = serde_json::from_value(value)
             .with_context(|| format!("line {} is not a session message", index + 1))?;
+        message.validate_user()?;
         let recorded_diff =
             imported_mutation_diff(message.recorded_diff, message.role, &message.tool);
         messages.push(SessionMessage {
             recorded_diff,
+            user: message.user,
             role: message.role,
             content: message.content,
             estimated_tokens: message.estimated_tokens,
@@ -524,9 +549,11 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
         }
         let msg: ImportMessage = serde_json::from_value(value)
             .with_context(|| format!("line {} is not a session message", idx + 1))?;
+        msg.validate_user()?;
         let recorded_diff = imported_mutation_diff(msg.recorded_diff, msg.role, &msg.tool);
         messages.push(SessionMessage {
             recorded_diff,
+            user: msg.user,
             role: msg.role,
             content: msg.content,
             estimated_tokens: msg.estimated_tokens,

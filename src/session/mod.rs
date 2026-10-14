@@ -4,6 +4,7 @@ pub(crate) mod compaction;
 pub mod lock;
 pub mod storage;
 pub mod title;
+pub(crate) mod user;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -161,7 +162,11 @@ pub enum MessageRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedSessionMessage")]
 pub struct SessionMessage {
+    /// Ordered canonical text/image payload; absent for legacy text-only rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) user: Option<user::PersistedUserMessage>,
     /// Bounded historical preview of a committed native mutation. This is
     /// display data, never current-filesystem or permission authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +182,55 @@ pub struct SessionMessage {
     /// UI; legacy sessions simply omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<PersistedToolMessage>,
+}
+
+#[derive(Deserialize)]
+struct UncheckedSessionMessage {
+    #[serde(default)]
+    user: Option<user::PersistedUserMessage>,
+    #[serde(default)]
+    recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
+    role: MessageRole,
+    content: CompactString,
+    estimated_tokens: u64,
+    #[serde(default)]
+    tool_call_id: Option<CompactString>,
+    #[serde(default)]
+    tool: Option<PersistedToolMessage>,
+}
+
+impl TryFrom<UncheckedSessionMessage> for SessionMessage {
+    type Error = &'static str;
+    fn try_from(value: UncheckedSessionMessage) -> Result<Self, Self::Error> {
+        let message = Self {
+            user: value.user,
+            recorded_diff: value.recorded_diff,
+            role: value.role,
+            content: value.content,
+            estimated_tokens: value.estimated_tokens,
+            tool_call_id: value.tool_call_id,
+            tool: value.tool,
+        };
+        message.validate_user()?;
+        Ok(message)
+    }
+}
+
+impl SessionMessage {
+    pub(crate) fn validate_user(&self) -> Result<(), &'static str> {
+        if let Some(user) = &self.user {
+            user.validate()?;
+            if self.role != MessageRole::User
+                || self.tool.is_some()
+                || self.tool_call_id.is_some()
+                || self.recorded_diff.is_some()
+                || self.content.as_str() != user.literal_text()
+            {
+                return Err("canonical user payload does not match its session row");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1176,6 +1230,23 @@ impl Session {
         self.mark_history_changed();
     }
 
+    pub(crate) fn validate_user_messages(&self) -> anyhow::Result<()> {
+        for message in &self.messages {
+            message.validate_user().map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_user_message(&mut self, user: user::PersistedUserMessage) {
+        let text = user.literal_text();
+        self.add_message(MessageRole::User, &text);
+        self.messages
+            .last_mut()
+            .expect("just appended user row")
+            .user = Some(user);
+        self.mark_history_changed();
+    }
+
     fn add_message_with_tool_data(
         &mut self,
         role: MessageRole,
@@ -1185,6 +1256,7 @@ impl Session {
     ) {
         let tokens = Self::estimate_tokens(content);
         self.messages.push(SessionMessage {
+            user: None,
             recorded_diff: None,
             role,
             content: CompactString::new(content),
@@ -2052,6 +2124,7 @@ impl Session {
 
         // Insert a System message with the summary at the boundary
         let summary_msg = SessionMessage {
+            user: None,
             recorded_diff: None,
             role: MessageRole::System,
             content: CompactString::from(summary.clone()),

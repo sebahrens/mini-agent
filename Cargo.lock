@@ -2831,6 +2831,7 @@ version = "1.9.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "base64 0.22.1",
  "blocking",
  "bytes",
  "cap-std",
