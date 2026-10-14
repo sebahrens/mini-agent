@@ -4,6 +4,7 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 /// Explicit opt-in for personas that can mutate the parent's workspace.
+#[cfg(feature = "subagents")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubagentPolicy {

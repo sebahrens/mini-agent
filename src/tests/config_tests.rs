@@ -515,6 +515,9 @@ subagent_provider = "sub-provider"
 acp_host = "127.0.0.1"
 acp_port = 7243
 
+[subagents]
+allow_write = true
+
 [future_table]
 nested = { flag = true, values = [3, 4] }
 
@@ -584,6 +587,7 @@ advisor_kilobytes_limit = 128
         "task_enabled",
         "subagent_model",
         "subagent_provider",
+        "subagents",
         "mcp_servers",
         "acp_servers",
         "acp_host",
@@ -601,6 +605,8 @@ advisor_kilobytes_limit = 128
     let reloaded = parse_config_content(path, &serialized).unwrap();
     assert_eq!(reloaded.model.as_deref(), Some("updated-model"));
     assert_eq!(reloaded.temperature, None);
+    #[cfg(feature = "subagents")]
+    assert!(reloaded.subagents.as_ref().unwrap().allow_write);
 }
 
 #[test]

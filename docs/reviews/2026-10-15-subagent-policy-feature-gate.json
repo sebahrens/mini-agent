@@ -1,0 +1,27 @@
+{
+  "owner_bead": "mini-agent-i7ro6.55",
+  "base": "44e964b2947a3cb2e81ac568b0f8c94724cdfce6",
+  "problem": "SubagentPolicy was unconditionally declared but Config.subagents and all constructors are gated by subagents. Both observed feature-off CI rows fail dead_code under -D warnings.",
+  "fix": "Gate the policy type with the same subagents feature; do not suppress the warning.",
+  "navigation": "Code-indexer exact type and indexed regex found only gated Config field and TaskTool test constructor.",
+  "validation": {
+    "strict": "cargo clippy --no-default-features --features memory --all-targets -- -D warnings PASS30.82s",
+    "config": "cargo test --no-default-features --features memory --bin mini-agent -- config_cross_feature_round_trip config_key_catalogue_matches_config_ownership --test-threads=1 PASS2/.01s",
+    "test_change": "Actual cross-feature roundtrip now preserves subagents.allow_write=true, both as typed settings when enabled and opaque settings when absent.",
+    "scope": "One representative subagents-off row validates the exact shared declaration boundary. No full suite or repeated install for unchanged enabled production behavior. Hosted js+sandbox and other feature-off rows remain next CI evidence."
+  },
+  "review": {
+    "findings": [],
+    "checks": [
+      "All type references occur in subagents-gated code",
+      "Cross-feature serialization retains operator preference",
+      "Default/read-only permission and containment behavior unchanged"
+    ]
+  },
+  "artifacts": {
+    "/private/tmp/mini-agent-44e-job-116126880086.log": "25816a8b457f603ea6fdaeada09f12f42b033f70323e12085ff204dd379d9e9b",
+    "/private/tmp/mini-agent-44e-job-116126880090.log": "3b7877a2182dd1b1a77b63e11ad3969b1000412b1959c6fe302378bc99eaaeaf",
+    "/private/tmp/mini-agent-44e-subagent-policy-off-clippy.log": "c29144f091c2f71f1354eccf8bf43af34a6aa74042c982f0bbf7a2ee6c0d0b1b",
+    "/private/tmp/mini-agent-44e-subagent-policy-off-config.log": "d694a630d3d2a5e3d46478e5fe223a2b7fd311d58e1264b181e4a7c9c3001b05"
+  }
+}
