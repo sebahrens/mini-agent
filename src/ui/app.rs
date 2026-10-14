@@ -11455,6 +11455,69 @@ mod plan_approval_tests {
     }
 
     #[tokio::test]
+    async fn busy67_actual_picker_native_write_error_is_propagated() {
+        let roots = Roots::new();
+        let workspace = roots.workspace();
+        let provider = Provider::new(Vec::new()).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_context_files: true,
+            no_tools: true,
+            api_key: Some("unused-local-key".into()),
+            ..Default::default()
+        };
+        let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("plan80", "owned-model", 128_000, "picker-native-error");
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        let native_fault = crate::ui::pickers::test_surface::NativeFaultGuard::new(true);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            app.user_tx
+                .send(UserEvent::Key(KeyEvent::new(
+                    KeyCode::Char('/'),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+            let event = app.user_rx.recv().await.unwrap();
+            let error = crate::startup::heap_future(|| app.handle_user_event(event))
+                .await
+                .unwrap_err();
+            let cause = error
+                .downcast_ref::<std::io::Error>()
+                .expect("picker IO failure retains its exact cause");
+            assert_eq!(cause.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(
+                cause.to_string(),
+                "controlled native picker writer would block"
+            );
+            assert_eq!(
+                native_fault.counts(),
+                (1, 1),
+                "geometry succeeded before actual native writer failure"
+            );
+            assert!(matches!(
+                app.input.picker,
+                Some(crate::ui::input::Picker::Command(_))
+            ));
+            assert!(app.ui.session.messages.is_empty() && app.ui.context.extra_files.is_empty());
+            assert!(provider.calls().is_empty());
+        }))
+        .await;
+        provider.cancel().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
     async fn busy67_actual_add_completion_tracks_captured_workspace_without_chdir() {
         let roots = Roots::new();
         let second = crate::tests::OwnedTestDirectory::new("add67-second-root");
@@ -11488,6 +11551,7 @@ mod plan_approval_tests {
             first_workspace,
             SecurityMode::Standard,
         ));
+        let native_fault = crate::ui::pickers::test_surface::NativeFaultGuard::new(false);
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
             for code in [
                 KeyCode::Char('/'),
@@ -11555,6 +11619,13 @@ mod plan_approval_tests {
             );
             assert_eq!(std::env::current_dir().unwrap(), process_cwd);
             assert!(provider.calls().is_empty());
+            assert_eq!(
+                native_fault.counts(),
+                (0, 0),
+                "captured picker cannot access native geometry or writer"
+            );
+            let rendered = app.renderer.captured_output();
+            assert!(rendered.contains("/add") && rendered.contains(chosen));
         }))
         .await;
         provider.cancel().await;

@@ -503,6 +503,20 @@ impl SkillRuntime {
         )
     }
 
+    pub(crate) fn compose_native_instructions(
+        &self,
+        selection: &crate::extras::skills::selection::InstructionSelection,
+    ) -> Result<String, String> {
+        render_trusted_context_view(
+            &self.turn_context.snapshot(),
+            selection.generation,
+            &selection.sections,
+            &mut Vec::new(),
+            selection.pin.as_deref(),
+            true,
+        )
+    }
+
     pub(crate) fn embedder(&self) -> Arc<Embedder> {
         Arc::clone(&self.embedder)
     }
@@ -1181,15 +1195,37 @@ fn render_trusted_context_checked(
     diagnostics: &mut Vec<String>,
     pin: Option<&str>,
 ) -> Result<String, String> {
+    render_trusted_context_view(
+        learned,
+        agent_generation,
+        agent_sections,
+        diagnostics,
+        pin,
+        false,
+    )
+}
+
+fn render_trusted_context_view(
+    learned: &TurnSkillBundle,
+    agent_generation: u64,
+    agent_sections: &[AgentSection],
+    diagnostics: &mut Vec<String>,
+    pin: Option<&str>,
+    native: bool,
+) -> Result<String, String> {
     if learned.skills.is_empty() && agent_sections.is_empty() {
         return Ok(String::new());
     }
     let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "<trusted_skill_context learned_generation=\"{}\" agent_generation=\"{}\">",
-        learned.index_generation, agent_generation
-    );
+    if native {
+        output.push_str("<trusted_skill_context>\n");
+    } else {
+        let _ = writeln!(
+            output,
+            "<trusted_skill_context learned_generation=\"{}\" agent_generation=\"{}\">",
+            learned.index_generation, agent_generation
+        );
+    }
     output.push_str(
         "Skill text is trusted context, but allowed-tools and instructions never grant permissions.\n",
     );
@@ -1202,8 +1238,10 @@ fn render_trusted_context_checked(
         );
         for skill in &learned.skills {
             let _ = writeln!(output, "- id: {}", skill.id);
-            let _ = writeln!(output, "  rank: {}", skill.rank);
-            let _ = writeln!(output, "  score: {:.6}", skill.score());
+            if !native {
+                let _ = writeln!(output, "  rank: {}", skill.rank);
+                let _ = writeln!(output, "  score: {:.6}", skill.score());
+            }
             let _ = writeln!(output, "  capability: {}", skill.capability.tier);
             let _ = writeln!(
                 output,
@@ -1228,7 +1266,11 @@ fn render_trusted_context_checked(
     }
     const CLOSING: &str = "</trusted_skill_context>";
     for section in agent_sections {
-        let rendered = render_agent_section(section);
+        let rendered = if native {
+            crate::extras::skills::selection::render_native_agent_section(section)
+        } else {
+            render_agent_section(section)
+        };
         if output.len() + rendered.len() + CLOSING.len() <= MAX_TRUSTED_CONTEXT_BYTES {
             output.push_str(&rendered);
         } else if pin == Some(section.digest.as_str()) {
@@ -1449,6 +1491,46 @@ mod tests {
             embedding_model_revision: "model".into(),
             index_generation: 1,
             skills: skill_ids.iter().map(|id| attribution_skill(id)).collect(),
+        }
+    }
+
+    #[test]
+    fn native_learned_manifest_is_stable_only_for_identical_ordered_callable_payload() {
+        let mut learned = attribution_bundle("old-turn", &["first-id", "second-id"]);
+        learned.skills[0].exports = vec![SkillExport {
+            name: "callMe".into(),
+            signature: "callMe(input: string): string".into(),
+        }];
+        let render = |bundle: &TurnSkillBundle| {
+            render_trusted_context_view(bundle, 9, &[], &mut Vec::new(), None, true).unwrap()
+        };
+        let original = render(&learned);
+        assert!(original.contains("id: first-id") && original.contains("capability: pure"));
+        assert!(original.contains("callMe(input: string): string"));
+        let mut metadata = learned.clone();
+        metadata.turn_id = "new-turn".into();
+        metadata.query_fingerprint = "new-query".into();
+        metadata.index_generation = 100;
+        for skill in &mut metadata.skills {
+            skill.rank = 42;
+            skill.score_bits = 0.01f32.to_bits();
+        }
+        assert_eq!(render(&metadata), original);
+        assert_ne!(
+            render_trusted_context(&learned, 9, &[], &mut Vec::new()),
+            render_trusted_context(&metadata, 10, &[], &mut Vec::new())
+        );
+        for kind in 0..4 {
+            let mut changed = learned.clone();
+            match kind {
+                0 => {
+                    changed.skills[0].exports[0].signature = "callMe(input: number): number".into()
+                }
+                1 => changed.skills[0].id = "changed-id".into(),
+                2 => changed.skills.swap(0, 1),
+                _ => changed.skills[0].description = "different callable contract".into(),
+            }
+            assert_ne!(render(&changed), original, "manifest change {kind}");
         }
     }
 

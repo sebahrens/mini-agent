@@ -2700,6 +2700,13 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    // Authored native heading formats a String, never a process receiver.
+    (
+        "src/extras/skills/selection.rs",
+        "let _ = writeln!(output, \"BEGIN_{delimiter}\");",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/skills/selection.rs",
         "let _ = writeln!(output, \"BEGIN_{resource_delimiter} path={path}\");",
@@ -3768,6 +3775,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/skills/selection.rs",
         &[
+            (
+                "8154a2ee5820021bc90b621e03072ff7718a42229efd4d9367831262646d587d",
+                1,
+            ),
             (
                 "e134a67930eed0c8e0c1a02bcac6efda89c87f216b2f1a438a90737d63907acb",
                 1,

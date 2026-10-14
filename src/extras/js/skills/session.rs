@@ -874,137 +874,163 @@ mod tests {
         use rig::test_utils::{MockCompletionModel, MockTurn};
         use rig::tool::Tool;
 
-        let directory = crate::tests::OwnedTestDirectory::new("skill-search61-captured");
-        let root = directory.path();
-        let home = root.join("home");
-        let workspace = root.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        for (name, guidance) in [
-            ("initial", "INITIAL TRUSTED CONTEXT"),
-            ("replacement", "REPLACEMENT TRUSTED CONTEXT"),
-        ] {
-            let package = home.join(".claude/skills").join(name);
-            std::fs::create_dir_all(&package).unwrap();
-            std::fs::write(
-                package.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: {name} only\n---\n{guidance}\n"),
-            )
-            .unwrap();
-        }
-        let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
-            platform: if cfg!(target_os = "macos") {
-                crate::paths::PathPlatform::MacOs
-            } else if cfg!(target_os = "windows") {
-                crate::paths::PathPlatform::Windows
-            } else {
-                crate::paths::PathPlatform::Linux
-            },
-            home_dir: None,
-            config_base: Some(root.join("config")),
-            data_base: Some(root.join("data")),
-            local_data_base: Some(root.join("local")),
-            state_base: Some(root.join("state")),
-            cache_base: Some(root.join("cache")),
-            workspace_root: None,
-            overrides: Default::default(),
-        })
-        .unwrap();
-        let services = SkillSessionServices::for_test(&paths);
-        let owner = crate::extras::skills::session::InstructionOwner::for_test(Some(home));
-        let instructions = owner.resolve(
-            paths,
-            Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
-            None,
-            false,
-        );
-        let turn = crate::extras::skills::session::InstructionTurn::new(instructions, None);
-        let prompt = "initial";
-        services
-            .prepare_instruction_prompt(prompt, &turn)
-            .await
-            .unwrap();
-        let model = MockCompletionModel::from_turns([
-            MockTurn::tool_call(
-                "search",
-                super::super::search_tool::SkillsSearchTool::NAME,
-                serde_json::json!({"query": "replacement"}),
-            ),
-            MockTurn::text("done"),
-        ]);
-        let agent = AgentBuilder::new(model.clone())
-            .preamble("BASE SYSTEM")
-            .tool(super::super::search_tool::SkillsSearchTool::new(
-                Arc::clone(&services),
-            ))
-            .add_hook(crate::extras::skills::session::InstructionContextHook::new(
-                "BASE SYSTEM".to_string(),
-                Arc::clone(&turn),
-                prompt.to_string(),
-                crate::context::instructions::InstructionProtocol::Chat,
-                Some(Arc::clone(&services)),
-            ))
-            .default_max_turns(2)
-            .build();
-
-        let result = agent.runner(prompt).run().await.unwrap();
-        let returned = result.messages.expect("returned run history");
-        assert!(returned.contains(&Message::user(prompt)));
-        assert!(
-            !returned
-                .iter()
-                .any(|message| matches!(message, Message::System { .. }))
-        );
-        let requests = model.requests();
-        assert_eq!(requests.len(), 2);
-        let system_texts = requests
-            .iter()
-            .map(|request| {
-                request
-                    .chat_history
-                    .iter()
-                    .find_map(|message| match message {
-                        Message::System { content } => Some(content.clone()),
-                        _ => None,
-                    })
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(system_texts[0].contains("INITIAL TRUSTED CONTEXT"));
-        assert!(!system_texts[1].contains("INITIAL TRUSTED CONTEXT"));
-        assert!(!system_texts[0].contains("REPLACEMENT TRUSTED CONTEXT"));
-        assert!(system_texts[1].contains("REPLACEMENT TRUSTED CONTEXT"));
-        let selected = turn.prepare(prompt).await.unwrap();
-        assert_eq!(
-            selected
-                .selected
-                .iter()
-                .map(|skill| skill.name.as_str())
-                .collect::<Vec<_>>(),
-            ["replacement"]
-        );
-        assert!(
-            requests[1].chat_history.iter().any(|message| {
-                match message {
-            Message::User { content } => content.iter().any(|content| matches!(
-                content,
-                rig::message::UserContent::ToolResult(result)
-                    if result.id == "search" && result.content.iter().any(|content| matches!(
-                        content, rig::message::ToolResultContent::Text(text)
-                            if text.text.contains("replacement")
+        for unwind in [false, true] {
+            let directory = crate::tests::OwnedTestDirectory::new("skill-search61-captured");
+            let fixture_root = directory.path().to_path_buf();
+            let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
+                let _cleanup = crate::extras::skills::session::ImmutableFixtureCleanup(
+                    directory.path().to_path_buf(),
+                );
+                let root = directory.path();
+                let home = root.join("home");
+                let workspace = root.join("workspace");
+                std::fs::create_dir_all(&workspace).unwrap();
+                for (name, guidance) in [
+                    ("initial", "INITIAL TRUSTED CONTEXT"),
+                    ("replacement", "REPLACEMENT TRUSTED CONTEXT"),
+                ] {
+                    let package = home.join(".claude/skills").join(name);
+                    std::fs::create_dir_all(&package).unwrap();
+                    std::fs::write(
+                        package.join("SKILL.md"),
+                        format!("---\nname: {name}\ndescription: {name} only\n---\n{guidance}\n"),
+                    )
+                    .unwrap();
+                }
+                let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
+                    platform: if cfg!(target_os = "macos") {
+                        crate::paths::PathPlatform::MacOs
+                    } else if cfg!(target_os = "windows") {
+                        crate::paths::PathPlatform::Windows
+                    } else {
+                        crate::paths::PathPlatform::Linux
+                    },
+                    home_dir: None,
+                    config_base: Some(root.join("config")),
+                    data_base: Some(root.join("data")),
+                    local_data_base: Some(root.join("local")),
+                    state_base: Some(root.join("state")),
+                    cache_base: Some(root.join("cache")),
+                    workspace_root: None,
+                    overrides: Default::default(),
+                })
+                .unwrap();
+                let services = SkillSessionServices::for_test(&paths);
+                let owner = crate::extras::skills::session::InstructionOwner::for_test(Some(home));
+                let instructions = owner.resolve(
+                    paths,
+                    Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+                    None,
+                    false,
+                );
+                let turn = crate::extras::skills::session::InstructionTurn::new(instructions, None);
+                let prompt = "initial";
+                services
+                    .prepare_instruction_prompt(prompt, &turn)
+                    .await
+                    .unwrap();
+                let model = MockCompletionModel::from_turns([
+                    MockTurn::tool_call(
+                        "search",
+                        super::super::search_tool::SkillsSearchTool::NAME,
+                        serde_json::json!({"query": "replacement"}),
+                    ),
+                    MockTurn::text("done"),
+                ]);
+                let agent = AgentBuilder::new(model.clone())
+                    .preamble("BASE SYSTEM")
+                    .tool(super::super::search_tool::SkillsSearchTool::new(
+                        Arc::clone(&services),
                     ))
-            )),
-            _ => false,
+                    .add_hook(crate::extras::skills::session::InstructionContextHook::new(
+                        "BASE SYSTEM".to_string(),
+                        Arc::clone(&turn),
+                        prompt.to_string(),
+                        crate::context::instructions::InstructionProtocol::Chat,
+                        Some(Arc::clone(&services)),
+                    ))
+                    .default_max_turns(2)
+                    .build();
+
+                let result = agent.runner(prompt).run().await.unwrap();
+                let returned = result.messages.expect("returned run history");
+                assert!(returned.contains(&Message::user(prompt)));
+                assert!(
+                    !returned
+                        .iter()
+                        .any(|message| matches!(message, Message::System { .. }))
+                );
+                let requests = model.requests();
+                assert_eq!(requests.len(), 2);
+                let system_texts = requests
+                    .iter()
+                    .map(|request| {
+                        request
+                            .chat_history
+                            .iter()
+                            .find_map(|message| match message {
+                                Message::System { content } => Some(content.clone()),
+                                _ => None,
+                            })
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert!(system_texts[0].contains("INITIAL TRUSTED CONTEXT"));
+                assert!(!system_texts[1].contains("INITIAL TRUSTED CONTEXT"));
+                assert!(!system_texts[0].contains("REPLACEMENT TRUSTED CONTEXT"));
+                assert!(system_texts[1].contains("REPLACEMENT TRUSTED CONTEXT"));
+                let selected = turn.prepare(prompt).await.unwrap();
+                assert_eq!(
+                    selected
+                        .selected
+                        .iter()
+                        .map(|skill| skill.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["replacement"]
+                );
+                assert!(
+                    requests[1].chat_history.iter().any(|message| {
+                        match message {
+                    Message::User { content } => content.iter().any(|content| matches!(
+                        content,
+                        rig::message::UserContent::ToolResult(result)
+                            if result.id == "search" && result.content.iter().any(|content| matches!(
+                                content, rig::message::ToolResultContent::Text(text)
+                                    if text.text.contains("replacement")
+                            ))
+                    )),
+                    _ => false,
+                }
+                    }),
+                    "the intact canonical search receipt accompanies the replacement context"
+                );
+                assert!(
+                    !requests[1]
+                        .chat_history
+                        .iter()
+                        .skip(1)
+                        .any(|message| matches!(message, Message::System { .. }))
+                );
+                if unwind {
+                    panic!("controlled captured search fixture unwind");
+                }
+            }))
+            .await;
+            assert_eq!(
+                std::fs::symlink_metadata(&fixture_root)
+                    .expect_err("captured search fixture must retire all sealed snapshots")
+                    .kind(),
+                std::io::ErrorKind::NotFound,
+            );
+            match outcome {
+                Ok(()) => assert!(!unwind, "the controlled unwind must execute"),
+                Err(payload) if unwind => assert_eq!(
+                    payload.downcast_ref::<&str>().copied(),
+                    Some("controlled captured search fixture unwind"),
+                ),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }
-            }),
-            "the intact canonical search receipt accompanies the replacement context"
-        );
-        assert!(
-            !requests[1]
-                .chat_history
-                .iter()
-                .skip(1)
-                .any(|message| matches!(message, Message::System { .. }))
-        );
     }
 
     #[tokio::test]
@@ -1466,6 +1492,12 @@ impl SkillSessionServices {
         selection: &crate::extras::skills::selection::InstructionSelection,
     ) -> Result<String, String> {
         self.runtime.compose_instructions(selection)
+    }
+    pub(crate) fn compose_native_instructions(
+        &self,
+        selection: &crate::extras::skills::selection::InstructionSelection,
+    ) -> Result<String, String> {
+        self.runtime.compose_native_instructions(selection)
     }
     pub(crate) async fn search(
         &self,

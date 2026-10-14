@@ -719,18 +719,30 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Instructi
             .insert(InstructionCarrier(Arc::clone(&self.turn)));
         #[cfg(feature = "skills")]
         let block = if let Some(learned) = &self.learned {
-            match learned.compose_instructions(&selection) {
+            match if native {
+                learned.compose_native_instructions(&selection)
+            } else {
+                learned.compose_instructions(&selection)
+            } {
                 Ok(block) => block,
                 Err(error) => return rig::agent::Flow::terminate(error),
             }
         } else {
-            match super::selection::render_plain(&selection) {
+            match if native {
+                super::selection::render_native_plain(&selection)
+            } else {
+                super::selection::render_plain(&selection)
+            } {
                 Ok(block) => block,
                 Err(error) => return rig::agent::Flow::terminate(error),
             }
         };
         #[cfg(not(feature = "skills"))]
-        let block = match super::selection::render_plain(&selection) {
+        let block = match if native {
+            super::selection::render_native_plain(&selection)
+        } else {
+            super::selection::render_plain(&selection)
+        } {
             Ok(block) => block,
             Err(error) => return rig::agent::Flow::terminate(error),
         };

@@ -66,6 +66,10 @@ impl Picker {
             renderer
                 .draw_picker_with(|writer, cols, floor, bg| picker.draw(writer, cols, floor, bg))
         } else {
+            #[cfg(test)]
+            if let Some(result) = renderer.draw_captured_picker(|floor| self.draw(floor)) {
+                return result;
+            }
             self.draw(renderer.picker_floor_row())
         }
     }

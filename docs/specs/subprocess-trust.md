@@ -689,3 +689,17 @@ retains its owner and fails closed; it never becomes a direct-child-only success
 The separate broker-only worker, AppContainer helper and trusted hook service
 ownership contracts remain distinct. See `docs/agent/TOOL_RUNTIME.md` for the
 bounded native membership-fence evidence and pending production acceptance.
+
+### Native instruction section formatting (mini-agent-i4yzr)
+
+The shared `render_agent_section_view` in `src/extras/skills/selection.rs`
+formats an owned `String` through `std::fmt::Write`. Its five `writeln!`
+invocations (generic heading, native heading, resource start/end, section end)
+are `NON-PROCESS`, with one occurrence of each exact structural macro digest.
+The lexical inventory retains the existing four expressions and adds the exact
+native `BEGIN_{delimiter}` expression. The Windows-capable inventory separately
+binds all five complete macro token trees; neither scanner, alias resolution,
+creation-boundary validator nor stale-entry check is relaxed. The four existing section-format digests are relocated from the old learned
+renderer path to this shared selection module, each retaining its count of one;
+the native heading adds one new digest. Other learned-compositor classifications
+and occurrence counts remain.

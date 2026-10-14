@@ -345,17 +345,17 @@ impl FilePicker {
             return super::draw_picker_message("no matches", self.monochrome, floor_row);
         }
 
-        let (cols, _rows) = crossterm::terminal::size()?;
-        let mut stdout = std::io::stdout();
+        let (cols, _rows) = super::picker_size()?;
+        let mut stdout = super::picker_writer();
         let window = super::picker_window(floor_row, 0, self.matches.len(), self.selected);
 
         for i in window.start..window.end {
             let render_row = window.top_row + (i - window.start) as u16;
-            stdout.execute(MoveTo(0, render_row))?;
+            stdout.execute(super::picker_command(MoveTo(0, render_row)))?;
             write!(
                 stdout,
                 "{}",
-                Clear(crossterm::terminal::ClearType::CurrentLine)
+                super::picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
             )?;
 
             let path = &self.matches[i];

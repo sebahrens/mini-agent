@@ -5,6 +5,8 @@ pub(crate) mod list;
 pub(crate) mod models;
 pub(crate) mod rewind;
 pub(crate) mod sessions;
+#[cfg(test)]
+pub(crate) mod test_surface;
 
 use std::io::Write;
 
@@ -14,6 +16,40 @@ use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::Clear;
 
 use super::utils::resolve_color;
+
+fn picker_command<C: crossterm::Command + std::fmt::Display>(
+    command: C,
+) -> impl crossterm::Command + std::fmt::Display {
+    #[cfg(test)]
+    {
+        test_surface::command(command)
+    }
+    #[cfg(not(test))]
+    {
+        command
+    }
+}
+
+fn picker_size() -> std::io::Result<(u16, u16)> {
+    #[cfg(test)]
+    {
+        test_surface::size()
+    }
+    #[cfg(not(test))]
+    {
+        crossterm::terminal::size()
+    }
+}
+fn picker_writer() -> impl std::io::Write {
+    #[cfg(test)]
+    {
+        test_surface::writer()
+    }
+    #[cfg(not(test))]
+    {
+        std::io::stdout()
+    }
+}
 
 pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
     if query.is_empty() {
@@ -135,12 +171,12 @@ pub(crate) fn draw_picker_message(
     let Some(row) = floor_row.checked_sub(1) else {
         return Ok(());
     };
-    let mut stdout = std::io::stdout();
-    stdout.execute(MoveTo(0, row))?;
+    let mut stdout = picker_writer();
+    stdout.execute(picker_command(MoveTo(0, row)))?;
     write!(
         stdout,
         "{}",
-        Clear(crossterm::terminal::ClearType::CurrentLine)
+        picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
     )?;
     write!(
         stdout,
@@ -164,8 +200,8 @@ pub(crate) fn draw_picker_list(
         return draw_picker_message(empty_message.unwrap_or("no matches"), monochrome, floor_row);
     }
 
-    let (cols, _rows) = crossterm::terminal::size()?;
-    let mut stdout = std::io::stdout();
+    let (cols, _rows) = picker_size()?;
+    let mut stdout = picker_writer();
     let window = picker_window(floor_row, reserved_above, matches.len(), selected);
 
     for (i, item) in matches
@@ -175,11 +211,11 @@ pub(crate) fn draw_picker_list(
         .take(window.end - window.start)
     {
         let render_row = window.top_row + (i - window.start) as u16;
-        stdout.execute(MoveTo(0, render_row))?;
+        stdout.execute(picker_command(MoveTo(0, render_row)))?;
         write!(
             stdout,
             "{}",
-            Clear(crossterm::terminal::ClearType::CurrentLine)
+            picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
         )?;
 
         let item = display_safe(item);

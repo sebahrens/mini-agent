@@ -184,17 +184,17 @@ impl ModelsPicker {
         if !self.active {
             return Ok(());
         }
-        let mut stdout = std::io::stdout();
+        let mut stdout = super::picker_writer();
         let window = super::picker_window(floor_row, 1, self.matches.len().max(1), self.selected);
 
         if let Some(header_row) = window.top_row.checked_sub(1)
             && floor_row >= 2
         {
-            stdout.execute(MoveTo(0, header_row))?;
+            stdout.execute(super::picker_command(MoveTo(0, header_row)))?;
             write!(
                 stdout,
                 "{}",
-                Clear(crossterm::terminal::ClearType::CurrentLine)
+                super::picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
             )?;
             let tab = |label: &str, count: usize, active: bool| {
                 if active {

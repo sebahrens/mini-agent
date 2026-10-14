@@ -1004,3 +1004,21 @@ Only filesystem completion entries enter this operand picker, with no MCP resour
 strings. Selection supplies a relative literal to the existing explicit operator
 `/add` attachment path; it does not install a model read permission or change the
 existing operator attachment policy.
+
+Native Anthropic instruction composition uses an authored deterministic view before request preparation.
+It retains ordered content-addressed package bodies, escaped resource bytes and inventory,
+and learned callable IDs, exports, descriptions and capability tiers. Runtime catalogue
+generations and retrieval scores/ranks stay in discovery metadata rather than the native
+system block. Generic rendering keeps those decorations. The instruction prepared observer
+still checks the composed system prefix and expected skill receipt before HTTP; it never
+strips metadata from an already prepared request. A captured native turn keeps its initial
+system context fixed; successful skill searches carry changed guidance in canonical tool
+results. Full persisted native replay and cross-frontend system/tools/history compatibility
+remain separate controller work.
+
+Captured App test renderers scope all picker overlays through the same owned byte
+sink and fixed geometry (`ui/pickers/test_surface.rs`, test-only). The synchronous
+per-thread guard restores its predecessor on success or unwind. Captured cursor
+and clear commands use Crossterm’s public ANSI serializer, without querying or
+executing native console commands. Native picker geometry/stdout calls and errors
+remain unchanged outside that test capture.

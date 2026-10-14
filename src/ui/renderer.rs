@@ -968,6 +968,25 @@ impl Renderer {
         crossterm::terminal::size()
     }
 
+    #[cfg(test)]
+    pub(crate) fn draw_captured_picker(
+        &mut self,
+        paint: impl FnOnce(u16) -> io::Result<()>,
+    ) -> Option<io::Result<()>> {
+        let bytes = self.test_output.as_ref()?.clone();
+        if super::pickers::test_surface::native_only() {
+            return None;
+        }
+        let size = match self.checked_draw_size() {
+            Ok(size) => size,
+            Err(error) => return Some(Err(error)),
+        };
+        let floor = self.picker_floor_row();
+        Some(super::pickers::test_surface::capture(bytes, size, || {
+            paint(floor)
+        }))
+    }
+
     pub(crate) fn draw_picker_with(
         &mut self,
         paint: impl FnOnce(&mut dyn std::io::Write, u16, u16, Option<Color>) -> io::Result<()>,
