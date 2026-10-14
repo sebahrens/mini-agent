@@ -17,6 +17,7 @@ pub struct ProviderHttpClient(std::sync::Arc<ProviderBackend>);
 struct ProviderBackend {
     client: reqwest::Client,
     identity: std::sync::Arc<()>,
+    bedrock: Option<std::sync::Arc<crate::provider::bedrock::BedrockAuth>>,
 }
 
 impl Default for ProviderHttpClient {
@@ -36,8 +37,37 @@ impl ProviderHttpClient {
         Self(std::sync::Arc::new(ProviderBackend {
             client,
             identity: std::sync::Arc::new(()),
+            bedrock: None,
         }))
     }
+    pub(crate) fn with_bedrock(
+        client: reqwest::Client,
+        auth: std::sync::Arc<crate::provider::bedrock::BedrockAuth>,
+    ) -> Self {
+        Self(std::sync::Arc::new(ProviderBackend {
+            client,
+            identity: std::sync::Arc::new(()),
+            bedrock: Some(auth),
+        }))
+    }
+
+    async fn prepare_request(
+        &self,
+        mut request: Request<Bytes>,
+    ) -> http_client::Result<reqwest::RequestBuilder> {
+        if let Some(auth) = &self.0.bedrock {
+            auth.prepare(&mut request).await?;
+        }
+        let (parts, body) = request.into_parts();
+        Ok(self
+            .0
+            .client
+            .request(parts.method, parts.uri.to_string())
+            .version(parts.version)
+            .headers(parts.headers)
+            .body(body))
+    }
+
     pub(crate) fn listing_identity(&self) -> std::sync::Weak<()> {
         std::sync::Arc::downgrade(&self.0.identity)
     }
@@ -48,17 +78,14 @@ impl ProviderHttpClient {
         request: http::Request<Vec<u8>>,
         limit: usize,
     ) -> anyhow::Result<Vec<u8>> {
-        let (parts, _) = request.into_parts();
         anyhow::ensure!(
-            parts.method == http::Method::GET,
+            request.method() == http::Method::GET,
             "invalid model listing request"
         );
         let mut response = self
-            .0
-            .client
-            .request(parts.method, parts.uri.to_string())
-            .version(parts.version)
-            .headers(parts.headers)
+            .prepare_request(request.map(|_| Bytes::new()))
+            .await
+            .map_err(|_| anyhow::anyhow!("model listing authentication failed"))?
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("model listing transport failed"))?;
@@ -143,16 +170,12 @@ impl HttpClientExt for ProviderHttpClient {
         T: Into<Bytes> + Send,
         U: From<Bytes> + Send + 'static,
     {
-        let (parts, body) = request.into_parts();
-        let request = self
-            .0
-            .client
-            .request(parts.method, parts.uri.to_string())
-            .version(parts.version)
-            .headers(parts.headers)
-            .body(body.into());
+        let client = self.clone();
+        let request = request.map(Into::into);
         async move {
-            let response = request
+            let response = client
+                .prepare_request(request)
+                .await?
                 .send()
                 .await
                 .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
@@ -170,6 +193,7 @@ impl HttpClientExt for ProviderHttpClient {
     where
         U: From<Bytes> + Send + 'static,
     {
+        let requires_signed_body = self.0.bedrock.is_some();
         let (parts, body) = request.into_parts();
         let request = self
             .0
@@ -179,6 +203,11 @@ impl HttpClientExt for ProviderHttpClient {
             .headers(parts.headers)
             .multipart(reqwest::multipart::Form::from(body));
         async move {
+            if requires_signed_body {
+                return Err(http_client::Error::Instance(Box::new(
+                    std::io::Error::other("Bedrock multipart is unsupported"),
+                )));
+            }
             let response = request
                 .send()
                 .await
@@ -197,23 +226,26 @@ impl HttpClientExt for ProviderHttpClient {
     where
         T: Into<Bytes> + Send,
     {
-        let (parts, body) = request.into_parts();
-        let request = self
-            .0
-            .client
-            .request(parts.method, parts.uri.to_string())
-            .version(parts.version)
-            .headers(parts.headers)
-            .body(body.into());
+        let client = self.clone();
+        let request = request.map(Into::into);
         let budget_guard = crate::spend::run::Run::current().and_then(|run| run.sdk_stream_guard());
         async move {
-            let response = match request.send().await {
+            let response = match async {
+                client
+                    .prepare_request(request)
+                    .await?
+                    .send()
+                    .await
+                    .map_err(|error| http_client::Error::Instance(Box::new(error)))
+            }
+            .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(guard) = &budget_guard {
                         guard.finished();
                     }
-                    return Err(http_client::Error::Instance(Box::new(error)));
+                    return Err(error);
                 }
             };
             if !response.status().is_success() {

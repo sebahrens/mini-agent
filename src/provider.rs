@@ -21,6 +21,8 @@ use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 
 #[path = "provider_azure.rs"]
 pub(crate) mod azure;
+#[path = "provider_bedrock.rs"]
+pub(crate) mod bedrock;
 #[path = "provider_effort.rs"]
 pub(crate) mod effort;
 
@@ -131,7 +133,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, azure, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
+            "Unknown provider: '{}'. Supported: openrouter, openai, azure, bedrock, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
             name
         )
     })?;
@@ -4471,7 +4473,17 @@ where
 {
     let config = resolve_provider_config(provider_name, custom_providers)?;
     let base_url = resolve_base_url_with_env(&config, &get_env);
-    let base_url = if config.kind == ProviderKind::Azure {
+    let bedrock_region = if config.kind == ProviderKind::Bedrock {
+        Some(bedrock::region(&get_env)?)
+    } else {
+        None
+    };
+    let base_url = if config.kind == ProviderKind::Bedrock {
+        Some(bedrock::endpoint(
+            base_url.as_deref(),
+            bedrock_region.as_deref().expect("Bedrock region validated"),
+        )?)
+    } else if config.kind == ProviderKind::Azure {
         Some(azure::normalize_endpoint(base_url.as_deref())?)
     } else {
         base_url
@@ -4493,16 +4505,22 @@ where
     // not be merged back into the native SDK's bearer-only request headers.
     let bearer_custom = custom
         .filter(|_| {
-            config.kind == ProviderKind::Azure
+            matches!(config.kind, ProviderKind::Azure | ProviderKind::Bedrock)
                 || matches!(&credential, ResolvedCredential::Bearer(_))
         })
         .map(|custom| {
             let mut custom = custom.clone();
             custom.headers.retain(|name, _| {
-                if config.kind == ProviderKind::Azure {
+                if matches!(config.kind, ProviderKind::Azure | ProviderKind::Bedrock) {
                     !matches!(
                         name.to_ascii_lowercase().as_str(),
-                        "authorization" | "api-key" | "x-api-key"
+                        "authorization"
+                            | "api-key"
+                            | "x-api-key"
+                            | "x-amz-security-token"
+                            | "x-amz-date"
+                            | "x-amz-content-sha256"
+                            | "host"
                     )
                 } else {
                     !name.eq_ignore_ascii_case("x-api-key")
@@ -4518,6 +4536,12 @@ where
         base_url.as_deref(),
     )?;
     match config.kind {
+        ProviderKind::Bedrock => bedrock::build_client(
+            credential,
+            base_url.as_deref().expect("Bedrock endpoint validated"),
+            bedrock_region.as_deref().expect("Bedrock region validated"),
+            http_client,
+        ),
         ProviderKind::Azure => azure::build_client(
             credential,
             base_url.as_deref().expect("Azure endpoint validated"),
@@ -4609,6 +4633,9 @@ fn build_anthropic_client(
     http: reqwest::Client,
 ) -> anyhow::Result<AnyClient> {
     match credential {
+        ResolvedCredential::AwsDefaultChain => {
+            anyhow::bail!("Anthropic cannot use AWS credentials")
+        }
         ResolvedCredential::ApiKey(key) => {
             build_provider_client!(anthropic::Client, Anthropic, key, base_url, http)
         }
