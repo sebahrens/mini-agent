@@ -790,6 +790,25 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // Exact cfg(test), owned/reaped current-image publication helpers.
+    (
+        "src/session/native_publication.rs",
+        "let mut child = Command::new(std::env::current_exe().unwrap())",
+        3,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        ".spawn()",
+        2,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        ".spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
     (
         "src/ui/app.rs",
         r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
@@ -926,11 +945,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    // Exact cfg(test) startup consumer on a joined 1 MiB Rust thread.
+    ("src/startup.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Owned one-MiB native capture consumer, joined before fixture teardown.
     (
         "src/provider_effort_replay_probe.rs",
         ".spawn(|| {",
-        2,
+        3,
         "NON-PROCESS",
     ),
     // Exact owned/joined context63 1MiB Rust thread, never an OS process.
@@ -1780,8 +1801,26 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/session/native_publication.rs",
+        "assert_eq!(status.code(), Some(130), \"{output}\\n{error}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/agent/tools/format_after_edit.rs",
         "assert!(!output.contains(\"Formatted.\"), \"{case}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/native_publication.rs",
+        "assert!(output.contains(\"NATIVE_CHILD_PID=\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/native_publication.rs",
+        "assert_eq!(status.code(), Some(130));",
         1,
         "NON-PROCESS",
     ),
@@ -3095,6 +3134,23 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
         ],
     ),
+    (
+        "src/session/native_publication.rs",
+        &[
+            (
+                "4f7b79705e309204080afd875515dc605469abd02b79eb7b519589cd9f922600",
+                1,
+            ),
+            (
+                "769b44781b2cbe10926b6ca25b4af88f04d839b8d1d0b125e6e1905c10fb279e",
+                1,
+            ),
+            (
+                "0c736d64cd41631588d11786bd650f77583c3cf4befe75be91a3126a94206649",
+                1,
+            ),
+        ],
+    ),
     // Bounded listing response status is metadata, not a subprocess terminal.
     (
         "src/provider_http.rs",
@@ -4374,6 +4430,26 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // Exact owned cfg(test) native publication helper sites.
+    (
+        "src/session/native_publication.rs",
+        "let mut child = Command::new(std::env::current_exe().unwrap())",
+        3,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        ".spawn()",
+        2,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        ".spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/startup.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     (
         "src/ui/clipboard_image.rs",
         "mut command: tokio::process::Command,",
@@ -4697,7 +4773,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/provider_effort_replay_probe.rs",
         ".spawn(|| {",
-        2,
+        3,
         "NON-PROCESS",
     ),
     // Exact owned/joined context63 1MiB Rust thread, never an OS process.

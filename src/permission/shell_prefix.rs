@@ -71,6 +71,10 @@ pub(crate) fn literal_argv(script: &str) -> Option<Vec<&str>> {
 }
 
 impl ShellPrefix {
+    pub(crate) fn compatibility_fields(&self) -> (&[String], usize) {
+        (&self.argv, self.specificity)
+    }
+
     pub(crate) fn parse(script: &str) -> anyhow::Result<Self> {
         let argv = literal_argv(script).ok_or_else(|| anyhow::anyhow!(
             "prefix rules require a complete simple ASCII command: literal words separated by spaces/tabs, without quoting, expansion, operators, redirection, leading assignments or control syntax; example: git status"

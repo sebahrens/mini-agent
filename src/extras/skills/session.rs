@@ -96,6 +96,55 @@ fn same_permission(left: &Option<PermCheck>, right: &Option<PermCheck>) -> bool 
 }
 
 impl InstructionServices {
+    pub(crate) fn native_policy(
+        &self,
+        workspace: &Arc<WorkspaceBinding>,
+        permission: &Option<PermCheck>,
+    ) -> Result<[u8; 32], crate::session::native_replay::RestartReason> {
+        use crate::session::native_replay::RestartReason;
+        if !Arc::ptr_eq(&self.workspace, workspace)
+            || !same_permission(&self.permission, permission)
+        {
+            return Err(RestartReason::ChangedPrefix);
+        }
+        let mut hash =
+            crate::provider::NativePolicyHasher::new(b"native-package-source-policy-v1\0");
+        hash.bytes(&[self.no_context_files as u8])?;
+        hash.path(&self.paths.config_dir)?;
+        hash.path(&self.paths.data_dir)?;
+        hash.bytes(&[
+            self.paths.project_dir.is_some() as u8,
+            self.home.is_some() as u8,
+        ])?;
+        if let Some(project) = &self.paths.project_dir {
+            hash.path(project)?;
+        }
+        if let Some(home) = &self.home {
+            hash.path(home)?;
+        }
+        // The fixed authored source policy is stable across catalogue refreshes.
+        // Selection/export bytes are separately bound by actual Prepared bodies.
+        // Runtime generations, scores, scope UUIDs and delivery receipts are absent.
+        for root in self.source_roots(false) {
+            hash.path(&root.directory)?;
+            hash.bytes(root.origin.as_bytes())?;
+            hash.bytes(&[root.project as u8])?;
+            hash.bytes(
+                &root
+                    .binding
+                    .compatibility_fingerprint()
+                    .map_err(|_| RestartReason::ChangedPrefix)?,
+            )?;
+        }
+        hash.bytes(
+            &self
+                .workspace
+                .compatibility_fingerprint()
+                .map_err(|_| RestartReason::ChangedPrefix)?,
+        )?;
+        Ok(hash.finish())
+    }
+
     fn source_roots(&self, explicit: bool) -> Vec<SourceRoot> {
         if self.no_context_files && !explicit {
             return Vec::new();

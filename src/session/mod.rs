@@ -2,6 +2,7 @@ pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
 pub mod lock;
+pub(crate) mod native_publication;
 pub(crate) mod native_replay;
 pub mod storage;
 pub mod title;
@@ -609,6 +610,10 @@ pub struct Session {
         skip_serializing_if = "native_replay::NativeFrontier::is_initial"
     )]
     pub(crate) native_frontier: native_replay::NativeFrontier,
+    /// Value-carried writer revision. Deserialization restores no permit;
+    /// clones cannot borrow a newer revision from the shared frontier cell.
+    #[serde(skip)]
+    pub(crate) native_publication: Option<native_publication::NativePublication>,
     pub messages: Vec<SessionMessage>,
     /// Provider-native identity and reasoning for persisted tool calls, keyed
     /// by the call record's `tool_call_id`. A session file written before this
@@ -957,6 +962,7 @@ impl Session {
             native_history: None,
             retired_native_history: Vec::new(),
             native_frontier: native_replay::NativeFrontier::default(),
+            native_publication: None,
             messages: Vec::new(),
             tool_call_provenance: BTreeMap::new(),
             compactions: Vec::new(),
@@ -1455,6 +1461,13 @@ impl Session {
             }
         }
         self.spend_account.set_cap(cap)?;
+        // A restored unfinished checkpoint cannot prove that its old process
+        // made no paid request merely because no final receipt was retained.
+        // Keep the existing account/cost estimate and mark uncertainty only.
+        // Live publication owners retain their actual observation lifecycle.
+        if self.native_publication.is_none() && self.native_frontier.refusal().is_some() {
+            self.spend_account.tracking_failed();
+        }
         Ok(())
     }
 

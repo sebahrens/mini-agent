@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use compact_str::CompactString;
@@ -955,17 +956,71 @@ where
     result
 }
 
+/// The actual native producer supplies this private invocation pair. Unlike
+/// an I/O scope, this owner explicitly destroys the model before joining its
+/// registered effects. Unpaired/generic headless behavior stays unchanged.
+pub(crate) async fn run_native_headless_turn<F>(
+    turn: F,
+    pair: crate::session::native_publication::NativeActorPair,
+) -> crate::agent::runner::HeadlessTurn
+where
+    F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
+{
+    if headless_force_stopped() {
+        return crate::agent::runner::HeadlessTurn::failed_before_start(
+            ForcedStop::SecondSignal.error(HEADLESS_FORCED_STOP_GRACE),
+        );
+    }
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(Arc::clone(&scope));
+    let model = crate::startup::heap_future(|| {
+        run_headless_turn_with_scope(
+            turn,
+            HeadlessInterrupts::os(),
+            HEADLESS_FORCED_STOP_GRACE,
+            scope,
+        )
+    });
+    let mut owner =
+        match crate::session::native_publication::NativeModelOwner::new(model, pair, cleanup) {
+            Ok(owner) => owner,
+            Err(error) => return crate::agent::runner::HeadlessTurn::failed_before_start(error),
+        };
+    let (result, forced) = owner.model().await;
+    if forced.is_some() {
+        record_forced_stop();
+        // Forced exit retains native ownership until the process exits; the
+        // cleanup guard's existing waiter must not extend the interrupt grace.
+        drop(owner);
+    } else {
+        owner.settle().await;
+    }
+    result
+}
+
 /// [`run_headless_turn`] without the process-wide forced-stop record, so tests
 /// can drive it with injected signals.
 async fn run_headless_turn_with<F>(
     turn: F,
-    mut interrupts: HeadlessInterrupts,
+    interrupts: HeadlessInterrupts,
     grace: std::time::Duration,
 ) -> (crate::agent::runner::HeadlessTurn, Option<ForcedStop>)
 where
     F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
 {
     let scope = crate::agent::runner::AgentWorkScope::new();
+    run_headless_turn_with_scope(turn, interrupts, grace, scope).await
+}
+
+async fn run_headless_turn_with_scope<F>(
+    turn: F,
+    mut interrupts: HeadlessInterrupts,
+    grace: std::time::Duration,
+    scope: Arc<crate::agent::runner::AgentWorkScope>,
+) -> (crate::agent::runner::HeadlessTurn, Option<ForcedStop>)
+where
+    F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
+{
     let (mut result, deadline, forced) = scope
         .run(async {
             tokio::pin!(turn);

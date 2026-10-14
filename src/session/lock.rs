@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::fs::{File, TryLockError};
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use compact_str::CompactString;
 use uuid::Uuid;
@@ -31,7 +31,346 @@ use crate::session::Session;
 
 /// Locks this process holds, keyed by lock-file path. Keeping the open file
 /// alive keeps the lock; dropping it releases the lock.
-static HELD: LazyLock<Mutex<HashMap<PathBuf, File>>> = LazyLock::new(Default::default);
+static HELD: LazyLock<Mutex<HashMap<PathBuf, Arc<HeldSessionLock>>>> =
+    LazyLock::new(Default::default);
+
+#[derive(Debug, Default)]
+struct LeaseState {
+    revoked: bool,
+    publishers: usize,
+    native_frontier: Option<super::native_replay::FrontierIdentity>,
+}
+
+#[derive(Debug)]
+struct HeldSessionLock {
+    file: File,
+    root: Arc<crate::paths::WorkspaceBinding>,
+    identity: crate::fs::CheckedMetadata,
+    name: std::ffi::OsString,
+    io: Mutex<()>,
+    state: Mutex<LeaseState>,
+}
+
+impl HeldSessionLock {
+    fn validate_namespace(&self) -> anyhow::Result<()> {
+        self.root.validate_private_root()?;
+        let current = self
+            .root
+            .open_regular_relative(std::path::Path::new(&self.name))?;
+        crate::fs::validate_private_file(&current)?;
+        let path = self.root.root().join(&self.name);
+        crate::fs::ensure_same_file(
+            &path,
+            &self.identity,
+            &crate::fs::checked_file_metadata(&self.file)?,
+        )?;
+        crate::fs::ensure_same_file(
+            &path,
+            &self.identity,
+            &crate::fs::checked_file_metadata(&current)?,
+        )?;
+        self.root.validate_private_root()?;
+        Ok(())
+    }
+
+    fn revoke(&self, force_unlock: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.revoked = true;
+        // Forced exit must not unlock an in-flight native publisher while its
+        // kernel operation can still replace the checkpoint. Process exit
+        // terminates that writer. An inherited descriptor may delay native
+        // recovery, which remains a truthful refusal rather than concurrent
+        // ownership. Legacy force-stop unlocking stays unchanged.
+        if state.publishers == 0 || (force_unlock && state.native_frontier.is_none()) {
+            let _ = self.file.unlock();
+        }
+    }
+
+    fn prepare_legacy_target(&self, session_id: &str) -> anyhow::Result<()> {
+        use std::io::{Read, Seek};
+        self.validate_namespace()?;
+        let name = format!("{session_id}.json");
+        let mut file = match self.root.open_regular_relative(std::path::Path::new(&name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "private file is not an owned regular file: {error}"
+                ));
+            }
+        };
+        // Classification is restrictive only: inspect the retained, owned
+        // regular file without chmod. Native or uncertain bytes never enter
+        // the legacy permission-repair path.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.uid() == crate::fs::private_current_uid()
+                    && metadata.nlink() == 1,
+                "private file is not an owned regular file"
+            );
+        }
+        #[cfg(not(unix))]
+        crate::fs::validate_private_file(&file)?;
+        let identity = crate::fs::checked_file_metadata(&file)?;
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take((super::storage::MAX_SESSION_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= super::storage::MAX_SESSION_BYTES,
+            "saved session exceeds its finite limit"
+        );
+        #[derive(serde::Deserialize)]
+        struct SavedClassification {
+            #[serde(default)]
+            native_frontier: super::native_replay::NativeFrontier,
+            #[serde(default)]
+            native_history: Option<serde::de::IgnoredAny>,
+            #[serde(default)]
+            retired_native_history: Vec<serde::de::IgnoredAny>,
+        }
+        let classification: SavedClassification = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("saved session compatibility cannot be classified"))?;
+        anyhow::ensure!(
+            classification.native_frontier.is_initial()
+                && classification.native_history.is_none()
+                && classification.retired_native_history.is_empty(),
+            "unfinished native context requires its saved-session owner"
+        );
+        let current = self
+            .root
+            .open_regular_relative(std::path::Path::new(&name))?;
+        crate::fs::ensure_same_file(
+            &self.root.root().join(&name),
+            &identity,
+            &crate::fs::checked_file_metadata(&current)?,
+        )?;
+        file.rewind()?;
+        let mut current_bytes = Vec::new();
+        file.by_ref()
+            .take((super::storage::MAX_SESSION_BYTES + 1) as u64)
+            .read_to_end(&mut current_bytes)?;
+        anyhow::ensure!(
+            current_bytes == bytes,
+            "saved session changed during classification"
+        );
+        self.validate_namespace()?;
+        // Preserve the existing Unix legacy repair contract, on the exact
+        // classified descriptor. No pathname is reopened for mutation.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.uid() == crate::fs::private_current_uid()
+                    && metadata.nlink() == 1,
+                "private file is not an owned regular file"
+            );
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        crate::fs::validate_private_file(&file)?;
+        self.validate_namespace()?;
+        Ok(())
+    }
+
+    fn publish(&self, session_id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        crate::paths::validate_portable_component(session_id)?;
+        anyhow::ensure!(
+            self.name == std::ffi::OsStr::new(&format!("{session_id}.lock")),
+            "checkpoint does not match its retained session lock"
+        );
+        self.validate_namespace()?;
+        let parent = crate::fs::checked_file_metadata(&self.root.try_clone_directory_file()?)?;
+        let name = format!("{session_id}.json");
+        match self.root.open_regular_relative(std::path::Path::new(&name)) {
+            Ok(existing) => crate::fs::validate_private_file(&existing)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        crate::fs::private_atomic_write_checked_sync(
+            &self.root.root().join(&name),
+            bytes,
+            &parent,
+        )?;
+        self.validate_namespace()?;
+        let published = self
+            .root
+            .open_regular_relative(std::path::Path::new(&name))?;
+        crate::fs::validate_private_file(&published)?;
+        self.root.validate_private_root()?;
+        Ok(())
+    }
+}
+
+/// Exact process-local writer lease; importing the same saved id does not
+/// reconstruct it. Session switches revoke it before releasing ownership.
+#[derive(Debug, Clone)]
+pub(super) struct NativeWriterLease {
+    held: Arc<HeldSessionLock>,
+    frontier: super::native_replay::NativeFrontier,
+    path: PathBuf,
+}
+
+impl NativeWriterLease {
+    pub(super) fn matches(&self, session: &Session) -> bool {
+        lock_path(&session.id).is_ok_and(|path| path == self.path)
+            && self.frontier.identity().matches(&session.native_frontier)
+    }
+
+    pub(super) fn begin_write(&self) -> anyhow::Result<NativeWriterGuard> {
+        self.held.validate_namespace()?;
+        let mut state = self
+            .held
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.revoked,
+            "unfinished native context no longer owns its saved session"
+        );
+        anyhow::ensure!(
+            state.publishers < 64,
+            "native context writer limit exceeded"
+        );
+        state.publishers += 1;
+        Ok(NativeWriterGuard(Arc::clone(&self.held)))
+    }
+
+    pub(super) fn publish_checkpoint(&self, session: &Session, bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.matches(session),
+            "native checkpoint belongs to another session owner"
+        );
+        let _io = self
+            .held
+            .io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.held.publish(&session.id, bytes)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct NativeWriterGuard(Arc<HeldSessionLock>);
+
+impl NativeWriterGuard {
+    pub(super) fn check(&self) -> anyhow::Result<()> {
+        // Filesystem checks never hold the short revocation mutex; force stop
+        // must remain able to revoke without waiting on a filesystem.
+        self.0.validate_namespace()?;
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.revoked,
+            "unfinished native context no longer owns its saved session"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for NativeWriterGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.publishers -= 1;
+        if state.revoked && state.publishers == 0 {
+            let _ = self.0.file.unlock();
+        }
+    }
+}
+
+/// A strict host attachment, distinct from the legacy id-only claim. The
+/// existing canonical owner must be the exact frontier being attached.
+pub(super) fn claim_native_writer(session: &Session) -> anyhow::Result<NativeWriterLease> {
+    anyhow::ensure!(
+        !crate::paths::artifact_disabled("sessions"),
+        "unfinished native context requires saved-session persistence"
+    );
+    anyhow::ensure!(
+        claim_session(&session.id)? == SessionClaim::Owned,
+        "unfinished native context is open in another process"
+    );
+    let path = lock_path(&session.id)?;
+    let held = HELD.lock().unwrap_or_else(|error| error.into_inner());
+    let lease = held
+        .get(&path)
+        .ok_or_else(|| anyhow::anyhow!("native session writer was released"))?;
+    let mut state = lease
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    anyhow::ensure!(!state.revoked, "native session writer was released");
+    if let Some(identity) = &state.native_frontier {
+        anyhow::ensure!(
+            identity.matches(&session.native_frontier),
+            "unfinished native context belongs to another session owner"
+        );
+    } else {
+        state.native_frontier = Some(session.native_frontier.identity());
+    }
+    Ok(NativeWriterLease {
+        held: Arc::clone(lease),
+        frontier: session.native_frontier.clone(),
+        path,
+    })
+}
+
+/// Restrictive classification only, never writer authority. An independently
+/// decoded same-id snapshot cannot use legacy save while the canonical owner
+/// has activated native publication, even before it has any opaque frames.
+pub(super) fn requires_native_publication(session_id: &str) -> bool {
+    let Ok(path) = lock_path(session_id) else {
+        return false;
+    };
+    let held = HELD.lock().unwrap_or_else(|error| error.into_inner());
+    held.get(&path).is_some_and(|lease| {
+        lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .native_frontier
+            .is_some()
+    })
+}
+
+/// Legacy snapshots may not erase a native marker already stored under the
+/// exact newly owned lock. No imported marker supplies a native permit.
+pub(super) fn publish_legacy_owned(session: &Session, bytes: &[u8]) -> anyhow::Result<()> {
+    let path = lock_path(&session.id)?;
+    let held = HELD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&path)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("saved-session writer was released"))?;
+    // A synchronous legacy caller never waits on an active native writer's
+    // mutex. Frontend native saves use their explicit owned async publisher.
+    let _io = held
+        .io
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("saved-session writer is busy"))?;
+    held.validate_namespace()?;
+    {
+        let state = held.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.revoked && state.native_frontier.is_none(),
+            "native checkpoint requires its original owner"
+        );
+    }
+    held.prepare_legacy_target(&session.id)?;
+    held.publish(&session.id, bytes)
+}
 
 /// Result of trying to take ownership of a session id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,15 +412,46 @@ pub fn claim_session(session_id: &str) -> anyhow::Result<SessionClaim> {
         return Ok(SessionClaim::Owned);
     }
     let path = lock_path(session_id)?;
-    let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if held.contains_key(&path) {
+    let cached = HELD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&path)
+        .cloned();
+    if let Some(lease) = cached {
+        lease.validate_namespace()?;
+        anyhow::ensure!(
+            !lease
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .revoked,
+            "saved session writer was released"
+        );
         return Ok(SessionClaim::Owned);
     }
     let file = open_lock_file(&path)?;
-    match file.try_lock() {
+    let root = Arc::new(crate::paths::WorkspaceBinding::capture(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("session lock has no parent"))?,
+    )?);
+    let lease = Arc::new(HeldSessionLock {
+        identity: crate::fs::checked_file_metadata(&file)?,
+        file,
+        root,
+        name: path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("session lock has no name"))?
+            .to_os_string(),
+        state: Mutex::default(),
+        io: Mutex::default(),
+    });
+    lease.validate_namespace()?;
+    match lease.file.try_lock() {
         Ok(()) => {
             tracing::debug!("session lock acquired: id={}", session_id);
-            held.insert(path, file);
+            HELD.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(path, lease);
             Ok(SessionClaim::Owned)
         }
         Err(TryLockError::WouldBlock) => Ok(SessionClaim::HeldElsewhere),
@@ -95,12 +465,12 @@ pub fn release_session(session_id: &str) {
         return;
     };
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(file) = held.remove(&path) {
+    if let Some(lease) = held.remove(&path) {
         // Unlock explicitly rather than relying on close: a child forked by a
         // concurrent spawn briefly shares this open file description until its
         // close-on-exec `exec`, and closing only our copy would leave the lock
         // held for that window.
-        let _ = file.unlock();
+        lease.revoke(false);
         tracing::debug!("session lock released: id={}", session_id);
     }
 }
@@ -111,8 +481,8 @@ pub fn release_session(session_id: &str) {
 /// session locked after this process is gone.
 pub fn release_all() {
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (_, file) in held.drain() {
-        let _ = file.unlock();
+    for (_, lease) in held.drain() {
+        lease.revoke(true);
     }
 }
 

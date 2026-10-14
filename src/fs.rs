@@ -878,7 +878,19 @@ enum AtomicWriteFailure {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomicWriteMode {
     Replace,
+    ReplacePrivate,
     CreateNew,
+    CreateNewPrivate,
+}
+
+impl AtomicWriteMode {
+    fn create_only(self) -> bool {
+        matches!(self, Self::CreateNew | Self::CreateNewPrivate)
+    }
+    #[cfg(windows)]
+    fn private(self) -> bool {
+        matches!(self, Self::ReplacePrivate | Self::CreateNewPrivate)
+    }
 }
 
 /// Whether an atomic write must be on stable storage when it reports success
@@ -1438,6 +1450,52 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
     )
 }
 
+/// Strict private checkpoint replacement bound to a retained parent's
+/// identity. The platform opens and compares that exact directory before
+/// descriptor-relative creation/publication; it never repairs an ambient
+/// destination or treats a replacement directory as the old authority.
+pub(crate) fn private_atomic_write_checked_sync(
+    path: &Path,
+    contents: &[u8],
+    approved_parent: &CheckedMetadata,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "checkpoint has no parent")
+    })?;
+    atomic_write_within_sync_impl(
+        parent,
+        path,
+        contents,
+        Some(approved_parent),
+        None,
+        AtomicWriteMode::ReplacePrivate,
+        AtomicWriteDurability::Sync,
+        AtomicWriteFailure::None,
+        &AtomicWriteCancellation::default(),
+    )
+}
+
+pub(crate) fn private_atomic_create_checked_sync(
+    path: &Path,
+    contents: &[u8],
+    approved_parent: &CheckedMetadata,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "checkpoint has no parent")
+    })?;
+    atomic_write_within_sync_impl(
+        parent,
+        path,
+        contents,
+        Some(approved_parent),
+        None,
+        AtomicWriteMode::CreateNewPrivate,
+        AtomicWriteDurability::Sync,
+        AtomicWriteFailure::None,
+        &AtomicWriteCancellation::default(),
+    )
+}
+
 /// Synchronous create-only variant used for randomly named tool output and
 /// private state files. Durable like [`atomic_write_sync`].
 pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -1870,7 +1928,7 @@ fn atomic_write_platform(
         new_name: &CString,
         mode: AtomicWriteMode,
     ) -> c_int {
-        if mode == AtomicWriteMode::Replace {
+        if !mode.create_only() {
             // SAFETY: both names are valid C strings and the descriptor remains
             // open for the duration of the call.
             return unsafe {
@@ -1928,7 +1986,7 @@ fn atomic_write_platform(
     let target_path = canonical_root.join(relative_parent).join(leaf);
     let initial_target =
         atomic_write_stage("platform_initial_target", inspect_target(&directory, leaf))?;
-    if mode == AtomicWriteMode::CreateNew && initial_target.is_some() {
+    if mode.create_only() && initial_target.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "atomic create target already exists",
@@ -2431,7 +2489,7 @@ fn atomic_write_platform(
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(path_changed_error(&target));
         }
-        Ok(_) if mode == AtomicWriteMode::CreateNew => {
+        Ok(_) if mode.create_only() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "atomic create target already exists",
@@ -2466,6 +2524,16 @@ fn atomic_write_platform(
             "could not allocate a unique atomic-write temp file",
         )
     })?;
+
+    if mode.private() {
+        // Initialize only this exclusive empty image, before private bytes.
+        // The central helper installs the explicit current-user owner and
+        // protected DACL on the retained object, including elevated tokens.
+        if let Err(error) = private::prepare_new_private_file(&file) {
+            delete_open_file(&file);
+            return Err(error);
+        }
+    }
 
     #[cfg(test)]
     if failure == AtomicWriteFailure::Write {
@@ -2543,15 +2611,8 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation.publish(|| {
-        rename_open_file(
-            &directory,
-            &file,
-            leaf,
-            mode == AtomicWriteMode::Replace,
-            cancellation,
-        )
-    });
+    let publish_result = cancellation
+        .publish(|| rename_open_file(&directory, &file, leaf, !mode.create_only(), cancellation));
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);
@@ -2605,7 +2666,7 @@ fn atomic_write_platform(
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(path_changed_error(&target));
         }
-        Ok(_) if mode == AtomicWriteMode::CreateNew => {
+        Ok(_) if mode.create_only() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "atomic create target already exists",

@@ -23,6 +23,28 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Borrow the actual compiled policy, rather than guessing glob/regex
+    /// semantics from the original spelling. No grant is carried by this data.
+    pub(crate) fn compatibility_fields(&self) -> (&str, &str, Option<&str>, bool, usize, bool) {
+        (
+            &self.original,
+            self.regex.as_str(),
+            {
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    Some(self.folded_regex.as_str())
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                {
+                    None
+                }
+            },
+            self.normalize_path_input,
+            self.specificity,
+            self.absolute_anchored,
+        )
+    }
+
     pub fn new(pattern: &str) -> Self {
         let original = pattern.to_string();
         let expanded = crate::fs::expand_tilde(pattern);

@@ -33,6 +33,8 @@ pub(crate) struct UiContext<'a> {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
+    pub native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
+    pub native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
     /// One-way invalidation of this UI's single startup snapshot, shared with
     /// its owner so clearing the agent cache cannot make the snapshot current.
     pub prebuild_invalidated: Arc<std::sync::atomic::AtomicBool>,
@@ -44,6 +46,24 @@ pub(crate) struct UiContext<'a> {
 }
 
 impl<'a> UiContext<'a> {
+    pub(crate) fn with_native_publication(
+        mut self,
+        startup: Option<crate::session::native_publication::NativeStartupPublication>,
+        ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    ) -> Self {
+        self.native_startup = startup;
+        self.native_ticket = ticket;
+        self
+    }
+
+    /// App calls this after awaiting the exact configured SessionStart task.
+    pub(crate) async fn join_native_startup(&mut self) -> anyhow::Result<()> {
+        if let Some(owner) = self.native_startup.take() {
+            self.native_ticket = Some(owner.into_model_ticket(self.session).await?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn invalidate_prebuild(&self) {
         self.prebuild_invalidated
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -112,6 +132,8 @@ impl<'a> UiContext<'a> {
             permission,
             ask_tx,
             sandbox,
+            native_startup: None,
+            native_ticket: None,
             prebuild_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),

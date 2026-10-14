@@ -52,8 +52,13 @@ pub(crate) struct BuiltCompletionRequest<M: CompletionModel> {
 impl<M: CompletionModel> PreparedCompletionRequest<M> {
     pub(crate) fn build(self) -> BuiltCompletionRequest<M> {
         let (model, request) = self.builder.into_model_and_request();
-        BuiltCompletionRequest { model, request, executable_tool_names: self.executable_tool_names,
-            allowed_tool_names: self.allowed_tool_names, output_tool_name: self.output_tool_name }
+        BuiltCompletionRequest {
+            model,
+            request,
+            executable_tool_names: self.executable_tool_names,
+            allowed_tool_names: self.allowed_tool_names,
+            output_tool_name: self.output_tool_name,
+        }
     }
 }
 

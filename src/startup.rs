@@ -484,6 +484,11 @@ pub(crate) struct Startup {
     pub model: CompactString,
     pub session: Session,
     pub client: AnyClient,
+    native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
+    native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    native_headless: Option<NativeHeadlessOwner>,
+    #[cfg(feature = "hooks")]
+    native_session_end_done: bool,
     pub is_interactive: bool,
     pub version_changed: bool,
     // Set by init_features:
@@ -1101,26 +1106,34 @@ impl Startup {
         }
 
         session.initialize_spend_account(max_budget_usd)?;
+        let reconciliation_scope = crate::agent::runner::AgentWorkScope::new();
+        let reconciliation_cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(
+            std::sync::Arc::clone(&reconciliation_scope),
+        );
         let account = session.spend_account.clone();
         let session_id = session.id.to_string();
         let ledger = account.runtime_ledger(std::sync::Arc::new(crate::spend::Ledger::new(
             &paths.state_dir,
         )));
-        if let Err(error) = crate::agent::runner::spawn_blocking_scoped(move || {
-            let result = ledger
-                .summary_for_session(&session_id)
-                .and_then(|summary| account.reconcile(max_budget_usd, &summary.session));
-            if result.is_err() {
-                account.tracking_failed();
-            }
-            if max_budget_usd.is_none() {
-                Ok(())
-            } else {
-                result
-            }
-        })
-        .await
-        .unwrap_or_else(|error| Err(error.into()))
+        if let Err(error) = reconciliation_scope
+            .run(async move {
+                crate::agent::runner::spawn_blocking_scoped(move || {
+                    let result = ledger
+                        .summary_for_session(&session_id)
+                        .and_then(|summary| account.reconcile(max_budget_usd, &summary.session));
+                    if result.is_err() {
+                        account.tracking_failed();
+                    }
+                    if max_budget_usd.is_none() {
+                        Ok(())
+                    } else {
+                        result
+                    }
+                })
+                .await
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.into()))
         {
             if max_budget_usd.is_none() {
                 return Err(error);
@@ -1137,6 +1150,8 @@ impl Startup {
             }
             return Err(error);
         }
+
+        reconciliation_cleanup.settle().await;
 
         // A resumed session persisted its context_window when first saved, which can
         // be stale if the model's catalog entry has changed since (e.g. a model that
@@ -1180,6 +1195,35 @@ impl Startup {
         // configuration rather than any serialized state.
         session.initialize_read_tracker(cfg.deny_repeated_reads.unwrap_or(true));
 
+        // Capture strict native startup ownership before capability probes,
+        // SessionStart hooks or agent/MCP prebuild can execute. ACP selects its
+        // own canonical editor Session later and establishes its barrier there.
+        #[cfg(feature = "acp")]
+        let editor_session = cli.acp_enabled;
+        #[cfg(not(feature = "acp"))]
+        let editor_session = false;
+        let adopted_native_frontend = cli.print && !cli.is_loop_mode();
+        anyhow::ensure!(
+            editor_session
+                || adopted_native_frontend
+                || !crate::session::native_publication::is_native_bearing(&session),
+            "this saved native context requires the headless print frontend; interactive and automatic-round replay are not available yet"
+        );
+        let mut native_startup = if !editor_session
+            && adopted_native_frontend
+            && crate::session::native_publication::startup_requires_publication(
+                &session,
+                matches!(&client, AnyClient::Anthropic(_)),
+                cli.no_session,
+            )? {
+            Some(
+                crate::session::native_publication::NativeStartupPublication::begin(&mut session)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         #[cfg(feature = "goal")]
         apply_goal_flags(&cli, &cfg, &session)?;
 
@@ -1189,9 +1233,17 @@ impl Startup {
             if let Some(name) = cli.name.as_deref() {
                 session.name = CompactString::new(name);
             }
-            if !cli.no_session && (cli.name.is_some() || cli.fork_session) {
+            if !cli.no_session
+                && native_startup.is_none()
+                && (cli.name.is_some() || cli.fork_session)
+            {
                 session::storage::save_session(&session)?;
             }
+        }
+        // Goal/name changes belong to this exact startup actor value. They
+        // remain InFlight; a metadata mutation supplies no completed model.
+        if let Some(owner) = &mut native_startup {
+            owner.save_progress(&mut session).await?;
         }
 
         Ok(Self {
@@ -1205,6 +1257,11 @@ impl Startup {
             model,
             session,
             client,
+            native_startup,
+            native_ticket: None,
+            native_headless: None,
+            #[cfg(feature = "hooks")]
+            native_session_end_done: false,
             is_interactive,
             version_changed,
             permission: None,
@@ -1274,6 +1331,14 @@ impl Startup {
 
     /// Phase 2: subagents, sandbox, tools config,
     /// permission checker, advisor.
+    #[cfg(test)]
+    pub(crate) fn fail_native_final_before_replace(&mut self) {
+        self.native_startup
+            .as_mut()
+            .unwrap()
+            .fail_final_before_replace();
+    }
+
     pub(crate) async fn init_features(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "subagents")]
         crate::extras::subagents::install(crate::extras::subagents::resolve_config(
@@ -1525,9 +1590,13 @@ impl Startup {
                 "startup"
             }
             .to_string();
-            self.session_start_task = Some(tokio::spawn(async move {
+            let hook = heap_future(|| async move {
                 crate::extras::hooks::dispatch_session_start(&source).await;
-            }));
+            });
+            self.session_start_task = Some(match &self.native_startup {
+                Some(owner) => owner.spawn_hook(hook).await,
+                None => tokio::spawn(hook),
+            });
         }
 
         // ARCHITECTURE.md prompt. It reads a line from stdin, so like the
@@ -1716,6 +1785,14 @@ impl Startup {
         Ok(())
     }
 
+    async fn join_native_startup(&mut self) -> anyhow::Result<()> {
+        if let Some(mut owner) = self.native_startup.take() {
+            owner.save_progress(&mut self.session).await?;
+            self.native_ticket = Some(owner.into_model_ticket(&self.session).await?);
+        }
+        Ok(())
+    }
+
     /// Phase 4: mode dispatch — print, loop, or interactive.
     /// Each mode future is built on the heap by [`heap_future`], so neither its
     /// state nor its construction is reserved in this frame, which stays on the
@@ -1727,28 +1804,42 @@ impl Startup {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
             // saved history.
-            session::storage::save_session(&self.session)?;
+            if let Some(owner) = &mut self.native_startup {
+                owner.save_progress(&mut self.session).await?;
+            } else {
+                session::storage::save_session(&self.session)?;
+            }
             self.resume_override_pending = false;
         }
         if self.cli.print {
             #[cfg(feature = "hooks")]
             if let Some(task) = self.session_start_task.take() {
-                let _ = task.await;
+                let joined = task.await;
+                if let Some(owner) = &self.native_startup {
+                    owner.hook_retired(joined)?;
+                }
             }
+            self.join_native_startup().await?;
             let result = heap_future(|| self.dispatch_print()).await;
             // Every headless exit ends the session: a failed turn, a
             // persistence failure and a goal's own exit code alike
             // (mini-agent-rnpjm).
             #[cfg(feature = "hooks")]
-            crate::extras::hooks::dispatch_session_end("exit").await;
+            if !self.native_session_end_done {
+                crate::extras::hooks::dispatch_session_end("exit").await;
+            }
             result
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
                 #[cfg(feature = "hooks")]
                 if let Some(task) = self.session_start_task.take() {
-                    let _ = task.await;
+                    let joined = task.await;
+                    if let Some(owner) = &self.native_startup {
+                        owner.hook_retired(joined)?;
+                    }
                 }
+                self.join_native_startup().await?;
                 return heap_future(|| self.dispatch_loop()).await;
             }
 
@@ -1756,7 +1847,7 @@ impl Startup {
         }
     }
 
-    async fn dispatch_print(self) -> anyhow::Result<()> {
+    async fn dispatch_print(&mut self) -> anyhow::Result<()> {
         let cli = self.cli.clone();
         let root = self.workspace.root().to_path_buf();
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -1776,7 +1867,7 @@ impl Startup {
         result
     }
 
-    async fn dispatch_print_inner(mut self) -> anyhow::Result<()> {
+    async fn dispatch_print_inner(&mut self) -> anyhow::Result<()> {
         let mut msg = self.cli.message.join(" ").trim().to_string();
         let schema = self.cli.loaded_output_schema.clone();
         if let Some(schema) = &schema {
@@ -1820,9 +1911,9 @@ impl Startup {
                 };
                 let mut persistence_failure = None;
                 if !self.cli.no_session {
-                    let mut session = self.session;
+                    let session = &mut self.session;
                     session.add_shell_interaction(&msg, &result);
-                    if let Err(error) = session::storage::save_session(&session) {
+                    if let Err(error) = session::storage::save_session(session) {
                         persistence_failure = Some(error);
                     } else if let Err(e) = session::chat_history::append_entry(
                         &session::chat_history::ChatHistoryEntry {
@@ -1962,34 +2053,36 @@ impl Startup {
             };
             // Boxed: building an agent pulls in every provider's setup, and this
             // future is inlined into the startup frame otherwise.
-            let agent = Box::pin(provider::build_agent_in_workspace(
-                completion_model,
-                &self.cli,
-                &self.cfg,
-                &self.context,
-                self.workspace.clone(),
-                self.permission,
-                // Non-interactive dispatch never keeps the ask channel: with
-                // no one draining it, an `Ask` verdict must fail closed as a
-                // denial rather than block forever. See `handle_ask_inner`.
-                None,
-                self.sandbox.clone(),
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store,
-                &self.session.id,
-                Some(self.session.tool_result_spills.clone()),
-                true,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                self.session.js_session_state.clone(),
-                #[cfg(feature = "skills")]
-                skill_service_owner_for_goal.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager.as_ref(),
-            ))
+            let agent = heap_future(|| {
+                provider::build_agent_in_workspace(
+                    completion_model,
+                    &self.cli,
+                    &self.cfg,
+                    &self.context,
+                    self.workspace.clone(),
+                    self.permission.clone(),
+                    // Non-interactive dispatch never keeps the ask channel: with
+                    // no one draining it, an `Ask` verdict must fail closed as a
+                    // denial rather than block forever. See `handle_ask_inner`.
+                    None,
+                    self.sandbox.clone(),
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store,
+                    &self.session.id,
+                    Some(self.session.tool_result_spills.clone()),
+                    true,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    self.session.js_session_state.clone(),
+                    #[cfg(feature = "skills")]
+                    skill_service_owner_for_goal.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager.as_ref(),
+                )
+            })
             .await;
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
@@ -2015,7 +2108,7 @@ impl Startup {
             // Construct the child in heap_future's short frame; Box::pin alone
             // still reserves its temporary in this parent poll frame. The
             // regression consumer uses the unchanged 1 MiB default stack.
-            let mut response_result = heap_future(|| {
+            let response_result = heap_future(|| {
                 run_headless_goal_rounds(
                     &agent,
                     &mut self.session,
@@ -2027,14 +2120,69 @@ impl Startup {
                     history,
                     json_output,
                     compaction_usage,
+                    &mut self.native_ticket,
+                    &mut self.native_headless,
                     #[cfg(feature = "hooks")]
                     false,
                 )
             })
             .await;
-            let schema_outcome = if let Some(schema) = &schema {
-                Box::pin(crate::output_schema::repair_rounds(
-                    &mut response_result,
+            let mut response_result = response_result;
+            // Schema HTTP runs before the measured large final persistence
+            // frame is polled; effects, accounting and repair order are unchanged.
+            let schema_outcome = heap_future(|| {
+                self.prepare_print_schema(&schema, &mut response_result, output, compaction_usage)
+            })
+            .await;
+            heap_future(|| {
+                self.finish_print_model(
+                    msg,
+                    schema,
+                    output,
+                    identity,
+                    change_baseline,
+                    compaction_usage,
+                    response_result,
+                    schema_outcome,
+                )
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn prepare_print_schema(
+        &mut self,
+        schema: &Option<std::sync::Arc<crate::output_schema::OutputSchema>>,
+        response_result: &mut HeadlessRounds,
+        output: crate::print::HeadlessOutputPolicy,
+        compaction_usage: crate::event::UsageDelta,
+    ) -> crate::output_schema::SchemaOutcome {
+        if let Some(schema) = schema
+            && self.native_headless.is_some()
+        {
+            // The primary native actor is already canonically committed.
+            // A tool-free schema repair changes its signed prefix and needs
+            // a separate explicitly owned context, not a generic replay.
+            match schema.validate(&response_result.turn.response) {
+                Ok(value) => crate::output_schema::SchemaOutcome {
+                    result_json: Some(value),
+                    exhausted: false,
+                },
+                Err(_) => {
+                    if response_result.turn.failure.is_none() {
+                        response_result.turn.failure = Some(anyhow::anyhow!(
+                            "the answer did not satisfy the output schema; automatic repair requires a fresh native context"
+                        ));
+                    }
+                    crate::output_schema::SchemaOutcome::default()
+                }
+            }
+        } else if let Some(schema) = schema {
+            heap_future(|| {
+                crate::output_schema::repair_rounds(
+                    response_result,
                     schema,
                     &self.client,
                     &self.cli,
@@ -2042,225 +2190,254 @@ impl Startup {
                     &mut self.session,
                     output,
                     compaction_usage,
-                ))
-                .await
-            } else {
-                crate::output_schema::SchemaOutcome::default()
-            };
-            if let Some(ss) = self.status_signals.as_ref() {
-                ss.send_stop();
-            }
-            // A write, edit or command may already have run before a terminal
-            // provider or budget failure. Persist that progress and the
-            // incurred usage before propagating the failure, so a resumed
-            // session has a durable record of what happened instead of
-            // repeating the effects.
-            let HeadlessRounds {
-                turn:
-                    crate::agent::runner::HeadlessTurn {
-                        response,
-                        usage,
-                        interactions,
-                        mut failure,
-                    },
-                prompt: recorded_prompt,
-                persisted: already_persisted,
-            } = response_result;
-            // Priced and charged in one shape whatever the provider.
-            let usage: rig::completion::Usage = self
-                .cfg
-                .normalize_usage(&self.session.provider, usage.into())
-                .into();
-            // The JSON reports the turn's usage together with the
-            // auto-compaction that ran before it (mini-agent-i6q98). The
-            // session was charged for that already, so it is added to the
-            // reported figure only, never to `usage`, which is charged below.
-            let json_usage: rig::completion::Usage = crate::event::UsageDelta::from(usage)
-                .saturating_add(compaction_usage)
-                .into();
-            let json_context = if json_output {
-                let files_changed = crate::print::files_changed_since(
-                    self.workspace.root(),
-                    change_baseline.as_ref(),
-                    &interactions,
                 )
-                .await;
-                Some((
-                    files_changed,
-                    crate::print::HeadlessPricing::from_session(&self.session, &self.cfg),
-                ))
-            } else {
-                None
-            };
-            // Snapshot before the session moves into the persistence block.
-            #[cfg(feature = "goal")]
-            let finished_goal = self.session.goal_store.snapshot();
-            let pending_question = failure
-                .as_ref()
-                .and_then(|error| error.downcast_ref::<crate::question::QuestionRequired>())
-                .cloned();
-            if let Some(question) = &pending_question {
-                self.session.pending_question = Some(question.clone());
-            }
-            let mut persistence_failure = None;
-            let mut title_accounting = None;
-            if !self.cli.no_session {
-                let mut session = self.session;
-                // Prompt, then tool calls/results in provider order, then the
-                // assistant message: the same record order the interactive UI
-                // writes, so `--continue` replays the turn in sequence.
-                //
-                // A goal run has already written this round, under the prompt
-                // that round actually ran with. Writing it again would double
-                // every record in it and charge its tokens twice.
-                if !already_persisted {
-                    crate::print::persist_headless_turn(
-                        &mut session,
-                        &recorded_prompt,
-                        &response,
-                        &interactions,
-                    );
-                    let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
-                    session.charge_usage_delta(usage.into(), anthropic_native);
-                }
-                if let Err(error) = session::storage::save_session(&session) {
-                    persistence_failure = Some(error);
-                } else {
-                    // Persist the actual turn first; title failure cannot lose
-                    // history. This awaited no-tools request owns its work and
-                    // adds observed usage at its captured model prices.
-                    if failure.is_none() {
-                        let cost_before = session.total_cost;
-                        // This measured large title child must not add its
-                        // construction copies to the primary request's poll.
-                        let (title_usage, interrupted) = heap_future(|| {
-                            session::title::generate_for_session(
-                                &mut session,
-                                &self.cfg,
-                                &self.client,
-                            )
-                        })
-                        .await;
-                        if title_usage.has_values() {
-                            title_accounting = Some(
-                                serde_json::json!({"input_tokens":title_usage.input_tokens,"output_tokens":title_usage.output_tokens,"cached_input_tokens":title_usage.cached_input_tokens,"cache_creation_input_tokens":title_usage.cache_creation_input_tokens,"cost":session.total_cost-cost_before}),
-                            );
-                        }
-                        if interrupted {
-                            failure =
-                                Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
-                        }
-                        if let Err(error) = session::storage::save_session(&session) {
-                            persistence_failure = Some(error);
-                        }
-                    }
-                    let _ = session::chat_history::append_entry(
-                        &session::chat_history::ChatHistoryEntry {
-                            content: msg,
-                            timestamp: session.updated_at.clone(),
-                        },
-                    );
-                }
-            }
-            if let Some((files_changed, pricing)) = json_context {
-                let stop_reason = if pending_question.is_some() {
-                    crate::print::HeadlessStopReason::AwaitingUser
-                } else if failure.as_ref().is_some_and(|error| {
-                    error
-                        .downcast_ref::<crate::spend::run::BudgetStopped>()
-                        .is_some()
-                }) {
-                    crate::print::HeadlessStopReason::Budget
-                } else if failure.is_some() || persistence_failure.is_some() {
-                    crate::print::HeadlessStopReason::Failed
-                } else if schema_outcome.exhausted {
-                    crate::print::HeadlessStopReason::SchemaFailed
-                } else {
-                    // A goal that stopped for a reason of its own reports that
-                    // reason, so a script can branch on the outcome.
-                    #[cfg(feature = "goal")]
-                    {
-                        finished_goal
-                            .as_ref()
-                            .map_or(crate::print::HeadlessStopReason::Completed, |goal| {
-                                crate::print::HeadlessStopReason::for_goal(goal.status)
-                            })
-                    }
-                    #[cfg(not(feature = "goal"))]
-                    {
-                        crate::print::HeadlessStopReason::Completed
-                    }
-                };
-                let rendered = crate::print::render_headless_json(
-                    self.workspace.root(),
+            })
+            .await
+        } else {
+            crate::output_schema::SchemaOutcome::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_print_model(
+        &mut self,
+        msg: String,
+        schema: Option<std::sync::Arc<crate::output_schema::OutputSchema>>,
+        output: crate::print::HeadlessOutputPolicy,
+        identity: (String, String),
+        change_baseline: Option<crate::print::WorkspaceChangeBaseline>,
+        compaction_usage: crate::event::UsageDelta,
+        response_result: HeadlessRounds,
+        schema_outcome: crate::output_schema::SchemaOutcome,
+    ) -> anyhow::Result<()> {
+        let json_output = output.format != OutputFormat::Text;
+        if let Some(ss) = self.status_signals.as_ref() {
+            ss.send_stop();
+        }
+        // A write, edit or command may already have run before a terminal
+        // provider or budget failure. Persist that progress and the
+        // incurred usage before propagating the failure, so a resumed
+        // session has a durable record of what happened instead of
+        // repeating the effects.
+        let HeadlessRounds {
+            turn:
+                crate::agent::runner::HeadlessTurn {
+                    response,
+                    usage,
+                    interactions,
+                    mut failure,
+                },
+            prompt: recorded_prompt,
+            persisted: already_persisted,
+        } = response_result;
+        // Priced and charged in one shape whatever the provider.
+        let usage: rig::completion::Usage = self
+            .cfg
+            .normalize_usage(&self.session.provider, usage.into())
+            .into();
+        // The JSON reports the turn's usage together with the
+        // auto-compaction that ran before it (mini-agent-i6q98). The
+        // session was charged for that already, so it is added to the
+        // reported figure only, never to `usage`, which is charged below.
+        let json_usage: rig::completion::Usage = crate::event::UsageDelta::from(usage)
+            .saturating_add(compaction_usage)
+            .into();
+        let json_context = if json_output {
+            let files_changed = crate::print::files_changed_since(
+                self.workspace.root(),
+                change_baseline.as_ref(),
+                &interactions,
+            )
+            .await;
+            Some((
+                files_changed,
+                crate::print::HeadlessPricing::from_session(&self.session, &self.cfg),
+            ))
+        } else {
+            None
+        };
+        // Snapshot before the session moves into the persistence block.
+        #[cfg(feature = "goal")]
+        let finished_goal = self.session.goal_store.snapshot();
+        let pending_question = failure
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<crate::question::QuestionRequired>())
+            .cloned();
+        if let Some(question) = &pending_question {
+            self.session.pending_question = Some(question.clone());
+        }
+        let mut persistence_failure = None;
+        let mut title_accounting = None;
+        if !self.cli.no_session {
+            let session = &mut self.session;
+            // Prompt, then tool calls/results in provider order, then the
+            // assistant message: the same record order the interactive UI
+            // writes, so `--continue` replays the turn in sequence.
+            //
+            // A goal run has already written this round, under the prompt
+            // that round actually ran with. Writing it again would double
+            // every record in it and charge its tokens twice.
+            if !already_persisted {
+                crate::print::persist_headless_turn(
+                    session,
+                    &recorded_prompt,
                     &response,
                     &interactions,
-                    json_usage,
-                    files_changed,
-                    pricing,
-                    stop_reason,
-                    #[cfg(feature = "goal")]
-                    finished_goal.as_ref(),
-                )?;
-                let mut rendered: serde_json::Value = serde_json::from_str(&rendered)?;
-                if let Some(question) = &pending_question {
-                    rendered["pending_question"] = serde_json::to_value(question)?;
-                }
-                if schema.is_some() {
-                    rendered["result_json"] = schema_outcome
-                        .result_json
-                        .unwrap_or(serde_json::Value::Null);
-                }
-                if let Some(accounting) = title_accounting {
-                    rendered["session_title_usage"] = accounting;
-                }
-                crate::print::emit_headless_result(
-                    &rendered.to_string(),
-                    output.format,
-                    Some((&identity.0, &identity.1)),
-                    !self.cli.no_session && persistence_failure.is_none(),
-                )
-                .await?;
-            }
-            if output.format == OutputFormat::Text && !output.streams_text() {
-                crate::print::headless_stdout_async(format!("{response}\n")).await?;
-            }
-            // A goal that stopped for a reason of its own exits with that
-            // reason's code, whatever the output format. The distinction
-            // between "resume me" and "stop retrying" is what an unattended
-            // caller acts on, and it does not depend on whether a human asked
-            // for JSON.
-            #[cfg(feature = "goal")]
-            if failure.is_none() && persistence_failure.is_none() {
-                let goal_stop = finished_goal
-                    .as_ref()
-                    .map(|goal| crate::print::HeadlessStopReason::for_goal(goal.status));
-                if let Some(reason) = goal_stop
-                    && reason.exit_code() != 0
-                {
-                    return Err(crate::print::HeadlessGoalExit(reason).into());
-                }
-            }
-            // The turn's own failure wins: a partial persistence failure is
-            // reported too, but neither is ever presented as success.
-            if let Some(failure) = failure {
-                if let Some(error) = persistence_failure {
-                    return Err(failure.context(format!(
-                        "the partial turn could not be persisted either: {error}"
-                    )));
-                }
-                return Err(failure);
-            }
-            if let Some(error) = persistence_failure {
-                return Err(error);
-            }
-            if schema_outcome.exhausted {
-                anyhow::bail!(
-                    "final answer did not satisfy output schema after bounded JSON repairs"
                 );
+                let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
+                session.charge_usage_delta(usage.into(), anthropic_native);
+            }
+            let saved = if let Some(owner) = &mut self.native_headless {
+                owner.progress(session).await
+            } else {
+                session::storage::save_session(session)
+            };
+            if let Err(error) = saved {
+                persistence_failure = Some(error);
+            } else {
+                // Persist the actual turn first; title failure cannot lose
+                // history. This awaited no-tools request owns its work and
+                // adds observed usage at its captured model prices.
+                if failure.is_none() {
+                    let cost_before = session.total_cost;
+                    // This measured large title child must not add its
+                    // construction copies to the primary request's poll.
+                    let (title_usage, interrupted) = heap_future(|| {
+                        session::title::generate_for_session(session, &self.cfg, &self.client)
+                    })
+                    .await;
+                    if title_usage.has_values() {
+                        title_accounting = Some(
+                            serde_json::json!({"input_tokens":title_usage.input_tokens,"output_tokens":title_usage.output_tokens,"cached_input_tokens":title_usage.cached_input_tokens,"cache_creation_input_tokens":title_usage.cache_creation_input_tokens,"cost":session.total_cost-cost_before}),
+                        );
+                    }
+                    if interrupted {
+                        failure = Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
+                    }
+                    let saved = if let Some(owner) = &mut self.native_headless {
+                        owner.progress(session).await
+                    } else {
+                        session::storage::save_session(session)
+                    };
+                    if let Err(error) = saved {
+                        persistence_failure = Some(error);
+                    }
+                }
+                let _ =
+                    session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
+                        content: msg,
+                        timestamp: session.updated_at.clone(),
+                    });
             }
         }
-
+        if let Some(owner) = &mut self.native_headless {
+            #[cfg(feature = "hooks")]
+            {
+                owner
+                    .scope
+                    .run(crate::extras::hooks::dispatch_session_end("exit"))
+                    .await;
+                self.native_session_end_done = true;
+            }
+            if let Err(error) = owner.finish(&mut self.session).await {
+                persistence_failure = Some(error);
+            }
+        }
+        if let Some((files_changed, pricing)) = json_context {
+            let stop_reason = if pending_question.is_some() {
+                crate::print::HeadlessStopReason::AwaitingUser
+            } else if failure.as_ref().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::spend::run::BudgetStopped>()
+                    .is_some()
+            }) {
+                crate::print::HeadlessStopReason::Budget
+            } else if failure.is_some() || persistence_failure.is_some() {
+                crate::print::HeadlessStopReason::Failed
+            } else if schema_outcome.exhausted {
+                crate::print::HeadlessStopReason::SchemaFailed
+            } else {
+                // A goal that stopped for a reason of its own reports that
+                // reason, so a script can branch on the outcome.
+                #[cfg(feature = "goal")]
+                {
+                    finished_goal
+                        .as_ref()
+                        .map_or(crate::print::HeadlessStopReason::Completed, |goal| {
+                            crate::print::HeadlessStopReason::for_goal(goal.status)
+                        })
+                }
+                #[cfg(not(feature = "goal"))]
+                {
+                    crate::print::HeadlessStopReason::Completed
+                }
+            };
+            let rendered = crate::print::render_headless_json(
+                self.workspace.root(),
+                &response,
+                &interactions,
+                json_usage,
+                files_changed,
+                pricing,
+                stop_reason,
+                #[cfg(feature = "goal")]
+                finished_goal.as_ref(),
+            )?;
+            let mut rendered: serde_json::Value = serde_json::from_str(&rendered)?;
+            if let Some(question) = &pending_question {
+                rendered["pending_question"] = serde_json::to_value(question)?;
+            }
+            if schema.is_some() {
+                rendered["result_json"] = schema_outcome
+                    .result_json
+                    .unwrap_or(serde_json::Value::Null);
+            }
+            if let Some(accounting) = title_accounting {
+                rendered["session_title_usage"] = accounting;
+            }
+            crate::print::emit_headless_result(
+                &rendered.to_string(),
+                output.format,
+                Some((&identity.0, &identity.1)),
+                !self.cli.no_session && persistence_failure.is_none(),
+            )
+            .await?;
+        }
+        if output.format == OutputFormat::Text && !output.streams_text() {
+            crate::print::headless_stdout_async(format!("{response}\n")).await?;
+        }
+        // A goal that stopped for a reason of its own exits with that
+        // reason's code, whatever the output format. The distinction
+        // between "resume me" and "stop retrying" is what an unattended
+        // caller acts on, and it does not depend on whether a human asked
+        // for JSON.
+        #[cfg(feature = "goal")]
+        if failure.is_none() && persistence_failure.is_none() {
+            let goal_stop = finished_goal
+                .as_ref()
+                .map(|goal| crate::print::HeadlessStopReason::for_goal(goal.status));
+            if let Some(reason) = goal_stop
+                && reason.exit_code() != 0
+            {
+                return Err(crate::print::HeadlessGoalExit(reason).into());
+            }
+        }
+        // The turn's own failure wins: a partial persistence failure is
+        // reported too, but neither is ever presented as success.
+        if let Some(failure) = failure {
+            if let Some(error) = persistence_failure {
+                return Err(failure.context(format!(
+                    "the partial turn could not be persisted either: {error}"
+                )));
+            }
+            return Err(failure);
+        }
+        if let Some(error) = persistence_failure {
+            return Err(error);
+        }
+        if schema_outcome.exhausted {
+            anyhow::bail!("final answer did not satisfy output schema after bounded JSON repairs");
+        }
         Ok(())
     }
 
@@ -2358,6 +2535,8 @@ impl Startup {
             handoff_rx,
             #[cfg(feature = "hooks")]
             session_start_task,
+            native_startup,
+            native_ticket,
             ..
         } = self;
 
@@ -2377,7 +2556,8 @@ impl Startup {
                 ask_tx,
                 sandbox,
                 status_signals,
-            ),
+            )
+            .with_native_publication(native_startup, native_ticket),
             None,
             ask_rx,
             auto_trigger_msg,
@@ -2547,6 +2727,8 @@ pub(crate) async fn run_goal_rounds_for_loop(
         cfg.resolve_keep_recent_tool_results(),
     );
 
+    let mut native_ticket = None;
+    let mut native_owner = None;
     let rounds = heap_future(|| {
         run_headless_goal_rounds(
             agent,
@@ -2559,6 +2741,8 @@ pub(crate) async fn run_goal_rounds_for_loop(
             history,
             false,
             crate::event::UsageDelta::default(),
+            &mut native_ticket,
+            &mut native_owner,
             #[cfg(feature = "hooks")]
             true,
         )
@@ -2616,6 +2800,251 @@ pub(crate) async fn run_goal_rounds_for_loop(
 /// The agent is reused between rounds: the goal preamble block is static for
 /// the goal's life, so a rebuild would produce an identical system prompt.
 #[allow(clippy::too_many_arguments)]
+/// The canonical headless invocation retains its writer through model, hook
+/// and I/O retirement. Drop transfers it to the existing scoped cleanup owner.
+struct NativeHeadlessOwner {
+    ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    binding: Option<provider::NativeTurnBinding>,
+    scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    cleanup: Option<crate::agent::runner::AgentRunCleanupGuard>,
+    outcome: crate::session::native_replay::RetiredNativeOutcome,
+}
+impl NativeHeadlessOwner {
+    fn new(ticket: Option<crate::session::native_publication::NativePublicationTicket>) -> Self {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        Self {
+            ticket,
+            binding: None,
+            scope,
+            cleanup: Some(cleanup),
+            outcome: crate::session::native_replay::RetiredNativeOutcome::Incomplete,
+        }
+    }
+    async fn progress(&mut self, session: &mut Session) -> anyhow::Result<()> {
+        if let Some(ticket) = &mut self.ticket {
+            crate::session::native_publication::progress_owned(session, ticket, &self.scope)
+                .await?;
+        }
+        Ok(())
+    }
+    async fn finish(&mut self, session: &mut Session) -> anyhow::Result<()> {
+        // SessionEnd may have admitted async command children after the
+        // model retired. Cancel and join that exact scope before publishing.
+        // Its cleanup owner retains the unique ticket even if this await drops.
+        if let Some(mut cleanup) = self.cleanup.take() {
+            let retained = std::sync::Arc::new(std::sync::Mutex::new(self.ticket.take()));
+            cleanup.retain_until_settled(retained.clone());
+            cleanup.settle().await;
+            self.ticket = retained.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        // The completed hook scope is cancelled. Final file work gets a new
+        // owned IO scope; the binding still proves exact model retirement.
+        self.scope = crate::agent::runner::AgentWorkScope::new();
+        self.cleanup = Some(crate::agent::runner::AgentRunCleanupGuard::auxiliary(
+            self.scope.clone(),
+        ));
+        let result = async {
+            if let Some(ticket) = self.ticket.take() {
+                let binding = self
+                    .binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("native model did not settle"))?;
+                if session.native_frontier.refusal().is_some() {
+                    binding
+                        .publish_refused_owned(session, ticket, &self.scope)
+                        .await?;
+                } else {
+                    binding
+                        .publish_retired_owned(session, ticket, self.outcome, &self.scope)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.settle().await;
+        }
+        result
+    }
+}
+impl Drop for NativeHeadlessOwner {
+    fn drop(&mut self) {
+        if let (Some(cleanup), Some(ticket)) = (&mut self.cleanup, self.ticket.take()) {
+            cleanup.retain_until_settled(ticket);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bound_headless_round(
+    agent: &provider::AnyAgent,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    output: crate::print::HeadlessOutputPolicy,
+    question_turn: crate::question::QuestionTurn,
+    native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
+    native_owner: &mut Option<NativeHeadlessOwner>,
+    #[cfg(feature = "agent-skills")] instruction_turn: Option<
+        std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+    >,
+    #[cfg(feature = "hooks")] loop_info: Option<crate::extras::hooks::LoopInfo>,
+) -> (crate::agent::runner::HeadlessTurn, bool) {
+    use crate::session::native_replay::{HistoryProtocol, ReplayBoundary, RetiredNativeOutcome};
+    let native = agent.history_protocol() == HistoryProtocol::AnthropicMessages
+        || session.native_history_snapshot().is_some();
+    if !native {
+        let turn = heap_future(|| {
+            let agent = agent.clone();
+            #[cfg(feature = "agent-skills")]
+            let agent = agent.with_instruction_turn(instruction_turn);
+            let agent = agent
+                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                .with_question_turn(Some(question_turn));
+            async move {
+                agent
+                    .run_print_with_output(
+                        message,
+                        output,
+                        &cfg.retry,
+                        history,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
+            }
+        })
+        .await;
+        return (turn, false);
+    }
+    let failed = |error: anyhow::Error| {
+        (
+            crate::agent::runner::HeadlessTurn::failed_before_start(error),
+            false,
+        )
+    };
+    if native_owner.is_some() {
+        return failed(anyhow::anyhow!(
+            "native automatic round requires its prior retired context owner"
+        ));
+    }
+    if !cli.no_session && native_ticket.is_none() {
+        return failed(anyhow::anyhow!("native context requires its startup owner"));
+    }
+    *native_owner = Some(NativeHeadlessOwner::new(native_ticket.take()));
+    let owner = native_owner.as_mut().unwrap();
+    let spend = crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Turn);
+    if let Err(error) = owner.scope.run(async { spend.prepare().await }).await {
+        return failed(error);
+    }
+    session.pending_question = None;
+    if let Err(error) = owner.progress(session).await {
+        return failed(error);
+    }
+    #[cfg(feature = "goal")]
+    if session.goal_store.is_live() {
+        return failed(anyhow::anyhow!(
+            "native automatic goal work requires its round publication owner; ordinary print is available"
+        ));
+    }
+    let pricing = crate::print::HeadlessPricing::from_session(session, cfg);
+    let boundary = match session.native_history_snapshot() {
+        Some(saved) => match saved.saved_boundary() {
+            Ok(value) => value,
+            Err(error) => return failed(error.into()),
+        },
+        None => ReplayBoundary::CompletedTurn,
+    };
+    let bound = heap_future(|| {
+        let agent = agent.clone();
+        #[cfg(feature = "agent-skills")]
+        let agent = agent.with_instruction_turn(instruction_turn);
+        let agent = agent
+            .with_spend(Some(spend))
+            .with_question_turn(Some(question_turn));
+        std::future::ready(agent.bind_native_turn(
+            session,
+            history,
+            boundary,
+            provider::RecordedToolIds::Canonical,
+        ))
+    })
+    .await;
+    let (agent, binding) = match bound {
+        Ok(value) => value,
+        Err(error) => return failed(error.into()),
+    };
+    if let Some(ticket) = &mut owner.ticket
+        && let Err(error) = binding.pair_publication(session, ticket)
+    {
+        return failed(error);
+    }
+    let history = binding.history();
+    owner.binding = Some(binding);
+    let mut turn = heap_future(|| {
+        agent.run_print_with_output(
+            message,
+            output,
+            &cfg.retry,
+            history,
+            #[cfg(feature = "hooks")]
+            loop_info,
+        )
+    })
+    .await;
+    // The producer returned only after its exact model and scoped effects joined.
+    owner.outcome = if turn.failure.is_none() {
+        RetiredNativeOutcome::Completed
+    } else if turn.failure.as_ref().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::question::QuestionRequired>()
+            .is_some()
+    }) {
+        RetiredNativeOutcome::LiveToolReply
+    } else {
+        RetiredNativeOutcome::Incomplete
+    };
+    session.pending_question = turn
+        .failure
+        .as_ref()
+        .and_then(|error| error.downcast_ref::<crate::question::QuestionRequired>())
+        .cloned();
+    let usage = cfg.normalize_usage(&session.provider, turn.usage.into());
+    let binding = owner.binding.as_ref().unwrap();
+    let committed = binding.commit_canonical_into_with_outcome(
+        session,
+        message,
+        &turn.response,
+        &turn.interactions,
+        usage,
+        pricing,
+        owner.outcome,
+    );
+    if let Err(reason) = committed {
+        turn.failure = Some(match turn.failure.take() {
+            Some(error) => error.context(reason),
+            None => reason.into(),
+        });
+    }
+    if session.native_frontier.refusal().is_some() {
+        if let Some(ticket) = owner.ticket.take()
+            && let Err(error) = binding
+                .publish_refused_owned(session, ticket, &owner.scope)
+                .await
+        {
+            turn.failure = Some(error);
+        }
+    } else if let Err(error) = owner.progress(session).await {
+        turn.failure = Some(error);
+    }
+    (turn, true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_headless_goal_rounds(
     agent: &provider::AnyAgent,
     #[cfg_attr(not(feature = "goal"), allow(unused_variables))] session: &mut Session,
@@ -2635,6 +3064,127 @@ async fn run_headless_goal_rounds(
     // reported to `Stop` hooks as `loop_iteration`/`loop_active`, and folding
     // the loop onto the goal driver must not silently empty those fields for
     // everyone who reads them.
+    native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
+    native_owner: &mut Option<NativeHeadlessOwner>,
+    #[cfg(feature = "hooks")] loop_mode: bool,
+) -> HeadlessRounds {
+    // Plain print has no goal engine to poll. Keep the independently
+    // measured automatic-round future behind its own constructor boundary.
+    #[cfg(feature = "goal")]
+    let plain = !session.goal_store.is_active();
+    #[cfg(not(feature = "goal"))]
+    let plain = true;
+    if plain {
+        session.pending_question = None;
+        #[cfg(feature = "agent-skills")]
+        let instruction_turn = agent.instruction_services().map(|services| {
+            crate::extras::skills::session::InstructionTurn::new(services.clone(), None)
+        });
+        let output = if cli.is_loop_mode() && !cli.print {
+            crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)
+        } else {
+            crate::print::HeadlessOutputPolicy::from_cli(cli)
+        };
+        let (turn, persisted) = if agent.history_protocol()
+            == crate::session::native_replay::HistoryProtocol::AnthropicMessages
+            || session.native_history_snapshot().is_some()
+        {
+            heap_future(|| {
+                run_bound_headless_round(
+                    agent,
+                    session,
+                    cli,
+                    cfg,
+                    message,
+                    history,
+                    output,
+                    crate::question::QuestionTurn::default(),
+                    native_ticket,
+                    native_owner,
+                    #[cfg(feature = "agent-skills")]
+                    instruction_turn,
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+            })
+            .await
+        } else {
+            // An inactive goal has no automatic rounds. Keep its measured
+            // 141 KiB polling frame off the ordinary one-turn HTTP path.
+            let turn = heap_future(|| {
+                let agent = agent.clone();
+                #[cfg(feature = "agent-skills")]
+                let agent = agent.with_instruction_turn(instruction_turn);
+                let agent = agent
+                    .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                    .with_question_turn(Some(crate::question::QuestionTurn::default()));
+                #[cfg(feature = "hooks")]
+                let loop_info = loop_round_info(session, loop_mode);
+                async move {
+                    agent
+                        .run_print_with_output(
+                            message,
+                            output,
+                            &cfg.retry,
+                            history,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                        .await
+                }
+            })
+            .await;
+            (turn, false)
+        };
+        return HeadlessRounds {
+            turn,
+            prompt: message.to_owned(),
+            persisted,
+        };
+    }
+    heap_future(|| {
+        run_headless_goal_rounds_inner(
+            agent,
+            session,
+            cli,
+            cfg,
+            sandbox,
+            client,
+            message,
+            history,
+            json_output,
+            compaction_usage,
+            native_ticket,
+            native_owner,
+            #[cfg(feature = "hooks")]
+            loop_mode,
+        )
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_headless_goal_rounds_inner(
+    agent: &provider::AnyAgent,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] sandbox: &crate::sandbox::Sandbox,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] client: &provider::AnyClient,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    json_output: bool,
+    // Normalized usage of the auto-compaction that ran before the first
+    // round. The session has already been charged for it; its tokens count
+    // toward the goal's first round (mini-agent-i6q98).
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))]
+    compaction_usage: crate::event::UsageDelta,
+    // Whether these rounds are a `--loop`. A loop's iterations have always been
+    // reported to `Stop` hooks as `loop_iteration`/`loop_active`, and folding
+    // the loop onto the goal driver must not silently empty those fields for
+    // everyone who reads them.
+    native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
+    native_owner: &mut Option<NativeHeadlessOwner>,
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
     let question_turn = crate::question::QuestionTurn::default();
@@ -2654,40 +3204,66 @@ async fn run_headless_goal_rounds(
     // files it under a prompt that was never sent.
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut round_prompt = message.to_string();
-    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
-    let mut persisted = false;
 
     // A goal's time bound measures how long the agent worked. Headless runs
     // never wait on a permission prompt, so the round's wall clock is its
     // active time; without this the bound is configurable and inert.
     #[cfg(feature = "goal")]
     let mut round_started = std::time::Instant::now();
+    #[cfg(feature = "hooks")]
+    let first_loop_info = loop_round_info(session, loop_mode);
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
-    let mut turn = heap_future(|| {
-        // The chained setters move a large AnyAgent. Construct it in this
-        // short factory frame before the owned request starts polling HTTP.
-        let agent = agent.clone();
-        #[cfg(feature = "agent-skills")]
-        let agent = agent.with_instruction_turn(instruction_turn.clone());
-        let agent = agent
-            .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-            .with_question_turn(Some(question_turn.clone()));
-        #[cfg(feature = "hooks")]
-        let loop_info = loop_round_info(session, loop_mode);
-        async move {
-            agent
-                .run_print_with_output(
-                    message,
-                    output,
-                    &cfg.retry,
-                    history,
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                )
-                .await
-        }
-    })
-    .await;
+    let (mut turn, mut persisted) = if agent.history_protocol()
+        == crate::session::native_replay::HistoryProtocol::AnthropicMessages
+        || session.native_history_snapshot().is_some()
+    {
+        heap_future(|| {
+            run_bound_headless_round(
+                agent,
+                session,
+                cli,
+                cfg,
+                message,
+                history,
+                output,
+                question_turn.clone(),
+                native_ticket,
+                native_owner,
+                #[cfg(feature = "agent-skills")]
+                instruction_turn.clone(),
+                #[cfg(feature = "hooks")]
+                first_loop_info,
+            )
+        })
+        .await
+    } else {
+        let turn = heap_future(|| {
+            // The chained setters move a large AnyAgent. Construct it in this
+            // short factory frame before the owned request starts polling HTTP.
+            let agent = agent.clone();
+            #[cfg(feature = "agent-skills")]
+            let agent = agent.with_instruction_turn(instruction_turn.clone());
+            let agent = agent
+                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                .with_question_turn(Some(question_turn.clone()));
+            #[cfg(feature = "hooks")]
+            let loop_info = loop_round_info(session, loop_mode);
+            async move {
+                agent
+                    .run_print_with_output(
+                        message,
+                        output,
+                        &cfg.retry,
+                        history,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
+            }
+        })
+        .await;
+        (turn, false)
+    };
     #[cfg(feature = "goal")]
     let mut round_elapsed = round_started.elapsed();
 
@@ -2716,6 +3292,9 @@ async fn run_headless_goal_rounds(
                 break;
             }
 
+            if native_owner.is_some() && turn.failure.is_some() {
+                break;
+            }
             let open_todos = session
                 .todos
                 .snapshot()
@@ -2939,18 +3518,20 @@ async fn run_headless_goal_rounds(
             // The round that just ran is history for whatever comes next, and its
             // work has to survive an interrupt, so it is persisted before the
             // gate's decision is acted on rather than only on a relaunch.
-            if let Err(error) = crate::extras::goal::driver::persist_round(
-                session,
-                &round_prompt,
-                crate::agent::runner::HeadlessTurn {
-                    response: turn.response.clone(),
-                    usage: turn.usage,
-                    interactions: turn.interactions.clone(),
-                    failure: None,
-                },
-                cfg,
-                cli.no_session,
-            ) {
+            if !persisted
+                && let Err(error) = crate::extras::goal::driver::persist_round(
+                    session,
+                    &round_prompt,
+                    crate::agent::runner::HeadlessTurn {
+                        response: turn.response.clone(),
+                        usage: turn.usage,
+                        interactions: turn.interactions.clone(),
+                        failure: None,
+                    },
+                    cfg,
+                    cli.no_session,
+                )
+            {
                 notices
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3035,6 +3616,12 @@ async fn run_headless_goal_rounds(
             round_prompt = relaunch.prompt.clone();
             persisted = false;
             round_started = std::time::Instant::now();
+            if native_owner.is_some() {
+                turn.failure = Some(anyhow::anyhow!(
+                    "native goal continuation requires its retired round owner"
+                ));
+                break;
+            }
             let next = heap_future(|| {
                 // Automatic rounds retain the same clarification identity;
                 // only this round's owned financial/request profile is fresh.
@@ -4790,5 +5377,127 @@ mod heap_future_tests {
         }));
         assert_eq!(result, "stack-heap");
         assert_eq!(borrowed, "stack");
+    }
+}
+
+#[cfg(test)]
+mod native_publication_startup_tests {
+    use super::*;
+
+    #[test]
+    fn native_publication_actual_startup_idle_zero_cap_preserves_denial_on_one_mib() {
+        std::thread::Builder::new()
+            .name("native-startup-one-mib".into())
+            .stack_size(1_048_576)
+            .spawn(|| {
+                let root = crate::tests::OwnedTestDirectory::new("native-startup-actual");
+                let _environment = crate::tests::ScopedProcessEnv::set(&[
+                    (
+                        "ZS_CONFIG_DIR",
+                        Some(root.path().join("config").into_os_string()),
+                    ),
+                    (
+                        "ZS_DATA_DIR",
+                        Some(root.path().join("data").into_os_string()),
+                    ),
+                    (
+                        "ZS_STATE_DIR",
+                        Some(root.path().join("state").into_os_string()),
+                    ),
+                    (
+                        "ZS_CACHE_DIR",
+                        Some(root.path().join("cache").into_os_string()),
+                    ),
+                ]);
+                let workspace = std::sync::Arc::new(
+                    crate::paths::WorkspaceBinding::capture(root.path()).unwrap(),
+                );
+                let paths = crate::paths::process_paths().unwrap();
+                let mut saved = Session::new("anthropic", "claude-fixture", 32_000, "old");
+                saved.working_dir = workspace.root().to_string_lossy().into();
+                saved.add_message(crate::session::MessageRole::User, "unchanged prior turn");
+                crate::session::storage::save_session(&saved).unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let cli = Cli {
+                        api_key: Some("unused-native-key".into()),
+                        print: true,
+                        message: vec!["retained idle literal".into()],
+                        session: Some(saved.id.to_string()),
+                        no_context_files: true,
+                        no_tools: true,
+                        no_sandbox: true,
+                        name: Some("idle renamed".into()),
+                        ..Default::default()
+                    };
+                    let cfg = Config {
+                        max_budget_usd: Some(0.0),
+                        ..Default::default()
+                    };
+                    let startup = Startup::init(
+                        cli.clone(),
+                        cfg.clone(),
+                        paths.clone(),
+                        workspace.clone(),
+                        false,
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(&startup.client, AnyClient::Anthropic(_)));
+                    assert!(startup.native_startup.is_some());
+                    assert!(startup.native_ticket.is_none());
+                    assert_eq!(startup.session.spend_account.snapshot().cap, Some(0.0));
+                    assert_eq!(startup.session.total_input_tokens, 0);
+                    let loaded = crate::session::storage::load_session_exact(&saved.id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(loaded.name, "idle renamed");
+                    assert_eq!(loaded.messages[0].content, "unchanged prior turn");
+                    assert_eq!(
+                        loaded.native_frontier.refusal(),
+                        Some(crate::session::native_replay::RestartReason::InFlight)
+                    );
+                    let checkpoint = crate::session::storage::session_path(&saved.id).unwrap();
+                    let before = std::fs::read(&checkpoint).unwrap();
+                    drop(startup); // No model completion or healthy checkpoint is fabricated.
+                    tokio::task::yield_now().await;
+                    let ephemeral = Cli {
+                        no_session: true,
+                        name: None,
+                        ..cli
+                    };
+                    let error = Startup::init(
+                        ephemeral,
+                        cfg,
+                        paths.clone(),
+                        workspace.clone(),
+                        false,
+                        false,
+                        false,
+                    )
+                    .await
+                    .err()
+                    .unwrap();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("saved native context requires persistence")
+                    );
+                    let after = crate::session::storage::load_session_exact(&saved.id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(after.name, "idle renamed");
+                    assert_eq!(std::fs::read(&checkpoint).unwrap(), before);
+                });
+                crate::session::lock::release_session(&saved.id);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

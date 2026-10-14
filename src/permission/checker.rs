@@ -170,6 +170,157 @@ mod tool_output_read_tests {
     }
 }
 
+#[cfg(test)]
+mod native_policy_tests {
+    use super::*;
+
+    fn checker(root: &Path, config: PermissionConfigs) -> PermissionChecker {
+        PermissionChecker::new(&config, SecurityMode::Guarded, Some(root.to_owned()), None).unwrap()
+    }
+
+    #[test]
+    #[cfg(not(feature = "hooks"))]
+    fn native_host_permission_modes_and_workspace_setters_change_compatibility() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-permission-modes");
+        let other = roots.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut policy = checker(roots.path(), PermissionConfigs::default());
+        let guarded = policy.compatibility_fingerprint().unwrap();
+        let initial_revision = policy.compatibility_revision().unwrap();
+        assert!(policy.set_prompt_mode(SecurityMode::ReadOnly));
+        assert_ne!(policy.compatibility_fingerprint().unwrap(), guarded);
+        assert!(policy.compatibility_revision().unwrap() > initial_revision);
+        policy.restore_user_mode();
+        assert_eq!(policy.compatibility_fingerprint().unwrap(), guarded);
+        let restored_revision = policy.compatibility_revision().unwrap();
+        assert!(
+            restored_revision > initial_revision,
+            "a transient change cannot disappear when restored"
+        );
+        assert!(!policy.set_prompt_mode(SecurityMode::Yolo));
+        assert_eq!(policy.compatibility_fingerprint().unwrap(), guarded);
+        assert_eq!(policy.compatibility_revision(), Some(restored_revision));
+        policy.set_mode(SecurityMode::Standard);
+        assert_ne!(policy.compatibility_fingerprint().unwrap(), guarded);
+        policy.set_mode(SecurityMode::Guarded);
+        assert_eq!(policy.compatibility_fingerprint().unwrap(), guarded);
+        #[cfg(feature = "mcp")]
+        {
+            policy.set_allow_all_mcp_calls(true);
+            assert_ne!(policy.compatibility_fingerprint().unwrap(), guarded);
+            policy.set_allow_all_mcp_calls(false);
+            assert_eq!(policy.compatibility_fingerprint().unwrap(), guarded);
+        }
+        policy.rebind_working_dir(&other).unwrap();
+        assert_ne!(policy.compatibility_fingerprint().unwrap(), guarded);
+        let revision = policy.compatibility_revision().unwrap();
+        let seed = PermissionConfig {
+            deny_entries: Some([("write".to_owned(), vec!["**/blocked.txt".to_owned()])].into()),
+            ..Default::default()
+        };
+        policy.apply_ephemeral_cli_rules(&seed).unwrap();
+        assert!(policy.compatibility_revision().unwrap() > revision);
+        policy.compatibility_revision = Some(u64::MAX);
+        policy.set_mode(SecurityMode::ReadOnly);
+        assert_eq!(policy.compatibility_revision(), None);
+        policy.set_mode(SecurityMode::Guarded);
+        assert_eq!(
+            policy.compatibility_revision(),
+            None,
+            "exhaustion cannot reset to a usable watcher"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mcp")]
+    fn native_host_permission_mcp_setter_changes_compatibility_without_hook_state() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-permission-mcp");
+        let mut policy = checker(roots.path(), PermissionConfigs::default());
+        let before = policy.compatibility_fingerprint().unwrap();
+        let initial_revision = policy.compatibility_revision().unwrap();
+        policy.set_allow_all_mcp_calls(true);
+        assert_ne!(policy.compatibility_fingerprint().unwrap(), before);
+        policy.set_allow_all_mcp_calls(false);
+        assert_eq!(policy.compatibility_fingerprint().unwrap(), before);
+        assert!(policy.compatibility_revision().unwrap() > initial_revision);
+    }
+
+    #[test]
+    fn native_host_permission_fingerprint_never_restores_ephemeral_grants() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-permission-grants");
+        let path = roots
+            .path()
+            .join("ordinary-owned-file.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut live = checker(roots.path(), PermissionConfigs::default());
+        let before = live.compatibility_fingerprint().unwrap();
+        let revision = live.compatibility_revision();
+        assert_eq!(live.check_path("write", &path), CheckResult::Ask);
+        live.add_session_allowlist("write".into(), &path);
+        assert_eq!(live.check_path("write", &path), CheckResult::Allowed);
+        assert_eq!(live.compatibility_fingerprint().unwrap(), before);
+        assert_eq!(
+            live.compatibility_revision(),
+            revision,
+            "ephemeral approvals are not configured policy revisions"
+        );
+        let mut fresh = checker(roots.path(), PermissionConfigs::default());
+        assert_eq!(fresh.compatibility_fingerprint().unwrap(), before);
+        assert_eq!(fresh.check_path("write", &path), CheckResult::Ask);
+        assert!(fresh.session_allowlist.is_empty());
+    }
+
+    #[test]
+    fn native_host_permission_compiled_semantics_and_canonical_order_are_bound() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-permission-compiled");
+        let mut glob = checker(roots.path(), PermissionConfigs::default());
+        let mut regex = checker(roots.path(), PermissionConfigs::default());
+        glob.rules.insert(
+            "write".into(),
+            vec![(Pattern::new("file.*"), Action::Allow)],
+        );
+        regex.rules.insert(
+            "write".into(),
+            vec![(Pattern::new_regex("file.*").unwrap(), Action::Allow)],
+        );
+        assert_ne!(
+            glob.compatibility_fingerprint().unwrap(),
+            regex.compatibility_fingerprint().unwrap()
+        );
+        let first = vec![
+            (Pattern::new("**/*.rs"), Action::Allow),
+            (Pattern::new("**/secret.rs"), Action::Deny),
+        ];
+        let mut second = first.clone();
+        second.reverse();
+        glob.rules.insert("write".into(), first);
+        regex.rules.insert("write".into(), second);
+        assert_eq!(
+            glob.compatibility_fingerprint().unwrap(),
+            regex.compatibility_fingerprint().unwrap()
+        );
+        glob.shell_allow_prefixes
+            .push(crate::permission::shell_prefix::ShellPrefix::parse("git status").unwrap());
+        assert_ne!(
+            glob.compatibility_fingerprint().unwrap(),
+            regex.compatibility_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn native_host_permission_bound_precedes_path_allocation_and_revalidation() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-permission-bound");
+        let mut policy = checker(roots.path(), PermissionConfigs::default());
+        policy.working_dir = "x".repeat(1024 * 1024 + 1);
+        policy.plan_write_root.as_mut().unwrap().configured = roots.path().join("missing");
+        assert_eq!(
+            policy.compatibility_fingerprint().unwrap_err().to_string(),
+            "native permission policy exceeds its compatibility bound"
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     Allowed,
@@ -269,6 +420,9 @@ pub struct PermissionChecker {
     user_mode: SecurityMode,
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
+    /// Runtime-only policy watcher. None is exhausted/unavailable, never an
+    /// imported revision or grant. Stable compatibility data excludes it.
+    compatibility_revision: Option<u64>,
     cached_resolved_cwd: Option<PathBuf>,
     /// Only the active logical session's immediate spill files are readable.
     /// Retain a directory capability so path replacement cannot widen the grant.
@@ -381,6 +535,7 @@ impl PermissionChecker {
     #[cfg(any(feature = "git-worktree", test))]
     pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) -> anyhow::Result<()> {
         let (canonical, plan_write_root) = canonical_working_dir(working_dir)?;
+        self.policy_changed();
         self.working_dir = canonical.to_string_lossy().into_owned();
         self.plan_write_root = Some(plan_write_root);
         self.cached_resolved_cwd = resolve_path_allow_missing(Path::new(&self.working_dir));
@@ -617,6 +772,7 @@ impl PermissionChecker {
             user_mode: mode,
             permission_modes: resolved_modes,
             allow_all_mcp_calls: false,
+            compatibility_revision: Some(0),
             cached_resolved_cwd,
             tool_output_binding: None,
             #[cfg(feature = "hooks")]
@@ -647,6 +803,18 @@ impl PermissionChecker {
         }
         Self::merge_entries(&mut self.rules, &config.allow_entries, Action::Allow);
         Self::merge_entries(&mut self.rules, &config.deny_entries, Action::Deny);
+        if config
+            .allow_entries
+            .as_ref()
+            .is_some_and(|entries| entries.values().any(|values| !values.is_empty()))
+            || config
+                .deny_entries
+                .as_ref()
+                .is_some_and(|entries| entries.values().any(|values| !values.is_empty()))
+            || !prefixes.is_empty()
+        {
+            self.policy_changed();
+        }
         self.shell_allow_prefixes.extend(prefixes);
         Ok(())
     }
@@ -1748,6 +1916,9 @@ impl PermissionChecker {
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
         tracing::debug!("perm mode changed: {:?} -> {:?}", self.mode, mode);
+        if self.mode != mode || self.user_mode != mode {
+            self.policy_changed();
+        }
         self.mode = mode;
         self.user_mode = mode;
         #[cfg(feature = "hooks")]
@@ -1765,6 +1936,9 @@ impl PermissionChecker {
                 self.user_mode
             );
             return false;
+        }
+        if self.mode != mode {
+            self.policy_changed();
         }
         self.mode = mode;
         #[cfg(feature = "hooks")]
@@ -1784,7 +1958,200 @@ impl PermissionChecker {
         Some(relative.to_string_lossy().into_owned())
     }
 
+    /// Bounded compatibility data for the configured ceiling and active mode.
+    /// Session approvals, hook decisions, counters and spill grants are absent.
+    pub(crate) fn compatibility_fingerprint(&self) -> anyhow::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        const MAX_POLICY_BYTES: usize = 1024 * 1024;
+        const MAX_POLICY_ENTRIES: usize = 16 * 1024;
+        anyhow::ensure!(
+            self.rules.len() <= 128 && self.permission_modes.len() <= 6,
+            "native permission policy exceeds its compatibility bound"
+        );
+        let mut bytes = 0usize;
+        let mut entries = 0usize;
+        let mut include = |value: &str| -> anyhow::Result<()> {
+            bytes = bytes.checked_add(value.len()).ok_or_else(|| {
+                anyhow::anyhow!("native permission policy exceeds its compatibility bound")
+            })?;
+            anyhow::ensure!(
+                bytes <= MAX_POLICY_BYTES,
+                "native permission policy exceeds its compatibility bound"
+            );
+            Ok(())
+        };
+        include(&self.working_dir)?;
+        for (tool, rules) in &self.rules {
+            include(tool)?;
+            entries = entries.checked_add(rules.len()).ok_or_else(|| {
+                anyhow::anyhow!("native permission policy exceeds its compatibility bound")
+            })?;
+            anyhow::ensure!(
+                entries <= MAX_POLICY_ENTRIES,
+                "native permission policy exceeds its compatibility bound"
+            );
+            for (pattern, _) in rules {
+                let (original, regex, folded, _, _, _) = pattern.compatibility_fields();
+                include(original)?;
+                include(regex)?;
+                if let Some(folded) = folded {
+                    include(folded)?;
+                }
+            }
+        }
+        entries = entries
+            .checked_add(self.ext_dir_rules.len())
+            .ok_or_else(|| {
+                anyhow::anyhow!("native permission policy exceeds its compatibility bound")
+            })?;
+        anyhow::ensure!(
+            entries <= MAX_POLICY_ENTRIES,
+            "native permission policy exceeds its compatibility bound"
+        );
+        for (pattern, _) in &self.ext_dir_rules {
+            let (original, regex, folded, _, _, _) = pattern.compatibility_fields();
+            include(original)?;
+            include(regex)?;
+            if let Some(folded) = folded {
+                include(folded)?;
+            }
+        }
+        for prefix in &self.shell_allow_prefixes {
+            let (argv, _) = prefix.compatibility_fields();
+            entries = entries.checked_add(argv.len()).ok_or_else(|| {
+                anyhow::anyhow!("native permission policy exceeds its compatibility bound")
+            })?;
+            anyhow::ensure!(
+                entries <= MAX_POLICY_ENTRIES,
+                "native permission policy exceeds its compatibility bound"
+            );
+            for word in argv {
+                include(word)?;
+            }
+        }
+        if let Some(root) = &self.plan_write_root {
+            // Reject before canonicalization/path cloning. Non-UTF8 policy
+            // roots refuse compatibility instead of allocating a lossy view.
+            include(
+                root.configured
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("native permission root is not portable"))?,
+            )?;
+            include(
+                root.canonical
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("native permission root is not portable"))?,
+            )?;
+        }
+        // Only after every borrowed value and count is bounded may sorting
+        // allocate. Rule resolution is order-independent (deny, specificity,
+        // then Ask), so HashMap/config insertion order must not change identity.
+        fn text(hash: &mut Sha256, value: &str) {
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        fn action(action: Action) -> u8 {
+            match action {
+                Action::Allow => 1,
+                Action::Ask => 2,
+                Action::Deny => 3,
+            }
+        }
+        fn mode(mode: SecurityMode) -> u8 {
+            match mode {
+                SecurityMode::Standard => 1,
+                SecurityMode::Restrictive => 2,
+                SecurityMode::ReadOnly => 3,
+                SecurityMode::PlanWrite => 4,
+                SecurityMode::Guarded => 5,
+                SecurityMode::Yolo => 6,
+            }
+        }
+        fn rule(pattern: &Pattern, permission: Action) -> [u8; 32] {
+            let mut hash = Sha256::new();
+            let (original, regex, folded, normalized, specificity, absolute) =
+                pattern.compatibility_fields();
+            text(&mut hash, original);
+            text(&mut hash, regex);
+            hash.update([folded.is_some() as u8]);
+            if let Some(folded) = folded {
+                text(&mut hash, folded);
+            }
+            hash.update([normalized as u8, absolute as u8, action(permission)]);
+            hash.update((specificity as u64).to_le_bytes());
+            hash.finalize().into()
+        }
+        fn rules(hash: &mut Sha256, values: &[(Pattern, Action)]) {
+            let mut values: Vec<_> = values
+                .iter()
+                .map(|(pattern, permission)| rule(pattern, *permission))
+                .collect();
+            values.sort_unstable();
+            hash.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hash.update(value);
+            }
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"mini-agent-native-permission-policy-v1\0");
+        hash.update([
+            action(self.default_action),
+            action(self.doom_loop_action),
+            mode(self.mode),
+            mode(self.user_mode),
+            self.allow_all_mcp_calls as u8,
+        ]);
+        hash.update((self.permission_modes.len() as u64).to_le_bytes());
+        for permission_mode in &self.permission_modes {
+            hash.update([mode(*permission_mode)]);
+        }
+        text(&mut hash, &self.working_dir);
+        let mut tools: Vec<_> = self.rules.iter().collect();
+        tools.sort_unstable_by_key(|(a, _)| *a);
+        hash.update((tools.len() as u64).to_le_bytes());
+        for (tool, values) in tools {
+            text(&mut hash, tool);
+            rules(&mut hash, values);
+        }
+        rules(&mut hash, &self.ext_dir_rules);
+        let mut prefixes = Vec::with_capacity(self.shell_allow_prefixes.len());
+        for prefix in &self.shell_allow_prefixes {
+            let (argv, specificity) = prefix.compatibility_fields();
+            let mut prefix = Sha256::new();
+            prefix.update((argv.len() as u64).to_le_bytes());
+            for word in argv {
+                text(&mut prefix, word);
+            }
+            prefix.update((specificity as u64).to_le_bytes());
+            prefixes.push(<[u8; 32]>::from(prefix.finalize()));
+        }
+        prefixes.sort_unstable();
+        hash.update((prefixes.len() as u64).to_le_bytes());
+        for prefix in prefixes {
+            hash.update(prefix);
+        }
+        hash.update([self.plan_write_root.is_some() as u8]);
+        if let Some(root) = &self.plan_write_root {
+            let current = std::fs::canonicalize(&root.configured)?;
+            anyhow::ensure!(
+                current == root.canonical,
+                "native permission workspace changed"
+            );
+            let identity = crate::fs::checked_path_metadata(&current)?;
+            crate::fs::ensure_same_file(&current, &root.identity, &identity)?;
+            text(&mut hash, root.configured.to_str().unwrap());
+            text(&mut hash, root.canonical.to_str().unwrap());
+            hash.update(root.identity.identity_fingerprint());
+            // This read is data-only; the actual controller must additionally
+            // revalidate its retained WorkspaceBinding at admission/publication.
+        }
+        Ok(hash.finalize().into())
+    }
+
     pub fn restore_user_mode(&mut self) {
+        if self.mode != self.user_mode {
+            self.policy_changed();
+        }
         self.mode = self.user_mode;
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_permission_mode(self.mode);
@@ -1800,7 +2167,20 @@ impl PermissionChecker {
 
     #[cfg(feature = "mcp")]
     pub fn set_allow_all_mcp_calls(&mut self, allow: bool) {
+        if self.allow_all_mcp_calls != allow {
+            self.policy_changed();
+        }
         self.allow_all_mcp_calls = allow;
+    }
+
+    fn policy_changed(&mut self) {
+        self.compatibility_revision = self
+            .compatibility_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
+    pub(crate) fn compatibility_revision(&self) -> Option<u64> {
+        self.compatibility_revision
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {

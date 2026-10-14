@@ -28,6 +28,7 @@ pub(crate) enum RestartReason {
     UnavailableSource,
     UnsupportedOverride,
     Limit,
+    InFlight,
 }
 
 impl std::fmt::Display for RestartReason {
@@ -43,6 +44,9 @@ impl std::fmt::Display for RestartReason {
                 "raw request overrides cannot reproduce native thinking context"
             }
             Self::Limit => "native thinking context exceeds its finite bounds",
+            Self::InFlight => {
+                "native thinking context is unfinished; start a fresh context to continue"
+            }
         })
     }
 }
@@ -72,9 +76,21 @@ pub(crate) enum RetiredNativeOutcome {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NativeFrontier(std::sync::Arc<FrontierState>);
 
+/// Runtime identity only. A deserialized checkpoint has a different cell even
+/// when its saved session id and cutoff are identical.
+#[derive(Debug, Clone)]
+pub(super) struct FrontierIdentity(std::sync::Weak<FrontierState>);
+
+impl FrontierIdentity {
+    pub(super) fn matches(&self, frontier: &NativeFrontier) -> bool {
+        self.0.ptr_eq(&std::sync::Arc::downgrade(&frontier.0))
+    }
+}
+
 #[derive(Debug, Default)]
 struct FrontierState {
     checkpoint: std::sync::Mutex<FrontierCheckpoint>,
+    publication: std::sync::Arc<super::native_publication::PublicationCell>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +98,7 @@ struct FrontierCheckpoint {
     epoch: u64,
     refusal: Option<RestartReason>,
     retiring: bool,
+    activated: bool,
 }
 
 pub(crate) struct NativeRetirement(NativeFrontier);
@@ -92,6 +109,33 @@ impl Drop for NativeRetirement {
 }
 
 impl NativeFrontier {
+    pub(super) fn publication_cell(
+        &self,
+    ) -> std::sync::Arc<super::native_publication::PublicationCell> {
+        std::sync::Arc::clone(&self.0.publication)
+    }
+
+    /// Persistence-only denial at the same cutoff. The healthy live binding
+    /// remains available to the exact admitted actor; imports cannot restore
+    /// that runtime owner.
+    pub(super) fn in_flight_projection(&self) -> Self {
+        let mut checkpoint = self.checkpoint().clone();
+        checkpoint.refusal = Some(RestartReason::InFlight);
+        checkpoint.retiring = false;
+        Self(std::sync::Arc::new(FrontierState {
+            checkpoint: std::sync::Mutex::new(checkpoint),
+            publication: Default::default(),
+        }))
+    }
+
+    pub(super) fn identity(&self) -> FrontierIdentity {
+        FrontierIdentity(std::sync::Arc::downgrade(&self.0))
+    }
+
+    pub(super) fn activate_publication(&self) {
+        self.checkpoint().activated = true;
+    }
+
     fn checkpoint(&self) -> std::sync::MutexGuard<'_, FrontierCheckpoint> {
         self.0
             .checkpoint
@@ -101,7 +145,7 @@ impl NativeFrontier {
 
     pub(crate) fn is_initial(&self) -> bool {
         let saved = self.checkpoint();
-        saved.epoch == 0 && saved.refusal.is_none()
+        saved.epoch == 0 && saved.refusal.is_none() && !saved.activated
     }
 
     pub(crate) fn current(&self) -> u64 {
@@ -164,6 +208,7 @@ impl NativeFrontier {
         checkpoint.retiring = false;
         Self(std::sync::Arc::new(FrontierState {
             checkpoint: std::sync::Mutex::new(checkpoint),
+            publication: Default::default(),
         }))
     }
 }
@@ -173,6 +218,19 @@ impl NativeFrontier {
 struct RefusedFrontier {
     epoch: u64,
     refusal: RestartReason,
+    #[serde(default, skip_serializing_if = "is_false")]
+    activated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivatedFrontier {
+    epoch: u64,
+    activated: bool,
 }
 
 impl serde::Serialize for NativeFrontier {
@@ -182,6 +240,12 @@ impl serde::Serialize for NativeFrontier {
             Some(refusal) => RefusedFrontier {
                 epoch: saved.epoch,
                 refusal,
+                activated: saved.activated,
+            }
+            .serialize(serializer),
+            None if saved.activated => ActivatedFrontier {
+                epoch: saved.epoch,
+                activated: true,
             }
             .serialize(serializer),
             None => serializer.serialize_u64(saved.epoch),
@@ -196,21 +260,43 @@ impl<'de> serde::Deserialize<'de> for NativeFrontier {
         enum Saved {
             Healthy(u64),
             Refused(RefusedFrontier),
+            Activated(ActivatedFrontier),
         }
         let checkpoint = match Saved::deserialize(deserializer)? {
             Saved::Healthy(epoch) => FrontierCheckpoint {
                 epoch,
                 refusal: None,
                 retiring: false,
+                activated: false,
             },
-            Saved::Refused(RefusedFrontier { epoch, refusal }) => FrontierCheckpoint {
+            Saved::Refused(RefusedFrontier {
+                epoch,
+                refusal,
+                activated,
+            }) => FrontierCheckpoint {
                 epoch,
                 refusal: Some(refusal),
                 retiring: false,
+                activated,
             },
+            Saved::Activated(ActivatedFrontier {
+                epoch,
+                activated: true,
+            }) => FrontierCheckpoint {
+                epoch,
+                refusal: None,
+                retiring: false,
+                activated: true,
+            },
+            Saved::Activated(_) => {
+                return Err(serde::de::Error::custom(
+                    "invalid native publication marker",
+                ));
+            }
         };
         Ok(Self(std::sync::Arc::new(FrontierState {
             checkpoint: std::sync::Mutex::new(checkpoint),
+            publication: Default::default(),
         })))
     }
 }
@@ -228,6 +314,8 @@ pub(crate) struct NativeHistory {
     feed_anchor: Option<FeedAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boundary: Option<ReplayBoundary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<crate::provider::NativeHostCompatibility>,
 }
 
 pub(crate) const MAX_NATIVE_PAYLOAD: usize = 4 * 1024 * 1024;
@@ -324,6 +412,7 @@ impl NativeHistory {
             frames,
             feed_anchor: None,
             boundary: None,
+            host: None,
         };
         history.validate()?;
         Ok(history)
@@ -393,6 +482,9 @@ impl NativeHistory {
     }
 
     pub(crate) fn validate(&self) -> Result<(), RestartReason> {
+        if let Some(host) = &self.host {
+            host.validate()?;
+        }
         use rig::completion::AssistantContent;
         if self.version != 1 || self.frames.is_empty() || self.frames.len() > MAX_NATIVE_FRAMES {
             return Err(RestartReason::UnavailableSource);

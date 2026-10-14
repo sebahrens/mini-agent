@@ -868,6 +868,8 @@ fn effort46_shared_binding_and_denial_on_one_mib() {
                     crate::startup::heap_future(native_retired_outcome_controls).await;
                     crate::startup::heap_future(native_interactive_zero_visible_controls).await;
                     crate::startup::heap_future(native_question_retired_outcome_control).await;
+                    crate::startup::heap_future(|| native_refused_checkpoint_controls(true)).await;
+                    crate::startup::heap_future(|| native_refused_checkpoint_controls(false)).await;
                 })
         })
         .unwrap()
@@ -989,6 +991,7 @@ async fn native_bound_interactive_turn() {
         previous_frames: binding.previous_frames,
         recorded_tool_ids: binding.recorded_tool_ids,
         retirement_claimed: std::sync::atomic::AtomicBool::new(false),
+        host: binding.host.clone(),
         history: binding.history.clone(),
         capture: binding.capture.clone(),
     };
@@ -2474,4 +2477,684 @@ async fn effort46_canonical_commit_generic_once_stale_and_captured_prices_withou
         wire.finish().is_empty(),
         "canonical projection attempted HTTP"
     );
+}
+
+#[tokio::test]
+async fn effort46_native_refused_checkpoint_preserves_observed_canonical_usage() {
+    native_refused_checkpoint_controls(false).await;
+}
+
+#[tokio::test]
+async fn effort46_native_refused_checkpoint_preserves_observed_interactive_usage() {
+    native_refused_checkpoint_controls(true).await;
+}
+
+async fn native_refused_checkpoint_controls(interactive: bool) {
+    use crate::session::native_replay::{ReplayBoundary, RestartReason};
+    let roots = crate::tests::OwnedTestDirectory::new("native-refused-checkpoint");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+    let wire = Wire::new(vec![(
+        true,
+        start()
+            + &thinking(0, "", "accepted refused-checkpoint signature")
+            + &text(1, "observed completed answer")
+            + &finish(),
+    )]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model_with_cache_ttl(
+        "claude-opus-5-5",
+        crate::config::PromptCacheTtl::default(),
+    ) else {
+        unreachable!()
+    };
+    let mut session = crate::session::Session::new("native-test", "claude-opus-5-5", 32_000, "");
+    let _release = Release(session.id.to_string());
+    session.add_message(crate::session::MessageRole::User, "prior user bytes");
+    session.set_input_output_prices(Some((2.0, 4.0)));
+    let cfg = crate::config::Config::default();
+    session.initialize_spend_account(None).unwrap();
+    let prices = crate::print::HeadlessPricing::from_session(&session, &cfg);
+    let io_scope = crate::agent::runner::AgentWorkScope::new();
+    let mut ticket = crate::session::native_publication::begin_owned(&mut session, &io_scope)
+        .await
+        .unwrap();
+    let (agent, binding) = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("Exact accepted-refusal publication")
+            .max_tokens(1000)
+            .default_max_turns(1)
+            .build(),
+    ))
+    .bind_native_turn(
+        &session,
+        vec![Message::user("prior user bytes")].into(),
+        ReplayBoundary::CompletedTurn,
+        if interactive {
+            crate::provider::RecordedToolIds::Lifecycle
+        } else {
+            crate::provider::RecordedToolIds::Canonical
+        },
+    )
+    .unwrap();
+    binding.pair_publication(&session, &mut ticket).unwrap();
+    assert!(binding.pair_publication(&session, &mut ticket).is_err());
+    let agent = agent.with_spend_for_session(&mut session, &cfg, crate::spend::RequestKind::Turn);
+    if interactive {
+        use crate::event::AgentEvent;
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        session.add_message(crate::session::MessageRole::User, "literal accepted work");
+        let paused = crate::startup::heap_future(|| {
+            agent.spawn_runner_paused_in_scope(
+                "literal accepted work".into(),
+                binding.history(),
+                RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+                #[cfg(feature = "hooks")]
+                None,
+                scope.clone(),
+            )
+        })
+        .await;
+        let mut runner = paused.start_interactive();
+        let mut done = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = runner.event_rx.recv().await {
+                match event {
+                    AgentEvent::UsageDelta {
+                        usage,
+                        awaits_compaction_decision,
+                        ..
+                    } => {
+                        session.charge_usage_delta(usage, true);
+                        if awaits_compaction_decision {
+                            runner
+                                .compaction_decision_tx
+                                .as_ref()
+                                .unwrap()
+                                .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    AgentEvent::Done { .. } => done = true,
+                    AgentEvent::Error { message, .. } => {
+                        panic!("paired native actor failed: {message}")
+                    }
+                    _ => {}
+                }
+            }
+            scope.wait_idle().await;
+        })
+        .await
+        .expect("paired native actor retirement");
+        assert!(done && runner.abort_handle.is_finished());
+        assert_eq!(scope.active_children(), 0);
+        assert!(binding.accepted_progress());
+        session.messages[0].content = "edited prior bytes, same row count".into();
+        assert_eq!(
+            binding.settle_into_with_outcome(
+                &mut session,
+                crate::session::native_replay::RetiredNativeOutcome::Completed
+            ),
+            Err(RestartReason::ChangedPrefix)
+        );
+    } else {
+        let turn = agent
+            .run_print_with_output(
+                "literal accepted work",
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                &RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+                binding.history(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await;
+        assert!(turn.failure.is_none());
+        assert!(binding.accepted_progress());
+        let usage: crate::event::UsageDelta = turn.usage.into();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 2));
+        session.messages[0].content = "edited prior bytes, same row count".into();
+        assert_eq!(
+            binding.commit_canonical_into(
+                &mut session,
+                "literal accepted work",
+                &turn.response,
+                &turn.interactions,
+                usage,
+                prices
+            ),
+            Err(RestartReason::ChangedPrefix)
+        );
+    }
+    assert_eq!(
+        session.native_frontier.refusal(),
+        Some(RestartReason::ChangedPrefix)
+    );
+    assert_eq!(
+        (session.total_input_tokens, session.total_output_tokens),
+        (10, 2)
+    );
+    assert!((session.total_cost - 0.000028).abs() < 1e-12);
+    // Actual accepted binding advanced its own cutoff. Its current mutable
+    // publisher must still persist canonical observation data as REFUSED.
+    binding
+        .publish_refused_owned(&mut session, ticket, &io_scope)
+        .await
+        .expect("accepted binding refusal must preserve its canonical checkpoint");
+    io_scope.wait_idle().await;
+    let mut loaded = crate::session::storage::load_session_exact(&session.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.native_frontier.refusal(),
+        Some(RestartReason::ChangedPrefix)
+    );
+    assert_eq!(
+        (loaded.total_input_tokens, loaded.total_output_tokens),
+        (10, 2)
+    );
+    assert!((loaded.total_cost - 0.000028).abs() < 1e-12);
+    assert!(loaded.native_history_snapshot().is_none());
+    loaded.initialize_spend_account(Some(1.0)).unwrap();
+    loaded.initialize_spend_account(Some(1.0)).unwrap();
+    assert!(loaded.spend_account.snapshot().tracking_error);
+    assert!((loaded.recorded_total_cost() - 0.000028).abs() < 1e-12);
+    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+    let summary = ledger.summary_for_session(&loaded.id).unwrap();
+    assert_eq!(summary.session.records, 1);
+    assert!((summary.session.known_cost - 0.000028).abs() < 1e-12);
+    assert_eq!(wire.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn effort46_restored_inflight_after_opened_unobserved_http_keeps_account_incomplete() {
+    use crate::session::native_replay::{ReplayBoundary, RestartReason};
+    let roots = crate::tests::OwnedTestDirectory::new("native-restored-http-uncertainty");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+    let wire = Wire::new(vec![(
+        true,
+        start() + "event: content_block_delta\ndata: {invalid incomplete native response}\n\n",
+    )]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model_with_cache_ttl(
+        "claude-opus-5-5",
+        crate::config::PromptCacheTtl::default(),
+    ) else {
+        unreachable!()
+    };
+    let mut session = crate::session::Session::new("native-test", "claude-opus-5-5", 32_000, "");
+    let _release = Release(session.id.to_string());
+    session.set_input_output_prices(Some((2.0, 4.0)));
+    let cfg = crate::config::Config {
+        max_budget_usd: Some(1.0),
+        retry: RetryConfig {
+            max_attempts: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    session
+        .initialize_spend_account(cfg.max_budget_usd)
+        .unwrap();
+    let io = crate::agent::runner::AgentWorkScope::new();
+    let mut ticket = crate::session::native_publication::begin_owned(&mut session, &io)
+        .await
+        .unwrap();
+    let (agent, binding) = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .max_tokens(1000)
+            .default_max_turns(1)
+            .build(),
+    ))
+    .bind_native_turn(
+        &session,
+        Vec::<Message>::new().into(),
+        ReplayBoundary::CompletedTurn,
+        crate::provider::RecordedToolIds::Canonical,
+    )
+    .unwrap();
+    binding.pair_publication(&session, &mut ticket).unwrap();
+    let turn = agent
+        .with_spend_for_session(&mut session, &cfg, crate::spend::RequestKind::Turn)
+        .run_print_with_output(
+            "actual unknown paid observation",
+            crate::print::HeadlessOutputPolicy::legacy(false, false),
+            &cfg.retry,
+            binding.history(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    assert!(turn.failure.is_some());
+    assert!(!binding.accepted_progress());
+    assert!(
+        session.spend_account.snapshot().tracking_error,
+        "actual opened200 without accepted usage is incomplete live"
+    );
+    drop(ticket);
+    crate::session::lock::release_session(&session.id);
+    let mut restored = crate::session::storage::load_session_exact(&session.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored.native_frontier.refusal(),
+        Some(RestartReason::InFlight)
+    );
+    assert!(
+        !restored.spend_account.snapshot().tracking_error,
+        "old durable preflight predates HTTP retirement"
+    );
+    restored
+        .initialize_spend_account(cfg.max_budget_usd)
+        .unwrap();
+    assert!(restored.spend_account.snapshot().tracking_error);
+    let run =
+        crate::spend::run::Run::for_session(&mut restored, &cfg, crate::spend::RequestKind::Turn);
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(io.clone());
+    assert!(io.run(run.prepare()).await.is_err());
+    cleanup.settle().await;
+    assert_eq!(restored.recorded_total_cost(), 0.0);
+    assert_eq!(
+        (restored.total_input_tokens, restored.total_output_tokens),
+        (0, 0)
+    );
+    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+    assert_eq!(
+        ledger
+            .summary_for_session(&restored.id)
+            .unwrap()
+            .session
+            .records,
+        0
+    );
+    assert_eq!(
+        wire.finish().len(),
+        1,
+        "no capped retry or invented receipt"
+    );
+}
+
+#[tokio::test]
+async fn effort46_actual_headless_frontend_publishes_and_reloads_native_context() {
+    native_headless_frontend_control(false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn effort46_actual_headless_frontend_changed_host_refuses_before_http() {
+    native_headless_frontend_control(true, false, false, false).await;
+}
+
+#[tokio::test]
+async fn effort46_actual_headless_frontend_failed_final_save_keeps_disk_inflight() {
+    native_headless_frontend_control(false, true, false, false).await;
+}
+
+#[tokio::test]
+async fn effort46_actual_headless_frontend_unadopted_resume_refuses_before_effects() {
+    native_headless_frontend_control(false, false, true, false).await;
+}
+
+async fn native_headless_frontend_control(
+    changed_host: bool,
+    fail_final_save: bool,
+    unadopted_resume: bool,
+    held_end_hook: bool,
+) {
+    let roots = crate::tests::OwnedTestDirectory::new("native-headless-frontend");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    struct Release(Option<String>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(id) = &self.0 {
+                crate::session::lock::release_session(id);
+            }
+        }
+    }
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    let _hook_gate = if held_end_hook {
+        let release = roots.path().join("end.release");
+        let gate = crate::tests::process_gate::ProcessGate::new(&release).unwrap();
+        crate::fs::private_atomic_write_sync(&roots.path().join("config/settings.json"),
+            serde_json::to_vec(&json!({"hooks":{"SessionEnd":[{"hooks":[
+                {"type":"command","command":"/bin/sh","args":["-c", r#"printf '%s\n' "$$" > "$1"; IFS= read -r release < "$2""#, "held-end", roots.path().join("end.pid"), release], "trust":"trusted","async":true,"timeout":60},
+                {"type":"command","command":"/bin/sh","args":["-c", r#"while [ ! -f "$1" ]; do sleep 0.01; done"#, "end-observer", roots.path().join("end.observed")], "trust":"trusted","timeout":15}
+            ]}]}})).unwrap().as_slice()).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(roots.path().join("config/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let config =
+            crate::extras::hooks::settings::parse_hooks_config(&settings["hooks"]).unwrap();
+        crate::extras::hooks::init_dispatcher(
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&config).unwrap(),
+        );
+        crate::extras::hooks::set_active_workspace(roots.path());
+        Some(gate)
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "hooks", any(target_os = "macos", target_os = "linux"))))]
+    assert!(!held_end_hook);
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    struct ResetHook;
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            crate::extras::hooks::reset_dispatcher();
+        }
+    }
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    let _hook_reset = if held_end_hook { Some(ResetHook) } else { None };
+    let mut release = Release(None);
+    let mut replies = vec![
+        (
+            true,
+            start()
+                + &thinking(0, "", "frontend preserved signature")
+                + &text(1, "first completed answer")
+                + &finish(),
+        ),
+        (
+            true,
+            start()
+                + &thinking(0, "", "second frontend signature")
+                + &text(1, "second completed answer")
+                + &finish(),
+        ),
+    ];
+    if held_end_hook {
+        replies.truncate(1);
+    }
+    let wire = Wire::new(replies);
+    let cfg: crate::config::Config = serde_json::from_value(json!({
+        "session_title_model":"off",
+        "custom_providers":{"effort-probe":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"native-test":{"provider":"effort-probe","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    let paths = crate::paths::process_paths().unwrap();
+    let mut id = None;
+    for (round, prompt) in ["first literal user input", "second literal user input"]
+        .into_iter()
+        .enumerate()
+    {
+        let cli = crate::cli::Cli {
+            api_key: Some("unused-native-key".into()),
+            quick_model: Some("native-test".into()),
+            session: id.clone(),
+            print: !(unadopted_resume && round == 1),
+            quiet: true,
+            message: vec![prompt.into()],
+            name: Some("native frontend owned test".into()),
+            no_context_files: !(changed_host && round == 1),
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let startup = crate::startup::heap_future(|| async {
+            let startup = crate::startup::Startup::init(
+                cli,
+                cfg.clone(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(Box::new(startup))
+        })
+        .await;
+        if unadopted_resume && round == 1 {
+            let error = startup
+                .err()
+                .expect("unadopted native resume must stop during init");
+            assert!(error.to_string().contains("headless print frontend"));
+            let saved = crate::session::storage::load_session_exact(id.as_ref().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.native_frontier.refusal(), None);
+            assert_eq!(
+                (saved.total_input_tokens, saved.total_output_tokens),
+                (10, 2)
+            );
+            assert_eq!(wire.finish().len(), 1);
+            return;
+        }
+        let mut startup = startup.unwrap();
+        assert_eq!(
+            (
+                startup.session.input_token_cost,
+                startup.session.output_token_cost
+            ),
+            (2.0, 4.0)
+        );
+        let sid = startup.session.id.to_string();
+        release.0 = Some(sid.clone());
+        startup.init_features().await.unwrap();
+        startup.resolve_prompts().await.unwrap();
+        if fail_final_save {
+            startup.fail_native_final_before_replace();
+        }
+        let dispatch = crate::startup::heap_future(|| startup.dispatch());
+        #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+        let result = if held_end_hook {
+            use crate::tests::process_state::{ProcessIdentity, ProcessState};
+            let observer = async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(roots.path().join("end.pid"))
+                        && text.ends_with('\n')
+                        && let Ok(pid) = text.trim().parse::<u32>()
+                    {
+                        let identity = ProcessIdentity::capture(pid).unwrap();
+                        assert!(matches!(
+                            identity.state().unwrap(),
+                            ProcessState::Live { .. }
+                        ));
+                        let saved = crate::session::storage::load_session_exact(&sid)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            saved.native_frontier.refusal(),
+                            Some(crate::session::native_replay::RestartReason::InFlight)
+                        );
+                        // The sole model request is complete; stop the shared
+                        // fixture's accept owner before the intentional red hang.
+                        wire.stop.store(true, std::sync::atomic::Ordering::Release);
+                        std::fs::write(
+                            roots.path().join("end.observed"),
+                            b"observed exact live handler",
+                        )
+                        .unwrap();
+                        return identity;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let (result, identity) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(5), dispatch),
+                tokio::time::timeout(Duration::from_secs(5), observer),
+            );
+            let identity = identity.expect("actual async SessionEnd did not start");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(
+                    identity.state().unwrap(),
+                    ProcessState::Gone | ProcessState::Replaced
+                ) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("exact SessionEnd handler survived cleanup");
+            assert_eq!(
+                identity.state().unwrap(),
+                ProcessState::Gone,
+                "hook must be reaped before healthy publication"
+            );
+            result.expect("async SessionEnd kept the actual native frontend pending")
+        } else {
+            dispatch.await
+        };
+        #[cfg(not(all(feature = "hooks", any(target_os = "macos", target_os = "linux"))))]
+        let result = dispatch.await;
+        if fail_final_save || (changed_host && round == 1) {
+            assert!(
+                result.is_err(),
+                "unfinished or incompatible context must refuse"
+            );
+            let saved = crate::session::storage::load_session_exact(&sid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved.native_frontier.refusal(),
+                Some(crate::session::native_replay::RestartReason::InFlight)
+            );
+            assert_eq!(
+                (saved.total_input_tokens, saved.total_output_tokens),
+                (10, 2)
+            );
+            let summary = crate::spend::Ledger::new(&paths.state_dir)
+                .summary_for_session(&sid)
+                .unwrap();
+            assert_eq!(summary.session.records, 1);
+            assert!((summary.session.known_cost - 0.000028).abs() < 1e-12);
+            assert!(saved.native_publication.is_none());
+            assert_eq!(wire.finish().len(), 1);
+            return;
+        }
+        result.unwrap();
+        // This reload precedes another request, quit, or incidental save.
+        let saved = crate::session::storage::load_session_exact(&sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.native_frontier.refusal(), None);
+        let history = saved
+            .native_history_snapshot()
+            .expect("retired native context must be durable immediately");
+        assert!(
+            history.host.is_some(),
+            "actual built-agent host compatibility must be retained"
+        );
+        assert_eq!(saved.total_input_tokens, (round as u64 + 1) * 10);
+        assert_eq!(saved.total_output_tokens, (round as u64 + 1) * 2);
+        assert!((saved.total_cost - (round as f64 + 1.0) * 0.000028).abs() < 1e-12);
+        assert!(!saved.spend_account.snapshot().tracking_error);
+        let summary = crate::spend::Ledger::new(&paths.state_dir)
+            .summary_for_session(&sid)
+            .unwrap();
+        assert_eq!(summary.session.records, round + 1);
+        assert!((summary.session.known_cost - saved.total_cost).abs() < 1e-12);
+        if held_end_hook {
+            assert_eq!(wire.finish().len(), 1);
+            return;
+        }
+        crate::session::lock::release_session(&sid);
+        id = Some(sid);
+    }
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), 2);
+    let first_opaque = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["signature"] == "frontend preserved signature")
+        .count();
+    assert_eq!(
+        first_opaque, 1,
+        "saved native opaque block must be replayed exactly once"
+    );
+    assert_eq!(bodies[0]["system"], bodies[1]["system"]);
+    assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+}
+
+#[test]
+fn effort46_actual_headless_frontend_on_one_mib() {
+    std::thread::Builder::new()
+        .name("native-headless-frontend-one-mib".into())
+        .stack_size(1_048_576)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::startup::heap_future(|| {
+                    native_headless_frontend_control(false, false, false, false)
+                }))
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+#[tokio::test]
+async fn effort46_actual_headless_frontend_reaps_held_async_session_end_before_publication() {
+    native_headless_frontend_control(false, false, false, true).await;
 }

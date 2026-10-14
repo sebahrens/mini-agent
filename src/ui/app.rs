@@ -195,6 +195,8 @@ mod dot_command_tests {
         let original = context.active_selection();
         let mut session = Session::new("anthropic", "test-model", 128_000, "");
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -311,6 +313,8 @@ mod btw_pricing_tests {
         session
             .set_input_output_prices(cfg.quick_models.as_ref().unwrap()["paid"].resolved_prices());
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -368,6 +372,8 @@ mod btw_pricing_tests {
         session.input_token_cost = 10.0;
         session.output_token_cost = 50.0;
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -1623,9 +1629,15 @@ impl<'a> App<'a> {
         if auto_trigger_msg.is_some()
             && let Some(task) = session_start_task.take()
         {
-            let _ = task.await;
+            let joined = task.await;
+            if let Some(owner) = &ui.native_startup {
+                owner.hook_retired(joined)?;
+            }
         }
 
+        if auto_trigger_msg.is_some() {
+            ui.join_native_startup().await?;
+        }
         if let Some(ref trigger_msg) = auto_trigger_msg {
             for line in trigger_msg.lines() {
                 let safe_line = sanitize_output(line);
@@ -1773,8 +1785,13 @@ impl<'a> App<'a> {
 
         #[cfg(feature = "hooks")]
         if let Some(task) = session_start_task.take() {
-            let _ = task.await;
+            let joined = task.await;
+            if let Some(owner) = &ui.native_startup {
+                owner.hook_retired(joined)?;
+            }
         }
+
+        ui.join_native_startup().await?;
 
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
         let (title_tx, title_rx) = mpsc::channel::<SessionTitleResult>(4);
@@ -6936,6 +6953,8 @@ mod interrupt_rewind_tests {
         session.add_message(MessageRole::User, "later prompt");
         let before = serde_json::to_value(&session.messages).unwrap();
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -7012,6 +7031,8 @@ mod interrupt_rewind_tests {
             session.add_message(MessageRole::User, "earlier prompt");
             session.add_message(MessageRole::Assistant, "earlier answer");
             let ui = UiContext {
+                native_startup: None,
+                native_ticket: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -7155,6 +7176,8 @@ mod interrupt_rewind_tests {
             session.total_cost = 0.5;
             let before = session.clone();
             let ui = UiContext {
+                native_startup: None,
+                native_ticket: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -7333,6 +7356,8 @@ mod interrupt_rewind_tests {
                 session.add_message(MessageRole::User, "earlier prompt");
                 session.add_message(MessageRole::Assistant, "earlier answer");
                 let ui = UiContext {
+                    native_startup: None,
+                    native_ticket: None,
                     cli: &cli,
                     cfg: &cfg,
                     session: &mut session,
@@ -7437,6 +7462,8 @@ mod explicit_shell_persistence_tests {
             .with_workspace_binding(workspace.clone())
             .with_resolved_shell(Some(shell));
         UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli,
             cfg,
             session,
@@ -7693,6 +7720,8 @@ mod permission_loop_tests {
         workspace: Arc<crate::paths::WorkspaceBinding>,
     ) -> UiContext<'a> {
         UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli,
             cfg,
             session,
@@ -9219,6 +9248,8 @@ mod mutation_consumer_tests {
         let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
         let mut session = Session::new("openrouter", "test-model", 128000, "");
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -9382,6 +9413,8 @@ mod compaction_visibility_tests {
         );
         let before = serde_json::to_vec(&session).unwrap();
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -9513,6 +9546,8 @@ mod custom_command_tests {
             root.path().to_str().unwrap(),
         );
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -10286,6 +10321,8 @@ mod usd_budget_app_tests {
             assert_eq!(session.spend_account.snapshot().recorded_spend(), 0.0);
 
             let ui = UiContext {
+                native_startup: None,
+                native_ticket: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -10387,6 +10424,8 @@ mod usd_budget_app_tests {
         let ledger_before = std::fs::read(paths.state_dir.join("usage.jsonl")).unwrap();
         let before = serde_json::to_vec(&session).unwrap();
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -11282,6 +11321,8 @@ mod context_diagnostic_tests {
         }
 
         let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -14635,7 +14676,7 @@ mod config_editor68_tests {
                 let mut context=crate::context::load(true).for_workspace_binding(true,&workspace);
                 let mut session=Session::new("editor68","test-model",128_000,root.path().to_str().unwrap());
                 let before=serde_json::to_vec(&session).unwrap();
-                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
+                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,native_startup:None,native_ticket:None,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
                     #[cfg(feature="skills")] skill_services:Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
                     #[cfg(feature="mcp")] mcp_manager:None,
                 };

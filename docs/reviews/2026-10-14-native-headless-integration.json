@@ -1,0 +1,112 @@
+{
+  "scope": "Actual plain headless native dispatch/canonical settlement/private immediate reload/final publication; full46/53/71 and TUI/loop/schema/recovery remain open",
+  "patch_sha256": "eb727e8ac9252f2da58ca5640287e55aacd249d37bab87f4928a202713aee962",
+  "base": "1ffd84c9d387bdc0616cbcf70c2fd040ae3bcfd0",
+  "main_base": "55632dfd2bcaf73dbe5be5db462ba282575dd0a4",
+  "reviewer": "root",
+  "review": "Full actual-base owned patch reviewed across all 22 files; prior approved rooted publication primitives and exact permission/state getter sources reused by manifest comparison. New host binding, startup handoff, actual producer, canonical accounting, final publication, filesystem lock and frontend tests inspected.",
+  "new_delta_reviewed": [
+    "host runtime/saved compatibility capture and Prepared/tool/publication checks",
+    "NativeActorPair::claim_retired exact one-shot completion proof",
+    "actual Startup/plain-print transfer, canonical commit and SessionEnd/final publication",
+    "small synchronous hook construction and inactive-goal/schema phase separation",
+    "four additional refusal/held producer negatives plus actual5frontend controls"
+  ],
+  "files_reviewed": [
+    "docs/agent/native-publication.md",
+    "docs/specs/subprocess-trust.md",
+    "src/agent/native_capture.rs",
+    "src/agent/runner.rs",
+    "src/context/instructions.rs",
+    "src/extras/skills/session.rs",
+    "src/fs.rs",
+    "src/permission/checker.rs",
+    "src/permission/pattern.rs",
+    "src/permission/shell_prefix.rs",
+    "src/print.rs",
+    "src/provider.rs",
+    "src/provider_effort_replay_probe.rs",
+    "src/session/lock.rs",
+    "src/session/mod.rs",
+    "src/session/native_publication.rs",
+    "src/session/native_replay.rs",
+    "src/session/storage.rs",
+    "src/startup.rs",
+    "src/tests/subprocess_inventory_tests.rs",
+    "src/ui/app.rs",
+    "src/ui/state.rs"
+  ],
+  "prior_reviews_reused": [
+    "/private/tmp/mini-agent-native46-rooted-progress-root-review.json",
+    "/private/tmp/mini-agent-native46-rooted-publication-peer-review.json",
+    "/private/tmp/mini-agent-native46-progress-sealing-peer-review.json"
+  ],
+  "integration": "Applied frozen source plus reviewed incremental SessionEnd fix and root legacy compatibility amendment; current clipboard, worktree, LSP and source-policy changes preserved.",
+  "validation_plan": [
+    "Actual native frontend five controls and async SessionEnd control",
+    "Actual one-MiB fork/config constructors affected by UiContext fields",
+    "Original generic schema four-case integration control",
+    "All three subprocess inventory readers",
+    "One current combined strict default row and required debug install; reuse unchanged minimal and primitive passes"
+  ],
+  "limits": [
+    "TUI and ACP actual controller adoption",
+    "automatic native goal/loop and schema auxiliary ownership",
+    "visible fresh-context recovery/archive/rewind/compaction and live-effort matrices",
+    "71 mutable memory/cache-prefix placement",
+    "Windows actual native publication proof"
+  ],
+  "findings_resolved": [
+    {
+      "finding": "Async SessionEnd could keep finish waiting on an admitted asynchronous hook until its full timeout.",
+      "fix": "Existing cleanup cancels and joins exact hook/progress scope while retaining the unique writer ticket; a fresh owned IO scope performs final publication only with the actual independent paired model-retirement proof.",
+      "incremental_patch_sha256": "78b702b6c26c9bf886839903175095bab3890bedab67d02962adbf963d9c06a3",
+      "control": "Actual live held async hook observed while disk is InFlight, then exact PID reaped before healthy reload."
+    },
+    {
+      "finding": "Two existing legacy session permission tests failed after strict native target classification was routed through legacy saves.",
+      "fix": "Retained locked bounded read-only classification precedes any repair. Native-marked or malformed target is refused. Only classified legacy bytes are rechecked for identity/content and Unix permissions repaired on that exact owned singly linked descriptor. Native strict import/publication unchanged.",
+      "red": "/private/tmp/mini-agent-wave48-session-storage.log: 43 pass, 2 failures",
+      "green": "/private/tmp/mini-agent-wave48-session-storage-final.log: 46 pass, including unchanged 45 existing storage controls and extended native marker no-repair negative"
+    }
+  ],
+  "results": {
+    "combined_native_startup_fork_config_inventory": "13 PASS, 17.12 seconds after compilation; all three independent inventory readers",
+    "final_native_frontend_with_async_end": "6 PASS, 1.63 seconds",
+    "legacy_storage_and_native_no_repair": "46 PASS, 1.01 seconds",
+    "generic_schema": "PASS, original four cases including physical 1 MiB effect/repair; 3.89 seconds",
+    "strict": "PASS cargo clippy --locked --all-targets --features advisor -- -D warnings, 38.30 seconds",
+    "strict_test_lints": "Corrected literal bool assertion and expressed intentional unjoined scoped child as a returned tuple; later model-drop and exact child join assertions unchanged.",
+    "debug_install": "PASS cargo install --path . --debug --locked --offline --features advisor --root /private/tmp/mini-agent-wave48-install; 27.85 seconds"
+  },
+  "source_sha256": {
+    "docs/agent/native-publication.md": "02f06b31b94676cba48d2fa2ad46ed4981a51817d7947ef2a6e70f2303adeed6",
+    "docs/specs/subprocess-trust.md": "c6d20b8cf18dbf62a1658bf3b2cf75458186360f9ae9c115fe2ed4bb3dd348da",
+    "src/agent/native_capture.rs": "88d26e50cf1cfddc1d0b6a531a6efc94d391f6f01937f281e2edb9d20c84fae4",
+    "src/agent/runner.rs": "7e15f678ef72e3cd1daf9d3a6e03108833f7938871021b09e25219c55bfb2321",
+    "src/context/instructions.rs": "fdcbca57114e48ab9074e0b0ae889b16e14b806227db4d6d5b0b3318139a1c35",
+    "src/extras/skills/session.rs": "841244f4da2bc133668c6b17cfc7188eaf3a6d87eb95311adabe5cf3378f18ec",
+    "src/fs.rs": "94e91d53670fa643b9912698ce47d77ff38cc907177845571cd7122911dfa9b9",
+    "src/permission/checker.rs": "773bbaf3b2cc73079fbd1bdf141997ed62e9ee5922c0033e1353f72ddd9909c4",
+    "src/permission/pattern.rs": "9a4b3ab3646e1bdf6e94b6c59f6b29e7162dcb5c5c3108c09f285ca7213f0602",
+    "src/permission/shell_prefix.rs": "d2b0c8ce68ea6832707e1108b062f82eee36f27c767f568359793cff5de583f5",
+    "src/print.rs": "66eb1165b2c22fff6424a7f31b3f855b78ffcffafc972e07463fc89f2869be5c",
+    "src/provider.rs": "029f7874ca6cde6fe53680047ece1fbac2eb071e6e1df0b8967e98689a625598",
+    "src/provider_effort_replay_probe.rs": "f9704dad31cf2f0ef07122c136c349174ec8c5051efe159034a972ea6712a9d2",
+    "src/session/lock.rs": "62ecd1533fdf77a83f949bd123356c920a2bdd2473cf1d96e9f0d10c2119b2dd",
+    "src/session/mod.rs": "43998d602a27a55d70b0988b464b32a963465d36024b61a721b62ddcc09f839c",
+    "src/session/native_publication.rs": "85eb12eb7c9d2a4b6dddfa14896a042f1a07ac453efdce7562dc5cf93fb856ea",
+    "src/session/native_replay.rs": "51a29636ed1c3ac16503a71cd7866b1763f9e4d14ad60b010b43391f6a2a2138",
+    "src/session/storage.rs": "6ee40afdce194fa33d0e4b3ca992ec24e3b54570854d731a8e2fa2367d0c6816",
+    "src/startup.rs": "9a28886aae85eccf5e2aa313f06a0286945bf368180438faeee7265620fc3aca",
+    "src/tests/subprocess_inventory_tests.rs": "6ce7e12bfcdbedf6f085f6545488f7ba8c2b54c7d976f22094fd620befd35cc1",
+    "src/ui/app.rs": "dae3bbc9523b03d40f6d0f40f3a091ddd3de9c5474d0994f9b16ea6850751281",
+    "src/ui/state.rs": "21a0310b13e7466eb93b5c4fed637a94338cd7f92e671c6912bd16ee23b67243"
+  },
+  "formatter_only": {
+    "path": "patched-deps/rig-core/src/agent/completion.rs",
+    "reason": "Required cargo fmt expands an existing struct literal; no behavior change or separate tests required."
+  },
+  "binary": "/private/tmp/mini-agent-wave48-install/bin/mini-agent",
+  "binary_sha256": "4fb36a058ad2bd1e7707c2dc06ad96052c98f349e6703a32fb380c1822f69bbc"
+}

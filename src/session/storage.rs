@@ -200,6 +200,9 @@ pub(crate) fn atomic_write_with_failure(
 }
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
+    if super::native_publication::is_native_bearing(session) {
+        return super::native_publication::save_snapshot(session);
+    }
     if disabled("sessions") {
         return Ok(());
     }
@@ -212,26 +215,31 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     let path = session_path(&session.id)?;
     // The snapshot replaces the whole file, so only the process that owns the
     // session may write it; another owner's turns would otherwise be lost
-    // (mini-agent-e42za). A lock that cannot be established at all does not
-    // block the save: losing this process's own turns would be worse.
+    // (mini-agent-e42za). Without an established lock, only an atomic
+    // create-only publication of a missing target is eligible.
     match crate::session::lock::claim_session(&session.id) {
-        Ok(crate::session::lock::SessionClaim::Owned) => {}
+        Ok(crate::session::lock::SessionClaim::Owned) => {
+            super::lock::publish_legacy_owned(session, json.as_bytes())
+        }
         Ok(crate::session::lock::SessionClaim::HeldElsewhere) => {
-            return Err(crate::session::lock::held_elsewhere_error(&session.id));
+            Err(crate::session::lock::held_elsewhere_error(&session.id))
         }
         Err(error) => {
-            tracing::warn!("session lock for {} unavailable: {}", session.id, error);
+            // Without exact ownership, classification cannot exclude an
+            // existing or concurrently activated native checkpoint. Preserve
+            // only the legacy new-target fallback through create-only CAS.
+            tracing::warn!(
+                "session lock unavailable; refusing replacement and trying create-only persistence: {}",
+                error
+            );
+            let root = crate::paths::WorkspaceBinding::capture(&dir)?;
+            root.validate_private_root()?;
+            let parent = crate::fs::checked_file_metadata(&root.try_clone_directory_file()?)?;
+            crate::fs::private_atomic_create_checked_sync(&path, json.as_bytes(), &parent)?;
+            root.validate_private_root()?;
+            Ok(())
         }
     }
-    let json_len = json.len();
-    atomic_write(&path, &json)?;
-    tracing::debug!(
-        "session saved: id={}, msgs={}, size={}",
-        session.id,
-        session.messages.len(),
-        json_len,
-    );
-    Ok(())
 }
 
 pub fn save_tool_output(
@@ -415,6 +423,9 @@ pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
             let json = read_private_string(&path)?;
             let session = decode_session_json(&json)
                 .map_err(|error| anyhow::anyhow!("invalid persisted session {id}: {error}"))?;
+            session
+                .validate_native_persistence()
+                .map_err(|reason| anyhow::anyhow!(reason))?;
             anyhow::ensure!(
                 session.id == id,
                 "persisted session ID mismatch: requested {id}, found {}",

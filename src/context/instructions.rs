@@ -217,6 +217,85 @@ impl std::fmt::Debug for WorkspaceInstructions {
     }
 }
 impl WorkspaceInstructions {
+    pub(crate) fn native_policy(
+        &self,
+        workspace: &Arc<WorkspaceBinding>,
+        permission: &Option<PermCheck>,
+    ) -> Result<[u8; 32], crate::session::native_replay::RestartReason> {
+        use crate::session::native_replay::RestartReason;
+        let same_permission = match (&self.permission, permission) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if !Arc::ptr_eq(&self.workspace, workspace) || !same_permission {
+            return Err(RestartReason::ChangedPrefix);
+        }
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| RestartReason::UnavailableSource)?;
+        if state.initial.error.is_some()
+            || state.initial.sources.len() > MAX_SOURCES
+            || state.initial.roots.len() > MAX_SOURCES
+        {
+            return Err(RestartReason::UnavailableSource);
+        }
+        let mut hash =
+            crate::provider::NativePolicyHasher::new(b"native-workspace-source-policy-v1\0");
+        hash.bytes(&[match self.protocol {
+            InstructionProtocol::Anthropic => 1,
+            InstructionProtocol::Chat => 2,
+            InstructionProtocol::Responses => 3,
+            InstructionProtocol::Gemini => 4,
+            InstructionProtocol::Ollama => 5,
+            #[cfg(test)]
+            InstructionProtocol::Unverified => 6,
+        }])?;
+        hash.bytes(&[self.paths.is_some() as u8])?;
+        if let Some(paths) = &self.paths {
+            hash.path(&paths.config_dir)?;
+            hash.path(&paths.data_dir)?;
+            hash.bytes(&[paths.project_dir.is_some() as u8])?;
+            if let Some(project) = &paths.project_dir {
+                hash.path(project)?;
+            }
+        }
+        for root in &state.initial.roots {
+            hash.path(&root.root)?;
+            hash.path(&root.path)?;
+            hash.path(&root.scope)?;
+            hash.bytes(&[root.project as u8])?;
+        }
+        for source in &state.initial.sources {
+            hash.bytes(source.id.as_bytes())?;
+            hash.path(&source.path)?;
+            hash.path(&source.scope)?;
+            hash.bytes(&[source.project as u8])?;
+            hash.bytes(source.text.as_bytes())?;
+        }
+        // Bounds above precede retained-identity validation or any path work.
+        hash.bytes(
+            &self
+                .workspace
+                .compatibility_fingerprint()
+                .map_err(|_| RestartReason::ChangedPrefix)?,
+        )?;
+        for source in &state.initial.sources {
+            hash.bytes(
+                &source
+                    .binding
+                    .compatibility_fingerprint()
+                    .map_err(|_| RestartReason::ChangedPrefix)?,
+            )?;
+            hash.bytes(&source.identity.identity_fingerprint())?;
+        }
+        for identity in &state.root_identities {
+            hash.bytes(&identity.identity_fingerprint())?;
+        }
+        Ok(hash.finish())
+    }
+
     pub(crate) fn new(
         workspace: Arc<WorkspaceBinding>,
         permission: Option<PermCheck>,

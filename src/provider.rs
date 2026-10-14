@@ -1962,6 +1962,188 @@ pub enum AnyAgentInner {
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
+/// Compatibility data only. Runtime owners and approvals are never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeHostCompatibility {
+    version: u8,
+    workspace: [u8; 32],
+    permission: Option<[u8; 32]>,
+    instruction_policy: [u8; 32],
+}
+impl NativeHostCompatibility {
+    pub(crate) fn validate(&self) -> Result<(), crate::session::native_replay::RestartReason> {
+        if self.version == 1 {
+            Ok(())
+        } else {
+            Err(crate::session::native_replay::RestartReason::UnavailableSource)
+        }
+    }
+}
+
+/// Bounded borrowed encoding. No path/regex/content clone precedes its bound.
+pub(crate) struct NativePolicyHasher {
+    hash: sha2::Sha256,
+    bytes: usize,
+    entries: usize,
+}
+impl NativePolicyHasher {
+    pub(crate) fn new(domain: &'static [u8]) -> Self {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        hash.update(domain);
+        Self {
+            hash,
+            bytes: 0,
+            entries: 0,
+        }
+    }
+    pub(crate) fn bytes(
+        &mut self,
+        value: &[u8],
+    ) -> Result<(), crate::session::native_replay::RestartReason> {
+        use crate::session::native_replay::RestartReason;
+        use sha2::Digest;
+        self.bytes = self
+            .bytes
+            .checked_add(value.len())
+            .filter(|n| *n <= 8 * 1024 * 1024)
+            .ok_or(RestartReason::Limit)?;
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .filter(|n| *n <= 16_384)
+            .ok_or(RestartReason::Limit)?;
+        self.hash.update((value.len() as u64).to_le_bytes());
+        self.hash.update(value);
+        Ok(())
+    }
+    pub(crate) fn path(
+        &mut self,
+        value: &std::path::Path,
+    ) -> Result<(), crate::session::native_replay::RestartReason> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            self.bytes(value.as_os_str().as_bytes())
+        }
+        #[cfg(windows)]
+        {
+            use sha2::Digest;
+            use std::os::windows::ffi::OsStrExt;
+            let units = value.as_os_str().encode_wide().count();
+            let size = units
+                .checked_mul(2)
+                .ok_or(crate::session::native_replay::RestartReason::Limit)?;
+            self.bytes = self
+                .bytes
+                .checked_add(size)
+                .filter(|n| *n <= 8 * 1024 * 1024)
+                .ok_or(crate::session::native_replay::RestartReason::Limit)?;
+            self.entries = self
+                .entries
+                .checked_add(1)
+                .filter(|n| *n <= 16_384)
+                .ok_or(crate::session::native_replay::RestartReason::Limit)?;
+            self.hash.update((size as u64).to_le_bytes());
+            for unit in value.as_os_str().encode_wide() {
+                self.hash.update(unit.to_le_bytes());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = value;
+            Err(crate::session::native_replay::RestartReason::UnavailableSource)
+        }
+    }
+    pub(crate) fn finish(self) -> [u8; 32] {
+        use sha2::Digest;
+        self.hash.finalize().into()
+    }
+}
+
+struct NativeHostOwner {
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    permission: Option<PermCheck>,
+    no_context_files: bool,
+    sources: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
+    #[cfg(feature = "agent-skills")]
+    instructions: Option<std::sync::Arc<crate::extras::skills::session::InstructionServices>>,
+}
+impl NativeHostOwner {
+    fn snapshot(
+        &self,
+    ) -> Result<(NativeHostCompatibility, Option<u64>), crate::session::native_replay::RestartReason>
+    {
+        use crate::session::native_replay::RestartReason;
+        let workspace = self
+            .workspace
+            .compatibility_fingerprint()
+            .map_err(|_| RestartReason::ChangedPrefix)?;
+        let (permission, revision) = match &self.permission {
+            Some(checker) => {
+                let checker = checker
+                    .try_lock()
+                    .map_err(|_| RestartReason::UnavailableSource)?;
+                (
+                    Some(
+                        checker
+                            .compatibility_fingerprint()
+                            .map_err(|_| RestartReason::ChangedPrefix)?,
+                    ),
+                    Some(
+                        checker
+                            .compatibility_revision()
+                            .ok_or(RestartReason::UnavailableSource)?,
+                    ),
+                )
+            }
+            None => (None, None),
+        };
+        let mut policy = NativePolicyHasher::new(b"native-host-source-policy-v1\0");
+        policy.bytes(&[self.no_context_files as u8, self.sources.is_some() as u8])?;
+        if let Some(sources) = &self.sources {
+            policy.bytes(&sources.native_policy(&self.workspace, &self.permission)?)?;
+        }
+        #[cfg(feature = "agent-skills")]
+        {
+            policy.bytes(&[self.instructions.is_some() as u8])?;
+            if let Some(instructions) = &self.instructions {
+                policy.bytes(&instructions.native_policy(&self.workspace, &self.permission)?)?;
+            }
+        }
+        self.workspace
+            .validate()
+            .map_err(|_| RestartReason::ChangedPrefix)?;
+        Ok((
+            NativeHostCompatibility {
+                version: 1,
+                workspace,
+                permission,
+                instruction_policy: policy.finish(),
+            },
+            revision,
+        ))
+    }
+}
+#[derive(Clone)]
+pub(crate) struct NativeHostGuard {
+    owner: std::sync::Arc<NativeHostOwner>,
+    saved: NativeHostCompatibility,
+    permission_revision: Option<u64>,
+}
+impl NativeHostGuard {
+    pub(crate) fn validate(&self) -> Result<(), crate::session::native_replay::RestartReason> {
+        let (current, revision) = self.owner.snapshot()?;
+        if current == self.saved && revision == self.permission_revision {
+            Ok(())
+        } else {
+            Err(crate::session::native_replay::RestartReason::ChangedPrefix)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AnyAgent {
     inner: AnyAgentInner,
@@ -1972,6 +2154,7 @@ pub struct AnyAgent {
     turn_token_budget: Option<u64>,
     spend: Option<crate::spend::run::Run>,
     native_capture: Option<crate::agent::native_capture::NativeCapture>,
+    native_host: Option<std::sync::Arc<NativeHostOwner>>,
     question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
     context_snapshot: Option<builder::PreambleSnapshot>,
@@ -2014,6 +2197,7 @@ pub(crate) struct NativeTurnBinding {
     previous_frames: usize,
     recorded_tool_ids: RecordedToolIds,
     retirement_claimed: std::sync::atomic::AtomicBool,
+    host: Option<NativeHostGuard>,
     history: std::sync::Arc<[rig::completion::Message]>,
     capture: Option<crate::agent::native_capture::NativeCapture>,
 }
@@ -2023,6 +2207,89 @@ pub(crate) struct NativeTurnBinding {
     reason = "shared API is intentionally dormant before its frontend consumer lands"
 )]
 impl NativeTurnBinding {
+    pub(crate) fn pair_publication(
+        &self,
+        session: &crate::session::Session,
+        ticket: &mut crate::session::native_publication::NativePublicationTicket,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session.id == self.session_id
+                && session.native_frontier.current() == self.epoch
+                && session.messages.len() == self.message_start
+                && self.preappend_matches(session)?
+                && self.compactions
+                    == crate::session::native_replay::compaction_digest(&session.compactions)?
+                && !self
+                    .retirement_claimed
+                    .load(std::sync::atomic::Ordering::Acquire),
+            "native publication belongs to another binding"
+        );
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native publication requires its actual adapter"))?;
+        let pair = crate::session::native_publication::NativeActorPair::pair(session, ticket)?;
+        capture.pair_publication(pair)?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish_retired_owned(
+        &self,
+        session: &mut crate::session::Session,
+        ticket: crate::session::native_publication::NativePublicationTicket,
+        outcome: crate::session::native_replay::RetiredNativeOutcome,
+        io_scope: &std::sync::Arc<runner::AgentWorkScope>,
+    ) -> anyhow::Result<()> {
+        if let Some(host) = &self.host {
+            host.validate()?;
+        }
+        if let Some(history) = session.native_history_snapshot() {
+            history.validate_feed(&session.messages, &session.compactions)?;
+        } else if self.accepted_progress() {
+            anyhow::bail!("completed native context has no accepted history");
+        }
+        let pair = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.actor_pair())
+            .ok_or_else(|| anyhow::anyhow!("native completion requires its paired model"))?;
+        pair.claim_retired(session, &ticket)?;
+        crate::session::native_publication::retire_owned(session, ticket, outcome, io_scope).await
+    }
+
+    pub(crate) async fn publish_refused_owned(
+        &self,
+        session: &mut crate::session::Session,
+        ticket: crate::session::native_publication::NativePublicationTicket,
+        io_scope: &std::sync::Arc<runner::AgentWorkScope>,
+    ) -> anyhow::Result<()> {
+        let pair = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.actor_pair())
+            .ok_or_else(|| anyhow::anyhow!("native refusal requires its paired model"))?;
+        crate::session::native_publication::publish_refused_owned(session, ticket, pair, io_scope)
+            .await
+    }
+
+    fn refuse_accepted(
+        &self,
+        session: &crate::session::Session,
+        reason: crate::session::native_replay::RestartReason,
+    ) {
+        if session
+            .native_frontier
+            .refuse_expected(self.epoch, reason)
+            .is_ok()
+            && let Some(pair) = self
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.actor_pair())
+        {
+            let _ = pair.accepted_refusal(session, self.epoch, reason);
+        }
+    }
+
     pub(crate) fn history(&self) -> std::sync::Arc<[rig::completion::Message]> {
         self.history.clone()
     }
@@ -2152,7 +2419,7 @@ impl NativeTurnBinding {
                 && session.native_frontier.current() == self.epoch
                 && self.accepted_progress()
             {
-                let _ = session.native_frontier.refuse_expected(self.epoch, reason);
+                self.refuse_accepted(session, reason);
             }
             return Err(reason);
         }
@@ -2160,9 +2427,7 @@ impl NativeTurnBinding {
             crate::print::persist_headless_turn_input(session, prompt, response, interactions);
         if projected.is_err() {
             if self.accepted_progress() {
-                let _ = session
-                    .native_frontier
-                    .refuse_expected(self.epoch, RestartReason::UnavailableSource);
+                self.refuse_accepted(session, RestartReason::UnavailableSource);
             }
             return Err(RestartReason::UnavailableSource);
         }
@@ -2258,7 +2523,7 @@ impl NativeTurnBinding {
         {
             // Same-cutoff accepted progress cannot silently fall back to an
             // older chain, even if prefix validation failed before attachment.
-            let _ = session.native_frontier.refuse_expected(self.epoch, reason);
+            self.refuse_accepted(session, reason);
         }
         result
     }
@@ -2326,6 +2591,11 @@ impl NativeTurnBinding {
         if seen.len() != exact.len() {
             return Err(RestartReason::UnavailableSource);
         }
+        let mut history = history;
+        if let Some(host) = &self.host {
+            host.validate()?;
+            history.host = Some(host.saved.clone());
+        }
         session.store_native_history(history)?;
         Ok(true)
     }
@@ -2348,6 +2618,33 @@ impl AnyAgent {
         use crate::session::native_replay::{RestartReason, compaction_digest};
         if let Some(reason) = session.native_frontier.refusal() {
             return Err(reason);
+        }
+        let host = if matches!(self.inner, AnyAgentInner::Anthropic(_)) {
+            self.native_host
+                .as_ref()
+                .map(|owner| {
+                    let (saved, permission_revision) = owner.snapshot()?;
+                    if let Some(previous) = session.native_history_snapshot()
+                        && previous.host.as_ref() != Some(&saved)
+                    {
+                        return Err(RestartReason::ChangedPrefix);
+                    }
+                    Ok(NativeHostGuard {
+                        owner: owner.clone(),
+                        saved,
+                        permission_revision,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if host.is_none()
+            && session
+                .native_history_snapshot()
+                .is_some_and(|history| history.host.is_some())
+        {
+            return Err(RestartReason::UnavailableSource);
         }
         let mut previous_frames = 0;
         let (capture, history) = match &self.inner {
@@ -2385,6 +2682,7 @@ impl AnyAgent {
         };
         if let Some(capture) = &capture {
             capture.reserve_retired_history(&session.retired_native_history)?;
+            capture.bind_host(host.clone())?;
         }
         self.native_capture = capture.clone();
         let binding = NativeTurnBinding {
@@ -2399,6 +2697,7 @@ impl AnyAgent {
             previous_frames,
             recorded_tool_ids,
             retirement_claimed: std::sync::atomic::AtomicBool::new(false),
+            host,
             history,
             capture,
         };
@@ -2431,6 +2730,7 @@ impl AnyAgent {
             turn_token_budget: None,
             spend: None,
             native_capture: None,
+            native_host: None,
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
@@ -2458,7 +2758,6 @@ impl AnyAgent {
         self
     }
 
-    #[cfg(any(feature = "acp", feature = "subagents", test))]
     pub(crate) fn with_spend(mut self, spend: Option<crate::spend::run::Run>) -> Self {
         self.spend = spend;
         self
@@ -2792,6 +3091,7 @@ impl AnyAgent {
             turn_token_budget: None,
             spend: None,
             native_capture: None,
+            native_host: None,
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
@@ -2914,162 +3214,169 @@ impl AnyAgent {
         // Construct the aggregate provider future in a short heap_future frame
         // before layering cancellation and task-local scopes around it.
         // Box::pin(async { ... }) still reserves its temporary in this poll.
-        let future = crate::spend::run::scope(
-            self.spend.clone(),
-            crate::print::run_headless_turn(crate::startup::heap_future(|| async {
-                let history = history.into();
-                #[cfg(not(feature = "multimodal"))]
-                if crate::agent::input::history_has_images(&history) {
-                    return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
-                        "this build cannot dispatch stored image content; use a multimodal build"
-                    ));
-                }
-                if let Some(spend) = crate::spend::run::Run::current()
-                    && let Err(error) = spend.prepare().await
-                {
-                    return runner::HeadlessTurn::failed_before_start(error);
-                }
-                #[cfg(feature = "skills")]
-                let _turn_guard = if self.skills.is_some() {
-                    Some(
-                        match runner::await_headless_work(self.turn_gate.lock()).await {
-                            Ok(guard) => guard,
-                            Err(error) => {
-                                return runner::HeadlessTurn::failed_before_start(error);
-                            }
-                        },
-                    )
-                } else {
-                    None
-                };
-                #[cfg(feature = "agent-skills")]
-                let inner = match runner::await_headless_work(crate::startup::heap_future(|| {
-                    self.prepared_instruction_inner(prompt)
-                }))
-                .await
-                {
-                    Ok(Ok(inner)) => inner,
-                    Ok(Err(error)) => {
-                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
-                    }
-                    Err(error) => {
-                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
-                    }
-                };
-                let prompt = prompt.to_string();
-                #[cfg(not(feature = "agent-skills"))]
-                let inner = &self.inner;
-                match &inner {
-                    AnyAgentInner::OpenRouter(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
-                    }
-                    AnyAgentInner::OpenAI(a) => match a {
-                        OpenAiAgent::Responses(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
-                        }
-                        OpenAiAgent::Completions(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
+        let native_pair = self
+            .native_capture
+            .as_ref()
+            .and_then(|capture| capture.actor_pair());
+        let child = crate::startup::heap_future(|| async {
+            let history = history.into();
+            #[cfg(not(feature = "multimodal"))]
+            if crate::agent::input::history_has_images(&history) {
+                return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+                    "this build cannot dispatch stored image content; use a multimodal build"
+                ));
+            }
+            if let Some(spend) = crate::spend::run::Run::current()
+                && let Err(error) = spend.prepare().await
+            {
+                return runner::HeadlessTurn::failed_before_start(error);
+            }
+            #[cfg(feature = "skills")]
+            let _turn_guard = if self.skills.is_some() {
+                Some(
+                    match runner::await_headless_work(self.turn_gate.lock()).await {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            return runner::HeadlessTurn::failed_before_start(error);
                         }
                     },
-                    AnyAgentInner::Anthropic(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::for_native(
-                                    self.native_capture.clone(),
-                                    &a.model.model,
-                                ),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
-                    }
-                    AnyAgentInner::Gemini(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
-                    }
-                    AnyAgentInner::Ollama(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
-                    }
+                )
+            } else {
+                None
+            };
+            #[cfg(feature = "agent-skills")]
+            let inner = match runner::await_headless_work(crate::startup::heap_future(|| {
+                self.prepared_instruction_inner(prompt)
+            }))
+            .await
+            {
+                Ok(Ok(inner)) => inner,
+                Ok(Err(error)) => {
+                    return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                 }
-            })),
-        );
+                Err(error) => {
+                    return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
+                }
+            };
+            let prompt = prompt.to_string();
+            #[cfg(not(feature = "agent-skills"))]
+            let inner = &self.inner;
+            match &inner {
+                AnyAgentInner::OpenRouter(a) => {
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
+                    .await
+                }
+                AnyAgentInner::OpenAI(a) => match a {
+                    OpenAiAgent::Responses(a) => {
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::default(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
+                        .await
+                    }
+                    OpenAiAgent::Completions(a) => {
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                history,
+                                self.completion_verification.clone(),
+                                crate::agent::native_capture::NativeCaptureHook::default(),
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
+                        .await
+                    }
+                },
+                AnyAgentInner::Anthropic(a) => {
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            crate::agent::native_capture::NativeCaptureHook::for_native(
+                                self.native_capture.clone(),
+                                &a.model.model,
+                            ),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
+                    .await
+                }
+                AnyAgentInner::Gemini(a) => {
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
+                    .await
+                }
+                AnyAgentInner::Ollama(a) => {
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
+                    .await
+                }
+            }
+        });
+        let future = crate::spend::run::scope(self.spend.clone(), async {
+            match native_pair {
+                Some(pair) => crate::print::run_native_headless_turn(child, pair).await,
+                None => crate::print::run_headless_turn(child).await,
+            }
+        });
         let mut turn = crate::question::scope(self.question_turn.clone(), future).await;
         // SDK hook errors carry a string. Recover the typed budget outcome
         // only when this exact parent-owned run actually refused admission.
@@ -4055,6 +4362,11 @@ pub async fn build_agent_in_workspace(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
+    let native_host = (
+        workspace.clone(),
+        permission.clone(),
+        cli.resolve_no_context_files(cfg),
+    );
     #[cfg(feature = "agent-skills")]
     let instruction_services = crate::extras::skills::session::InstructionOwner::default().resolve(
         crate::paths::process_paths().expect("startup installed validated application paths"),
@@ -4294,6 +4606,18 @@ pub async fn build_agent_in_workspace(
     let agent = agent.with_lsp_manager(diagnostic_lsp);
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_services(instruction_services);
+    let mut agent = agent;
+    agent.native_host = Some(std::sync::Arc::new(NativeHostOwner {
+        workspace: native_host.0,
+        permission: native_host.1,
+        no_context_files: native_host.2,
+        sources: agent
+            .context_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.instruction_sources.clone()),
+        #[cfg(feature = "agent-skills")]
+        instructions: agent.instructions.clone(),
+    }));
     agent
 }
 

@@ -874,6 +874,8 @@ pub(crate) struct AgentRunCleanupGuard {
     lifecycle_tx: Option<mpsc::Sender<AgentEvent>>,
     runtime: tokio::runtime::Handle,
     armed: bool,
+    /// Runtime-only ownership carried until all registered children retire.
+    retained: Option<Box<dyn Send>>,
 }
 
 impl AgentRunCleanupGuard {
@@ -883,6 +885,7 @@ impl AgentRunCleanupGuard {
             lifecycle_tx: Some(lifecycle_tx),
             runtime: tokio::runtime::Handle::current(),
             armed: true,
+            retained: None,
         }
     }
 
@@ -893,7 +896,15 @@ impl AgentRunCleanupGuard {
             lifecycle_tx: None,
             runtime: tokio::runtime::Handle::current(),
             armed: true,
+            retained: None,
         }
+    }
+
+    /// Keep an existing lease or ticket in this guard's existing settlement
+    /// waiter. This adds no task and cannot detach the retained owner.
+    pub(crate) fn retain_until_settled<T: Send + 'static>(&mut self, value: T) {
+        assert!(self.retained.is_none(), "cleanup owner already retained");
+        self.retained = Some(Box::new(value));
     }
 
     pub(crate) async fn settle(mut self) {
@@ -910,11 +921,13 @@ impl Drop for AgentRunCleanupGuard {
             return;
         }
         let lifecycle_tx = self.lifecycle_tx.take();
+        let retained = self.retained.take();
         self.scope.cancellation_handle().cancel();
         let scope = Arc::clone(&self.scope);
         std::mem::drop(self.runtime.spawn(async move {
             scope.wait_idle().await;
             drop(lifecycle_tx);
+            drop(retained);
         }));
     }
 }
@@ -2883,6 +2896,7 @@ where
     let compaction_enabled = Arc::new(AtomicBool::new(false));
     let runner_compaction_enabled = Arc::clone(&compaction_enabled);
     let runner_lifecycle_tx = event_tx.clone();
+    let native_pair = native_capture.actor_pair();
     let mutation_events = event_tx.clone();
     let (start_tx, start_rx) = if start_paused {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3644,21 +3658,51 @@ where
     let task_scope = Arc::clone(&work_scope);
     // Construct before spawning so abort-before-first-poll still drops the
     // guard and transfers cleanup ownership.
+    let setup_error_tx = runner_lifecycle_tx.clone();
     let cleanup = AgentRunCleanupGuard::new(Arc::clone(&task_scope), runner_lifecycle_tx);
     let agent_future = async move {
-        let cancellation_scope = Arc::clone(&task_scope);
-        task_scope
-            .run(async move {
-                tokio::select! {
-                    biased;
-                    _ = cancellation_scope.cancelled() => {}
-                    _ = agent_future => {}
+        if let Some(pair) = native_pair {
+            let model = crate::startup::heap_future(|| async move {
+                let cancellation_scope = Arc::clone(&task_scope);
+                task_scope
+                    .run(async move {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation_scope.cancelled() => {}
+                            _ = agent_future => {}
+                        }
+                    })
+                    .await;
+            });
+            let mut owner = match crate::session::native_publication::NativeModelOwner::new(
+                model, pair, cleanup,
+            ) {
+                Ok(owner) => owner,
+                Err(_) => {
+                    let _ = setup_error_tx
+                        .send(AgentEvent::error_with(
+                            "Native context invocation already retired.",
+                            Vec::new(),
+                        ))
+                        .await;
+                    return;
                 }
-            })
-            .await;
-        // A successful terminal event is also a settlement boundary. This
-        // stops async:true hooks without waiting for their declared timeout.
-        cleanup.settle().await;
+            };
+            owner.model().await;
+            owner.settle().await;
+        } else {
+            let cancellation_scope = Arc::clone(&task_scope);
+            task_scope
+                .run(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_scope.cancelled() => {}
+                        _ = agent_future => {}
+                    }
+                })
+                .await;
+            cleanup.settle().await;
+        }
     };
 
     #[cfg(feature = "subagents")]

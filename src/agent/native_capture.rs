@@ -68,6 +68,9 @@ struct State {
     empty_native_end_turn: bool,
     unavailable: Option<Unavailable>,
     replay: Option<ReplayState>,
+    actor_pair: Option<crate::session::native_publication::NativeActorPair>,
+    prepared_observed: bool,
+    host: Option<crate::provider::NativeHostGuard>,
 }
 
 type NativeBodyFactory = Arc<
@@ -101,6 +104,44 @@ struct ReplayState {
 pub(crate) struct NativeCapture(Arc<Mutex<State>>);
 
 impl NativeCapture {
+    pub(crate) fn bind_host(
+        &self,
+        host: Option<crate::provider::NativeHostGuard>,
+    ) -> Result<(), RestartReason> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.prepared_observed || state.accepted_new_turn {
+            return Err(RestartReason::UnavailableSource);
+        }
+        state.host = host;
+        Ok(())
+    }
+    pub(crate) fn pair_publication(
+        &self,
+        pair: crate::session::native_publication::NativeActorPair,
+    ) -> Result<(), RestartReason> {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.actor_pair.is_some()
+            || state.prepared_observed
+            || state.accepted_new_turn
+            || state
+                .replay
+                .as_ref()
+                .is_none_or(|replay| replay.pending.is_some())
+        {
+            return Err(RestartReason::UnavailableSource);
+        }
+        state.actor_pair = Some(pair);
+        Ok(())
+    }
+
+    pub(crate) fn actor_pair(&self) -> Option<crate::session::native_publication::NativeActorPair> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .actor_pair
+            .clone()
+    }
+
     #[allow(
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"
@@ -295,6 +336,10 @@ impl NativeCapture {
         request: &CompletionRequest,
     ) -> Result<(), RestartReason> {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.prepared_observed = true;
+        if let Some(host) = &state.host {
+            host.validate()?;
+        }
         state.empty_native_end_turn = false;
         if state.replay.is_some() && state.unavailable.is_some() {
             return Err(RestartReason::UnavailableSource);
@@ -764,6 +809,14 @@ pub(crate) struct NativeCaptureHook {
 }
 
 impl NativeCaptureHook {
+    pub(crate) fn actor_pair(&self) -> Option<crate::session::native_publication::NativeActorPair> {
+        if !self.native {
+            return None;
+        }
+        self.capture
+            .as_ref()
+            .and_then(|(capture, _)| capture.actor_pair())
+    }
     pub(crate) fn for_native(capture: Option<NativeCapture>, model: &str) -> Self {
         if model.len() > MAX_IDENTITY_BYTES {
             if let Some(capture) = capture {
@@ -841,6 +894,16 @@ impl<M: CompletionModel> AgentHook<M> for NativeCaptureHook {
                     internal_call_id,
                     ..
                 } => {
+                    let host_valid = capture
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .host
+                        .as_ref()
+                        .is_none_or(|host| host.validate().is_ok());
+                    if !host_valid {
+                        capture.unavailable(Unavailable::InconsistentCompletedTurn);
+                    }
                     if capture.replay_failed() {
                         return Flow::skip("native thinking context cannot be reproduced");
                     }

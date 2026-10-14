@@ -727,8 +727,9 @@ uses the existing sandbox command owner and creation boundary.
 The shared native binding control in `src/provider_effort_replay_probe.rs` adds
 one named `std::thread::Builder` thread with an explicit 1 MiB stack. Like the
 existing capture control, it joins before its owned fake HTTP fixture teardown.
-Both exact `.spawn(|| {` sites are `NON-PROCESS`; neither creates a command,
-worker, security grant, or independent accounting owner.
+The three exact `.spawn(|| {` sites, including the actual two-dispatch headless
+frontend consumer, are `NON-PROCESS`; they create no command, worker, security
+grant, or independent accounting owner. Each thread is joined before teardown.
 
 
 ## Installed preflight helper observation inventory
@@ -748,3 +749,20 @@ preparation/publication workers use existing scoped blocking ownership, with
 construction inside the auxiliary scope and retirement before success is reported.
 
 Clipboard image paste (`TC-SUPPORT-UTILITY`) is an explicit operator action. Its fixed macOS AppKit/JXA or Windows STA PowerShell script receives no clipboard content as source code or argv; Linux requests the literal PNG MIME type from `wl-paste` or `xclip`. Every adapter uses the existing captured support-command owner, original captured workspace, strict three-second command deadline and bounded complete stdout. A cleared environment restores only desktop/session IPC and system utility values, never provider credentials or shell startup variables. Clipboard bytes and errors are never audited as payload. Oversize, incomplete, nonzero, timeout or escaped-descendant results cannot become attachments. No helper daemon is intentionally retained. These adapters add no model tool, permission grant, shell fallback, URI opening or network request. Windows image runtime acceptance is distinct from the existing text clipboard controls.
+
+## Native checkpoint publication fixture inventory
+
+The three exact current-libtest-image constructors and their spawn terminals in
+`session/native_publication.rs` are `TEST-ONLY`. They run only cfg(test) owned
+publication helpers, close the inherited release pipe, reap the exact helper,
+and observe inherited lock retirement before removing the fixture root.
+Their exit-code and captured-output assertion macros are `NON-PROCESS` data
+checks, identified by exact lexical sites and full-token macro digests. No
+production dispatcher, scanner exemption, or negative validator changes.
+
+The native startup publication consumer in `src/startup.rs` adds exactly one
+`std::thread::Builder` terminal (`.spawn(|| {`), classified `NON-PROCESS`. It
+runs `Startup::init` on an explicitly selected 1 MiB stack and joins before
+private-root cleanup. It creates no process, permission grant or new financial
+owner. Both lexical and Windows-capable terminal checks bind that exact site;
+scanner and macro-context validation remain unchanged.
