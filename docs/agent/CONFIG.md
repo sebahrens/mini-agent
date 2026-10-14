@@ -569,7 +569,48 @@ read = "allow"
 permission.doom_loop = "ask"
 ```
 
-### Completion verification
+### Optional formatting after file edits
+
+Formatting is disabled until an extension is configured:
+
+```toml
+[format]
+rs = 'rustfmt --edition 2024 "{file}"'
+js = 'prettier --write "{file}"'
+py = 'black "{file}"'
+# A command without a placeholder runs in the captured project directory:
+# rs = "cargo fmt"
+```
+
+These are literal argument templates, not shell programs. Single/double quotes
+and backslash escapes group literal arguments; environment expansion, pipelines,
+redirection, command substitution and control syntax are rejected. `{file}` must
+be one whole argument (quoted is accepted), or the value in `--flag={file}`.
+At most one placeholder is allowed. The canonical UTF-8 target is substituted
+**after** tokenization and each resulting argument is quoted for the configured
+POSIX shell or PowerShell. Non-UTF-8 paths skip formatting without redirecting to
+a lossy alias. The map accepts at most 64 extensions of 1–16 ASCII letters,
+digits or underscores; commands accept at most 8 KiB and 64 arguments.
+
+The original edit commits first. The formatter then runs in the original captured
+workspace, preserving project config and plugin discovery, through normal `shell`
+permission. An unknown command asks once; an edit approval does not approve its
+formatter. CLI shell exclusions and unavailable containment disable formatting.
+Project-local `[format]` is a sensitive setting covered by the existing
+content-bound project-config approval. Commands have a 10-second timeout and a
+combined 1 MiB output limit. A failed, denied or stopped formatter never rolls back
+the committed edit. Results append a static status; formatter stdout/stderr is not
+shown. After retirement, authorized bounded final source determines previews and
+diffs even when the command failed after modifying the file.
+
+A formatter is an ordinary shell effect, and a project-wide command can change
+other files within its sandbox authority. Target identity/digest and workspace
+are checked again after approval; concurrent edits during execution retain
+ordinary shell semantics. Final metadata reports an observed target snapshot,
+not a causal ledger of every formatter or concurrent-editor change. No new full
+read/overwrite proof is created by the final observation.
+
+## Completion verification
 
 Set a trusted project quality command to prevent a tool-using turn from being
 reported as complete before that command passes:

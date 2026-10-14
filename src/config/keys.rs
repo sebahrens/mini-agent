@@ -85,6 +85,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("keep_recent_tool_results"),
     key("max_agent_turns"),
     key("verify_command"),
+    key("format"),
     gated("goal", "goal"),
     gated("goal", "goal_checks"),
     gated("goal", "goal_judge_model"),

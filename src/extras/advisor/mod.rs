@@ -408,6 +408,7 @@ conversation, so focus your question on the specific decision you need help with
                     &cfg.advisor_model,
                     &cfg.request_config,
                     None,
+                    client.listing_key(&cfg.advisor_provider).ok().as_ref(),
                     crate::spend::RequestKind::Advisor,
                 )
             });

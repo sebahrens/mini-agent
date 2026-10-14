@@ -829,6 +829,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/provider_http.rs",
+        "response.status().is_success(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "response.status().as_u16()",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        r#"std::thread::Builder::new().name("model48-app-one-mib".into()).stack_size(1024*1024).spawn(|| {"#,
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
         "let response_code = response.status();",
         1,
         "NON-PROCESS",
@@ -1696,6 +1714,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Literal formatter-result assertion data; exact full-token digests below.
+    (
+        "src/agent/tools/format_after_edit.rs",
+        "assert!(output.contains(\"Written 10 bytes\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/format_after_edit.rs",
+        "assert!(!output.contains(\"Formatted.\"), \"{case}\");",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact captured model/text data assertions in context63 controls.
     (
         "src/context/instruction_wire_tests.rs",
@@ -2993,6 +3024,27 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/agent/tools/format_after_edit.rs",
+        &[
+            (
+                "1e5eaabec41b03e558c0e1864140eaa8d289afae2768fcdae7df42844ec0acdb",
+                1,
+            ),
+            (
+                "69224cb13021988e04ebb302f0c6f781ff9ecfb8bcf2b9e6f3aac24196f0181e",
+                1,
+            ),
+        ],
+    ),
+    // Bounded listing response status is metadata, not a subprocess terminal.
+    (
+        "src/provider_http.rs",
+        &[(
+            "05231f50fbe276ef652346dfef91ee00e56417da4cb5041c4c29d7eb5ca0f664",
+            1,
+        )],
+    ),
     // Complete tokens of the exact context63 captured data macros above.
     (
         "src/context/instruction_wire_tests.rs",
@@ -4330,6 +4382,24 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "tokio::process::Command::new(std::env::current_exe().unwrap());",
         1,
         "TEST-ONLY",
+    ),
+    (
+        "src/provider_http.rs",
+        "response.status().is_success(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "response.status().as_u16()",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        r#"std::thread::Builder::new().name("model48-app-one-mib".into()).stack_size(1024*1024).spawn(|| {"#,
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/provider_http.rs",

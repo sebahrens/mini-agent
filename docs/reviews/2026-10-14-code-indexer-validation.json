@@ -1,0 +1,221 @@
+{
+  "scope": "Root integration of formatter45, native provider metadata48, App constructor48.1; fallback success fixture44.3 committed separately.",
+  "base_head": "049dc8f5364d24e260a904413322a02600813037",
+  "selection_method": "Code-indexer defining-file callers, symbol searches and indexed source grep; concentrated files physically reviewed. Homonymous runner test run_interactive excluded. CLI tests endpoint had stale session404; usable MCP caller/grep indexes used instead. Empty hits never treated as proof of no impact.",
+  "maps": [
+    {
+      "changes": [
+        "Provider listing bounded native GET",
+        "SDK captured HTTP client getter",
+        "cache/context/pricing and selected models caller"
+      ],
+      "contracts": [
+        "Captured auth/route",
+        "Native Ollama endpoint and model/name semantics",
+        "Duplicate/cursor errors return no partial result",
+        "App refresh keeps current Session/account and does not call completion",
+        "Actual selection retains configured pin"
+      ],
+      "root_filters": [
+        "model_listing48_actual_native_auth_pages_context_and_precise_ids",
+        "model_listing48_repeated_cursor_oversize_and_echo_errors_are_closed",
+        "model_listing48_actual_refresh_and_picker_keep_session_and_do_not_call_model_on_one_mib_stack",
+        "model_listing48_actual_selection_uses_completed_metadata_and_retains_local_pin"
+      ],
+      "cfg": "default+advisor",
+      "result": "4 passed;3982 filtered;0.24s"
+    },
+    {
+      "changes": [
+        "Write/Edit formatter callers",
+        "Existing sandbox output worker future construction",
+        "Merged inventory exact source data"
+      ],
+      "root_filters": [
+        "format45_actual_write_failure_preserves_commit_and_reports_observed_final_diff",
+        "format45_actual_edit_uses_final_excerpt_and_does_not_authorize_overwrite",
+        "format45_actual_empty_map_keeps_output_and_atomic_formatter_replacement_is_observed",
+        "format45_late_read_revocation_during_real_lsp_wait_scrubs_write_and_edit_results",
+        "format45_native_timeout_output_cap_and_cancel_retire_the_owned_family",
+        "explicit_shell_operation_cancellation_kills_and_reaps_tree",
+        "explicit_shell_caller_drop_audits_after_tree_cleanup",
+        "production_subprocess_sites_have_a_trust_classification",
+        "windows_capable_production_process_terminals_use_creation_boundary"
+      ],
+      "cfg": "default+advisor actual LSP/hooks present",
+      "result": "9 passed;3993 filtered;35.08s"
+    },
+    {
+      "changes": [
+        "App::new construction factory and Write caller cfg boundaries"
+      ],
+      "root_filters": [
+        "format45_actual_write_failure_preserves_commit_and_reports_observed_final_diff",
+        "model_listing48_actual_refresh_and_picker_keep_session_and_do_not_call_model_on_one_mib_stack",
+        "model_listing48_actual_selection_uses_completed_metadata_and_retains_local_pin"
+      ],
+      "cfg": "no-default-features, hooks/advisor/LSP absent",
+      "result": "3 passed;2335 filtered;0.24s"
+    },
+    {
+      "changes": [
+        "Existing output worker constructor"
+      ],
+      "root_filters": [
+        "seatbelt_children_use_private_temp_and_cannot_overwrite_shared_temp"
+      ],
+      "cfg": "native macOS Seatbelt shell/workspace service/hook",
+      "result": "1 passed;4001 filtered;0.10s;actual private temp/secret/shared-temp assertions. Earlier exact+ignored command selected zero and is excluded from proof."
+    }
+  ],
+  "other_gates": {
+    "fmt": "passed before commit",
+    "diff_check": "passed",
+    "strict": "default+advisor all-targets Clippy -D warnings passed49.08s",
+    "required_debug_install": "cargo install --path . --debug --locked --offline passed34.59s"
+  },
+  "source_sha256": {
+    "docs/agent/COMMANDS.md": "e70fdf604491eb404246d639b5c36feb20e2277f02aee34126aaf1419ee6837d",
+    "docs/agent/CONFIG.md": "e0096d6a5db3c55c845568ba9bae6274c9f0ab18811a66390292e75cbac2a561",
+    "docs/agent/TOOL_RUNTIME.md": "f9b7ee00a850be9cff39c86d6ba97dc9d3bbb71d98e63c04fc7eaa86ac4016c7",
+    "docs/specs/subprocess-trust.md": "32e7e644cfe5a25bc3fa605ffda3fbd35302a448b25f2a4048008fc84b97282d",
+    "patched-deps/rig-core/PATCH.md": "512ef221491ce504760ed93f8248f24698b9d13fd05567aab2deb92e48e3e141",
+    "patched-deps/rig-core/src/client/mod.rs": "a4f4b35a310d6271f1de2dacfbd0402771a5a6bc0c8c4f518767c439719adffb",
+    "src/agent/builder.rs": "5eeb77aad573c3610fc8dc21d2190b5b4354bcf0563189253728918bcc0d7cf3",
+    "src/agent/tools/edit.rs": "dbb27e7cb05d67ea9d156b4db4895c24f00039e4b833925c0563f9f21b6c2779",
+    "src/agent/tools/format_after_edit.rs": "60bd8c8797a34a249ef6403f5b861fdb96273da6f77b36dc5b29261df4dfc0a7",
+    "src/agent/tools/mod.rs": "a57cdfc98034849d12f52c0233f962d2c9e13c25bdf5bdec724aab6368db50ad",
+    "src/agent/tools/write.rs": "ac7cc09f1dc3e04d09cd33789dc744d589a29fc9b18861404882ea0e4215999e",
+    "src/auth.rs": "2198c283ba3b8eb610b593dc394aa383beaf514711e51947ba004166abb742e6",
+    "src/config/keys.rs": "9c2bb7247f60a18586c59b7710941143e35e47be23bb5e287fd11d4a7aff0e72",
+    "src/config/load.rs": "b9af832a876d47ab3684c70c99f4c1b54abb4ee7ba48ed158bc307df8d4cac16",
+    "src/config/mod.rs": "07b0c6632f4ae9598379621580172fb912b7785e4509c10631bcaa0de77f1c4b",
+    "src/extras/acp/mod.rs": "d7afadec503213458c5fd22bdf56cf3b2b4e24d1dc7efc2a8f40632e68b5686f",
+    "src/extras/advisor/mod.rs": "917fe9da6583d729fb2f4b98eac107eab282ab88eb8e66d87840c60aa345c2d3",
+    "src/extras/subagents/task_tool.rs": "f1a4b58dca18dd06ab25ce6391d86ce22472e4282e88fb3a7abc3b4873eb6393",
+    "src/main.rs": "d69fdfdbc98bf5bef0fad4283453bc2ef0b29d6d9ac6efbb161ffa38256c39f1",
+    "src/permission/checker.rs": "b0a1268347fdeef6ded074e41c04b8713b67c716339f07024564f53eec02c938",
+    "src/provider.rs": "e6f6f30a127281ee0a96dbd59dd14732994168b15b2dd369a217629147d49cc0",
+    "src/provider_http.rs": "0bd68974c9d4fcd817f79daef403ad911eaa896b286aee86545eb373979ff9d9",
+    "src/provider_listing.rs": "548104f79692eb93714bf5d86727ba8e39c948b040813055a99f0db65f675640",
+    "src/sandbox.rs": "113350ae25754cd26c85cc776554add332ebb96d987e233c2f84fcf2ddb518ed",
+    "src/spend/run.rs": "ccf92b20aff7b939a80ed5f11b000ca8889a480203abc9d067f95630c51f3c07",
+    "src/startup.rs": "4cf6ae54bf3cf57595fb35c2643bd3e0a558b4a734d6ec9dfa2dbb9ea92b817f",
+    "src/tests/provider_tests.rs": "c725267191ca282fdda8c91bdc8afaa240ab3a232b25c03a0f5c588d8a6b8cec",
+    "src/tests/subprocess_inventory_tests.rs": "fc7998d74f7c367b737a9334981e060e269750cef4ec6935158150e57f0a6b6b",
+    "src/ui/app.rs": "58228f5004eddfb5d88539d06be99ed99806fa8640b23e11453f74d98db962a6",
+    "src/ui/event_handler.rs": "94fdb80215861fcc2f4ffc94ab7b6e832464e2e23fea1db50e9f4c1e114eada2",
+    "src/ui/mod.rs": "6a9e582554b403072339bd352e4a7fbd5c169bb97f92a93c35f488eaeb83af07",
+    "src/ui/slash/providers.rs": "d294d01782250b81f4ebed8fd2fc1febb457622af42e024905a72ddd1b953fd6"
+  },
+  "frozen_reviewed_patches": {
+    "formatter45": "3b36ca7651667c028215b5eaade82767c5f1f6d4b09fd92d40e5aed636e13bac",
+    "metadata48": "3ff24f61b83bc8164a0c710b535639c6f8b19a23c2f0c547996e0955809ae089",
+    "constructor48.1": "33a0033caa43e7c515ff9a33ea743c19b042d07f224043c374122f22e8109f05",
+    "coverage48": "e28a70ed2cd47f88f2a22d340fe28f64408b3d59ebbdd814c7e35effeb376f12",
+    "three_file_additive_merge": "4e7a5011cbeabf0ad65c9136027982afcad68e69466b64df0a4b5a85d80d78ab"
+  },
+  "reuse": [
+    "Metadata owner22 default/21 core unique controls and bounded route/cache/cap/context/pricing tests, strict core and native ordinary interactive proof unchanged. Root added two coverage cases then reran their exact two filters.",
+    "Formatter owner parser/config trusted-layer/key catalogue/Ask identity/revocation/spend/Question/read privacy/caps controls unchanged; actual callers and merged source inventory rerun. Minimal strict source checks reused with current root minimal3 type/behavior proof.",
+    "App constructor default/advisor/core exact2 owner controls and measured31KiB frame reduction reused; combined actual binary physical1MiB reproduced.",
+    "Phase6 protocol/QuickJS worker/native launch API, accounting arithmetic/ledgers, inventory scanners and negative validators unchanged; no full suite or unrelated feature-row repetition."
+  ],
+  "native_reports": {
+    "/private/tmp/mini-agent-model48-native-pry5sge1/report.json": {
+      "sha256": "af8034b1e10e0d91344b509edbaeed35473ea494d9448c9925697b7596872366",
+      "assertions": {
+        "root": "/private/tmp/mini-agent-model48-native-pry5sge1",
+        "binary": "/private/tmp/mini-agent-wave42-root-install/bin/mini-agent",
+        "binary_sha256": "0cd3f15e332d9d606dbbf220d10df43a95eacefc8985b5975db5807223d1d9d8",
+        "stack_limit_bytes": 1048576,
+        "calls": [
+          "GET /v1/models?limit=1000 HTTP/1.1",
+          "GET /v1/models?limit=1000 HTTP/1.1"
+        ],
+        "errors": [],
+        "setup_prompts": true,
+        "setup_themes": true,
+        "background_answered": true,
+        "operator_phase": "doctor",
+        "first_refresh_completed": true,
+        "passed": true,
+        "completion_requests": 0,
+        "model_unchanged": true,
+        "precise_native_picker_ids": true,
+        "context_and_unknown_price_labels_proven_by_actual_app_test": true,
+        "normal_quit": true,
+        "exit_code": 0,
+        "listener_joined": true,
+        "process_retired": true
+      }
+    },
+    "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-format45-installed-jrk19igg/report.json": {
+      "sha256": "6d67244b0f0bd1df32723cf046f800e9d7f6488f01a6069f9d1003c14cf931a6",
+      "assertions": {
+        "root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-format45-installed-jrk19igg",
+        "binary": "/private/tmp/mini-agent-wave42-root-install/bin/mini-agent",
+        "binary_sha256": "0cd3f15e332d9d606dbbf220d10df43a95eacefc8985b5975db5807223d1d9d8",
+        "stack_bytes": 1048576,
+        "cases": [
+          {
+            "formatter_enabled": true,
+            "posts": 2,
+            "write_committed": true,
+            "formatter_marker": true,
+            "final_sha256": "b3cf50859aee10075cb8ed80f5812189c5c4dd15ef4fe2335c55bc4b00ec01bd",
+            "literal_operand_no_injection": true,
+            "exit": 0
+          },
+          {
+            "formatter_enabled": false,
+            "posts": 2,
+            "write_committed": true,
+            "formatter_marker": false,
+            "final_sha256": "d51adcb7e8ff239125748e0a63c7a55cd346e4c7b074ebd64b581b18a9cc42ec",
+            "literal_operand_no_injection": true,
+            "exit": 0
+          }
+        ],
+        "external_requests": 0,
+        "passed": true
+      }
+    },
+    "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-format45-tui-ogf14eyt/report.json": {
+      "sha256": "23062c911951221eb3f5a37e911fd586a4a7b979e4a27b14b6f4f7e36180b929",
+      "assertions": {
+        "root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-format45-tui-ogf14eyt",
+        "binary_sha256": "0cd3f15e332d9d606dbbf220d10df43a95eacefc8985b5975db5807223d1d9d8",
+        "stack_limit_bytes": 1048576,
+        "paid_calls": 0,
+        "lsp_table_omitted": true,
+        "formatter_modified_failure_committed": true,
+        "automatic_registered_schema": true,
+        "lazy_start_before_tool": false,
+        "post_write_rust_diagnostic_in_actual_followup": true,
+        "toggle_lsp_hooks_media": true,
+        "completion_posts": 2,
+        "exit_code": 0,
+        "language_server_retired": true,
+        "passed": true,
+        "errors": [],
+        "thread_retired": true
+      }
+    }
+  },
+  "logs": {
+    "/private/tmp/mini-agent-root-integrated48-owning.log": "2c0cb22ac6189527338673ed54bd8fb7f6f4cf11d44197ba12d04410fb3e2df7",
+    "/private/tmp/mini-agent-root-integrated45-owning.log": "7a599c676fc20747a91cb3e8cef80b6afcb80301dc040a7e6445e07d6ea1eb85",
+    "/private/tmp/mini-agent-root-integrated45-48-minimal.log": "64321f1f20b45443bd3973164400fd138e1d82e6426adf812e4c645a8a4b872e",
+    "/private/tmp/mini-agent-root-integrated45-native-containment.log": "de7536fccd658ffaf1bd9867796bbb82a844a7815fdbd3e15422ad3510e3f620",
+    "/private/tmp/mini-agent-root-integrated45-48-strict.log": "c1de4df5d5232510edcbafb239a2dd6d2e99c50271e1535427dd04b92e6a1f96",
+    "/private/tmp/mini-agent-wave42-root-install.log": "41775c7d6be7f1276f9b14b2de3ff877f022bc27b58bd4072804900a7d9a250d"
+  },
+  "review_limits": [
+    "The original metadata normal-stack proof was not1MiB; existing baseline overflow tracked separately as44 child48.1 and fixed by the measured single App constructor seam.",
+    "OneMiB acceptance covers the selected actual refresh/headless formatter/TUI LSP paths, not all commands.",
+    "Current hosted bf38 CI terminal87 success/4 failure: actual Windows helper and Mac success fixture plus2 aggregates. New exact-source CI must be observed separately; no whole CI green claim.",
+    "Windows native formatter/metadata effects and Linux invalidUTF8 filename path not locally claimed.",
+    "Native-session publication frontend/controller46 remains isolated and incomplete; none of that draft is integrated here."
+  ]
+}

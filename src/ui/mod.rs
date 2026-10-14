@@ -1446,16 +1446,18 @@ pub async fn run_interactive(
     #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     #[cfg(feature = "hooks")] session_start_task: Option<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
-    let mut app = app::App::new(
-        ui,
-        agent,
-        ask_rx,
-        auto_trigger_msg,
-        #[cfg(feature = "advisor")]
-        handoff_rx,
-        #[cfg(feature = "hooks")]
-        session_start_task,
-    )
+    let mut app = crate::startup::heap_future(|| {
+        app::App::new(
+            ui,
+            agent,
+            ask_rx,
+            auto_trigger_msg,
+            #[cfg(feature = "advisor")]
+            handoff_rx,
+            #[cfg(feature = "hooks")]
+            session_start_task,
+        )
+    })
     .await?;
     let result = app.run().await;
     app.teardown().await;

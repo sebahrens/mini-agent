@@ -4287,3 +4287,18 @@ pub(crate) fn mcp_config_in_workspace_at(
     workspace.validate().map_err(io::Error::other)?;
     Ok(cfg)
 }
+
+#[cfg(test)]
+#[test]
+fn format45_config_map_is_sensitive_and_merges_only_in_the_trusted_layer() {
+    let input = "[format]\nrs = 'rustfmt \"{file}\"'\n";
+    let (benign, sensitive, names) = split_project_override(input).unwrap();
+    assert!(names.contains("format"));
+    assert!(benign.get("format").is_none());
+    let untrusted = merge_config_value(&Config::default(), benign).unwrap();
+    assert!(untrusted.format.is_empty());
+    let trusted = merge_config_value(&untrusted, sensitive).unwrap();
+    assert_eq!(trusted.format["rs"], "rustfmt \"{file}\"");
+    assert_eq!(keys::lookup("format").unwrap().name, "format");
+    assert!(Config::default().format.is_empty());
+}

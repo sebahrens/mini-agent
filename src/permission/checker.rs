@@ -1045,6 +1045,59 @@ impl PermissionChecker {
         self.check_inner("mcp_tool", policy_input, identity, read_only_exempt)
     }
 
+    fn matched_script_rules(
+        &self,
+        tool: &str,
+        policy_input: &str,
+    ) -> SmallVec<[(usize, Action); 4]> {
+        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
+        if self.apply_rules()
+            && let Some(rules) = self.rules.get(tool)
+        {
+            for (pattern, action) in rules {
+                let matches = if tool == "shell" && *action == Action::Allow {
+                    // Model B: allow only the exact, complete script. Ask and
+                    // deny rules remain pattern-based so broad safeguards keep
+                    // working, but globs/regexes cannot widen Bash execution.
+                    pattern.original == policy_input
+                } else {
+                    pattern.matches(policy_input)
+                };
+                if matches {
+                    matched.push((pattern.specificity(), *action));
+                }
+            }
+        }
+
+        if self.apply_rules()
+            && tool == "shell"
+            && let Some(argv) = crate::permission::shell_prefix::literal_argv(policy_input)
+        {
+            for prefix in &self.shell_allow_prefixes {
+                if prefix.matches(&argv) {
+                    matched.push((prefix.specificity(), Action::Allow));
+                }
+            }
+        }
+
+        matched
+    }
+
+    /// Recheck only revocation of a previously admitted shell invocation.
+    /// Ask does not confer permission here: the caller already owns its exact
+    /// AllowOnce/AllowAlways decision. No hook token, grant or doom state is
+    /// consumed, and explicit denies and current mode keep normal precedence.
+    pub(crate) fn retains_shell_approval(&self, exact_script: &str) -> bool {
+        if self.matches_deny_rule("shell", &[exact_script]) {
+            return false;
+        }
+        if self.is_session_allowed("shell", exact_script) {
+            return true;
+        }
+        self.resolve_check_action("shell", &self.matched_script_rules("shell", exact_script))
+            != Action::Deny
+    }
+
     fn check_inner(
         &mut self,
         tool: &str,
@@ -1095,35 +1148,7 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
-        if self.apply_rules()
-            && let Some(rules) = self.rules.get(tool)
-        {
-            for (pattern, action) in rules {
-                let matches = if tool == "shell" && *action == Action::Allow {
-                    // Model B: allow only the exact, complete script. Ask and
-                    // deny rules remain pattern-based so broad safeguards keep
-                    // working, but globs/regexes cannot widen Bash execution.
-                    pattern.original == policy_input
-                } else {
-                    pattern.matches(policy_input)
-                };
-                if matches {
-                    matched.push((pattern.specificity(), *action));
-                }
-            }
-        }
-
-        if self.apply_rules()
-            && tool == "shell"
-            && let Some(argv) = crate::permission::shell_prefix::literal_argv(policy_input)
-        {
-            for prefix in &self.shell_allow_prefixes {
-                if prefix.matches(&argv) {
-                    matched.push((prefix.specificity(), Action::Allow));
-                }
-            }
-        }
+        let matched = self.matched_script_rules(tool, policy_input);
 
         let mut action = self.resolve_check_action(tool, &matched);
         // Yolo allows unmatched scripts but still asks before a recognizably
@@ -4376,4 +4401,52 @@ mod resumed_session_allowlist_tests {
             CheckResult::Denied(_)
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn format45_retained_approval_query_preserves_doom_state_and_normal_revocation_precedence() {
+    let root = crate::tests::OwnedTestDirectory::new("format45-policy");
+    let mut checker = PermissionChecker::new(
+        &PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Allow),
+            ..Default::default()
+        }),
+        SecurityMode::Standard,
+        Some(root.path().to_path_buf()),
+        None,
+    )
+    .unwrap();
+    let script = "rustfmt source.rs";
+    assert_eq!(checker.check("shell", script), CheckResult::Ask);
+    let observed = (checker.last_call.clone(), checker.consecutive_repeat_count);
+    for _ in 0..3 {
+        assert!(checker.retains_shell_approval(script));
+    }
+    assert_eq!(
+        (checker.last_call.clone(), checker.consecutive_repeat_count),
+        observed
+    );
+    checker.set_mode(SecurityMode::ReadOnly);
+    assert!(!checker.retains_shell_approval(script));
+    checker.add_session_allowlist("shell".into(), script);
+    assert!(
+        checker.retains_shell_approval(script),
+        "existing exact session grant precedence is preserved"
+    );
+    let checker = PermissionChecker::new(
+        &PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Allow),
+            bash: Some(ToolPerm::Simple(Action::Deny)),
+            ..Default::default()
+        }),
+        SecurityMode::Yolo,
+        Some(root.path().to_path_buf()),
+        None,
+    )
+    .unwrap();
+    assert!(
+        !checker.retains_shell_approval(script),
+        "explicit deny survives permissive mode"
+    );
 }

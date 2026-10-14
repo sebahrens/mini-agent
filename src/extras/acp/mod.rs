@@ -2646,7 +2646,17 @@ async fn settle_acp_goal_round(
                                 Default::default,
                                 |run| {
                                     crate::spend::run::UsageObserver::with_run(
-                                        run.for_judge(&resolved, cfg),
+                                        run.for_judge(
+                                            &resolved,
+                                            cfg,
+                                            resolved
+                                                .same_provider_as_session
+                                                .then(|| {
+                                                    client.listing_key(&resolved.provider).ok()
+                                                })
+                                                .flatten()
+                                                .as_ref(),
+                                        ),
                                     )
                                 },
                             ),

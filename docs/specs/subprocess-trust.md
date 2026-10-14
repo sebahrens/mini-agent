@@ -703,3 +703,23 @@ creation-boundary validator nor stale-entry check is relaxed. The four existing 
 renderer path to this shared selection module, each retaining its count of one;
 the native heading adds one new digest. Other learned-compositor classifications
 and occurrence counts remain.
+
+### Live model-listing metadata (mini-agent-i7ro6.48)
+
+The two `response.status()` expressions in the bounded listing GET check are
+`NON-PROCESS` HTTP status metadata. Both lexical tables and the complete
+`ensure!` macro token digest record the exact sites and occurrence counts.
+The `model48-app-one-mib` fixture's explicitly named standard-library thread
+is also `NON-PROCESS`; it runs an owned App channel test and creates no child
+process. No scanner, creation-boundary rule or negative control changes.
+
+
+## Formatter assertion data
+
+The two `output` identifiers inside formatter approval test assertions are
+returned tool-result strings, not process terminal calls. The exact source
+line counts and complete macro-token digests in the inventory classify only
+these two inert `String::contains` contexts, each with a count of one.
+No scanner, process
+creation classification, or negative validator is changed. Formatter execution
+uses the existing sandbox command owner and creation boundary.

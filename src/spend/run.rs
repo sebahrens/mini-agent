@@ -134,7 +134,7 @@ impl Run {
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
         };
-        Ok(run.for_model(provider, model, cfg, selected, RequestKind::Turn))
+        Ok(run.for_model(provider, model, cfg, selected, None, RequestKind::Turn))
     }
 
     pub(crate) fn with_captured_profile(
@@ -177,6 +177,7 @@ impl Run {
         &self,
         judge: &crate::extras::goal::ResolvedJudge,
         cfg: &Config,
+        source: Option<&crate::provider_listing::ListingKey>,
     ) -> Self {
         if judge.same_as_session {
             self.with_captured_profile(
@@ -192,6 +193,7 @@ impl Run {
                 &judge.model,
                 cfg,
                 Some(&judge.label),
+                source,
                 RequestKind::Judge,
             )
         }
@@ -209,6 +211,7 @@ impl Run {
         model: &str,
         cfg: &Config,
         selected: Option<&str>,
+        source: Option<&crate::provider_listing::ListingKey>,
         kind: RequestKind,
     ) -> Self {
         let quick = crate::config::quick_models_map(cfg);
@@ -216,7 +219,7 @@ impl Run {
             .and_then(|alias| quick.get(alias))
             .filter(|entry| entry.provider == provider && entry.model == model)
             .and_then(|entry| entry.resolved_prices())
-            .or_else(|| crate::ui::slash::resolve_model_pricing(provider, model, cfg));
+            .or_else(|| crate::ui::slash::resolve_model_pricing(provider, model, cfg, source));
         let cache = crate::pricing::cache_prices_for_model(
             provider,
             model,

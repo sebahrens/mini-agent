@@ -62,6 +62,7 @@ pub struct WriteTool {
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read_tracker: ReadTracker,
     diff_options: DiffOptions,
+    formatter: Option<std::sync::Arc<super::format_after_edit::FormatAfterEdit>>,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -96,6 +97,7 @@ impl WriteTool {
             workspace: None,
             read_tracker,
             diff_options: DiffOptions::default(),
+            formatter: None,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -122,6 +124,14 @@ impl WriteTool {
 
     pub(crate) fn with_diff_options(mut self, options: DiffOptions) -> Self {
         self.diff_options = options;
+        self
+    }
+
+    pub(crate) fn with_formatter(
+        mut self,
+        formatter: Option<std::sync::Arc<super::format_after_edit::FormatAfterEdit>>,
+    ) -> Self {
+        self.formatter = formatter;
         self
     }
 
@@ -298,32 +308,80 @@ impl WriteTool {
                     ));
                 }
             }
-            let diff = if created {
-                MutationDiff::replacement(&expanded, None, &args.content, self.diff_options)
-            } else {
-                preview_before.as_deref().and_then(|before| {
-                    MutationDiff::replacement(
-                        &expanded,
-                        Some(before),
-                        &args.content,
-                        self.diff_options,
-                    )
-                })
-            };
             self.read_tracker.untrack_read_path(&expanded);
+            let formatted = match &self.formatter {
+                Some(formatter) => {
+                    crate::startup::heap_future(|| {
+                        formatter.run(
+                            &requested,
+                            Some((workspace, relative)),
+                            &args.content,
+                            &self.permission,
+                            &self.ask_tx,
+                            self.max_text_file_size,
+                        )
+                    })
+                    .await
+                }
+                None => None,
+            };
+            let final_content = match &formatted {
+                Some(formatted) => formatted.content.as_deref(),
+                None => Some(args.content.as_str()),
+            };
+            let mut diff = if created {
+                final_content.and_then(|content| {
+                    MutationDiff::replacement(&expanded, None, content, self.diff_options)
+                })
+            } else {
+                preview_before
+                    .as_deref()
+                    .zip(final_content)
+                    .and_then(|(before, content)| {
+                        MutationDiff::replacement(
+                            &expanded,
+                            Some(before),
+                            content,
+                            self.diff_options,
+                        )
+                    })
+            };
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
             if let Some(msg) = coaching {
                 result = format!("{}\n\n{}", msg, result);
             }
+            if let Some(formatted) = &formatted {
+                result.push('\n');
+                result.push_str(formatted.status);
+            }
+            let private_fallback = formatted.as_ref().map(|_| result.clone());
             #[cfg(feature = "lsp")]
-            if let Some(lsp) = &self.lsp {
+            if let Some(lsp) = &self.lsp
+                && formatted
+                    .as_ref()
+                    .is_none_or(|formatted| formatted.notify_lsp)
+            {
                 let baseline = lsp.notify_changed_relative(relative).await;
                 if let Some(block) = lsp
                     .diagnostics_block_for_relative_edit(relative, baseline)
                     .await
+                    && (formatted.is_none()
+                        || super::mutation_diff::preimage_allowed(
+                            &self.permission,
+                            &expanded,
+                            true,
+                        ))
                 {
                     result.push_str(&block);
                 }
+            }
+            if formatted.is_some()
+                && (!super::mutation_diff::preimage_allowed(&self.permission, &expanded, true)
+                    || crate::agent::runner::current_work_scope_is_cancelled()
+                    || crate::question::required().is_some())
+            {
+                result = private_fallback.expect("configured formatting retains a static fallback");
+                diff = None;
             }
             return Ok(MutationOutcome {
                 output: result,
@@ -414,38 +472,85 @@ impl WriteTool {
                 .await
                 .map_err(|error| create_error(&expanded, error))?;
         }
-        let diff = if created {
-            MutationDiff::replacement(
-                &path.to_string_lossy(),
-                None,
-                &args.content,
-                self.diff_options,
-            )
-        } else {
-            preview_before.as_deref().and_then(|before| {
-                MutationDiff::replacement(
-                    &path.to_string_lossy(),
-                    Some(before),
-                    &args.content,
-                    self.diff_options,
-                )
-            })
-        };
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
+        let formatted = match &self.formatter {
+            Some(formatter) => {
+                crate::startup::heap_future(|| {
+                    formatter.run(
+                        path,
+                        None,
+                        &args.content,
+                        &self.permission,
+                        &self.ask_tx,
+                        self.max_text_file_size,
+                    )
+                })
+                .await
+            }
+            None => None,
+        };
+        let final_content = match &formatted {
+            Some(formatted) => formatted.content.as_deref(),
+            None => Some(args.content.as_str()),
+        };
+        let mut diff = if created {
+            final_content.and_then(|content| {
+                MutationDiff::replacement(&path.to_string_lossy(), None, content, self.diff_options)
+            })
+        } else {
+            preview_before
+                .as_deref()
+                .zip(final_content)
+                .and_then(|(before, content)| {
+                    MutationDiff::replacement(
+                        &path.to_string_lossy(),
+                        Some(before),
+                        content,
+                        self.diff_options,
+                    )
+                })
+        };
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);
         }
 
+        if let Some(formatted) = &formatted {
+            result.push('\n');
+            result.push_str(formatted.status);
+        }
+        let private_fallback = formatted.as_ref().map(|_| result.clone());
         #[cfg(feature = "lsp")]
-        if let Some(lsp) = &self.lsp {
+        if let Some(lsp) = &self.lsp
+            && formatted
+                .as_ref()
+                .is_none_or(|formatted| formatted.notify_lsp)
+        {
             let baseline = lsp.notify_changed(path).await;
-            if let Some(block) = lsp.diagnostics_block_for_edit(path, baseline).await {
+            if let Some(block) = lsp.diagnostics_block_for_edit(path, baseline).await
+                && (formatted.is_none()
+                    || super::mutation_diff::preimage_allowed(
+                        &self.permission,
+                        &path.to_string_lossy(),
+                        false,
+                    ))
+            {
                 result.push_str(&block);
             }
         }
 
+        if formatted.is_some()
+            && (!super::mutation_diff::preimage_allowed(
+                &self.permission,
+                &path.to_string_lossy(),
+                false,
+            ) || crate::agent::runner::current_work_scope_is_cancelled()
+                || crate::question::required().is_some())
+        {
+            result = private_fallback.expect("configured formatting retains a static fallback");
+            diff = None;
+        }
         Ok(MutationOutcome {
             output: result,
             diff,

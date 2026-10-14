@@ -1496,8 +1496,10 @@ impl<'a> App<'a> {
             let provider = ui.session.provider.to_string();
             let is_custom = ui.cfg.custom_providers_map().contains_key(&provider);
             // Non-blocking: an unreachable gateway must not stall startup.
-            crate::ui::slash::warm_model_cache(&provider, is_custom, &ui.client, ui.cli, ui.cfg);
-            input.set_live_model_names(crate::ui::slash::cached_model_ids(&provider));
+            crate::ui::slash::warm_model_cache(&provider, is_custom, &ui.client);
+            input.set_live_model_names(crate::ui::slash::cached_model_ids(
+                &provider, is_custom, &ui.client,
+            ));
         }
 
         #[cfg(feature = "git-worktree")]
@@ -2068,6 +2070,11 @@ impl<'a> App<'a> {
             self.input
                 .set_live_model_names(crate::ui::slash::cached_model_ids(
                     &self.ui.session.provider,
+                    self.ui
+                        .cfg
+                        .custom_providers_map()
+                        .contains_key(self.ui.session.provider.as_str()),
+                    &self.ui.client,
                 ));
         }
     }
@@ -4731,13 +4738,7 @@ impl<'a> App<'a> {
         if !is_quit_command(text) && !context_diagnostic {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
-            crate::ui::slash::warm_model_cache(
-                &provider,
-                is_custom,
-                &self.ui.client,
-                self.ui.cli,
-                self.ui.cfg,
-            );
+            crate::ui::slash::warm_model_cache(&provider, is_custom, &self.ui.client);
             self.sync_live_model_names(true);
         }
 
@@ -13750,5 +13751,129 @@ mod plan_approval_tests {
                 && app.ui.session.permission_allowlist.is_empty()
         );
         provider.finish().await;
+    }
+    #[test]
+    fn model_listing48_actual_refresh_and_picker_keep_session_and_do_not_call_model_on_one_mib_stack()
+     {
+        std::thread::Builder::new().name("model48-app-one-mib".into()).stack_size(1024*1024).spawn(|| {
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(crate::startup::heap_future(|| async {
+                let roots=Roots::new(); let workspace=roots.workspace();
+                let provider=Provider::new(Vec::new()).await; let cfg=provider.config();
+                let cli=crate::cli::Cli { no_session:true,no_context_files:true,no_tools:true,api_key:Some("unused-local-key".into()),..Default::default() };
+                let mut files=crate::context::load(true).for_workspace_binding(true,&workspace);
+                let mut session=Session::new("anthropic","owned-model",128000,"model-listing48");
+                session.set_input_output_prices(Some((2.0,3.0)));
+                let mut app=owned_app(ui(&cli,&cfg,&mut session,&mut files,workspace,SecurityMode::Standard));
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                app.ui.client=crate::provider::AnyClient::Anthropic(rig::providers::anthropic::Client::builder()
+                    .api_key("CAPTURED_LISTING_KEY").base_url(format!("http://{}",listener.local_addr().unwrap()))
+                    .http_client(crate::provider_http::ProviderHttpClient::default()).build().unwrap());
+                let before=serde_json::to_vec(app.ui.session).unwrap();
+                let operator=async {
+                    app.input.buffer="/models refresh".into(); app.input.cursor=app.input.buffer.len();
+                    user(&mut app,UserEvent::Key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE))).await;
+                    app.input.buffer="/models".into(); app.input.cursor=app.input.buffer.len();
+                    user(&mut app,UserEvent::Key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE))).await;
+                };
+                let server=async {
+                    let (mut socket,_)=listener.accept().await.unwrap();
+                    let mut bytes=Vec::new();
+                    while !bytes.windows(4).any(|v| v==b"\r\n\r\n") { let mut chunk=[0;1024];let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);bytes.extend_from_slice(&chunk[..n]);assert!(bytes.len()<16384); }
+                    assert!(String::from_utf8(bytes).unwrap().starts_with("GET /v1/models?limit=1000 "));
+                    let body=r#"{"data":[{"id":"claude-opus-5-5","display_name":"Opus 雪","max_input_tokens":200000},{"id":"new-unpriced-model","max_input_tokens":64000}],"has_more":false}"#;
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                };
+                tokio::time::timeout(Duration::from_secs(5),async {tokio::join!(operator,server);}).await.unwrap();
+                assert_eq!(serde_json::to_vec(app.ui.session).unwrap(),before);
+                let captured=app.renderer.captured_output(); assert!(captured.contains("model list refreshed"));assert!(captured.contains("claude-opus-5-5"));assert!(captured.contains("200k ctx"));assert!(captured.contains("(no price known)"));
+                let ids=crate::ui::slash::cached_model_ids("anthropic",false,&app.ui.client);assert!(ids.contains(&"claude-opus-5-5".into()));
+                assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+                assert!(provider.calls().is_empty());
+                assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
+                provider.finish().await;
+            }));
+        }).unwrap().join().unwrap();
+    }
+    #[tokio::test]
+    async fn model_listing48_actual_selection_uses_completed_metadata_and_retains_local_pin() {
+        for pin in [None, Some(123456)] {
+            let roots = Roots::new();
+            let workspace = roots.workspace();
+            let provider = Provider::new(Vec::new()).await;
+            let mut cfg = provider.config();
+            cfg.context_window = pin;
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_context_files: true,
+                no_tools: true,
+                api_key: Some("unused-local-key".into()),
+                ..Default::default()
+            };
+            let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session =
+                Session::new("openrouter", "old-owned-model", 128000, "model-selection48");
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut files,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            app.ui.client = crate::provider::AnyClient::OpenRouter(
+                rig::providers::openrouter::Client::builder()
+                    .api_key("CAPTURED_SELECTION_KEY")
+                    .base_url(format!("http://{}", listener.local_addr().unwrap()))
+                    .http_client(crate::provider_http::ProviderHttpClient::default())
+                    .build()
+                    .unwrap(),
+            );
+            let operator = async {
+                app.input.buffer = "/model selection48-live".into();
+                app.input.cursor = app.input.buffer.len();
+                user(
+                    &mut app,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                )
+                .await;
+            };
+            let server = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    assert!(bytes.len() < 16384);
+                }
+                assert!(
+                    String::from_utf8(bytes)
+                        .unwrap()
+                        .starts_with("GET /models ")
+                );
+                let body = r#"{"data":[{"id":"selection48-live","context_length":240000,"pricing":{"prompt":"0.000007","completion":"0.000011"}}]}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(operator, server);
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.ui.session.model.as_str(), "selection48-live");
+            assert_eq!(app.ui.session.context_window, pin.unwrap_or(240000));
+            assert!((app.ui.session.input_token_cost - 7.0).abs() < 1e-12);
+            assert!((app.ui.session.output_token_cost - 11.0).abs() < 1e-12);
+            assert!(app.ui.session.messages.is_empty());
+            assert!(provider.calls().is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            provider.finish().await;
+        }
     }
 }

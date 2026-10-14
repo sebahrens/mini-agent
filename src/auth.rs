@@ -184,6 +184,7 @@ impl AuthResolver {
         self
     }
 
+    #[cfg(test)]
     pub fn resolve(&self) -> anyhow::Result<String> {
         self.resolve_with_env(|name| std::env::var(name))
     }
@@ -220,6 +221,7 @@ impl AuthResolver {
             .map(|(_, source)| source)
     }
 
+    #[cfg(test)]
     pub fn resolve_with_env<F: Fn(&str) -> Result<String, VarError>>(
         &self,
         get_env: F,

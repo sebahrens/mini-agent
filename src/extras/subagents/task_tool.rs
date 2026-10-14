@@ -783,6 +783,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 &runtime.model_name,
                 &config,
                 selected_alias,
+                runtime
+                    .client
+                    .listing_key(&runtime.provider_name)
+                    .ok()
+                    .as_ref(),
                 crate::spend::RequestKind::Subagent,
             )
         });

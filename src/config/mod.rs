@@ -131,6 +131,10 @@ pub struct Config {
     /// Project-local values require the existing sensitive-config approval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<CompactString>,
+    /// Optional formatter argv templates. Project values require the existing
+    /// sensitive-config approval; commands retain ordinary shell permission.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub format: BTreeMap<String, String>,
     /// Goal defaults. Benign: these only bound how long the harness keeps
     /// working, never what it is allowed to run.
     #[cfg(feature = "goal")]

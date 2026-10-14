@@ -37,7 +37,7 @@ fn resolve_startup_model_pricing(
     if let Some(quick) = selected_startup_quick_model(cli, cfg, provider, model, openrouter_model) {
         return quick.resolved_prices();
     }
-    crate::ui::slash::resolve_model_pricing(provider, model, cfg)
+    crate::ui::slash::resolve_model_pricing(provider, model, cfg, None)
 }
 
 fn selected_startup_quick_model(
@@ -89,7 +89,7 @@ pub(crate) fn diagnostic_startup_pricing(
             },
         );
     }
-    crate::ui::slash::providers::diagnostic_model_pricing(provider, model, cfg)
+    crate::ui::slash::providers::diagnostic_model_pricing(provider, model, cfg, None)
 }
 
 fn resolve_startup_cache_prices(
@@ -301,7 +301,8 @@ fn apply_resume_provider_decision(
         saved.provider != target.provider,
     );
     let qm = config::quick_models_map(cfg);
-    let prices = crate::ui::slash::resolve_model_pricing(&target.provider, &target.model, cfg);
+    let prices =
+        crate::ui::slash::resolve_model_pricing(&target.provider, &target.model, cfg, None);
     session.set_input_output_prices(prices);
     let input = session.input_token_cost;
     session.set_cache_prices(crate::pricing::cache_prices_for_model(
@@ -1362,21 +1363,33 @@ impl Startup {
             return;
         }
 
-        let api_key = self.cli.api_key.clone();
-        let custom_providers = self.cfg.custom_providers_map();
-        let config_api_keys = self.cfg.api_keys.clone();
+        let client = self.client.clone();
+        let provider = self.provider.to_string();
+        let is_custom = self.cfg.custom_providers_map().contains_key(&provider);
         self.openrouter_pricing_refresh = Some(OpenRouterPricingRefresh::start(
             self.model.clone(),
             need_pricing,
             need_context,
             self.session.context_window,
             async move {
-                provider::fetch_openrouter_pricing(
-                    api_key.as_deref(),
-                    &custom_providers,
-                    config_api_keys.as_ref(),
+                let models = crate::ui::slash::providers::fetch_models_cached(
+                    &provider, is_custom, &client, true,
                 )
-                .await
+                .await?;
+                Ok(models
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.id.clone(),
+                            provider::OpenRouterModelInfo {
+                                input_cost: m.input_price.unwrap_or(0.0),
+                                output_cost: m.output_price.unwrap_or(0.0),
+                                context_length: m.context_length.map(u64::from),
+                                prices_known: Some(m.input_price.zip(m.output_price).is_some()),
+                            },
+                        )
+                    })
+                    .collect())
             },
         ));
     }
@@ -2818,7 +2831,17 @@ async fn run_headless_goal_rounds(
                             // a verdict arriving after the operator stopped the
                             // run must not decide the goal.
                             let observed = crate::spend::run::UsageObserver::with_run(
-                                spend.for_judge(&resolved, &cfg_for_judge),
+                                spend.for_judge(
+                                    &resolved,
+                                    &cfg_for_judge,
+                                    resolved
+                                        .same_provider_as_session
+                                        .then(|| {
+                                            client_for_judge.listing_key(&resolved.provider).ok()
+                                        })
+                                        .flatten()
+                                        .as_ref(),
+                                ),
                             );
                             let verdict = driver::unless_interrupted(
                                 crate::extras::goal::judge::ask_with_transcript_observed(

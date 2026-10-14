@@ -25,6 +25,7 @@ pub struct EditTool {
     read_tracker: ReadTracker,
     max_text_file_size: u64,
     diff_options: DiffOptions,
+    formatter: Option<std::sync::Arc<super::format_after_edit::FormatAfterEdit>>,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -56,6 +57,7 @@ impl EditTool {
             read_tracker,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             diff_options: DiffOptions::default(),
+            formatter: None,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -76,6 +78,14 @@ impl EditTool {
 
     pub(crate) fn with_diff_options(mut self, options: DiffOptions) -> Self {
         self.diff_options = options;
+        self
+    }
+
+    pub(crate) fn with_formatter(
+        mut self,
+        formatter: Option<std::sync::Arc<super::format_after_edit::FormatAfterEdit>>,
+    ) -> Self {
+        self.formatter = formatter;
         self
     }
 
@@ -1116,6 +1126,10 @@ impl EditTool {
         } else {
             None
         };
+        let formatting_path = resolved
+            .as_deref()
+            .unwrap_or(requested.as_path())
+            .to_path_buf();
         let path = resolved
             .as_deref()
             .unwrap_or(requested.as_path())
@@ -1324,17 +1338,51 @@ impl EditTool {
             .await?;
         }
         // Publication succeeded against the exact source identity and bytes.
-        // Failed validation/publication never produces result metadata.
-        let diff = preview_before.as_deref().and_then(|before| {
-            MutationDiff::build(
-                &path,
-                Some(before),
-                &output,
-                applied_ranges,
-                self.diff_options,
-            )
-        });
+        // Invalidate overwrite proof before optional formatter approval/effects.
         self.read_tracker.untrack_read_path(&path);
+        let formatted = match &self.formatter {
+            Some(formatter) => {
+                crate::startup::heap_future(|| {
+                    formatter.run(
+                        &formatting_path,
+                        bound_workspace.map(|workspace| (workspace, relative)),
+                        &output,
+                        &self.permission,
+                        &self.ask_tx,
+                        self.max_text_file_size,
+                    )
+                })
+                .await
+            }
+            None => None,
+        };
+        let excerpts = match &formatted {
+            Some(formatted) => formatted
+                .content
+                .as_deref()
+                .map(|content| resulting_excerpts(content, &[(0, content.len())]))
+                .unwrap_or_else(|| replacement_excerpts(&ranges)),
+            None => excerpts,
+        };
+        // Old edit byte ranges cease to describe the result after formatting.
+        let mut diff = if let Some(formatted) = &formatted {
+            preview_before
+                .as_deref()
+                .zip(formatted.content.as_deref())
+                .and_then(|(before, content)| {
+                    MutationDiff::replacement(&path, Some(before), content, self.diff_options)
+                })
+        } else {
+            preview_before.as_deref().and_then(|before| {
+                MutationDiff::build(
+                    &path,
+                    Some(before),
+                    &output,
+                    applied_ranges,
+                    self.diff_options,
+                )
+            })
+        };
 
         tracing::debug!(
             "tool edit done: path={}, edit_count={}, notes={}",
@@ -1346,20 +1394,44 @@ impl EditTool {
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }
+        let private_fallback = formatted.as_ref().map(|formatted| {
+            let mut safe = result.clone();
+            safe.push_str(&replacement_excerpts(&ranges));
+            safe.push('\n');
+            safe.push_str(formatted.status);
+            if let Some(coaching) = &coaching {
+                safe = format!("{coaching}\n\n{safe}");
+            }
+            safe
+        });
         result.push_str(&excerpts);
+        if let Some(formatted) = &formatted {
+            result.push('\n');
+            result.push_str(formatted.status);
+        }
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);
         }
 
         #[cfg(feature = "lsp")]
-        if let Some(lsp) = &self.lsp {
+        if let Some(lsp) = &self.lsp
+            && formatted
+                .as_ref()
+                .is_none_or(|formatted| formatted.notify_lsp)
+        {
             let file = std::path::Path::new(&path);
             let baseline = if capability_metadata.is_some() {
                 lsp.notify_changed_relative(relative).await
             } else {
                 lsp.notify_changed(file).await
             };
-            let diagnostics = if !disclose_source {
+            let diagnostics = if !disclose_source
+                || (formatted.is_some()
+                    && !super::mutation_diff::preimage_allowed(
+                        &self.permission,
+                        &path,
+                        bound_workspace.is_some(),
+                    )) {
                 // Keep the server synchronized, but its messages may quote
                 // unchanged private source. Do not append unchecked content.
                 None
@@ -1369,11 +1441,30 @@ impl EditTool {
             } else {
                 lsp.diagnostics_block_for_edit(file, baseline).await
             };
-            if let Some(block) = diagnostics {
+            if let Some(block) = diagnostics
+                && (formatted.is_none()
+                    || super::mutation_diff::preimage_allowed(
+                        &self.permission,
+                        &path,
+                        bound_workspace.is_some(),
+                    ))
+            {
                 result.push_str(&block);
             }
         }
 
+        if formatted.is_some()
+            && (!super::mutation_diff::preimage_allowed(
+                &self.permission,
+                &path,
+                bound_workspace.is_some(),
+            ) || crate::agent::runner::current_work_scope_is_cancelled()
+                || crate::question::required().is_some())
+        {
+            result =
+                private_fallback.expect("configured formatting retains an input-only fallback");
+            diff = None;
+        }
         Ok(MutationOutcome {
             output: result,
             diff,

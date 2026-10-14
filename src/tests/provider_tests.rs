@@ -2083,3 +2083,322 @@ async fn anthropic_bearer_redirects_refuse_other_origins_and_isolated_custom_tok
         assert!(client.is_err());
     }
 }
+
+mod model_listing48_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn exchange(
+        kind: &str,
+        style: Option<ApiStyle>,
+        pages: Vec<&str>,
+    ) -> (Vec<ModelEntry>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = cfg(style);
+        config.provider_type = kind.into();
+        config.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config
+            .headers
+            .insert("x-listing-default".into(), "captured-default".into());
+        let client = create_client(
+            "listing-fixture",
+            Some("CAPTURED_LISTING_KEY"),
+            &HashMap::from([("listing-fixture".into(), config)]),
+            None,
+        )
+        .unwrap();
+        let server = async {
+            let mut calls = Vec::new();
+            for page in pages {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    assert!(bytes.len() <= 16384);
+                }
+                let call = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
+                assert!(call.starts_with("get "));
+                assert!(call.contains("x-listing-default: captured-default"));
+                assert!(call.contains("captured_listing_key"));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",page.len()).as_bytes()).await.unwrap();
+                calls.push(call);
+            }
+            calls
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (models, calls) = tokio::join!(client.list_models(), server);
+            (models.unwrap(), calls)
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn model_listing48_actual_native_auth_pages_context_and_precise_ids() {
+        let (models,calls) = exchange("anthropic",None,vec![r#"{"data":[{"id":"first","display_name":"First","max_input_tokens":64000}],"has_more":true,"last_id":"cursor&part"}"#,r#"{"data":[{"id":"claude-opus-5-5","display_name":"Opus 雪","max_input_tokens":200000,"max_tokens":64000}],"has_more":false}"#]).await;
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].id, "claude-opus-5-5");
+        assert_eq!(models[1].context_length, Some(200000));
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.contains("x-api-key: captured_listing_key")
+                    && c.contains("anthropic-version: 2023-06-01"))
+        );
+        assert!(calls[1].contains("after_id=cursor%26part"));
+        for style in [ApiStyle::Responses, ApiStyle::Completions] {
+            let (models, calls) = exchange(
+                "openai",
+                Some(style),
+                vec![r#"{"data":[{"id":"gpt-live","context_length":999999,"max_input_tokens":999999},{"id":"text-embedding-live"}]}"#],
+            )
+            .await;
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].context_length, None);
+            assert_eq!(models[0].input_price, None);
+            assert!(calls[0].contains("authorization: bearer captured_listing_key"));
+        }
+        let (models,calls) = exchange("gemini",None,vec![r#"{"models":[{"name":"models/gemini-exact-001","baseModelId":"gemini-base","inputTokenLimit":1000000,"supportedGenerationMethods":["generateContent"]}],"nextPageToken":"a+b&c"}"#,r#"{"models":[{"name":"models/embedding","supportedGenerationMethods":["embedContent"]}]}"#]).await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-exact-001");
+        assert!(calls[1].contains("pagetoken=a%2bb%26c"));
+        assert!(calls.iter().all(|c| {
+            c.lines()
+                .next()
+                .unwrap()
+                .contains("&key=captured_listing_key ")
+        }));
+        let (models, calls) = exchange(
+            "ollama",
+            None,
+            vec![r#"{"models":[{"model":"llama3.1:latest","name":"Local 雪","context_length":999999,"max_input_tokens":999999,"pricing":{"prompt":"1","completion":"2"}}]}"#],
+        )
+        .await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "llama3.1:latest");
+        assert_eq!(models[0].display, "Local 雪");
+        assert_eq!(models[0].context_length, None);
+        assert_eq!(models[0].input_price, None);
+        assert_eq!(models[0].output_price, None);
+        assert_eq!(models[0].cache_read_price, None);
+        assert_eq!(models[0].cache_write_price, None);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with("get /api/tags http/1.1\r\n"));
+        assert!(calls[0].contains("authorization: bearer captured_listing_key"));
+    }
+    #[tokio::test]
+    async fn model_listing48_repeated_cursor_oversize_and_echo_errors_are_closed() {
+        for case in ["cursor", "duplicate", "oversize", "echo", "malformed"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = cfg(None);
+            config.provider_type = "anthropic".into();
+            config.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let client = create_client(
+                "listing-negative",
+                Some("PRIVATE_LISTING_SENTINEL"),
+                &HashMap::from([("listing-negative".into(), config)]),
+                None,
+            )
+            .unwrap();
+            let server = async {
+                for index in 0..if matches!(case, "cursor" | "duplicate") {
+                    2
+                } else {
+                    1
+                } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 16384];
+                    assert!(socket.read(&mut buffer).await.unwrap() > 0);
+                    let body = if case == "cursor" {
+                        format!(
+                            r#"{{"data":[{{"id":"m{index}"}}],"has_more":true,"last_id":"repeat"}}"#
+                        )
+                    } else if case == "duplicate" {
+                        if index == 0 {
+                            r#"{"data":[{"id":"duplicate"}],"has_more":true,"last_id":"next"}"#
+                                .into()
+                        } else {
+                            r#"{"data":[{"id":"duplicate"}],"has_more":false}"#.into()
+                        }
+                    } else {
+                        "PRIVATE_LISTING_SENTINEL not json".into()
+                    };
+                    let length = if case == "oversize" {
+                        crate::provider_listing::MAX_BYTES + 1
+                    } else {
+                        body.len()
+                    };
+                    let status = if case == "echo" { 403 } else { 200 };
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+                }
+            };
+            let error = tokio::time::timeout(Duration::from_secs(3), async {
+                let (result, ()) = tokio::join!(client.list_models(), server);
+                result.err().expect("listing must fail")
+            })
+            .await
+            .unwrap();
+            assert!(!format!("{error:#}").contains("PRIVATE_LISTING_SENTINEL"));
+            assert!(error.to_string().contains(match case {
+                "cursor" => "cursor repeated",
+                "duplicate" => "duplicate model listing id",
+                "oversize" => "byte limit",
+                "echo" => "HTTP status 403",
+                _ => "invalid model listing response",
+            }));
+        }
+    }
+    #[tokio::test]
+    async fn model_listing48_whole_deadline_cancels_a_held_native_get() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = cfg(None);
+        config.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let client = create_client(
+            "held-listing",
+            Some("unused-key"),
+            &HashMap::from([("held-listing".into(), config)]),
+            None,
+        )
+        .unwrap();
+        let mut listing = Box::pin(client.list_models());
+        let (mut socket, _) = tokio::select! { result=&mut listing => panic!("premature listing: {}",result.is_ok()), accepted=listener.accept()=>accepted.unwrap() };
+        let mut bytes = [0; 8192];
+        // Continue polling the producer while the accepted peer waits for its
+        // request; retaining an unpolled send future would deadlock the fixture.
+        let count = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut listing => panic!("premature listing: {}", result.is_ok()),
+                received = socket.read(&mut bytes) => received.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(count > 0);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(
+            listing
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("deadline exceeded")
+        );
+        // Request cancellation does not promise peer TCP EOF while its shared
+        // HTTP backend remains alive. Bound the actual operation, retain/drop
+        // this held socket locally, and prove no new request is dispatched.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(socket);
+    }
+}
+
+#[tokio::test]
+async fn model_listing48_actual_entry_and_page_limits_never_return_partial_rows() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for case in ["entries", "pages"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut custom = cfg(None);
+        custom.provider_type = if case == "entries" {
+            "openai"
+        } else {
+            "anthropic"
+        }
+        .into();
+        custom.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let client = create_client(
+            "listing-cap",
+            Some("unused-local-key"),
+            &HashMap::from([("listing-cap".into(), custom)]),
+            None,
+        )
+        .unwrap();
+        let server = async {
+            for page in 0..if case == "entries" { 1 } else { 32 } {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 16384];
+                assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                let body = if case == "entries" {
+                    serde_json::json!({"data":(0..10001).map(|i|serde_json::json!({"id":format!("model-{i}")})).collect::<Vec<_>>()} ).to_string()
+                } else {
+                    serde_json::json!({"data":[{"id":format!("partial-{page}")}],"has_more":true,"last_id":format!("cursor-{page}")}).to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        };
+        let error = tokio::time::timeout(Duration::from_secs(3), async {
+            let (result, ()) = tokio::join!(client.list_models(), server);
+            result
+                .err()
+                .expect("bounded list must not succeed with partial rows")
+        })
+        .await
+        .unwrap();
+        assert!(error.to_string().contains(if case == "entries" {
+            "entry limit"
+        } else {
+            "page limit"
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_listing48_actual_redirect_keeps_captured_origin_auth_policy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let foreign = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut custom = cfg(None);
+    custom.provider_type = "anthropic".into();
+    custom.base_url = format!("http://{}", origin.local_addr().unwrap());
+    custom.headers.insert(
+        "x-private-listing-header".into(),
+        "PRIVATE_REDIRECT_SENTINEL".into(),
+    );
+    let client = create_client(
+        "listing-redirect",
+        Some("PRIVATE_REDIRECT_SENTINEL"),
+        &HashMap::from([("listing-redirect".into(), custom)]),
+        None,
+    )
+    .unwrap();
+    let server = async {
+        let (mut socket, _) = origin.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+            assert!(bytes.len() < 16384);
+        }
+        let headers = String::from_utf8(bytes).unwrap();
+        assert!(headers.starts_with("GET /v1/models?limit=1000 "));
+        assert!(headers.contains("PRIVATE_REDIRECT_SENTINEL"));
+        socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{}/models?PRIVATE_REDIRECT_SENTINEL\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", foreign.local_addr().unwrap()).as_bytes()).await.unwrap();
+    };
+    let error = tokio::time::timeout(Duration::from_secs(3), async {
+        let (result, ()) = tokio::join!(client.list_models(), server);
+        result
+            .err()
+            .expect("cross-origin listing redirect must be refused")
+    })
+    .await
+    .unwrap();
+    assert_eq!(error.to_string(), "model listing transport failed");
+    assert!(!format!("{error:#}").contains("PRIVATE_REDIRECT_SENTINEL"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), foreign.accept())
+            .await
+            .is_err()
+    );
+}

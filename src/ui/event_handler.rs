@@ -711,8 +711,17 @@ async fn start_goal_verification(
                 // `/goal pause` while it waits on its provider abandons the
                 // request rather than letting it run to an ignored verdict
                 // (mini-agent-4teup).
-                let observed =
-                    crate::spend::run::UsageObserver::with_run(spend.for_judge(&resolved, &cfg));
+                let observed = crate::spend::run::UsageObserver::with_run(
+                    spend.for_judge(
+                        &resolved,
+                        &cfg,
+                        resolved
+                            .same_provider_as_session
+                            .then(|| client.listing_key(&resolved.provider).ok())
+                            .flatten()
+                            .as_ref(),
+                    ),
+                );
                 let verdict = crate::extras::goal::driver::unless_interrupted(
                     crate::extras::goal::judge::ask_with_transcript_observed(
                         &goal,

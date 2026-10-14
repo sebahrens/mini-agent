@@ -225,3 +225,11 @@ no transport status/source chain, usage observation, or other provider decoder.
 The application fixture exercises malformed signature/redacted/type-tag events
 through real local HTTP, requires failure and zero tool effects, and checks both
 Display and Debug diagnostics without accepting an opaque completed block.
+
+## Retained HTTP backend access for bounded model metadata
+
+The immutable `Client::http_client()` getter lets mini-agent reuse the actual
+captured request endpoint/auth/version headers and configured HTTP backend for
+bounded listing GETs. It adds no client state and leaves completion request,
+streaming, native projection and cache-control semantics unchanged. The host's
+listing adapter owns pagination/body/deadline limits and redacted errors.

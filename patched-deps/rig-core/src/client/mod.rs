@@ -351,6 +351,11 @@ impl<Ext, H> Client<Ext, H> {
         &self.headers
     }
 
+    /// Borrow the retained HTTP backend without rebuilding route or credentials.
+    pub fn http_client(&self) -> &H {
+        &self.http_client
+    }
+
     /// Returns the provider extension.
     pub fn ext(&self) -> &Ext {
         &self.ext

@@ -6,7 +6,7 @@ use std::time::Duration;
 use compact_str::CompactString;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rig::agent::Agent;
-use rig::client::{CompletionClient, ModelListingClient};
+use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, Message};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 use sha2::{Digest, Sha256};
@@ -1266,21 +1266,6 @@ pub struct ModelEntry {
     pub cache_write_price: Option<f64>,
 }
 
-impl ModelEntry {
-    fn from_rig(m: &rig::model::listing::Model) -> Self {
-        Self {
-            id: m.id.clone(),
-            display: m.display_name().to_string(),
-            context_length: m.context_length,
-            kind: m.r#type.clone(),
-            input_price: None,
-            output_price: None,
-            cache_read_price: None,
-            cache_write_price: None,
-        }
-    }
-}
-
 /// Chat/completion model suitable as an agent (not embedding/image/audio/etc.)?
 pub fn is_agent_model(m: &ModelEntry) -> bool {
     if let Some(t) = m.kind.as_deref() {
@@ -1329,79 +1314,10 @@ pub fn is_agent_model(m: &ModelEntry) -> bool {
 }
 
 impl AnyClient {
-    /// Built-in providers: rig's ModelListingClient.
+    /// Bounded listing on this client's captured native route.
     pub async fn list_models(&self) -> anyhow::Result<Vec<ModelEntry>> {
-        let list = match self {
-            AnyClient::OpenAI(OpenAiClient::Responses(c)) => c.list_models().await?,
-            AnyClient::Anthropic(c) => c.list_models().await?,
-            AnyClient::OpenRouter(c) => c.list_models().await?,
-            AnyClient::Gemini(c) => c.list_models().await?,
-            AnyClient::Ollama(c) => c.list_models().await?,
-            // If any arm above does NOT impl ModelListingClient it won't compile —
-            // move it down here to the manual fallback.
-            AnyClient::OpenAI(OpenAiClient::Completions(_)) => {
-                anyhow::bail!("rig model listing unavailable for this client")
-            }
-        };
-        Ok(list.iter().map(ModelEntry::from_rig).collect())
+        self.bounded_model_listing().await
     }
-}
-
-/// Custom / OpenAI-compatible gateway: best-effort GET {base}/models.
-pub async fn list_models_manual(
-    provider_name: &str,
-    cli_key: Option<&str>,
-    custom_providers: &std::collections::HashMap<String, CustomProviderConfig>,
-    config_api_keys: Option<&std::collections::HashMap<String, String>>,
-) -> anyhow::Result<Vec<ModelEntry>> {
-    let config = resolve_provider_config(provider_name, custom_providers)?;
-    let base = config
-        .base_url
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no base_url"))?;
-    let key = AuthResolver::new(config.kind)
-        .with_cli_key(cli_key)
-        .with_env_override(config.api_key_env.as_deref())
-        .with_config_keys(config_api_keys)
-        .with_custom_provider_name(Some(provider_name))
-        .with_credential_isolation(config.credential_isolation)
-        .resolve()
-        .ok();
-    let custom = custom_providers.get(provider_name);
-    let http = build_http_client(
-        provider_name,
-        config.danger_accept_invalid_certs,
-        custom,
-        Some(&base),
-    )?;
-    let url = format!("{}/models", base.trim_end_matches('/'));
-    let mut req = http.get(url);
-    if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
-        req = req.bearer_auth(k);
-    }
-    #[derive(serde::Deserialize)]
-    struct Resp {
-        data: Vec<Item>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Item {
-        id: String,
-    }
-    let resp: Resp = req.send().await?.error_for_status()?.json().await?;
-    Ok(resp
-        .data
-        .into_iter()
-        .map(|i| ModelEntry {
-            display: i.id.clone(),
-            id: i.id,
-            context_length: None,
-            kind: None,
-            input_price: None,
-            output_price: None,
-            cache_read_price: None,
-            cache_write_price: None,
-        })
-        .collect())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1427,6 +1343,7 @@ impl OpenRouterModelInfo {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn openrouter_pricing_request(
     api_key: Option<&str>,
     custom_providers: &HashMap<String, CustomProviderConfig>,
@@ -1459,6 +1376,7 @@ pub(crate) fn openrouter_pricing_request(
     Ok(req)
 }
 
+#[cfg(test)]
 pub async fn fetch_openrouter_pricing(
     api_key: Option<&str>,
     custom_providers: &HashMap<String, CustomProviderConfig>,

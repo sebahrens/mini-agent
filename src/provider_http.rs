@@ -11,12 +11,79 @@ const _: () = assert!(rig::http_client::MINI_AGENT_HTTP_RESPONSE_SOURCE_CHAIN);
 use bytes::Bytes;
 use rig::http_client::{self, HttpClientExt, LazyBody, MultipartForm, Request, Response};
 
-#[derive(Clone, Debug, Default)]
-pub struct ProviderHttpClient(reqwest::Client);
+#[derive(Clone)]
+pub struct ProviderHttpClient(std::sync::Arc<ProviderBackend>);
+
+struct ProviderBackend {
+    client: reqwest::Client,
+    identity: std::sync::Arc<()>,
+}
+
+impl Default for ProviderHttpClient {
+    fn default() -> Self {
+        Self::new(reqwest::Client::default())
+    }
+}
+
+impl std::fmt::Debug for ProviderHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderHttpClient([REDACTED])")
+    }
+}
 
 impl ProviderHttpClient {
     pub(crate) fn new(client: reqwest::Client) -> Self {
-        Self(client)
+        Self(std::sync::Arc::new(ProviderBackend {
+            client,
+            identity: std::sync::Arc::new(()),
+        }))
+    }
+    pub(crate) fn listing_identity(&self) -> std::sync::Weak<()> {
+        std::sync::Arc::downgrade(&self.0.identity)
+    }
+
+    /// Listing GETs collect bounded bytes and never open a model usage stream.
+    pub(crate) async fn listing_get(
+        &self,
+        request: http::Request<Vec<u8>>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (parts, _) = request.into_parts();
+        anyhow::ensure!(
+            parts.method == http::Method::GET,
+            "invalid model listing request"
+        );
+        let mut response = self
+            .0
+            .client
+            .request(parts.method, parts.uri.to_string())
+            .version(parts.version)
+            .headers(parts.headers)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("model listing transport failed"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "model listing HTTP status {}",
+            response.status().as_u16()
+        );
+        anyhow::ensure!(
+            response.content_length().is_none_or(|n| n <= limit as u64),
+            "model listing byte limit exceeded"
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("model listing body failed"))?
+        {
+            anyhow::ensure!(
+                chunk.len() <= limit.saturating_sub(body.len()),
+                "model listing byte limit exceeded"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -79,6 +146,7 @@ impl HttpClientExt for ProviderHttpClient {
         let (parts, body) = request.into_parts();
         let request = self
             .0
+            .client
             .request(parts.method, parts.uri.to_string())
             .version(parts.version)
             .headers(parts.headers)
@@ -105,6 +173,7 @@ impl HttpClientExt for ProviderHttpClient {
         let (parts, body) = request.into_parts();
         let request = self
             .0
+            .client
             .request(parts.method, parts.uri.to_string())
             .version(parts.version)
             .headers(parts.headers)
@@ -131,6 +200,7 @@ impl HttpClientExt for ProviderHttpClient {
         let (parts, body) = request.into_parts();
         let request = self
             .0
+            .client
             .request(parts.method, parts.uri.to_string())
             .version(parts.version)
             .headers(parts.headers)

@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::cli::Cli;
 use crate::config::{self, Config};
-use crate::provider::{AnyClient, ModelEntry, list_models_manual};
+use crate::provider::{AnyClient, ModelEntry};
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -67,221 +68,198 @@ async fn handle_subagent_model_command(
     }
 }
 
-static MODEL_CACHE: LazyLock<Mutex<HashMap<String, Arc<[ModelEntry]>>>> =
+use crate::provider_listing::ListingKey;
+struct CachedListing {
+    models: Arc<[ModelEntry]>,
+    bytes: usize,
+}
+static MODEL_CACHE: LazyLock<Mutex<HashMap<ListingKey, CachedListing>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Bumped whenever [`MODEL_CACHE`] gains or replaces an entry, so the UI can
-/// pick up a background warm without re-reading the list on every event.
 static MODEL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Providers whose last listing failed, and when. A failed listing is not
-/// retried implicitly until [`LISTING_FAILURE_TTL`] passes (an explicit
-/// `/models refresh` always retries), so an unreachable gateway cannot stall
-/// every slash command.
-static LISTING_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> =
+static LISTING_FAILURES: LazyLock<Mutex<HashMap<ListingKey, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Providers with a background warm in flight.
-static WARMING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
+static WARMING: LazyLock<Mutex<HashSet<ListingKey>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static TICKETS: LazyLock<Mutex<HashMap<ListingKey, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 const LISTING_FAILURE_TTL: Duration = Duration::from_secs(300);
+const CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Credentials a model listing needs, owned so a background task can use them.
-#[derive(Clone)]
-pub(crate) struct ListingCredentials {
-    api_key: Option<String>,
-    custom_providers: HashMap<String, crate::config::CustomProviderConfig>,
-    api_keys: Option<HashMap<String, String>>,
+fn cache_insert(key: &ListingKey, ticket: u64, models: Arc<[ModelEntry]>) -> anyhow::Result<()> {
+    cache_insert_with_limit(key, ticket, models, CACHE_BYTES)
 }
-
-impl ListingCredentials {
-    pub(crate) fn new(cli: &Cli, cfg: &Config) -> Self {
-        Self {
-            api_key: cli.api_key.clone(),
-            custom_providers: cfg.custom_providers_map(),
-            api_keys: cfg.api_keys.clone(),
-        }
-    }
-}
-
-fn cache_insert(provider: &str, models: Arc<[ModelEntry]>) {
-    MODEL_CACHE
-        .lock()
-        .unwrap()
-        .insert(provider.to_string(), models);
-    LISTING_FAILURES.lock().unwrap().remove(provider);
+fn cache_insert_with_limit(
+    key: &ListingKey,
+    ticket: u64,
+    models: Arc<[ModelEntry]>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let tickets = TICKETS.lock().unwrap();
+    anyhow::ensure!(
+        tickets.get(key) == Some(&ticket),
+        "model listing superseded"
+    );
+    let bytes = models
+        .len()
+        .saturating_mul(std::mem::size_of::<ModelEntry>())
+        .saturating_add(
+            models
+                .iter()
+                .map(|m| {
+                    m.id.capacity()
+                        + m.display.capacity()
+                        + m.kind.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>(),
+        );
+    let mut cache = MODEL_CACHE.lock().unwrap();
+    cache.retain(|key, _| key.is_live());
+    let used = cache
+        .iter()
+        .filter(|(other, _)| *other != key)
+        .map(|(_, v)| v.bytes)
+        .sum::<usize>();
+    anyhow::ensure!(
+        bytes <= limit.saturating_sub(used),
+        "model listing cache capacity exceeded"
+    );
+    cache.insert(key.clone(), CachedListing { models, bytes });
+    LISTING_FAILURES.lock().unwrap().remove(key);
     MODEL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
-
-/// Whether a listing for `provider` failed within the TTL (as of `now`).
-fn recently_failed(provider: &str, now: Instant) -> bool {
+fn recently_failed(key: &ListingKey, now: Instant) -> bool {
     LISTING_FAILURES
         .lock()
         .unwrap()
-        .get(provider)
+        .get(key)
         .is_some_and(|failed| now.saturating_duration_since(*failed) < LISTING_FAILURE_TTL)
 }
-
-/// The cached listing or the baked catalog, without any network access.
-fn cached_or_baked(provider: &str, is_custom: bool) -> Option<Arc<[ModelEntry]>> {
-    if let Some(hit) = MODEL_CACHE.lock().unwrap().get(provider) {
-        return Some(Arc::clone(hit)); // guard dropped here, NOT across any await
+fn cached_or_baked(provider: &str, is_custom: bool, key: &ListingKey) -> Option<Arc<[ModelEntry]>> {
+    if let Some(hit) = MODEL_CACHE.lock().unwrap().get(key) {
+        return Some(hit.models.clone());
     }
-    // No cache yet: serve the baked catalog for built-in providers — no network.
     let entries = (!is_custom)
         .then(|| crate::models_catalog::catalog_entries(provider))
         .flatten()?;
-    let models: Vec<ModelEntry> = entries
-        .iter()
-        .filter(|m| crate::provider::is_agent_model(m))
-        .cloned()
-        .collect();
-    let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
-    cache_insert(provider, Arc::clone(&arc));
-    Some(arc)
+    Some(Arc::from(
+        entries
+            .iter()
+            .filter(|m| crate::provider::is_agent_model(m))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    ))
 }
-
-/// Returns the provider's models.
-///
-/// Network is only touched on `refresh`, for custom gateways, or for built-in
-/// providers that aren't baked (e.g. ollama). Baked built-ins are served from
-/// the embedded catalog with no network call — this is what keeps startup instant.
-/// A recent failure is returned without a new request unless `refresh` is set.
 pub(crate) async fn fetch_models_cached(
     provider: &str,
     is_custom: bool,
     client: &AnyClient,
-    cli: &Cli,
-    cfg: &Config,
     refresh: bool,
 ) -> anyhow::Result<Arc<[ModelEntry]>> {
+    let key = client.listing_key(provider)?;
     if !refresh {
-        if let Some(hit) = cached_or_baked(provider, is_custom) {
+        if let Some(hit) = cached_or_baked(provider, is_custom, &key) {
             return Ok(hit);
         }
-        if recently_failed(provider, Instant::now()) {
-            anyhow::bail!(
-                "model listing for {provider} failed recently; run /models refresh to retry"
-            );
+        if recently_failed(&key, Instant::now()) {
+            anyhow::bail!("model listing failed recently; run /models refresh to retry");
         }
     }
-    fetch_and_cache(
-        provider,
-        is_custom,
-        client,
-        &ListingCredentials::new(cli, cfg),
-    )
-    .await
+    fetch_and_cache(provider, client, key).await
 }
-
 async fn fetch_and_cache(
     provider: &str,
-    is_custom: bool,
     client: &AnyClient,
-    creds: &ListingCredentials,
+    key: ListingKey,
 ) -> anyhow::Result<Arc<[ModelEntry]>> {
-    let result = fetch_uncached(provider, is_custom, client, creds).await;
-    match &result {
-        Ok(models) => cache_insert(provider, Arc::clone(models)),
-        Err(_) => {
-            LISTING_FAILURES
-                .lock()
-                .unwrap()
-                .insert(provider.to_string(), Instant::now());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut tickets = TICKETS.lock().unwrap();
+        tickets.retain(|key, _| key.is_live());
+        anyhow::ensure!(
+            tickets.contains_key(&key) || tickets.len() < 64,
+            "model listing cache capacity exceeded"
+        );
+        tickets.insert(key.clone(), ticket);
+    }
+    let result = async {
+        let mut models = client.list_models().await?;
+        if !key.has_live_prices() {
+            for model in &mut models {
+                if let Some(baked) = crate::models_catalog::catalog_entries(provider)
+                    .and_then(|v| v.iter().find(|m| m.id == model.id))
+                {
+                    model.context_length = model.context_length.or(baked.context_length);
+                    model.input_price = baked.input_price;
+                    model.output_price = baked.output_price;
+                    model.cache_read_price = baked.cache_read_price;
+                    model.cache_write_price = baked.cache_write_price;
+                }
+            }
+        }
+        let models: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "model listing deadline exceeded"
+        );
+        cache_insert(&key, ticket, models.clone())?;
+        Ok(models)
+    }
+    .await;
+    if result.is_err() {
+        // A stale failure cannot suppress the latest successful route revision.
+        if TICKETS.lock().unwrap().get(&key) == Some(&ticket) {
+            let mut failures = LISTING_FAILURES.lock().unwrap();
+            failures.retain(|key, _| key.is_live());
+            failures.insert(key, Instant::now());
         }
     }
     result
 }
-
-async fn fetch_uncached(
-    provider: &str,
-    is_custom: bool,
-    client: &AnyClient,
-    creds: &ListingCredentials,
-) -> anyhow::Result<Arc<[ModelEntry]>> {
-    let mut models = if is_custom {
-        list_models_manual(
-            provider,
-            creds.api_key.as_deref(),
-            &creds.custom_providers,
-            creds.api_keys.as_ref(),
-        )
-        .await?
-    } else {
-        client.list_models().await?
-    };
-    models.retain(crate::provider::is_agent_model);
-
-    if provider == "openrouter" {
-        match crate::provider::fetch_openrouter_pricing(
-            creds.api_key.as_deref(),
-            &creds.custom_providers,
-            creds.api_keys.as_ref(),
-        )
-        .await
-        {
-            Ok(prices) => {
-                for m in &mut models {
-                    if let Some(prices) = prices.get(&m.id).and_then(|info| info.known_prices()) {
-                        m.input_price = Some(prices.0);
-                        m.output_price = Some(prices.1);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to fetch OpenRouter pricing: {e}");
-            }
-        }
-    }
-
-    Ok(Arc::from(models.into_boxed_slice()))
-}
-
-/// sync read for the picker (no await)
-pub(crate) fn cached_model_ids(provider: &str) -> Vec<String> {
-    MODEL_CACHE
-        .lock()
-        .unwrap()
-        .get(provider)
+pub(crate) fn cached_model_ids(provider: &str, is_custom: bool, client: &AnyClient) -> Vec<String> {
+    client
+        .listing_key(provider)
+        .ok()
+        .and_then(|key| cached_or_baked(provider, is_custom, &key))
         .map(|v| v.iter().map(|m| m.id.clone()).collect())
         .unwrap_or_default()
 }
-
-/// The cache generation; changes whenever a listing lands in the cache.
 pub(crate) fn model_cache_generation() -> u64 {
     MODEL_CACHE_GENERATION.load(Ordering::Relaxed)
 }
-
-/// Make sure `provider`'s models get cached without blocking the caller: a
-/// cached or baked list is used as is, a recent failure is not retried, and
-/// otherwise one background task per provider fetches the list. Read the
-/// result with [`cached_model_ids`] once [`model_cache_generation`] changes.
-pub(crate) fn warm_model_cache(
-    provider: &str,
-    is_custom: bool,
-    client: &AnyClient,
-    cli: &Cli,
-    cfg: &Config,
-) {
-    if cached_or_baked(provider, is_custom).is_some()
-        || recently_failed(provider, Instant::now())
-        || !WARMING.lock().unwrap().insert(provider.to_string())
+struct Warming(ListingKey);
+impl Drop for Warming {
+    fn drop(&mut self) {
+        WARMING.lock().unwrap().remove(&self.0);
+    }
+}
+pub(crate) fn warm_model_cache(provider: &str, is_custom: bool, client: &AnyClient) {
+    let Ok(key) = client.listing_key(provider) else {
+        return;
+    };
+    if cached_or_baked(provider, is_custom, &key).is_some() || recently_failed(&key, Instant::now())
     {
         return;
     }
-    // Outside a runtime (never in the app) there is nothing to spawn on.
-    if tokio::runtime::Handle::try_current().is_err() {
-        WARMING.lock().unwrap().remove(provider);
+    let mut warming = WARMING.lock().unwrap();
+    warming.retain(ListingKey::is_live);
+    if !warming.insert(key.clone()) {
         return;
     }
-    let provider = provider.to_string();
+    drop(warming);
+    let lease = Warming(key.clone());
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let provider = provider.to_owned();
     let client = client.clone();
-    let creds = ListingCredentials::new(cli, cfg);
     tokio::spawn(async move {
-        if let Err(error) = fetch_and_cache(&provider, is_custom, &client, &creds).await {
-            tracing::debug!("background model listing for {provider} failed: {error}");
+        let _lease = lease;
+        if let Err(error) = fetch_and_cache(&provider, &client, key).await {
+            tracing::debug!("background model listing failed: {error}");
         }
-        WARMING.lock().unwrap().remove(&provider);
     });
 }
 
@@ -292,11 +270,12 @@ pub(crate) fn resolve_model_pricing(
     provider: &str,
     model_id: &str,
     cfg: &Config,
+    source: Option<&ListingKey>,
 ) -> Option<(f64, f64)> {
-    let listing = MODEL_CACHE.lock().unwrap().get(provider).cloned();
-    resolve_model_pricing_from_listing(provider, model_id, cfg, listing.as_deref())
+    diagnostic_model_pricing(provider, model_id, cfg, source).0
 }
 
+#[cfg(test)]
 fn resolve_model_pricing_from_listing(
     provider: &str,
     model_id: &str,
@@ -310,15 +289,22 @@ pub(crate) fn diagnostic_model_pricing(
     provider: &str,
     model_id: &str,
     cfg: &Config,
+    source: Option<&ListingKey>,
 ) -> (Option<(f64, f64)>, &'static str) {
-    let Ok(cache) = MODEL_CACHE.try_lock() else {
-        return (None, "model listing cache busy or unavailable");
-    };
-    resolve_model_pricing_with_source_from_listing(
-        provider,
-        model_id,
-        cfg,
-        cache.get(provider).map(AsRef::as_ref),
+    let cache = MODEL_CACHE.lock().unwrap();
+    let listing = source
+        .filter(|key| key.is_live() && key.matches_provider(provider) && key.has_live_prices())
+        .and_then(|key| cache.get(key))
+        .map(|v| v.models.as_ref());
+    let (prices, provenance) =
+        resolve_model_pricing_with_source_from_listing(provider, model_id, cfg, listing);
+    (
+        prices,
+        if source.is_none() && provenance == "embedded catalogue" {
+            "embedded catalogue (no captured listing route)"
+        } else {
+            provenance
+        },
     )
 }
 
@@ -366,7 +352,49 @@ fn apply_model_pricing(
     ))
 }
 
-async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
+fn resolve_selected_model_capacity(
+    provider: &str,
+    model: &str,
+    cfg: &Config,
+    selected: Option<&str>,
+    source: Option<&ListingKey>,
+) -> u64 {
+    if let Some(pin) = cfg.context_window {
+        return pin;
+    }
+    let quick = config::quick_models_map(cfg);
+    if let Some(pin) = selected
+        .and_then(|name| quick.get(name))
+        .filter(|q| q.provider == provider && q.model == model)
+        .and_then(|q| q.context_window)
+    {
+        return pin;
+    }
+    if let Some(pin) = quick
+        .iter()
+        .filter(|(_, q)| q.provider == provider && q.model == model && q.context_window.is_some())
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .and_then(|(_, q)| q.context_window)
+    {
+        return pin;
+    }
+    let live = source
+        .filter(|key| key.is_live() && key.matches_provider(provider))
+        .and_then(|key| {
+            MODEL_CACHE.lock().unwrap().get(key).and_then(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .find(|m| m.id == model)
+                    .and_then(|m| m.context_length)
+            })
+        });
+    live.map(u64::from)
+        .or_else(|| Config::catalog_context_window(provider, model))
+        .unwrap_or(128_000)
+}
+
+async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str, selected_alias: Option<&str>) {
     let new_model = compact_str::CompactString::new(model_id);
     let new_agent = ctx
         .agent_build_ctx()
@@ -374,31 +402,36 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
         .await;
     *ctx.agent = Some(new_agent);
     ctx.session.model = new_model.clone();
-    ctx.session
-        .update_context_window(ctx.cfg.resolve_context_window(
-            &ctx.session.provider,
-            &new_model,
-            &crate::config::quick_models_map(ctx.cfg),
-        ));
-    let mut pricing = resolve_model_pricing(&ctx.session.provider, model_id, ctx.cfg);
+    let key = ctx.client.listing_key(&ctx.session.provider).ok();
+    let mut pricing = resolve_model_pricing(
+        &ctx.session.provider,
+        model_id,
+        ctx.cfg,
+        ctx.client.listing_key(&ctx.session.provider).ok().as_ref(),
+    );
     if pricing.is_none()
         && ctx.session.provider == "openrouter"
-        && let Ok(prices) = crate::provider::fetch_openrouter_pricing(
-            ctx.cli.api_key.as_deref(),
-            &ctx.cfg.custom_providers_map(),
-            ctx.cfg.api_keys.as_ref(),
+        && let Ok(models) = fetch_models_cached(
+            &ctx.session.provider,
+            ctx.cfg
+                .custom_providers_map()
+                .contains_key(ctx.session.provider.as_str()),
+            ctx.client,
+            true,
         )
         .await
-        && let Some(info) = prices.get(model_id)
+        && let Some(info) = models.iter().find(|m| m.id == model_id)
     {
-        pricing = info.known_prices();
-        if ctx.cfg.context_window.is_none()
-            && crate::config::Config::catalog_context_window("openrouter", model_id).is_none()
-            && let Some(cw) = info.context_length
-        {
-            ctx.session.update_context_window(cw);
-        }
+        pricing = info.input_price.zip(info.output_price);
     }
+    ctx.session
+        .update_context_window(resolve_selected_model_capacity(
+            &ctx.session.provider,
+            model_id,
+            ctx.cfg,
+            selected_alias,
+            key.as_ref(),
+        ));
     if let Some(note) = apply_model_pricing(ctx.session, model_id, pricing) {
         let _ = ctx
             .renderer
@@ -451,7 +484,14 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         pricing = costs;
     }
     let model = ctx.session.model.to_string();
-    let pricing = pricing.or_else(|| resolve_model_pricing(new_provider, &model, ctx.cfg));
+    let pricing = pricing.or_else(|| {
+        resolve_model_pricing(
+            new_provider,
+            &model,
+            ctx.cfg,
+            ctx.client.listing_key(new_provider).ok().as_ref(),
+        )
+    });
     if let Some(note) = apply_model_pricing(ctx.session, &model, pricing) {
         let _ = ctx
             .renderer
@@ -467,10 +507,12 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         ));
     ctx.rebuild_agent().await;
     ctx.session
-        .update_context_window(ctx.cfg.resolve_context_window(
+        .update_context_window(resolve_selected_model_capacity(
             new_provider,
-            &ctx.session.model,
-            &crate::config::quick_models_map(ctx.cfg),
+            &model,
+            ctx.cfg,
+            selected_alias,
+            ctx.client.listing_key(new_provider).ok().as_ref(),
         ));
     write_ok(
         ctx.renderer,
@@ -561,7 +603,7 @@ async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
         ModelTarget::Quick(name) => {
             let q = &qm[name];
             ctx.switch_client(&q.provider)?;
-            apply_model(ctx, &q.model).await;
+            apply_model(ctx, &q.model, Some(name)).await;
             // preserve v1.4.x pricing/cost tracking
             let input_price = q.resolved_prices().map(|prices| prices.0).unwrap_or(0.0);
             ctx.session.set_input_output_prices(q.resolved_prices());
@@ -578,7 +620,7 @@ async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
                 format!("  quick model {} — {}", name, quick_price_notice(q)),
             );
         }
-        ModelTarget::Raw(id) => apply_model(ctx, id).await,
+        ModelTarget::Raw(id) => apply_model(ctx, id, None).await,
     }
     Ok(())
 }
@@ -596,9 +638,10 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     }
 
     // ---- list mode (+ optional refresh) ----
-    match fetch_models_cached(&provider, is_custom, ctx.client, ctx.cli, ctx.cfg, refresh).await {
+    match fetch_models_cached(&provider, is_custom, ctx.client, refresh).await {
         Ok(models) => {
-            ctx.input.set_live_model_names(cached_model_ids(&provider));
+            ctx.input
+                .set_live_model_names(cached_model_ids(&provider, is_custom, ctx.client));
             if refresh {
                 // Explicit refresh: just confirm with a count overview — the picker
                 // already holds the full list, so don't dump it to the scrollback.
@@ -655,7 +698,26 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                         } else {
                             format!("{} ({})", m.display, m.id)
                         };
-                        write_result(ctx.renderer, format!("  {}{}", label, ctx_win));
+                        write_result(
+                            ctx.renderer,
+                            format!(
+                                "  {}{}{}",
+                                label,
+                                ctx_win,
+                                if resolve_model_pricing(
+                                    &provider,
+                                    &m.id,
+                                    ctx.cfg,
+                                    ctx.client.listing_key(&provider).ok().as_ref()
+                                )
+                                .is_none()
+                                {
+                                    "  (no price known)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        );
                     }
                     if models.len() > CAP {
                         write_result(
@@ -923,69 +985,97 @@ mod subagent_command_tests {
 #[cfg(test)]
 mod model_cache_tests {
     use super::*;
-    use clap::Parser;
-
-    fn fixtures() -> (AnyClient, Cli, Config) {
-        let client = AnyClient::OpenRouter(
-            rig::providers::openrouter::Client::builder()
-                .http_client(crate::provider_http::ProviderHttpClient::default())
-                .api_key("unused-test-key")
-                .build()
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn fixtures(address: std::net::SocketAddr) -> AnyClient {
+        crate::provider::create_client(
+            "local",
+            Some("unused-local-key"),
+            &HashMap::from([(
+                "local".into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "base_url":format!("http://{address}/v1")
+                }))
                 .unwrap(),
-        );
-        (
-            client,
-            Cli::parse_from(["mini-agent", "--api-key", "unused-test-key"]),
-            Config::default(),
+            )]),
+            None,
         )
+        .unwrap()
     }
-
     #[tokio::test]
     async fn a_failed_listing_is_not_retried_until_refresh_or_ttl() {
-        let (client, cli, cfg) = fixtures();
-        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
-        let first = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
-            .await
-            .err()
-            .expect("listing must fail");
-        assert!(!first.to_string().contains("failed recently"), "{first}");
-        assert!(recently_failed(&provider, Instant::now()));
-
-        let cached = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
-            .await
-            .err()
-            .expect("listing must fail");
-        assert!(cached.to_string().contains("failed recently"), "{cached}");
-
-        let refreshed = fetch_models_cached(&provider, true, &client, &cli, &cfg, true)
-            .await
-            .err()
-            .expect("listing must fail");
-        assert!(!refreshed.to_string().contains("failed recently"));
-
-        let later = Instant::now() + LISTING_FAILURE_TTL + Duration::from_secs(1);
-        assert!(!recently_failed(&provider, later), "the TTL expires");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = fixtures(listener.local_addr().unwrap());
+        let provider = format!("local-{}", uuid::Uuid::new_v4());
+        let key = client.listing_key(&provider).unwrap();
+        let requests = async {
+            let first = fetch_models_cached(&provider, true, &client, false)
+                .await
+                .err()
+                .expect("listing must fail");
+            assert!(!first.to_string().contains("failed recently"));
+            assert!(recently_failed(&key, Instant::now()));
+            let cached = fetch_models_cached(&provider, true, &client, false)
+                .await
+                .err()
+                .expect("listing must fail");
+            assert!(cached.to_string().contains("failed recently"));
+            let refreshed = fetch_models_cached(&provider, true, &client, true)
+                .await
+                .err()
+                .expect("listing must fail");
+            assert!(!refreshed.to_string().contains("failed recently"));
+            assert!(!recently_failed(
+                &key,
+                Instant::now() + LISTING_FAILURE_TTL + Duration::from_secs(1)
+            ));
+        };
+        let server = async {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(requests, server);
+        })
+        .await
+        .unwrap();
     }
-
     #[tokio::test]
     async fn warming_returns_immediately_and_skips_known_failures() {
-        let (client, cli, cfg) = fixtures();
-        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = fixtures(listener.local_addr().unwrap());
+        let provider = format!("local-{}", uuid::Uuid::new_v4());
+        let key = client.listing_key(&provider).unwrap();
         LISTING_FAILURES
             .lock()
             .unwrap()
-            .insert(provider.clone(), Instant::now());
-        warm_model_cache(&provider, true, &client, &cli, &cfg);
-        assert!(!WARMING.lock().unwrap().contains(&provider));
-
-        // A baked built-in catalog warms synchronously, with no task.
-        let before = model_cache_generation();
-        warm_model_cache("anthropic", false, &client, &cli, &cfg);
-        if crate::models_catalog::catalog_entries("anthropic").is_some() {
-            assert!(!cached_model_ids("anthropic").is_empty());
-            assert!(model_cache_generation() >= before);
-        }
-        assert!(!WARMING.lock().unwrap().contains("anthropic"));
+            .insert(key.clone(), Instant::now());
+        warm_model_cache(&provider, true, &client);
+        assert!(!WARMING.lock().unwrap().contains(&key));
+        let native = AnyClient::Anthropic(
+            rig::providers::anthropic::Client::builder()
+                .http_client(crate::provider_http::ProviderHttpClient::default())
+                .api_key("unused-local-key")
+                .base_url(format!("http://{}", listener.local_addr().unwrap()))
+                .build()
+                .unwrap(),
+        );
+        warm_model_cache("anthropic", false, &native);
+        assert!(!cached_model_ids("anthropic", false, &native).is_empty());
+        assert!(
+            !WARMING
+                .lock()
+                .unwrap()
+                .contains(&native.listing_key("anthropic").unwrap())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -1219,7 +1309,7 @@ mod model_pricing_tests {
         let mut session = Session::new(&provider, "previous-model", 128_000, "");
         session.input_token_cost = 7.0;
         session.output_token_cost = 19.0;
-        let pricing = resolve_model_pricing(&provider, "unknown-model", &cfg);
+        let pricing = resolve_model_pricing(&provider, "unknown-model", &cfg, None);
         let note = apply_model_pricing(&mut session, "unknown-model", pricing).unwrap();
         assert_eq!(
             (session.input_token_cost, session.output_token_cost),
@@ -1301,6 +1391,223 @@ mod model_pricing_tests {
             resolve_model_pricing_from_listing(&provider, "live", &cfg, None),
             Some((9.0, 10.0))
         );
-        assert_eq!(resolve_model_pricing("other-provider", "live", &cfg), None);
+        assert_eq!(
+            resolve_model_pricing("other-provider", "live", &cfg, None),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_listing48_cache_tests {
+    use super::*;
+    fn client(secret: &str, backend: crate::provider_http::ProviderHttpClient) -> AnyClient {
+        AnyClient::OpenRouter(
+            rig::providers::openrouter::Client::builder()
+                .api_key(secret)
+                .base_url("http://127.0.0.1:1/v1")
+                .http_client(backend)
+                .build()
+                .unwrap(),
+        )
+    }
+    fn rows(input: f64, context: u32) -> Arc<[ModelEntry]> {
+        Arc::from(
+            vec![ModelEntry {
+                id: "raw-live".into(),
+                display: "Raw 雪".into(),
+                context_length: Some(context),
+                kind: None,
+                input_price: Some(input),
+                output_price: Some(11.0),
+                cache_read_price: None,
+                cache_write_price: None,
+            }]
+            .into_boxed_slice(),
+        )
+    }
+    fn publish(key: &ListingKey, ticket: u64, rows: Arc<[ModelEntry]>) {
+        TICKETS.lock().unwrap().insert(key.clone(), ticket);
+        cache_insert(key, ticket, rows).unwrap();
+    }
+    #[test]
+    fn model_listing48_clone_identity_stale_publication_and_capacity_preserve_live_prices() {
+        let backend = crate::provider_http::ProviderHttpClient::default();
+        let first = client("PRIVATE_IDENTITY", backend.clone());
+        let same = first.clone();
+        let changed_auth = client("other", backend.clone());
+        let changed_backend = client("PRIVATE_IDENTITY", Default::default());
+        let provider = format!("cache48-{}", uuid::Uuid::new_v4());
+        let key = first.listing_key(&provider).unwrap();
+        assert_eq!(key, same.listing_key(&provider).unwrap());
+        assert_ne!(key, changed_auth.listing_key(&provider).unwrap());
+        assert_ne!(key, changed_backend.listing_key(&provider).unwrap());
+        assert!(!format!("{key:?} {backend:?}").contains("PRIVATE_IDENTITY"));
+        publish(&key, 20, rows(7.0, 64000));
+        let cfg = Config::default();
+        assert_eq!(
+            resolve_model_pricing(
+                &provider,
+                "raw-live",
+                &cfg,
+                Some(&same.listing_key(&provider).unwrap())
+            ),
+            Some((7.0, 11.0))
+        );
+        assert_eq!(
+            resolve_model_pricing(
+                &provider,
+                "raw-live",
+                &cfg,
+                Some(&changed_auth.listing_key(&provider).unwrap())
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_model_pricing(&provider, "raw-live", &cfg, None),
+            None
+        );
+        assert!(cache_insert(&key, 19, rows(99.0, 32000)).is_err());
+        assert!(cache_insert_with_limit(&key, 20, rows(99.0, 32000), 0).is_err());
+        assert_eq!(
+            resolve_model_pricing(&provider, "raw-live", &cfg, Some(&key)),
+            Some((7.0, 11.0))
+        );
+        drop(first);
+        drop(same);
+        assert!(key.is_live(), "shared configured backend remains retained");
+        drop(changed_auth);
+        drop(backend);
+        assert!(!key.is_live());
+    }
+    #[test]
+    fn model_listing48_capacity_pins_and_offline_sources_are_exact() {
+        let native = client("unused", Default::default());
+        let key = native.listing_key("openrouter").unwrap();
+        publish(&key, 42, rows(7.0, 64000));
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({"quick_models":{
+            "z":{"provider":"openrouter","model":"raw-live","context_window":90000},
+            "a":{"provider":"openrouter","model":"raw-live","context_window":80000},
+            "foreign":{"provider":"openai","model":"raw-live","context_window":70000}}}))
+        .unwrap();
+        assert_eq!(
+            resolve_selected_model_capacity("openrouter", "raw-live", &cfg, Some("z"), Some(&key)),
+            90000
+        );
+        assert_eq!(
+            resolve_selected_model_capacity("openrouter", "raw-live", &cfg, None, Some(&key)),
+            80000
+        );
+        cfg.context_window = Some(120000);
+        assert_eq!(
+            resolve_selected_model_capacity("openrouter", "raw-live", &cfg, Some("z"), Some(&key)),
+            120000
+        );
+        assert_eq!(
+            resolve_selected_model_capacity(
+                "openrouter",
+                "raw-live",
+                &Config::default(),
+                None,
+                Some(&key)
+            ),
+            64000
+        );
+        assert_eq!(
+            resolve_selected_model_capacity(
+                "openrouter",
+                "raw-live",
+                &Config::default(),
+                None,
+                None
+            ),
+            128000
+        );
+        let model = crate::models_catalog::catalog_entries("anthropic")
+            .unwrap()
+            .iter()
+            .find(|m| m.input_price.zip(m.output_price).is_some())
+            .unwrap();
+        let (price, source) =
+            diagnostic_model_pricing("anthropic", &model.id, &Config::default(), None);
+        assert_eq!(price, model.input_price.zip(model.output_price));
+        assert_eq!(source, "embedded catalogue (no captured listing route)");
+    }
+    #[cfg(feature = "goal")]
+    #[test]
+    fn model_listing48_auxiliary_capture_uses_actual_route_and_retains_original_snapshot() {
+        let root = crate::tests::OwnedTestDirectory::new("model48-price");
+        let account = crate::spend::Account::new("model48", None, 0.0).unwrap();
+        let run = crate::spend::run::Run::fixture(
+            account.clone(),
+            Arc::new(crate::spend::Ledger::new(root.path())),
+            "model48",
+            crate::spend::PriceSnapshot::capture(Some((2.0, 3.0)), Default::default(), false),
+        );
+        let native = client("unused", Default::default());
+        let key = native.listing_key("openrouter").unwrap();
+        publish(&key, 50, rows(7.0, 64000));
+        let captured = run.for_model(
+            "openrouter",
+            "raw-live",
+            &Config::default(),
+            None,
+            Some(&key),
+            crate::spend::RequestKind::Subagent,
+        );
+        assert_eq!(serde_json::to_value(captured.prices).unwrap()["input"], 7.0);
+        publish(&key, 51, rows(99.0, 32000));
+        assert_eq!(serde_json::to_value(captured.prices).unwrap()["input"], 7.0);
+        assert_eq!(serde_json::to_value(run.prices).unwrap()["input"], 2.0);
+        assert_eq!(account.snapshot().recorded_spend(), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod model_listing48_cancel_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn model_listing48_actual_cancelled_refresh_preserves_previous_complete_price_record() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = AnyClient::OpenRouter(
+            rig::providers::openrouter::Client::builder()
+                .api_key("unused-local-key")
+                .base_url(format!("http://{}", listener.local_addr().unwrap()))
+                .http_client(crate::provider_http::ProviderHttpClient::default())
+                .build()
+                .unwrap(),
+        );
+        let provider = format!("cancel48-{}", uuid::Uuid::new_v4());
+        let key = client.listing_key(&provider).unwrap();
+        let models: Arc<[ModelEntry]> = Arc::from(
+            vec![ModelEntry {
+                id: "before".into(),
+                display: "Before".into(),
+                context_length: Some(64000),
+                kind: None,
+                input_price: Some(7.0),
+                output_price: Some(11.0),
+                cache_read_price: None,
+                cache_write_price: None,
+            }]
+            .into_boxed_slice(),
+        );
+        TICKETS.lock().unwrap().insert(key.clone(), 100);
+        cache_insert(&key, 100, models.clone()).unwrap();
+        let mut refresh = Box::pin(fetch_models_cached(&provider, true, &client, true));
+        let (mut socket,_)=tokio::time::timeout(Duration::from_secs(2),async{tokio::select!{result=&mut refresh=>panic!("premature refresh: {}",result.is_ok()),peer=listener.accept()=>peer.unwrap()}}).await.unwrap();
+        let mut bytes = [0; 8192];
+        tokio::time::timeout(Duration::from_secs(2),async{tokio::select!{result=&mut refresh=>panic!("premature refresh: {}",result.is_ok()),received=socket.read(&mut bytes)=>assert!(received.unwrap()>0)}}).await.unwrap();
+        drop(refresh);
+        assert_eq!(
+            resolve_model_pricing(&provider, "before", &Config::default(), Some(&key)),
+            Some((7.0, 11.0))
+        );
+        assert!(Arc::ptr_eq(
+            &MODEL_CACHE.lock().unwrap().get(&key).unwrap().models,
+            &models
+        ));
+        drop(socket);
     }
 }

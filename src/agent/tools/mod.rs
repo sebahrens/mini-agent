@@ -4,6 +4,7 @@ pub(crate) mod concurrency;
 pub(crate) mod crc;
 pub(crate) mod edit;
 pub(crate) mod find_files;
+pub(crate) mod format_after_edit;
 pub(crate) mod grep;
 #[cfg(all(test, unix))]
 mod home_path_tests;

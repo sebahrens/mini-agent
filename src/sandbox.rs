@@ -3351,21 +3351,23 @@ impl Sandbox {
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
-        std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
-            sandbox
-                .run_built_output_command(
-                    cmd,
-                    limits,
-                    OutputCommandOptions {
-                        cancellation,
-                        audit,
-                        input,
-                        capture: None,
-                    },
-                    response_tx,
-                )
-                .await;
-        }));
+        std::mem::drop(crate::agent::runner::spawn_async_scoped(
+            crate::startup::heap_future(|| async move {
+                sandbox
+                    .run_built_output_command(
+                        cmd,
+                        limits,
+                        OutputCommandOptions {
+                            cancellation,
+                            audit,
+                            input,
+                            capture: None,
+                        },
+                        response_tx,
+                    )
+                    .await;
+            }),
+        ));
         response_rx.await.map_err(|_| {
             std::io::Error::other("command output worker stopped before returning a result")
         })

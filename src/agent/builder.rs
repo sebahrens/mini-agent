@@ -929,6 +929,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let max_grep_results = cfg.resolve_max_grep_results();
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
+        let formatter = shell_tool_enabled
+            .then(|| tools::format_after_edit::FormatAfterEdit::new(&cfg.format, sandbox.clone()))
+            .flatten();
         let write_tool = tools::WriteTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
@@ -936,7 +939,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
-        .with_diff_options(cfg.mutation_diff_options());
+        .with_diff_options(cfg.mutation_diff_options())
+        .with_formatter(formatter.clone());
         #[cfg(feature = "lsp")]
         let write_tool = write_tool.with_lsp(lsp_manager.clone());
         let edit_tool = tools::EditTool::new_with_tracker(
@@ -946,7 +950,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
-        .with_diff_options(cfg.mutation_diff_options());
+        .with_diff_options(cfg.mutation_diff_options())
+        .with_formatter(formatter.clone());
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let mut base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::new();

@@ -778,3 +778,10 @@ learned ABI, lease, scope and admission checks remain in force.
 
 Typing `?` into an empty input editor shows the keyboard help locally, including while busy.
 A `?` in a nonempty draft or pasted text stays literal; help adds no chat-history entry.
+
+`/models refresh` updates the current route's available models using bounded
+native metadata GETs (ten seconds for the entire listing). `/models` and the
+model picker then use the completed cache. Refresh does not change the active
+model, session context window or captured prices. Live-only IDs with no known
+catalogue/configured price show `(no price known)`; available IDs do not imply
+image, tool or reasoning support. Startup for baked providers remains offline.

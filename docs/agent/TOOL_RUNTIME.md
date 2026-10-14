@@ -1022,3 +1022,74 @@ per-thread guard restores its predecessor on success or unwind. Captured cursor
 and clear commands use Crossterm’s public ANSI serializer, without querying or
 executing native console commands. Native picker geometry/stdout calls and errors
 remain unchanged outside that test capture.
+
+### Live model catalogue metadata
+
+`src/provider_listing.rs` performs metadata GETs through the actual retained
+provider client. `/models refresh` supports native Anthropic, both OpenAI API
+styles, Gemini, OpenRouter and Ollama, including configured native aliases.
+The complete operation has a ten-second deadline and limits of 32 pages,
+8 MiB of response data and 10,000 entries. Invalid/repeated pagination, body
+limits and failed responses preserve the previous complete cache. Errors omit
+response bodies, credentials and endpoint values. Listing never issues a model
+completion request or grants tool, image, permission or replay capabilities.
+
+Cached results bind the actual endpoint, authentication headers and original
+configured HTTP backend; client clones share this identity. New backends and
+other routes cannot borrow its live prices. Inactive backend entries are
+pruned; bounded cache admission refuses a new oversized result rather than
+silently evicting a live route's prices. Startup retains the offline embedded
+catalogue for baked providers. Explicit refresh changes picker metadata only,
+not active session capacity, captured request prices or accounting.
+
+Anthropic `max_input_tokens` and Gemini `inputTokenLimit` supply live input
+capacity; Gemini removes the `models/` prefix once and keeps the precise
+completion model ID, listing only `generateContent` models. OpenAI model-list
+responses have no standardized capacity field, so catalogue and local pins
+remain authoritative there. Published display names are escaped and limited to
+4 KiB; oversized escaped names reject the complete refresh. Catalogue prices (including explicit zero) remain
+available; IDs without known prices show `(no price known)`. Native listing
+responses do not invent pricing. Raw model selection resolves actual-route
+OpenRouter prices, then catalogue prices, configured known prices, then
+unknown. Deliberate model selection uses a global context pin, a selected
+alias pin, a deterministic matching provider/model alias pin, matching live
+input capacity, catalogue capacity, then the existing 128k fallback. Offline
+Doctor labels catalogue pricing as lacking a captured listing route; runtime
+Doctor continues to show the session's captured rates.
+
+## Optional post-commit formatters
+
+`agent::tools::format_after_edit` implements `[format]` for native `write` and
+`edit`. The existing permission/instruction gate and guarded atomic publication
+remain the first mutation. After success, the target's read proof is invalidated
+before any formatter approval or process work. The actual builder attaches this
+service only when its registered shell capability is eligible; readonly child/BTW
+tools and CLI-excluded shell do not acquire a hidden execution surface.
+
+Templates tokenize literal argv before canonical `{file}` substitution. The
+complete reconstructed script is both the normal shell permission key and the
+executed script. Once approval and current effect admission finish, retained
+workspace, parent, file identity and content digest are revalidated before
+dispatch. The existing Sandbox output worker owns the family through termination
+and reap, with 10 seconds and a combined 1 MiB output cap. No new worker/process
+registry, grants, mount policy or CAS relaxation is introduced.
+
+Formatting preserves the original workspace/path context. It is separately
+authorized ordinary shell execution, so arbitrary formatter programs need not
+be file-local or atomic. A legitimate formatter can replace the target inode;
+a post-retirement nofollow regular-file observation validates the current target
+through the retained root/parent and bounds UTF-8 content by the smaller of the
+configured file-tool limit and an independent 8 MiB observation ceiling. This
+ceiling does not change the ordinary edit limit.
+Concurrent changes are reported only as observed final content. Missing, changed
+parent/root, oversized or non-UTF-8 observations omit stale final metadata.
+
+Success and modifying failure both use final content for replacement diffs and
+bounded excerpts before LSP notification. Each disclosure requires fresh existing
+READ-Allow, without a prompt, hook token, doom-loop count or read-tracker record.
+Private source and formatter stdout/stderr never enter results. Without a valid
+authorized snapshot, results retain caller-authored mutation success plus static
+formatter status. Dropping a cancelled tool future cannot promise a reply, but the
+original committed bytes are not rolled back and its scoped process owner retains
+the existing retirement/forced-exit contract. An empty map preserves legacy tool
+output exactly.
