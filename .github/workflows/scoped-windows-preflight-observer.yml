@@ -1,0 +1,89 @@
+name: Scoped installed Windows preflight observer
+on:
+  push:
+    branches: [codex/windows108-installed-observer-proof]
+permissions:
+  contents: read
+env:
+  RUSTFLAGS: ''
+jobs:
+  installed-preflight-observer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Bind the exact reviewed source candidate
+        shell: pwsh
+        run: |
+          $parents = @(git cat-file -p HEAD | Where-Object { $_ -like 'parent *' })
+          if ($LASTEXITCODE -ne 0 -or $parents.Count -ne 1 -or $parents[0] -ne 'parent 9dfa37b0fc309388db7ac49a3506629103d4c5e1') { throw 'Unexpected observer source parent' }
+          $expected = @{
+            'src/sandbox/windows.rs' = 'BFF1964C2263843452450830B69CFD28419DCDAA5635711537A075231E7243DC'
+            'src/sandbox/windows/preflight_witness.rs' = '463502A997768E4A17A66AB8AA6482541191E2968079E4A50C985CA146502560'
+            'src/tests/subprocess_inventory_tests.rs' = '75AD14782428664ACF12C6A1FE8693B57FE2F0CBA1A15AC48B6D72076AF68485'
+            'docs/agent/TOOL_RUNTIME.md' = '95B00005909E7688FC0A3CEBDEA5422CF19032684B3FBF581B68E662129E57F9'
+            'docs/specs/subprocess-trust.md' = 'DB7DE58E9859795EAFAC279B18FCB0C937087785D0E5195D90EAE9E9CB1C509E'
+            '.github/workflows/ci.yml' = '3C1BAF925B9A28D0A2622FB82E1261557EFB60C008C4CC6439E8C22C0E8FC615'
+            'scripts/tests/test_phase6_ci_workflow.py' = '39E21CE513C84FDB5D36E2F64D5D22F918C2A4EC9A2114DF119A21E3BA232C3C'
+          }
+          if ($expected.Count -ne 7) { throw 'Observer source set changed' }
+          $paths = @($expected.Keys | Sort-Object)
+          foreach ($path in $paths) {
+            $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            Write-Output "OBSERVER_SOURCE_BEFORE file=$path sha256=$before"
+          }
+          git -c core.autocrlf=false checkout-index --force -- @paths
+          if ($LASTEXITCODE -ne 0) { throw 'Exact observer source materialization failed' }
+          foreach ($path in $paths) {
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -ne $expected[$path]) { throw "Observer source bytes differ: $path" }
+          }
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          rustflags: ''
+      - name: Execute only the two new closed observation contracts
+        shell: pwsh
+        run: |
+          $suite = 'sandbox::windows::preflight_witness::tests::'
+          $required = @(
+            "${suite}preflight_helper_observation_decodes_only_closed_stages_and_exact_header",
+            "${suite}ordinary_launch_request_omits_observer_and_diagnostics_are_value_free"
+          )
+          $listed = @(cargo test --locked --bin mini-agent $suite -- --list 2>&1)
+          $listExit = $LASTEXITCODE
+          $listed | Write-Output
+          if ($listExit -ne 0) { throw 'Observer test discovery failed' }
+          foreach ($name in $required) {
+            if (@($listed | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -eq "${name}: test" }).Count -ne 1) { throw "Missing exact observer test: $name" }
+          }
+          if (@($listed | Where-Object { $_ -match '^sandbox::windows::preflight_witness::tests::.*: test$' }).Count -ne 2) { throw 'Unexpected observer test count' }
+          $result = @(cargo test --locked --bin mini-agent $suite -- --nocapture --test-threads=1 2>&1)
+          $testExit = $LASTEXITCODE
+          $result | Write-Output
+          if ($testExit -ne 0 -or -not ($result -match '^test result: ok\. 2 passed; 0 failed; 0 ignored;')) { throw 'Observer contracts did not execute exactly two passes' }
+      - name: Install the original default debug profile for the real preflight
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-installed-observer'
+          cargo install --locked --path . --debug --root $root
+          if ($LASTEXITCODE -ne 0) { throw 'Observer default production install failed' }
+          $binary = Join-Path $root 'bin\mini-agent.exe'
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Installed observer image absent' }
+          "OBSERVER_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "OBSERVER_BINARY_SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash)"
+      - name: Execute one original installed sandbox self-check with the observer
+        shell: pwsh
+        run: |
+          $output = @(& $env:OBSERVER_BINARY --mini-agent-windows-sandbox-runtime-check 2>&1)
+          $probeExit = $LASTEXITCODE
+          $output | Write-Output
+          if ($probeExit -ne 0) { throw "Original installed self-check failed: $probeExit" }
+          $helper = @($output | ForEach-Object { $_.ToString() } | Where-Object { $_.StartsWith('WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC ') })
+          if ($helper.Count -ne 1) { throw 'Missing exact retired helper observation' }
+          $match = [regex]::Match($helper[0], '^WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase=cleanup elapsed_ms=([0-9]{1,5})$')
+          if (-not $match.Success -or [int]$match.Groups[1].Value -gt 60000) { throw 'Successful preflight did not finish its closed helper phase' }
+          $diagnostics = @($output | ForEach-Object { $_.ToString() } | Where-Object { $_.StartsWith('WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC ') })
+          if ($diagnostics.Count -lt 1 -or $diagnostics.Count -gt 34) { throw 'Missing bounded parent diagnostics' }
+          if (-not ($diagnostics -match ' stage=finished category=available ') -or -not ($diagnostics -match ' stage=cached category=available ')) { throw 'Missing original completion/cache observations' }
+          $expected = 'WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
+          if (-not (($output -join "`n").Contains($expected))) { throw 'Original installed boundary witness absent' }
