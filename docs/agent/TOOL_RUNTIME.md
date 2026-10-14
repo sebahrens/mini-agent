@@ -1,5 +1,33 @@
 # Tool Runtime
 
+## Test-only Windows helper-phase witness
+
+`tests/fixtures/windows_phase_probe.rs` and
+`src/tests/windows_phase_witness_tests.rs` contain a finite native ownership
+experiment for the unresolved installed AppContainer self-check timeout. The
+copied, role-checked fixture uses an unnamed noninheritable 32-byte mapping with
+an immutable version/nonce and one aligned stage DWORD. The parent reads only
+after exact helper retirement. Unknown values are failed observations, never
+availability or permission authority. Production `LaunchRequest`, ordinary
+`verify_direct_command(None)`, helper launch and profile policy are unchanged.
+
+Four ignored native tests cover a known store followed by forced kill, explicit
+three-stdio handle-list target launch without the observer, whole-request and
+feeder failure retirement, and invalid-stage/absent-observer fixed-target parity.
+The last control compares this inert packet protocol; it does not claim new
+production AppContainer acceptance. Each invocation uses the original absolute
+five-second run and five-second cleanup windows. The owned feeder targets only
+its retained writer thread with `CancelSynchronousIo`, then waits for the thread
+signal before joining. Cancellation alone is not settlement. No second reader,
+generic registry, arbitrary executable or production diagnostic flag is added.
+
+The outer suspended fixture is assigned to a kill-on-close Job before resume.
+Exact leader/member signals and zero Job membership precede root removal.
+Uncertain inner cleanup fatally terminates the inert fixture instead of detaching
+owners; uncertain outer cleanup fails the native experiment without deleting the
+root. The experiment is not enabled in production and does not establish the
+cause of the original helper stall. Native Windows execution remains required.
+
 Built-in, optional, and MCP tools are collected as `ToolDyn` instances before
 the main agent is built. After command-line filtering, each registered tool is
 wrapped by `src/agent/tools/memoize.rs`. The wrapper snapshots the tool name,

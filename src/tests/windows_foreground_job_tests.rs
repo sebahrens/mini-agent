@@ -197,7 +197,7 @@ impl Drop for SuspendedFamily {
     }
 }
 
-fn unique_initial_thread(pid: u32) -> Result<Handle, String> {
+pub(super) fn unique_initial_thread(pid: u32) -> Result<Handle, String> {
     let snapshot = Handle::created(
         unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) },
         "prototype thread snapshot",

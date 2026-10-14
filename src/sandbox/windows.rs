@@ -16,6 +16,9 @@ pub(super) mod general_owner;
 #[cfg(test)]
 #[path = "../tests/windows_foreground_job_tests.rs"]
 mod general_process_prototype_tests;
+#[cfg(test)]
+#[path = "../tests/windows_phase_witness_tests.rs"]
+mod phase_witness_tests;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, c_void};

@@ -1,4 +1,7 @@
-//! Test-only native GH image. No GitHub access, shell or child launch exists here.
+//! Test-only native GH image. No GitHub access or general shell launch exists.
+//! Fixed Windows phase roles are inert ownership experiments, never production.
+#[cfg(windows)]
+mod windows_phase_probe;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -102,6 +105,38 @@ fn run() -> Result<i32, String> {
     // fixture authority must not depend on widening that production allowlist.
     if !owned_role() {
         return Ok(0);
+    }
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg.starts_with("--phase-")) {
+        let scalar = |value: &str| {
+            if value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("phase scalar refused".to_string());
+            }
+            value
+                .parse::<u64>()
+                .map_err(|_| "phase scalar refused".to_string())
+        };
+        let result = match args.as_slice() {
+            [role, case, run, cleanup] if role == "--phase-probe" => {
+                windows_phase_probe::probe(case, scalar(run)?, scalar(cleanup)?)
+            }
+            [role, mode] if role == "--phase-helper" => windows_phase_probe::helper(mode),
+            [role, handle] if role == "--phase-target" => windows_phase_probe::target(
+                usize::try_from(scalar(handle)?).map_err(|_| "phase scalar refused")?,
+            ),
+            _ => Err("phase role refused"),
+        };
+        if let Err(error) = result {
+            // Closed fixture-only categories; no argv, path, handle or payload.
+            let name = match args[0].as_str() {
+                "--phase-probe" => "phase-probe-error",
+                "--phase-helper" => "phase-helper-error",
+                "--phase-target" => "phase-target-error",
+                _ => "phase-role-error",
+            };
+            let _ = std::fs::write(name, error.as_bytes());
+        }
+        return result.map_err(String::from);
     }
     if args == ["--posthook-redact"] {
         std::fs::write("gh-posthook", "HOOK_RAN").map_err(|_| "fixture hook marker failed")?;
