@@ -523,18 +523,20 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         }
     }
 
-    let mut startup = startup::heap_future(|| {
-        startup::Startup::init(
-            cli,
-            cfg,
-            app_paths,
-            workspace,
-            is_first_startup,
-            version_changed,
-            is_interactive,
-        )
-    })
-    .await?;
+    let mut startup = Box::new(
+        startup::heap_future(|| {
+            startup::Startup::init(
+                cli,
+                cfg,
+                app_paths,
+                workspace,
+                is_first_startup,
+                version_changed,
+                is_interactive,
+            )
+        })
+        .await?,
+    );
 
     // ACP mode skips feature initialization, so validate the shared process
     // sandbox contract before entering either execution surface.

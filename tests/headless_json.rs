@@ -927,6 +927,25 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
             ][..],
             "finished",
         ),
+        // JSON dispatch also retains the startup owner while streaming and
+        // rendering its terminal result on the physical main-thread stack.
+        (
+            &[
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-session",
+                "--no-tools",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "--output",
+                "json",
+                "-p",
+                "hello",
+            ][..],
+            "finished",
+        ),
         // `--loop` assembles a goal, an agent and a round driver on the same
         // startup frame, and is dispatched down a different path from `-p`.
         #[cfg(feature = "loop")]
@@ -989,6 +1008,11 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+        if args.contains(&"json") {
+            let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(value["stop_reason"], "completed");
+            assert_eq!(value["result"], "finished");
+        }
         if args == ["--print-config"] {
             assert!(
                 stdout.contains(root.0.to_str().unwrap()),

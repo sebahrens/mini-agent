@@ -1695,7 +1695,7 @@ impl Startup {
     /// Each mode future is built on the heap by [`heap_future`], so neither its
     /// state nor its construction is reserved in this frame, which stays on the
     /// stack for the whole run.
-    pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(mut self: Box<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_workspace(self.workspace.root());
         if self.resume_override_pending {
