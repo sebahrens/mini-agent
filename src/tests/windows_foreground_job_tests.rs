@@ -251,9 +251,12 @@ fn unique_initial_thread(pid: u32) -> Result<Handle, String> {
     found.ok_or_else(|| "prototype initial thread absent".into())
 }
 
-struct Fixture(crate::tests::OwnedTestDirectory);
+pub(super) struct Fixture(crate::tests::OwnedTestDirectory);
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn path(&self) -> &Path {
+        self.0.path()
+    }
+    pub(super) fn new() -> Self {
         let root = crate::tests::OwnedTestDirectory::new("windows-foreground-job108");
         let image = std::env::var_os("MINI_AGENT_WINDOWS_GH_FIXTURE_EXE")
             .expect("guarded helper discovery required");
@@ -264,16 +267,18 @@ impl Fixture {
         std::fs::write(root.path().join("gh-mode"), b"wait").unwrap();
         Self(root)
     }
-    fn command(&self, wait_for_child: bool) -> Command {
-        let script = format!(
+    pub(super) fn command(&self, wait_for_child: bool) -> Command {
+        self.command_with_script(&self.script(wait_for_child))
+    }
+    pub(super) fn script(&self, wait_for_child: bool) -> String {
+        format!(
             "$i=[System.Diagnostics.ProcessStartInfo]::new();$i.FileName=($ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath+'\\fixture bin 雪\\gh.exe');$i.Arguments='pr create --title inert --body inert';$i.UseShellExecute=$false;$p=[System.Diagnostics.Process]::new();$p.StartInfo=$i;try{{if(-not $p.Start()){{exit 9}};{}}}finally{{$p.Dispose()}}",
             if wait_for_child {
                 "$p.WaitForExit();exit $p.ExitCode"
             } else {
                 "exit 0"
             }
-        );
-        self.command_with_script(&script)
+        )
     }
     fn command_with_script(&self, script: &str) -> Command {
         let shell = super::super::ShellCapability::resolve(
@@ -303,7 +308,7 @@ impl Fixture {
         }
         command
     }
-    async fn ready(&self) -> Handle {
+    pub(super) async fn ready(&self) -> Handle {
         let path = self.0.path().join("gh-ready.json");
         tokio::time::timeout(Duration::from_secs(10), async {
             while !path.exists() {

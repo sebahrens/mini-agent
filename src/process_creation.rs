@@ -42,6 +42,15 @@ pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
     }
 }
 
+// Read-only native test observation, never used for authorization or launch.
+// Exact ignored owner controls run serially in their owning hosted step.
+#[cfg(all(windows, test))]
+static CREATION_WAIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(windows, test))]
+pub(crate) fn creation_wait_attempts() -> u64 {
+    CREATION_WAIT_ATTEMPTS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(windows)]
 pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuard> {
     loop {
@@ -53,6 +62,8 @@ pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuar
                 return Ok(CreationGuard { _inner: guard });
             }
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                CREATION_WAIT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Release);
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -66,6 +77,26 @@ pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuar
             }
         }
     }
+}
+
+/// Hold the exact creation guard through suspended assignment and resume. The
+/// callback consumes the spawned child, including its failure cleanup owner;
+/// it cannot return an unowned child between spawn and Job association.
+#[cfg(windows)]
+pub(crate) fn launch_tokio_with_creation_guard_until<R>(
+    command: &mut TokioCommand,
+    deadline: Instant,
+    finish: impl FnOnce(TokioChild) -> Result<R, String>,
+) -> io::Result<R> {
+    let _guard = creation_guard_until(deadline)?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sandbox: general process construction deadline elapsed",
+        ));
+    }
+    let child = TokioCommand::spawn(command)?;
+    finish(child).map_err(io::Error::other)
 }
 
 pub(crate) trait StdCommandCreationExt {
@@ -114,11 +145,32 @@ impl StdCommandCreationExt for std::process::Command {
 
 pub(crate) trait TokioCommandCreationExt {
     fn spawn_guarded(&mut self) -> io::Result<TokioChild>;
+    #[cfg(windows)]
+    fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<TokioChild>;
 }
 
 impl TokioCommandCreationExt for TokioCommand {
     fn spawn_guarded(&mut self) -> io::Result<TokioChild> {
         let _guard = creation_guard()?;
+        TokioCommand::spawn(self)
+    }
+    #[cfg(windows)]
+    fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<TokioChild> {
+        let _guard = creation_guard_until(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process-creation deadline elapsed",
+            ));
+        }
+        if let Some(run) = crate::spend::run::Run::current()
+            && run.admit_effect().is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sandbox: captured spend admission refused process launch",
+            ));
+        }
         TokioCommand::spawn(self)
     }
 }

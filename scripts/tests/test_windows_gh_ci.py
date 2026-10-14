@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 import tomllib
 import unittest
-from scripts.tests.test_phase6_ci_workflow import job_body
+from scripts.tests.test_phase6_ci_workflow import WORKFLOW, job_body, top_level_split, workflow_jobs
 
 ROOT = Path(__file__).resolve().parents[2]
 STEP = "Test native Windows GH argv and actual foreground authority"
@@ -40,7 +40,7 @@ def validate_native_step(workflow):
     names = set(re.findall(r"ui::slash::git::windows_native_pr_tests::(\w+): test", body))
     if names != CASES:
         raise AssertionError("exact five acceptance cases required")
-    if body.count("if ($LASTEXITCODE -ne 0)") != 5:
+    if body.count("if ($LASTEXITCODE -ne 0)") != 6:
         raise AssertionError("each compilation/discovery/proof exit must be checked")
     if "cargo build" in body or "--release" in body or "RUST_MIN_STACK" in body:
         raise AssertionError("development policy or fixed stack boundary widened")
@@ -249,6 +249,22 @@ class WindowsGhCiTests(unittest.TestCase):
             with self.subTest(guard=before), self.assertRaises(AssertionError):
                 require_evidence(probe.replace(before, after))
 
+    def test_production_general_owner_requires_exact_native_failure_and_family_controls(self):
+        body = validate_native_step((ROOT / ".github/workflows/ci.yml").read_text())
+        guards = ["$ownerActual.Count -ne 4", "Compare-Object -ReferenceObject $ownerExpected -DifferenceObject $ownerActual", "$ownerExit -ne 0", "^test result: ok\\. 4 passed; 0 failed; 0 ignored;", "--bin mini-agent $ownerFilter -- --ignored --list", "--bin mini-agent $ownerFilter -- --ignored --nocapture --test-threads=1"]
+        def require(candidate):
+            for guard in guards:
+                if guard not in candidate:
+                    raise AssertionError("missing actual general owner native witness: " + guard)
+        require(body)
+        for guard in guards:
+            with self.subTest(guard=guard), self.assertRaises(AssertionError):
+                require(body.replace(guard, "removed owner witness"))
+        names = set(re.findall(r"general_owner::tests::(\w+): test", body))
+        self.assertEqual(names, {"windows_general_owner_cancel_and_leader_exit_signal_exact_family", "windows_general_owner_construction_failures_never_execute_and_reap_exact_child", "windows_general_owner_status_and_background_publish_only_after_family_drain", "windows_general_owner_detached_workers_recheck_captured_spend_after_actual_lock_wait"})
+        manifest = (ROOT / "Cargo.toml").read_text().split('[target.\'cfg(windows)\'.dependencies]', 1)[1].split('[target.\'cfg(windows)\'.dev-dependencies]', 1)[0]
+        self.assertIn('"Win32_System_Diagnostics_ToolHelp"', manifest)
+
     def test_missing_or_weakened_discovery_controls_are_rejected(self):
         original = (ROOT / ".github/workflows/ci.yml").read_text()
         for before, after in [
@@ -262,6 +278,81 @@ class WindowsGhCiTests(unittest.TestCase):
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 validate_native_step(original.replace(before, after))
+
+
+
+def condition_value(expression: str, event: str, scope: str, code: str) -> bool:
+    """Evaluate only the workflow's closed job-selector expression vocabulary."""
+    for operator in ("||", "&&"):
+        terms = top_level_split(expression, operator)
+        if len(terms) > 1:
+            values = [condition_value(term, event, scope, code) for term in terms]
+            return any(values) if operator == "||" else all(values)
+    if expression.startswith("(") and expression.endswith(")"):
+        return condition_value(expression[1:-1], event, scope, code)
+    if expression == "always()":
+        return True
+    match = re.fullmatch(r"(github\.event_name|inputs\.scope|needs\.changes\.outputs\.code) (==|!=) '([^']*)'", expression)
+    if match is None:
+        raise AssertionError(f"unsupported selector expression: {expression!r}")
+    actual = {"github.event_name": event, "inputs.scope": scope, "needs.changes.outputs.code": code}[match[1]]
+    return (actual == match[3]) if match[2] == "==" else (actual != match[3])
+
+
+def admitted_jobs(workflow: str, event: str, scope: str, code: str) -> set[str]:
+    admitted = set()
+    for job in workflow_jobs(workflow):
+        first = job_body(workflow, job).splitlines()[0].strip()
+        if not first.startswith("if:"):
+            if job != "changes":
+                raise AssertionError(f"unexpected unconditional job: {job}")
+            admitted.add(job)
+        elif condition_value(first[len("if: "):], event, scope, code):
+            admitted.add(job)
+    return admitted
+
+
+def validate_scope(workflow: str) -> None:
+    if admitted_jobs(workflow, "workflow_dispatch", "windows-command-family", "false") != {"changes", "windows-default-compile"}:
+        raise AssertionError("command-family dispatch must admit exactly its existing native job and change detector")
+    if admitted_jobs(workflow, "workflow_dispatch", "windows-general-sandbox", "true") != {"changes", "windows-general-sandbox-policy"}:
+        raise AssertionError("existing general-sandbox scope changed")
+    for event, scope in (("workflow_dispatch", "unknown"), ("workflow_dispatch", ""), ("push", "windows-command-family"), ("pull_request", "windows-command-family")):
+        expected = {"changes"} if event == "workflow_dispatch" else {"changes", "fmt", "ci-success"}
+        if admitted_jobs(workflow, event, scope, "false") != expected:
+            raise AssertionError("manual native admission must match the exact event and scope")
+    header = workflow.split("  push:", 1)[0]
+    if "          - windows-command-family\n" not in header or "          SCOPE: ${{ inputs.scope }}\n" not in job_body(workflow, "changes"):
+        raise AssertionError("dispatch choice and captured scope environment are required")
+    all_jobs = set(workflow_jobs(workflow))
+    for event in ("push", "pull_request", "workflow_dispatch"):
+        if admitted_jobs(workflow, event, "full", "true") != all_jobs:
+            raise AssertionError(f"full code gate changed for {event}")
+    for scope in ("windows-command-family", "windows-general-sandbox", "unknown", ""):
+        if "ci-success" in admitted_jobs(workflow, "workflow_dispatch", scope, "true"):
+            raise AssertionError("partial or unknown manual scope must not publish ci-success")
+    native_job = job_body(workflow, "windows-default-compile")
+    if "    needs: changes\n" not in native_job:
+        raise AssertionError("native job must wait for the selector")
+    validate_native_step(workflow)
+
+
+class WindowsCommandFamilyCiTests(unittest.TestCase):
+    def test_exact_scope_keeps_native_guards_and_full_event_policy(self) -> None:
+        validate_scope(WORKFLOW.read_text())
+
+    def test_selector_weakening_and_partial_aggregate_are_rejected(self) -> None:
+        workflow = WORKFLOW.read_text()
+        aggregate = job_body(workflow, "ci-success").splitlines()[0]
+        for old, new in (
+            ("(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family'))", "needs.changes.outputs.code == 'true'"),
+            ("inputs.scope == 'windows-command-family'", "inputs.scope != 'windows-general-sandbox'"),
+            (aggregate, aggregate.replace("inputs.scope == 'full'", "inputs.scope != 'windows-general-sandbox'")),
+        ):
+            with self.subTest(new=new):
+                self.assertIn(old, workflow)
+                with self.assertRaises(AssertionError):
+                    validate_scope(workflow.replace(old, new, 1))
 
 
 if __name__ == "__main__":

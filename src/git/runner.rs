@@ -596,7 +596,7 @@ impl GitRunner {
         workspace: &crate::paths::WorkspaceBinding,
         sandbox: &Sandbox,
         args: I,
-    ) -> Result<Command, String>
+    ) -> Result<crate::sandbox::ExecutionCommand, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -613,7 +613,7 @@ impl GitRunner {
         sandbox: &Sandbox,
         args: I,
         extra_env: &[(OsString, OsString)],
-    ) -> Result<Command, String>
+    ) -> Result<crate::sandbox::ExecutionCommand, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -627,7 +627,13 @@ impl GitRunner {
             .collect::<Vec<_>>();
         let mut env = git_environment().to_vec();
         env.extend_from_slice(extra_env);
-        sandbox.wrap_workspace_service(self.program.as_path(), &argv, workspace.root(), &env, true)
+        sandbox.wrap_workspace_service_for_execution(
+            self.program.as_path(),
+            &argv,
+            workspace.root(),
+            &env,
+            true,
+        )
     }
 
     /// Resolves the commit author/committer identity on the host.

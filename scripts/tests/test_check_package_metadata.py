@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -1223,6 +1224,23 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
                 repository, "mini-agent"
             ),
         )
+
+    def test_default_agent_skills_feature_cannot_disappear_from_release_readme(self) -> None:
+        repository = SCRIPT.parents[1]
+        read_text = Path.read_text
+
+        def missing_default_feature(path: Path, *args, **kwargs) -> str:
+            text = read_text(path, *args, **kwargs)
+            if path == repository / "README.md":
+                return text.replace("and `agent-skills`.", "", 1)
+            return text
+
+        with mock.patch.object(Path, "read_text", missing_default_feature):
+            errors = CHECK_PACKAGE_METADATA.validate_file_fragments(repository, "mini-agent")
+
+        self.assertEqual(1, len(errors))
+        self.assertIn("README.md is missing required text", errors[0])
+        self.assertIn("`agent-skills`", errors[0])
 
     def test_checked_in_package_recipes_install_compliance_documents(self) -> None:
         self.assertEqual(

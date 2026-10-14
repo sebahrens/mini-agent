@@ -11,6 +11,7 @@ on:
         options:
           - full
           - windows-general-sandbox
+          - windows-command-family
   push:
     branches:
       - main
@@ -59,7 +60,8 @@ jobs:
   # This fails open. Tag pushes, scheduled runs, and any event whose base
   # revision cannot be resolved (a first push, a force push, a shallow clone)
   # all report `code=true` and get the full matrix. Skipping work is only ever
-  # the result of a diff we successfully computed.
+  # the result of a diff we successfully computed, or the explicit manual
+  # windows-command-family scope below (which never publishes ci-success).
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -74,6 +76,7 @@ jobs:
         id: filter
         env:
           EVENT: ${{ github.event_name }}
+          SCOPE: ${{ inputs.scope }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         shell: bash
@@ -85,6 +88,14 @@ jobs:
             echo "Running the full matrix: $1"
             exit 0
           }
+
+          # This explicit manual scope runs only the existing native command
+          # job. Every other event/scope retains the fail-open classification.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${SCOPE:-}" = "windows-command-family" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Running only the Windows command-family proof."
+            exit 0
+          fi
 
           case "$EVENT" in
             schedule|workflow_dispatch) run_everything "event is $EVENT" ;;
@@ -135,7 +146,7 @@ jobs:
           fi
 
   fmt:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -612,7 +623,7 @@ jobs:
         run: cargo test --locked
 
   windows-default-compile:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family')) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
@@ -701,6 +712,22 @@ jobs:
             $prototypeExit = $LASTEXITCODE
             $prototypeResult | ForEach-Object { Write-Host $_ }
             if ($prototypeExit -ne 0 -or -not ($prototypeResult -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) { throw 'Suspended general Job native prototype failed' }
+            $ownerFilter = 'sandbox::windows::general_owner::tests::'
+            $ownerListing = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $ownerFilter -- --ignored --list)
+            if ($LASTEXITCODE -ne 0) { throw 'General process owner discovery failed' }
+            $ownerActual = @($ownerListing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^sandbox::windows::general_owner::tests::.*: test$' } | Sort-Object)
+            $ownerExpected = @(
+              'sandbox::windows::general_owner::tests::windows_general_owner_cancel_and_leader_exit_signal_exact_family: test'
+              'sandbox::windows::general_owner::tests::windows_general_owner_construction_failures_never_execute_and_reap_exact_child: test'
+              'sandbox::windows::general_owner::tests::windows_general_owner_detached_workers_recheck_captured_spend_after_actual_lock_wait: test'
+              'sandbox::windows::general_owner::tests::windows_general_owner_status_and_background_publish_only_after_family_drain: test'
+            ) | Sort-Object
+            $ownerDifference = @(Compare-Object -ReferenceObject $ownerExpected -DifferenceObject $ownerActual)
+            if ($ownerActual.Count -ne 4 -or $ownerDifference.Count -ne 0) { throw 'Expected exact four production general process owner controls' }
+            $ownerResult = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $ownerFilter -- --ignored --nocapture --test-threads=1)
+            $ownerExit = $LASTEXITCODE
+            $ownerResult | ForEach-Object { Write-Host $_ }
+            if ($ownerExit -ne 0 -or -not ($ownerResult -match '^test result: ok\. 4 passed; 0 failed; 0 ignored;')) { throw 'General process ownership proof failed' }
             & cargo test --locked --no-default-features --features $features --bin mini-agent $filter -- --ignored --nocapture --test-threads=1
             if ($LASTEXITCODE -ne 0) { throw 'Native Windows GH argv/result/Job proof failed' }
           } finally {
@@ -2692,7 +2719,7 @@ jobs:
   # scripts/ci_success.py owns that decision and its tests. Adding a job to this
   # workflow without adding it here fails scripts.tests.test_phase6_ci_workflow.
   ci-success:
-    if: always() && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: always() && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
     needs:
       - changes
       - fmt

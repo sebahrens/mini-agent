@@ -796,6 +796,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "let child = cmd.spawn()?;",
+        1,
+        "TC-LIFECYCLE-HELPER",
+    ),
     // reqwest response status is HTTP metadata, never a process terminal.
     (
         "src/update.rs",
@@ -865,7 +877,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "std::mem::drop(runtime.spawn(async move {",
+        "std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {",
         1,
         "NON-PROCESS",
     ),
@@ -1396,6 +1408,36 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "use tokio::process::{Child, Command};",
         1,
         "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = Command::new(\"inert-command-108\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = Command::new(\"inert-helper-108\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert!(!ExecutionCommand::from(Command::new(\"inert-helper-108\")).helper_owns_tree());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        "use tokio::process::{Child as TokioChild, Command as TokioCommand};",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        "let mut command = TokioCommand::new(\"powershell.exe\");",
+        5,
+        "TEST-ONLY",
     ),
     ("src/sandbox/worker.rs", ".spawn()", 1, "TEST-ONLY"),
     (
@@ -3698,10 +3740,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "53b45424ea372be94559be65c6f1ac40932431c7093e9cfe824d256dc55454ec",
-                1,
-            ),
-            (
                 "5eeb4ebba574fc8359881819f6b7d27f879be4b7a64a5993cc4b89429e7d5831",
                 1,
             ),
@@ -3722,15 +3760,24 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "d4ee4a31960023c4dca62084241f8e7e0e63866d5367a3c02886b4c0a29bb428",
-                1,
-            ),
-            (
                 "dac84961f14ecf95f7c7977967ca0956483de20be39a59e3e535972c86df536d",
                 1,
             ),
+        ],
+    ),
+    (
+        "src/extras/skills/selection.rs",
+        &[
             (
                 "e134a67930eed0c8e0c1a02bcac6efda89c87f216b2f1a438a90737d63907acb",
+                1,
+            ),
+            (
+                "53b45424ea372be94559be65c6f1ac40932431c7093e9cfe824d256dc55454ec",
+                1,
+            ),
+            (
+                "d4ee4a31960023c4dca62084241f8e7e0e63866d5367a3c02886b4c0a29bb428",
                 1,
             ),
             (
@@ -3867,6 +3914,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/sandbox.rs",
         &[
+            (
+                "5aac039070f3564d9fbd695b02011940968a7ef00c1bc7dbb31f56a7ab5aa89f",
+                1,
+            ),
+            (
+                "be15ad15d5bdb6dd8980fa2cdad4e8ad377d08ab4b6efbf79303765ad5b4ab82",
+                1,
+            ),
             // Exact macro contexts for the two new native Seatbelt tests.
             // Native bwrap alias-refusal stderr predicates read CommandOutput data.
             (
@@ -3911,14 +3966,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "d41de9f2559c59c3403416bf0fc72407b08c084cbe2d3086af0e0e4cf4e42c05",
-                1,
-            ),
-            (
-                "1be8b9a093e8b907b6122b21db33a9b30571b75c96e87c7908f804bea7d99d06",
-                1,
-            ),
-            (
-                "c2f73c6bf16b04844a46c0a7239dbf486bedb5b09f3b287f895e6d033d7ce652",
                 1,
             ),
             (
@@ -4172,11 +4219,6 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut child = match cmd.spawn() {",
-        &["TC-LIFECYCLE-HELPER", "TC-SUPPORT-UTILITY"],
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(zerobox);",
         &["TC-MODEL-ACTION", "TC-PROJECT-AUTOMATION", "TC-MCP-STDIO"],
     ),
@@ -4216,6 +4258,48 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
         1,
         "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "let child = cmd.spawn()?;",
+        1,
+        "TC-LIFECYCLE-HELPER",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = Command::new(\"inert-command-108\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = Command::new(\"inert-helper-108\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert!(!ExecutionCommand::from(Command::new(\"inert-helper-108\")).helper_owns_tree());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        "use tokio::process::{Child as TokioChild, Command as TokioCommand};",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows/general_owner.rs",
+        "let mut command = TokioCommand::new(\"powershell.exe\");",
+        5,
+        "TEST-ONLY",
     ),
     (
         "src/context/commands.rs",
@@ -4380,7 +4464,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "std::mem::drop(runtime.spawn(async move {",
+        "std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {",
         1,
         "NON-PROCESS",
     ),
@@ -4936,11 +5020,6 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut child = match cmd.spawn() {",
-        &["TC-LIFECYCLE-HELPER", "TC-SUPPORT-UTILITY"],
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(zerobox);",
         &["TC-MODEL-ACTION", "TC-PROJECT-AUTOMATION", "TC-MCP-STDIO"],
     ),
@@ -5341,6 +5420,8 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
             1,
         ),
         ("spawn_guarded|TokioCommand::spawn(self)".to_string(), 1),
+        ("spawn_guarded_until|TokioCommand::spawn(self)".to_string(), 1),
+        ("launch_tokio_with_creation_guard_until|let child = TokioCommand::spawn(command)?;".to_string(), 1),
         (
             "spawn_guarded|process_wrap::tokio::CommandWrap::spawn(self)".to_string(),
             1,

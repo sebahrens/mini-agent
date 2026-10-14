@@ -19,6 +19,8 @@ non-process data in the checked inventory. The shared instruction compositor mov
 inert `String` formatting macros from learned `turn.rs` to `extras/skills/selection.rs`;
 these exact output identifiers are non-process sites. No process dispatcher or
 scanner exemption is added, and existing process negative controls stay unchanged.
+Both lexical and Windows creation-boundary inventories retain the exact four
+formatting macro digests/counts under their new `selection.rs` owner.
 
 ## Windows journal-publication regression inventory
 
@@ -668,3 +670,22 @@ usage fields and renderer text are classified by exact source line and complete
 macro digest/count; they do not create a process. No inventory scanner or
 unknown-context negative control is weakened. All HTTP fixture threads retain
 their existing bounded timeout, stop flag and unconditional join ownership.
+
+#### General Windows command ownership (.108)
+
+The new `src/sandbox/windows/general_owner.rs` module implements the ordinary
+`TC-MODEL-ACTION` execution family owner; shared captured/status/background and
+trusted internal Git callers retain their existing authorization classes. The
+crate creation boundary has two additional exact Tokio terminals: the deadline
+variant and `launch_tokio_with_creation_guard_until`. The latter retains its
+creation guard through the suspended child ownership callback, assignment,
+registration and checked resume. It is not a raw-launch exemption.
+
+The exact inventory removes two old inline sandbox spawn expressions now routed
+through that shared boundary, classifies inert carrier/PowerShell fixtures as
+`TEST-ONLY`, and updates the full select-macro fingerprints for status data.
+No scanner or negative-control exemption is broadened. Failed family retirement
+retains its owner and fails closed; it never becomes a direct-child-only success.
+The separate broker-only worker, AppContainer helper and trusted hook service
+ownership contracts remain distinct. See `docs/agent/TOOL_RUNTIME.md` for the
+bounded native membership-fence evidence and pending production acceptance.

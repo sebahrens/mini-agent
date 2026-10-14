@@ -37,6 +37,64 @@ type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
 type SeatbeltProfileKey = (String, String, String, String, bool);
 type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
+#[cfg(windows)]
+type GeneralOwnerMap = Arc<Mutex<HashMap<u32, Arc<windows::general_owner::GeneralOwner>>>>;
+
+/// The actual authoring boundary of a general execution command. In
+/// particular, a disabled sandbox named `appcontainer` is still a plain
+/// process; a backend label is not evidence that a helper owns descendants.
+#[derive(Debug)]
+pub struct ExecutionCommand {
+    command: Command,
+    boundary: ExecutionBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionBoundary {
+    General,
+    #[cfg(windows)]
+    AppContainerHelper,
+}
+
+impl From<Command> for ExecutionCommand {
+    fn from(command: Command) -> Self {
+        Self {
+            command,
+            boundary: ExecutionBoundary::General,
+        }
+    }
+}
+
+impl std::ops::Deref for ExecutionCommand {
+    type Target = Command;
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl std::ops::DerefMut for ExecutionCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+impl ExecutionCommand {
+    #[cfg(windows)]
+    fn appcontainer_helper(command: Command) -> Self {
+        Self {
+            command,
+            boundary: ExecutionBoundary::AppContainerHelper,
+        }
+    }
+
+    fn helper_owns_tree(&self) -> bool {
+        match self.boundary {
+            ExecutionBoundary::General => false,
+            #[cfg(windows)]
+            ExecutionBoundary::AppContainerHelper => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Sandbox {
@@ -58,6 +116,8 @@ pub struct Sandbox {
     windows_appcontainer_read_roots: Vec<PathBuf>,
     windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
+    #[cfg(windows)]
+    general_owners: GeneralOwnerMap,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     background_jobs: Arc<BackgroundJobsInner>,
     /// Lazily captured environment snapshot shared by all clones.
@@ -1141,6 +1201,8 @@ pub(crate) struct ProcessGroupGuard {
     /// may hand the number to an unrelated process, so cleanup must first
     /// confirm the group is still live (mini-agent-7xrej.1).
     leader_reaped: bool,
+    #[cfg(windows)]
+    general: Option<(Arc<windows::general_owner::GeneralOwner>, GeneralOwnerMap)>,
 }
 
 struct OutputCommandLifecycleGuard {
@@ -1224,7 +1286,19 @@ impl ProcessGroupGuard {
             pid,
             active_groups,
             leader_reaped: false,
+            #[cfg(windows)]
+            general: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn with_general(
+        mut self,
+        owner: Option<Arc<windows::general_owner::GeneralOwner>>,
+        owners: GeneralOwnerMap,
+    ) -> Self {
+        self.general = owner.map(|owner| (owner, owners));
+        self
     }
 
     /// Records that the owner has reaped the group leader, so any later
@@ -1234,6 +1308,19 @@ impl ProcessGroupGuard {
     }
 
     pub(crate) fn disarm(&mut self) {
+        #[cfg(windows)]
+        if let Some((owner, owners)) = &self.general {
+            // Keep failed retirement capabilities in this Sandbox's owner
+            // catalogue; failure is not proof that the family settled.
+            if owner.retire().is_ok() {
+                owners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&owner.pid());
+            } else {
+                return;
+            }
+        }
         if let Some(pid) = self.pid.take() {
             self.active_groups
                 .lock()
@@ -1243,10 +1330,57 @@ impl ProcessGroupGuard {
     }
 
     fn terminate_owned_group(&self) {
+        #[cfg(windows)]
+        if let Some((owner, _)) = &self.general {
+            owner.request_stop();
+            if let Err(error) = owner.retire() {
+                tracing::warn!("{error}");
+            }
+            return;
+        }
         if let Some(pid) = self.pid {
             signal_owned_group(pid, self.leader_reaped);
         }
     }
+
+    async fn retire_general(&self) -> Option<bool> {
+        #[cfg(windows)]
+        if let Some((owner, _)) = &self.general {
+            let owner = owner.clone();
+            return Some(
+                match crate::agent::runner::spawn_blocking_scoped(move || owner.retire()).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        tracing::warn!("{error}");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!("sandbox: general family retirement worker failed");
+                        false
+                    }
+                },
+            );
+        }
+        None
+    }
+
+    fn general_retirement_failed(&self) -> bool {
+        #[cfg(windows)]
+        if let Some((owner, _)) = &self.general {
+            return owner.failed_retirement();
+        }
+        false
+    }
+}
+
+async fn wait_for_general_cancellation(guard: &ProcessGroupGuard) {
+    #[cfg(windows)]
+    if let Some((owner, _)) = &guard.general {
+        owner.cancelled().await;
+        return;
+    }
+    let _ = guard;
+    std::future::pending::<()>().await;
 }
 
 /// Signals a guard's group: unconditionally while the leader is unreaped
@@ -1267,6 +1401,12 @@ fn signal_owned_group(pid: u32, leader_reaped: bool) {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.general.is_some() {
+            self.terminate_owned_group();
+            self.disarm();
+            return;
+        }
         if let Some(pid) = self.pid.take() {
             self.active_groups
                 .lock()
@@ -1303,12 +1443,17 @@ impl Drop for OutputCommandLifecycleGuard {
         // cleanup-before-audit-before-accounting order as the normal path.
         self.process.terminate_owned_group();
         if let Some(audit) = self.audit.take() {
+            let failed = self.process.general_retirement_failed();
             audit.emit(&CommandOutput {
                 exit_status: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-                status: CommandStatus::Cancelled,
-                descendants_escaped: false,
+                status: if failed {
+                    CommandStatus::Failed
+                } else {
+                    CommandStatus::Cancelled
+                },
+                descendants_escaped: failed,
             });
         }
         self.process.disarm();
@@ -1417,6 +1562,8 @@ impl Sandbox {
             windows_appcontainer_read_roots: Vec::new(),
             windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(windows)]
+            general_owners: Arc::new(Mutex::new(HashMap::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
@@ -1930,7 +2077,7 @@ impl Sandbox {
         Ok(profile)
     }
 
-    pub fn wrap_command(&self, command: &str) -> Result<Command, String> {
+    pub fn wrap_command(&self, command: &str) -> Result<ExecutionCommand, String> {
         self.wrap_command_inner(command)
     }
 
@@ -1939,7 +2086,7 @@ impl Sandbox {
     pub(crate) fn wrap_command_with_executable_snapshot(
         &self,
         arguments: &[String],
-    ) -> Result<Command, String> {
+    ) -> Result<ExecutionCommand, String> {
         if let Some(workspace) = &self.workspace_binding {
             workspace.validate()?;
         }
@@ -1960,7 +2107,9 @@ impl Sandbox {
                 .to_string()
         })?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root)?;
-        Ok(self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata))
+        Ok(self
+            .build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata)
+            .into())
     }
 
     #[cfg(feature = "js")]
@@ -1975,7 +2124,7 @@ impl Sandbox {
         }
     }
 
-    fn wrap_command_inner(&self, command: &str) -> Result<Command, String> {
+    fn wrap_command_inner(&self, command: &str) -> Result<ExecutionCommand, String> {
         if let Some(workspace) = &self.workspace_binding {
             workspace.validate()?;
         }
@@ -2007,7 +2156,7 @@ impl Sandbox {
                 }
                 configure_new_session_child_lifetime(&mut cmd);
                 self.bind_workspace_cwd(&mut cmd)?;
-                return Ok(cmd);
+                return Ok(cmd.into());
             }
             SandboxPolicy::RequiredButUnavailable => {
                 return Err(format!(
@@ -2034,7 +2183,8 @@ impl Sandbox {
                 &cache_dir,
                 &self.windows_appcontainer_read_roots,
                 &self.windows_appcontainer_write_roots,
-            );
+            )
+            .map(ExecutionCommand::appcontainer_helper);
         }
 
         if self.backend == "zerobox" {
@@ -2049,7 +2199,7 @@ impl Sandbox {
             })?;
             let mut cmd = self.build_zerobox_shell_command(zerobox, command, &cwd);
             self.bind_workspace_cwd(&mut cmd)?;
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
 
         let cache_dir = self.get_cached_cache_dir()?;
@@ -2069,7 +2219,7 @@ impl Sandbox {
                 command.current_dir("/");
             }
             self.bind_workspace_cwd(&mut command)?;
-            return Ok(command);
+            return Ok(command.into());
         }
 
         let bwrap = bwrap_path().ok_or_else(|| {
@@ -2080,7 +2230,7 @@ impl Sandbox {
             bwrap_git_metadata_binds(bwrap, &self.canonical_workspace_root(&requested_cwd)?)?;
         let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata);
         self.bind_workspace_cwd(&mut command)?;
-        Ok(command)
+        Ok(command.into())
     }
 
     /// Builds the model-action shell command under the `zerobox` backend.
@@ -2305,6 +2455,19 @@ impl Sandbox {
         env: &[(OsString, OsString)],
         deny_network: bool,
     ) -> Result<Command, String> {
+        self.wrap_workspace_service_for_execution(program, args, cwd, env, deny_network)
+            .map(|execution| execution.command)
+    }
+
+    #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
+    pub(crate) fn wrap_workspace_service_for_execution(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        deny_network: bool,
+    ) -> Result<ExecutionCommand, String> {
         match self.policy() {
             SandboxPolicy::Disabled => {
                 return Err("workspace-service sandbox must be explicitly requested".to_string());
@@ -2332,7 +2495,8 @@ impl Sandbox {
                     &cache_dir,
                     &self.windows_appcontainer_read_roots,
                     &self.windows_appcontainer_write_roots,
-                );
+                )
+                .map(ExecutionCommand::appcontainer_helper);
             }
             return Err(
                 "Windows workspace-service launch without network denial is unsupported".into(),
@@ -2373,7 +2537,7 @@ impl Sandbox {
             }
             cmd.arg(program).args(args).current_dir(&cwd);
             configure_new_session_child_lifetime(&mut cmd);
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
 
         if self.backend == "zerobox" {
@@ -2397,7 +2561,7 @@ impl Sandbox {
                 .args(args)
                 .current_dir(&cwd);
             configure_new_session_child_lifetime(&mut cmd);
-            return Ok(cmd);
+            return Ok(cmd.into());
         }
 
         let bwrap = bwrap_path().ok_or_else(|| {
@@ -2414,7 +2578,8 @@ impl Sandbox {
             env,
             deny_network,
             git_metadata,
-        ))
+        )
+        .into())
     }
 
     /// Builds the bubblewrap arm of [`Self::wrap_workspace_service`] from an
@@ -2521,7 +2686,7 @@ impl Sandbox {
         &self,
         program: &Path,
         arguments: &[String],
-    ) -> Result<Command, String> {
+    ) -> Result<ExecutionCommand, String> {
         if self.policy() != SandboxPolicy::RequiredAndAvailable || self.backend != "appcontainer" {
             return Err("Windows direct process launch requires the AppContainer sandbox".into());
         }
@@ -2545,6 +2710,7 @@ impl Sandbox {
             &self.windows_appcontainer_read_roots,
             &self.windows_appcontainer_write_roots,
         )
+        .map(ExecutionCommand::appcontainer_helper)
     }
 
     fn build_seatbelt_command(
@@ -2783,11 +2949,12 @@ impl Sandbox {
             cwd,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
         };
-        tokio::spawn(async move {
+        let run = crate::spend::run::Run::current();
+        tokio::spawn(crate::spend::run::scope(run, async move {
             sandbox
-                .run_built_status_command(cmd, limits, audit, response_tx)
+                .run_built_status_command(cmd.into(), limits, audit, response_tx)
                 .await;
-        });
+        }));
         response_rx.await.map_err(|_| {
             std::io::Error::other("support command worker stopped before returning a result")
         })
@@ -2853,7 +3020,10 @@ impl Sandbox {
         let owner = Arc::downgrade(&self.background_jobs);
         let sandbox = self.detached_background_sandbox();
         let task_id = id.clone();
-        std::mem::drop(runtime.spawn(async move {
+        // Keep only the captured spend account: intentional background jobs
+        // retain their independent cancellation/lifetime policy.
+        let run = crate::spend::run::Run::current();
+        std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {
             let terminal = match sandbox
                 .run_background_command(command, timeout, &cancellation, capture)
                 .await
@@ -2868,7 +3038,8 @@ impl Sandbox {
                 },
             };
             finish_background_job(&owner, &task_id, terminal);
-        }));
+        })));
+
         Ok(id)
     }
 
@@ -3096,10 +3267,10 @@ impl Sandbox {
 
     pub(crate) async fn output_built_command_with_limits(
         &self,
-        cmd: Command,
+        cmd: impl Into<ExecutionCommand>,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
-        self.output_built_command_with_limits_scoped(cmd, limits, None, None, None)
+        self.output_built_command_with_limits_scoped(cmd.into(), limits, None, None, None)
             .await
     }
 
@@ -3124,11 +3295,11 @@ impl Sandbox {
     #[cfg(any(feature = "git-worktree", test))]
     pub(crate) async fn output_built_command_with_input_and_limits(
         &self,
-        cmd: Command,
+        cmd: impl Into<ExecutionCommand>,
         input: Vec<u8>,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
-        self.output_built_command_with_limits_scoped(cmd, limits, None, None, Some(input))
+        self.output_built_command_with_limits_scoped(cmd.into(), limits, None, None, Some(input))
             .await
     }
 
@@ -3138,7 +3309,7 @@ impl Sandbox {
     #[cfg(feature = "js")]
     pub(crate) async fn output_built_command_with_limits_cancelled(
         &self,
-        cmd: Command,
+        cmd: impl Into<ExecutionCommand>,
         limits: CommandLimits,
         cancellation: &CommandCancellation,
     ) -> std::io::Result<CommandOutput> {
@@ -3152,7 +3323,7 @@ impl Sandbox {
             });
         }
         self.output_built_command_with_limits_scoped(
-            cmd,
+            cmd.into(),
             limits,
             Some(cancellation.subscribe()),
             None,
@@ -3163,7 +3334,7 @@ impl Sandbox {
 
     async fn output_built_command_with_limits_scoped(
         &self,
-        cmd: Command,
+        cmd: ExecutionCommand,
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
         audit: Option<OwnedExplicitShellAudit>,
@@ -3191,13 +3362,93 @@ impl Sandbox {
         })
     }
 
+    fn spawn_execution_command(
+        &self,
+        cmd: &mut ExecutionCommand,
+        deadline: tokio::time::Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<(Child, ProcessGroupGuard)> {
+        #[cfg(windows)]
+        {
+            if !cmd.helper_owns_tree() {
+                let previous: Vec<_> = self
+                    .general_owners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
+                if previous.iter().any(|owner| owner.failed_retirement()) {
+                    return Err(std::io::Error::other(
+                        "sandbox: an earlier general family has not proved retirement",
+                    ));
+                }
+                let mut guard = None;
+                let result = windows::general_owner::GeneralOwner::launch(
+                    &mut cmd.command,
+                    deadline.into_std(),
+                    cancelled,
+                    |owner| {
+                        let mut owners = self
+                            .general_owners
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if owners.contains_key(&owner.pid()) {
+                            return Err(
+                                "sandbox: general process registration identity already retained"
+                                    .into(),
+                            );
+                        }
+                        owners.insert(owner.pid(), owner.clone());
+                        drop(owners);
+                        guard = Some(
+                            ProcessGroupGuard::new(Some(owner.pid()), self.active_groups.clone())
+                                .with_general(Some(owner), self.general_owners.clone()),
+                        );
+                        Ok(())
+                    },
+                );
+                return match result {
+                    Ok((child, _)) => Ok((
+                        child,
+                        guard.expect("owner registered before successful resume"),
+                    )),
+                    Err(error) => {
+                        // Registration guard owns both setup failure and unwind
+                        // before any child can execute. Failed retirement stays
+                        // captured in the Sandbox instead of removing authority.
+                        drop(guard);
+                        Err(std::io::Error::other(error))
+                    }
+                };
+            }
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "command cancelled before helper launch",
+                ));
+            }
+            let child = cmd.spawn_guarded_until(deadline.into_std())?;
+            let guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
+            return Ok((child, guard));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (deadline, cancelled);
+            let child = cmd.spawn_guarded()?;
+            let guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
+            Ok((child, guard))
+        }
+    }
+
     async fn run_built_output_command(
         &self,
-        mut cmd: Command,
+        mut cmd: ExecutionCommand,
         limits: CommandLimits,
         options: OutputCommandOptions,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
+        let deadline = tokio::time::Instant::now() + limits.timeout;
         let OutputCommandOptions {
             mut cancellation,
             audit,
@@ -3228,8 +3479,16 @@ impl Sandbox {
             // Captured/model-authored commands never own the user's terminal.
             cmd.stdin(Stdio::null());
         }
-        let mut child = match cmd.spawn_guarded() {
-            Ok(child) => child,
+        let helper_owns_tree = cmd.helper_owns_tree();
+        let (mut child, process) = match self.spawn_execution_command(&mut cmd, deadline, || {
+            cancellation
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow())
+                || response_tx.is_closed()
+                || crate::agent::runner::current_work_cancellation()
+                    .is_some_and(|cancel| cancel.is_cancelled())
+        }) {
+            Ok(spawned) => spawned,
             Err(error) => {
                 let output = CommandOutput {
                     exit_status: None,
@@ -3253,10 +3512,7 @@ impl Sandbox {
                 let _ = stdin.write_all(&input).await;
             });
         }
-        let mut lifecycle = OutputCommandLifecycleGuard::new(
-            ProcessGroupGuard::new(child.id(), self.active_groups.clone()),
-            audit,
-        );
+        let mut lifecycle = OutputCommandLifecycleGuard::new(process, audit);
         let captured = capture.unwrap_or_else(SharedCommandCapture::bounded);
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
         let stdout_handle = spawn_bounded_pipe_reader(
@@ -3277,9 +3533,10 @@ impl Sandbox {
         let termination = tokio::select! {
             biased;
             _ = wait_for_command_cancellation(cancellation.as_mut()) => CommandTermination::Cancelled,
+            _ = wait_for_general_cancellation(&lifecycle.process) => CommandTermination::Cancelled,
             // If executor starvation makes both branches ready, the elapsed deadline must win.
             // Otherwise an over-budget child can be reported as a successful completion.
-            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
+            _ = tokio::time::sleep_until(deadline) => CommandTermination::TimedOut,
             status = child.wait() => CommandTermination::Exited(status),
             Some(error) = reader_error_rx.recv() => CommandTermination::ReaderError(error),
             _ = response_tx.closed() => CommandTermination::Cancelled,
@@ -3293,13 +3550,17 @@ impl Sandbox {
                 // the command open or continue running in the background. The
                 // Windows AppContainer helper has already closed its Job
                 // before it exits, so there is no live tree left to terminate.
-                if let Some(pid) = pid
-                    && !(cfg!(windows) && self.backend == "appcontainer")
+                let general_settled = lifecycle.process.retire_general().await;
+                if general_settled.is_none()
+                    && let Some(pid) = pid
+                    && !helper_owns_tree
                     && !(cfg!(target_os = "linux") && self.backend == "bwrap")
                 {
                     kill_process_group_if_live(pid);
                 }
-                let command_status = if self.take_cancelled(pid) {
+                let command_status = if general_settled == Some(false) {
+                    CommandStatus::Failed
+                } else if self.take_cancelled(pid) {
                     CommandStatus::Cancelled
                 } else {
                     CommandStatus::Completed
@@ -3337,9 +3598,13 @@ impl Sandbox {
         let readers_finished = finish_pipe_readers(stdout_handle, stderr_handle)
             .await
             .is_ok();
-        let (classified_status, descendants_escaped) =
+        let (classified_status, mut descendants_escaped) =
             classify_pipe_completion(command_status, readers_finished);
         command_status = classified_status;
+        if lifecycle.process.general_retirement_failed() {
+            command_status = CommandStatus::Failed;
+            descendants_escaped = true;
+        }
         if descendants_escaped {
             tracing::warn!(
                 "sandbox: direct command completed but a descendant escaped process-group cleanup"
@@ -3375,28 +3640,30 @@ impl Sandbox {
 
     async fn run_built_status_command(
         &self,
-        mut cmd: Command,
+        mut cmd: ExecutionCommand,
         limits: SupportCommandLimits,
         audit: OwnedSupportCommandAudit,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
-        let mut child = match cmd.spawn_guarded() {
-            Ok(child) => child,
-            Err(error) => {
-                let output = CommandOutput {
-                    exit_status: None,
-                    stdout: Vec::new(),
-                    stderr: format!("failed to spawn support command: {error}").into_bytes(),
-                    status: CommandStatus::Failed,
-                    descendants_escaped: false,
-                };
-                audit.emit(&output);
-                let _ = response_tx.send(output);
-                return;
-            }
-        };
+        let deadline = tokio::time::Instant::now() + limits.timeout;
+        let helper_owns_tree = cmd.helper_owns_tree();
+        let (mut child, mut guard) =
+            match self.spawn_execution_command(&mut cmd, deadline, || response_tx.is_closed()) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    let output = CommandOutput {
+                        exit_status: None,
+                        stdout: Vec::new(),
+                        stderr: format!("failed to spawn support command: {error}").into_bytes(),
+                        status: CommandStatus::Failed,
+                        descendants_escaped: false,
+                    };
+                    audit.emit(&output);
+                    let _ = response_tx.send(output);
+                    return;
+                }
+            };
         let pid = child.id();
-        let mut guard = ProcessGroupGuard::new(pid, self.active_groups.clone());
         #[cfg(unix)]
         let foreground = match ForegroundProcessGroupGuard::acquire(pid) {
             Ok(foreground) => foreground,
@@ -3420,17 +3687,24 @@ impl Sandbox {
             biased;
             // Preserve the same hard deadline semantics as captured commands when the runtime is
             // starved long enough for both completion and timeout to become ready.
-            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
+            _ = tokio::time::sleep_until(deadline) => CommandTermination::TimedOut,
+            _ = wait_for_general_cancellation(&guard) => CommandTermination::Cancelled,
             status = child.wait() => CommandTermination::Exited(status),
             _ = response_tx.closed() => CommandTermination::Cancelled,
         };
         let (exit_status, status) = match termination {
             CommandTermination::Exited(Ok(status)) => {
                 guard.mark_leader_reaped();
-                if let Some(pid) = pid {
+                let general_settled = guard.retire_general().await;
+                if general_settled.is_none()
+                    && let Some(pid) = pid
+                    && !helper_owns_tree
+                {
                     kill_process_group_if_live(pid);
                 }
-                let command_status = if self.take_cancelled(pid) {
+                let command_status = if general_settled == Some(false) {
+                    CommandStatus::Failed
+                } else if self.take_cancelled(pid) {
                     CommandStatus::Cancelled
                 } else {
                     CommandStatus::Completed
@@ -3454,12 +3728,17 @@ impl Sandbox {
         };
         #[cfg(unix)]
         drop(foreground);
+        let failed = guard.general_retirement_failed();
         let output = CommandOutput {
-            exit_status,
+            exit_status: if failed { None } else { exit_status },
             stdout: Vec::new(),
             stderr: Vec::new(),
-            status,
-            descendants_escaped: false,
+            status: if failed {
+                CommandStatus::Failed
+            } else {
+                status
+            },
+            descendants_escaped: failed,
         };
         // Same cleanup-before-audit-before-accounting order as
         // `OutputCommandLifecycleGuard::finish`: the group stays accounted as
@@ -3489,12 +3768,37 @@ impl Sandbox {
                 job.cancellation.cancel();
             }
         }
-        let groups: Vec<u32> = self
-            .active_groups
+        #[cfg(windows)]
+        let general: Vec<_> = self
+            .general_owners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .drain()
+            .values()
+            .cloned()
             .collect();
+        #[cfg(windows)]
+        for owner in &general {
+            self.cancelled_groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(owner.pid());
+            // Preserve the fenced member snapshot before signalling the same
+            // retained Job. Its runner still owns the actual retirement.
+            owner.request_stop();
+        }
+        let mut active = self.active_groups.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(windows)]
+        let groups: Vec<u32> = active
+            .iter()
+            .filter(|pid| !general.iter().any(|owner| owner.pid() == **pid))
+            .copied()
+            .collect();
+        #[cfg(not(windows))]
+        let groups: Vec<u32> = active.iter().copied().collect();
+        for pid in &groups {
+            active.remove(pid);
+        }
+        drop(active);
         self.cancelled_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3992,6 +4296,35 @@ pub(crate) const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(2);
 
 async fn terminate_and_reap(child: &mut Child, pid: Option<u32>, guard: &mut ProcessGroupGuard) {
+    #[cfg(windows)]
+    if let Some((owner, _)) = &guard.general {
+        let owner = owner.clone();
+        owner.request_stop();
+        let _ = guard.retire_general().await;
+        // Reap under the same retirement boundary. Signals/accounting from
+        // this exact owner precede any audit or response publication.
+        let reaped = match child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => match owner.drain_deadline() {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), child.wait())
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if reaped {
+            guard.mark_leader_reaped();
+        } else {
+            owner.record_failure("sandbox: retained general leader reaping did not settle");
+            tracing::warn!(
+                "sandbox: general leader reap did not settle within its retained retirement boundary"
+            );
+        }
+        return;
+    }
     // The leader may already have been reaped (a wait that completed before
     // this path was chosen, or this probe reaping an exited leader now). Its
     // pid then no longer pins the pgid, so only signal a group that is still
@@ -5808,6 +6141,61 @@ mod sandbox_tests {
     }
 
     #[test]
+    fn execution_carrier_keeps_literal_direct_configuration_and_plain_backend_identity() {
+        let mut command = Command::new("inert-command-108");
+        command
+            .args(["literal 雪", "$(not a shell)"])
+            .env_clear()
+            .env("OWNED108", "literal value")
+            .current_dir("owned-workspace-108");
+        let carrier = ExecutionCommand::from(command);
+        assert_eq!(carrier.boundary, ExecutionBoundary::General);
+        assert!(!carrier.helper_owns_tree());
+        let direct = carrier.as_std();
+        assert_eq!(direct.get_program(), "inert-command-108");
+        assert_eq!(
+            direct.get_args().collect::<Vec<_>>(),
+            ["literal 雪", "$(not a shell)"]
+        );
+        assert_eq!(
+            direct.get_current_dir(),
+            Some(Path::new("owned-workspace-108"))
+        );
+        assert_eq!(
+            direct.get_envs().collect::<Vec<_>>(),
+            [(
+                std::ffi::OsStr::new("OWNED108"),
+                Some(std::ffi::OsStr::new("literal value"))
+            )]
+        );
+
+        for backend in ["appcontainer", "bwrap", "seatbelt"] {
+            let sandbox = Sandbox::new(false, backend);
+            let plain = sandbox.wrap_command("echo literal").unwrap();
+            assert_eq!(plain.boundary, ExecutionBoundary::General);
+            assert!(
+                !plain.helper_owns_tree(),
+                "backend {backend} did not create a helper"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_appcontainer_carrier_retains_the_authored_helper_command() {
+        let mut command = Command::new("inert-helper-108");
+        command.args(["captured-protocol-role", "literal 雪"]);
+        let helper = ExecutionCommand::appcontainer_helper(command);
+        assert!(helper.helper_owns_tree());
+        assert_eq!(helper.as_std().get_program(), "inert-helper-108");
+        assert_eq!(
+            helper.as_std().get_args().collect::<Vec<_>>(),
+            ["captured-protocol-role", "literal 雪"]
+        );
+        assert!(!ExecutionCommand::from(Command::new("inert-helper-108")).helper_owns_tree());
+    }
+
+    #[test]
     fn linux_sandbox_policy_command_matches_capability_matrix() {
         let sandbox = Sandbox::new(true, "bwrap");
         let cmd = sandbox.build_bwrap_command(
@@ -7397,7 +7785,8 @@ echo PRIVATE_TEMP_PASS"#,
                     ],
                     true,
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         #[cfg(feature = "hooks")]
         commands.push(
@@ -7412,7 +7801,8 @@ echo PRIVATE_TEMP_PASS"#,
                         ("TEMP".into(), "/private/tmp".into()),
                     ]),
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         for command in commands {
             let output = sandbox

@@ -12,6 +12,7 @@ use super::profile_journal::{
     MAX_CONTROL_RECORD_BYTES, RecordKind, is_staging_leaf, validate_payload,
 };
 
+pub(super) mod general_owner;
 #[cfg(test)]
 #[path = "../tests/windows_foreground_job_tests.rs"]
 mod general_process_prototype_tests;

@@ -44,15 +44,15 @@ class CiDocsFilterTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.script = filter_script()
 
-    def classify(self, *changed: str) -> str:
+    def classify(self, *changed: str, event="pull_request", scope="", base=BASE, ref="refs/pull/1/merge", missing_base=False, missing_diff=False) -> str:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stub = root / "git"
             stub.write_text(
                 "#!/bin/sh\n"
                 'case "$1" in\n'
-                "  cat-file) exit 0 ;;\n"
-                '  diff) cat "$FILTER_CHANGED" ;;\n'
+                '  cat-file) exit "$FILTER_MISSING_BASE" ;;\n'
+                '  diff) [ "$FILTER_MISSING_DIFF" = "0" ] || exit 2; cat "$FILTER_CHANGED" ;;\n'
                 "  *) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -67,9 +67,12 @@ class CiDocsFilterTests(unittest.TestCase):
                 PATH=f"{root}:{env['PATH']}",
                 FILTER_CHANGED=str(changed_file),
                 GITHUB_OUTPUT=str(output),
-                GITHUB_REF="refs/pull/1/merge",
-                EVENT="pull_request",
-                BASE_SHA=BASE,
+                GITHUB_REF=ref,
+                EVENT=event,
+                SCOPE=scope,
+                FILTER_MISSING_BASE=str(int(missing_base)),
+                FILTER_MISSING_DIFF=str(int(missing_diff)),
+                BASE_SHA=base,
                 HEAD_SHA=HEAD,
             )
             result = subprocess.run(
@@ -83,6 +86,20 @@ class CiDocsFilterTests(unittest.TestCase):
             values = re.findall(r"^code=(true|false)$", output.read_text(), re.MULTILINE)
             self.assertEqual(1, len(values), output.read_text())
             return values[0]
+
+    def test_manual_command_family_is_the_only_dispatch_that_reports_no_code(self) -> None:
+        self.assertEqual("false", self.classify("src/main.rs", event="workflow_dispatch", scope="windows-command-family", base=""))
+        for scope in ("full", "windows-general-sandbox", "", "unknown", "windows-command-family-extra"):
+            with self.subTest(scope=scope):
+                self.assertEqual("true", self.classify(event="workflow_dispatch", scope=scope, base=""))
+        for event in ("push", "pull_request", "schedule"):
+            with self.subTest(event=event):
+                self.assertEqual("true", self.classify("src/main.rs", event=event, scope="windows-command-family"))
+
+    def test_unresolved_history_and_tags_still_fail_open(self) -> None:
+        for options in ({"base": ""}, {"base": "0" * 40}, {"missing_base": True}, {"missing_diff": True}, {"ref": "refs/tags/v1"}):
+            with self.subTest(options=options):
+                self.assertEqual("true", self.classify("README.md", **options))
 
     def test_plain_documentation_skips_the_matrix(self) -> None:
         self.assertEqual("false", self.classify("README.md", "docs/plans/idea.md"))

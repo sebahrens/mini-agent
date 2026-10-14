@@ -159,7 +159,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     # job, including the Windows probe, which reads its output.
                     # Guarding it by scope would skip it on a probe dispatch and
                     # take the probe down with it, so it runs unconditionally
-                    # and reports code=true for every dispatch.
+                    # and reports code=true for the general-sandbox dispatch.
                     self.assertNotIn("inputs.scope", condition)
                     continue
                 # Parse the expression rather than substring-match it:
@@ -173,10 +173,16 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                         top_level_split(term, "||"),
                         f"an unparenthesised `||` leaks out of {condition!r}",
                     )
-                expected = probe_scope if job == "windows-general-sandbox-policy" else skip_probe_scope
+                if job in ("fmt", "ci-success"):
+                    expected = "(github.event_name != 'workflow_dispatch' || inputs.scope == 'full')"
+                else:
+                    expected = probe_scope if job == "windows-general-sandbox-policy" else skip_probe_scope
                 self.assertIn(expected, conjuncts, condition)
                 if "needs.changes.outputs.code" in condition:
-                    self.assertIn("needs.changes.outputs.code == 'true'", conjuncts)
+                    expected_code = "needs.changes.outputs.code == 'true'"
+                    if job == "windows-default-compile":
+                        expected_code = "(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family'))"
+                    self.assertIn(expected_code, conjuncts)
 
         windows_job = job_body(self.workflow, "windows-general-sandbox-policy")
         source_step = windows_job.split(

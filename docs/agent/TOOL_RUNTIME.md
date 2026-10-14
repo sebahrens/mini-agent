@@ -915,3 +915,60 @@ that captured turn's intact successful final host result commits both selections
 spilled results leave the previous live bundle unchanged. A cancelled or retired-turn candidate cannot
 replace a later turn. Existing learned ABI, lease, scope and admission checks still apply; publication
 is not a new script approval path.
+
+### Windows general command family ownership
+
+`src/sandbox/windows/general_owner.rs` owns ordinary Windows commands separately
+from the AppContainer helper and broker-only JS worker launchers. The actual
+constructor labels helper commands; a backend name (including disabled
+`appcontainer`) does not identify a helper. Captured output, status, background
+commands and contained Git commands retain this label through execution.
+
+General commands are created suspended under the crate-wide creation lock,
+assigned to a retained kill-on-close Job, and registered before their uniquely
+identified initial thread resumes. Setup consumes the original command deadline
+and rechecks cancellation and captured spend admission. These general constructors
+author no extra Windows creation flags; the separately labelled AppContainer
+helper retains its existing breakaway flags and launcher contract.
+
+Retirement first freezes Job membership with the native-tested zero active-process
+limit, retains up to 4,096 exact member handles, then terminates the Job. Success
+requires the leader and every captured member to signal termination and Job
+accounting to reach zero within the existing two-second family drain budget.
+Query, capture or drain failure remains a failed settlement with the retained
+owner; `kill_active` signals that same owner and cannot erase its accounting or
+publish successful cleanup. This is process-family ownership, not a new sandbox
+permission, and does not claim a crash-atomic boundary before Job association.
+
+The hosted inert zero-limit probe passed on CI run 38509643944, job 115674985903.
+Production adoption additionally requires the unchanged five native PR/Shell
+cases and the exact constructor-failure, cancel/leader-exit, and status/background owner controls;
+local macOS tests cannot establish that Windows acceptance.
+
+Detached status/background workers retain the launch-admission `Run` solely for
+captured spend checks, including changes while waiting for the creation lock.
+They do not inherit a different `AgentWorkScope` or change the intentional
+background lifetime/cancellation policy. The native held-lock negative uses a
+real `WouldBlock` observation, then a controlled accounting receipt, to require
+zero executed marker and exact suspended-owner cleanup before terminal failure.
+It does not describe that controlled receipt as provider-observed usage.
+
+The actual Tokio helper guard also rechecks this captured account after its
+creation-lock wait and before process creation. The same native negative covers
+that called guard primitive with an inert command; it does not substitute for
+AppContainer runtime containment proofs, which retain their existing launcher
+and broker contracts.
+
+The manual CI scope `windows-command-family` runs the existing Windows default
+compilation job, including four physical App stack controls, three suspended Job
+prototypes, four production owner controls and the unchanged five native PR/Shell
+cases with their exact discovery guards. It also retains the three ledger
+controls in that job. Other matrix jobs skip, and `ci-success` is not published:
+a partial native proof cannot substitute for a full push/PR or manual `full` run.
+Pushes, pull requests and unresolved diffs retain their existing full-matrix policy.
+
+The learned search continuation regression binds the same production
+`InstructionTurn` and `InstructionContextHook` as the builder, with retained
+user skill packages. It checks the actual intact canonical tool receipt and
+next-request replacement, rather than a test-only context hook or unbound
+publication. Its roots are owned independently and retired on test unwinding.
