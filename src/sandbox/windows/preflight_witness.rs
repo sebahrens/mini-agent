@@ -14,6 +14,46 @@ use windows_sys::Win32::System::Memory::{
 };
 
 const CELL_BYTES: usize = 32;
+const CELL_VERSION: u32 = 2;
+const PHASE_BITS: u32 = 8;
+const MAX_PHASE_ENTERED_MS: u32 = (1 << (32 - PHASE_BITS)) - 1;
+
+#[derive(Clone, Copy)]
+pub(super) struct Observation {
+    pub(super) phase: &'static str,
+    pub(super) entered_ms: Option<u32>,
+    pub(super) capped: bool,
+}
+impl Observation {
+    fn unavailable(phase: &'static str) -> Self {
+        Self {
+            phase,
+            entered_ms: None,
+            capped: false,
+        }
+    }
+    fn from_bytes(bytes: &[u8; CELL_BYTES], nonce: &[u8; 16]) -> Self {
+        let phase = decode(bytes, nonce);
+        if matches!(phase, "invalid_header" | "invalid_stage" | "not_attached") {
+            return Self::unavailable(phase);
+        }
+        let word = u32::from_le_bytes(
+            bytes[STAGE_OFFSET..STAGE_OFFSET + 4]
+                .try_into()
+                .expect("fixed DWORD"),
+        );
+        let entered_ms = word >> PHASE_BITS;
+        Self {
+            phase,
+            entered_ms: Some(entered_ms),
+            capped: entered_ms == MAX_PHASE_ENTERED_MS,
+        }
+    }
+}
+fn phase_word(stage: u8, elapsed: Duration) -> u32 {
+    let entered_ms = elapsed.as_millis().min(u128::from(MAX_PHASE_ENTERED_MS)) as u32;
+    (entered_ms << PHASE_BITS) | u32::from(stage)
+}
 const STAGE_OFFSET: usize = 24;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,7 +105,7 @@ impl Cell {
         unsafe {
             std::ptr::write_bytes(view.0.Value.cast::<u8>(), 0, CELL_BYTES);
             std::ptr::copy_nonoverlapping(
-                1u32.to_le_bytes().as_ptr(),
+                CELL_VERSION.to_le_bytes().as_ptr(),
                 view.0.Value.cast::<u8>(),
                 4,
             );
@@ -108,11 +148,11 @@ impl Cell {
             nonce: self.nonce,
         })
     }
-    fn observe_retired(&self, child: &Child) -> &'static str {
+    fn observe_retired(&self, child: &Child) -> Observation {
         // SAFETY: only exact signaled helper may authorize sampling this purely
         // observational cell. No concurrent sample is ever performed.
         if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } != WAIT_OBJECT_0 {
-            return "unretired";
+            return Observation::unavailable("unretired");
         }
         let mut bytes = [0u8; CELL_BYTES];
         // SAFETY: retained view; exact helper has retired. Immutable header was
@@ -133,22 +173,24 @@ impl Cell {
             );
             bytes[STAGE_OFFSET..STAGE_OFFSET + 4].copy_from_slice(&phase.to_le_bytes());
         }
-        decode(&bytes, &self.nonce)
+        Observation::from_bytes(&bytes, &self.nonce)
     }
 }
 fn decode(bytes: &[u8; CELL_BYTES], nonce: &[u8; 16]) -> &'static str {
-    if bytes[..4] != 1u32.to_le_bytes()
+    if bytes[..4] != CELL_VERSION.to_le_bytes()
         || bytes[4..8] != (CELL_BYTES as u32).to_le_bytes()
         || bytes[8..24] != *nonce
     {
         return "invalid_header";
     }
-    match u32::from_le_bytes(
+    let word = u32::from_le_bytes(
         bytes[STAGE_OFFSET..STAGE_OFFSET + 4]
             .try_into()
             .expect("fixed DWORD"),
-    ) {
-        0 => "not_attached",
+    );
+    match word & 0xff {
+        0 if word == 0 => "not_attached",
+        0 => "invalid_stage",
         1 => "request",
         2 => "setup",
         3 => "launch",
@@ -165,12 +207,29 @@ fn decode(bytes: &[u8; CELL_BYTES], nonce: &[u8; 16]) -> &'static str {
         24 => "regular_token_descriptor",
         25 => "regular_token_access",
         26 => "resume",
+        27 => "setup_parent",
+        28 => "setup_cancel",
+        29 => "setup_job",
+        30 => "setup_profile_root",
+        31 => "setup_profile_lock",
+        32 => "setup_profile_sweep",
+        33 => "setup_profile_intent",
+        34 => "setup_profile_create",
+        35 => "setup_profile_storage",
+        36 => "setup_profile_journal",
+        37 => "setup_write_roots",
+        38 => "setup_read_roots",
+        39 => "setup_loopback",
+        40 => "setup_token",
+        41 => "setup_desktop",
+        42 => "setup_canary",
         _ => "invalid_stage",
     }
 }
 struct HelperCell {
     _handle: Handle,
     view: View,
+    attached: Instant,
 }
 thread_local! { static HELPER_CELL: RefCell<Option<HelperCell>> = const { RefCell::new(None) }; }
 pub(super) fn attach(attachment: &Attachment) -> Result<(), String> {
@@ -211,6 +270,7 @@ pub(super) fn attach(attachment: &Attachment) -> Result<(), String> {
         *cell = Some(HelperCell {
             _handle: handle,
             view,
+            attached: Instant::now(),
         });
         Ok(())
     })
@@ -219,7 +279,9 @@ pub(super) fn mark(stage: u8) {
     HELPER_CELL.with(|cell| {
         if let Some(cell) = cell.borrow().as_ref() {
             // SAFETY: helper's live owned view; parent does not read until helper
-            // retirement. One aligned DWORD; no Rust shared-storage reference.
+            // retirement. Phase and bounded entry time share this single aligned
+            // DWORD, so a forced kill cannot expose a mixed phase/time pair.
+            // No Rust shared-storage reference is created.
             unsafe {
                 std::ptr::write_volatile(
                     cell.view
@@ -228,7 +290,7 @@ pub(super) fn mark(stage: u8) {
                         .cast::<u8>()
                         .add(STAGE_OFFSET)
                         .cast::<u32>(),
-                    u32::from(stage),
+                    phase_word(stage, cell.attached.elapsed()),
                 );
             }
         }
@@ -469,7 +531,7 @@ mod tests {
     fn preflight_helper_observation_decodes_only_closed_stages_and_exact_header() {
         let nonce = [9u8; 16];
         let mut bytes = [0u8; CELL_BYTES];
-        bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[..4].copy_from_slice(&CELL_VERSION.to_le_bytes());
         bytes[4..8].copy_from_slice(&(CELL_BYTES as u32).to_le_bytes());
         bytes[8..24].copy_from_slice(&nonce);
         for (stage, label) in [
@@ -490,17 +552,44 @@ mod tests {
             (24, "regular_token_descriptor"),
             (25, "regular_token_access"),
             (26, "resume"),
+            (27, "setup_parent"),
+            (28, "setup_cancel"),
+            (29, "setup_job"),
+            (30, "setup_profile_root"),
+            (31, "setup_profile_lock"),
+            (32, "setup_profile_sweep"),
+            (33, "setup_profile_intent"),
+            (34, "setup_profile_create"),
+            (35, "setup_profile_storage"),
+            (36, "setup_profile_journal"),
+            (37, "setup_write_roots"),
+            (38, "setup_read_roots"),
+            (39, "setup_loopback"),
+            (40, "setup_token"),
+            (41, "setup_desktop"),
+            (42, "setup_canary"),
         ] {
             bytes[24..28].copy_from_slice(&stage.to_le_bytes());
             assert_eq!(decode(&bytes, &nonce), label);
         }
-        for stage in [5u32, 14, 27, u32::MAX] {
+        for stage in [5u32, 14, 43, 1 << PHASE_BITS, u32::MAX] {
             bytes[24..28].copy_from_slice(&stage.to_le_bytes());
             assert_eq!(decode(&bytes, &nonce), "invalid_stage");
         }
-        bytes[0] = 2;
-        assert_eq!(decode(&bytes, &nonce), "invalid_header");
+        for (elapsed, expected, capped) in [
+            (Duration::from_millis(0), 0, false),
+            (Duration::from_millis(2393), 2393, false),
+            (Duration::from_millis(u64::MAX), MAX_PHASE_ENTERED_MS, true),
+        ] {
+            bytes[24..28].copy_from_slice(&phase_word(34, elapsed).to_le_bytes());
+            let observed = Observation::from_bytes(&bytes, &nonce);
+            assert_eq!(observed.phase, "setup_profile_create");
+            assert_eq!(observed.entered_ms, Some(expected));
+            assert_eq!(observed.capped, capped);
+        }
         bytes[0] = 1;
+        assert_eq!(decode(&bytes, &nonce), "invalid_header");
+        bytes[0] = CELL_VERSION as u8;
         assert_eq!(decode(&bytes, &[8u8; 16]), "invalid_header");
     }
     #[test]
@@ -536,7 +625,11 @@ mod tests {
         original["preflight_witness"] = serde_json::json!({"handle":12,"nonce":vec![0u8;16]});
         assert!(serde_json::from_value::<LaunchRequest>(original).is_ok());
         let diagnostics = PreflightDiagnostics::new();
-        diagnostics.helper_phase.set(Some("regular_token_access"));
+        diagnostics.helper_phase.set(Some(Observation {
+            phase: "regular_token_access",
+            entered_ms: Some(2393),
+            capped: false,
+        }));
         let rendered = diagnostics.render();
         for secret in [
             "PRIVATE_PROGRAM",
@@ -549,5 +642,7 @@ mod tests {
             assert!(!rendered.contains(secret));
         }
         assert!(rendered.contains("phase=regular_token_access"));
+        assert!(rendered.contains("phase_entered_ms=2393"));
+        assert!(rendered.contains("phase_clock=attachment"));
     }
 }

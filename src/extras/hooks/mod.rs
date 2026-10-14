@@ -86,6 +86,26 @@ pub(crate) fn set_active_permission_mode(mode: crate::permission::SecurityMode) 
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(mode.to_string());
 }
 
+/// Fixture-only ownership of the process selection, separate from a turn's
+/// task-local execution root. Drop runs before its temporary workspace dies.
+#[cfg(test)]
+pub(crate) struct TestWorkspaceSelection(Option<std::path::PathBuf>);
+#[cfg(test)]
+pub(crate) fn retain_test_workspace_selection() -> TestWorkspaceSelection {
+    TestWorkspaceSelection(
+        ACTIVE_WORKSPACE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    )
+}
+#[cfg(test)]
+impl Drop for TestWorkspaceSelection {
+    fn drop(&mut self) {
+        *ACTIVE_WORKSPACE.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take();
+    }
+}
+
 pub(crate) fn set_active_workspace(path: &std::path::Path) {
     let selected = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     *ACTIVE_WORKSPACE

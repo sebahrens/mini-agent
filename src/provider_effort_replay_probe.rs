@@ -2825,22 +2825,22 @@ async fn effort46_restored_inflight_after_opened_unobserved_http_keeps_account_i
 
 #[tokio::test]
 async fn effort46_actual_headless_frontend_publishes_and_reloads_native_context() {
-    native_headless_frontend_control(false, false, false, false).await;
+    native_headless_frontend_control(false, false, false, false, false, None).await;
 }
 
 #[tokio::test]
 async fn effort46_actual_headless_frontend_changed_host_refuses_before_http() {
-    native_headless_frontend_control(true, false, false, false).await;
+    native_headless_frontend_control(true, false, false, false, false, None).await;
 }
 
 #[tokio::test]
 async fn effort46_actual_headless_frontend_failed_final_save_keeps_disk_inflight() {
-    native_headless_frontend_control(false, true, false, false).await;
+    native_headless_frontend_control(false, true, false, false, false, None).await;
 }
 
 #[tokio::test]
 async fn effort46_actual_headless_frontend_unadopted_resume_refuses_before_effects() {
-    native_headless_frontend_control(false, false, true, false).await;
+    native_headless_frontend_control(false, false, true, false, false, None).await;
 }
 
 async fn native_headless_frontend_control(
@@ -2848,7 +2848,11 @@ async fn native_headless_frontend_control(
     fail_final_save: bool,
     unadopted_resume: bool,
     held_end_hook: bool,
+    fail_second_final: bool,
+    no_session_case: Option<bool>,
 ) {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_owner = crate::tests::fake_model::dispatcher_guard::acquire();
     let roots = crate::tests::OwnedTestDirectory::new("native-headless-frontend");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
@@ -2868,6 +2872,10 @@ async fn native_headless_frontend_control(
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
+    // Restore the exact previous selection before environment/root cleanup.
+    // The existing dispatcher owner serializes all global-hook fixture users.
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
     struct Release(Option<String>);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -2896,11 +2904,23 @@ async fn native_headless_frontend_control(
         );
         crate::extras::hooks::set_active_workspace(roots.path());
         Some(gate)
+    } else if no_session_case.is_some() {
+        let settings = json!({"SessionStart":[{"hooks":[{
+            "type":"command", "command":"/bin/sh",
+            "args":["-c", r#"printf 'actual SessionStart\n' >> "$1""#, "start-proof", roots.path().join("start.effects")],
+            "trust":"trusted", "timeout":5
+        }]}]});
+        let config = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
+        crate::extras::hooks::init_dispatcher(
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&config).unwrap(),
+        );
+        crate::extras::hooks::set_active_workspace(roots.path());
+        None
     } else {
         None
     };
     #[cfg(not(all(feature = "hooks", any(target_os = "macos", target_os = "linux"))))]
-    assert!(!held_end_hook);
+    assert!(!held_end_hook && no_session_case.is_none());
     #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
     struct ResetHook;
     #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
@@ -2910,7 +2930,11 @@ async fn native_headless_frontend_control(
         }
     }
     #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
-    let _hook_reset = if held_end_hook { Some(ResetHook) } else { None };
+    let _hook_reset = if held_end_hook || no_session_case.is_some() {
+        Some(ResetHook)
+    } else {
+        None
+    };
     let mut release = Release(None);
     let mut replies = vec![
         (
@@ -2928,7 +2952,7 @@ async fn native_headless_frontend_control(
                 + &finish(),
         ),
     ];
-    if held_end_hook {
+    if held_end_hook || no_session_case == Some(true) {
         replies.truncate(1);
     }
     let wire = Wire::new(replies);
@@ -2948,6 +2972,7 @@ async fn native_headless_frontend_control(
             api_key: Some("unused-native-key".into()),
             quick_model: Some("native-test".into()),
             session: id.clone(),
+            no_session: no_session_case.is_some_and(|fresh| fresh || round == 1),
             print: !(unadopted_resume && round == 1),
             quiet: true,
             message: vec![prompt.into()],
@@ -2971,11 +2996,19 @@ async fn native_headless_frontend_control(
             Ok::<_, anyhow::Error>(Box::new(startup))
         })
         .await;
-        if unadopted_resume && round == 1 {
+        if (unadopted_resume || no_session_case == Some(false)) && round == 1 {
             let error = startup
                 .err()
                 .expect("unadopted native resume must stop during init");
-            assert!(error.to_string().contains("headless print frontend"));
+            if no_session_case.is_some() {
+                assert!(error.to_string().contains("no-session"), "{error:#}");
+                assert_eq!(
+                    std::fs::read(roots.path().join("start.effects")).unwrap(),
+                    b"actual SessionStart\n"
+                );
+            } else {
+                assert!(error.to_string().contains("headless print frontend"));
+            }
             let saved = crate::session::storage::load_session_exact(id.as_ref().unwrap())
                 .unwrap()
                 .unwrap();
@@ -2999,7 +3032,7 @@ async fn native_headless_frontend_control(
         release.0 = Some(sid.clone());
         startup.init_features().await.unwrap();
         startup.resolve_prompts().await.unwrap();
-        if fail_final_save {
+        if fail_final_save || (fail_second_final && round == 1) {
             startup.fail_native_final_before_replace();
         }
         let dispatch = crate::startup::heap_future(|| startup.dispatch());
@@ -3063,7 +3096,7 @@ async fn native_headless_frontend_control(
         };
         #[cfg(not(all(feature = "hooks", any(target_os = "macos", target_os = "linux"))))]
         let result = dispatch.await;
-        if fail_final_save || (changed_host && round == 1) {
+        if fail_final_save || ((fail_second_final || changed_host) && round == 1) {
             assert!(
                 result.is_err(),
                 "unfinished or incompatible context must refuse"
@@ -3075,20 +3108,49 @@ async fn native_headless_frontend_control(
                 saved.native_frontier.refusal(),
                 Some(crate::session::native_replay::RestartReason::InFlight)
             );
+            let accepted_rounds = if changed_host { 1 } else { round + 1 };
             assert_eq!(
                 (saved.total_input_tokens, saved.total_output_tokens),
-                (10, 2)
+                (accepted_rounds as u64 * 10, accepted_rounds as u64 * 2)
+            );
+            let summary = crate::spend::Ledger::new(&paths.state_dir)
+                .summary_for_session(&sid)
+                .unwrap();
+            assert_eq!(summary.session.records, accepted_rounds);
+            assert!((summary.session.known_cost - accepted_rounds as f64 * 0.000028).abs() < 1e-12);
+            assert!(saved.native_publication.is_none());
+            if fail_second_final {
+                crate::session::lock::release_session(&sid);
+                #[cfg(unix)]
+                crate::session::native_publication::assert_refused_reload_in_separate_process(
+                    &sid, &workspace, 20, 4,
+                );
+            }
+            assert_eq!(wire.finish().len(), accepted_rounds);
+            return;
+        }
+        result.unwrap();
+        if no_session_case.is_some() {
+            assert_eq!(
+                std::fs::read(roots.path().join("start.effects")).unwrap(),
+                b"actual SessionStart\n"
+            );
+        }
+        if no_session_case == Some(true) {
+            assert!(
+                !crate::session::storage::session_path(&sid)
+                    .unwrap()
+                    .exists(),
+                "explicit fresh ephemeral run must not create a saved native chain"
             );
             let summary = crate::spend::Ledger::new(&paths.state_dir)
                 .summary_for_session(&sid)
                 .unwrap();
             assert_eq!(summary.session.records, 1);
             assert!((summary.session.known_cost - 0.000028).abs() < 1e-12);
-            assert!(saved.native_publication.is_none());
             assert_eq!(wire.finish().len(), 1);
             return;
         }
-        result.unwrap();
         // This reload precedes another request, quit, or incidental save.
         let saved = crate::session::storage::load_session_exact(&sid)
             .unwrap()
@@ -3145,7 +3207,7 @@ fn effort46_actual_headless_frontend_on_one_mib() {
                 .build()
                 .unwrap()
                 .block_on(crate::startup::heap_future(|| {
-                    native_headless_frontend_control(false, false, false, false)
+                    native_headless_frontend_control(false, false, false, false, false, None)
                 }))
         })
         .unwrap()
@@ -3156,7 +3218,25 @@ fn effort46_actual_headless_frontend_on_one_mib() {
 #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
 #[tokio::test]
 async fn effort46_actual_headless_frontend_reaps_held_async_session_end_before_publication() {
-    native_headless_frontend_control(false, false, false, true).await;
+    native_headless_frontend_control(false, false, false, true, false, None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn effort46_actual_headless_second_final_failure_refuses_separate_process_reload() {
+    native_headless_frontend_control(false, false, false, false, true, None).await;
+}
+
+#[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+#[tokio::test]
+async fn effort46_actual_headless_no_session_resume_refuses_before_session_start_effect() {
+    native_headless_frontend_control(false, false, false, false, false, Some(false)).await;
+}
+
+#[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+#[tokio::test]
+async fn effort46_actual_headless_fresh_no_session_runs_configured_start_hook_without_checkpoint() {
+    native_headless_frontend_control(false, false, false, false, false, Some(true)).await;
 }
 
 #[cfg(feature = "multimodal")]

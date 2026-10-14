@@ -790,11 +790,24 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // ReadImage serializes already admitted image data; no process terminal.
+    (
+        "src/agent/tools/read.rs",
+        "output: image.output(&result.output),",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact cfg(test), owned/reaped current-image publication helpers.
     (
         "src/session/native_publication.rs",
         "let mut child = Command::new(std::env::current_exe().unwrap())",
-        3,
+        2,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        "let mut command = Command::new(std::env::current_exe().unwrap());",
+        1,
         "TEST-ONLY",
     ),
     (
@@ -805,7 +818,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/session/native_publication.rs",
-        ".spawn().unwrap();",
+        "command.spawn().unwrap()",
         1,
         "TEST-ONLY",
     ),
@@ -1793,6 +1806,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/session/native_publication.rs",
+        "status.success(),",
+        1,
+        "NON-PROCESS",
+    ),
     // Literal formatter-result assertion data; exact full-token digests below.
     (
         "src/agent/tools/format_after_edit.rs",
@@ -3138,6 +3157,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/session/native_publication.rs",
         &[
             (
+                "5b0d857a99f27e381df3b8fa7ad4564db345c35a6133d15025342b3a36fa35f6",
+                1,
+            ),
+            (
                 "4f7b79705e309204080afd875515dc605469abd02b79eb7b519589cd9f922600",
                 1,
             ),
@@ -3767,7 +3790,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/acp/mod.rs",
         &[
             (
-                "9106b09f8b4839d779e3f835488b1de3b17df2dabdf109f16d5088cd13f1140f",
+                "f916c2d7ba7a437738651f8bb303850276f6a20d3e50b876e924540be5a586e5",
                 1,
             ),
             (
@@ -4430,11 +4453,24 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // ReadImage serializes already admitted image data; no process terminal.
+    (
+        "src/agent/tools/read.rs",
+        "output: image.output(&result.output),",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact owned cfg(test) native publication helper sites.
     (
         "src/session/native_publication.rs",
         "let mut child = Command::new(std::env::current_exe().unwrap())",
-        3,
+        2,
+        "TEST-ONLY",
+    ),
+    (
+        "src/session/native_publication.rs",
+        "let mut command = Command::new(std::env::current_exe().unwrap());",
+        1,
         "TEST-ONLY",
     ),
     (
@@ -4445,7 +4481,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/session/native_publication.rs",
-        ".spawn().unwrap();",
+        "command.spawn().unwrap()",
         1,
         "TEST-ONLY",
     ),

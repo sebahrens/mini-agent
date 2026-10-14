@@ -756,6 +756,10 @@ The three exact current-libtest-image constructors and their spawn terminals in
 `session/native_publication.rs` are `TEST-ONLY`. They run only cfg(test) owned
 publication helpers, close the inherited release pipe, reap the exact helper,
 and observe inherited lock retirement before removing the fixture root.
+The shared root-writer helper also has a read-only reload mode: it opens the
+actual bounded private Session in a new process and requires the persisted
+InFlight refusal plus unchanged canonical usage. It cannot write or mint a
+writer permit. Both modes retain the same owned child/reaping guard.
 Their exit-code and captured-output assertion macros are `NON-PROCESS` data
 checks, identified by exact lexical sites and full-token macro digests. No
 production dispatcher, scanner exemption, or negative validator changes.
@@ -766,3 +770,9 @@ runs `Startup::init` on an explicitly selected 1 MiB stack and joins before
 private-root cleanup. It creates no process, permission grant or new financial
 owner. Both lexical and Windows-capable terminal checks bind that exact site;
 scanner and macro-context validation remain unchanged.
+
+The image reader's `image.output(&result.output)` is a data serializer for an
+already admitted image, not a process terminal. Its exact expression is registered
+as NON-PROCESS in both inventories. The ACP lifecycle fixture's image-bearing
+ToolResult event vector is registered by its complete macro token digest; adding
+image fields does not exempt any process constructor or terminal.

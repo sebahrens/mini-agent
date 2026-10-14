@@ -955,7 +955,7 @@ struct PreflightDiagnostics {
     started: Instant,
     events: std::cell::RefCell<Vec<PreflightDiagnosticEvent>>,
     saturated: std::cell::Cell<bool>,
-    helper_phase: std::cell::Cell<Option<&'static str>>,
+    helper_phase: std::cell::Cell<Option<preflight_witness::Observation>>,
 }
 impl PreflightDiagnostics {
     fn new() -> Self {
@@ -1025,12 +1025,14 @@ impl PreflightDiagnostics {
         if let Some(phase) = self.helper_phase.get() {
             writeln!(
                 text,
-                "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase={} elapsed_ms={}",
-                phase,
+                "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase={} elapsed_ms={} phase_entered_ms={} phase_clock=attachment phase_time_capped={}",
+                phase.phase,
                 self.started
                     .elapsed()
                     .as_millis()
-                    .min(MAX_PREFLIGHT_DIAGNOSTIC_MS)
+                    .min(MAX_PREFLIGHT_DIAGNOSTIC_MS),
+                phase.entered_ms.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                phase.capped,
             )
             .expect("String formatting cannot fail");
         }
@@ -2854,15 +2856,20 @@ fn run_helper() -> Result<i32, String> {
         .map(|path| validate_ready_path(path, &cwd))
         .transpose()?;
     mark_helper_stage(HELPER_STAGE_SETUP);
+    preflight_witness::mark(27); // setup_parent
     let parent = open_and_verify_parent(request.parent_pid, request.parent_created)?;
     ensure_parent_alive(&parent)?;
+    preflight_witness::mark(28); // setup_cancel
     let cancel = helper_cancel_event()?;
+    preflight_witness::mark(29); // setup_job
     let (job, job_name) = bounded_job()?;
     let profile = create_appcontainer_profile(&cache, &read_roots, &write_roots, &job_name)?;
     let mut grants = AccessGrants::new(profile, read_roots, write_roots);
+    preflight_witness::mark(37); // setup_write_roots
     for root in grants.write_roots.clone() {
         grant_write_root(&root, &mut grants, &parent)?;
     }
+    preflight_witness::mark(38); // setup_read_roots
     for root in grants.read_roots.clone() {
         if !grants
             .write_roots
@@ -2877,12 +2884,16 @@ fn run_helper() -> Result<i32, String> {
     // launch; the contained authority probe separately verifies that TCP connection attempts fail.
     // Zero token capabilities are the protocol-independent proof that UDP is not authorized: a
     // successful connectionless `send` only proves that Winsock queued a datagram locally.
+    preflight_witness::mark(39); // setup_loopback
     if !appcontainer_has_no_loopback_exemption(grants.sid())? {
         return Err("sandbox: AppContainer profile has a loopback exemption".into());
     }
     ensure_parent_alive(&parent)?;
+    preflight_witness::mark(40); // setup_token
     let token = primary_token()?;
+    preflight_witness::mark(41); // setup_desktop
     let desktop = private_desktop(grants.sid())?;
+    preflight_witness::mark(42); // setup_canary
     let omitted_handle = inheritable_omitted_canary()?;
     let mut arguments = request.arguments;
     let authority_probe_requested =
@@ -3645,9 +3656,12 @@ fn create_appcontainer_profile(
     write_roots: &[PathBuf],
     job_name: &str,
 ) -> Result<AppContainerProfile, String> {
+    preflight_witness::mark(30); // setup_profile_root
     let journal_root = profile_journal_root(cache, read_roots, write_roots)?;
     let profile_control_deadline = Instant::now() + Duration::from_secs(5);
+    preflight_witness::mark(31); // setup_profile_lock
     let profile_control = ProfileControlGuard::acquire_until(profile_control_deadline)?;
+    preflight_witness::mark(32); // setup_profile_sweep
     sweep_stale_profiles_until_locked(&journal_root, profile_control_deadline, &profile_control)?;
     let name_text = format!(
         "{APPCONTAINER_PROFILE_PREFIX}{}",
@@ -3657,11 +3671,13 @@ fn create_appcontainer_profile(
     // Publish the name before profile creation. If this trusted helper is terminated between
     // CreateAppContainerProfile and the full SID/root journal below, the parent can still delete
     // the exact profile without guessing or deleting the control tree that owns recovery.
+    preflight_witness::mark(33); // setup_profile_intent
     let (intent_path, intent_lease) =
         create_profile_intent(&journal_root, &name_text, &profile_control)?;
     let display = wide_string("mini-agent general sandbox");
     let description = wide_string("Ephemeral workspace-capable mini-agent sandbox");
     let mut sid = null_mut();
+    preflight_witness::mark(34); // setup_profile_create
     let result = unsafe {
         CreateAppContainerProfile(
             name.as_ptr(),
@@ -3720,6 +3736,7 @@ fn create_appcontainer_profile(
                 "sandbox: created AppContainer SID differed from derived profile SID".into(),
             );
         }
+        preflight_witness::mark(35); // setup_profile_storage
         profile.storage = appcontainer_storage_path(&profile.text)?;
         std::fs::create_dir_all(&profile.storage).map_err(|error| {
             format!(
@@ -3743,6 +3760,7 @@ fn create_appcontainer_profile(
         };
         let payload = serde_json::to_vec(&journal)
             .map_err(|error| format!("sandbox: encode AppContainer cleanup journal: {error}"))?;
+        preflight_witness::mark(36); // setup_profile_journal
         publish_profile_record(
             &journal_root,
             RecordKind::Journal,

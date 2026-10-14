@@ -1,0 +1,60 @@
+{
+  "scope": "Windows closed setup observer and actual native headless publication controls integrated after full image reading",
+  "base": "939f1b88",
+  "reviewer": "root",
+  "review": [
+    "Read complete Windows5file observer diff and canonical Phase6 checklist; closed value-free subphase plus bounded phase-entry time stays a single aligned DWORD, observed only after exact helper retirement. Both full executable proofs, failure stages, deadlines and containment calls retained.",
+    "Read original native actual-control patch; requested correction to use the bounded read-only loader in its separate process, with independently parent-captured workspace/session roots and bytes/mode unchanged assertions. Correction reviewed and integrated. No saved-field authority or ordinary repairing loader.",
+    "Existing source/caller inventory unchanged except exact moved test constructors and their registered full-token macros; no broad scan exclusions.",
+    "Windows Startup concurrent probes now capture only Cli/Config through a Send closure, preserving the same policy and join order while leaving non-Sync cleanup ownership on the caller. Actual factory regression retains a RefCell owner locally.",
+    "CI fixture correction preserves strict refusal for unowned native writes and creates bounded imported data explicitly. Native frontend tests retain the dispatcher guard and restore the exact previous ACTIVE_WORKSPACE before environment and root cleanup.",
+    "The combined owning batch exposed an existing changed-host caller incorrectly charged a refused second request; Root corrected expected tokens, receipts, cost and HTTP count to accepted rounds. Image data output registered as exact NON-PROCESS and ACP full-token macro identity updated; scanner policy unchanged."
+  ],
+  "patch_sha256": [
+    "8fa8a6c40983b4a114281a4474b5aa544dae897d18d23d9c7fb77f71c74bc97d",
+    "283b01690dead5caaf0768e80c1b904bf9ad78c9e325ad586914606cd695f4a4",
+    "c64b83fb1ba7afdc9b7782eb5602238fedf1401b6eed4eea3e34901183093ff7",
+    "735aa4dfdf31e90bd8e5cd221a96dd6d0c34243e9090e99ba3d026e8547d402f",
+    "c5f29d016000aca0e2a219f66a8ede8f6ad4c6beccd74728c415eb89439a99f9"
+  ],
+  "source_sha256": {
+    ".github/workflows/ci.yml": "762da4dfdeeee4ef106347fa2991efca2b3c8a8a86cb97f3b79e30bf86bd1b17",
+    "src/sandbox/windows.rs": "7c23737e522510a488762a9cc5160b2caadfa08000900401180b29f2d1609d4f",
+    "src/sandbox/windows/preflight_witness.rs": "7f72d5f0b351ecda43b05f8020f8c214142828fd4792fbe92e961973e4cc3689",
+    "src/provider_effort_replay_probe.rs": "6bfc2775da7c671732e372af1ade49cc02fe53e6dec242598baa5a28f834b227",
+    "src/session/native_publication.rs": "0efe0dfe99cce9900dcb27dafc7aa5a98ab7c6f81c7760f4dafcc747d97848fe",
+    "src/tests/subprocess_inventory_tests.rs": "d7728408b99b0ae0d8ff356ce72b0f1b066f244c0dbc274df6b7c4b2ff672048",
+    "src/startup.rs": "2b936f9bebd812d74ae51f810ee695209a2a9277d801057b9d5b3304cf9dd28f",
+    "src/extras/hooks/mod.rs": "4d0841f6ef7105474ce56b046504a4c52248ea1d02cbba775fb059b073c530c6",
+    "src/session/native_replay.rs": "44445267f6c1ecbe21e3895f662e93e9e15c4a2f674e18b1d155800deda62966",
+    "docs/specs/subprocess-trust.md": "80612c59180b0dfe8d35f7c83875a6c3ee6caac5d9a930a198db863152e8d7c7"
+  },
+  "results": {
+    "windows_policy": "3PASS0.008s",
+    "native_current": "44 unique owning tests pass across first41PASS plus corrected4PASS25.96s (one repeated positive): actual headless9, readonly replacement helper, native refusal/import, startup factory/join/policy3, hook decorator27, resumed Stop continuation and inventory2. No broad suite repeated.",
+    "selection": "Code-indexer existing caller maps confirm shared native fixture and root helper callers; startup concurrent-probe search saved /private/tmp/mini-agent-wave50-startup-indexer.json. New actual cases, affected existing changed-host path, hook consumers that failed on hosted CI and exact inventory entries selected.",
+    "first_run": "41PASS/3FAIL28.58s after48.11s compile; failure evidence retained. Corrected only failing shared fixture expectations and exact inventory entries; unchanged passing tests reused.",
+    "required_install": "PASS11.60s; cargo install --path . --debug --locked --offline --features advisor",
+    "native_windows": "pending owning hosted run; no local Windows acceptance claim",
+    "actual_installed_consumers": {
+      "binary": "/private/tmp/mini-agent-wave50-install/bin/mini-agent",
+      "binary_sha256": "b2391d5f04450aafe36c70a2049199ac28256d0de4964b0d5df9486b0bf3a37d",
+      "stack_bytes": 1048576,
+      "fixture_sha256": "96a441f2694c0e877af35d34a7124503ebbccebb5efd181a4c99bd6aa4c7b7bb",
+      "external_provider_calls": 0,
+      "passed": true,
+      "headless_posts": 2,
+      "tui_posts": 3,
+      "next_user_turn_preserves_image": true,
+      "normal_quit": 0,
+      "persisted_tool_images": [
+        "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-image64-installed-t09sp6tm/home/sessions/be208232-02e5-4da2-8b1a-ff6e01c0431c.json"
+      ],
+      "errors": []
+    }
+  },
+  "limits": [
+    "Observer is diagnosis, not a Windows timeout repair or native Windows acceptance.",
+    "Native controls add failed final replacement/separate-process refusal and actual configured SessionStart positive/early refusal; full native/TUI/ACP/UserPromptSubmit closure remains separately tracked."
+  ]
+}

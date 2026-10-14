@@ -1100,6 +1100,17 @@ pub(crate) async fn retire_owned(
     Ok(())
 }
 
+/// Runs the existing owned helper in a new process; never writes the checkpoint.
+#[cfg(all(test, unix))]
+pub(crate) fn assert_refused_reload_in_separate_process(
+    id: &str,
+    workspace: &crate::paths::WorkspaceBinding,
+    inputs: u64,
+    outputs: u64,
+) {
+    tests::assert_refused_reload_in_separate_process(id, workspace, inputs, outputs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,6 +1638,52 @@ mod tests {
     #[ignore = "owned helper for the replaced-root publication probe"]
     fn native_publication_new_root_writer_fixture() {
         use std::io::{Read, Write};
+        if let Some(id) = std::env::var_os("NATIVE_PUBLICATION_REFUSED_RELOAD") {
+            let id = id.to_str().unwrap();
+            // These paths come from the owning host fixture, independently
+            // of all saved Session fields. Capture and retain both bindings.
+            let sessions_root = crate::paths::WorkspaceBinding::capture(std::path::Path::new(
+                &std::env::var_os("NATIVE_PUBLICATION_RELOAD_SESSIONS").unwrap(),
+            ))
+            .unwrap();
+            let workspace = crate::paths::WorkspaceBinding::capture(std::path::Path::new(
+                &std::env::var_os("NATIVE_PUBLICATION_RELOAD_WORKSPACE").unwrap(),
+            ))
+            .unwrap();
+            let session =
+                super::super::storage::load_session_exact_read_only(&sessions_root, id, &workspace)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(session.id.as_str(), id);
+            assert!(
+                session.native_publication.is_none(),
+                "load cannot mint writer authority"
+            );
+            assert_eq!(
+                session.native_frontier.refusal(),
+                Some(RestartReason::InFlight)
+            );
+            assert_eq!(
+                session
+                    .native_restore_history(
+                        crate::session::native_replay::HistoryProtocol::AnthropicMessages,
+                        crate::session::native_replay::ReplayBoundary::CompletedTurn,
+                    )
+                    .unwrap_err(),
+                RestartReason::InFlight
+            );
+            let expected: Vec<u64> = std::env::var("NATIVE_PUBLICATION_RELOAD_USAGE")
+                .unwrap()
+                .split(',')
+                .map(|part| part.parse().unwrap())
+                .collect();
+            assert_eq!(
+                (session.total_input_tokens, session.total_output_tokens),
+                (expected[0], expected[1])
+            );
+            writeln!(std::io::stdout(), "REFUSED_RELOAD_WITH_CANONICAL_USAGE").unwrap();
+            return;
+        }
         let mut session = Session::new("openai", "fixture", 32_000, "");
         session.id = "native-root-replacement-fixture".into();
         session.name = "new namespace owner".into();
@@ -1638,10 +1695,113 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn spawn_root_writer_fixture(
+        reload: Option<(&str, &crate::paths::WorkspaceBinding, u64, u64)>,
+    ) -> std::process::Child {
+        use std::process::{Command, Stdio};
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "session::native_publication::tests::native_publication_new_root_writer_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some((id, workspace, inputs, outputs)) = reload {
+            let session_path = super::super::storage::session_path(id).unwrap();
+            command
+                .env("NATIVE_PUBLICATION_RELOAD_WORKSPACE", workspace.root())
+                .env(
+                    "NATIVE_PUBLICATION_RELOAD_SESSIONS",
+                    session_path.parent().unwrap(),
+                )
+                .env("NATIVE_PUBLICATION_REFUSED_RELOAD", id)
+                .env(
+                    "NATIVE_PUBLICATION_RELOAD_USAGE",
+                    format!("{inputs},{outputs}"),
+                );
+        } else {
+            command
+                .env_remove("NATIVE_PUBLICATION_REFUSED_RELOAD")
+                .env_remove("NATIVE_PUBLICATION_RELOAD_USAGE")
+                .env_remove("NATIVE_PUBLICATION_RELOAD_WORKSPACE")
+                .env_remove("NATIVE_PUBLICATION_RELOAD_SESSIONS");
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn assert_refused_reload_in_separate_process(
+        id: &str,
+        workspace: &crate::paths::WorkspaceBinding,
+        inputs: u64,
+        outputs: u64,
+    ) {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let path = super::super::storage::session_path(id).unwrap();
+        let sessions_root =
+            crate::paths::WorkspaceBinding::capture(path.parent().unwrap()).unwrap();
+        sessions_root.validate_private_root().unwrap();
+        workspace.validate().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let mut child = spawn_root_writer_fixture(Some((id, workspace, inputs, outputs)));
+        let release = child.stdin.take();
+        let mut owned = OwnedForceFixture {
+            child,
+            release,
+            native_lock: super::super::lock::lock_path(id).unwrap(),
+            root_guard: None,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = owned.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "separate-process readonly reload did not retire"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut stdout = String::new();
+        owned
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .take(16 * 1024)
+            .read_to_string(&mut stdout)
+            .unwrap();
+        let mut stderr = String::new();
+        owned
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .take(16 * 1024)
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            status.success(),
+            "readonly reload failed: {stdout} {stderr}"
+        );
+        assert!(stdout.contains("REFUSED_RELOAD_WITH_CANONICAL_USAGE"));
+        sessions_root.validate_private_root().unwrap();
+        workspace.validate().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode(), mode);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn native_publication_replaced_root_and_lock_namespace_refuse_old_writer() {
         use std::io::{BufRead, Write};
-        use std::process::{Command, Stdio};
         let roots = crate::tests::OwnedTestDirectory::new("native-publication-root-replace");
         let _environment = environment(&roots);
         let mut session = Session::new("anthropic", "fixture", 32_000, "");
@@ -1656,14 +1816,12 @@ mod tests {
             let moved = root.with_extension("retained-old");
             std::fs::rename(root, &moved).unwrap();
             crate::paths::ensure_private_directory(root).unwrap();
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "session::native_publication::tests::native_publication_new_root_writer_fixture", "--ignored", "--nocapture", "--test-threads=1"])
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                .spawn().unwrap();
+            let mut child = spawn_root_writer_fixture(None);
             let release = child.stdin.take();
             let output = child.stdout.take().unwrap();
             let mut owned = OwnedForceFixture {
-                child, release,
+                child,
+                release,
                 native_lock: super::super::lock::lock_path(&session.id).unwrap(),
                 root_guard: Some(roots),
             };
@@ -1675,7 +1833,10 @@ mod tests {
                     let mut line = String::new();
                     match output.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) if line.contains("NEW_ROOT_OWNER_READY") => { found = true; break; }
+                        Ok(_) if line.contains("NEW_ROOT_OWNER_READY") => {
+                            found = true;
+                            break;
+                        }
                         Ok(_) => {}
                     }
                 }

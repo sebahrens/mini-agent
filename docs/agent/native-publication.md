@@ -168,3 +168,19 @@ without changing permissions. Native markers and malformed classification remain
 closed. Only a positively legacy target is rechecked for identity and unchanged
 bytes, repaired through that exact descriptor, and privately replaced. Native
 checkpoint imports and writes keep their nonrepairing validation.
+
+## Additional actual publication controls
+
+The plain-print acceptance fixture now saves a healthy first native turn,
+accepts a second response, and fails its final replacement. Immediate reload
+and a separately spawned process both retain InFlight refusal, 20 input and
+4 output tokens, and the two canonical usage receipts. The new process uses
+the bounded read-only loader and saved-history refusal gate; it cannot create
+runtime writer authority.
+
+Configured SessionStart has an actual successful handler control. Resuming
+that saved native Session with `--no-session` refuses before a second handler
+or HTTP request, while a fresh explicit `--no-session` invocation runs the
+handler and model without creating a saved native checkpoint. These controls
+do not claim UserPromptSubmit parity, interactive/ACP adoption, or automatic
+round ownership.

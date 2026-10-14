@@ -1194,6 +1194,16 @@ argv, payloads, or credentials. The observation is not readiness, containment,
 or availability authority and does not repair a timeout. Ordinary launches and
 direct verification omit the optional field and retain their existing path.
 
+Cell version 2 packs the closed phase and capped phase-entry milliseconds into
+that same single DWORD, preventing a killed helper from leaving a mixed
+phase/time pair. The clock starts at validated helper attachment, before the
+helper's full executable digest proof, and is explicitly separate from the
+parent's elapsed clock. Setup observations distinguish parent/Job, profile
+control and publication, root ACL grants, loopback attestation, token and desktop
+work. They refine observation only: legacy helper failure stages, both complete
+executable proofs, containment policy and deadlines are unchanged. A last phase
+identifies the active region, not a proven blocking API or timeout cause.
+
 The observed self-check owns its request writer thread through cancellation,
 actual thread signal and join. Every parent pipe reader is closed after spawn.
 Preparation, duplicate/encode/delivery, helper execution and retirement consume

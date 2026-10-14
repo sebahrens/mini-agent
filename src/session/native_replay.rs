@@ -1488,7 +1488,13 @@ mod refusal_storage_tests {
             Some(RestartReason::UnavailableSource)
         );
         std::fs::remove_dir(&target).unwrap();
-        crate::session::storage::save_session(&session).unwrap();
+        // Removing the bad target cannot manufacture native writer authority.
+        assert!(crate::session::storage::save_session(&session).is_err());
+        // This test owns imported compatibility data, not an accepted actor.
+        // Create the bounded private data fixture explicitly; publication of
+        // real actor observations is covered by native_publication/frontends.
+        let json = crate::session::storage::serialize_bounded_session(&session).unwrap();
+        crate::fs::private_atomic_write_sync(&target, json.as_bytes()).unwrap();
         let imported = crate::session::storage::load_session_exact(&session.id)
             .unwrap()
             .unwrap();

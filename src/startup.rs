@@ -315,6 +315,37 @@ fn apply_resume_provider_decision(
     session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
 }
 
+/// Capture only immutable startup policy. Runtime publication/cleanup owners
+/// remain on the calling thread and need not implement Sync.
+fn configured_sandbox_validation_probe<'a>(
+    cli: &'a Cli,
+    cfg: &'a Config,
+) -> impl FnOnce() -> anyhow::Result<()> + Send + 'a {
+    move || {
+        if !cli.general_sandbox_is_eligible(cfg) {
+            return Ok(());
+        }
+        let backend = cli.resolve_sandbox_backend(cfg);
+        let sandbox = Sandbox::new(cli.resolve_sandbox(cfg), &backend)
+            .with_windows_appcontainer_roots(
+                cli.resolve_windows_appcontainer_read_roots(cfg),
+                cli.resolve_windows_appcontainer_write_roots(cfg),
+            );
+        if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
+            && unavailable_sandbox_must_fail(cli, cfg, cfg!(target_os = "windows"))
+        {
+            let reason = sandbox
+                .unavailable_diagnostic()
+                .map(|diagnostic| format!("\n{diagnostic}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(any(test, all(target_os = "windows", feature = "js")))]
 fn run_startup_probes_concurrently<General, Worker, WorkerStatus>(
     general: General,
@@ -1287,27 +1318,7 @@ impl Startup {
     /// other platforms retain the legacy warning only for an entirely
     /// inherited default.
     pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
-        if !self.cli.general_sandbox_is_eligible(&self.cfg) {
-            return Ok(());
-        }
-        let backend = self.cli.resolve_sandbox_backend(&self.cfg);
-        let sandbox = Sandbox::new(self.cli.resolve_sandbox(&self.cfg), &backend)
-            .with_windows_appcontainer_roots(
-                self.cli.resolve_windows_appcontainer_read_roots(&self.cfg),
-                self.cli.resolve_windows_appcontainer_write_roots(&self.cfg),
-            );
-        if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
-            && unavailable_sandbox_must_fail(&self.cli, &self.cfg, cfg!(target_os = "windows"))
-        {
-            let reason = sandbox
-                .unavailable_diagnostic()
-                .map(|diagnostic| format!("\n{diagnostic}"))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}"
-            );
-        }
-        Ok(())
+        configured_sandbox_validation_probe(&self.cli, &self.cfg)()
     }
 
     /// Resolve the startup containment gates after the workspace has been captured. On Windows,
@@ -1318,7 +1329,7 @@ impl Startup {
         #[cfg(all(target_os = "windows", feature = "js"))]
         if self.cli.tool_is_eligible(&self.cfg, "js") {
             let (general, _worker_status) = run_startup_probes_concurrently(
-                || self.validate_sandbox_availability(),
+                configured_sandbox_validation_probe(&self.cli, &self.cfg),
                 crate::sandbox::worker::containment_status,
             )?;
             // Worker unavailability is consumed later as an unavailable JS tool; the cached status
@@ -4853,6 +4864,32 @@ mod tests {
                 && cleanup < propagate
                 && propagate < dispatch
         );
+    }
+
+    #[test]
+    fn startup_probe_captures_policy_without_sharing_runtime_owners() {
+        // Like Startup's publication/cleanup owner, this carrier is !Sync.
+        struct Inputs {
+            cli: Cli,
+            cfg: crate::config::Config,
+            owner: std::cell::RefCell<u8>,
+        }
+        let inputs = Inputs {
+            cli: Cli {
+                no_sandbox: true,
+                ..Default::default()
+            },
+            cfg: Default::default(),
+            owner: std::cell::RefCell::new(7),
+        };
+        let (general, worker) = run_startup_probes_concurrently(
+            super::configured_sandbox_validation_probe(&inputs.cli, &inputs.cfg),
+            || "captured worker status",
+        )
+        .unwrap();
+        general.unwrap();
+        assert_eq!(worker, "captured worker status");
+        assert_eq!(*inputs.owner.borrow(), 7);
     }
 
     #[test]

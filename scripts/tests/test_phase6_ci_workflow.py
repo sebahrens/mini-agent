@@ -1478,6 +1478,16 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         ]:
             if item not in native:
                 raise AssertionError("missing native diagnostic execution guard: " + item)
+        observer = job.split("name: Test the exact installed-preflight observer controls", 1)[1].split("- name:", 1)[0]
+        for item in [
+            "sandbox::windows::preflight_witness::tests::preflight_helper_observation_decodes_only_closed_stages_and_exact_header",
+            "sandbox::windows::preflight_witness::tests::ordinary_launch_request_omits_observer_and_diagnostics_are_value_free",
+            "--exact --list", "--exact --nocapture --test-threads=1", ".Count -ne 1",
+            "$observerExit = $LASTEXITCODE", "if ($observerExit -ne 0)",
+            r"'^test result: ok\. 2 passed; 0 failed; 0 ignored;'",
+        ]:
+            if item not in observer:
+                raise AssertionError("missing exact observer execution guard: " + item)
         probe = job.split("name: Attest write, authority, desktop, and parent-owned Job boundaries", 1)[1]
         for item in [
             "foreach ($attempt in 1..3)", "--mini-agent-windows-sandbox-runtime-check 2>&1",
@@ -1487,7 +1497,8 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
             "if (-not $match.Success", " stage=finished category=available ", " stage=cached category=available ",
             "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular", "breakaway=denied", "network=denied",
             "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC ", "$helper.Count -ne 1",
-            "phase=cleanup elapsed_ms=([0-9]{1,5})$", "[int]$helperMatch.Groups[1].Value -gt 60000",
+            "phase=cleanup elapsed_ms=([0-9]{1,5}) phase_entered_ms=([0-9]{1,8}) phase_clock=attachment phase_time_capped=false$",
+            "[int]$helperMatch.Groups[1].Value -gt 60000", "[int]$helperMatch.Groups[2].Value -gt 60000",
         ]:
             if item not in probe:
                 raise AssertionError("missing installed diagnostic guard: " + item)
@@ -1521,6 +1532,10 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
             ("preflight_diagnostics_bound_closed_timing_and_late_exit_categories", "missing_bound_test"),
             ("preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data", "missing_cache_test"),
             ("40 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 40 ignored;"),
+            ("$observerExit = $LASTEXITCODE", "$observerExit = 0"),
+            ("2 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 2 ignored;"),
+            ("--exact --nocapture --test-threads=1", "--ignored --nocapture --test-threads=1"),
+            ("[int]$helperMatch.Groups[2].Value -gt 60000", "[int]$helperMatch.Groups[2].Value -lt 0"),
             ("$probeExit = $LASTEXITCODE", "$probeExit = 0"),
             ("$diagnostics.Count -gt 34", "$diagnostics.Count -lt 0"),
             ("[int]$match.Groups[3].Value -gt 60000", "[int]$match.Groups[3].Value -lt 0"),

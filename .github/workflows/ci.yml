@@ -1392,6 +1392,28 @@ jobs:
             throw "Native Windows atomic publication regressions failed with exit code $LASTEXITCODE"
           }
 
+      - name: Test the exact installed-preflight observer controls
+        shell: pwsh
+        run: |
+          $observerTests = @(
+            'sandbox::windows::preflight_witness::tests::preflight_helper_observation_decodes_only_closed_stages_and_exact_header',
+            'sandbox::windows::preflight_witness::tests::ordinary_launch_request_omits_observer_and_diagnostics_are_value_free'
+          )
+          $observerList = @(cargo test --locked --bin mini-agent -- @observerTests --exact --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Preflight observer discovery failed' }
+          foreach ($test in $observerTests) {
+            if (@($observerList | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -eq "${test}: test" }).Count -ne 1) {
+              throw "Expected exactly one preflight observer control: $test"
+            }
+          }
+          $observerNative = @(cargo test --locked --bin mini-agent -- @observerTests --exact --nocapture --test-threads=1 2>&1)
+          $observerExit = $LASTEXITCODE
+          $observerNative | Write-Output
+          if ($observerExit -ne 0) { throw "Preflight observer controls failed: $observerExit" }
+          if (-not ($observerNative -match '^test result: ok\. 2 passed; 0 failed; 0 ignored;')) {
+            throw 'Preflight observer controls did not execute exactly two tests'
+          }
+
       - name: Attest write, authority, desktop, and parent-owned Job boundaries
         shell: pwsh
         run: |
@@ -1419,8 +1441,8 @@ jobs:
             }
             $helper = @($output | ForEach-Object { $_.ToString() } | Where-Object { $_.StartsWith('WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC ') })
             if ($helper.Count -ne 1) { throw 'Installed preflight omitted its exact retired helper observation' }
-            $helperMatch = [regex]::Match($helper[0], '^WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase=cleanup elapsed_ms=([0-9]{1,5})$')
-            if (-not $helperMatch.Success -or [int]$helperMatch.Groups[1].Value -gt 60000) {
+            $helperMatch = [regex]::Match($helper[0], '^WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase=cleanup elapsed_ms=([0-9]{1,5}) phase_entered_ms=([0-9]{1,8}) phase_clock=attachment phase_time_capped=false$')
+            if (-not $helperMatch.Success -or [int]$helperMatch.Groups[1].Value -gt 60000 -or [int]$helperMatch.Groups[2].Value -gt 60000) {
               throw 'Successful installed preflight emitted no closed completed-helper observation'
             }
             $expected = 'WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
