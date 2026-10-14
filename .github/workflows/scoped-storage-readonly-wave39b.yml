@@ -1,0 +1,96 @@
+name: Scoped Windows readonly fixture retirement wave39b
+
+on:
+  push:
+    branches: [codex/windows-storage-readonly-wave39b-20261014]
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+
+jobs:
+  windows-readonly-fixture:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 4
+      - name: Assert immutable source candidate and exact workflow-only child
+        shell: pwsh
+        run: |
+          $candidate = '639fd9810b1a8581951ad58ad645adae7ed0f735'
+          $previous = '638c0e965977f282924cd42cf5906921cf40aefe'
+          $baseline = 'c4dd68557cababcb2a19c9331e9499c977858c75'
+          $parent = (git rev-parse HEAD^).Trim()
+          if ($LASTEXITCODE -ne 0 -or $parent -ne $candidate) { throw 'Wrong source candidate parent' }
+          $sourceParent = (git rev-parse "${candidate}^").Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceParent -ne $previous) { throw 'Wrong published source baseline' }
+          $priorParent = (git rev-parse "${previous}^").Trim()
+          if ($LASTEXITCODE -ne 0 -or $priorParent -ne $baseline) { throw 'Wrong original source baseline' }
+          $fixPaths = @(git diff --name-only $previous $candidate)
+          if ($LASTEXITCODE -ne 0 -or $fixPaths.Count -ne 1 -or $fixPaths[0] -ne 'src/session/storage.rs') { throw 'Fixture fix changed unrelated source' }
+          $childPaths = @(git diff --name-only $candidate HEAD)
+          if ($LASTEXITCODE -ne 0 -or $childPaths.Count -ne 1 -or $childPaths[0] -ne '.github/workflows/scoped-storage-readonly-wave39b.yml') {
+            throw 'Proof child changed reviewed source or unrelated workflow'
+          }
+          $expectedPaths = @('docs/agent/MCP_CONFIGURATION.md', 'docs/agent/TOOL_RUNTIME.md', 'src/fs/private.rs', 'src/session/storage.rs')
+          $sourcePaths = @(git diff --name-only $baseline $candidate)
+          if ($LASTEXITCODE -ne 0 -or $sourcePaths.Count -ne 4 -or (Compare-Object $expectedPaths $sourcePaths)) {
+            throw 'Candidate differs from the four reviewed source files'
+          }
+          # Compare Git's stored and canonical working-tree blob identities, so
+          # Windows checkout newline normalization cannot falsify source proof.
+          $expectedBlobs = @{
+            'src/fs/private.rs' = '1a3c880ade8f4b1a417e8f34eea8d33cb138c9d4'
+            'src/session/storage.rs' = 'a63b5c92243b609ca2b3367cbbdd078bcc349c66'
+            'docs/agent/MCP_CONFIGURATION.md' = 'd1c064af5a4188626c185821a34984aa04022f0d'
+            'docs/agent/TOOL_RUNTIME.md' = 'cd587d673c64ad1ad66e95e9a82cf3daed8bb194'
+            'Cargo.toml' = 'eb559a5cc859e6b7994263bbb63370f79d6e62d8'
+            'Cargo.lock' = '3db276d64f80efce03441f36d691c4bf16205188'
+          }
+          foreach ($relative in $expectedBlobs.Keys) {
+            $stored = (git rev-parse "${candidate}:${relative}").Trim()
+            if ($LASTEXITCODE -ne 0 -or $stored -ne $expectedBlobs[$relative]) { throw 'Reviewed source blob differs' }
+            $working = (git hash-object "--path=$relative" $relative).Trim()
+            if ($LASTEXITCODE -ne 0 -or $working -ne $expectedBlobs[$relative]) { throw 'Working source differs from reviewed candidate' }
+          }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked source is dirty before native validation' }
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: stable
+          cache-on-failure: true
+      - name: Record reused unchanged production installation proof
+        shell: pwsh
+        run: |
+          Write-Output 'Production code before cfg(test) is unchanged; this workflow reuses the previous minimal acp,mcp debug installation rather than reinstalling for a test-only descriptor drop.'
+          Write-Output 'Reused install: source638c0e965977f282924cd42cf5906921cf40aefe, run38551277994, job115809554555 Install required minimal debug binary passed.'
+      - name: Discover and execute the one failed readonly fixture
+        shell: pwsh
+        run: |
+          $required = @(
+            'session::storage::readonly_import_tests::readonly_session_import_is_exact_bounded_and_never_recreates_grants_or_missing_artifacts'
+          )
+          $discovered = @(cargo test --locked --no-default-features --features 'acp,mcp' --bin mini-agent -- @required --exact --list 2>&1)
+          $discoveryExit = $LASTEXITCODE
+          $discovered | Write-Output
+          if ($discoveryExit -ne 0) { throw 'Native changed-control discovery failed' }
+          $actual = @($discovered | ForEach-Object { $_.ToString() } | Where-Object { $_ -match ': test$' })
+          $expected = @($required | ForEach-Object { "${_}: test" })
+          if ($actual.Count -ne 1 -or (Compare-Object $expected $actual)) {
+            throw 'Exact one failed readonly control was not discovered'
+          }
+          foreach ($name in $expected) {
+            if (@($actual | Where-Object { $_ -eq $name }).Count -ne 1) { throw 'Native control discovery is missing or duplicated' }
+          }
+          $native = @(cargo test --locked --no-default-features --features 'acp,mcp' --bin mini-agent -- @required --exact --nocapture --test-threads=1 2>&1)
+          $nativeExit = $LASTEXITCODE
+          $native | Write-Output
+          if ($nativeExit -ne 0) { throw 'Changed native controls failed' }
+          if (-not ($native -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
+            throw 'Changed native controls did not execute exactly one passing test'
+          }
