@@ -1,8 +1,11 @@
 mod bounded_http;
+pub(crate) mod catalogue;
 pub mod client;
 pub mod config;
 pub(crate) mod deferred;
 mod egress;
+pub(crate) mod elicitation;
+pub(crate) mod forms;
 pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod project;
@@ -304,6 +307,9 @@ impl McpClientManager {
                         )
                         .await
                     };
+                    if let Ok(handle) = &result {
+                        handle.discover_auxiliary().await;
+                    }
                     attempt.finish(if result.is_ok() {
                         health::AttemptOutcome::Succeeded
                     } else {
@@ -388,6 +394,7 @@ impl McpClientManager {
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;
                 let source_proof = handle.source_proof.clone();
+                let elicitation = handle.elicitation.clone();
                 let liveness = Arc::downgrade(&handle.liveness);
                 let live_peer = peer.clone();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
@@ -409,6 +416,7 @@ impl McpClientManager {
                         server_name,
                         trusted_identity,
                         source_proof,
+                        elicitation,
                         client_is_live,
                         peer,
                         result,
@@ -420,7 +428,16 @@ impl McpClientManager {
         let results = futures::future::join_all(futs).await;
 
         let mut all_tools = Vec::new();
-        for (server_name, trusted_identity, source_proof, client_is_live, peer, result) in results {
+        for (
+            server_name,
+            trusted_identity,
+            source_proof,
+            elicitation,
+            client_is_live,
+            peer,
+            result,
+        ) in results
+        {
             match result {
                 Ok(tools) => {
                     tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
@@ -442,6 +459,7 @@ impl McpClientManager {
                             trusted_identity,
                             source_proof: source_proof.clone(),
                             client_is_live: client_is_live.clone(),
+                            elicitation: elicitation.clone(),
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
                             model_description,

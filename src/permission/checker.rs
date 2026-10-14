@@ -1030,6 +1030,21 @@ impl PermissionChecker {
         self.check_inner("mcp_tool", input, input, read_only_exempt)
     }
 
+    /// Auxiliary RPCs retain ordinary MCP policy/deny checks, but their
+    /// selected identity cannot mint or consume a remote tool-call grant.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn check_mcp_auxiliary(
+        &mut self,
+        policy_input: &str,
+        identity: &str,
+        trusted_identity: Option<TrustedMcpServer>,
+        operation: &str,
+    ) -> CheckResult {
+        let read_only_exempt =
+            trusted_identity.is_some_and(|trusted| trusted.exempts_read_only_tool(operation));
+        self.check_inner("mcp_tool", policy_input, identity, read_only_exempt)
+    }
+
     fn check_inner(
         &mut self,
         tool: &str,

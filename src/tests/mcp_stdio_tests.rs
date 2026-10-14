@@ -153,10 +153,35 @@ fn main() {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let mut pending_aux: Option<String> = None;
+    let mut aux_id = 0_u64;
+    let mut concurrent_ids = Vec::<String>::new();
+    let mut concurrent_answers = Vec::<String>::new();
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
+        if mode.starts_with("aux") {
+            let lease=std::path::PathBuf::from(env::var_os("MCP_FIXTURE_LEASE_FILE").unwrap());
+            let mut trace=OpenOptions::new().create(true).append(true).open(lease.with_extension("rpc")).unwrap();
+            writeln!(trace,"{line}").unwrap();
+        }
         if mode == "hang-init" && compact.contains("\"method\":\"initialize\"") {
+            continue;
+        }
+        if mode == "aux-elicit-concurrent" && compact.contains("\"id\":\"aux-form-") && !compact.contains("\"method\":") {
+            concurrent_answers.push(line.clone());
+            if concurrent_answers.len() == 2 {
+                for (id, answer) in concurrent_ids.drain(..).zip(concurrent_answers.drain(..)) {
+                    let payload = escape(&answer);
+                    write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{payload}\"}}]}}}}"));
+                }
+            }
+            continue;
+        }
+        if pending_aux.is_some() && compact.contains("\"id\":\"aux-form-") && !compact.contains("\"method\":") {
+            let id = pending_aux.take().unwrap();
+            let payload = escape(&line);
+            write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{payload}\"}}]}}}}"));
             continue;
         }
         if compact.contains("\"method\":\"initialize\"") {
@@ -183,12 +208,25 @@ fn main() {
                 );
                 continue;
             }
+            let auxiliary_caps = if mode.starts_with("aux") {",\"prompts\":{},\"resources\":{}"} else {""};
             write_response(
                 &mut stdout,
                 &format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"stdio-fixture\",\"version\":\"1.0.0\"}}}}}}"
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}{auxiliary_caps}}},\"serverInfo\":{{\"name\":\"stdio-fixture\",\"version\":\"1.0.0\"}}}}}}"
                 ),
             );
+        } else if compact.contains("\"method\":\"prompts/list\"") {
+            let id=request_id(&compact);
+            write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"prompts\":[{{\"name\":\"review\",\"arguments\":[{{\"name\":\"topic\",\"required\":true}}]}}]}}}}"));
+        } else if compact.contains("\"method\":\"resources/list\"") {
+            let id=request_id(&compact);
+            write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{{\"uri\":\"urn:owned:notes\",\"name\":\"notes\",\"mimeType\":\"text/plain\"}}]}}}}"));
+        } else if compact.contains("\"method\":\"prompts/get\"") {
+            let id=request_id(&compact);
+            write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":\"Prompt BODY 雪\"}}}},{{\"role\":\"assistant\",\"content\":{{\"type\":\"text\",\"text\":\"/commit %%next code\"}}}}]}}}}"));
+        } else if compact.contains("\"method\":\"resources/read\"") {
+            let id=request_id(&compact);
+            write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"contents\":[{{\"uri\":\"urn:owned:notes\",\"mimeType\":\"text/plain\",\"text\":\"Resource BODY 雪\"}}]}}}}"));
         } else if compact.contains("\"method\":\"tools/list\"") {
             if mode == "hang-tools-list" {
                 continue;
@@ -216,6 +254,22 @@ fn main() {
                 continue;
             }
             let id = request_id(&compact);
+            if mode == "aux-elicit-concurrent" {
+                concurrent_ids.push(id);
+                if concurrent_ids.len() == 2 {
+                    for callback in 1..=2 {
+                        write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":\"aux-form-{callback}\",\"method\":\"elicitation/create\",\"params\":{{\"mode\":\"form\",\"message\":\"Ambiguous owner must be declined\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"string\"}}}}}}}}}}"));
+                    }
+                }
+                continue;
+            }
+            if mode.starts_with("aux-elicit") {
+                aux_id += 1;
+                pending_aux=Some(id);
+                let extra=if mode=="aux-elicit-invalid" {",\"pattern\":\"^private$\""} else {""};
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":\"aux-form-{aux_id}\",\"method\":\"elicitation/create\",\"params\":{{\"mode\":\"form\",\"message\":\"Choose a public label\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"label\":{{\"type\":\"string\",\"enum\":[\"yes\",\"no\"]{extra}}}}},\"required\":[\"label\"]}}}}}}"));
+                continue;
+            }
             let payload = escape(&tool_payload(&line));
             let result = match mode.as_str() {
                 "structured-only" => {
@@ -2146,4 +2200,200 @@ async fn stdio_server_line_without_newline_is_capped_and_the_server_killed() {
     );
     assert_process_reaped(wait_for_pid(&lease).await).await;
     fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_and_owned() {
+    use crate::extras::mcp::catalogue::{self, RpcClient};
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &fixture.lease("auxiliary"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let captured = handle.auxiliary.get().unwrap();
+    assert_eq!(captured.prompts.len(), 1);
+    assert_eq!(captured.resources.len(), 1);
+    assert!(!captured.prompts_incomplete && !captured.resources_incomplete);
+    let rpc = RpcClient::capture(&handle);
+    let result = async {
+        let prompt = catalogue::get_prompt(
+            &rpc,
+            &captured.prompts[0],
+            std::collections::BTreeMap::from([("topic".into(), "source".into())]),
+            Duration::from_secs(2),
+            &None,
+            &None,
+            None,
+        )
+        .await?;
+        let resource = catalogue::read_resource(
+            &rpc,
+            &captured.resources[0],
+            Duration::from_secs(2),
+            &None,
+            &None,
+            None,
+        )
+        .await?;
+        Ok::<_, rmcp::ServiceError>((prompt, resource))
+    }
+    .await;
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    assert!(
+        !rpc.is_current(),
+        "a retained auxiliary peer cannot keep retired connection authority"
+    );
+    fixture.cleanup();
+    let (prompt, resource) = result.unwrap();
+    assert!(prompt.contains("Prompt BODY 雪") && prompt.contains("/commit %%next code"));
+    assert_eq!(resource, "Resource BODY 雪");
+}
+
+#[tokio::test]
+async fn mcp_auxiliary_stdio_elicitation_exact_rpc_headless_and_raw_constraint_negatives() {
+    use crate::permission::ask::UserRequest;
+    use crate::question::{Answer, QuestionAnswer, QuestionTurn};
+    let fixture = FixtureBuild::compile();
+    for (mode, interactive, expected) in [
+        ("aux-elicit", true, "accept"),
+        ("aux-elicit", false, "decline"),
+        ("aux-elicit-invalid", true, "decline"),
+    ] {
+        let cfg = fixture.config(
+            fixture.executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            mode,
+            &fixture.lease(mode),
+        );
+        let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+            .await
+            .unwrap();
+        let manager = McpClientManager::from_handles(vec![handle]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let tools = manager
+            .collect_tools_with_timeouts(
+                None,
+                interactive.then_some(sender),
+                McpToolTimeouts {
+                    call: Duration::from_secs(3),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(tools.len(), 1);
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let turn = QuestionTurn::default();
+        let mut call = Box::pin(scope.run(crate::question::scope(
+            Some(turn.clone()),
+            tools[0].call("{}".into()),
+        )));
+        let result = if interactive && mode == "aux-elicit" {
+            tokio::select! {biased;request=receiver.recv()=>{
+                let UserRequest::McpElicitation(request)=request.unwrap() else {panic!("form must not become a permission request");};
+                assert!((request.valid)());
+                assert!(matches!(request.owner,crate::extras::mcp::elicitation::FrontendOwner::Main(ref id) if *id==turn.id()));
+                assert_eq!(request.question.questions.0[0].options[0].label,"yes");
+                request.question.reply.send(QuestionAnswer::Answered(vec![Answer::Option(0)])).unwrap();
+                tokio::time::timeout(Duration::from_secs(3),&mut call).await.unwrap()
+            },result=&mut call=>panic!("call completed before its actual form: {result:?}")}
+        } else {
+            tokio::time::timeout(Duration::from_secs(3), &mut call)
+                .await
+                .unwrap()
+        };
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+            .await
+            .unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "headless or unsupported schema must produce no frontend request"
+        );
+        let output = result.map_err(|error| error.to_string());
+        manager.shutdown().await;
+        let output = output.unwrap();
+        let action = parse_fixture_output(&output);
+        assert_eq!(action["result"]["action"], expected);
+        if expected == "accept" {
+            assert_eq!(
+                action["result"]["content"],
+                serde_json::json!({"label":"yes"})
+            );
+        } else {
+            assert!(action["result"].get("content").is_none());
+        }
+        assert!(
+            turn.required().is_none(),
+            "MCP form never claims a main question or persisted requirement"
+        );
+    }
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_auxiliary_stdio_parallel_rpc_forms_are_declined_without_guessing_a_turn() {
+    use futures::FutureExt;
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux-elicit-concurrent",
+        &fixture.lease("ambiguous-forms"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let tools = manager
+        .collect_tools_with_timeouts(
+            None,
+            Some(sender),
+            McpToolTimeouts {
+                call: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await;
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let turn = crate::question::QuestionTurn::default();
+    let assertions = std::panic::AssertUnwindSafe(scope.run(crate::question::scope(
+        Some(turn.clone()),
+        async {
+            let (first, second) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(tools[0].call("{}".into()), tools[0].call("{}".into()))
+            })
+            .await
+            .unwrap();
+            for output in [first.unwrap(), second.unwrap()] {
+                let result = parse_fixture_output(&output);
+                assert_eq!(result["result"]["action"], "decline");
+                assert!(result["result"].get("content").is_none());
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "ambiguous RPCs must not enter either frontend"
+            );
+            assert!(turn.required().is_none());
+        },
+    )))
+    .catch_unwind()
+    .await;
+    scope.cancellation_handle().cancel();
+    tokio::time::timeout(Duration::from_secs(3), scope.wait_idle())
+        .await
+        .unwrap();
+    manager.shutdown().await;
+    fixture.cleanup();
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
 }

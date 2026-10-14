@@ -189,6 +189,14 @@ impl Approval {
 }
 
 pub(super) enum Completion {
+    PromptData {
+        client: crate::extras::mcp::catalogue::RpcClient,
+        message: String,
+    },
+    ResourceData {
+        attachments: Vec<crate::extras::mcp::catalogue::Attachment>,
+        submission: Option<String>,
+    },
     Prepared {
         cfg: Box<crate::config::Config>,
         approval: Option<(String, String)>,
@@ -325,6 +333,9 @@ pub(super) struct State {
     pub approval: Option<Approval>,
     pub work: Option<Work>,
     pub live: Option<Box<crate::config::Config>>,
+    pub resources: Vec<crate::extras::mcp::catalogue::Attachment>,
+    pub auxiliary_draft: Option<String>,
+    pub reading_resources: bool,
 }
 
 impl Work {

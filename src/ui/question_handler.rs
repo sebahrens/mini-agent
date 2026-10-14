@@ -14,6 +14,8 @@ pub(crate) enum QuestionEvent {
     Stop,
 }
 pub(crate) struct QuestionState {
+    #[cfg(feature = "mcp")]
+    origin: Option<crate::extras::mcp::elicitation::AskOrigin>,
     request: Option<QuestionRequest>,
     answers: Vec<Answer>,
     draft: String,
@@ -36,6 +38,8 @@ impl QuestionState {
         );
         let text_mode = request.questions.0[0].options.is_empty();
         let state = Self {
+            #[cfg(feature = "mcp")]
+            origin: None,
             request: Some(request),
             answers: Vec::new(),
             draft: String::new(),
@@ -47,9 +51,21 @@ impl QuestionState {
         Ok(state)
     }
     pub(crate) fn abandoned(&self) -> bool {
+        #[cfg(feature = "mcp")]
+        if self.origin.as_ref().is_some_and(|origin| !(origin.valid)()) {
+            return true;
+        }
         self.request
             .as_ref()
             .is_some_and(|request| request.reply.is_closed())
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn bind_origin(&mut self, origin: crate::extras::mcp::elicitation::AskOrigin) {
+        self.origin = Some(origin);
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn origin_owner(&self) -> Option<&crate::extras::mcp::elicitation::FrontendOwner> {
+        self.origin.as_ref().map(|origin| &origin.owner)
     }
     pub(crate) fn finish(&self, renderer: &mut Renderer) -> std::io::Result<()> {
         renderer.permission_prompt = None;

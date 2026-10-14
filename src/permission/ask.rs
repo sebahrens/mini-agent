@@ -71,15 +71,43 @@ pub(crate) fn current_tool_call_id() -> Option<String> {
 pub type AskSender = mpsc::Sender<UserRequest>;
 pub type AskReceiver = mpsc::Receiver<UserRequest>;
 
+#[cfg(feature = "mcp")]
+tokio::task_local! {static MCP_ASK_ORIGIN: Option<crate::extras::mcp::elicitation::AskOrigin>;}
+#[cfg(feature = "mcp")]
+pub(crate) async fn scope_mcp_ask<F: std::future::Future>(
+    origin: Option<crate::extras::mcp::elicitation::AskOrigin>,
+    future: F,
+) -> F::Output {
+    MCP_ASK_ORIGIN.scope(origin, future).await
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn current_mcp_origin_valid() -> bool {
+    MCP_ASK_ORIGIN
+        .try_with(|origin| origin.as_ref().is_none_or(|origin| (origin.valid)()))
+        .unwrap_or(true)
+}
+
 /// Frontend transport only. Question replies cannot be used as approvals.
 #[derive(Debug)]
 pub enum UserRequest {
     Permission(AskRequest),
     Question(QuestionRequest),
+    #[cfg(feature = "mcp")]
+    McpElicitation(crate::extras::mcp::elicitation::Request),
+    #[cfg(feature = "mcp")]
+    McpPermission(crate::extras::mcp::elicitation::PermissionRequest),
 }
 
 impl From<AskRequest> for UserRequest {
     fn from(request: AskRequest) -> Self {
+        #[cfg(feature = "mcp")]
+        if let Some(origin) = MCP_ASK_ORIGIN.try_with(Clone::clone).ok().flatten() {
+            return Self::McpPermission(crate::extras::mcp::elicitation::PermissionRequest {
+                request,
+                origin,
+            });
+        }
         Self::Permission(request)
     }
 }
@@ -95,6 +123,17 @@ impl UserRequest {
                     .reply
                     .send(crate::question::QuestionAnswer::Cancelled);
             }
+            #[cfg(feature = "mcp")]
+            Self::McpElicitation(request) => {
+                let _ = request
+                    .question
+                    .reply
+                    .send(crate::question::QuestionAnswer::Cancelled);
+            }
+            #[cfg(feature = "mcp")]
+            Self::McpPermission(request) => {
+                let _ = request.request.reply.send(UserDecision::Deny);
+            }
         }
     }
 
@@ -103,6 +142,10 @@ impl UserRequest {
         match self {
             Self::Permission(request) => request,
             Self::Question(_) => panic!("expected permission request, received question"),
+            #[cfg(feature = "mcp")]
+            Self::McpElicitation(_) => panic!("expected permission request, received MCP form"),
+            #[cfg(feature = "mcp")]
+            Self::McpPermission(request) => request.request,
         }
     }
 }

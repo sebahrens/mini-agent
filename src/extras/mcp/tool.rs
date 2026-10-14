@@ -33,6 +33,7 @@ pub struct McpTool {
     pub trusted_identity: Option<TrustedMcpServer>,
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub(crate) client_is_live: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    pub(crate) elicitation: super::elicitation::Handler,
     pub definition: rmcp::model::Tool,
     pub(super) model_description: String,
     pub(super) model_parameters: serde_json::Value,
@@ -204,6 +205,7 @@ impl ToolDyn for McpTool {
         let spill_scope = self.spill_scope.clone();
         let source_proof = self.source_proof.clone();
         let client_is_live = self.client_is_live.clone();
+        let elicitation = self.elicitation.clone();
 
         Box::pin(async move {
             ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
@@ -240,6 +242,16 @@ impl ToolDyn for McpTool {
             // Permission/hook waits may outlive the approved source revision.
             // Recheck immediately before the exact retained peer receives RPC.
             ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+            let proof = source_proof.clone();
+            let live = client_is_live.clone();
+            let _elicitation_lease = elicitation.enter(
+                server_name.to_string(),
+                ask_tx.clone(),
+                std::sync::Arc::new(move || {
+                    live() && proof.as_ref().is_none_or(|proof| proof.is_current())
+                }),
+                None,
+            );
             let result = call_tool_bounded(&peer, params, call_timeout)
                 .await
                 .map_err(|e| {

@@ -2064,6 +2064,79 @@ impl<'a> App<'a> {
         request: crate::permission::ask::UserRequest,
     ) -> anyhow::Result<()> {
         match request {
+            #[cfg(feature = "mcp")]
+            crate::permission::ask::UserRequest::McpPermission(request) => {
+                if !self.mcp_frontend_owner_current(&request.origin.owner)
+                    || !(request.origin.valid)()
+                    || request.request.reply.is_closed()
+                {
+                    let _ = request
+                        .request
+                        .reply
+                        .send(crate::permission::ask::UserDecision::Deny);
+                    return Ok(());
+                }
+                let mut prompt = PermissionState::begin(
+                    request.request,
+                    &mut self.renderer,
+                    &self.ui,
+                    &mut self.run,
+                )?;
+                prompt.bind_origin(request.origin.valid);
+                prompt.bind_owner(request.origin.owner);
+                self.permission_prompt = Some(prompt);
+                Ok(())
+            }
+            #[cfg(feature = "mcp")]
+            crate::permission::ask::UserRequest::McpElicitation(request) => {
+                let current = (request.valid)()
+                    && match &request.owner {
+                        crate::extras::mcp::elicitation::FrontendOwner::Main(id) => {
+                            self.run.is_running
+                                && self
+                                    .run
+                                    .question_turn
+                                    .as_ref()
+                                    .is_some_and(|turn| turn.id() == *id)
+                        }
+                        crate::extras::mcp::elicitation::FrontendOwner::Operator {
+                            session,
+                            workspace,
+                            generation,
+                        } => {
+                            *session == self.ui.session.id
+                                && Arc::ptr_eq(workspace, &self.ui.workspace)
+                                && self
+                                    .mcp_admin
+                                    .as_ref()
+                                    .and_then(|state| state.work.as_ref())
+                                    .is_some_and(|work| {
+                                        work.id == *generation
+                                            && work.valid(&self.ui.session.id, &self.ui.workspace)
+                                    })
+                        }
+                    };
+                if !current || request.question.reply.is_closed() {
+                    let _ = request
+                        .question
+                        .reply
+                        .send(crate::question::QuestionAnswer::Cancelled);
+                    return Ok(());
+                }
+                self.question_prompt =
+                    Some(QuestionState::begin(request.question, &mut self.renderer)?);
+                self.question_prompt.as_mut().unwrap().bind_origin(
+                    crate::extras::mcp::elicitation::AskOrigin {
+                        owner: request.owner,
+                        valid: request.valid,
+                    },
+                );
+                #[cfg(feature = "goal")]
+                if let Some(collector) = self.run.goal_round.as_mut() {
+                    collector.pause_clock();
+                }
+                Ok(())
+            }
             crate::permission::ask::UserRequest::Permission(request) => {
                 self.begin_permission_request(request)
             }
@@ -2124,10 +2197,19 @@ impl<'a> App<'a> {
     }
 
     fn expire_abandoned_permission(&mut self) -> anyhow::Result<()> {
-        if self
+        #[cfg(feature = "mcp")]
+        let stale_mcp_question = self
             .question_prompt
             .as_ref()
-            .is_some_and(QuestionState::abandoned)
+            .and_then(QuestionState::origin_owner)
+            .is_some_and(|owner| !self.mcp_frontend_owner_current(owner));
+        #[cfg(not(feature = "mcp"))]
+        let stale_mcp_question = false;
+        if stale_mcp_question
+            || self
+                .question_prompt
+                .as_ref()
+                .is_some_and(QuestionState::abandoned)
         {
             if let Some(prompt) = self.question_prompt.take() {
                 prompt.finish(&mut self.renderer)?;
@@ -2135,10 +2217,19 @@ impl<'a> App<'a> {
             self.resume_permission_clock();
             self.refresh()?;
         }
-        if self
+        #[cfg(feature = "mcp")]
+        let stale_mcp_permission = self
             .permission_prompt
             .as_ref()
-            .is_some_and(PermissionState::abandoned)
+            .and_then(PermissionState::origin_owner)
+            .is_some_and(|owner| !self.mcp_frontend_owner_current(owner));
+        #[cfg(not(feature = "mcp"))]
+        let stale_mcp_permission = false;
+        if stale_mcp_permission
+            || self
+                .permission_prompt
+                .as_ref()
+                .is_some_and(PermissionState::abandoned)
         {
             if let Some(prompt) = self.permission_prompt.take() {
                 prompt.decline_on_cancel(&self.ui);
@@ -2187,6 +2278,8 @@ impl<'a> App<'a> {
                 QuestionEvent::Finished => self.resume_permission_clock(),
                 QuestionEvent::Stop => {
                     drop(prompt);
+                    #[cfg(feature = "mcp")]
+                    self.retire_mcp_work().await?;
                     self.abort_main_run().await?;
                     if self.run.agent_rx.is_some() {
                         return Err(anyhow::anyhow!(
@@ -2220,6 +2313,8 @@ impl<'a> App<'a> {
             PermissionEvent::Waiting => self.permission_prompt = Some(prompt),
             PermissionEvent::Finished => self.resume_permission_clock(),
             PermissionEvent::Stop { instruction } => {
+                #[cfg(feature = "mcp")]
+                self.retire_mcp_work().await?;
                 // Reply and abort happen in one polling turn before awaiting
                 // cleanup, preventing a denial from launching an alternative.
                 drop(prompt);
@@ -2717,6 +2812,10 @@ impl<'a> App<'a> {
         if key.code == KeyCode::Char('/') && self.input.buffer.is_empty() {
             self.refresh_custom_commands();
         }
+        #[cfg(feature = "mcp")]
+        if key.code == KeyCode::Char('@') {
+            self.refresh_custom_commands();
+        }
 
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.pause_event_thread();
@@ -2877,6 +2976,10 @@ impl<'a> App<'a> {
             } else if !one_shot && text.starts_with('!') {
                 self.run_bang_command(&text).await?;
             } else {
+                #[cfg(feature = "mcp")]
+                if crate::startup::heap_future(|| self.start_mcp_mentions(&text)).await? {
+                    return Ok(());
+                }
                 self.echo_main_submission(&text)?;
                 self.start_main_run(&text, crate::question::QuestionOrigin::NewUserTurn)
                     .await?;
@@ -3247,6 +3350,10 @@ impl<'a> App<'a> {
                 return Ok(());
             }
             if let Some(next) = self.run.pending_inputs.pop_front() {
+                #[cfg(feature = "mcp")]
+                if crate::startup::heap_future(|| self.start_mcp_mentions(&next)).await? {
+                    return Ok(());
+                }
                 self.renderer.chain_prompt = None;
                 self.renderer.chain_but_mode = false;
                 self.chain.pending = None;
@@ -3733,6 +3840,10 @@ impl<'a> App<'a> {
     #[cfg(feature = "git-worktree")]
     async fn advance_git_queue(&mut self) -> anyhow::Result<()> {
         if let Some(next) = self.run.pending_inputs.pop_front() {
+            #[cfg(feature = "mcp")]
+            if crate::startup::heap_future(|| self.start_mcp_mentions(&next)).await? {
+                return Ok(());
+            }
             self.echo_main_submission(&next)?;
             self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
                 .await?;
@@ -4027,6 +4138,20 @@ impl<'a> App<'a> {
     }
 
     async fn start_main_run(
+        &mut self,
+        text: &str,
+        question_origin: crate::question::QuestionOrigin,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "mcp")]
+        let prepared = self.mcp_resource_text(text);
+        #[cfg(feature = "mcp")]
+        let text = prepared.as_deref().unwrap_or(text);
+        crate::startup::heap_future(|| self.start_main_run_prepared(text, question_origin)).await
+    }
+
+    /// Already projected literal input: no slash, bang, directives, MCP
+    /// references or operator-approval reclassification occurs here.
+    async fn start_main_run_prepared(
         &mut self,
         text: &str,
         question_origin: crate::question::QuestionOrigin,
@@ -4544,12 +4669,25 @@ impl<'a> App<'a> {
     }
 
     fn refresh_custom_commands(&mut self) {
-        self.input.set_custom_commands(
-            crate::context::commands::load_for_workspace(&self.ui.workspace)
-                .into_iter()
-                .map(|(name, template)| (format!("/{name}"), template.description))
-                .collect(),
-        );
+        let commands = crate::context::commands::load_for_workspace(&self.ui.workspace)
+            .into_iter()
+            .map(|(name, template)| (format!("/{name}"), template.description))
+            .collect::<Vec<_>>();
+        #[cfg(feature = "mcp")]
+        let commands = {
+            let mut commands = commands;
+            let mut resources = Vec::new();
+            if let Some(manager) = &self.ui.mcp_manager {
+                for client in &manager.handles {
+                    let (prompts, entries) = crate::extras::mcp::catalogue::cached_choices(client);
+                    commands.extend(prompts);
+                    resources.extend(entries);
+                }
+            }
+            self.input.set_mcp_resources(resources);
+            commands
+        };
+        self.input.set_custom_commands(commands);
     }
 
     async fn submit_custom_command(

@@ -861,3 +861,17 @@ It never opens files, displays instruction bodies, or treats loaded snapshots or
 notice counts as delivery acknowledgements. Busy metadata is unavailable rather
 than blocking the UI. Snapshots remain stable until agent rebuild; changing or
 revoking source authority cannot authorize a later mutation from stale delivery.
+
+
+### MCP auxiliary requests and forms
+
+The `mcp` feature also owns advertised prompt/resource catalogues and selected
+text RPCs in `src/extras/mcp/catalogue.rs`. Operator selection uses the existing
+MCP work actor and an exact session/workspace/generation permission origin.
+Runtime resource snapshots enter new literal user messages; older request
+prefixes are preserved. `src/extras/mcp/forms.rs` validates raw schema constraints
+before rmcp decoding, and `elicitation.rs` binds callbacks to one live RPC's
+captured Question/Run/work scope. Form answers never mint grants or a persisted
+main question. Headless declines forms and ACP cancels unsupported forms; URL elicitation and sampling are
+unsupported. Both transports keep bounded raw schema observations. See
+[MCP prompts, resources and forms](MCP_INTERACTION.md) for limits and UI controls.

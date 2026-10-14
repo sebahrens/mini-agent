@@ -835,6 +835,19 @@ pub(crate) struct AgentWorkCancellation {
 }
 
 impl AgentWorkCancellation {
+    #[cfg(feature = "mcp")]
+    pub(crate) async fn cancelled(&self) {
+        self.scope.cancelled().await;
+    }
+
+    /// Service callbacks run on the protocol's task, outside the originating
+    /// tool task-local scope. Retain that exact owner for cancellation, ledger
+    /// children and settlement; this does not create a new request or grant.
+    #[cfg(feature = "mcp")]
+    pub(crate) async fn run_callback<F: std::future::Future>(&self, future: F) -> F::Output {
+        let _child = self.scope.register();
+        self.scope.run(future).await
+    }
     pub(crate) fn cancel(&self) {
         self.scope.cancel();
     }

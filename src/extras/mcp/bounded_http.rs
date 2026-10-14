@@ -53,6 +53,7 @@ type HttpError = StreamableHttpError<reqwest::Error>;
 pub(crate) struct BoundedHttpClient {
     inner: reqwest::Client,
     max_body_bytes: usize,
+    forms: super::forms::RawForms,
 }
 
 impl BoundedHttpClient {
@@ -60,7 +61,12 @@ impl BoundedHttpClient {
         Self {
             inner,
             max_body_bytes,
+            forms: Default::default(),
         }
+    }
+    pub(crate) fn with_forms(mut self, forms: super::forms::RawForms) -> Self {
+        self.forms = forms;
+        self
     }
 }
 
@@ -277,6 +283,7 @@ fn capped_sse_stream(
     response: reqwest::Response,
     cap: usize,
     request_id: Option<RequestId>,
+    forms: super::forms::RawForms,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     // The body as a byte stream that fails once one SSE event exceeds `cap`.
     // Bytes before the offending one are still delivered so events that
@@ -321,7 +328,12 @@ fn capped_sse_stream(
                     }
                     _ => vec![Err(error)],
                 },
-                ok => vec![ok],
+                Ok(event) => {
+                    if let Some(data) = &event.data {
+                        forms.observe(data.as_bytes());
+                    }
+                    vec![Ok(event)]
+                }
             };
             futures::stream::iter(items)
         })
@@ -375,7 +387,12 @@ impl StreamableHttpClient for BoundedHttpClient {
         {
             return Err(StreamableHttpError::UnexpectedContentType(content_type));
         }
-        Ok(capped_sse_stream(response, self.max_body_bytes, None))
+        Ok(capped_sse_stream(
+            response,
+            self.max_body_bytes,
+            None,
+            self.forms.clone(),
+        ))
     }
 
     async fn delete_session(
@@ -492,7 +509,7 @@ impl StreamableHttpClient for BoundedHttpClient {
         }
         if starts_with_mime(content_type.as_deref(), EVENT_STREAM_MIME_TYPE) {
             return Ok(StreamableHttpPostResponse::Sse(
-                capped_sse_stream(response, cap, request_id),
+                capped_sse_stream(response, cap, request_id, self.forms.clone()),
                 response_session_id,
             ));
         }
@@ -507,6 +524,7 @@ impl StreamableHttpClient for BoundedHttpClient {
             }
             // Like rmcp: a malformed 200 body (for example to a notification)
             // is treated as accepted rather than failing the transport.
+            self.forms.observe(&body.bytes);
             return Ok(
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&body.bytes) {
                     Ok(message) => StreamableHttpPostResponse::Json(message, response_session_id),
@@ -546,6 +564,65 @@ mod tests {
     const MAX_ERROR_TEXT: usize = MCP_HTTP_ERROR_BODY_BYTES + 512;
 
     type Respond = Arc<dyn Fn(&str, &serde_json::Value) -> Vec<u8> + Send + Sync>;
+
+    #[tokio::test]
+    async fn actual_http_json_and_sse_validate_raw_forms_before_typed_schema_loss() {
+        use super::{BoundedHttpClient, StreamableHttpClient, StreamableHttpPostResponse};
+        use futures::{FutureExt, StreamExt};
+        for sse in [false, true] {
+            for unknown in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url: Arc<str> = format!("http://{}/mcp", listener.local_addr().unwrap()).into();
+                let mut request = serde_json::json!({"jsonrpc":"2.0","id":"form","method":"elicitation/create","params":{"message":"Public value","requestedSchema":{"type":"object","properties":{"value":{"type":"string"}}}}});
+                if unknown {
+                    request["params"]["requestedSchema"]["properties"]["value"]["pattern"] =
+                        serde_json::json!("never silently erase me");
+                }
+                let json = serde_json::to_vec(&request).unwrap();
+                let body = if sse {
+                    format!("data: {}\n\n", String::from_utf8(json).unwrap()).into_bytes()
+                } else {
+                    json
+                };
+                let response = http_response(
+                    "200 OK",
+                    if sse {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                    &body,
+                );
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_request(&mut stream).await.unwrap().0, "POST");
+                    stream.write_all(&response).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                });
+                let result = std::panic::AssertUnwindSafe(async {
+                    let forms = crate::extras::mcp::forms::RawForms::default();
+                    let client = BoundedHttpClient::new(reqwest::Client::builder().no_proxy().build().unwrap(), MCP_HTTP_MAX_BODY_BYTES).with_forms(forms.clone());
+                    let outbound = serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"owned","arguments":{}}})).unwrap();
+                    let received = tokio::time::timeout(Duration::from_secs(2), client.post_message(url, outbound, None, None, HashMap::new())).await.unwrap().unwrap();
+                    match received {
+                        StreamableHttpPostResponse::Json(_, _) if !sse => {},
+                        StreamableHttpPostResponse::Sse(mut stream, _) if sse => { assert!(tokio::time::timeout(Duration::from_secs(2), stream.next()).await.unwrap().unwrap().is_ok()); },
+                        _ => panic!("fixture must exercise actual selected transport"),
+                    }
+                    let id = serde_json::from_value(serde_json::json!("form")).unwrap();
+                    assert_eq!(forms.take(&id).is_some(), !unknown, "raw unknown constraint must survive both transport paths as an explicit refusal");
+                }).catch_unwind().await;
+                server.abort();
+                let joined = tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .expect("owned HTTP fixture settles");
+                assert!(joined.is_ok() || joined.unwrap_err().is_cancelled());
+                if let Err(error) = result {
+                    std::panic::resume_unwind(error);
+                }
+            }
+        }
+    }
 
     fn http_response(status_line: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
         // No Content-Length: the body runs until the connection closes, so

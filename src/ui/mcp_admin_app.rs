@@ -6,6 +6,37 @@ use crate::ui::mcp_admin::{self, Action, Approval, Completion, State, Work};
 mod tests;
 
 impl App<'_> {
+    pub(super) fn mcp_frontend_owner_current(
+        &self,
+        owner: &crate::extras::mcp::elicitation::FrontendOwner,
+    ) -> bool {
+        match owner {
+            crate::extras::mcp::elicitation::FrontendOwner::Main(id) => {
+                self.run.is_running
+                    && self
+                        .run
+                        .question_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.id() == *id)
+            }
+            crate::extras::mcp::elicitation::FrontendOwner::Operator {
+                session,
+                workspace,
+                generation,
+            } => {
+                *session == self.ui.session.id
+                    && Arc::ptr_eq(workspace, &self.ui.workspace)
+                    && self
+                        .mcp_admin
+                        .as_ref()
+                        .and_then(|state| state.work.as_ref())
+                        .is_some_and(|work| {
+                            work.id == *generation
+                                && work.valid(&self.ui.session.id, &self.ui.workspace)
+                        })
+            }
+        }
+    }
     fn mcp_edit_busy(&self) -> bool {
         if self.chain.plan.pending.is_some() {
             return true;
@@ -44,6 +75,7 @@ impl App<'_> {
         }
         if let Some(state) = &mut self.mcp_admin {
             state.work = None;
+            state.reading_resources = false;
         }
         Ok(())
     }
@@ -160,6 +192,32 @@ impl App<'_> {
                     server.defer()
                 });
             rows.push(format!("    schema loading: {defer:?}"));
+            if let Some(client) = self.ui.mcp_manager.as_ref().and_then(|manager| {
+                manager
+                    .handles
+                    .iter()
+                    .find(|client| client.server_name == name)
+            }) {
+                let current =
+                    crate::extras::mcp::catalogue::RpcClient::capture(client).is_current();
+                if current && let Some(catalogue) = client.auxiliary.get() {
+                    rows.push(format!(
+                        "    cached prompts: {}{}; resources: {}{} (no RPC)",
+                        catalogue.prompts.len(),
+                        if catalogue.prompts_incomplete {
+                            " (incomplete)"
+                        } else {
+                            ""
+                        },
+                        catalogue.resources.len(),
+                        if catalogue.resources_incomplete {
+                            " (incomplete)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
             if let Some((deferred, enabled)) = self
                 .ui
                 .mcp_manager
@@ -318,6 +376,7 @@ impl App<'_> {
                     false,
                 ),
             );
+            handle.discover_auxiliary().await;
             Ok(Completion::Connected(handle))
         })?;
         self.mcp_state().work.as_mut().unwrap().attempt = Some(attempt);
@@ -452,6 +511,18 @@ impl App<'_> {
     }
 
     pub(super) async fn handle_mcp_command(&mut self, text: &str) -> anyhow::Result<bool> {
+        if text.trim_start().starts_with("/mcp:")
+            || text.trim_start().starts_with("/add mcp:")
+            || text.trim_start().starts_with("/drop mcp:")
+        {
+            return self.start_mcp_auxiliary_command(text.trim()).await;
+        }
+        if text.trim() == "/drop-all" {
+            self.cancel_mcp_resource_read().await?;
+            if let Some(state) = &mut self.mcp_admin {
+                state.resources.clear();
+            }
+        }
         if text.split_whitespace().next() != Some("/mcp") {
             return Ok(false);
         }
@@ -638,6 +709,7 @@ impl App<'_> {
             return Ok(());
         }
         self.mcp_state().work = None;
+        self.mcp_state().reading_resources = false;
         let result = match result {
             Ok(Completion::Closed { next, names }) => {
                 if !matches!(&*next, Completion::Connected(_))
@@ -652,7 +724,81 @@ impl App<'_> {
             result => result,
         };
         match result {
+            Ok(Completion::PromptData { client, message }) => {
+                if !client.is_current() {
+                    self.renderer.write_line(
+                        "MCP prompt source or connection retired; no text used",
+                        C_ERROR,
+                    )?;
+                    if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+                        self.restore_interrupted_prompt(&draft);
+                    }
+                    return Ok(());
+                }
+                self.mcp_state().auxiliary_draft = None;
+                self.echo_main_submission(&message)?;
+                crate::startup::heap_future(|| {
+                    self.start_main_run_prepared(
+                        &message,
+                        crate::question::QuestionOrigin::NewUserTurn,
+                    )
+                })
+                .await?;
+            }
+            Ok(Completion::ResourceData {
+                attachments,
+                submission,
+            }) => {
+                if attachments
+                    .iter()
+                    .any(|item| !item.current(&self.ui.session.id, &self.ui.workspace))
+                    || attachments.is_empty()
+                {
+                    self.renderer.write_line(
+                        "MCP resources retired before adoption; no text used",
+                        C_ERROR,
+                    )?;
+                    if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+                        self.restore_interrupted_prompt(&draft);
+                    }
+                } else if let Some(text) = submission {
+                    let mut combined = self.mcp_current_resources();
+                    combined.extend(attachments);
+                    if !self.adopt_mcp_resource_budget(&combined)? {
+                        return Ok(());
+                    }
+                    self.mcp_state().auxiliary_draft = None;
+                    let message =
+                        crate::extras::mcp::catalogue::compose_resource_data(&text, &combined)
+                            .expect("nonempty resources");
+                    self.echo_main_submission(&message)?;
+                    crate::startup::heap_future(|| {
+                        self.start_main_run_prepared(
+                            &message,
+                            crate::question::QuestionOrigin::NewUserTurn,
+                        )
+                    })
+                    .await?;
+                } else {
+                    let mut combined = self.mcp_current_resources();
+                    for item in attachments {
+                        combined.retain(|old| {
+                            old.client.server_name != item.client.server_name || old.uri != item.uri
+                        });
+                        combined.push(item);
+                    }
+                    if !self.adopt_mcp_resource_budget(&combined)? {
+                        return Ok(());
+                    }
+                    self.mcp_state().auxiliary_draft = None;
+                    self.mcp_state().resources = combined;
+                    self.renderer.write_line("MCP resource text added for this session (runtime-only); /drop mcp:<server>:<uri> removes it", C_AGENT)?;
+                }
+            }
             Err(error) => {
+                if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+                    self.restore_interrupted_prompt(&draft);
+                }
                 self.renderer
                     .write_line(&sanitize_output(&error), C_ERROR)?;
             }
@@ -839,6 +985,343 @@ impl App<'_> {
         Ok(())
     }
 
+    fn mcp_current_resources(&self) -> Vec<crate::extras::mcp::catalogue::Attachment> {
+        self.mcp_admin.as_ref().map_or_else(Vec::new, |state| {
+            state
+                .resources
+                .iter()
+                .filter(|item| item.current(&self.ui.session.id, &self.ui.workspace))
+                .cloned()
+                .collect()
+        })
+    }
+    fn check_mcp_resource_budget(
+        &self,
+        items: &[crate::extras::mcp::catalogue::Attachment],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            items.len() <= crate::extras::mcp::catalogue::MAX_ATTACHMENTS
+                && items.iter().map(|item| item.literal().len()).sum::<usize>()
+                    <= crate::extras::mcp::catalogue::MAX_ATTACHMENT_BYTES,
+            "MCP resource context exceeds its snapshot budget"
+        );
+        Ok(())
+    }
+    fn adopt_mcp_resource_budget(
+        &mut self,
+        items: &[crate::extras::mcp::catalogue::Attachment],
+    ) -> anyhow::Result<bool> {
+        if self.check_mcp_resource_budget(items).is_ok() {
+            return Ok(true);
+        }
+        if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+            self.restore_interrupted_prompt(&draft);
+        }
+        self.renderer.write_line(
+            "MCP resource context exceeds its snapshot budget; no text adopted",
+            C_ERROR,
+        )?;
+        Ok(false)
+    }
+    async fn cancel_mcp_resource_read(&mut self) -> anyhow::Result<()> {
+        if self
+            .mcp_admin
+            .as_ref()
+            .is_some_and(|state| state.reading_resources)
+        {
+            self.retire_mcp_work().await?;
+            if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+                self.restore_interrupted_prompt(&draft);
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn mcp_resource_text(&self, text: &str) -> Option<String> {
+        crate::extras::mcp::catalogue::compose_resource_data(text, &self.mcp_current_resources())
+    }
+    pub(super) async fn start_mcp_mentions(&mut self, text: &str) -> anyhow::Result<bool> {
+        let tokens = text
+            .split_whitespace()
+            .filter_map(|token| {
+                token
+                    .strip_prefix('@')
+                    .filter(|token| token.starts_with("mcp:"))
+            })
+            .map(str::to_owned)
+            .take(crate::extras::mcp::catalogue::MAX_ATTACHMENTS + 1)
+            .collect::<Vec<_>>();
+        if tokens.is_empty() {
+            return Ok(false);
+        }
+        self.start_mcp_resources(tokens, Some(text.to_owned()))
+            .await?;
+        Ok(true)
+    }
+    async fn start_mcp_auxiliary_command(&mut self, text: &str) -> anyhow::Result<bool> {
+        if text.len() > 32 * 1024 {
+            self.renderer
+                .write_line("MCP command exceeds its byte bound", C_ERROR)?;
+            return Ok(true);
+        }
+        let (command, tail) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if command == "/drop" {
+            let Some((server, uri)) = crate::extras::mcp::catalogue::operand(tail.trim()) else {
+                self.renderer
+                    .write_line("Invalid MCP resource operand", C_ERROR)?;
+                return Ok(true);
+            };
+            self.cancel_mcp_resource_read().await?;
+            if let Some(state) = &mut self.mcp_admin {
+                state
+                    .resources
+                    .retain(|item| item.client.server_name != server || item.uri != uri);
+            }
+            self.renderer
+                .write_line("MCP resource removed from runtime context", C_AGENT)?;
+            return Ok(true);
+        }
+        if command == "/add" {
+            self.start_mcp_resources(
+                tail.split_whitespace()
+                    .take(crate::extras::mcp::catalogue::MAX_ATTACHMENTS + 1)
+                    .map(str::to_owned)
+                    .collect(),
+                None,
+            )
+            .await?;
+            return Ok(true);
+        }
+        if self.mcp_auxiliary_busy() {
+            self.renderer.write_line(
+                "Finish or cancel active work before expanding an MCP prompt",
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
+        let Some((server, name)) =
+            crate::extras::mcp::catalogue::operand(command.trim_start_matches('/'))
+        else {
+            self.renderer
+                .write_line("Invalid MCP prompt operand", C_ERROR)?;
+            return Ok(true);
+        };
+        let arguments = if tail.trim().is_empty() {
+            Default::default()
+        } else {
+            match serde_json::from_str::<std::collections::BTreeMap<String, String>>(tail.trim()) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    self.renderer.write_line(
+                        "MCP prompt arguments must be a JSON object of strings",
+                        C_ERROR,
+                    )?;
+                    return Ok(true);
+                }
+            }
+        };
+        let Some(client) = self.ui.mcp_manager.as_ref().and_then(|manager| {
+            manager
+                .handles
+                .iter()
+                .find(|client| client.server_name == server)
+        }) else {
+            self.renderer
+                .write_line("MCP server is not connected", C_ERROR)?;
+            return Ok(true);
+        };
+        let Some(prompt) = client
+            .auxiliary
+            .get()
+            .and_then(|catalogue| catalogue.prompts.iter().find(|prompt| prompt.name == name))
+            .cloned()
+        else {
+            self.renderer
+                .write_line("MCP prompt is not in this connection's catalogue", C_ERROR)?;
+            return Ok(true);
+        };
+        let rpc = crate::extras::mcp::catalogue::RpcClient::capture(client);
+        let permission = self.ui.permission.clone();
+        let ask = self.ui.ask_tx.clone();
+        let run = crate::spend::run::Run::for_session(
+            self.ui.session,
+            self.ui.cfg,
+            crate::spend::RequestKind::Turn,
+        );
+        let cfg = self.mcp_server_config(&server);
+        let owner = self.mcp_auxiliary_owner()?;
+        let origin = self
+            .mcp_current_config()
+            .mcp_origins
+            .get(&server)
+            .and_then(|layers| layers.iter().find(|layer| layer.selected))
+            .cloned();
+        self.spawn_mcp_work(server, cfg, origin, async move {
+            crate::spend::run::scope(Some(run), async move {
+                let message = crate::extras::mcp::catalogue::get_prompt(
+                    &rpc,
+                    &prompt,
+                    arguments,
+                    Duration::from_secs(30),
+                    &permission,
+                    &ask,
+                    Some(owner),
+                )
+                .await
+                .map_err(|_| "MCP prompt request refused or unavailable".to_owned())?;
+                Ok(Completion::PromptData {
+                    client: rpc,
+                    message,
+                })
+            })
+            .await
+        })?;
+        self.mcp_state().auxiliary_draft = Some(text.to_owned());
+        self.renderer
+            .write_line("MCP prompt expansion started; Ctrl-C cancels it", C_AGENT)?;
+        Ok(true)
+    }
+    fn mcp_auxiliary_busy(&self) -> bool {
+        self.mcp_edit_busy()
+            || self
+                .mcp_admin
+                .as_ref()
+                .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+    }
+    fn mcp_auxiliary_owner(
+        &mut self,
+    ) -> anyhow::Result<crate::extras::mcp::elicitation::FrontendOwner> {
+        let generation = self
+            .mcp_state()
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("MCP generation exhausted"))?;
+        Ok(crate::extras::mcp::elicitation::FrontendOwner::Operator {
+            session: self.ui.session.id.clone(),
+            workspace: self.ui.workspace.clone(),
+            generation,
+        })
+    }
+    async fn start_mcp_resources(
+        &mut self,
+        tokens: Vec<String>,
+        submission: Option<String>,
+    ) -> anyhow::Result<()> {
+        if self.mcp_auxiliary_busy() {
+            if let Some(text) = submission {
+                self.restore_interrupted_prompt(&text);
+            }
+            self.renderer.write_line(
+                "Finish or cancel active work before reading MCP resources",
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
+        if tokens.is_empty() || tokens.len() > crate::extras::mcp::catalogue::MAX_ATTACHMENTS {
+            if let Some(text) = submission {
+                self.restore_interrupted_prompt(&text);
+            }
+            self.renderer
+                .write_line("MCP resource selection exceeds its count bound", C_ERROR)?;
+            return Ok(());
+        }
+        let mut selected = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for token in tokens {
+            let Some((server, uri)) = crate::extras::mcp::catalogue::operand(&token) else {
+                self.renderer
+                    .write_line("Invalid MCP resource operand", C_ERROR)?;
+                return Ok(());
+            };
+            if !seen.insert((server.clone(), uri.clone())) {
+                continue;
+            }
+            let Some(client) = self.ui.mcp_manager.as_ref().and_then(|manager| {
+                manager
+                    .handles
+                    .iter()
+                    .find(|client| client.server_name == server)
+            }) else {
+                self.renderer
+                    .write_line("MCP server is not connected", C_ERROR)?;
+                return Ok(());
+            };
+            let Some(resource) = client
+                .auxiliary
+                .get()
+                .and_then(|catalogue| {
+                    catalogue
+                        .resources
+                        .iter()
+                        .find(|resource| resource.uri == uri)
+                })
+                .cloned()
+            else {
+                self.renderer.write_line(
+                    "MCP resource is not in this connection's catalogue",
+                    C_ERROR,
+                )?;
+                return Ok(());
+            };
+            selected.push((
+                crate::extras::mcp::catalogue::RpcClient::capture(client),
+                resource,
+            ));
+        }
+        let permission = self.ui.permission.clone();
+        let ask = self.ui.ask_tx.clone();
+        let session_id = self.ui.session.id.clone();
+        let workspace = self.ui.workspace.clone();
+        let run = crate::spend::run::Run::for_session(
+            self.ui.session,
+            self.ui.cfg,
+            crate::spend::RequestKind::Turn,
+        );
+        // Every selected client carries its own content-bound source proof;
+        // Work additionally checks the captured session/workspace at adoption.
+        let draft = submission.clone();
+        let owner = self.mcp_auxiliary_owner()?;
+        self.spawn_mcp_work(String::new(), None, None, async move {
+            crate::spend::run::scope(Some(run), async move {
+                let mut attachments = Vec::new();
+                let mut bytes = 0_usize;
+                for (client, resource) in selected {
+                    let text = crate::extras::mcp::catalogue::read_resource(
+                        &client,
+                        &resource,
+                        Duration::from_secs(30),
+                        &permission,
+                        &ask,
+                        Some(owner.clone()),
+                    )
+                    .await
+                    .map_err(|_| "MCP resource request refused or unavailable".to_owned())?;
+                    let attachment = crate::extras::mcp::catalogue::Attachment {
+                        client,
+                        uri: resource.uri,
+                        text,
+                        session_id: session_id.clone(),
+                        workspace: workspace.clone(),
+                    };
+                    bytes = bytes.saturating_add(attachment.literal().len());
+                    if bytes > crate::extras::mcp::catalogue::MAX_ATTACHMENT_BYTES {
+                        return Err("MCP resource context exceeds its snapshot budget".into());
+                    }
+                    attachments.push(attachment);
+                }
+                Ok(Completion::ResourceData {
+                    attachments,
+                    submission,
+                })
+            })
+            .await
+        })?;
+        self.mcp_state().auxiliary_draft = draft;
+        self.mcp_state().reading_resources = true;
+        self.renderer
+            .write_line("MCP resource read started; Ctrl-C cancels it", C_AGENT)?;
+        Ok(())
+    }
+
     pub(super) async fn handle_mcp_user_event(
         &mut self,
         event: &UserEvent,
@@ -867,6 +1350,9 @@ impl App<'_> {
                 && key.modifiers.contains(KeyModifiers::CONTROL);
         if state.is_some_and(|state| state.work.is_some()) && cancel {
             self.retire_mcp_work().await?;
+            if let Some(draft) = self.mcp_state().auxiliary_draft.take() {
+                self.restore_interrupted_prompt(&draft);
+            }
             self.discard_interrupted_queue();
             self.renderer.write_line("MCP operation cancelled; saved edits stay configured but no new connection is authorized",C_AGENT)?;
             self.refresh()?;

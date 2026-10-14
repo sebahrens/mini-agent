@@ -2913,3 +2913,505 @@ async fn actual_native_anthropic_unsupported_model_keeps_eager_schema_and_ordina
 async fn actual_native_anthropic_deferred_cache_markers_keep_selected_one_hour_prefix() {
     native_deferred_case("cached-1h").await;
 }
+
+fn auxiliary_completion() -> String {
+    let first = serde_json::json!({"id":"mcp58-owned","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":{"role":"assistant","content":"MCP58 terminal"},"finish_reason":null}]});
+    let end = serde_json::json!({"id":"mcp58-owned","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
+    format!("data: {first}\n\ndata: {end}\n\ndata: [DONE]\n\n")
+}
+async fn auxiliary_terminal(app: &mut App<'_>) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while app.run.is_running {
+            let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+            crate::startup::heap_future(|| app.handle_agent_event(event))
+                .await
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn actual_mcp_auxiliary_actor_asks_once_and_preserves_literal_context_and_prompt_admission() {
+    use futures::FutureExt;
+    let root = crate::tests::OwnedTestDirectory::new("mcp58-actual-app");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let mut cfg = config(root.path(), &server);
+    let fixture = crate::tests::mcp_stdio_tests::FixtureBuild::compile();
+    let lease = fixture.lease("actual-auxiliary");
+    let mut mcp = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &lease,
+    );
+    if let crate::extras::mcp::config::McpServerConfig::Command { env, .. } = &mut mcp {
+        env.insert("MCP_FIXTURE_TOOL_NAME".into(), "resources/read".into());
+    }
+    cfg.mcp_servers = Some(std::collections::HashMap::from([(
+        "owned".into(),
+        mcp.clone(),
+    )]));
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        ..Default::default()
+    };
+    let mut session = Session::new(
+        "mcp57",
+        "owned-model",
+        128_000,
+        root.path().to_str().unwrap(),
+    );
+    let mut context = crate::context::load_for_workspace(true, Some(root.path()));
+    let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
+    let handle =
+        crate::extras::mcp::client::McpClientHandle::connect_in("owned".into(), &mcp, root.path())
+            .await
+            .unwrap();
+    handle.discover_auxiliary().await;
+    app.ui.mcp_manager = Some(McpClientManager::from_handles(vec![handle]));
+    let (ask, mut asks) = tokio::sync::mpsc::channel(4);
+    app.ui.ask_tx = Some(ask);
+    let policy = crate::permission::PermissionConfig {
+        default: Some(crate::permission::Action::Deny),
+        mcp_tool: Some(crate::permission::ToolPerm::Granular(
+            std::collections::HashMap::from([
+                (
+                    "mcp_tool:owned:resources/read".into(),
+                    crate::permission::Action::Ask,
+                ),
+                (
+                    "mcp_tool:owned:prompts/get".into(),
+                    crate::permission::Action::Allow,
+                ),
+            ]),
+        )),
+        ..Default::default()
+    };
+    app.ui.permission = Some(Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(policy),
+            crate::permission::SecurityMode::Standard,
+            None,
+            Some(vec!["standard".into()]),
+        )
+        .unwrap(),
+    )));
+    let assertions = std::panic::AssertUnwindSafe(async {
+        app.refresh_custom_commands();
+        let rpc_before = std::fs::read_to_string(lease.with_extension("rpc")).unwrap();
+        command(&mut app, "/add mcp:owned:urn%3Aowned%3Anotes").await;
+        let request = tokio::time::timeout(Duration::from_secs(2), asks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::permission::ask::UserRequest::McpPermission(owned) = &request else {
+            panic!("operator permission requires its exact actor binding");
+        };
+        assert_eq!(
+            owned.request.input,
+            "mcp_auxiliary:owned:resources/read:urn%3Aowned%3Anotes"
+        );
+        assert!(
+            !std::fs::read_to_string(lease.with_extension("rpc"))
+                .unwrap()
+                .contains("resources/read")
+        );
+        app.begin_user_request(request).unwrap();
+        app.refresh().unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("mcp_auxiliary:owned:resources/read:urn%3Aowned%3Anotes")
+        );
+        user(
+            &mut app,
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        )
+        .await;
+        drain(&mut app).await;
+        assert_eq!(app.mcp_admin.as_ref().unwrap().resources.len(), 1);
+        assert_eq!(app.mcp_current_resources()[0].text, "Resource BODY 雪");
+        let native = app.ui.mcp_manager.as_ref().unwrap().collect_tools_with_timeouts(
+            app.ui.permission.clone(), app.ui.ask_tx.clone(), crate::extras::mcp::McpToolTimeouts {call:Duration::from_secs(2),..Default::default()}
+        ).await;
+        assert_eq!(native.len(),1);
+        let mut native_call=Box::pin(rig::tool::ToolDyn::call(&native[0], "{}".into()));
+        let native_request=tokio::time::timeout(Duration::from_secs(2),async {
+            tokio::select! {
+                request=asks.recv()=>request.unwrap(),
+                result=&mut native_call=>panic!("auxiliary session approval widened a same-name actual native tool: {result:?}"),
+            }
+        }).await.unwrap();
+        let crate::permission::ask::UserRequest::Permission(native_request)=native_request else {panic!("native invocation must retain its separate ordinary scope");};
+        assert_eq!(native_request.input,"mcp_tool:owned:resources/read");
+        assert!(!std::fs::read_to_string(lease.with_extension("rpc")).unwrap().contains("tools/call"));
+        native_request.reply.send(crate::permission::ask::UserDecision::Deny).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2),&mut native_call).await.unwrap().is_err());
+        drop(native_call);
+        assert_eq!(app.ui.session.permission_allowlist.len(),1);
+
+        server.assert_no_provider_request();
+        let rpc_added = std::fs::read_to_string(lease.with_extension("rpc")).unwrap();
+        assert!(rpc_added.len() > rpc_before.len());
+        app.mcp_status().unwrap();
+        app.refresh_custom_commands();
+        assert_eq!(
+            std::fs::read_to_string(lease.with_extension("rpc")).unwrap(),
+            rpc_added,
+            "status/pickers never query the peer"
+        );
+        server
+            .provider_streams
+            .lock()
+            .unwrap()
+            .push_back(auxiliary_completion());
+        command(&mut app, "Explain the added resource").await;
+        auxiliary_terminal(&mut app).await;
+        let rows = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(route, _)| route.starts_with("POST /v1/chat/completions "))
+            .map(|(_, body)| body.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let text = rows[0].to_string();
+        assert!(text.contains("Resource BODY 雪") && text.contains("User request:"));
+        assert!(
+            !rows[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .any(|message| message.to_string().contains("Resource BODY 雪")),
+            "resource data must not mutate native system prefix"
+        );
+        command(&mut app, "/drop mcp:owned:urn%3Aowned%3Anotes").await;
+        assert!(app.mcp_current_resources().is_empty());
+        server
+            .provider_streams
+            .lock()
+            .unwrap()
+            .push_back(auxiliary_completion());
+        command(&mut app, "/mcp:owned:review {\"topic\":\"public\"}").await;
+        drain(&mut app).await;
+        auxiliary_terminal(&mut app).await;
+        assert!(!app.input.buffer.contains("/commit"));
+        assert!(
+            app.ui.session.permission_allowlist.len() == 1,
+            "only the explicit selected auxiliary approval can persist; server prompt data cannot mint grants"
+        );
+        let rows = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(route, _)| route.starts_with("POST /v1/chat/completions "))
+            .map(|(_, body)| body.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].to_string().contains("Prompt BODY 雪"));
+        assert_eq!(app.ui.session.total_input_tokens, 14);
+    })
+    .catch_unwind()
+    .await;
+    app.retire_mcp_work().await.unwrap();
+    app.abort_main_run().await.unwrap();
+    if let Some(manager) = app.ui.mcp_manager.take() {
+        manager.shutdown().await;
+    }
+    drop(app);
+    server.finish().await;
+    fixture.cleanup();
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn auxiliary_tool_completion() -> String {
+    let first = serde_json::json!({"id":"mcp58-tool","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"mcp58-canonical","type":"function","function":{"name":"probe","arguments":"{}"}}]},"finish_reason":null}]});
+    let end = serde_json::json!({"id":"mcp58-tool","object":"chat.completion.chunk","created":0,"model":"owned-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
+    format!("data: {first}\n\ndata: {end}\n\ndata: [DONE]\n\n")
+}
+#[tokio::test]
+async fn actual_mcp_elicitation_channels_render_btw_before_answer_and_cancel_without_next_request()
+{
+    use futures::FutureExt;
+    for outcome in ["accept", "cancel", "retired-turn"] {
+        let cancel = outcome != "accept";
+        let root = crate::tests::OwnedTestDirectory::new("mcp58-elicitation-app");
+        let _environment = environment(root.path());
+        let server = Server::new(false).await;
+        let mut cfg = config(root.path(), &server);
+        let fixture = crate::tests::mcp_stdio_tests::FixtureBuild::compile();
+        let lease = fixture.lease("actual-form");
+        let mcp = fixture.config(
+            fixture.executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            "aux-elicit",
+            &lease,
+        );
+        cfg.mcp_servers = Some(std::collections::HashMap::from([(
+            "owned".into(),
+            mcp.clone(),
+        )]));
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["probe".into()],
+            ..Default::default()
+        };
+        let mut session = Session::new(
+            "mcp57",
+            "owned-model",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        let mut context = crate::context::load_for_workspace(true, Some(root.path()));
+        let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
+        let handle = crate::extras::mcp::client::McpClientHandle::connect_in(
+            "owned".into(),
+            &mcp,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        app.ui.mcp_manager = Some(McpClientManager::from_handles(vec![handle]));
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        app.ui.ask_tx = Some(sender);
+        app.ask_rx = Some(receiver);
+        let policy = crate::permission::PermissionConfig {
+            default: Some(crate::permission::Action::Deny),
+            mcp_tool: Some(crate::permission::ToolPerm::Granular(
+                std::collections::HashMap::from([(
+                    "mcp_tool:owned:probe".into(),
+                    crate::permission::Action::Allow,
+                )]),
+            )),
+            ..Default::default()
+        };
+        app.ui.permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs::from(policy),
+                crate::permission::SecurityMode::Standard,
+                None,
+                Some(vec!["standard".into()]),
+            )
+            .unwrap(),
+        )));
+        let assertions=std::panic::AssertUnwindSafe(async {
+            if !cancel {
+                server.provider_streams.lock().unwrap().push_back(auxiliary_completion());
+                command(&mut app,"/btw Public side question").await;
+                tokio::time::timeout(Duration::from_secs(2),async {loop {if server.requests.lock().unwrap().iter().any(|(route,_)|route.starts_with("POST /v1/")){break;}tokio::task::yield_now().await;}}).await.unwrap();
+            }
+            server.provider_streams.lock().unwrap().push_back(auxiliary_tool_completion());
+            if !cancel {server.provider_streams.lock().unwrap().push_back(auxiliary_completion());}
+            command(&mut app,"Ask the owned MCP server for its public label").await;
+            tokio::time::timeout(Duration::from_secs(3),async {
+                while app.question_prompt.is_none() {
+                    tokio::select! {biased;
+                        request=app.ask_rx.as_mut().unwrap().recv()=>app.begin_user_request(request.unwrap()).unwrap(),
+                        event=app.run.agent_rx.as_mut().unwrap().recv()=>crate::startup::heap_future(||app.handle_agent_event(event.unwrap())).await.unwrap(),
+                    }
+                }
+            }).await.unwrap();
+            let before=app.renderer.captured_output();assert!(before.contains("Choose a public label"));
+            assert!(app.ui.session.permission_allowlist.is_empty());assert!(app.ui.session.pending_question.is_none());
+            if cancel {
+                if outcome == "retired-turn" {
+                    app.run.question_turn = None;
+                    app.expire_abandoned_permission().unwrap();
+                    assert!(app.question_prompt.is_none(), "an old Question turn cannot retain the form overlay");
+                }
+                app.run.pending_inputs.push_back("STALE never launch".into());
+                let stop = if outcome == "retired-turn" { KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL) } else { KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE) };
+                user(&mut app,UserEvent::Key(stop)).await;
+                assert!(!app.run.is_running&&app.run.agent_rx.is_none());
+                assert!(app.run.pending_inputs.is_empty());
+                assert!(app.ui.session.permission_allowlist.is_empty());
+                assert_eq!(server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/")).count(),1);
+            } else {
+                tokio::time::timeout(Duration::from_secs(3),async {while app.btw_inflight>0 {let event=app.btw_rx.recv().await.unwrap();app.handle_btw_event(event).unwrap();}}).await.unwrap();
+                assert!(app.renderer.captured_output().contains("MCP58 terminal"),"real side-channel result rendered before answering");
+                assert!(app.question_prompt.is_some(),"side completion must not auto-answer the form");
+                user(&mut app,UserEvent::Key(KeyEvent::new(KeyCode::Char('1'),KeyModifiers::NONE))).await;
+                auxiliary_terminal(&mut app).await;
+                let rows=server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
+                assert_eq!(rows.len(),3);assert!(rows[2].to_string().contains("accept"));
+                assert!(app.ui.session.pending_question.is_none()&&app.ui.session.permission_allowlist.is_empty());
+            }
+        }).catch_unwind().await;
+        app.cancel_pending_permissions();
+        app.abort_main_run().await.unwrap();
+        app.retire_mcp_work().await.unwrap();
+        if let Some(manager) = app.ui.mcp_manager.take() {
+            manager.shutdown().await;
+        }
+        drop(app);
+        server.finish().await;
+        fixture.cleanup();
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn actual_mcp_auxiliary_held_ask_cannot_survive_drop_session_or_connection_retirement() {
+    use futures::FutureExt;
+    for retirement in ["drop", "session", "connection", "late-reply"] {
+        let root = crate::tests::OwnedTestDirectory::new("mcp58-retired-auxiliary");
+        let _environment = environment(root.path());
+        let server = Server::new(false).await;
+        let mut cfg = config(root.path(), &server);
+        let fixture = crate::tests::mcp_stdio_tests::FixtureBuild::compile();
+        let lease = fixture.lease("retired-auxiliary");
+        let mcp = fixture.config(
+            fixture.executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            "aux",
+            &lease,
+        );
+        cfg.mcp_servers = Some(std::collections::HashMap::from([(
+            "owned".into(),
+            mcp.clone(),
+        )]));
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let mut session = Session::new(
+            "mcp57",
+            "owned-model",
+            128_000,
+            root.path().to_str().unwrap(),
+        );
+        let mut context = crate::context::load_for_workspace(true, Some(root.path()));
+        let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
+        let handle = crate::extras::mcp::client::McpClientHandle::connect_in(
+            "owned".into(),
+            &mcp,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        handle.discover_auxiliary().await;
+        app.ui.mcp_manager = Some(McpClientManager::from_handles(vec![handle]));
+        let (sender, mut requests) = tokio::sync::mpsc::channel(4);
+        app.ui.ask_tx = Some(sender);
+        app.ui.permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                    default: Some(crate::permission::Action::Ask),
+                    ..Default::default()
+                }),
+                crate::permission::SecurityMode::Standard,
+                None,
+                Some(vec!["standard".into()]),
+            )
+            .unwrap(),
+        )));
+        let assertions = std::panic::AssertUnwindSafe(async {
+            command(&mut app, "/add mcp:owned:urn%3Aowned%3Anotes").await;
+            let request = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                &request,
+                crate::permission::ask::UserRequest::McpPermission(_)
+            ));
+            let mut request = Some(request);
+            if retirement != "drop" && retirement != "late-reply" {
+                app.begin_user_request(request.take().unwrap()).unwrap();
+                assert!(app.permission_prompt.is_some());
+            }
+            match retirement {
+                "drop" => {
+                    command(&mut app, "/drop mcp:owned:urn%3Aowned%3Anotes").await;
+                    assert!(app.mcp_admin.as_ref().unwrap().work.is_none());
+                    app.begin_user_request(request.take().unwrap()).unwrap();
+                    assert!(
+                        app.permission_prompt.is_none(),
+                        "retired channel backlog cannot become an overlay"
+                    );
+                }
+                "session" => app.ui.session.id = "fresh-session".into(),
+                "late-reply" => {
+                    let manager = app.ui.mcp_manager.take().unwrap();
+                    manager.shutdown().await;
+                    let crate::permission::ask::UserRequest::McpPermission(late) =
+                        request.take().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    let pattern = late.request.input.clone();
+                    late.request
+                        .reply
+                        .send(crate::permission::ask::UserDecision::AllowAlways(pattern))
+                        .unwrap();
+                }
+                "connection" => {
+                    let manager = app.ui.mcp_manager.take().unwrap();
+                    manager.shutdown().await;
+                }
+                _ => unreachable!(),
+            }
+            app.expire_abandoned_permission().unwrap();
+            assert!(
+                app.permission_prompt.is_none(),
+                "retired operator cannot retain a permission overlay"
+            );
+            user(
+                &mut app,
+                UserEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            )
+            .await;
+            if app
+                .mcp_admin
+                .as_ref()
+                .is_some_and(|state| state.work.is_some())
+            {
+                drain(&mut app).await;
+            }
+            assert!(app.mcp_current_resources().is_empty());
+            assert!(
+                !std::fs::read_to_string(lease.with_extension("rpc"))
+                    .unwrap()
+                    .contains("resources/read"),
+                "held authorization cannot dispatch after exact retirement"
+            );
+            assert!(app.ui.session.permission_allowlist.is_empty());
+            assert!(matches!(
+                app.ui
+                    .permission
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .check_mcp("mcp_tool:owned:resources/read", None, "resources/read"),
+                crate::permission::checker::CheckResult::Ask
+            ));
+            server.assert_no_provider_request();
+        })
+        .catch_unwind()
+        .await;
+        app.cancel_pending_permissions();
+        app.retire_mcp_work().await.unwrap();
+        if let Some(manager) = app.ui.mcp_manager.take() {
+            manager.shutdown().await;
+        }
+        drop(app);
+        server.finish().await;
+        fixture.cleanup();
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}

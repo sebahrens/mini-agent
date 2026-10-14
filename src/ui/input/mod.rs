@@ -321,6 +321,8 @@ pub struct InputEditor {
     agent_names: Vec<String>,
     theme_names: Vec<String>,
     custom_commands: Vec<(String, String)>,
+    #[cfg(feature = "mcp")]
+    mcp_resources: Vec<String>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
     current_model: Option<String>,
@@ -349,6 +351,8 @@ impl InputEditor {
             agent_names: Vec::new(),
             theme_names: Vec::new(),
             custom_commands: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_resources: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
             current_model: None,
@@ -424,6 +428,11 @@ impl InputEditor {
         self.custom_commands = commands;
     }
 
+    #[cfg(feature = "mcp")]
+    pub(crate) fn set_mcp_resources(&mut self, resources: Vec<String>) {
+        self.mcp_resources = resources;
+    }
+
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
         self.quick_model_names = names;
     }
@@ -489,6 +498,14 @@ impl InputEditor {
         let mut picker = FilePicker::new();
         picker.set_monochrome(self.monochrome);
         picker.activate();
+        #[cfg(feature = "mcp")]
+        // Ordinary file completion removes its opening '@'. An MCP operand
+        // retains the explicit resource marker instead of becoming a path.
+        picker.append_virtual_items(
+            self.mcp_resources
+                .iter()
+                .map(|operand| std::path::PathBuf::from(format!("@{operand}"))),
+        );
         self.picker = Some(Picker::File(picker));
     }
 

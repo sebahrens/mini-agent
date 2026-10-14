@@ -635,6 +635,10 @@ async fn handle_ask_inner(
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {
             let mut checker = permission.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "mcp")]
+            if !crate::permission::ask::current_mcp_origin_valid() {
+                return Err(ToolError::Msg("MCP approval source or work retired".into()));
+            }
             checker.add_session_allowlist(tool.to_string(), &pattern);
             for additional in additional_allow_patterns {
                 checker.add_session_allowlist(tool.to_string(), &additional);
@@ -742,6 +746,36 @@ pub(crate) async fn check_mcp_perm(
             };
             handle_ask_inner(tx, perm, "mcp_tool", input_key, None, Vec::new()).await?;
             Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) async fn check_mcp_auxiliary_perm(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    policy_input: &str,
+    identity: &str,
+    trusted_identity: Option<TrustedMcpServer>,
+    operation: &str,
+) -> Result<(), ToolError> {
+    let Some(permission) = permission else {
+        return Ok(());
+    };
+    let result = permission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .check_mcp_auxiliary(policy_input, identity, trusted_identity, operation);
+    match result {
+        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
+        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        CheckResult::Ask => {
+            let Some(sender) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".into(),
+                ));
+            };
+            handle_ask_inner(sender, permission, "mcp_tool", identity, None, Vec::new()).await
         }
     }
 }

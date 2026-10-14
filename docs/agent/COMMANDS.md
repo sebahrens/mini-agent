@@ -267,6 +267,11 @@ accessible via `/memory read` and `memory_search`.
 | `/mcp <server>` | List tools of a specific MCP server. |
 | `/mcp login <server>` | Run the OAuth 2.0 login flow for a URL server, then reconnect it. |
 | `/mcp logout <server>` | Remove a server's stored OAuth token. |
+| `/mcp:<server>:<prompt> [JSON arguments]` | Expand a cached server prompt as literal user-turn data, then use ordinary model admission. |
+| `/add mcp:<server>:<uri>` | Read bounded server text through ordinary MCP permission and add a runtime-only resource snapshot. |
+| `/drop mcp:<server>:<uri>` | Remove a runtime resource snapshot; cancel a pending resource selection first. |
+
+See [MCP prompts, resources and forms](MCP_INTERACTION.md) for cached picker operands, `@mcp:` mentions, bounds and form handling.
 
 See [MCP configuration and live operations](MCP_CONFIGURATION.md) for source precedence, reviewed project trust, literal quoting and explicit loopback policy.
 

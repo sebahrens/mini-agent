@@ -47,9 +47,11 @@ const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
-    pub running_service: RunningService<RoleClient, ()>,
+    pub running_service: RunningService<RoleClient, super::elicitation::Handler>,
+    pub(crate) elicitation: super::elicitation::Handler,
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub(crate) liveness: std::sync::Arc<()>,
+    pub(crate) auxiliary: Arc<tokio::sync::OnceCell<super::catalogue::Catalogue>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -64,6 +66,8 @@ struct LineCappedStdout<R> {
     inner: R,
     max_line: usize,
     current_line: usize,
+    raw_line: Vec<u8>,
+    forms: super::forms::RawForms,
     overflowed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -81,10 +85,19 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCappedStdout<
         let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
         if let std::task::Poll::Ready(Ok(())) = &poll {
             let read = &buf.filled()[before..];
-            this.current_line = match read.iter().rposition(|byte| *byte == b'\n') {
-                Some(newline) => read.len() - newline - 1,
-                None => this.current_line.saturating_add(read.len()),
-            };
+            for byte in read {
+                if *byte == b'\n' {
+                    let line = std::mem::take(&mut this.raw_line);
+                    this.forms.observe(&line);
+                    this.current_line = 0;
+                } else {
+                    this.current_line = this.current_line.saturating_add(1);
+                    if this.current_line > this.max_line {
+                        break;
+                    }
+                    this.raw_line.push(*byte);
+                }
+            }
             if this.current_line > this.max_line {
                 this.overflowed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -119,6 +132,7 @@ impl OwnedStdioTransport {
         stdout: ChildStdout,
         stdin: ChildStdin,
         max_line: usize,
+        forms: super::forms::RawForms,
     ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
         let (cleanup_complete, completion) = tokio::sync::oneshot::channel();
         let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -126,6 +140,8 @@ impl OwnedStdioTransport {
             inner: stdout,
             max_line,
             current_line: 0,
+            raw_line: Vec::new(),
+            forms,
             overflowed: Arc::clone(&overflowed),
         };
         (
@@ -244,7 +260,11 @@ type SpawnedStdioServer = (
 
 /// Launch a stdio MCP server in its owned process tree with piped stdio and a
 /// line-capped protocol reader.
-fn spawn_stdio_server(cmd: Command, max_line: usize) -> std::io::Result<SpawnedStdioServer> {
+fn spawn_stdio_server(
+    cmd: Command,
+    max_line: usize,
+    forms: super::forms::RawForms,
+) -> std::io::Result<SpawnedStdioServer> {
     let mut command = owned_workspace_service_tree(cmd);
     command
         .command_mut()
@@ -262,7 +282,7 @@ fn spawn_stdio_server(cmd: Command, max_line: usize) -> std::io::Result<SpawnedS
             "MCP server stdio pipes were not created",
         ));
     };
-    let (transport, completion) = OwnedStdioTransport::new(child, stdout, stdin, max_line);
+    let (transport, completion) = OwnedStdioTransport::new(child, stdout, stdin, max_line, forms);
     Ok((transport, completion, stderr))
 }
 
@@ -412,21 +432,23 @@ impl McpClientHandle {
                     )
                 })?;
                 validate()?;
+                let elicitation = super::elicitation::Handler::default();
                 let (transport, cleanup_complete, stderr) =
-                    spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES).map_err(|error| {
-                        bounded_stdio_error(
-                            &server_name,
-                            &format!("command spawn failed: {error}"),
-                            "",
-                        )
-                    })?;
+                    spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES, elicitation.forms.clone())
+                        .map_err(|error| {
+                            bounded_stdio_error(
+                                &server_name,
+                                &format!("command spawn failed: {error}"),
+                                "",
+                            )
+                        })?;
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
                     stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
                 let initialized = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => None,
-                    result = tokio::time::timeout(initialize_timeout, serve_client((), transport)) => Some(result),
+                    result = tokio::time::timeout(initialize_timeout, serve_client(elicitation.clone(), transport)) => Some(result),
                 };
                 let running_service = match initialized {
                     None => {
@@ -468,8 +490,10 @@ impl McpClientHandle {
                     server_name,
                     trusted_identity: config.trusted_identity(),
                     running_service,
+                    elicitation,
                     source_proof: None,
                     liveness: std::sync::Arc::new(()),
+                    auxiliary: Arc::new(tokio::sync::OnceCell::new()),
                 })
             }
             McpServerConfig::Url {
@@ -553,11 +577,13 @@ impl McpClientHandle {
             )
             .custom_headers(custom_headers);
         let oauth_settings = oauth.and_then(|o| o.settings());
+        let elicitation = super::elicitation::Handler::default();
         // Every response body and SSE event is capped (see `bounded_http`).
         let http_client = BoundedHttpClient::new(
             http_client_for(initialize_timeout, endpoint)?,
             super::bounded_http::MCP_HTTP_MAX_BODY_BYTES,
-        );
+        )
+        .with_forms(elicitation.forms.clone());
 
         let connect = async {
             if let Some(settings) = oauth_settings {
@@ -573,15 +599,19 @@ impl McpClientHandle {
                     rmcp::transport::auth::AuthClient<BoundedHttpClient>,
                 >;
                 let transport = AuthHttpClient::with_client(auth_client, cfg);
-                serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                })
+                serve_client(elicitation.clone(), transport)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                    })
             } else {
                 type HttpClient = rmcp::transport::StreamableHttpClientTransport<BoundedHttpClient>;
                 let transport = HttpClient::with_client(http_client, cfg);
-                serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                })
+                serve_client(elicitation.clone(), transport)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                    })
             }
         };
         let initialized = tokio::select! {
@@ -600,8 +630,10 @@ impl McpClientHandle {
             server_name,
             trusted_identity: None,
             running_service,
+            elicitation,
             source_proof: None,
             liveness: std::sync::Arc::new(()),
+            auxiliary: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -612,6 +644,14 @@ impl McpClientHandle {
     pub(crate) fn with_source_proof(mut self, proof: super::project::ServerSourceProof) -> Self {
         self.source_proof = Some(std::sync::Arc::new(proof));
         self
+    }
+
+    /// Called by the owned connection actor after its immutable source proof
+    /// is attached. Diagnostic and picker consumers only read the cached cell.
+    pub(crate) async fn discover_auxiliary(&self) {
+        self.auxiliary
+            .get_or_init(|| super::catalogue::discover(self, Duration::from_secs(3)))
+            .await;
     }
 
     /// Enumerate every tool the server exposes, bounded by
@@ -1083,6 +1123,8 @@ mod tests {
             inner: std::io::Cursor::new(bytes),
             max_line: 16,
             current_line: 0,
+            raw_line: Vec::new(),
+            forms: Default::default(),
             overflowed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -1100,6 +1142,16 @@ mod tests {
         assert!(capped.overflowed.load(std::sync::atomic::Ordering::Acquire));
         // Once overflowed, the reader stays failed.
         assert!(capped.read_to_end(&mut Vec::new()).await.is_err());
+        let mut completed = reader([vec![b'x'; 64], b"\nshort\n".to_vec()].concat());
+        assert_eq!(
+            completed
+                .read_to_end(&mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+            "a newline in the same read must not hide an oversized completed line"
+        );
     }
 
     use std::collections::HashMap;

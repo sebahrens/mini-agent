@@ -133,6 +133,9 @@ pub(super) fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
 /// The main App loop owns this state; no permission handler waits on a
 /// receiver. Dropping an unanswered state explicitly denies its exact request.
 pub(crate) struct PermissionState {
+    origin_valid: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    #[cfg(feature = "mcp")]
+    origin_owner: Option<crate::extras::mcp::elicitation::FrontendOwner>,
     request: Option<crate::permission::ask::AskRequest>,
     offer: Option<PromptGrantOffer>,
     folder: Option<std::path::PathBuf>,
@@ -186,6 +189,9 @@ impl PermissionState {
                 .then(|| ui.workspace.clone())
         });
         let state = Self {
+            origin_valid: None,
+            #[cfg(feature = "mcp")]
+            origin_owner: None,
             request: Some(request),
             offer,
             folder,
@@ -201,6 +207,9 @@ impl PermissionState {
     /// Collect a next-turn draft only after the App has retired the denied run.
     pub(crate) fn instruction(renderer: &mut Renderer) -> anyhow::Result<Self> {
         let state = Self {
+            origin_valid: None,
+            #[cfg(feature = "mcp")]
+            origin_owner: None,
             request: None,
             offer: None,
             folder: None,
@@ -213,9 +222,23 @@ impl PermissionState {
     }
 
     pub(crate) fn abandoned(&self) -> bool {
-        self.request
-            .as_ref()
-            .is_some_and(|request| request.reply.is_closed())
+        self.origin_valid.as_ref().is_some_and(|valid| !valid())
+            || self
+                .request
+                .as_ref()
+                .is_some_and(|request| request.reply.is_closed())
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn bind_origin(&mut self, valid: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.origin_valid = Some(valid);
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn bind_owner(&mut self, owner: crate::extras::mcp::elicitation::FrontendOwner) {
+        self.origin_owner = Some(owner);
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn origin_owner(&self) -> Option<&crate::extras::mcp::elicitation::FrontendOwner> {
+        self.origin_owner.as_ref()
     }
 
     pub(crate) fn decline_on_cancel(&self, ui: &UiContext<'_>) {

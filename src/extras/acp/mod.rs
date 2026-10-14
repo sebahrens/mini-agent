@@ -2200,6 +2200,21 @@ async fn drive_permission_bridge(
         };
 
         let mut ask = match ask {
+            #[cfg(feature = "mcp")]
+            crate::permission::ask::UserRequest::McpPermission(request) => {
+                let _ = request.request.reply.send(UserDecision::Deny);
+                continue;
+            }
+            #[cfg(feature = "mcp")]
+            crate::permission::ask::UserRequest::McpElicitation(request) => {
+                // ACP has no form-response contract. Refuse instead of routing
+                // a server question through the permission approval protocol.
+                let _ = request
+                    .question
+                    .reply
+                    .send(crate::question::QuestionAnswer::Cancelled);
+                continue;
+            }
             crate::permission::ask::UserRequest::Permission(ask) => ask,
             crate::permission::ask::UserRequest::Question(question) => {
                 drive_question_request(

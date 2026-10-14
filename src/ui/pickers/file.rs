@@ -25,6 +25,35 @@ const MAX_WALK_ENTRIES: usize = 50_000;
 /// Deepest directory level the walk descends into.
 const MAX_WALK_DEPTH: usize = 16;
 
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_resource_tests {
+    use super::*;
+    #[test]
+    fn opaque_resource_completion_preserves_the_operand_without_opening_a_walk() {
+        let operand = "mcp:owned:urn%3A%E9%9B%AA";
+        let mut picker = FilePicker::new();
+        picker.append_virtual_items(std::iter::once(PathBuf::from(format!("@{operand}"))));
+        for character in "mcp:owned:".chars() {
+            picker.char_input(character);
+        }
+        assert_eq!(picker.matches, vec![PathBuf::from(format!("@{operand}"))]);
+        assert!(!picker.is_loading());
+        let mut buffer: compact_str::CompactString = "inspect @mcp:owned:".into();
+        let mut cursor = buffer.len();
+        assert!(super::super::handlers::handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE
+            ),
+        ));
+        assert_eq!(buffer, format!("inspect @{operand}"));
+        assert_eq!(cursor, buffer.len());
+    }
+}
+
 pub struct FilePicker {
     pub active: bool,
     pub query: String,
@@ -56,6 +85,13 @@ impl FilePicker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
+    }
+
+    /// Opaque MCP operands are completion strings, never filesystem walk roots.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn append_virtual_items(&mut self, items: impl Iterator<Item = PathBuf>) {
+        self.file_cache.extend(items);
+        self.filter();
     }
 
     fn color(&self, color: Color) -> Color {
