@@ -75,6 +75,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "commands:");
     emit(
         false,
+        "  /config [--global|--project|--local] [key [TOML value]]  edit known settings",
+    );
+    emit(
+        false,
         "  /keys                 list effective configured keyboard bindings",
     );
     emit(
@@ -143,6 +147,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  /models <name>         same as /model <name>");
     emit(false, "  /models-add <n> <p> <m> save a quick model");
     emit(false, "  /sessions              list recent sessions");
+    emit(
+        false,
+        "  /fork [n]              branch here or at user turn n",
+    );
     emit(
         false,
         "  /sessions <id>         load a session (by ID prefix)",

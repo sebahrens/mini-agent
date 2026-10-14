@@ -71,12 +71,6 @@ impl HookedTool {
     where
         F: std::future::Future<Output = Result<T, ToolError>> + Send,
     {
-        // Only lifecycle hooks are configured: no tool event can fire for
-        // this call, so skip building the per-call context (a `current_dir`
-        // syscall + permission lock) and run the inner tool directly.
-        if !self.dispatcher.has_tool_hooks() {
-            return invoke(args).await;
-        }
         let tool_name = self.inner.name();
         let ctx = self.build_ctx();
         let tool_input: serde_json::Value =
@@ -275,12 +269,20 @@ impl ToolDyn for HookedTool {
     }
 
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(self.run_with_hooks(
-            args,
-            |args| self.inner.call(args),
-            |text| (true, text.as_str()),
-            |_, rewritten| rewritten,
-        ))
+        // Select before constructing/polling the much larger hook pipeline.
+        // Keep inner construction inside the returned future: dropping an
+        // unpolled wrapper must not start even eager ToolDyn constructor work.
+        if !self.dispatcher.has_tool_hooks() {
+            return Box::pin(async move { self.inner.call(args).await });
+        }
+        crate::startup::heap_future(|| {
+            self.run_with_hooks(
+                args,
+                |args| self.inner.call(args),
+                |text| (true, text.as_str()),
+                |_, rewritten| rewritten,
+            )
+        })
     }
 
     fn call_with_extensions<'a>(
@@ -288,12 +290,19 @@ impl ToolDyn for HookedTool {
         args: String,
         extensions: &'a ToolCallExtensions,
     ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(self.run_with_hooks(
-            args,
-            |args| self.inner.call_with_extensions(args, extensions),
-            |text| (true, text.as_str()),
-            |_, rewritten| rewritten,
-        ))
+        if !self.dispatcher.has_tool_hooks() {
+            return Box::pin(
+                async move { self.inner.call_with_extensions(args, extensions).await },
+            );
+        }
+        crate::startup::heap_future(|| {
+            self.run_with_hooks(
+                args,
+                |args| self.inner.call_with_extensions(args, extensions),
+                |text| (true, text.as_str()),
+                |_, rewritten| rewritten,
+            )
+        })
     }
 
     fn call_structured<'a>(
@@ -301,7 +310,10 @@ impl ToolDyn for HookedTool {
         args: String,
         extensions: &'a ToolCallExtensions,
     ) -> WasmBoxedFuture<'a, ToolExecutionResult> {
-        Box::pin(async move {
+        if !self.dispatcher.has_tool_hooks() {
+            return Box::pin(async move { self.inner.call_structured(args, extensions).await });
+        }
+        crate::startup::heap_future(|| async move {
             match self
                 .run_with_hooks(
                     args,

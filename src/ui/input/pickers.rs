@@ -8,6 +8,7 @@ use crate::ui::pickers::models::ModelsPicker;
 use crate::ui::pickers::rewind::RewindPicker;
 
 pub enum Picker {
+    Config(Box<crate::ui::pickers::config::ConfigPicker>),
     File(FilePicker),
     Command(ListPicker),
     Prefixed(ListPicker, &'static str),
@@ -21,6 +22,7 @@ pub enum Picker {
 impl Picker {
     pub fn active(&self) -> bool {
         match self {
+            Picker::Config(p) => p.list.active,
             Picker::File(p) => p.active,
             Picker::Command(p) => p.active,
             Picker::Prefixed(p, _) => p.active,
@@ -48,6 +50,7 @@ impl Picker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         match self {
+            Picker::Config(p) => p.list.set_monochrome(monochrome),
             Picker::File(p) => p.set_monochrome(monochrome),
             Picker::Command(p) => p.set_monochrome(monochrome),
             Picker::Prefixed(p, _) => p.set_monochrome(monochrome),
@@ -78,6 +81,9 @@ impl Picker {
     /// the input (see `Renderer::picker_floor_row`).
     pub fn draw(&mut self, floor_row: u16) -> std::io::Result<()> {
         match self {
+            Picker::Config(p) => p
+                .list
+                .draw(Some("type a key or select; Esc closes"), floor_row),
             Picker::File(p) => p.draw(floor_row),
             Picker::Command(p) => p.draw(None, floor_row),
             Picker::Prefixed(p, prefix) => {
@@ -141,11 +147,12 @@ impl InputEditor {
         // Argument pickers of slash commands (`/theme `, `/models `, ...).
         let argument_picker = match &self.picker {
             Some(Picker::Prefixed(_, prefix)) => prefix.starts_with('/'),
-            Some(Picker::Models(_)) => true,
+            Some(Picker::Config(_)) | Some(Picker::Models(_)) => true,
             Some(Picker::File(p)) => p.argument_start.is_some(),
             _ => false,
         };
         let handled = match self.picker.as_mut() {
+            Some(Picker::Config(p)) => p.handle(&mut self.buffer, &mut self.cursor, key),
             Some(Picker::File(p)) => {
                 handlers::handle_file_key(&mut self.buffer, &mut self.cursor, p, key)
             }

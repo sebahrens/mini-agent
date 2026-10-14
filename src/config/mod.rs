@@ -1,3 +1,4 @@
+pub(crate) mod editor;
 mod finite;
 pub(crate) mod keybindings;
 pub(crate) mod keys;

@@ -863,7 +863,6 @@ mod windows {
         }
     }
 
-    #[cfg(feature = "mcp")]
     pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<()> {
         if file.metadata()?.len() != 0 {
             return Err(super::private_file_error());
@@ -2857,7 +2856,7 @@ mod checked_private_race_tests {
 
 /// Restrict an exclusively created, still-empty owned temporary file before
 /// writing secret config bytes. This never repairs an existing destination.
-#[cfg(all(feature = "mcp", unix))]
+#[cfg(unix)]
 pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = file.metadata()?;
@@ -2871,12 +2870,12 @@ pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(all(feature = "mcp", not(any(unix, windows))))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn prepare_new_private_file(_: &std::fs::File) -> std::io::Result<()> {
     Err(unsupported())
 }
 
-#[cfg(all(feature = "mcp", windows))]
+#[cfg(windows)]
 pub(crate) use windows::prepare_new_private_file;
 
 #[cfg(windows)]

@@ -42,6 +42,7 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/sessions --all` | Open the picker with All workspaces explicitly selected. Choosing foreign history creates a fresh session in the current workspace; foreign approvals and hidden redo are removed. |
 | `/sessions <id-or-name>` | Load a session: an exact ID or exact case-insensitive name wins, otherwise a unique ID prefix or name substring. A same-workspace session another process owns is forked under a new ID. Foreign history always forks into the current workspace without foreign approvals or hidden redo. |
 | `/sessions delete <id-or-name>` | Delete a saved session using the same selection rules. The active session cannot be deleted; load another session first. |
+| `/fork [n]` | Branch into a new session named `<name> (fork)` and switch to it. Without `n`, keep the current history. With `n`, use the one-based user-turn numbering shown by `/rewind`, keeping that input (including ordered media) and dropping its answer and later turns. The source file stays unchanged. |
 | `/rename <name>` | Rename the current session. |
 | `/history` | Show global chat history (last 10 entries across sessions). |
 | `/export [file]` | Export the current session to a standalone HTML page (default `mini-agent-session-<id>.html`), Markdown with `.md`, or JSONL with `.jsonl`. Quote a file name that contains spaces. Markdown preserves message bodies literally in fenced blocks and includes tool arguments; each tool result shows at most 16 KiB with an omission notice and any recorded full-output path. Export does not read that path and refuses to overwrite an existing file. Markdown is a readable transcript; use JSONL for `/import`. Requires the `export` feature (default-on). |
@@ -56,6 +57,17 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/welcome` | Show the welcome/onboarding screen. |
 | `/tutorial` | Alias for `/welcome`. |
 | `/tutor` | Open the full getting-started guide in `less`, or print it when no pager is available. |
+
+Use `mini-agent -c --fork-session` to continue the latest saved session under a new
+ID, or combine `--fork-session` with `--session <id-or-name>` or `--resume`.
+The branch is saved even before a new model turn; `--name` overrides its generated
+name. CLI forking requires a saved-session selection and conflicts with `--no-session`.
+In an ephemeral TUI, `/fork` switches the in-memory branch without writing a file.
+
+Forking requires a settled conversation. Branches retain recorded usage and budget
+uncertainty, so branching cannot reset spending limits. Explicit branches discard
+session approvals and hidden redo; runtime ownership is fresh. Forking does not
+change files in the working tree.
 
 HTML exports treat every session field as untrusted. Raw HTML is displayed as escaped text;
 assistant Markdown keeps normal formatting, HTTP(S)/`mailto:` or relative links, and HTTPS images,
@@ -796,3 +808,9 @@ literally (`n` repeats, Escape cancels). The status bar shows the current mode
 and search query. These commands affect the input only and remain available
 while a model turn runs. Use `[keys]` in trusted config to replace shortcuts;
 see [Input keyboard settings](input-keybindings.md).
+
+`/config [--global|--project|--local] [key [TOML value]]` opens the known-setting
+picker or validates and saves one setting. The picker shows current startup
+values, types, sources and restart requirements. Sensitive project changes require
+approval of the exact candidate; current permission/provider authority is unchanged.
+See [interactive settings](CONFIG.md#interactive-settings-editor).

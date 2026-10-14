@@ -1276,6 +1276,90 @@ async fn concurrent_mcp_calls_cannot_borrow_another_invocations_hook_grant() {
     assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn lifecycle_only_tool_entries_defer_inner_construction_until_polled() {
+    use rig::tool::{ToolCallExtensions, ToolExecutionResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Input(u8);
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Output(u8);
+    struct EagerConstructor(Arc<[AtomicUsize; 3]>);
+    impl ToolDyn for EagerConstructor {
+        fn name(&self) -> String {
+            "constructor_probe".into()
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            self.0[0].fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(args) })
+        }
+        fn call_with_extensions<'a>(
+            &'a self,
+            args: String,
+            extensions: &'a ToolCallExtensions,
+        ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            self.0[1].fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                assert_eq!(extensions.get::<Input>(), Some(&Input(7)));
+                Ok(args)
+            })
+        }
+        fn call_structured<'a>(
+            &'a self,
+            args: String,
+            extensions: &'a ToolCallExtensions,
+        ) -> WasmBoxedFuture<'a, ToolExecutionResult> {
+            self.0[2].fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                assert_eq!(extensions.get::<Input>(), Some(&Input(7)));
+                ToolExecutionResult::denied(args).with_extension(Output(9))
+            })
+        }
+    }
+    let constructions = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+    let tools = wrap_all(
+        vec![Box::new(EagerConstructor(constructions.clone()))],
+        dispatcher_with("SessionStart", vec![handler("unused-lifecycle-command")]),
+        None,
+        None,
+    );
+    let mut extensions = ToolCallExtensions::new();
+    extensions.insert(Input(7));
+    drop(tools[0].call("unpolled-string".into()));
+    drop(tools[0].call_with_extensions("unpolled-extension".into(), &extensions));
+    drop(tools[0].call_structured("unpolled-structured".into(), &extensions));
+    assert_eq!(
+        constructions.each_ref().map(|n| n.load(Ordering::SeqCst)),
+        [0; 3]
+    );
+
+    assert_eq!(tools[0].call("string".into()).await.unwrap(), "string");
+    assert_eq!(
+        tools[0]
+            .call_with_extensions("extension".into(), &extensions)
+            .await
+            .unwrap(),
+        "extension"
+    );
+    let result = tools[0]
+        .call_structured("structured".into(), &extensions)
+        .await;
+    assert_eq!(result.model_output(), "structured");
+    assert_eq!(result.outcome().as_str(), "denied");
+    assert_eq!(result.extensions().get::<Output>(), Some(&Output(9)));
+    assert_eq!(
+        constructions.each_ref().map(|n| n.load(Ordering::SeqCst)),
+        [1; 3]
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn actual_sdk_wrapper_stack_preserves_typed_results_outcomes_and_exact_call_ids() {

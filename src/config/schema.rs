@@ -30,6 +30,8 @@ pub(crate) fn generate() -> Value {
     let mut aliases = Vec::new();
     for key in CONFIG_KEYS {
         let mut field = shape(key.shape);
+        field["description"] = json!(key.description);
+        field["x-mini-agent-restart-required"] = json!(key.restart_required);
         if key.name == "lsp" {
             field["properties"] = json!({"enabled":{"anyOf":[{"type":"boolean"},{"const":"auto"}]}, "servers":{"type":"object"}});
         }

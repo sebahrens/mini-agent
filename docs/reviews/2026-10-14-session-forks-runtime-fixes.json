@@ -1,0 +1,283 @@
+{
+  "hook115": {
+    "bead": "mini-agent-i7ro6.115",
+    "base": "a2697b06ecc5d21d36bf27a0484fa5a7c1a1addb",
+    "worktree": "/Users/seb/projects/mini-agent/target/agent-worktrees/hook115-stack",
+    "source_frozen": true,
+    "patch": "/private/tmp/mini-agent-hook115-final-owned.patch",
+    "patch_sha256": "06f8c27d93dbdbea8ff54cd1b0efc41b5cfe5a4f92a06de3d62b4f3e437fe1fa",
+    "patch_bytes": 7997,
+    "files": [
+      {
+        "path": "src/extras/hooks/decorator.rs",
+        "sha256": "57e6392e76dd03bebe51ed008be4d27568c1bdfb8bdce12720191443d02b4b58",
+        "bytes": 14633
+      },
+      {
+        "path": "src/tests/hooks/decorator_tests.rs",
+        "sha256": "b7a560a82e106ac274f775aa671bb94de72086487712a76b8dc077551b267d93",
+        "bytes": 58527
+      },
+      {
+        "path": "docs/agent/TOOL_RUNTIME.md",
+        "sha256": "95d42bcd819ecc84def371515d1f064d469a5ea609d6e36307e634ea53cf758c",
+        "bytes": 80308
+      }
+    ],
+    "tests": {
+      "exact2": "/private/tmp/mini-agent-hook115-owning-first.log",
+      "fmt_diffcheck": "PASS",
+      "default_debug_install": "/private/tmp/mini-agent-hook115-install.log",
+      "install_seconds": 37.69,
+      "binary": "/private/tmp/mini-agent-hook115-install/bin/mini-agent",
+      "binary_sha256": "b591ec47145225a436aedbcc4078476598eaa0ef9607236aeb3d3343cbb85123"
+    },
+    "native": {
+      "driver": "/private/tmp/mini-agent-config69-hook-stack-causal.py",
+      "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-config69-installed-3a3q6qcx/report.json",
+      "report_sha256": "a2a3f8f4d7c88b9b41fe0b54decae6e091734fb9c3bbca226ec806e92f4152f8",
+      "stack_contract_pass": true,
+      "raw_driver_passed": false,
+      "qualification": "Raw overall fixture remains false only because lifecycle hook_marker=false, also false in both retained crash baselines. Do not claim lifecycle hook execution proof. All original driver assertions/output retained. Physical1048576 stack, actual native ReadTool/captured-child-content assertion passed, exit0,2 owned loopback POSTs,0 external requests; exact child/listener retired by unchanged finally."
+    },
+    "indexed_test_map": "/private/tmp/mini-agent-hook115-final-indexed-test-map.json",
+    "owner_review": "/private/tmp/mini-agent-hook115-final-owner-review.json",
+    "source_snapshots": "/private/tmp/mini-agent-hook115-final-sources",
+    "no_commit_no_push": "Root owns Main integration and final pushes; no Main mutations or shared target use."
+  },
+  "windows108": {
+    "bead": "mini-agent-i7ro6.108.2",
+    "status": "Observed installed integration PASSED; original intermittent internal timeout cause remains OPEN/unreproduced.",
+    "run": 38612295195,
+    "url": "https://github.com/sebahrens/mini-agent/actions/runs/38612295195",
+    "job": 116018448640,
+    "source_commit": "9dfa37b0fc309388db7ac49a3506629103d4c5e1",
+    "workflow_commit": "50fda08754c0a456e222a747dc6c3f3c7d69f9b8",
+    "branch": "codex/windows108-installed-observer-proof",
+    "source_patch_sha256": "556096bcbd005f7f687d7e88f81dd7a6ae782bd8d18e72d0f5df5e580c303be8",
+    "workflow_patch_sha256": "5001e4fef0a40fca0c4b34e1e141a21e75a433a48a5f03cf1d43c4d1a791d486",
+    "binary_sha256": "7dba63a623de1a1e4631aa52a18af4cd7ebfb29fc44c093439e16350e33040f4",
+    "log": "/private/tmp/mini-agent-windows108-installed-observer-terminal.log",
+    "log_sha256": "a3cff5cc3777e4cafeccfd27700e5d6a6cd79af2cc619a061f98f8633120056b",
+    "job_conclusion": "success",
+    "jobs_count": 1,
+    "new_native_units": [
+      "test sandbox::windows::preflight_witness::tests::ordinary_launch_request_omits_observer_and_diagnostics_are_value_free ... ok",
+      "test sandbox::windows::preflight_witness::tests::preflight_helper_observation_decodes_only_closed_stages_and_exact_header ... ok"
+    ],
+    "unit_execution": "2 passed;0failed;0ignored;0.00s; source/unit native compilation6m43s",
+    "production_install": "original DEFAULT debug install PASS2m05s; actual Windows normal graph, not dev-feature-only proof",
+    "installed_checks": 1,
+    "helper_observations": [
+      "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase=cleanup elapsed_ms=4762"
+    ],
+    "parent_records": [
+      {
+        "stage": "prior_recovery",
+        "category": "begin",
+        "elapsed_ms": "0",
+        "slack_ms": "0",
+        "capped": "false"
+      },
+      {
+        "stage": "prior_recovery_ready",
+        "category": "ok",
+        "elapsed_ms": "1",
+        "slack_ms": "0",
+        "capped": "false"
+      },
+      {
+        "stage": "setup",
+        "category": "begin",
+        "elapsed_ms": "1",
+        "slack_ms": "4999",
+        "capped": "false"
+      },
+      {
+        "stage": "prepared",
+        "category": "ok",
+        "elapsed_ms": "2298",
+        "slack_ms": "2703",
+        "capped": "false"
+      },
+      {
+        "stage": "spawn",
+        "category": "begin",
+        "elapsed_ms": "2298",
+        "slack_ms": "2703",
+        "capped": "false"
+      },
+      {
+        "stage": "spawn_returned",
+        "category": "ok",
+        "elapsed_ms": "2300",
+        "slack_ms": "2701",
+        "capped": "false"
+      },
+      {
+        "stage": "observe",
+        "category": "exit_success",
+        "elapsed_ms": "4710",
+        "slack_ms": "291",
+        "capped": "false"
+      },
+      {
+        "stage": "recovery",
+        "category": "begin",
+        "elapsed_ms": "4752",
+        "slack_ms": "4999",
+        "capped": "false"
+      },
+      {
+        "stage": "recovery_finished",
+        "category": "ok",
+        "elapsed_ms": "4756",
+        "slack_ms": "4995",
+        "capped": "false"
+      },
+      {
+        "stage": "root_disposition",
+        "category": "ok",
+        "elapsed_ms": "4762",
+        "slack_ms": "0",
+        "capped": "false"
+      },
+      {
+        "stage": "finished",
+        "category": "available",
+        "elapsed_ms": "4762",
+        "slack_ms": "0",
+        "capped": "false"
+      },
+      {
+        "stage": "cached",
+        "category": "available",
+        "elapsed_ms": "0",
+        "slack_ms": "0",
+        "capped": "false"
+      }
+    ],
+    "original_boundary_pass": "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated",
+    "observed_margin": "Prepared2298ms;spawn_returned2300ms;exit_success4710ms with291ms originalrun slack;rootdisposition/finished4762ms. These are observations, not an internal cause.",
+    "reuse": [
+      "Prior native scalar/forcedkill/noinherit/error/None experiment3reused+1fresh alreadypassed; not rerun.",
+      "Existing source inventories2PASS22.58s; diagnosticsCI Python3PASS .006s; privateworkflow controlled4PASS .002s.",
+      "No old40 sandbox/22atomic/threeprobe/fullmatrix repeated."
+    ],
+    "limits": [
+      "No original timeout recurrence in this single run, so no internal cause/fix or108.2closure claim.",
+      "Instrumented permanent owning CI emits phase on future recurrence; successful case requires exactly1cleanup observation, originalbounds/proofs retained.",
+      "No Main merge/push by this agent; independentlylandable7file source patch is separate from privateworkflow-only proof child."
+    ],
+    "steps": [
+      {
+        "name": "Set up job",
+        "conclusion": "success"
+      },
+      {
+        "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "conclusion": "success"
+      },
+      {
+        "name": "Bind the exact reviewed source candidate",
+        "conclusion": "success"
+      },
+      {
+        "name": "Install Rust",
+        "conclusion": "success"
+      },
+      {
+        "name": "Execute only the two new closed observation contracts",
+        "conclusion": "success"
+      },
+      {
+        "name": "Install the original default debug profile for the real preflight",
+        "conclusion": "success"
+      },
+      {
+        "name": "Execute one original installed sandbox self-check with the observer",
+        "conclusion": "success"
+      },
+      {
+        "name": "Post Install Rust",
+        "conclusion": "success"
+      },
+      {
+        "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "conclusion": "success"
+      },
+      {
+        "name": "Complete job",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "session_fork75": {
+    "behavior": "Explicit /fork [one-based user turn] and saved-resume --fork-session create and activate a fresh ID, preserving source files, ordered media, usage and budget uncertainty; remove approvals and hidden redo. Branch commands never auto-start goals.",
+    "peer_review": "/private/tmp/mini-agent-fork75-independent-peer-review.json",
+    "targeted_tests": "7 integrated controls passed; final changed App goal/no-run control plus three original failed config contracts and new bounded location/identity control: 5 passed. Existing budget-fork and help controls reused.",
+    "logs": [
+      "/private/tmp/mini-agent-wave46-combined-owning.log",
+      "/private/tmp/mini-agent-wave46-final-corrections.log",
+      "/private/tmp/mini-agent-fork75-initial-owning.log"
+    ],
+    "native": {
+      "report": "/private/tmp/mini-agent-fork75-native-i37owowa/report.json",
+      "physical_stack_bytes": 1048576,
+      "passed": true,
+      "assertions": [
+        "second persisted identity",
+        "source bytes unchanged",
+        "normal exit0",
+        "exact PID retired",
+        "0 model POSTs",
+        "listener joined"
+      ],
+      "binary_sha256": "ad710a1fe2a671549887dba04ee1f55fe702243938987881bd5ea117c3c3444f",
+      "causal_correction": "Observed new fork exhausted the native stack under retained session dispatch frames. Existing owned heap_future now constructs the three session dispatcher futures and fork resume future; no stack/deadline/lifecycle authority changes. Actual1MiB session-picker event loop includes /fork1 as regression."
+    }
+  },
+  "config691": {
+    "original_ci": "https://github.com/sebahrens/mini-agent/actions/runs/38612787304",
+    "correction": "Static bounded-scan line/column errors omit values; merge restores only previously captured builtin MCP identities; outer loader injects defaults. Feature-off prompt image helper moved before test module.",
+    "tests": "All three unchanged original failing controls plus new bounded-location/default-identity control pass."
+  },
+  "validation": {
+    "default_advisor_strict": "PASS /private/tmp/mini-agent-wave46-final-strict.log",
+    "minimal_strict": "PASS /private/tmp/mini-agent-wave46-strict-minimal.log; exercises feature-off item ordering fix",
+    "required_debug_install": "PASS /private/tmp/mini-agent-wave46-final-install.log",
+    "binary_sha256": "354be67091d82e23d51dbada78dc884869518ba7c4d7a25d0403d05f7f86819f",
+    "windows_policy": "3PASS /private/tmp/mini-agent-wave46-windows-policy.log",
+    "source_inventory": "2PASS23.34s /private/tmp/mini-agent-wave46-inventory.log; composed editor inventory included in final integration",
+    "final_combined_tests": "14PASS24.44s /private/tmp/mini-agent-wave46-editor-integration.log; changed editor, fork, actual1MiB App/event loop, source inventories",
+    "final_combined_strict": "PASS35.32s /private/tmp/mini-agent-wave46-editor-strict.log",
+    "final_combined_install": "PASS21.93s /private/tmp/mini-agent-wave46-editor-install.log",
+    "final_binary": "/private/tmp/mini-agent-wave46-final-install/bin/mini-agent",
+    "final_binary_sha256": "ff3240a0d7748b179b4ae6f1c4b45b423b3ba694ac812d569ec07ecd8b8373cf",
+    "final_native_fork": {
+      "report": "/private/tmp/mini-agent-fork75-native-xn9lmac0/report.json",
+      "passed": true,
+      "physical_stack_bytes": 1048576,
+      "binary_sha256": "ff3240a0d7748b179b4ae6f1c4b45b423b3ba694ac812d569ec07ecd8b8373cf",
+      "exit_code": 0,
+      "model_posts": 0,
+      "source_bytes_unchanged": true,
+      "second_persisted_id": true,
+      "exact_pid_retired": 51192,
+      "listener_joined": true
+    }
+  },
+  "limits": [
+    "Windows diagnostic proof does not identify/fix original intermittent timeout;108.2 stays open.",
+    "Raw original hook fixture reports ancillary lifecycle marker false before and after; stack-specific native exit0/two requests/read result/cleanup proof is retained, with no lifecycle execution claim.",
+    "Current full CI has known failures corrected in this source; new pushed-head CI still required."
+  ],
+  "config_editor68": {
+    "source_patch_sha256": "f4c5dacf1f8ef2ec83103a8e4dbe83207a8004fd8c76c5945c2eebffb550bf19",
+    "independent_review": "Root production review of editor/trust/CAS/owned blocking/picker/schema/cfg and test behavior; no remaining blocker.",
+    "owning_controls": "selected15, minimal2, finalCAS/picker/App3, default strict and required debug install allPASS; unchanged passes reused.",
+    "native_report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-config68-installed-el9t68ht/report.json",
+    "native_sha256": "602a4a84c35b505baeb02f1dbbf0ea6972a82bb5690d5040609adbade60ed8c3",
+    "native": "PASS physical1MiB; actual picker/save/global preservation/local decline then exact hash approval/reload precedence/preservationcheck/quit/0POST; no livefixtureowners."
+  }
+}

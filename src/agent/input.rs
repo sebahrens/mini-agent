@@ -43,6 +43,16 @@ impl PromptInput {
     }
 }
 
+#[cfg(not(feature = "multimodal"))]
+pub(crate) fn history_has_images(history: &[rig::message::Message]) -> bool {
+    history.iter().any(|message| match message {
+        rig::message::Message::User { content } => content
+            .iter()
+            .any(|block| matches!(block, rig::message::UserContent::Image(_))),
+        rig::message::Message::Assistant { .. } | rig::message::Message::System { .. } => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,14 +94,4 @@ mod tests {
         text.apply_hook_text("rewritten".into()).unwrap();
         assert_eq!(text.to_message(), rig::message::Message::user("rewritten"));
     }
-}
-
-#[cfg(not(feature = "multimodal"))]
-pub(crate) fn history_has_images(history: &[rig::message::Message]) -> bool {
-    history.iter().any(|message| match message {
-        rig::message::Message::User { content } => content
-            .iter()
-            .any(|block| matches!(block, rig::message::UserContent::Image(_))),
-        rig::message::Message::Assistant { .. } | rig::message::Message::System { .. } => false,
-    })
 }

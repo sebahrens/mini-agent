@@ -128,13 +128,40 @@ pub(crate) fn held_elsewhere_error(session_id: &str) -> anyhow::Error {
 /// copied through the same serialization a reload uses, so process-local
 /// stores (todos, goal, read tracker) are not shared with the source.
 pub fn fork_session(source: &Session) -> anyhow::Result<Session> {
-    let mut fork: Session = serde_json::from_value(serde_json::to_value(source)?)?;
+    let mut fork =
+        super::storage::decode_session_json(&super::storage::serialize_bounded_session(source)?)?;
     fork.native_frontier = source.native_frontier.fork();
     fork.id = CompactString::new(Uuid::new_v4().to_string());
     if !fork.name.is_empty() {
         fork.name = CompactString::new(format!("{} (fork)", fork.name));
     }
     fork.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    Ok(fork)
+}
+
+/// Explicit branching uses the rewind list's one-based user-turn order.
+/// A selected turn keeps that input and its typed media, before its answer;
+/// omitting it keeps the complete current history. No source state is mutated.
+pub(crate) fn fork_at_turn(source: &Session, turn: Option<usize>) -> anyhow::Result<Session> {
+    let length = match turn {
+        None => source.messages.len(),
+        Some(0) => anyhow::bail!("fork turn numbers start at 1"),
+        Some(turn) => source
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == super::MessageRole::User)
+            .nth(turn - 1)
+            .map(|(index, _)| index + 1)
+            .ok_or_else(|| anyhow::anyhow!("fork turn is outside the conversation"))?,
+    };
+    let mut fork = fork_session(source)?;
+    fork.truncate_to(length);
+    fork.rewind_undo = None;
+    fork.permission_allowlist.clear();
+    if fork.name.is_empty() {
+        fork.name = "session (fork)".into();
+    }
     Ok(fork)
 }
 
@@ -182,6 +209,114 @@ pub fn claim_or_fork(session: Session) -> anyhow::Result<ResumedSession> {
                 session,
                 notice: None,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod fork75_tests {
+    use super::*;
+    use crate::session::{MessageRole, PermissionAllowEntry};
+
+    fn conversation() -> Session {
+        let mut session = Session::new("openrouter", "fixture", 128_000, "branch");
+        for (role, text) in [
+            (MessageRole::User, "first"),
+            (MessageRole::Assistant, "first answer"),
+            (MessageRole::User, "second"),
+            (MessageRole::Assistant, "second answer"),
+            (MessageRole::User, "hidden redo"),
+        ] {
+            session.add_message(role, text);
+        }
+        session.rewind_to(4);
+        session.total_input_tokens = 80;
+        session.total_output_tokens = 20;
+        session.total_cost = 0.5;
+        session.permission_allowlist.push(PermissionAllowEntry {
+            tool: "shell".into(),
+            pattern: "*".into(),
+        });
+        session
+    }
+
+    #[test]
+    fn fork75_branch_keeps_selected_input_costs_and_original_without_grants_or_redo() {
+        let source = conversation();
+        let before = serde_json::to_vec(&source).unwrap();
+        let fork = fork_at_turn(&source, Some(2)).unwrap();
+        assert_ne!(fork.id, source.id);
+        assert_eq!(fork.name, "branch (fork)");
+        assert_eq!(fork.messages.len(), 3);
+        assert_eq!(fork.messages[2].content, "second");
+        assert_eq!(fork.total_input_tokens, 80);
+        assert_eq!(fork.total_output_tokens, 20);
+        assert_eq!(fork.total_cost, 0.5);
+        assert!(fork.permission_allowlist.is_empty());
+        assert!(fork.rewind_undo.is_none());
+        assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        let full = fork_at_turn(&source, None).unwrap();
+        assert_eq!(full.messages.len(), 4);
+        assert_eq!(full.messages[3].content, "second answer");
+    }
+
+    #[test]
+    fn fork75_selected_turn_preserves_ordered_media_exactly() {
+        use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
+        let mut source = conversation();
+        let user = PersistedUserMessage::new(vec![
+            UserBlock::Text {
+                text: "before image".into(),
+            },
+            UserBlock::Image {
+                data: "aW5lcnQ=".into(),
+                mime_type: ImageMime::Png,
+            },
+            UserBlock::Text {
+                text: "after image".into(),
+            },
+        ])
+        .unwrap();
+        source.add_user_message(user.clone());
+        source.add_message(MessageRole::Assistant, "later answer");
+        let before = serde_json::to_vec(&source).unwrap();
+        let fork = fork_at_turn(&source, Some(3)).unwrap();
+        assert_eq!(fork.messages.len(), 5);
+        assert_eq!(fork.messages[4].user.as_ref(), Some(&user));
+        assert_eq!(fork.messages[4].content, "before image\nafter image");
+        assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+    }
+
+    #[test]
+    fn fork75_invalid_turn_and_oversized_source_refuse_without_mutation() {
+        let mut source = conversation();
+        let before = serde_json::to_vec(&source).unwrap();
+        for turn in [0, 3, usize::MAX] {
+            assert!(fork_at_turn(&source, Some(turn)).is_err());
+        }
+        assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        source.add_message(
+            MessageRole::User,
+            &"x".repeat(super::super::storage::MAX_SESSION_BYTES),
+        );
+        assert!(fork_at_turn(&source, None).is_err());
+    }
+
+    #[test]
+    fn fork75_cli_requires_resume_and_rejects_ephemeral_fork() {
+        use clap::Parser;
+        for args in [
+            vec!["mini-agent", "-c", "--fork-session"],
+            vec!["mini-agent", "--session", "example", "--fork-session"],
+            vec!["mini-agent", "--resume", "--fork-session"],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(args).unwrap().fork_session);
+        }
+        for args in [
+            vec!["mini-agent", "--fork-session"],
+            vec!["mini-agent", "-c", "--fork-session", "--no-session"],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(args).is_err());
         }
     }
 }

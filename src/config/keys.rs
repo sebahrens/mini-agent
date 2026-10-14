@@ -44,6 +44,8 @@ pub(crate) struct ConfigKey {
     /// Alternative spellings accepted on input and rewritten to `name`.
     pub(crate) aliases: &'static [&'static str],
     pub(crate) shape: ConfigShape,
+    pub(crate) description: &'static str,
+    pub(crate) restart_required: bool,
 }
 
 const fn key(name: &'static str) -> ConfigKey {
@@ -52,6 +54,8 @@ const fn key(name: &'static str) -> ConfigKey {
         feature: None,
         aliases: &[],
         shape: ConfigShape::Any,
+        description: "Saved configuration for this setting; applies after restart",
+        restart_required: true,
     }
 }
 
@@ -61,6 +65,8 @@ const fn aliased(name: &'static str, aliases: &'static [&'static str]) -> Config
         feature: None,
         aliases,
         shape: ConfigShape::Any,
+        description: "Saved configuration for this setting; applies after restart",
+        restart_required: true,
     }
 }
 
@@ -70,6 +76,8 @@ const fn gated(feature: &'static str, name: &'static str) -> ConfigKey {
         feature: Some(feature),
         aliases: &[],
         shape: ConfigShape::Any,
+        description: "Saved configuration for this setting; applies after restart",
+        restart_required: true,
     }
 }
 
@@ -83,10 +91,20 @@ const fn gated_aliased(
         feature: Some(feature),
         aliases,
         shape: ConfigShape::Any,
+        description: "Saved configuration for this setting; applies after restart",
+        restart_required: true,
     }
 }
 
 impl ConfigKey {
+    const fn described(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+    const fn live(mut self) -> Self {
+        self.restart_required = false;
+        self
+    }
     const fn shaped(mut self, shape: ConfigShape) -> Self {
         self.shape = shape;
         self
@@ -95,39 +113,59 @@ impl ConfigKey {
 
 /// Every top-level key of `Config` across all Cargo feature combinations.
 pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
-    key("model").shaped(ConfigShape::String),
-    key("provider").shaped(ConfigShape::String),
-    key("max_tokens").shaped(ConfigShape::Integer),
-    key("turn_token_budget").shaped(ConfigShape::Integer),
-    key("max_budget_usd").shaped(ConfigShape::Number),
-    key("cache_ttl").shaped(ConfigShape::Enum(&["5m", "1h"])),
-    key("temperature").shaped(ConfigShape::Number),
-    key("extra_body").shaped(ConfigShape::Any),
-    key("reasoning").shaped(ConfigShape::Object),
+    key("model")
+        .described("Default model identifier")
+        .shaped(ConfigShape::String),
+    key("provider")
+        .described("Default provider or custom gateway")
+        .shaped(ConfigShape::String),
+    key("max_tokens")
+        .described("Maximum response tokens")
+        .shaped(ConfigShape::Integer),
+    key("turn_token_budget").described("Cumulative fail-closed token budget for one agentic turn: the sum of input+output tokens across every completion call the turn makes.").shaped(ConfigShape::Integer),
+    key("max_budget_usd")
+        .described("Global spend ceiling in US dollars")
+        .shaped(ConfigShape::Number),
+    key("cache_ttl").described("Owner-selected native Anthropic cache TTL. Project layers cannot alter this billing policy. Omission preserves manual five-minute caching.").shaped(ConfigShape::Enum(&["5m", "1h"])),
+    key("temperature")
+        .described("Sampling temperature")
+        .shaped(ConfigShape::Number),
+    key("extra_body").described("Provider-specific JSON shallow-merged into every completion request body as a global default.").shaped(ConfigShape::Any),
+    key("reasoning").described("First-class reasoning controls for the OpenAI family: `effort` and `summary` map to the Responses API's `reasoning` object (and `effort` alone to Chat Completions' `reasoning_effort`),…").shaped(ConfigShape::Object),
     key("retry").shaped(ConfigShape::Object),
     key("no_tools").shaped(ConfigShape::Bool),
     key("headless_questions").shaped(ConfigShape::Enum(&["error", "fail"])),
-    key("no_context_files").shaped(ConfigShape::Bool),
-    key("context_window").shaped(ConfigShape::Integer),
+    key("no_context_files")
+        .described("Disable automatic instruction-file discovery")
+        .shaped(ConfigShape::Bool),
+    key("context_window")
+        .described("Context token capacity")
+        .shaped(ConfigShape::Integer),
     key("reserve_tokens").shaped(ConfigShape::Integer),
     key("keep_recent_tokens").shaped(ConfigShape::Integer),
-    key("keep_recent_tool_results").shaped(ConfigShape::Integer),
+    key("keep_recent_tool_results").described("Number of newest historical tool results kept verbatim in the live model context.").shaped(ConfigShape::Integer),
     key("max_agent_turns").shaped(ConfigShape::Integer),
-    key("verify_command").shaped(ConfigShape::String),
-    key("format").shaped(ConfigShape::StringMap),
-    key("keys").shaped(ConfigShape::StringArrayMap),
-    key("vim_mode").shaped(ConfigShape::Bool),
-    gated("goal", "goal").shaped(ConfigShape::Object),
-    gated("goal", "goal_checks").shaped(ConfigShape::Strings),
-    gated("goal", "goal_judge_model").shaped(ConfigShape::String),
-    key("session_title_model").shaped(ConfigShape::String),
-    key("verify_timeout_secs").shaped(ConfigShape::Integer),
-    key("verify_max_attempts").shaped(ConfigShape::Integer),
+    key("verify_command").described("Trusted operator command run before a tool-using turn may complete. Project-local values require the existing sensitive-config approval.").shaped(ConfigShape::String),
+    key("format")
+        .described("Formatter command templates by extension")
+        .shaped(ConfigShape::StringMap),
+    key("keys")
+        .described("Keyboard actions and chord lists")
+        .shaped(ConfigShape::StringArrayMap),
+    key("vim_mode")
+        .described("Enable modal input editing")
+        .shaped(ConfigShape::Bool),
+    gated("goal", "goal").described("Goal defaults. Benign: these only bound how long the harness keeps working, never what it is allowed to run.").shaped(ConfigShape::Object),
+    gated("goal", "goal_checks").described("Commands that must exit zero before a goal may be reported complete.").shaped(ConfigShape::Strings),
+    gated("goal", "goal_judge_model").described("A `quick_models` entry name to judge goal completion claims.").shaped(ConfigShape::String),
+    key("session_title_model").described("A `quick_models` entry name that titles sessions for `--resume` and `/sessions` after their first exchange.").shaped(ConfigShape::String),
+    key("verify_timeout_secs").described("Wall-clock bound for one verification attempt. Default: 300 seconds.").shaped(ConfigShape::Integer),
+    key("verify_max_attempts").described("Total verification attempts within one agent turn. Default: 3; capped at 8 so a persistently failing command cannot loop indefinitely.").shaped(ConfigShape::Integer),
     key("max_text_file_size").shaped(ConfigShape::Integer),
     key("max_read_lines").shaped(ConfigShape::Integer),
     key("max_bash_output_lines").shaped(ConfigShape::Integer),
-    key("shell_timeout_secs").shaped(ConfigShape::Integer),
-    key("update_check").shaped(ConfigShape::Bool),
+    key("shell_timeout_secs").described("Foreground shell tool deadline. Other sandbox command classes retain their own limits; this does not alter brokered JavaScript spawn limits.").shaped(ConfigShape::Integer),
+    key("update_check").described("Opt-in anonymous release check, only during interactive startup.").shaped(ConfigShape::Bool),
     key("max_grep_results").shaped(ConfigShape::Integer),
     key("max_find_results").shaped(ConfigShape::Integer),
     key("max_list_dir_entries").shaped(ConfigShape::Integer),
@@ -136,14 +174,16 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "subagent_max_find_results").shaped(ConfigShape::Integer),
     gated("subagents", "subagent_max_list_dir_entries").shaped(ConfigShape::Integer),
     key("compact_enabled").shaped(ConfigShape::Bool),
-    key("mid_turn_compact_threshold").shaped(ConfigShape::Number),
+    key("mid_turn_compact_threshold").described("Opt-in mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure.").shaped(ConfigShape::Number),
     key("always_show_welcome").shaped(ConfigShape::Bool),
     aliased("auto-update-prompts", &["auto_update_prompts"]).shaped(ConfigShape::Bool),
     aliased("auto-update-themes", &["auto_update_themes"]).shaped(ConfigShape::Bool),
     key("custom_providers").shaped(ConfigShape::Object),
-    key("embedding").shaped(ConfigShape::Object),
-    key("enable_skill_proposals").shaped(ConfigShape::Bool),
-    key("permission").shaped(ConfigShape::Any),
+    key("embedding").described("Embedding backend for the skill library. Absent means the built-in offline deterministic backend.").shaped(ConfigShape::Object),
+    key("enable_skill_proposals").described("Allow model-authored JavaScript steps to submit bounded learned-skill proposals.").shaped(ConfigShape::Bool),
+    key("permission")
+        .described("Default tool permission policy")
+        .shaped(ConfigShape::Any),
     aliased("permission-regex", &["permission_regex"]).shaped(ConfigShape::Any),
     aliased("permission-allow", &["permission_allow"]).shaped(ConfigShape::StringArrayMap),
     aliased("permission-allow-prefix", &["permission_allow_prefix"])
@@ -153,7 +193,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("restrictive").shaped(ConfigShape::Bool),
     key("accept_all").shaped(ConfigShape::Bool),
     key("yolo").shaped(ConfigShape::Bool),
-    key("sandbox").shaped(ConfigShape::Bool),
+    key("sandbox")
+        .described("Enable process containment")
+        .shaped(ConfigShape::Bool),
     aliased("sandbox-backend", &["sandbox_backend"]).shaped(ConfigShape::String),
     aliased(
         "windows-appcontainer-read-roots",
@@ -175,32 +217,37 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated_aliased("js", "js-fetch-origins", &["js_fetch_origins"]).shaped(ConfigShape::Strings),
     gated_aliased("js", "js-fetch-allow-http", &["js_fetch_allow_http"]).shaped(ConfigShape::Bool),
     aliased("allow_all_mcp_calls", &["allow-all-mcp-calls"]).shaped(ConfigShape::Bool),
-    gated("mcp", "mcp_tool_timeout_secs").shaped(ConfigShape::Integer),
+    gated("mcp", "mcp_tool_timeout_secs").described("Bound on one MCP `tools/call` round trip, in seconds. Default: 120.").shaped(ConfigShape::Integer),
     gated_aliased("mcp", "enable-exa-mcp", &["enable_exa_mcp"]).shaped(ConfigShape::Bool),
     gated_aliased("mcp", "enable-context7-mcp", &["enable_context7_mcp"]).shaped(ConfigShape::Bool),
     gated_aliased("mcp", "enable-grepapp-mcp", &["enable_grepapp_mcp"]).shaped(ConfigShape::Bool),
     aliased("default_permission_mode", &["default-permission-mode"]).shaped(ConfigShape::String),
     aliased("permission-modes", &["permission_modes"]).shaped(ConfigShape::Strings),
-    key("permission_mode_cycle").shaped(ConfigShape::Strings),
+    key("permission_mode_cycle").described("Explicit-user Shift+Tab cycle, independent of the rule-application modes.").shaped(ConfigShape::Strings),
     key("show_tool_details").shaped(ConfigShape::BoolOrInteger),
-    key("diff_context_lines").shaped(ConfigShape::Integer),
-    key("max_diff_lines").shaped(ConfigShape::Integer),
+    key("diff_context_lines").described("Context rows in successful edit/write previews (hard maximum 20).").shaped(ConfigShape::Integer),
+    key("max_diff_lines").described("Preview row cap (hard maximum 1000); zero disables mutation previews.").shaped(ConfigShape::Integer),
     key("show_reasoning").shaped(ConfigShape::Bool),
-    key("reasoning_display").shaped(ConfigShape::Enum(&["off", "collapsed", "full"])),
-    key("statusline").shaped(ConfigShape::Object),
-    key("chat_left_margin").shaped(ConfigShape::Integer),
-    key("mouse_capture").shaped(ConfigShape::Bool),
-    key("terminal_title").shaped(ConfigShape::Bool),
-    key("terminal_notify").shaped(ConfigShape::Enum(&["off", "osc9", "osc777"])),
-    key("terminal_prompt_marks").shaped(ConfigShape::Bool),
+    key("reasoning_display")
+        .live()
+        .described("Presentation of reasoning; does not enable model thinking")
+        .shaped(ConfigShape::Enum(&["off", "collapsed", "full"])),
+    key("statusline").described("Configurable status-bar (up to 3 lines). When absent, a built-in default layout is used.").shaped(ConfigShape::Object),
+    key("chat_left_margin").described("Left padding (columns) for the chat area. Default: 0.").shaped(ConfigShape::Integer),
+    key("mouse_capture").described("Capture mouse events in the TUI (wheel scrolling, click-to-place-cursor, link opening, drag-to-copy). `false` leaves the mouse to the terminal so its native selection works. Default: true.").shaped(ConfigShape::Bool),
+    key("terminal_title").described("Report agent activity in the terminal/window title (`mini-agent: working`, `waiting for approval`, `idle`) so terminal multiplexers and tab bars can show it; the previous title is…").shaped(ConfigShape::Bool),
+    key("terminal_notify").described("Desktop notification escape (`osc9`, `osc777`) emitted when a turn finishes or a permission prompt waits. Default: off.").shaped(ConfigShape::Enum(&["off", "osc9", "osc777"])),
+    key("terminal_prompt_marks").described("Emit OSC 133 semantic prompt marks: a prompt while the TUI waits for input, command start while a run is active, command end when it finishes. Default: false.").shaped(ConfigShape::Bool),
     key("default_prompt").shaped(ConfigShape::String),
     gated_aliased("git-worktree", "wt-auto-merge", &["wt_auto_merge"]).shaped(ConfigShape::Bool),
     gated_aliased("git-worktree", "wt-base-dir", &["wt_base_dir"]).shaped(ConfigShape::String),
     key("shell").shaped(ConfigShape::String),
     key("editor").shaped(ConfigShape::String),
-    key("api_keys").shaped(ConfigShape::StringMap),
+    key("api_keys")
+        .described("Provider credentials (values hidden)")
+        .shaped(ConfigShape::StringMap),
     key("quick_models").shaped(ConfigShape::Object),
-    key("prompt_to_model").shaped(ConfigShape::StringMap),
+    key("prompt_to_model").described("Map prompt names to quick-model names. When switching to a prompt, zerostack looks up the quick model and switches provider+model. Empty-string values are treated as \"no change\".").shaped(ConfigShape::StringMap),
     gated("mcp", "mcp_servers").shaped(ConfigShape::Object),
     gated("acp", "acp_servers").shaped(ConfigShape::Object),
     gated("acp", "acp_host").shaped(ConfigShape::String),
@@ -213,7 +260,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "task_max_cost_units").shaped(ConfigShape::Integer),
     gated("subagents", "task_timeout_secs").shaped(ConfigShape::Integer),
     key("deny_repeated_reads").shaped(ConfigShape::Bool),
-    key("show_cost_always").shaped(ConfigShape::Bool),
+    key("show_cost_always").described("Show the session cost in the status bar even when it is $0.0000 (e.g. when the model has no per-token pricing configured). Default: false.").shaped(ConfigShape::Bool),
     gated("subagents", "task_enabled").shaped(ConfigShape::Bool),
     gated("subagents", "subagent_model").shaped(ConfigShape::String),
     gated("subagents", "subagent_provider").shaped(ConfigShape::String),
@@ -361,7 +408,7 @@ pub(crate) fn describe_toml_error(content: &str, error: &toml::de::Error) -> Str
 }
 
 /// One-based line and column (in chars) of byte `offset` within `content`.
-fn line_column(content: &str, offset: usize) -> (usize, usize) {
+pub(super) fn line_column(content: &str, offset: usize) -> (usize, usize) {
     let mut offset = offset.min(content.len());
     while !content.is_char_boundary(offset) {
         offset -= 1;

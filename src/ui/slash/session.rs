@@ -17,6 +17,7 @@ fn format_session_line(s: &crate::session::Session) -> String {
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
         "/sessions" => handle_sessions(parts, ctx).await,
+        "/fork" => handle_fork(parts, ctx).await,
         "/rename" => handle_rename(parts, ctx).await,
         "/clear" | "/new" => handle_clear(ctx).await,
         "/undo" => handle_undo(parts, ctx).await,
@@ -606,6 +607,49 @@ pub(crate) async fn resume_selected_session(
         );
     }
     write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
+    Ok(())
+}
+
+async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if *ctx.is_running {
+        write_error(
+            ctx.renderer,
+            "finish or stop the current turn before forking",
+        );
+        return Ok(());
+    }
+    let turn = match parts {
+        [_] => None,
+        [_, value] => match value.parse::<usize>() {
+            Ok(turn) => Some(turn),
+            Err(_) => {
+                write_error(ctx.renderer, "usage: /fork [user-turn number]");
+                return Ok(());
+            }
+        },
+        _ => {
+            write_error(ctx.renderer, "usage: /fork [user-turn number]");
+            return Ok(());
+        }
+    };
+    let fork = match crate::session::lock::fork_at_turn(ctx.session, turn) {
+        Ok(fork) => fork,
+        Err(error) => {
+            write_error(ctx.renderer, format!("could not fork: {error}"));
+            return Ok(());
+        }
+    };
+    let id = fork.id.clone();
+    if let Err(error) = persist_session_unless_ephemeral(ctx.cli.no_session, &fork) {
+        crate::session::lock::release_session(&id);
+        write_error(ctx.renderer, format!("could not save fork: {error}"));
+        return Ok(());
+    }
+    crate::startup::heap_future(|| resume_selected_session(fork, ctx)).await?;
+    write_ok(
+        ctx.renderer,
+        format!("forked into session {}", short_id(&id)),
+    );
     Ok(())
 }
 

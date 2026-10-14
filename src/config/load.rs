@@ -24,7 +24,7 @@ const MAX_PROJECT_TRUST_BYTES: usize = 1024 * 1024;
 /// Project-local keys that cannot launch a process, select an executable
 /// integration/provider, or weaken an authorization boundary. Every other
 /// top-level key, including unknown future keys, requires explicit trust.
-const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
+pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "always_show_welcome",
     // Goal bounds only limit how long the harness keeps working and who
     // reviews a completion claim; nothing here widens what may be executed.
@@ -287,14 +287,8 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
     if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-        super::layers::validate_toml_bounds_with_limit(content, MAX_PRIVATE_CONFIG_BYTES).map_err(
-            |_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "config TOML structure exceeds bounds (values omitted)",
-                )
-            },
-        )?;
+        super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     }
     let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => toml::from_str(content).map_err(|error| {
@@ -1656,7 +1650,7 @@ fn read_private_content(
     read_private_content_mode(path, max_bytes, require_private_mode, true)
 }
 
-fn read_private_content_mode(
+pub(super) fn read_private_content_mode(
     path: &Path,
     max_bytes: usize,
     require_private_mode: bool,
@@ -1750,7 +1744,7 @@ fn bounded_config_text(file: std::fs::File, max_bytes: usize) -> io::Result<Stri
     }
 }
 
-fn read_project_config_text_in_workspace(
+pub(super) fn read_project_config_text_in_workspace(
     workspace: &crate::paths::WorkspaceBinding,
     relative: &Path,
 ) -> io::Result<String> {
@@ -1915,7 +1909,7 @@ fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
         .any(|item| crate::config::STATUSLINE_GIT_STATUS_ITEMS.contains(&item))
 }
 
-fn split_project_override(
+pub(super) fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
     let local = parse_project_toml(local_toml)?;
@@ -1968,7 +1962,7 @@ fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, Strin
     merge_config_value_layer(base, local, ConfigLayer::Project)
 }
 
-fn merge_config_value_layer(
+pub(super) fn merge_config_value_layer(
     base: &Config,
     mut local: toml::Value,
     layer: ConfigLayer,
@@ -2004,7 +1998,21 @@ fn merge_config_value_layer(
     {
         merged.mcp_origins = base.mcp_origins.clone();
         merged.mcp_cli_overrides = base.mcp_cli_overrides.clone();
-        inject_mcp_defaults(&mut merged);
+        // Normalization strips runtime-only identities from the data body.
+        // Restore only defaults already captured by this base, without opening
+        // the injection boundary or reacquiring environment credentials here.
+        if let Some(servers) = &base.mcp_servers {
+            for (name, server) in servers
+                .iter()
+                .filter(|(_, server)| server.trusted_identity().is_some())
+            {
+                merged
+                    .mcp_servers
+                    .get_or_insert_with(Default::default)
+                    .entry(name.clone())
+                    .or_insert_with(|| server.clone());
+            }
+        }
     }
     Ok(merged)
 }
@@ -2039,7 +2047,7 @@ fn redact_sensitive_value(value: &toml::Value, redact_scalar: bool) -> toml::Val
     }
 }
 
-fn sensitive_settings_summary(value: &toml::Value) -> String {
+pub(super) fn sensitive_settings_summary(value: &toml::Value) -> String {
     let redacted = redact_sensitive_value(value, false);
     toml::to_string_pretty(&redacted)
         .unwrap_or_else(|_| "<settings could not be rendered>".to_string())
@@ -2398,7 +2406,6 @@ pub(crate) fn project_config_is_trusted_in_workspace_readonly(
     project_config_is_trusted_in_workspace_mode(paths, workspace, false)
 }
 
-#[cfg(feature = "mcp")]
 pub(crate) fn project_config_relative_is_trusted_at_readonly(
     trust_store: &Path,
     workspace: &crate::paths::WorkspaceBinding,
@@ -2503,9 +2510,13 @@ pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, 
 /// their canonical spellings, so trust classification and merging see
 /// `permission_deny` exactly as they see `permission-deny`.
 pub(crate) fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
-    super::layers::validate_toml_bounds(local_toml).map_err(str::to_owned)?;
-    let mut local: toml::Value = toml::from_str(local_toml)
-        .map_err(|_| "project config is not valid TOML (values omitted)".to_string())?;
+    super::layers::validate_toml_bounds_diagnostic(local_toml, MAX_PROJECT_CONFIG_BYTES)?;
+    let mut local: toml::Value = toml::from_str(local_toml).map_err(|error:toml::de::Error| {
+        match error.span() {
+            Some(span)=>{let(line,column)=keys::line_column(local_toml,span.start);format!("project config is not valid TOML (line {line}, column {column}; values omitted)")},
+            None=>"project config is not valid TOML (values omitted)".into(),
+        }
+    })?;
     if let Some(table) = local.as_table_mut() {
         keys::canonicalize_top_level_keys(table)?;
     }
@@ -2796,7 +2807,11 @@ pub fn save_config_changes(before: &Config, after: &Config) -> io::Result<()> {
     save_config_changes_at(&resolve_config_path(), before, after)
 }
 
-fn save_config_changes_at(path: &Path, before: &Config, after: &Config) -> io::Result<()> {
+pub(super) fn save_config_changes_at(
+    path: &Path,
+    before: &Config,
+    after: &Config,
+) -> io::Result<()> {
     if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
         return save_toml_config_changes_at(path, before, after);
     }
@@ -4951,4 +4966,70 @@ fn keys73_keyboard_maps_and_vim_require_project_trust() {
         )
         .is_err()
     );
+}
+
+/// Commit only the same exact candidate explicitly approved by the operator.
+pub(super) fn approve_editor_project_config(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    expected_sha: &str,
+    trust: &Path,
+) -> io::Result<()> {
+    let (content, binding) = read_project_config_in_workspace(workspace, relative)?;
+    if binding.config_sha256 != expected_sha {
+        return Err(io::Error::other("project configuration changed"));
+    }
+    let mut store = load_project_config_trust_mode(trust, true)?;
+    store.bindings.retain(|old| {
+        old.canonical_project != binding.canonical_project
+            || old.canonical_config != binding.canonical_config
+    });
+    store.bindings.push(binding);
+    workspace.validate().map_err(io::Error::other)?;
+    if read_project_config_text_in_workspace(workspace, relative)? != content {
+        return Err(io::Error::other("project configuration changed"));
+    }
+    save_project_config_trust(trust, &store)
+}
+
+#[cfg(test)]
+mod config691_tests {
+    use super::*;
+    #[test]
+    fn config691_static_locations_and_existing_default_identity_are_preserved() {
+        for (text, line) in [
+            ("model='secret-value'\narray=[\n", 2),
+            ("model='secret-value'\narray=]\n", 2),
+            ("model='secret-value'\narray='unfinished", 2),
+        ] {
+            let error = parse_project_toml(text).unwrap_err();
+            assert!(error.contains(&format!("line {line}, column")), "{error}");
+            assert!(!error.contains("secret-value"));
+        }
+        let over = super::super::layers::MAX_LAYER_BYTES + 1;
+        let error = parse_project_toml(&"a".repeat(over)).unwrap_err();
+        assert!(error.contains("byte limit") && error.contains("line 1, column 1"));
+        assert!(error.len() < 150);
+        #[cfg(feature = "mcp")]
+        {
+            let mut base = Config::default();
+            inject_mcp_defaults(&mut base);
+            let prior = base.mcp_servers.as_ref().unwrap();
+            let merged = merge_config_value(&base, toml::toml! { max_tokens=64 }.into()).unwrap();
+            let current = merged.mcp_servers.as_ref().unwrap();
+            assert_eq!(current.len(), prior.len());
+            for (name, server) in prior {
+                assert_eq!(
+                    current.get(name).unwrap().trusted_identity(),
+                    server.trusted_identity()
+                );
+            }
+            assert!(
+                merge_config_value(&Config::default(), toml::toml! {max_tokens=64}.into())
+                    .unwrap()
+                    .mcp_servers
+                    .is_none()
+            );
+        }
+    }
 }

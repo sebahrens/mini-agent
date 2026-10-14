@@ -492,7 +492,6 @@ impl WorkspaceBinding {
         self.create_relative_atomic_policy(path, content, false)
     }
 
-    #[cfg(feature = "mcp")]
     pub(crate) fn create_relative_private_atomic(
         &self,
         path: &Path,
@@ -524,12 +523,9 @@ impl WorkspaceBinding {
                 options.mode(0o666);
             }
             let mut file = parent.open_with(&temp, &options)?;
-            #[cfg(feature = "mcp")]
             if private {
                 crate::fs::prepare_new_private_file(&file.try_clone()?.into_std())?;
             }
-            #[cfg(not(feature = "mcp"))]
-            let _ = private;
             file.write_all(content)?;
             file.flush()?;
             parent.hard_link(&temp, &parent, &name)?;
@@ -583,7 +579,6 @@ impl WorkspaceBinding {
         )
     }
 
-    #[cfg(feature = "mcp")]
     pub(crate) fn replace_relative_private_atomic_expecting(
         &self,
         path: &Path,
@@ -669,7 +664,6 @@ impl WorkspaceBinding {
                 options.mode(0o600);
             }
             let mut file = parent.open_with(&temp, &options)?;
-            #[cfg(feature = "mcp")]
             if private {
                 crate::fs::prepare_new_private_file(&file.try_clone()?.into_std())?;
             }

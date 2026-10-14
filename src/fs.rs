@@ -2778,7 +2778,6 @@ fn expand_home_relative(home: &Path, relative: &str) -> PathBuf {
     expanded
 }
 
-#[cfg(feature = "mcp")]
 pub(crate) use private::prepare_new_private_file;
 
 #[cfg(test)]

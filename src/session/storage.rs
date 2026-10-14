@@ -27,7 +27,7 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
     Ok(session)
 }
 
-fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
     session.validate_user_messages()?;
     anyhow::ensure!(
         session.messages.len() <= MAX_SESSION_MESSAGES,

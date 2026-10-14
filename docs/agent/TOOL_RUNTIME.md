@@ -140,6 +140,14 @@ also compile for hook tests. The broker adapter rejects both Deny and Ask,
 returns Allow/Defer input rewrites, and leaves grant-target validation to the
 parent effect broker.
 
+Lifecycle-only hook configurations select a small tool delegate before the
+larger pre/post/failure pipeline is constructed or polled. The immutable event
+configuration determines that choice for all three ToolDyn call forms. Inner
+tool construction still starts on the delegate's first poll, so dropping an
+unpolled call starts no inner work; arguments, extensions and structured
+outcomes pass through unchanged. Configured tool hooks retain the existing
+permission and post-hook behavior through the owned heap-future factory.
+
 Loop caller regressions exercise real CLI output and transcript persistence,
 and TUI completion handling with output limits, unavailable sandboxing, scoped
 cancellation, and a stale result arriving during a replacement validation.
@@ -1172,3 +1180,26 @@ non-initial User messages. The shared bounded encoder validates typed rows befor
 creating directories or claiming a writer. These prerequisites do not enable ACP
 list/load/media handlers or import approvals, instruction receipts or replay
 authority.
+
+
+### Installed Windows preflight helper observation
+
+Only the explicit installed sandbox self-check attaches the unnamed fixed-size
+`windows/preflight_witness.rs` observation cell. Its complete private request
+transfers a noninheritable handle duplicated into the exact spawned helper; the
+contained target retains its unchanged three-stdio handle list. Existing helper
+stage stores mirror into one aligned scalar. The parent samples only after the
+exact helper retires and emits a closed phase label, never handles, paths, SIDs,
+argv, payloads, or credentials. The observation is not readiness, containment,
+or availability authority and does not repair a timeout. Ordinary launches and
+direct verification omit the optional field and retain their existing path.
+
+The observed self-check owns its request writer thread through cancellation,
+actual thread signal and join. Every parent pipe reader is closed after spawn.
+Preparation, duplicate/encode/delivery, helper execution and retirement consume
+the original five-second run plus five-second cleanup deadlines; recovery keeps
+its established separate deadline. If exact helper/writer retirement cannot be
+proved by that cleanup bound, the explicit self-check terminates fatally rather
+than detaching an owner or declaring availability. Recovery state is preserved.
+The scalar and feeder primitives have prior finite native Windows proof; an
+actual observed installed check remains the owning integration witness.

@@ -524,6 +524,20 @@ impl InputEditor {
         self.editor = Some(editor);
     }
 
+    pub(crate) fn open_config_picker(
+        &mut self,
+        cfg: &crate::config::Config,
+        cli: &crate::cli::Cli,
+        target: crate::config::editor::Target,
+        key: Option<&str>,
+    ) {
+        let mut picker = crate::ui::pickers::config::ConfigPicker::new(cfg, cli, target, key);
+        picker.list.set_monochrome(self.monochrome);
+        self.buffer = picker.draft().into();
+        self.cursor = self.buffer.len();
+        self.picker = Some(Picker::Config(Box::new(picker)));
+    }
+
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
         if let Some(ref mut picker) = self.picker {
@@ -1264,7 +1278,7 @@ impl InputEditor {
                 }
                 let text = self.buffer.clone();
                 let is_blank = text.trim().is_empty();
-                if !is_blank {
+                if !is_blank && !crate::ui::slash::config::is_command(&text) {
                     self.history.push(text.clone());
                 }
                 self.history_pos = None;
@@ -1955,5 +1969,29 @@ mod busy67_editor_tests {
         assert!(editor.history.is_empty());
         assert!(!editor.picker.as_ref().unwrap().active());
         assert_eq!(editor.cursor, editor.buffer.len());
+    }
+}
+
+#[cfg(test)]
+mod settings_history_tests {
+    use super::*;
+    #[test]
+    fn config68_secret_settings_are_not_recalled_but_ordinary_history_is() {
+        let mut input = InputEditor::new();
+        input.load_text("/config api_keys {provider='secret-settings-value'}");
+        assert!(input.handle_key(KeyCode::Enter.into()).is_some());
+        assert!(input.history.is_empty());
+        input.load_text("ordinary prompt");
+        input.handle_key(KeyCode::Enter.into());
+        assert_eq!(input.history.len(), 1);
+        input.open_config_picker(
+            &crate::config::Config::default(),
+            &crate::cli::Cli::default(),
+            crate::config::editor::Target::Project,
+            Some("sandbox"),
+        );
+        assert!(input.handle_picker_key(KeyCode::Enter.into()));
+        assert_eq!(input.buffer, "/config --project sandbox true");
+        assert!(!input.picker.as_ref().unwrap().active());
     }
 }

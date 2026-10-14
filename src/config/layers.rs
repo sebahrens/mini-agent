@@ -86,18 +86,32 @@ pub(super) fn validate_toml_bounds_with_limit(
     text: &str,
     byte_limit: usize,
 ) -> Result<(), &'static str> {
+    validate_toml_bounds_at(text, byte_limit).map_err(|(message, _)| message)
+}
+
+/// Static diagnostic plus the bounded scanner's exact byte position. Never
+/// parse past a rejected allocation bound or include a caller-supplied value.
+pub(super) fn validate_toml_bounds_diagnostic(text: &str, byte_limit: usize) -> Result<(), String> {
+    validate_toml_bounds_at(text, byte_limit).map_err(|(message, offset)| {
+        let (line, column) = super::keys::line_column(text, offset);
+        format!("line {line}, column {column}: {message} (values omitted)")
+    })
+}
+
+fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'static str, usize)> {
     if text.len() > byte_limit {
-        return Err("config layer exceeds byte limit");
+        return Err(("config layer exceeds byte limit", 0));
     }
     #[derive(Clone, Copy)]
     struct Frame {
         close: u8,
         key: bool,
         dots: usize,
+        start: usize,
     }
     let bytes = text.as_bytes();
     let mut stack: Vec<Frame> = Vec::with_capacity(MAX_DEPTH);
-    let mut quote: Option<(u8, bool)> = None;
+    let mut quote: Option<(u8, bool, usize)> = None;
     let mut table_depth = 0;
     let mut header = false;
     let mut line_start = true;
@@ -107,7 +121,7 @@ pub(super) fn validate_toml_bounds_with_limit(
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some((delimiter, triple)) = quote {
+        if let Some((delimiter, triple, _)) = quote {
             if delimiter == b'"' && byte == b'\\' {
                 index = index.saturating_add(2);
                 continue;
@@ -125,7 +139,7 @@ pub(super) fn validate_toml_bounds_with_limit(
         match byte {
             b'"' | b'\'' => {
                 let triple = bytes.get(index..index + 3) == Some(&[byte; 3]);
-                quote = Some((byte, triple));
+                quote = Some((byte, triple, index));
                 line_start = false;
                 index += if triple { 3 } else { 1 };
                 continue;
@@ -154,18 +168,21 @@ pub(super) fn validate_toml_bounds_with_limit(
                     + stack.iter().map(|frame| frame.dots).sum::<usize>()
                     >= MAX_DEPTH
                 {
-                    return Err("config layer exceeds nesting limit");
+                    return Err(("config layer exceeds nesting limit", index));
                 }
                 stack.push(Frame {
                     close: if byte == b'[' { b']' } else { b'}' },
                     key: byte == b'{',
                     dots: 0,
+                    start: index,
                 });
             }
             b']' | b'}' => {
-                let frame = stack.pop().ok_or("config delimiters are invalid")?;
+                let frame = stack
+                    .pop()
+                    .ok_or(("config delimiters are invalid", index))?;
                 if frame.close != byte {
-                    return Err("config delimiters are invalid");
+                    return Err(("config delimiters are invalid", index));
                 }
                 if header && stack.is_empty() {
                     table_depth = root_dots + 1;
@@ -192,14 +209,14 @@ pub(super) fn validate_toml_bounds_with_limit(
                 if header || (stack.is_empty() && root_key) {
                     root_dots += 1;
                     if root_dots + table_depth + stack.len() >= MAX_DEPTH {
-                        return Err("config layer exceeds key depth limit");
+                        return Err(("config layer exceeds key depth limit", index));
                     }
                 } else if let Some(frame) = stack.last_mut()
                     && frame.key
                 {
                     frame.dots += 1;
                     if frame.dots + table_depth + stack.len() >= MAX_DEPTH {
-                        return Err("config layer exceeds key depth limit");
+                        return Err(("config layer exceeds key depth limit", index));
                     }
                 }
             }
@@ -211,18 +228,21 @@ pub(super) fn validate_toml_bounds_with_limit(
             + stack.iter().map(|frame| frame.dots).sum::<usize>()
             > MAX_DEPTH
         {
-            return Err("config layer exceeds nesting limit");
+            return Err(("config layer exceeds nesting limit", index));
         }
         if items > MAX_ITEMS {
-            return Err("config layer exceeds item limit");
+            return Err(("config layer exceeds item limit", index));
         }
         if !byte.is_ascii_whitespace() {
             line_start = false;
         }
         index += 1;
     }
-    if quote.is_some() || !stack.is_empty() {
-        return Err("config delimiters are invalid");
+    if let Some((_, _, start)) = quote {
+        return Err(("config delimiters are invalid", start));
+    }
+    if let Some(frame) = stack.first() {
+        return Err(("config delimiters are invalid", frame.start));
     }
     Ok(())
 }
@@ -372,7 +392,7 @@ impl McpOverrides {
 /// Typed configuration can contain JSON nulls and unsigned values that TOML
 /// cannot represent. Normalize through bounded JSON without changing the input
 /// layer dialect or its separate pre-parse limits.
-pub(super) fn normalized_json<T: serde::Serialize>(
+pub(crate) fn normalized_json<T: serde::Serialize>(
     value: &T,
 ) -> Result<serde_json::Value, &'static str> {
     super::finite::validate(value)?;

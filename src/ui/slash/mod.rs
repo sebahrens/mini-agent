@@ -1,4 +1,5 @@
 pub(crate) mod add;
+pub(crate) mod config;
 mod content;
 pub(crate) mod context;
 mod doctor;
@@ -699,6 +700,9 @@ pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
 /// Exact read-only operator syntax; arguments that mutate route/session never
 /// enter this path just because their command has a query form.
 pub(crate) fn is_readonly_view(text: &str) -> bool {
+    if config::is_browse(text) {
+        return true;
+    }
     matches!(
         split_command(text).as_slice(),
         ["/help"]
@@ -870,6 +874,7 @@ pub(crate) async fn handle_slash(
     }
 
     match parts[0] {
+        "/config" => crate::startup::heap_future(|| config::handle(text, &mut ctx)).await,
         "/diff" | "/commit" | "/pr" => {
             #[cfg(feature = "git-worktree")]
             {
@@ -894,8 +899,10 @@ pub(crate) async fn handle_slash(
         }
         "/cost" | "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys"
         | "/advisor" | "/keys" | "/vim" => settings::handle(&parts, &mut ctx).await,
-        "/sessions" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind" | "/retry"
-        | "/quit" | "/exit" | "/history" => session::handle(&parts, &mut ctx).await,
+        "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"
+        | "/retry" | "/quit" | "/exit" | "/history" => {
+            crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await
+        }
         #[cfg(feature = "export")]
         "/export" | "/import" if path_parts.len() > 2 => {
             write_error(
@@ -908,9 +915,11 @@ pub(crate) async fn handle_slash(
             Ok(())
         }
         #[cfg(feature = "export")]
-        "/export" | "/import" => session::handle(&path_parts, &mut ctx).await,
+        "/export" | "/import" => {
+            crate::startup::heap_future(|| session::handle(&path_parts, &mut ctx)).await
+        }
         #[cfg(feature = "export")]
-        "/share" => session::handle(&parts, &mut ctx).await,
+        "/share" => crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await,
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => doctor::handle(&parts, &mut ctx),
         "/jobs" => jobs::handle(&parts, &mut ctx),

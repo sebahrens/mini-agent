@@ -1033,8 +1033,18 @@ impl Startup {
             return Err(error);
         }
 
+        let fork_source = cli.fork_session.then(|| session.id.clone());
         if session_resumed {
             session = session::catalogue::for_workspace(session, &workspace)?;
+        }
+
+        if let Some(original) = fork_source {
+            anyhow::ensure!(session_resumed, "--fork-session requires a saved session");
+            // A cross-workspace selection has already created its fresh fork.
+            if session.id == original {
+                session = session::lock::fork_at_turn(&session, None)?;
+            }
+            eprintln!("notice: forked session {original} into {}", session.id);
         }
 
         // Another live process that already owns this session keeps writing
@@ -1175,9 +1185,11 @@ impl Startup {
 
         // Rename only the selected (possibly forked) session after setup has
         // succeeded. Ephemeral invocations keep the rename in memory only.
-        if session_resumed && let Some(name) = cli.name.as_deref() {
-            session.name = CompactString::new(name);
-            if !cli.no_session {
+        if session_resumed {
+            if let Some(name) = cli.name.as_deref() {
+                session.name = CompactString::new(name);
+            }
+            if !cli.no_session && (cli.name.is_some() || cli.fork_session) {
                 session::storage::save_session(&session)?;
             }
         }
@@ -4527,6 +4539,71 @@ mod tests {
             ..Cli::default()
         };
         assert!(unavailable_sandbox_must_fail(&selected, &cfg, false));
+    }
+
+    #[tokio::test]
+    async fn fork75_actual_startup_resume_creates_second_file_without_changing_source() {
+        let root = crate::tests::OwnedTestDirectory::new("fork75-startup");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::process_paths().unwrap();
+        for continue_session in [false, true] {
+            let mut saved = Session::new("openrouter", "saved-model", 128_000, "original");
+            saved.working_dir = workspace.root().to_string_lossy().into();
+            saved.add_message(crate::session::MessageRole::User, "retained turn");
+            crate::session::storage::save_session(&saved).unwrap();
+            let source_path = paths.sessions_dir().join(format!("{}.json", saved.id));
+            let before = std::fs::read(&source_path).unwrap();
+            let cli = Cli {
+                api_key: Some("unused-test-key".into()),
+                no_context_files: true,
+                no_tools: true,
+                no_sandbox: true,
+                continue_session,
+                session: (!continue_session).then(|| saved.id.to_string()),
+                fork_session: true,
+                ..Default::default()
+            };
+            let startup = super::Startup::init(
+                cli,
+                Config::default(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_ne!(startup.session.id, saved.id);
+            assert_eq!(startup.session.name, "original (fork)");
+            assert_eq!(startup.session.messages[0].content, "retained turn");
+            let restored = crate::session::storage::load_session_exact(&startup.session.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.messages[0].content, "retained turn");
+            assert_eq!(std::fs::read(&source_path).unwrap(), before);
+            crate::session::lock::release_session(&startup.session.id);
+            crate::session::lock::release_session(&saved.id);
+        }
     }
 
     #[tokio::test]

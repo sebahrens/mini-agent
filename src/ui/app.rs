@@ -4679,9 +4679,10 @@ impl<'a> App<'a> {
             )?;
             return Ok(());
         }
-        if selected_session.is_some()
+        if (selected_session.is_some() || text.split_whitespace().next() == Some("/fork"))
             && (self.run.is_running
                 || self.permission_prompt.is_some()
+                || self.question_prompt.is_some()
                 || self.run.pending_turn.is_some())
         {
             self.renderer.write_line(
@@ -4696,7 +4697,7 @@ impl<'a> App<'a> {
         if selected_session.is_some()
             || matches!(
                 name,
-                Some("/import" | "/new" | "/clear" | "/rename" | "/worktree")
+                Some("/import" | "/fork" | "/new" | "/clear" | "/rename" | "/worktree")
             )
             || name == Some("/sessions")
                 && argument.is_some_and(|arg| arg != "--all" && arg != "delete")
@@ -4716,7 +4717,22 @@ impl<'a> App<'a> {
             self.retire_session_title().await?;
         }
 
-        for line in text.lines() {
+        if crate::ui::slash::config::is_command(text)
+            && !crate::ui::slash::config::is_browse(text)
+            && (self.permission_prompt.is_some()
+                || self.run.pending_turn.is_some()
+                || self.ui.session.pending_question.is_some())
+        {
+            self.renderer.write_line(
+                "Finish pending approval or clarification before saving settings",
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
+        for line in text
+            .lines()
+            .filter(|_| !crate::ui::slash::config::is_command(text))
+        {
             let safe_line = sanitize_output(line);
             self.renderer
                 .write_line(&format!("> {}", safe_line), Color::Green)?;
@@ -4771,7 +4787,8 @@ impl<'a> App<'a> {
             return result;
         }
 
-        if crate::ui::slash::is_readonly_view(text)
+        if crate::ui::slash::config::is_command(text)
+            || crate::ui::slash::is_readonly_view(text)
             || crate::ui::slash::is_jobs_control(text)
             || crate::ui::slash::is_input_control(text)
         {
@@ -4786,6 +4803,23 @@ impl<'a> App<'a> {
             return result;
         }
 
+        // Branching already persisted its new identity before activation.
+        // Neither valid nor invalid forks may start a copied first goal round
+        // or rewrite the original through generic command settlement.
+        if name == Some("/fork") {
+            if result
+                .as_ref()
+                .is_err_and(crate::ui::slash::is_persistence_restart_required)
+            {
+                return result;
+            }
+            if let Err(error) = result {
+                self.renderer
+                    .write_line(&sanitize_output(&error.to_string()), C_ERROR)?;
+            }
+            return Ok(());
+        }
+
         // The provider may have changed: warm its model list in the
         // background (never blocking the command) and show what is cached.
         let context_diagnostic = crate::ui::slash::is_readonly_diagnostic(text);
@@ -4794,7 +4828,7 @@ impl<'a> App<'a> {
         if context_diagnostic && result.is_ok() {
             return Ok(());
         }
-        if !is_quit_command(text) && !context_diagnostic {
+        if !is_quit_command(text) && !context_diagnostic && name != Some("/fork") {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
             crate::ui::slash::warm_model_cache(&provider, is_custom, &self.ui.client);
@@ -6580,6 +6614,7 @@ fn pause_input_reader(
 fn slash_command_needs_tty(text: &str) -> bool {
     let mut parts = text.split_whitespace();
     match parts.next() {
+        Some("/config") => crate::ui::slash::config::needs_tty(text),
         Some("/tutor") => true,
         Some("/init") => parts.next() != Some("force"),
         _ => false,
@@ -8270,6 +8305,85 @@ mod permission_loop_tests {
     }
 
     #[tokio::test]
+    async fn fork75_actual_app_creates_truncated_branch_and_keeps_original_file() {
+        let root = crate::tests::OwnedTestDirectory::new("fork75-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "fork test");
+        #[cfg(feature = "goal")]
+        {
+            let mut goal =
+                crate::extras::goal::Goal::new("fork waits for input", Vec::new()).unwrap();
+            goal.context_file = Some(root.path().join("UNREAD_FORK_PLAN.md"));
+            session.goal_store.set(goal, false).unwrap();
+        }
+        session.working_dir = workspace.root().to_string_lossy().into();
+        for (role, text) in [
+            (MessageRole::User, "first"),
+            (MessageRole::Assistant, "first answer"),
+            (MessageRole::User, "second"),
+            (MessageRole::Assistant, "second answer"),
+        ] {
+            session.add_message(role, text);
+        }
+        crate::session::storage::save_session(&session).unwrap();
+        let original_id = session.id.clone();
+        let original_path = crate::paths::process_paths()
+            .unwrap()
+            .sessions_dir()
+            .join(format!("{original_id}.json"));
+        let original_bytes = std::fs::read(&original_path).unwrap();
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        crate::startup::heap_future(|| app.run_slash_command("/fork 2"))
+            .await
+            .unwrap();
+        assert_ne!(app.ui.session.id, original_id);
+        assert_eq!(app.ui.session.name, "fork test (fork)");
+        assert!(!app.run.is_running);
+        assert!(app.run.agent_rx.is_none());
+        assert_eq!(app.ui.session.messages.len(), 3);
+        assert_eq!(app.ui.session.messages[2].content, "second");
+        assert!(app.run.agent.is_some());
+        let fork_id = app.ui.session.id.clone();
+        let restored = crate::session::storage::load_session_exact(&fork_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+        for invalid in ["/fork 0", "/fork 99", "/fork 2 extra"] {
+            crate::startup::heap_future(|| app.run_slash_command(invalid))
+                .await
+                .unwrap();
+            assert_eq!(app.ui.session.id, fork_id);
+            assert!(!app.run.is_running);
+            assert!(app.run.agent_rx.is_none());
+        }
+        app.run.is_running = true;
+        crate::startup::heap_future(|| app.run_slash_command("/fork"))
+            .await
+            .unwrap();
+        assert_eq!(app.ui.session.id, fork_id);
+        assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+        app.run.is_running = false;
+        drop(app);
+        crate::session::lock::release_session(&original_id);
+        crate::session::lock::release_session(&fork_id);
+    }
+
+    #[tokio::test]
     async fn actual_mode_cycle_preserves_drafts_queue_and_unanswered_permission() {
         use crate::permission::{SecurityMode, checker::PermissionChecker};
         let root = crate::tests::OwnedTestDirectory::new("mode-cycle-app");
@@ -9504,6 +9618,8 @@ mod workspace_session_picker_tests {
                         app.deferred_user_events.extend([
                             UserEvent::Paste("ONE_MIB_SAVED_ROW".into()),
                             UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            UserEvent::Paste("/fork 1".into()),
+                            UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
                             UserEvent::Quit,
                         ]);
                         tokio::time::timeout(
@@ -9513,7 +9629,13 @@ mod workspace_session_picker_tests {
                         .await
                         .unwrap()
                         .unwrap();
-                        assert_eq!(app.ui.session.id, saved.id);
+                        assert_ne!(app.ui.session.id, saved.id);
+                        assert_eq!(app.ui.session.messages.len(), 1);
+                        assert!(
+                            app.renderer
+                                .captured_output()
+                                .contains("forked into session")
+                        );
                         assert!(app.renderer.captured_output().contains("ONE_MIB_SAVED_ROW"));
                         assert!(app.input.picker.is_none());
                     }));
@@ -14127,5 +14249,41 @@ mod plan_approval_tests {
             );
             provider.finish().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod config_editor68_tests {
+    use super::*;
+    #[test]
+    fn config68_actual_app_busy_listing_save_and_live_display_are_pure_on_one_mib() {
+        std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(crate::startup::heap_future(||async {
+                let root=crate::tests::OwnedTestDirectory::new("config68-app");
+                let environment=["ZS_CONFIG_DIR","ZS_DATA_DIR","ZS_LOCAL_DATA_DIR","ZS_STATE_DIR","ZS_CACHE_DIR","ZS_CREDENTIALS_DIR"].map(|name|(name,Some(root.path().join(name).into_os_string())));
+                let _environment=crate::tests::ScopedProcessEnv::set(&environment);
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+                let mut cfg:crate::config::Config=serde_json::from_value(serde_json::json!({"max_tokens":51,"custom_providers":{"editor68":{"provider_type":"openai","base_url":format!("http://{address}/v1"),"api_style":"completions"}}})).unwrap();
+                let paths=crate::paths::process_paths().unwrap();let global=paths.config_dir.join("config.toml");
+                crate::fs::private_atomic_write_sync(&global,b"model='disk-model'\nmax_tokens=51\n").unwrap();cfg.provenance.global_file=Some(global.clone());
+                let cli=crate::cli::Cli {no_session:true,no_context_files:true,max_tokens:Some(999),..Default::default()};
+                let workspace=Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+                let mut context=crate::context::load(true).for_workspace_binding(true,&workspace);
+                let mut session=Session::new("editor68","test-model",128_000,root.path().to_str().unwrap());
+                let before=serde_json::to_vec(&session).unwrap();
+                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
+                    #[cfg(feature="skills")] skill_services:Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+                    #[cfg(feature="mcp")] mcp_manager:None,
+                };
+                let mut app=super::test_support::fixture_app(ui);app.run.is_running=true;
+                app.run_slash_command("/config").await.unwrap();assert!(matches!(app.input.picker,Some(crate::ui::input::Picker::Config(_))));assert!(app.run.agent.is_none());
+                app.run_slash_command("/config max_tokens 99").await.unwrap();assert!(std::fs::read_to_string(&global).unwrap().contains("51"));
+                app.run.is_running=false;app.run_slash_command("/config max_tokens 99").await.unwrap();
+                let saved=std::fs::read_to_string(&global).unwrap();assert!(saved.contains("99"));assert!(saved.contains("disk-model"));assert!(!saved.contains("999"));assert_eq!(app.ui.cfg.max_tokens,Some(51));
+                app.run_slash_command("/config reasoning_display \"full\"").await.unwrap();assert_eq!(app.renderer.feed().reasoning_display(),crate::config::ReasoningDisplay::Full);
+                app.run_slash_command("/config api_keys malformed-secret-value").await.unwrap();assert!(!app.renderer.captured_output().contains("malformed-secret-value"));
+                assert_eq!(before,serde_json::to_vec(app.ui.session).unwrap());assert!(app.run.agent.is_none());assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
+            }));
+        }).unwrap().join().unwrap();
     }
 }

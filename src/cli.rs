@@ -77,6 +77,7 @@ pub enum OutputFormat {
 #[command(name = "mini-agent", version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
     about = "Minimal coding agent")]
+#[command(group(clap::ArgGroup::new("fork_resume_source").args(["continue_session", "session", "resume"]).multiple(true)))]
 #[cfg_attr(all(feature = "acp", feature = "loop"), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled", "loop_mode"]).multiple(true))))]
 #[cfg_attr(all(feature = "acp", not(feature = "loop")), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled"]))))]
 #[cfg_attr(all(feature = "loop", not(feature = "acp")), command(group(clap::ArgGroup::new("idle_server_mode").args(["loop_mode"]))))]
@@ -647,6 +648,14 @@ pub struct Cli {
 
     #[arg(long = "session", help = "Load session by ID prefix or exact name")]
     pub session: Option<String>,
+
+    #[arg(
+        long,
+        requires = "fork_resume_source",
+        conflicts_with = "no_session",
+        help = "Resume under a new session ID, preserving the original saved conversation"
+    )]
+    pub fork_session: bool,
 
     #[arg(
         long = "resume-provider",

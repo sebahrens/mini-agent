@@ -3518,3 +3518,38 @@ with a 40-byte limit per chord. Ctrl, Alt, Shift, Super, named navigation keys,
 F1–F24 and single Unicode characters are supported. Project keyboard settings
 require trust. Approval and picker choices keep their raw operator keys. See
 [Input keyboard settings](input-keybindings.md) for editing and undo limits.
+
+## Interactive settings editor
+
+`/config` opens a searchable known-key picker with the startup-effective value,
+structural type, source files/layers, description, and restart marker. Credential
+maps and other dynamic values are hidden. Choose a boolean or enum value from
+its picker; other settings leave an inline TOML draft. Selecting a value fills
+the draft; press Enter again to validate and save it.
+
+Use `/config key TOML-value` directly, for example `/config max_tokens 4096` or
+`/config model "provider/model"`. `/config --project` and `/config --local`
+select the nearest captured project pair; their direct set forms use the same
+scope. `--global` is the default. With no project pair, the project file is
+created under the captured workspace. Global writes use the raw global document
+and structural deltas, preserving unknown settings and avoiding copies of
+unchanged CLI or local overrides. Project/local writes preserve unrelated TOML
+values and use the retained file identity and digest; replacement during approval
+refuses the write. Comments in a rewritten project TOML document may be normalized.
+
+A sensitive project candidate requires explicit approval of its canonical source
+root, exact file and SHA-256. Approval is independent for the main and local
+file. Declining changes neither the file nor trust. Permission, sandbox, hooks,
+provider and tool settings apply after restart, without granting current tools
+new authority. Global-only financial/cache/permission-cycle fields cannot be
+written to project layers. Platforms without the existing atomic replacement
+primitive visibly refuse updates to an existing project file.
+
+Browsing is available during a run; saving waits for an idle turn and resolved
+approval/clarification. Settings commands do not warm models, save conversation
+history or start a pending goal. Values are not echoed into the feed or input
+history. Restart applies saved changes subject to higher local/CLI precedence.
+`reasoning_display` alone can update presentation immediately when no higher
+captured layer overrides it. The immutable startup-effective list remains labelled
+as such until restart. `--config-preservation-check` retains its existing bounded
+round-trip check of the global writer.
