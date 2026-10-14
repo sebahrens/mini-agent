@@ -1,0 +1,19 @@
+{
+  "date": "2026-10-15",
+  "base": "5980bdae",
+  "bead": "mini-agent-4ccbc",
+  "changes": {
+    "test_contracts": "Hook parsing expects executable echo plus argument hi. Exact subprocess inventory classifications cover local HookOutput fixture calls and numeric NTSTATUS diagnostics; distill fixture fingerprints include the delivered images field.",
+    "windows_observation": "Test builds report the original OS error at each private-temp API failure. No permission, owner, ACL, sharing, publication, cleanup or timeout contract changes. Descriptor conversion and DACL access have distinct labels.",
+    "focused_dispatch": "windows-session-storage executes exactly two existing native session-storage tests in the failing minimal-MCP feature row, reusing windows-default-compile. Other steps and jobs are excluded only for this explicit manual scope. Push/PR coverage and ci-success remain unchanged. Scope-specific concurrency prevents a diagnostic run waiting behind the full matrix."
+  },
+  "validation": [
+    "Hook parser owning test passed in /private/tmp/mini-agent-44e-test-contract-followup.log.",
+    "All 27 subprocess inventory controls passed; /private/tmp/mini-agent-44e-inventory-fixed.log.",
+    "After Windows observation edits, the exact process creation-boundary source check passed; /private/tmp/mini-agent-private-temp-final-inventory.log.",
+    "All 62 workflow-policy and change-filter tests passed in 2.555 seconds; /private/tmp/mini-agent-session-scope-policy.log.",
+    "cargo fmt and git diff --check passed."
+  ],
+  "test_selection": "Code-indexer resolved the boundary validator and both Windows session-storage owners. Windows-only observations require the actual Windows dispatch; a macOS full suite/install cannot validate those cfg branches and was not repeated. Previously passing feature-policy tests for unchanged code are reused.",
+  "remaining": "No Windows repair is claimed. The native Windows result must identify the exact failing API before changing production behavior. mini-agent-4ccbc remains in progress."
+}

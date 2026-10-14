@@ -22,7 +22,8 @@ fn parses_cc_shaped_config() {
     assert_eq!(group.hooks.len(), 1);
     let handler = &group.hooks[0];
     assert_eq!(handler.kind, "command");
-    assert_eq!(handler.command.as_deref(), Some("echo hi"));
+    assert_eq!(handler.command.as_deref(), Some("echo"));
+    assert_eq!(handler.args.as_deref(), Some(["hi".to_string()].as_slice()));
     assert_eq!(handler.timeout, Some(60));
     assert!(!handler.is_async);
     assert!(handler.condition.is_none());

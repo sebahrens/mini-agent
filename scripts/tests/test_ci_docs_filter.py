@@ -87,14 +87,17 @@ class CiDocsFilterTests(unittest.TestCase):
             self.assertEqual(1, len(values), output.read_text())
             return values[0]
 
-    def test_manual_command_family_is_the_only_dispatch_that_reports_no_code(self) -> None:
-        self.assertEqual("false", self.classify("src/main.rs", event="workflow_dispatch", scope="windows-command-family", base=""))
-        for scope in ("full", "windows-general-sandbox", "", "unknown", "windows-command-family-extra"):
+    def test_only_explicit_manual_windows_proofs_report_no_code(self) -> None:
+        for scope in ("windows-command-family", "windows-session-storage"):
+            with self.subTest(scope=scope):
+                self.assertEqual("false", self.classify("src/main.rs", event="workflow_dispatch", scope=scope, base=""))
+        for scope in ("full", "windows-general-sandbox", "", "unknown", "windows-command-family-extra", "windows-session-storage-extra"):
             with self.subTest(scope=scope):
                 self.assertEqual("true", self.classify(event="workflow_dispatch", scope=scope, base=""))
         for event in ("push", "pull_request", "schedule"):
-            with self.subTest(event=event):
-                self.assertEqual("true", self.classify("src/main.rs", event=event, scope="windows-command-family"))
+            for scope in ("windows-command-family", "windows-session-storage"):
+                with self.subTest(event=event, scope=scope):
+                    self.assertEqual("true", self.classify("src/main.rs", event=event, scope=scope))
 
     def test_unresolved_history_and_tags_still_fail_open(self) -> None:
         for options in ({"base": ""}, {"base": "0" * 40}, {"missing_base": True}, {"missing_diff": True}, {"ref": "refs/tags/v1"}):

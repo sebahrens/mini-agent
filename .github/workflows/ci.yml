@@ -12,6 +12,7 @@ on:
           - full
           - windows-general-sandbox
           - windows-command-family
+          - windows-session-storage
   push:
     branches:
       - main
@@ -42,7 +43,7 @@ env:
   RUSTFLAGS: ''
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -61,7 +62,7 @@ jobs:
   # revision cannot be resolved (a first push, a force push, a shallow clone)
   # all report `code=true` and get the full matrix. Skipping work is only ever
   # the result of a diff we successfully computed, or the explicit manual
-  # windows-command-family scope below (which never publishes ci-success).
+  # Windows command-family/session-storage scopes below (neither publishes ci-success).
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -89,12 +90,15 @@ jobs:
             exit 0
           }
 
-          # This explicit manual scope runs only the existing native command
-          # job. Every other event/scope retains the fail-open classification.
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "${SCOPE:-}" = "windows-command-family" ]; then
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "Running only the Windows command-family proof."
-            exit 0
+          # Explicit owning Windows proofs reuse one job without the matrix.
+          # Every other event/scope retains the fail-open classification.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "${SCOPE:-}" in
+              windows-command-family|windows-session-storage)
+                echo "code=false" >> "$GITHUB_OUTPUT"
+                echo "Running only the selected Windows proof: $SCOPE."
+                exit 0 ;;
+            esac
           fi
 
           case "$EVENT" in
@@ -623,7 +627,7 @@ jobs:
         run: cargo test --locked
 
   windows-default-compile:
-    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family')) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows-command-family' || inputs.scope == 'windows-session-storage'))) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
@@ -638,8 +642,10 @@ jobs:
       # full libtest also contains Unix-only integration fixtures, so this gate
       # specifically prevents default-feature cfg and compilation drift.
       - name: Compile the Windows default feature suite
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         run: cargo test --locked --no-run
       - name: Test native ledger lock and persistence contracts
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         shell: pwsh
         run: |
           $filters = @('spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent', 'spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge', 'spend_ledger_concurrent_lock_is_bounded_and_directory_replacement_is_refused')
@@ -652,6 +658,7 @@ jobs:
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native ledger lock or persistence contract failed' }
       - name: Test native one MiB App event loops
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         shell: pwsh
         run: |
           $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack', 'actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack', 'actual_plan_confirmation_event_loop_runs_on_one_mib_stack')
@@ -670,6 +677,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native one MiB App event loop failed' }
 
       - name: Test native Windows GH argv and actual foreground authority
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         shell: pwsh
         run: |
           $features = 'git-worktree,sandbox,hooks'
@@ -733,6 +741,28 @@ jobs:
           } finally {
             if ($null -eq $previous) { Remove-Item Env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE -ErrorAction SilentlyContinue } else { $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE = $previous }
           }
+
+      # Reproduce the failing minimal-MCP row without rebuilding all feature rows.
+      # Full push/PR coverage remains in platform-paths; this manual proof cannot
+      # publish the ci-success aggregate.
+      - name: Test exact Windows session private storage
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-session-storage'
+        shell: pwsh
+        run: |
+          $tests = @(
+            'tests::session_storage_tests::session_storage_permissions_windows_dacls_exclude_broad_principals'
+            'tests::session_storage_tests::session_storage_permissions_windows_reject_reparse_paths_without_mutation'
+          )
+          $listing = @(& cargo test --locked --no-default-features --features mcp --bin mini-agent -- @tests --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Windows session private-storage discovery failed' }
+          $expected = @($tests | ForEach-Object { "${_}: test" } | Sort-Object)
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^tests::session_storage_tests::.*: test$' } | Sort-Object)
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 2 -or $difference.Count -ne 0) { throw 'Expected exactly the two Windows session private-storage controls' }
+          $native = @(& cargo test --locked --no-default-features --features mcp --bin mini-agent -- @tests --nocapture --test-threads=1 2>&1)
+          $nativeExit = $LASTEXITCODE
+          $native | Write-Output
+          if ($nativeExit -ne 0 -or -not ($native -match '^test result: ok\. 2 passed; 0 failed; 0 ignored;')) { throw 'Windows session private-storage controls failed' }
 
   # `hooks` is opt-in, so the default-feature compile above never builds the
   # hook launcher or its Windows process-tree code. A Windows-only duplicate

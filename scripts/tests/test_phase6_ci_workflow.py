@@ -182,7 +182,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 if "needs.changes.outputs.code" in condition:
                     expected_code = "needs.changes.outputs.code == 'true'"
                     if job == "windows-default-compile":
-                        expected_code = "(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family'))"
+                        expected_code = "(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows-command-family' || inputs.scope == 'windows-session-storage')))"
                     self.assertIn(expected_code, conjuncts)
 
         windows_job = job_body(self.workflow, "windows-general-sandbox-policy")
@@ -1270,6 +1270,43 @@ class WindowsBoundedProjectTrustCiTests(unittest.TestCase):
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 self.validate(prefix + "- name: " + name + step.replace(before, after) + "- name:" + rest)
+
+
+class WindowsSessionStorageDispatchTests(unittest.TestCase):
+    """Manual diagnostics execute the owning tests without claiming full CI."""
+
+    def test_manual_scope_reuses_one_job_and_skips_unrelated_steps(self) -> None:
+        workflow = WORKFLOW.read_text()
+        body = job_body(workflow, "windows-default-compile")
+        condition = body.splitlines()[0]
+        self.assertIn("inputs.scope == 'windows-session-storage'", condition)
+        for name in (
+            "Compile the Windows default feature suite",
+            "Test native ledger lock and persistence contracts",
+            "Test native one MiB App event loops",
+            "Test native Windows GH argv and actual foreground authority",
+        ):
+            step = body.split("- name: " + name, 1)[1].split("- name:", 1)[0]
+            self.assertIn("if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'", step)
+        self.assertIn("inputs.scope == 'full'", job_body(workflow, "ci-success").splitlines()[0])
+        self.assertIn("group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}", workflow)
+
+    def test_native_proof_requires_exact_discovery_execution_and_success(self) -> None:
+        workflow = WORKFLOW.read_text()
+        body = job_body(workflow, "windows-default-compile")
+        step = body.split("- name: Test exact Windows session private storage", 1)[1]
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-session-storage'", step)
+        self.assertIn("session_storage_permissions_windows_dacls_exclude_broad_principals'", step)
+        self.assertIn("session_storage_permissions_windows_reject_reparse_paths_without_mutation'", step)
+        self.assertIn("$actual.Count -ne 2 -or $difference.Count -ne 0", step)
+        self.assertIn("$nativeExit = $LASTEXITCODE", step)
+        self.assertIn("if ($nativeExit -ne 0 -or -not ($native -match '^test result: ok\\. 2 passed; 0 failed; 0 ignored;'))", step)
+        self.assertEqual(2, step.count("cargo test --locked --no-default-features --features mcp --bin mini-agent -- @tests"))
+        self.assertNotIn("--ignored", step)
+        self.assertNotIn("continue-on-error", step)
+        source = (REPOSITORY_ROOT / "src/tests/session_storage_tests.rs").read_text()
+        for name in re.findall(r"'tests::session_storage_tests::([^']+)'", step):
+            self.assertIn("fn " + name + "()", source)
 
 
 class WindowsMcpPrivateTemporaryCiTests(unittest.TestCase):

@@ -660,6 +660,30 @@ mod windows {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: Dword) -> Bool;
     }
 
+    // Observation is confined to this existing exact-empty-image setup.
+    // Production expands the original operation; tests print only a
+    // closed stage and numeric OS code, never paths/ACLs/SIDs/content.
+    macro_rules! observe_private_temp {
+        ($stage:literal, $operation:expr) => {{
+            #[cfg(test)]
+            {
+                let result = $operation;
+                if let Err(error) = &result {
+                    eprintln!(
+                        "WINDOWS_PRIVATE_TEMP_FAILURE stage={} os_code={:?}",
+                        $stage,
+                        error.raw_os_error()
+                    );
+                }
+                result
+            }
+            #[cfg(not(test))]
+            {
+                $operation
+            }
+        }};
+    }
+
     struct SecurityDescriptor(*mut c_void);
 
     impl SecurityDescriptor {
@@ -678,7 +702,10 @@ mod windows {
                 )
             } == 0
             {
-                Err(std::io::Error::last_os_error())
+                observe_private_temp!(
+                    "descriptor_from_string",
+                    Err(std::io::Error::last_os_error())
+                )
             } else {
                 Ok(Self(descriptor))
             }
@@ -701,7 +728,7 @@ mod windows {
                 || present == 0
                 || dacl.is_null()
             {
-                Err(std::io::Error::last_os_error())
+                observe_private_temp!("descriptor_get_dacl", Err(std::io::Error::last_os_error()))
             } else {
                 Ok(dacl)
             }
@@ -725,7 +752,10 @@ mod windows {
     ) -> std::io::Result<T> {
         let mut token = null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(std::io::Error::last_os_error());
+            return observe_private_temp!(
+                "open_process_token",
+                Err(std::io::Error::last_os_error())
+            );
         }
         let result = (|| {
             let mut required = 0;
@@ -733,7 +763,10 @@ mod windows {
                 GetTokenInformation(token, TOKEN_USER_CLASS, null_mut(), 0, &mut required)
             };
             if required == 0 {
-                return Err(std::io::Error::last_os_error());
+                return observe_private_temp!(
+                    "token_user_size",
+                    Err(std::io::Error::last_os_error())
+                );
             }
             let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
             let mut buffer = vec![0usize; words];
@@ -747,7 +780,10 @@ mod windows {
                 )
             } == 0
             {
-                return Err(std::io::Error::last_os_error());
+                return observe_private_temp!(
+                    "token_user_information",
+                    Err(std::io::Error::last_os_error())
+                );
             }
             let token_user = unsafe { &*(buffer.as_ptr().cast::<TokenUser>()) };
             operation(token_user.user.sid)
@@ -760,7 +796,10 @@ mod windows {
         with_current_user_sid(|sid| {
             let mut string_sid = null_mut();
             if unsafe { ConvertSidToStringSidW(sid, &mut string_sid) } == 0 {
-                return Err(std::io::Error::last_os_error());
+                return observe_private_temp!(
+                    "sid_to_string",
+                    Err(std::io::Error::last_os_error())
+                );
             }
             let mut length = 0;
             while unsafe { *string_sid.add(length) } != 0 {
@@ -795,7 +834,8 @@ mod windows {
             )
         };
         if status != 0 {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
+            let error = std::io::Error::from_raw_os_error(status as i32);
+            return observe_private_temp!("get_owner_security", Err(error));
         }
         let owned = with_current_user_sid(|current| {
             if owner.is_null() || unsafe { EqualSid(owner, current) } == 0 {
@@ -857,14 +897,17 @@ mod windows {
             _file_index_low: 0,
         };
         if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
-            Err(std::io::Error::last_os_error())
+            observe_private_temp!(
+                "file_information_by_handle",
+                Err(std::io::Error::last_os_error())
+            )
         } else {
             Ok(information)
         }
     }
 
     pub(crate) fn prepare_new_private_file(file: &std::fs::File) -> std::io::Result<()> {
-        if file.metadata()?.len() != 0 {
+        if observe_private_temp!("original_metadata", file.metadata())?.len() != 0 {
             return Err(super::private_file_error());
         }
         use std::os::windows::io::AsRawHandle;
@@ -883,10 +926,13 @@ mod windows {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
+            return observe_private_temp!(
+                "reopen_security_handle",
+                Err(std::io::Error::last_os_error())
+            );
         }
         let reopened = unsafe { std::fs::File::from_raw_handle(handle as _) };
-        let information = information(handle)?;
+        let information = observe_private_temp!("reopened_metadata", information(handle))?;
         if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
             != 0
             || information._number_of_links != 1
@@ -899,8 +945,9 @@ mod windows {
         // initialized. Elevated tokens can default its owner to Administrators;
         // install the explicit user owner before writing any private bytes.
         // Existing destination readers/validators still reject foreign owners.
-        let descriptor = SecurityDescriptor::private()?;
-        with_current_user_sid(|owner| {
+        let descriptor =
+            observe_private_temp!("private_descriptor", SecurityDescriptor::private())?;
+        let initialized = with_current_user_sid(|owner| {
             let status = unsafe {
                 SetSecurityInfo(
                     handle,
@@ -917,11 +964,16 @@ mod windows {
             if status == 0 {
                 Ok(())
             } else {
-                Err(std::io::Error::from_raw_os_error(status as i32))
+                let error = std::io::Error::from_raw_os_error(status as i32);
+                observe_private_temp!("set_owner_and_dacl", Err(error))
             }
-        })?;
+        });
+        observe_private_temp!("current_owner_and_dacl", initialized)?;
         // Recheck the same object, including its explicit owner, after setup.
-        apply_private_dacl(reopened.as_raw_handle() as Handle, false)
+        observe_private_temp!(
+            "strict_revalidation",
+            apply_private_dacl(reopened.as_raw_handle() as Handle, false)
+        )
     }
 
     fn apply_private_dacl(handle: Handle, expect_directory: bool) -> std::io::Result<()> {
@@ -956,7 +1008,8 @@ mod windows {
         if status == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::from_raw_os_error(status as i32))
+            let error = std::io::Error::from_raw_os_error(status as i32);
+            observe_private_temp!("set_private_dacl", Err(error))
         }
     }
 

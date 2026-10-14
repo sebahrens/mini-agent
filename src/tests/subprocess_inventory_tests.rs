@@ -1806,6 +1806,21 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Reviewed local HookOutput fixture calls inside exact matches! contexts.
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "&output(serde_json::json!({\"additionalContext\":\"x\".repeat(32769)}))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "matches!(super::merge_decisions(\"UserPromptSubmit\", &[nested(), output(serde_json::json!({\"decision\":\"block\",\"reason\":\"blocked\"})), flat()]), super::Decision::Block { reason } if reason == \"blocked\")",
+        1,
+        "NON-PROCESS",
+    ),
+    // Numeric NTSTATUS arguments in the two test-only native diagnostics.
+    ("src/fs.rs", "status as u32", 2, "NON-PROCESS"),
     (
         "src/session/native_publication.rs",
         "status.success(),",
@@ -3140,6 +3155,20 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Test-only diagnostic prints a numeric NTSTATUS, not a process status terminal.
+    (
+        "src/fs.rs",
+        &[
+            (
+                "71f031649abe23acf15013d8ff92f00a9ee847aa1d08401e79157aa8971a344d",
+                1,
+            ),
+            (
+                "de4d0f3f252e6baaec9e9c2c31e29440bfc9373d41e0c8ae5999e33cddddd83d",
+                1,
+            ),
+        ],
+    ),
     (
         "src/agent/tools/format_after_edit.rs",
         &[
@@ -3874,11 +3903,11 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/skills/distill.rs",
         &[
             (
-                "2be6da2b6d2f946def7179a79bb891007b3c71f31406926a8b009dd076c998ad",
+                "e29c4db61b300c9232bd5dac5648daf7847f57f2a335b79b8c063bc0f9df7ee6",
                 1,
             ),
             (
-                "49458cd07accf0772709b9032c5603c438da7143e59d2b1c443cc8715967a292",
+                "a2a0b59efb88598321f470e499fff73689fb23ba54944b5548efe5bcb42bb28f",
                 1,
             ),
         ],
@@ -4085,10 +4114,21 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/extras/hooks/dispatcher.rs",
-        &[(
-            "4455fff110b3f344a84e2da4538deb7323313eafb4e100e51a659498ebf49077",
-            1,
-        )],
+        &[
+            (
+                "4455fff110b3f344a84e2da4538deb7323313eafb4e100e51a659498ebf49077",
+                1,
+            ),
+            // matches! predicates call the local fixture output(Value), not a process.
+            (
+                "b4a21a2e238f2b0b84865f9a46b5d4c192332a95e0f10d81b11f4d102386c534",
+                1,
+            ),
+            (
+                "2038cb9c54e834f60e215100c1c8e293c5277f833a78920ed77cb21d48ca1e19",
+                1,
+            ),
+        ],
     ),
     (
         "src/extras/mcp/client.rs",
