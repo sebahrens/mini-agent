@@ -387,6 +387,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         total_tokens: prompt_tokens + completion_tokens,
                         cached_input_tokens: 0,
                         cache_creation_input_tokens: 0,
+                        cache_creation: None,
                         tool_use_prompt_tokens: 0,
                         reasoning_tokens: 0,
                     },

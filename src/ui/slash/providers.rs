@@ -737,7 +737,8 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
     let new_model = parts[1].trim().to_string();
     let subagent_client =
         subagents::with_config(|cfg| cfg.client.clone()).map_err(anyhow::Error::from)?;
-    let model = subagent_client.completion_model(new_model.clone());
+    let model = subagent_client
+        .completion_model_with_cache_ttl(new_model.clone(), ctx.cfg.cache_ttl.unwrap_or_default());
     model_for_subagent(ctx, model).await?;
     subagents::set_model_name(new_model.clone());
     write_ok(
@@ -802,7 +803,10 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
                 &ctx.cfg.custom_providers_map(),
                 ctx.cfg.api_keys.as_ref(),
             )?;
-            let model = new_client.completion_model(q.model.to_string());
+            let model = new_client.completion_model_with_cache_ttl(
+                q.model.to_string(),
+                ctx.cfg.cache_ttl.unwrap_or_default(),
+            );
             model_for_subagent(ctx, model).await?;
             subagents::set_client_and_model(
                 new_client,
@@ -810,7 +814,10 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
                 q.model.to_string(),
             );
         } else {
-            let model = current_client.completion_model(q.model.to_string());
+            let model = current_client.completion_model_with_cache_ttl(
+                q.model.to_string(),
+                ctx.cfg.cache_ttl.unwrap_or_default(),
+            );
             model_for_subagent(ctx, model).await?;
             subagents::set_model_name(q.model.to_string());
         }

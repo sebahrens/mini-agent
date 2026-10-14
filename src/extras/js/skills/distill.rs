@@ -758,13 +758,14 @@ where
 async fn generalize(
     client: &AnyClient,
     model_name: &str,
+    cache_ttl: crate::config::PromptCacheTtl,
     retry_config: &RetryConfig,
     recorded: &str,
 ) -> anyhow::Result<GeneratedSkill> {
     let preamble = generalization_preamble();
     let prompt = generalization_prompt(recorded);
     let response = tokio::time::timeout(MODEL_TIMEOUT, async {
-        match client.completion_model(model_name.to_string()) {
+        match client.completion_model_with_cache_ttl(model_name.to_string(), cache_ttl) {
             AnyModel::OpenRouter(model, _) => {
                 complete_once(model, prompt, preamble, retry_config).await
             }
@@ -838,7 +839,14 @@ async fn generalize_package(
         cfg.api_keys.as_ref(),
     )
     .context("no usable provider for generalization")?;
-    let generated = generalize(&client, &model_name, &cfg.retry, recorded).await?;
+    let generated = generalize(
+        &client,
+        &model_name,
+        cfg.cache_ttl.unwrap_or_default(),
+        &cfg.retry,
+        recorded,
+    )
+    .await?;
     package_from_generation(generated, session_id, tool_call_id)
 }
 

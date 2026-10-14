@@ -48,7 +48,15 @@ pub(crate) struct PriceSnapshot {
     pub output: Option<f64>,
     pub cache_read: Option<f64>,
     pub cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<f64>,
+    #[serde(default, skip_serializing_if = "false_value")]
+    pub cache_split_required: bool,
     pub anthropic_native: bool,
+}
+
+fn false_value(value: &bool) -> bool {
+    !*value
 }
 
 impl PriceSnapshot {
@@ -59,26 +67,20 @@ impl PriceSnapshot {
     ) -> Self {
         let (input, output) =
             prices.map_or((None, None), |(input, output)| (Some(input), Some(output)));
-        let (cache_read, cache_write) = if anthropic_native {
-            if let Some(input) = input.filter(|input| input.is_finite() && *input > 0.0) {
-                let ratios = cache.multipliers(input);
-                (Some(input * ratios.read), Some(input * ratios.write))
-            } else if input == Some(0.0) {
-                (
-                    Some(cache.read.unwrap_or(0.0)),
-                    Some(cache.write.unwrap_or(0.0)),
-                )
-            } else {
-                (cache.read, cache.write)
-            }
+        let cache = if anthropic_native {
+            input
+                .map(|input| cache.effective_at(input))
+                .unwrap_or(cache)
         } else {
-            (None, None)
+            crate::pricing::CachePrices::default()
         };
         Self {
             input,
             output,
-            cache_read,
-            cache_write,
+            cache_read: cache.read,
+            cache_write: cache.write,
+            cache_write_1h: cache.write_1h,
+            cache_split_required: cache.split_required,
             anthropic_native,
         }
     }
@@ -91,14 +93,53 @@ impl PriceSnapshot {
             session.cache_prices(),
             cfg.is_anthropic_native(&session.provider),
         )
+        .with_cache_policy(cfg, &session.model)
+    }
+
+    pub(crate) fn with_cache_policy(mut self, cfg: &crate::config::Config, model: &str) -> Self {
+        if !self.anthropic_native {
+            return self;
+        }
+        self.cache_split_required |= cfg.native_cache_split_required(model);
+        self
     }
     fn valid(self) -> bool {
-        [self.input, self.output, self.cache_read, self.cache_write]
-            .into_iter()
-            .flatten()
-            .all(|rate| rate.is_finite() && rate >= 0.0)
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.cache_write_1h,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|rate| rate.is_finite() && rate >= 0.0)
     }
     pub(crate) fn cost(self, usage: UsageDelta) -> Option<f64> {
+        if !self.valid() {
+            return None;
+        }
+        if !self.anthropic_native {
+            return self.legacy_cost(usage);
+        }
+        let Some(split) = usage.cache_creation else {
+            if self.cache_split_required && usage.cache_creation_input_tokens != 0 {
+                return None;
+            }
+            return self.legacy_cost(usage);
+        };
+        if split.total()? != usage.cache_creation_input_tokens {
+            return None;
+        }
+        crate::pricing::CachePrices {
+            read: self.cache_read,
+            write: self.cache_write,
+            write_1h: self.cache_write_1h,
+            split_required: false,
+        }
+        .native_split_cost(usage, self.input?, self.output?)
+    }
+    fn legacy_cost(self, usage: UsageDelta) -> Option<f64> {
         if !self.valid() {
             return None;
         }
@@ -107,14 +148,19 @@ impl PriceSnapshot {
         let cost = crate::pricing::CachePrices {
             read: self.cache_read,
             write: self.cache_write,
+            write_1h: None,
+            split_required: false,
         }
-        .estimate_cost(self.anthropic_native, usage, input, output);
+        .estimate_cost_legacy(self.anthropic_native, usage, input, output);
         (cost.is_finite() && cost >= 0.0).then_some(cost)
     }
     pub(crate) fn is_known(self) -> bool {
         self.cost(UsageDelta::default()).is_some()
     }
     fn is_free(self) -> bool {
+        self.legacy_is_free() && (!self.anthropic_native || self.cache_write_1h == Some(0.0))
+    }
+    fn legacy_is_free(self) -> bool {
         self.is_known()
             && [self.input, self.output]
                 .into_iter()
@@ -141,7 +187,7 @@ pub(crate) enum RequestKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "VersionedRow")]
 struct Row {
     version: u8,
     id: Uuid,
@@ -156,9 +202,137 @@ struct Row {
     cost: Option<f64>,
 }
 
+// Decode each version against its exact wire schema. Testing only the decoded
+// values would let null/false new fields sneak into a version-one receipt.
+// Derived map decoding also keeps duplicate-key rejection (unlike a Value
+// intermediate), and both versions deny unknown nested and outer fields.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VersionedRow {
+    Legacy(RowFields<LegacyPrices, LegacyUsage, 1>),
+    Current(RowFields<PriceSnapshot, UsageDelta, 2>),
+}
+
+struct ExactVersion<const V: u8>;
+
+impl<'de, const V: u8> Deserialize<'de> for ExactVersion<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if u8::deserialize(deserializer)? != V {
+            return Err(serde::de::Error::custom("unsupported usage ledger version"));
+        }
+        Ok(Self)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RowFields<P, U, const V: u8> {
+    version: ExactVersion<V>,
+    id: Uuid,
+    ts: chrono::DateTime<chrono::Utc>,
+    session_id: String,
+    provider: String,
+    model: String,
+    kind: RequestKind,
+    usage: U,
+    usage_reported: bool,
+    prices: P,
+    cost: Option<f64>,
+}
+
+impl<P: Into<PriceSnapshot>, U: Into<UsageDelta>, const V: u8> From<RowFields<P, U, V>> for Row {
+    fn from(fields: RowFields<P, U, V>) -> Self {
+        let _ = fields.version;
+        Self {
+            version: V,
+            id: fields.id,
+            ts: fields.ts,
+            session_id: fields.session_id,
+            provider: fields.provider,
+            model: fields.model,
+            kind: fields.kind,
+            usage: fields.usage.into(),
+            usage_reported: fields.usage_reported,
+            prices: fields.prices.into(),
+            cost: fields.cost,
+        }
+    }
+}
+
+impl From<VersionedRow> for Row {
+    fn from(row: VersionedRow) -> Self {
+        match row {
+            VersionedRow::Legacy(fields) => fields.into(),
+            VersionedRow::Current(fields) => fields.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPrices {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    anthropic_native: bool,
+}
+
+impl From<LegacyPrices> for PriceSnapshot {
+    fn from(prices: LegacyPrices) -> Self {
+        Self {
+            input: prices.input,
+            output: prices.output,
+            cache_read: prices.cache_read,
+            cache_write: prices.cache_write,
+            cache_write_1h: None,
+            cache_split_required: false,
+            anthropic_native: prices.anthropic_native,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    tool_use_prompt_tokens: u64,
+    reasoning_tokens: u64,
+}
+
+impl From<LegacyUsage> for UsageDelta {
+    fn from(usage: LegacyUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation: None,
+            tool_use_prompt_tokens: usage.tool_use_prompt_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        }
+    }
+}
+
 impl Row {
     fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.version == 1, "unsupported usage ledger version");
+        anyhow::ensure!(
+            matches!(self.version, 1 | 2),
+            "unsupported usage ledger version"
+        );
+        if self.version == 1 {
+            anyhow::ensure!(
+                self.usage.cache_creation.is_none()
+                    && self.prices.cache_write_1h.is_none()
+                    && !self.prices.cache_split_required,
+                "version one usage receipt contains new cache metadata"
+            );
+        }
         anyhow::ensure!(
             [&self.session_id, &self.provider, &self.model]
                 .into_iter()
@@ -166,6 +340,14 @@ impl Row {
             "usage receipt identity exceeds limits"
         );
         let usage = self.usage;
+        if let Some(split) = usage.cache_creation {
+            anyhow::ensure!(
+                split.total() == Some(usage.cache_creation_input_tokens)
+                    && split.ephemeral_5m_input_tokens <= MAX_RECEIPT_TOKENS
+                    && split.ephemeral_1h_input_tokens <= MAX_RECEIPT_TOKENS,
+                "usage receipt cache tiers mismatch"
+            );
+        }
         anyhow::ensure!(
             [
                 usage.input_tokens,
@@ -185,8 +367,19 @@ impl Row {
             "usage receipt metrics mismatch"
         );
         anyhow::ensure!(self.prices.valid(), "invalid captured usage price");
-        let expected = (self.usage_reported || self.prices.is_free())
-            .then(|| self.prices.cost(usage))
+        let free = if self.version == 1 {
+            self.prices.legacy_is_free()
+        } else {
+            self.prices.is_free()
+        };
+        let expected = (self.usage_reported || free)
+            .then(|| {
+                if self.version == 1 {
+                    self.prices.legacy_cost(usage)
+                } else {
+                    self.prices.cost(usage)
+                }
+            })
             .flatten();
         anyhow::ensure!(
             self.cost == expected && self.cost.is_none_or(|cost| cost <= MAX_RECEIPT_USD),
@@ -220,7 +413,7 @@ impl Receipt {
             .flatten();
         Self {
             row: Arc::new(Row {
-                version: 1,
+                version: 2,
                 id: Uuid::new_v4(),
                 ts: chrono::Utc::now(),
                 session_id: session_id.into(),
@@ -580,6 +773,225 @@ mod tests {
             false,
         )
     }
+    fn split_usage(five: u64, hour: u64) -> UsageDelta {
+        UsageDelta {
+            cache_creation_input_tokens: five + hour,
+            cache_creation: Some(rig::completion::CacheCreationUsage {
+                ephemeral_5m_input_tokens: five,
+                ephemeral_1h_input_tokens: hour,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache71_captured_mixed_tiers_round_once_and_never_scale_five_minute_override() {
+        let mut prices = PriceSnapshot::capture(
+            Some((2.0, 10.0)),
+            crate::pricing::CachePrices {
+                read: Some(0.2),
+                write: Some(9.0),
+                write_1h: None,
+                split_required: false,
+            },
+            true,
+        );
+        assert_eq!(prices.cache_write, Some(9.0));
+        assert_eq!(prices.cache_write_1h, Some(4.0));
+        prices.cache_write = Some(2.5);
+        let mut usage = split_usage(1, 1);
+        usage.cached_input_tokens = 3;
+        assert_eq!(prices.cost(usage), Some(0.000008));
+        let mut paid_free_base = PriceSnapshot::capture(
+            Some((0.0, 0.0)),
+            crate::pricing::CachePrices {
+                read: Some(0.3),
+                write: Some(4.0),
+                write_1h: None,
+                split_required: false,
+            },
+            true,
+        );
+        paid_free_base.cache_write_1h = Some(8.0);
+        usage = split_usage(1_000_000, 1_000_000);
+        usage.cached_input_tokens = 1_000_000;
+        assert_eq!(paid_free_base.cost(usage), Some(12.3));
+        assert!(!paid_free_base.is_free());
+    }
+
+    #[test]
+    fn cache71_missing_or_inconsistent_tiers_never_mint_known_one_hour_cost() {
+        let mut prices = PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), true);
+        prices.cache_split_required = true;
+        let account = Account::new("cache71", Some(1.0), 0.0).unwrap();
+        let missing = UsageDelta {
+            input_tokens: 10,
+            cache_creation_input_tokens: 100,
+            ..Default::default()
+        };
+        assert_eq!(prices.cost(missing), None);
+        let receipt = Receipt::new(
+            "cache71",
+            "anthropic",
+            "native",
+            RequestKind::Turn,
+            missing,
+            prices,
+        );
+        assert!(account.observe(&receipt).unwrap());
+        assert!(account.snapshot().tracking_error);
+        assert!(account.admit(prices).is_err());
+        assert_eq!(receipt.row.cost, None);
+        receipt.row.validate().unwrap();
+        let mut invalid = split_usage(3, 2);
+        invalid.cache_creation_input_tokens = 4;
+        assert_eq!(prices.cost(invalid), None);
+        let invalid = Receipt::new(
+            "cache71",
+            "anthropic",
+            "native",
+            RequestKind::Turn,
+            invalid,
+            prices,
+        );
+        assert!(invalid.row.validate().is_err());
+        prices.cache_write_1h = None;
+        assert_eq!(prices.cost(split_usage(0, 1)), None);
+    }
+
+    #[test]
+    fn cache71_native_cache_policy_requires_tiers_without_guessing_request_ttl() {
+        let usage = UsageDelta {
+            cache_creation_input_tokens: 10,
+            ..Default::default()
+        };
+        for (extra, required) in [
+            (serde_json::json!({}), false),
+            (serde_json::json!({"cache_control":null}), false),
+            (
+                serde_json::json!({"cache_control":{"type":"ephemeral","ttl":"1h"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"cache_control":{"type":"ephemeral"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"tools":[{"cache_control":{"type":"ephemeral","ttl":"1h"}}]}),
+                true,
+            ),
+            (serde_json::json!({"system":"raw override"}), true),
+            (serde_json::json!({"messages":[]}), true),
+        ] {
+            let cfg = crate::config::Config {
+                extra_body: Some(extra),
+                ..Default::default()
+            };
+            let native = PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), true)
+                .with_cache_policy(&cfg, "fixture");
+            assert_eq!(native.cache_split_required, required);
+            assert_eq!(native.cost(usage).is_none(), required);
+            let routed = PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), false)
+                .with_cache_policy(&cfg, "fixture");
+            assert!(!routed.cache_split_required);
+        }
+        let cfg = crate::config::Config {
+            cache_ttl: Some(crate::config::PromptCacheTtl::OneHour),
+            ..Default::default()
+        };
+        assert!(
+            PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), true)
+                .with_cache_policy(&cfg, "fixture")
+                .cache_split_required
+        );
+    }
+
+    #[test]
+    fn cache71_receipt_versions_preserve_old_rounding_and_reject_metadata_smuggling() {
+        let usage = UsageDelta {
+            input_tokens: 10,
+            cache_creation_input_tokens: 3,
+            ..Default::default()
+        };
+        let mut prices = PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), true);
+        prices.cache_write_1h = None;
+        let mut legacy = Receipt::new(
+            "cache71",
+            "anthropic",
+            "native",
+            RequestKind::Turn,
+            usage,
+            prices,
+        )
+        .row
+        .as_ref()
+        .clone();
+        legacy.version = 1;
+        legacy.cost = prices.legacy_cost(usage);
+        legacy.validate().unwrap();
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("cache_write_1h"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("cache_split_required"));
+        let decoded: Row = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        let wire = String::from_utf8(bytes.clone()).unwrap();
+        for (key, value) in [
+            ("cache_write_1h", "null"),
+            ("cache_split_required", "false"),
+            ("cache_creation", "null"),
+        ] {
+            let original = if key == "cache_creation" {
+                "\"usage\":{"
+            } else {
+                "\"prices\":{"
+            };
+            let injected = wire.replacen(original, &format!("{original}\"{key}\":{value},"), 1);
+            assert!(serde_json::from_str::<Row>(&injected).is_err(), "{key}");
+        }
+        // Untagged version selection must not collapse duplicate map keys.
+        for duplicate in [
+            wire.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+            wire.replacen(
+                "\"input_tokens\":10",
+                "\"input_tokens\":10,\"input_tokens\":10",
+                1,
+            ),
+            wire.replacen("\"input\":2.0", "\"input\":2.0,\"input\":2.0", 1),
+        ] {
+            assert!(serde_json::from_str::<Row>(&duplicate).is_err());
+        }
+        let mut smuggled = legacy.clone();
+        smuggled.prices.cache_write_1h = Some(4.0);
+        assert!(smuggled.validate().is_err());
+        smuggled = legacy.clone();
+        smuggled.usage.cache_creation = split_usage(3, 0).cache_creation;
+        assert!(smuggled.validate().is_err());
+        legacy.version = 3;
+        assert!(legacy.validate().is_err());
+        assert!(serde_json::from_slice::<Row>(&serde_json::to_vec(&legacy).unwrap()).is_err());
+        let modern = Receipt::new(
+            "cache71",
+            "anthropic",
+            "native",
+            RequestKind::Turn,
+            split_usage(3, 0),
+            PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), true),
+        );
+        assert_eq!(modern.row.version, 2);
+        modern.row.validate().unwrap();
+        let modern_wire = serde_json::to_string(modern.row.as_ref()).unwrap();
+        let modern_decoded: Row = serde_json::from_str(&modern_wire).unwrap();
+        modern_decoded.validate().unwrap();
+        assert_eq!(modern_decoded, *modern.row);
+        let duplicate = modern_wire.replacen(
+            "\"input_tokens\":0",
+            "\"input_tokens\":0,\"input_tokens\":0",
+            1,
+        );
+        assert!(serde_json::from_str::<Row>(&duplicate).is_err());
+    }
+
     #[test]
     fn spend_cap_validation_and_unknown_zero_prices_are_distinct() {
         for invalid in [f64::NAN, f64::INFINITY, -1.0] {
@@ -627,6 +1039,8 @@ mod tests {
             crate::pricing::CachePrices {
                 read: Some(0.3),
                 write: Some(4.0),
+                write_1h: None,
+                split_required: false,
             },
             true,
         );

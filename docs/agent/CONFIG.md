@@ -687,7 +687,8 @@ Accepted top-level keys:
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. This also holds for an entry that shadows a built-in name (`custom`, `openai`, `google`, ...); see Custom provider credentials below. |
-| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "cache_read_token_cost"?, "cache_write_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
+| `cache_ttl` | string | Owner global setting: `"5m"` (default) or `"1h"` for Anthropic-native routes. Project layers cannot change it. Other protocols retain their existing caching behavior. One-hour writes require a reported TTL usage breakdown for known cost. |
+| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "cache_read_token_cost"?, "cache_write_token_cost"?, "cache_write_1h_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
 | `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, mini-agent automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, recommended MCPs are auto-configured (see below).                                                   |
 | `enable-exa-mcp`          | boolean | Auto-configure the Exa Web Search MCP server. Default: `true`.                                                                                                         |
@@ -712,11 +713,15 @@ Accepted top-level keys:
 | `advisor`                 | object  | Advisor configuration; requires `advisor`. See Advisor below. |
 | `colors`                  | object  | Background color overrides for the TUI. See the colors section below.                                                                                                       |
 
-Quick-model `cache_read_token_cost` and `cache_write_token_cost` are independent
+Quick-model `cache_read_token_cost`, `cache_write_token_cost` (5m), and
+`cache_write_1h_token_cost` are independent
 USD/M prices. On Anthropic-native routes, an explicit cache price still applies
 when `input_token_cost` is zero; missing or zero cache tiers add no charge.
 Positive base input rates preserve equivalent-token rounding. Session, headless,
-judge and side-question accounting retain these absolute tier prices.
+judge and side-question accounting retain these absolute tier prices. The
+one-hour tier defaults to twice the selected native input price; changing an
+explicit five-minute price does not change that fallback. Missing required write
+tiers remain unpriced, rather than being relabeled five-minute writes.
 
 The macOS general-command Seatbelt profile permits reads from ordinary
 host-readable paths needed by developer tools, but explicitly denies the

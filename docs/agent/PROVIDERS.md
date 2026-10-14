@@ -196,13 +196,23 @@ configured separately, in the `[reasoning]` config section — see
 
 ## Prompt caching
 
+The owner global setting `cache_ttl = "1h"` selects native Anthropic automatic
+one-hour caching, with generated tools/system breakpoints at the same TTL.
+Omission or `"5m"` preserves the existing manual five-minute policy. The native
+model factory applies this to ordinary, child and auxiliary requests; other
+provider protocols keep their existing cache controls. Explicit incompatible
+markers fail SDK validation before HTTP. These controls do not relocate mutable
+memory or attest that a changed prompt/tool prefix can replay signed thinking.
+
+
 mini-agent enables prompt caching automatically where the underlying rig provider supports it. The behavior depends on which provider backs the model you choose.
 
 Anthropic-native cost accounting uses the model's cache-read and five-minute
 cache-write prices from the embedded catalog. For example, Fable 5.1 cache
 reads cost $0.25/M tokens, Opus 5.5 $0.20/M, and Sonnet 5.5 $0.10/M, as listed
 in [Anthropic's pricing reference](https://platform.claude.com/docs/en/about-claude/pricing).
-Quick models can set `cache_read_token_cost` and `cache_write_token_cost` in
+Quick models can set `cache_read_token_cost`, `cache_write_token_cost` (5m), and
+`cache_write_1h_token_cost` in
 USD per million tokens. A selected alias's explicit cache prices win per tier;
 an absent tier inherits the catalog's cache-to-input ratio at the alias's
 configured input price. Raw model selections use catalog ratios before matching
@@ -211,7 +221,12 @@ quick-model ratios. Missing or invalid prices fall back to 0.10x reads and
 cache prices, and older sessions without these fields inherit catalog ratios.
 For a zero base input price, explicitly configured native cache tiers still
 charge their absolute USD/M rates; missing or free tiers contribute zero.
-Positive base prices retain the existing nearest-token equivalent rounding.
+Reported native five-minute and one-hour writes are priced separately. The
+one-hour fallback is 2x selected input, independently of a five-minute override.
+Positive base prices round once over the combined equivalent-input pool.
+See [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+`/cost` shows the latest recorded request's uncached/cached input and known TTL
+write breakdown; an unreported breakdown stays labeled as such.
 Subagent token-budget normalization remains separate: explicit free tiers have
 zero weight, while positive or unknown tiers at a zero base use fallback ratios.
 Headless JSON, session totals, goal judges, and side questions use the same

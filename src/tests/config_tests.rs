@@ -217,6 +217,7 @@ fn resolve_context_window_from_quick_model() {
             output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: None,
@@ -998,6 +999,7 @@ mod extra_body_api_style_scoping {
             output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: Some(extra_body),
@@ -1138,6 +1140,7 @@ fn normalized_usage_charges_gemini_thinking_as_output() {
         total_tokens: 1_400,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        cache_creation: None,
         tool_use_prompt_tokens: 0,
         reasoning_tokens: 300,
     };
@@ -1187,6 +1190,7 @@ fn known_context_window_orders_pin_quick_model_then_catalog() {
             output_token_cost: Some(0.0),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: None,
@@ -1299,6 +1303,8 @@ fn quick_model_price_presence_session_free_and_native_cache_survive_reload() {
     session.set_cache_prices(crate::pricing::CachePrices {
         read: Some(0.3),
         write: Some(4.0),
+        write_1h: None,
+        split_required: false,
     });
     session.charge_usage_delta(
         crate::event::UsageDelta {

@@ -768,6 +768,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         });
         let specialization = specialization.map(|resolved| resolved.prompt);
         let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
+        let cache_split_required = config.native_cache_split_required(&runtime.model_name);
         let reasoning_exclusive =
             config.reasoning_tokens_are_exclusive_of_output(&runtime.provider_name);
 
@@ -842,13 +843,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                     cancellation_repair_usage.total(),
                 );
                 let output = Err("subagent cancelled before completion".to_string());
-                usage_cost_units_with_multipliers(
+                usage_cost_units_with_cache_policy(
                     &usage,
                     anthropic_native,
                     reasoning_exclusive,
                     &cancellation_prompt,
                     &output,
                     cache_multipliers,
+                    cache_split_required,
                 )
             });
             let future = Box::pin(async move {
@@ -874,7 +876,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                 #[cfg(not(feature = "hooks"))]
                 let execution_prompt = prompt_text;
 
-                let model = client.completion_model(model_name);
+                let model = client.completion_model_with_cache_ttl(
+                    model_name,
+                    config.cache_ttl.unwrap_or_default(),
+                );
                 let agent = builder::build_explore_agent(
                     model,
                     max_turns,
@@ -949,13 +954,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let output = run
                     .response
                     .map(|response| enforce_bounded_report_contract(&response));
-                let cost_units = usage_cost_units_with_multipliers(
+                let cost_units = usage_cost_units_with_cache_policy(
                     &run.usage,
                     anthropic_native,
                     reasoning_exclusive,
                     &display_prompt,
                     &output,
                     cache_multipliers,
+                    cache_split_required,
                 );
                 ChildExecution { output, cost_units }
             });
@@ -1630,12 +1636,31 @@ fn usage_cost_units_with_multipliers(
     response: &Result<String, String>,
     multipliers: crate::pricing::CacheMultipliers,
 ) -> u64 {
-    let itemized = crate::pricing::billable_input_tokens_with_multipliers(
+    usage_cost_units_with_cache_policy(
+        usage,
         anthropic_native,
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_input_tokens,
+        reasoning_exclusive,
+        prompt,
+        response,
         multipliers,
+        false,
+    )
+}
+
+fn usage_cost_units_with_cache_policy(
+    usage: &Usage,
+    anthropic_native: bool,
+    reasoning_exclusive: bool,
+    prompt: &str,
+    response: &Result<String, String>,
+    multipliers: crate::pricing::CacheMultipliers,
+    split_required: bool,
+) -> u64 {
+    let itemized = crate::pricing::billable_input_tokens_with_cache_tiers(
+        anthropic_native,
+        (*usage).into(),
+        multipliers,
+        split_required,
     )
     .saturating_add(usage.output_tokens)
     .saturating_add(usage.tool_use_prompt_tokens)
@@ -1652,8 +1677,25 @@ fn usage_cost_units_with_multipliers(
         // Reported cache usage can legitimately be free. A positive rate that
         // rounds below one proxy unit still consumes one; neither case is an
         // absent usage report that warrants a total/text fallback.
-        let positive_cache_cost = (usage.cached_input_tokens > 0 && multipliers.read > 0.0)
-            || (usage.cache_creation_input_tokens > 0 && multipliers.write > 0.0);
+        let positive_write = match usage
+            .cache_creation
+            .filter(|split| split.total() == Some(usage.cache_creation_input_tokens))
+        {
+            Some(split) => {
+                (split.ephemeral_5m_input_tokens > 0 && multipliers.write > 0.0)
+                    || (split.ephemeral_1h_input_tokens > 0 && multipliers.write_1h > 0.0)
+            }
+            None => {
+                usage.cache_creation_input_tokens > 0
+                    && if split_required || usage.cache_creation.is_some() {
+                        multipliers.write.max(multipliers.write_1h) > 0.0
+                    } else {
+                        multipliers.write > 0.0
+                    }
+            }
+        };
+        let positive_cache_cost =
+            (usage.cached_input_tokens > 0 && multipliers.read > 0.0) || positive_write;
         return u64::from(positive_cache_cost);
     }
     if usage.total_tokens > 0 {
@@ -2136,6 +2178,7 @@ mod tests {
                 output_token_cost: Some(0.0),
                 cache_read_token_cost: None,
                 cache_write_token_cost: None,
+                cache_write_1h_token_cost: None,
                 reserve_tokens: None,
                 temperature: None,
                 extra_body: Some(serde_json::json!({"seed": 7})),
@@ -2944,6 +2987,93 @@ mod tests {
     }
 
     #[test]
+    fn cache71_task_units_honor_reported_tiers_and_bound_required_unknown_writes() {
+        use rig::completion::CacheCreationUsage;
+        let mut usage = Usage {
+            cache_creation_input_tokens: 100,
+            total_tokens: 100,
+            cache_creation: Some(CacheCreationUsage {
+                ephemeral_5m_input_tokens: 20,
+                ephemeral_1h_input_tokens: 80,
+            }),
+            ..Usage::new()
+        };
+        let units = |usage: &Usage, ratios, required| {
+            usage_cost_units_with_cache_policy(
+                usage,
+                true,
+                false,
+                "nonempty prompt",
+                &Ok("response".into()),
+                ratios,
+                required,
+            )
+        };
+        assert_eq!(
+            units(&usage, crate::pricing::CacheMultipliers::default(), true),
+            185
+        );
+        let mut ratios = crate::pricing::CacheMultipliers {
+            read: 0.0,
+            write: 4.5,
+            write_1h: 3.0,
+        };
+        assert_eq!(units(&usage, ratios, true), 330);
+        usage.cache_creation = None;
+        assert_eq!(
+            units(&usage, ratios, true),
+            450,
+            "required unknown writes use the larger captured ratio as a conservative proxy"
+        );
+        ratios.write = 0.0;
+        ratios.write_1h = 2.0;
+        assert_eq!(
+            units(&usage, ratios, false),
+            0,
+            "legacy default5m proxy remains unchanged"
+        );
+        assert_eq!(units(&usage, ratios, true), 200);
+        usage.cache_creation = Some(CacheCreationUsage {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 100,
+        });
+        assert_eq!(units(&usage, ratios, true), 200);
+        ratios.write_1h = 0.0;
+        assert_eq!(
+            units(&usage, ratios, true),
+            0,
+            "reported free tiers cannot acquire a text/total fallback"
+        );
+        usage.cache_creation_input_tokens = 1;
+        usage.cache_creation = Some(CacheCreationUsage {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 1,
+        });
+        usage.total_tokens = 1_000_000;
+        ratios.write_1h = 0.1;
+        assert_eq!(
+            units(&usage, ratios, true),
+            1,
+            "a positive subtoken hour tier consumes at least one proxy unit"
+        );
+        usage.input_tokens = 20;
+        usage.cached_input_tokens = 4;
+        assert_eq!(
+            usage_cost_units_with_cache_policy(
+                &usage,
+                false,
+                false,
+                "",
+                &Ok(String::new()),
+                ratios,
+                true
+            ),
+            20,
+            "routed totals remain provider-normalized, without adding native tiers"
+        );
+    }
+
+    #[test]
     fn task_cache_cost_units_distinguish_free_and_subtoken_rates_from_missing_usage() {
         let reported = Usage {
             cached_input_tokens: 1_000_000,
@@ -2953,6 +3083,8 @@ mod tests {
         let free = crate::pricing::CachePrices {
             read: Some(0.0),
             write: Some(0.0),
+            write_1h: None,
+            split_required: false,
         }
         .multipliers(4.0);
         assert_eq!(
@@ -2979,7 +3111,8 @@ mod tests {
                 &Ok("response".into()),
                 crate::pricing::CacheMultipliers {
                     read: 0.025,
-                    write: 1.25
+                    write: 1.25,
+                    write_1h: 2.0,
                 }
             ),
             1,
@@ -2999,7 +3132,8 @@ mod tests {
                     &Ok("response".into()),
                     crate::pricing::CacheMultipliers {
                         read: 0.0,
-                        write: write_rate
+                        write: write_rate,
+                        write_1h: 2.0,
                     }
                 ),
                 expected,
@@ -3078,6 +3212,7 @@ mod tests {
             output_tokens: u64::MAX - 1,
             total_tokens: u64::MAX - 1,
             cached_input_tokens: u64::MAX - 1,
+            cache_creation: None,
             cache_creation_input_tokens: u64::MAX - 1,
             tool_use_prompt_tokens: u64::MAX - 1,
             reasoning_tokens: u64::MAX - 1,
@@ -3087,6 +3222,7 @@ mod tests {
             output_tokens: 10,
             total_tokens: 10,
             cached_input_tokens: 10,
+            cache_creation: None,
             cache_creation_input_tokens: 10,
             tool_use_prompt_tokens: 10,
             reasoning_tokens: 10,

@@ -1712,6 +1712,7 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
                         output_token_cost: new_output_cost,
                         cache_read_token_cost: None,
                         cache_write_token_cost: None,
+                        cache_write_1h_token_cost: None,
                         reserve_tokens: None,
                         temperature: None,
                         extra_body: None,

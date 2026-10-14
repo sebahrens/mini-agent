@@ -460,6 +460,7 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
             output_token_cost: Some(0.1966),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: None,
@@ -475,6 +476,7 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
             output_token_cost: Some(0.87),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: None,
@@ -512,6 +514,7 @@ pub fn save_quick_model(
             output_token_cost,
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
             reserve_tokens: None,
             temperature: None,
             extra_body: None,
@@ -1517,6 +1520,7 @@ fn merge_config_value(base: &Config, mut local: toml::Value) -> Result<Config, S
     // ignored project caps before recording diagnostic provenance.
     if let Some(table) = local.as_table_mut() {
         table.remove("max_budget_usd");
+        table.remove("cache_ttl");
     }
     let mut provenance = base.provenance.clone();
     if let Some(table) = local.as_table() {
@@ -2544,6 +2548,64 @@ mod project_config_trust_tests {
                     .unwrap();
                     assert_eq!(cfg.max_budget_usd, global);
                     assert_eq!(cfg.chat_left_margin, Some(7));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache71_ttl_is_global_only_validated_and_known_to_the_catalogue() {
+        use crate::config::PromptCacheTtl;
+        for (wire, expected) in [
+            ("5m", PromptCacheTtl::FiveMinutes),
+            ("1h", PromptCacheTtl::OneHour),
+        ] {
+            let cfg: Config = toml::from_str(&format!("cache_ttl=\"{wire}\"\n")).unwrap();
+            assert_eq!(cfg.cache_ttl, Some(expected));
+            assert_eq!(
+                serde_json::from_str::<Config>(&serde_json::to_string(&cfg).unwrap())
+                    .unwrap()
+                    .cache_ttl,
+                Some(expected)
+            );
+        }
+        for invalid in ["10m", "1H", "off", ""] {
+            assert!(toml::from_str::<Config>(&format!("cache_ttl=\"{invalid}\"\n")).is_err());
+        }
+        assert_eq!(super::keys::lookup("cache_ttl").unwrap().name, "cache_ttl");
+        let root = crate::tests::OwnedTestDirectory::new("cache71-project-policy");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for global in [
+            None,
+            Some(PromptCacheTtl::FiveMinutes),
+            Some(PromptCacheTtl::OneHour),
+        ] {
+            for project in ["5m", "1h"] {
+                for interactive in [false, true] {
+                    std::fs::write(
+                        &path,
+                        format!("cache_ttl=\"{project}\"\nchat_left_margin=7\nyolo=true\n"),
+                    )
+                    .unwrap();
+                    let mut cfg = Config {
+                        cache_ttl: global,
+                        ..Default::default()
+                    };
+                    apply_local_override_with_confirmation(
+                        &mut cfg,
+                        &path,
+                        &trust,
+                        interactive,
+                        &|_| true,
+                    )
+                    .unwrap();
+                    assert_eq!(cfg.cache_ttl, global);
+                    assert_eq!(cfg.chat_left_margin, Some(7));
+                    assert!(!cfg.provenance.project_keys.contains("cache_ttl"));
                 }
             }
         }

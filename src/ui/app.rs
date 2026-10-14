@@ -469,6 +469,8 @@ mod btw_pricing_tests {
             .set_cache_prices(crate::pricing::CachePrices {
                 read: Some(1.0),
                 write: None,
+                write_1h: None,
+                split_required: false,
             });
         let cache_only = app
             .btw_pricing
@@ -484,6 +486,8 @@ mod btw_pricing_tests {
             .set_cache_prices(crate::pricing::CachePrices {
                 read: Some(0.2),
                 write: Some(5.0),
+                write_1h: None,
+                split_required: false,
             });
         app.handle_btw_event(BtwEvent::Done {
             id: cache_only,
@@ -4356,10 +4360,10 @@ impl<'a> App<'a> {
             self.run.is_running,
             self.ui.cfg.resolve_keep_recent_tool_results(),
         );
-        let model = self
-            .ui
-            .client
-            .completion_model(self.ui.session.model.to_string());
+        let model = self.ui.client.completion_model_with_cache_ttl(
+            self.ui.session.model.to_string(),
+            self.ui.cfg.cache_ttl.unwrap_or_default(),
+        );
         let temperature =
             crate::config::resolve_temperature(self.ui.cli, self.ui.cfg, &self.ui.session.model);
         let extra_body = crate::config::resolve_extra_body(self.ui.cfg, &self.ui.session.model);

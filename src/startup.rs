@@ -1918,7 +1918,10 @@ impl Startup {
                     schema.native_params(&self.session.provider, &self.model, &self.cfg)
                 }),
             );
-            let completion_model = self.client.completion_model(self.model.to_string());
+            let completion_model = self.client.completion_model_with_cache_ttl(
+                self.model.to_string(),
+                self.cfg.cache_ttl.unwrap_or_default(),
+            );
             let read_tracker = self.session.read_tracker.clone();
             let todo_store = self.session.todos.clone();
             #[cfg(feature = "goal")]
@@ -2246,7 +2249,10 @@ impl Startup {
         {
             return Ok(());
         }
-        let model_completion = self.client.completion_model(self.model.to_string());
+        let model_completion = self.client.completion_model_with_cache_ttl(
+            self.model.to_string(),
+            self.cfg.cache_ttl.unwrap_or_default(),
+        );
         let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         let read_tracker = self.session.read_tracker.clone();
@@ -4133,6 +4139,7 @@ mod tests {
                     output_token_cost: Some(0.0),
                     cache_read_token_cost: None,
                     cache_write_token_cost: None,
+                    cache_write_1h_token_cost: None,
                     reserve_tokens: None,
                     temperature: None,
                     extra_body: None,

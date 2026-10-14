@@ -13,6 +13,9 @@ pub struct UsageDelta {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Reported write tiers, never inferred from a requested TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<rig::completion::CacheCreationUsage>,
     pub tool_use_prompt_tokens: u64,
     pub reasoning_tokens: u64,
 }
@@ -29,6 +32,12 @@ impl UsageDelta {
             cache_creation_input_tokens: self
                 .cache_creation_input_tokens
                 .saturating_sub(previous.cache_creation_input_tokens),
+            cache_creation: rig::completion::CacheCreationUsage::difference_optional(
+                self.cache_creation_input_tokens,
+                self.cache_creation,
+                previous.cache_creation_input_tokens,
+                previous.cache_creation,
+            ),
             tool_use_prompt_tokens: self
                 .tool_use_prompt_tokens
                 .saturating_sub(previous.tool_use_prompt_tokens),
@@ -39,7 +48,17 @@ impl UsageDelta {
     }
 
     pub fn has_values(self) -> bool {
-        self != Self::default()
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.total_tokens,
+            self.cached_input_tokens,
+            self.cache_creation_input_tokens,
+            self.tool_use_prompt_tokens,
+            self.reasoning_tokens,
+        ]
+        .into_iter()
+        .any(|count| count != 0)
     }
 
     /// Field-wise saturating sum, for totalling several reports of separate
@@ -55,6 +74,12 @@ impl UsageDelta {
             cache_creation_input_tokens: self
                 .cache_creation_input_tokens
                 .saturating_add(other.cache_creation_input_tokens),
+            cache_creation: rig::completion::CacheCreationUsage::add_optional(
+                self.cache_creation_input_tokens,
+                self.cache_creation,
+                other.cache_creation_input_tokens,
+                other.cache_creation,
+            ),
             tool_use_prompt_tokens: self
                 .tool_use_prompt_tokens
                 .saturating_add(other.tool_use_prompt_tokens),

@@ -1,18 +1,22 @@
 /// Fallback rates for models without published or configured cache pricing.
 /// Writes assume the default five-minute TTL used by the production client.
 const ANTHROPIC_CACHE_WRITE_MULT: f64 = 1.25;
+const ANTHROPIC_CACHE_WRITE_1H_MULT: f64 = 2.0;
 const ANTHROPIC_CACHE_READ_MULT: f64 = 0.10;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct CachePrices {
     pub read: Option<f64>,
     pub write: Option<f64>,
+    pub write_1h: Option<f64>,
+    pub split_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheMultipliers {
     pub read: f64,
     pub write: f64,
+    pub write_1h: f64,
 }
 
 impl Default for CacheMultipliers {
@@ -20,6 +24,7 @@ impl Default for CacheMultipliers {
         Self {
             read: ANTHROPIC_CACHE_READ_MULT,
             write: ANTHROPIC_CACHE_WRITE_MULT,
+            write_1h: ANTHROPIC_CACHE_WRITE_1H_MULT,
         }
     }
 }
@@ -31,7 +36,7 @@ fn valid_price(price: f64) -> bool {
 impl CachePrices {
     #[cfg(feature = "goal")]
     pub(crate) fn has_valid_tier(self) -> bool {
-        [self.read, self.write]
+        [self.read, self.write, self.write_1h]
             .into_iter()
             .flatten()
             .any(valid_price)
@@ -40,6 +45,46 @@ impl CachePrices {
     /// Charge native cache tiers independently when the uncached input is free.
     /// A positive base keeps the historical equivalent-token rounding policy.
     pub(crate) fn estimate_cost(
+        self,
+        anthropic_native: bool,
+        usage: crate::event::UsageDelta,
+        input_price: f64,
+        output_price: f64,
+    ) -> f64 {
+        self.checked_cost(anthropic_native, usage, input_price, output_price)
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn checked_cost(
+        self,
+        anthropic_native: bool,
+        usage: crate::event::UsageDelta,
+        input_price: f64,
+        output_price: f64,
+    ) -> Option<f64> {
+        if !valid_price(input_price) || !valid_price(output_price) {
+            return None;
+        }
+        if anthropic_native
+            && self.split_required
+            && usage.cache_creation_input_tokens > 0
+            && usage.cache_creation.is_none()
+        {
+            return None;
+        }
+        if anthropic_native && usage.cache_creation.is_some() {
+            return self.effective_at(input_price).native_split_cost(
+                usage,
+                input_price,
+                output_price,
+            );
+        }
+        let cost = self.estimate_cost_legacy(anthropic_native, usage, input_price, output_price);
+        valid_price(cost).then_some(cost)
+    }
+
+    /// Version-one rows retain the original total-write estimate exactly.
+    pub(crate) fn estimate_cost_legacy(
         self,
         anthropic_native: bool,
         usage: crate::event::UsageDelta,
@@ -69,6 +114,81 @@ impl CachePrices {
         )
     }
 
+    /// Capture independent native tier rates at the selected base price. The
+    /// one-hour fallback never derives from an explicit five-minute override.
+    pub(crate) fn effective_at(self, input: f64) -> Self {
+        let (read, write) = if input.is_finite() && input > 0.0 {
+            let ratios = self.multipliers(input);
+            (Some(input * ratios.read), Some(input * ratios.write))
+        } else if input == 0.0 {
+            (
+                Some(self.read.unwrap_or(0.0)),
+                Some(self.write.unwrap_or(0.0)),
+            )
+        } else {
+            (self.read, self.write)
+        };
+        Self {
+            read,
+            write,
+            write_1h: self.write_1h.or_else(|| {
+                let price = input * ANTHROPIC_CACHE_WRITE_1H_MULT;
+                valid_price(price).then_some(price)
+            }),
+            split_required: self.split_required,
+        }
+    }
+
+    /// Price reported native write tiers over a single equivalent-input pool.
+    /// Callers supply captured effective rates; missing rates stay unknown.
+    pub(crate) fn native_split_cost(
+        self,
+        usage: crate::event::UsageDelta,
+        input: f64,
+        output: f64,
+    ) -> Option<f64> {
+        let split = usage.cache_creation?;
+        if split.total()? != usage.cache_creation_input_tokens
+            || !valid_price(input)
+            || !valid_price(output)
+            || [self.read, self.write, self.write_1h]
+                .into_iter()
+                .flatten()
+                .any(|rate| !valid_price(rate))
+        {
+            return None;
+        }
+        let read = self.read?;
+        let write_5m = self.write?;
+        let write_1h = if split.ephemeral_1h_input_tokens == 0 {
+            0.0
+        } else {
+            self.write_1h?
+        };
+        let cost = if input == 0.0 {
+            (usage.output_tokens as f64 * output
+                + usage.cached_input_tokens as f64 * read
+                + split.ephemeral_5m_input_tokens as f64 * write_5m
+                + split.ephemeral_1h_input_tokens as f64 * write_1h)
+                / 1_000_000.0
+        } else {
+            let equivalent = usage.input_tokens as f64
+                + usage.cached_input_tokens as f64 * (read / input)
+                + split.ephemeral_5m_input_tokens as f64 * (write_5m / input)
+                + split.ephemeral_1h_input_tokens as f64 * (write_1h / input);
+            if !equivalent.is_finite() || equivalent < 0.0 || equivalent >= u64::MAX as f64 {
+                return None;
+            }
+            estimate_cost(
+                equivalent.round() as u64,
+                usage.output_tokens,
+                input,
+                output,
+            )
+        };
+        (cost.is_finite() && cost >= 0.0).then_some(cost)
+    }
+
     pub(crate) fn multipliers(self, input_price: f64) -> CacheMultipliers {
         let ratio = |price: Option<f64>, fallback| {
             if price == Some(0.0) {
@@ -86,6 +206,7 @@ impl CachePrices {
         CacheMultipliers {
             read: ratio(self.read, ANTHROPIC_CACHE_READ_MULT),
             write: ratio(self.write, ANTHROPIC_CACHE_WRITE_MULT),
+            write_1h: ratio(self.write_1h, ANTHROPIC_CACHE_WRITE_1H_MULT),
         }
     }
 
@@ -115,6 +236,8 @@ impl CachePrices {
                 Self {
                     read: scale(entry.cache_read_price),
                     write: scale(entry.cache_write_price),
+                    write_1h: None,
+                    split_required: false,
                 }
             })
             .unwrap_or_default()
@@ -170,6 +293,9 @@ pub(crate) fn cache_prices_for_model(
             .or_else(|| {
                 let entry = matching?;
                 let entry_input_price = entry.resolved_input_price()?;
+                if entry_input_price == 0.0 && input_price == 0.0 {
+                    return get(entry);
+                }
                 if !entry_input_price.is_finite()
                     || entry_input_price <= 0.0
                     || !input_price.is_finite()
@@ -184,6 +310,28 @@ pub(crate) fn cache_prices_for_model(
     CachePrices {
         read: tier(true),
         write: tier(false),
+        write_1h: selected
+            .and_then(|entry| {
+                entry
+                    .cache_write_1h_token_cost
+                    .filter(|price| valid_price(*price))
+            })
+            .or_else(|| {
+                let entry = matching?;
+                let base = entry.resolved_input_price()?;
+                let configured = entry
+                    .cache_write_1h_token_cost
+                    .filter(|price| valid_price(*price))?;
+                if base == 0.0 && input_price == 0.0 {
+                    return Some(configured);
+                }
+                if base <= 0.0 || !valid_price(input_price) {
+                    return None;
+                }
+                let rate = configured / base * input_price;
+                valid_price(rate).then_some(rate)
+            }),
+        split_required: cfg.is_anthropic_native(provider) && cfg.native_cache_split_required(model),
     }
 }
 
@@ -245,6 +393,46 @@ pub(crate) fn billable_input_tokens_with_multipliers(
     }
 }
 
+/// Task proxy units use reported write tiers. Missing required breakdowns use
+/// the larger captured write ratio conservatively; this is not a dollar quote.
+#[cfg(feature = "subagents")]
+pub(crate) fn billable_input_tokens_with_cache_tiers(
+    anthropic_native: bool,
+    usage: crate::event::UsageDelta,
+    mut multipliers: CacheMultipliers,
+    split_required: bool,
+) -> u64 {
+    if !anthropic_native {
+        return usage.input_tokens;
+    }
+    if [multipliers.read, multipliers.write, multipliers.write_1h]
+        .into_iter()
+        .any(|rate| !rate.is_finite() || rate < 0.0)
+    {
+        return u64::MAX;
+    }
+    if let Some(split) = usage
+        .cache_creation
+        .filter(|split| split.total() == Some(usage.cache_creation_input_tokens))
+    {
+        return (usage.input_tokens as f64
+            + usage.cached_input_tokens as f64 * multipliers.read
+            + split.ephemeral_5m_input_tokens as f64 * multipliers.write
+            + split.ephemeral_1h_input_tokens as f64 * multipliers.write_1h)
+            .round() as u64;
+    }
+    if split_required || usage.cache_creation.is_some() {
+        multipliers.write = multipliers.write.max(multipliers.write_1h);
+    }
+    billable_input_tokens_with_multipliers(
+        true,
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_input_tokens,
+        multipliers,
+    )
+}
+
 /// Estimate cost for given token counts and per-million-token prices.
 /// Returns 0.0 if either price is 0.0.
 ///
@@ -265,6 +453,167 @@ pub fn estimate_cost(
 #[cfg(test)]
 mod cache_pricing_tests {
     use super::*;
+
+    #[test]
+    fn cache71_one_hour_rates_are_independent_validated_and_persisted() {
+        let make = |hour: Option<f64>| {
+            let mut entry = serde_json::json!({"provider":"anthropic", "model":"cache71-unknown",
+                "input_token_cost":2.0, "output_token_cost":10.0, "cache_write_token_cost":9.0});
+            if let Some(hour) = hour {
+                entry["cache_write_1h_token_cost"] = hour.into();
+            }
+            serde_json::from_value::<crate::config::Config>(
+                serde_json::json!({"quick_models":{"long":entry}}),
+            )
+            .unwrap()
+        };
+        for (hour, expected) in [(None, 4.0), (Some(0.0), 0.0), (Some(6.0), 6.0)] {
+            let cfg = make(hour);
+            let rates =
+                cache_prices_for_model("anthropic", "cache71-unknown", &cfg, Some("long"), 2.0);
+            let snapshot = crate::spend::PriceSnapshot::capture(Some((2.0, 10.0)), rates, true);
+            assert_eq!(snapshot.cache_write, Some(9.0));
+            assert_eq!(snapshot.cache_write_1h, Some(expected));
+            let restored: crate::config::Config =
+                serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(
+                restored.quick_models.unwrap()["long"].cache_write_1h_token_cost,
+                hour
+            );
+        }
+        let invalid = serde_json::json!({"provider":"anthropic", "model":"cache71-unknown", "cache_write_1h_token_cost":-1.0});
+        assert!(serde_json::from_value::<crate::config::QuickModelConfig>(invalid).is_err());
+        let rates =
+            cache_prices_for_model("anthropic", "cache71-unknown", &make(Some(6.0)), None, 4.0);
+        assert_eq!(
+            rates.write_1h,
+            Some(12.0),
+            "matching alias's own one-hour ratio uses its base, not its five-minute tier"
+        );
+
+        let usage = crate::event::UsageDelta {
+            input_tokens: 8,
+            output_tokens: 5,
+            cached_input_tokens: 4,
+            cache_creation_input_tokens: 10,
+            cache_creation: Some(rig::completion::CacheCreationUsage {
+                ephemeral_5m_input_tokens: 3,
+                ephemeral_1h_input_tokens: 7,
+            }),
+            ..Default::default()
+        };
+        let cfg = make(Some(6.0));
+        let rates = cache_prices_for_model("anthropic", "cache71-unknown", &cfg, Some("long"), 2.0);
+        let mut session = crate::session::Session::new("anthropic", "cache71-unknown", 100_000, "");
+        session.set_input_output_prices(Some((2.0, 10.0)));
+        session.set_cache_prices(rates);
+        let mut restored: crate::session::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(restored.cache_prices().write_1h, Some(6.0));
+        restored.charge_usage_delta(usage, true);
+        assert_eq!(restored.total_cache_creation, usage.cache_creation);
+        let snapshot = crate::spend::PriceSnapshot::from_session(&restored, &cfg);
+        assert_eq!(snapshot.cost(usage), Some(restored.total_cost));
+        assert_eq!(
+            crate::print::HeadlessPricing::from_session(&restored, &cfg).cost(usage.into()),
+            restored.total_cost
+        );
+        assert!((restored.total_cost - 0.000136).abs() < 1e-12);
+        let mut legacy = session;
+        legacy.total_cache_creation_input_tokens = 1;
+        legacy.charge_usage_delta(usage, true);
+        assert_eq!(
+            legacy.total_cache_creation, None,
+            "positive legacy writes do not acquire a fabricated TTL breakdown"
+        );
+        let mut cfg = cfg;
+        cfg.cache_ttl = Some(crate::config::PromptCacheTtl::OneHour);
+        let rates = cache_prices_for_model("anthropic", "cache71-unknown", &cfg, Some("long"), 2.0);
+        let mut unpriced =
+            crate::session::Session::new("anthropic", "cache71-unknown", 100_000, "");
+        unpriced.set_input_output_prices(Some((2.0, 10.0)));
+        unpriced.set_cache_prices(rates);
+        let mut missing = usage;
+        missing.cache_creation = None;
+        unpriced.charge_usage_delta(missing, true);
+        assert_eq!(
+            unpriced.total_cost, 0.0,
+            "missing required tiers add no fabricated five-minute dollars"
+        );
+        assert!(
+            crate::spend::PriceSnapshot::from_session(&unpriced, &cfg)
+                .cost(missing)
+                .is_none()
+        );
+        assert_eq!(
+            crate::print::HeadlessPricing::from_session(&unpriced, &cfg).cost(missing.into()),
+            0.0
+        );
+        #[cfg(feature = "goal")]
+        {
+            let resolved = crate::extras::goal::ResolvedJudge {
+                label: "long".into(),
+                provider: "anthropic".into(),
+                model: "cache71-unknown".into(),
+                same_provider_as_session: true,
+                same_as_session: false,
+            };
+            let call = crate::extras::goal::judge::JudgeCall {
+                outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                    reason: "fixture".into(),
+                },
+                tokens: 27,
+                usage: missing,
+            };
+            let charge = call
+                .charge(&resolved, &cfg, Some((2.0, 10.0)), rates)
+                .unwrap();
+            assert!(
+                !unpriced.charge_judge_call(&charge),
+                "missing required judge tiers remain unpriced"
+            );
+            assert_eq!(unpriced.unpriced_judge_tokens, 27);
+            assert_eq!(unpriced.total_cost, 0.0);
+        }
+    }
+
+    #[test]
+    fn cache71_raw_free_base_keeps_matching_paid_cache_tiers() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "quick_models": {"cached": {"provider": "anthropic", "model": "cache71-free-base",
+                "input_token_cost": 0.0, "output_token_cost": 0.0,
+                "cache_read_token_cost": 1.0, "cache_write_token_cost": 2.0,
+                "cache_write_1h_token_cost": 3.0}}
+        }))
+        .unwrap();
+        let usage = crate::event::UsageDelta {
+            cached_input_tokens: 5,
+            cache_creation_input_tokens: 10,
+            cache_creation: Some(rig::completion::CacheCreationUsage {
+                ephemeral_5m_input_tokens: 5,
+                ephemeral_1h_input_tokens: 5,
+            }),
+            ..Default::default()
+        };
+        for alias in [Some("cached"), None] {
+            let rates = cache_prices_for_model("anthropic", "cache71-free-base", &cfg, alias, 0.0);
+            assert_eq!(rates.read, Some(1.0));
+            assert_eq!(rates.write, Some(2.0));
+            assert_eq!(rates.write_1h, Some(3.0));
+            let snapshot = crate::spend::PriceSnapshot::capture(Some((0.0, 0.0)), rates, true);
+            assert_eq!(snapshot.cost(usage), Some(0.000030));
+            assert!(
+                snapshot.cost(usage).unwrap() > 0.0,
+                "paid cache tiers remain billable"
+            );
+        }
+        // There is no proportional conversion from a free configured base to a
+        // different paid selected base; preserve the existing ratio fallback.
+        let changed = cache_prices_for_model("anthropic", "cache71-free-base", &cfg, None, 4.0);
+        assert_eq!(changed.read, None);
+        assert_eq!(changed.write, None);
+        assert_eq!(changed.write_1h, None);
+    }
 
     #[test]
     fn published_fable_opus_and_sonnet_cache_rates_price_native_usage() {
@@ -322,18 +671,23 @@ mod cache_pricing_tests {
         assert_eq!(
             CachePrices {
                 read: Some(0.0),
-                write: Some(0.0)
+                write: Some(0.0),
+                write_1h: None,
+                split_required: false,
             }
             .multipliers(0.0),
             CacheMultipliers {
                 read: 0.0,
-                write: 0.0
+                write: 0.0,
+                write_1h: 2.0,
             }
         );
         assert_eq!(
             CachePrices {
                 read: Some(1.0),
-                write: None
+                write: None,
+                write_1h: None,
+                split_required: false,
             }
             .multipliers(0.0),
             CacheMultipliers::default()
@@ -345,7 +699,9 @@ mod cache_pricing_tests {
         assert_eq!(
             CachePrices {
                 read: Some(1.0),
-                write: None
+                write: None,
+                write_1h: None,
+                split_required: false,
             }
             .estimate_cost(true, one_cached_token, 0.0, 0.0),
             0.000001
@@ -353,7 +709,9 @@ mod cache_pricing_tests {
         assert_eq!(
             CachePrices {
                 read: Some(0.25),
-                write: Some(12.5)
+                write: Some(12.5),
+                write_1h: None,
+                split_required: false,
             }
             .estimate_cost(true, one_cached_token, 10.0, 50.0),
             0.0,
@@ -390,36 +748,45 @@ mod cache_pricing_tests {
             let rates = CachePrices {
                 read: Some(invalid),
                 write: Some(0.0),
+                write_1h: None,
+                split_required: false,
             };
             assert_eq!(
                 rates.multipliers(10.0),
                 CacheMultipliers {
                     read: 0.10,
-                    write: 0.0
+                    write: 0.0,
+                    write_1h: 2.0,
                 }
             );
             assert_eq!(
                 CachePrices {
                     read: Some(0.0),
-                    write: Some(invalid)
+                    write: Some(invalid),
+                    write_1h: None,
+                    split_required: false,
                 }
                 .multipliers(10.0),
                 CacheMultipliers {
                     read: 0.0,
-                    write: 1.25
+                    write: 1.25,
+                    write_1h: 2.0,
                 }
             );
             assert_eq!(
                 rates.multipliers(invalid),
                 CacheMultipliers {
                     read: 0.10,
-                    write: 0.0
+                    write: 0.0,
+                    write_1h: 2.0,
                 }
             );
             assert_eq!(
                 CachePrices {
                     read: Some(1.0),
-                    write: None
+                    write: None,
+                    write_1h: None,
+                    split_required: false,
                 }
                 .multipliers(invalid),
                 CacheMultipliers::default(),
@@ -429,7 +796,9 @@ mod cache_pricing_tests {
         assert_eq!(
             CachePrices {
                 read: Some(1.0),
-                write: Some(2.0)
+                write: Some(2.0),
+                write_1h: None,
+                split_required: false,
             }
             .multipliers(0.0),
             CacheMultipliers::default()
@@ -450,7 +819,9 @@ mod cache_pricing_tests {
             selected,
             CachePrices {
                 read: Some(0.6),
-                write: Some(10.0)
+                write: Some(10.0),
+                write_1h: None,
+                split_required: false,
             }
         );
         let raw = cache_prices_for_model("anthropic", "claude-opus-5-5", &cfg, None, 4.0);
@@ -458,7 +829,9 @@ mod cache_pricing_tests {
             raw,
             CachePrices {
                 read: Some(0.2),
-                write: Some(5.0)
+                write: Some(5.0),
+                write_1h: None,
+                split_required: false,
             }
         );
         let gateway = cache_prices_for_model(
@@ -472,7 +845,8 @@ mod cache_pricing_tests {
             gateway.multipliers(8.0),
             CacheMultipliers {
                 read: 0.25,
-                write: 0.0
+                write: 0.0,
+                write_1h: 2.0,
             }
         );
         let gateway_config = &cfg.quick_models.as_ref().unwrap()["gateway"];
@@ -483,6 +857,8 @@ mod cache_pricing_tests {
             CachePrices {
                 read: Some(1.0),
                 write: Some(0.0),
+                write_1h: None,
+                split_required: false,
             },
             "a known input/cache ratio does not fabricate an omitted output rate"
         );

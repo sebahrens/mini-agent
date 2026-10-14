@@ -24,6 +24,7 @@ pub(crate) struct Run {
     kind: RequestKind,
     setup_error: Option<Arc<str>>,
     reasoning_exclusive: bool,
+    cache_ttl: crate::config::PromptCacheTtl,
     cap_required: bool,
     refused: Arc<std::sync::atomic::AtomicBool>,
     sdk_request: Arc<std::sync::Mutex<std::sync::Weak<SdkRequest>>>,
@@ -51,6 +52,7 @@ impl Run {
             kind: RequestKind::Turn,
             setup_error: None,
             reasoning_exclusive: false,
+            cache_ttl: Default::default(),
             cap_required,
             refused: Default::default(),
             sdk_request: Default::default(),
@@ -89,6 +91,7 @@ impl Run {
             refused: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
+            cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(&session.provider),
         };
         run.reject_model_override(cfg);
@@ -128,6 +131,7 @@ impl Run {
             refused: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
+            cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
         };
         Ok(run.for_model(provider, model, cfg, selected, RequestKind::Turn))
@@ -144,8 +148,9 @@ impl Run {
         Self {
             provider: provider.into(),
             model: model.into(),
-            prices,
+            prices: prices.with_cache_policy(cfg, model),
             kind,
+            cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
             refused: Default::default(),
             sdk_request: Default::default(),
@@ -222,8 +227,10 @@ impl Run {
         let mut run = Self {
             provider: provider.into(),
             model: model.into(),
-            prices: PriceSnapshot::capture(prices, cache, cfg.is_anthropic_native(provider)),
+            prices: PriceSnapshot::capture(prices, cache, cfg.is_anthropic_native(provider))
+                .with_cache_policy(cfg, model),
             kind,
+            cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
             refused: Default::default(),
             sdk_request: Default::default(),
@@ -571,6 +578,12 @@ pub(crate) struct UsageObserver {
     run: Option<Run>,
 }
 impl UsageObserver {
+    pub(crate) fn cache_ttl(&self) -> crate::config::PromptCacheTtl {
+        self.run
+            .as_ref()
+            .map(|run| run.cache_ttl)
+            .unwrap_or_default()
+    }
     pub(crate) fn with_run(run: Run) -> Self {
         Self {
             usage: Default::default(),

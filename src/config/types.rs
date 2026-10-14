@@ -3,6 +3,25 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// Host-owned TTL for native Anthropic prompt caching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl PromptCacheTtl {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
 /// Behavior when an ordinary headless turn asks for clarification.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -145,6 +164,14 @@ pub struct QuickModelConfig {
     pub cache_read_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_token_cost: Option<f64>,
+    /// Independent native one-hour cache-write rate. Omission inherits 2x the
+    /// selected input price, not a configured five-minute write rate.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub cache_write_1h_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve_tokens: Option<u64>,
     /// Per-model temperature override (0.0–2.0). Takes precedence over the

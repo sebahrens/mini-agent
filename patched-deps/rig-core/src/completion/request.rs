@@ -527,6 +527,85 @@ where
     }
 }
 
+/// Reported cache-write counts for the two native TTL tiers. No TTL is inferred
+/// from the requested cache policy when a provider omits this breakdown.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheCreationUsage {
+    pub ephemeral_5m_input_tokens: u64,
+    pub ephemeral_1h_input_tokens: u64,
+}
+
+impl CacheCreationUsage {
+    /// Checked sum used to reject inconsistent reported totals.
+    pub fn total(self) -> Option<u64> {
+        self.ephemeral_5m_input_tokens
+            .checked_add(self.ephemeral_1h_input_tokens)
+    }
+
+    /// Retains a complete breakdown when aggregating known tiers and zero-write
+    /// calls; any positive unknown component keeps the aggregate unknown.
+    pub fn add_optional(
+        left_total: u64,
+        left: Option<Self>,
+        right_total: u64,
+        right: Option<Self>,
+    ) -> Option<Self> {
+        let known = |total, split: Option<Self>| match split {
+            Some(split) if split.total() == Some(total) => Some(split),
+            None if total == 0 => Some(Self {
+                ephemeral_5m_input_tokens: 0,
+                ephemeral_1h_input_tokens: 0,
+            }),
+            _ => None,
+        };
+        if left.is_none() && right.is_none() {
+            return None;
+        }
+        let left = known(left_total, left)?;
+        let right = known(right_total, right)?;
+        let sum = Self {
+            ephemeral_5m_input_tokens: left
+                .ephemeral_5m_input_tokens
+                .checked_add(right.ephemeral_5m_input_tokens)?,
+            ephemeral_1h_input_tokens: left
+                .ephemeral_1h_input_tokens
+                .checked_add(right.ephemeral_1h_input_tokens)?,
+        };
+        let expected_total = left_total.checked_add(right_total)?;
+        (sum.total()? == expected_total).then_some(sum)
+    }
+
+    /// A terminal delta is tier-complete only if both snapshots prove it.
+    /// Zero earlier writes need no fabricated historical tier counts.
+    pub fn difference_optional(
+        total: u64,
+        split: Option<Self>,
+        previous_total: u64,
+        previous: Option<Self>,
+    ) -> Option<Self> {
+        let split = split.filter(|split| split.total() == Some(total))?;
+        let previous = match previous {
+            Some(previous) if previous.total() == Some(previous_total) => previous,
+            None if previous_total == 0 => Self {
+                ephemeral_5m_input_tokens: 0,
+                ephemeral_1h_input_tokens: 0,
+            },
+            _ => return None,
+        };
+        let difference = Self {
+            ephemeral_5m_input_tokens: split
+                .ephemeral_5m_input_tokens
+                .checked_sub(previous.ephemeral_5m_input_tokens)?,
+            ephemeral_1h_input_tokens: split
+                .ephemeral_1h_input_tokens
+                .checked_sub(previous.ephemeral_1h_input_tokens)?,
+        };
+        let expected_total = total.checked_sub(previous_total)?;
+        (difference.total()? == expected_total).then_some(difference)
+    }
+}
+
 /// Struct representing the token usage for a completion request.
 /// If tokens used are `0`, then the provider failed to supply token usage metrics.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
@@ -541,6 +620,9 @@ pub struct Usage {
     pub cached_input_tokens: u64,
     /// The number of input tokens written to a provider-managed cache
     pub cache_creation_input_tokens: u64,
+    /// Actual reported cache-write tiers; absent means unknown, not all five-minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreationUsage>,
     /// The number of tool-use prompt tokens used in a given request.
     #[serde(default)]
     pub tool_use_prompt_tokens: u64,
@@ -558,6 +640,7 @@ impl Usage {
             total_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation: None,
             tool_use_prompt_tokens: 0,
             reasoning_tokens: 0,
         }
@@ -568,7 +651,17 @@ impl Usage {
     /// Zero-valued usage is this type's documented sentinel for "the provider
     /// supplied no usage metrics", so `false` means usage was not reported.
     pub fn has_values(&self) -> bool {
-        *self != Self::new()
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.total_tokens,
+            self.cached_input_tokens,
+            self.cache_creation_input_tokens,
+            self.tool_use_prompt_tokens,
+            self.reasoning_tokens,
+        ]
+        .into_iter()
+        .any(|count| count != 0)
     }
 }
 
@@ -589,6 +682,12 @@ impl Add for Usage {
             cached_input_tokens: self.cached_input_tokens + other.cached_input_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens
                 + other.cache_creation_input_tokens,
+            cache_creation: CacheCreationUsage::add_optional(
+                self.cache_creation_input_tokens,
+                self.cache_creation,
+                other.cache_creation_input_tokens,
+                other.cache_creation,
+            ),
             tool_use_prompt_tokens: self.tool_use_prompt_tokens + other.tool_use_prompt_tokens,
             reasoning_tokens: self.reasoning_tokens + other.reasoning_tokens,
         }
@@ -601,6 +700,12 @@ impl AddAssign for Usage {
         self.output_tokens += other.output_tokens;
         self.total_tokens += other.total_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_creation = CacheCreationUsage::add_optional(
+            self.cache_creation_input_tokens,
+            self.cache_creation,
+            other.cache_creation_input_tokens,
+            other.cache_creation,
+        );
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.tool_use_prompt_tokens += other.tool_use_prompt_tokens;
         self.reasoning_tokens += other.reasoning_tokens;

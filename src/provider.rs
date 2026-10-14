@@ -543,7 +543,10 @@ impl AnyClient {
         preamble: String,
         usage: crate::ui::slash::git::UsageLedger,
     ) -> anyhow::Result<String> {
-        let model = self.completion_model(model_name.to_owned());
+        let model = self.completion_model_with_cache_ttl(
+            model_name.to_owned(),
+            cfg.cache_ttl.unwrap_or_default(),
+        );
         let extras = passive_provider_request_params(
             &model,
             cfg,
@@ -617,7 +620,10 @@ impl AnyClient {
             }
             builder.build()
         }
-        let model = self.completion_model(model_name.to_string());
+        let model = self.completion_model_with_cache_ttl(
+            model_name.to_string(),
+            cfg.cache_ttl.unwrap_or_default(),
+        );
         let params = merge_extra_body(
             passive_provider_request_params(&model, cfg, extra_body, session_id, max_tokens)?,
             native_format,
@@ -645,7 +651,16 @@ impl AnyClient {
         Ok(AnyAgent::without_skills(inner).with_turn_token_budget(budget))
     }
 
+    #[cfg(test)]
     pub fn completion_model(&self, name: impl Into<String>) -> AnyModel {
+        self.completion_model_with_cache_ttl(name, Default::default())
+    }
+
+    pub(crate) fn completion_model_with_cache_ttl(
+        &self,
+        name: impl Into<String>,
+        cache_ttl: crate::config::PromptCacheTtl,
+    ) -> AnyModel {
         let name = name.into();
         match self {
             AnyClient::OpenRouter(c) => {
@@ -654,7 +669,11 @@ impl AnyClient {
             }
             AnyClient::OpenAI(c) => AnyModel::OpenAI(c.completion_model(name)),
             AnyClient::Anthropic(c) => {
-                AnyModel::Anthropic(c.completion_model(name).with_prompt_caching())
+                let model = c.completion_model(name).with_prompt_caching();
+                AnyModel::Anthropic(match cache_ttl {
+                    crate::config::PromptCacheTtl::FiveMinutes => model,
+                    crate::config::PromptCacheTtl::OneHour => model.with_automatic_caching_1h(),
+                })
             }
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
@@ -748,7 +767,8 @@ impl AnyClient {
         retry_config: &RetryConfig,
         observed: crate::spend::run::UsageObserver,
     ) -> anyhow::Result<(String, rig::completion::Usage)> {
-        let model = self.completion_model(model_name.to_string());
+        let model =
+            self.completion_model_with_cache_ttl(model_name.to_string(), observed.cache_ttl());
         summarize_with_model(
             model,
             prompt,
@@ -768,7 +788,10 @@ impl AnyClient {
         cfg: &Config,
         ledger: crate::session::title::UsageLedger,
     ) -> anyhow::Result<String> {
-        let model = self.completion_model(request.model.to_string());
+        let model = self.completion_model_with_cache_ttl(
+            request.model.to_string(),
+            cfg.cache_ttl.unwrap_or_default(),
+        );
         let quick = crate::config::quick_models_map(cfg);
         let alias = cfg
             .session_title_model
@@ -896,7 +919,10 @@ impl AnyClient {
                     let retry_config = retry_config.clone();
                     let observed = observed.clone();
                     async move {
-                        let model = self.completion_model(model_name.to_string());
+                        let model = self.completion_model_with_cache_ttl(
+                            model_name.to_string(),
+                            observed.cache_ttl(),
+                        );
                         summarize_with_model(
                             model,
                             summary_prompt,

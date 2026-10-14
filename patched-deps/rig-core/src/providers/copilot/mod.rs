@@ -681,6 +681,7 @@ impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse<ChatComp
                     .map(|d| d.cached_tokens as u64)
                     .unwrap_or(0),
                 cache_creation_input_tokens: 0,
+                cache_creation: None,
                 tool_use_prompt_tokens: 0,
                 reasoning_tokens: 0,
             })

@@ -397,7 +397,10 @@ conversation, so focus your question on the specific decision you need help with
                 return Err(ToolError::Msg("Advisor model not configured".into()));
             };
 
-            let model = client.completion_model(cfg.advisor_model.clone());
+            let model = client.completion_model_with_cache_ttl(
+                cfg.advisor_model.clone(),
+                cfg.request_config.cache_ttl.unwrap_or_default(),
+            );
             let messages = current_messages();
             let spend = crate::spend::run::Run::current().map(|run| {
                 run.for_model(

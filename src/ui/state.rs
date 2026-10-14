@@ -149,7 +149,10 @@ impl AgentBuildCtx<'_> {
         if let Some(invalidated) = self.prebuild_invalidated {
             invalidated.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let model = self.client.completion_model(model_id.to_string());
+        let model = self.client.completion_model_with_cache_ttl(
+            model_id.to_string(),
+            self.cfg.cache_ttl.unwrap_or_default(),
+        );
         let temperature = crate::config::resolve_temperature(self.cli, self.cfg, model_id);
         let extra_body = crate::config::resolve_extra_body(self.cfg, model_id);
         crate::provider::build_agent_in_workspace(

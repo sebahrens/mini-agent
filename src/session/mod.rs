@@ -561,6 +561,10 @@ pub struct Session {
     pub total_cached_input_tokens: u64,
     #[serde(default)]
     pub total_cache_creation_input_tokens: u64,
+    /// Write-tier totals are known only when every positive write increment
+    /// supplied a consistent provider breakdown. Legacy totals stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cache_creation: Option<rig::completion::CacheCreationUsage>,
     /// Provider-normalized prompt tokens, including cached tiers exactly once.
     #[serde(default)]
     pub total_real_input_tokens: u64,
@@ -597,6 +601,10 @@ pub struct Session {
     pub cache_read_token_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "cache_split_not_required")]
+    pub cache_split_required: bool,
     pub context_window: u64,
     pub model: CompactString,
     pub provider: CompactString,
@@ -700,6 +708,8 @@ impl Session {
     pub(crate) fn set_cache_prices(&mut self, prices: crate::pricing::CachePrices) {
         self.cache_read_token_cost = prices.read;
         self.cache_write_token_cost = prices.write;
+        self.cache_write_1h_token_cost = prices.write_1h;
+        self.cache_split_required = prices.split_required;
     }
 
     /// Legacy saved sessions lack cache prices. Inherit their model's catalog
@@ -713,6 +723,8 @@ impl Session {
         crate::pricing::CachePrices {
             read: self.cache_read_token_cost.or(catalog.read),
             write: self.cache_write_token_cost.or(catalog.write),
+            write_1h: self.cache_write_1h_token_cost,
+            split_required: self.cache_split_required,
         }
     }
 
@@ -805,6 +817,7 @@ impl Session {
             total_output_tokens: 0,
             total_cached_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            total_cache_creation: None,
             total_real_input_tokens: 0,
             total_cost: 0.0,
             unpriced_judge_tokens: 0,
@@ -818,6 +831,8 @@ impl Session {
             spend_account: crate::spend::Account::default(),
             cache_read_token_cost: None,
             cache_write_token_cost: None,
+            cache_write_1h_token_cost: None,
+            cache_split_required: false,
             context_window,
             model: CompactString::new(model),
             provider: CompactString::new(provider),
@@ -1355,7 +1370,29 @@ impl Session {
                     output_cost,
                     charge.cache_prices,
                 );
-                true
+                let priced = charge
+                    .cache_prices
+                    .checked_cost(
+                        charge.anthropic_native,
+                        charge.usage,
+                        input_cost,
+                        output_cost,
+                    )
+                    .is_some();
+                if !priced {
+                    self.unpriced_judge_tokens = self
+                        .unpriced_judge_tokens
+                        .saturating_add(Self::real_input_tokens(
+                            charge.anthropic_native,
+                            charge.usage.input_tokens,
+                            charge.usage.total_tokens,
+                            charge.usage.output_tokens,
+                            charge.usage.cached_input_tokens,
+                            charge.usage.cache_creation_input_tokens,
+                        ))
+                        .saturating_add(charge.usage.output_tokens);
+                }
+                priced
             }
             None => {
                 self.charge_usage_delta_at(
@@ -1389,6 +1426,12 @@ impl Session {
         self.total_cached_input_tokens = self
             .total_cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.total_cache_creation = rig::completion::CacheCreationUsage::add_optional(
+            self.total_cache_creation_input_tokens,
+            self.total_cache_creation,
+            usage.cache_creation_input_tokens,
+            usage.cache_creation,
+        );
         self.total_cache_creation_input_tokens = self
             .total_cache_creation_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
@@ -2184,6 +2227,10 @@ pub(crate) fn shell_interaction_command(content: &str) -> Option<&str> {
     command.starts_with('!').then_some(command)
 }
 
+fn cache_split_not_required(required: &bool) -> bool {
+    !*required
+}
+
 #[cfg(test)]
 mod shell_interaction_tests {
     use super::*;
@@ -2276,6 +2323,8 @@ mod preflight_tests {
         restored.set_cache_prices(crate::pricing::CachePrices {
             read: Some(0.04),
             write: Some(5.0),
+            write_1h: None,
+            split_required: false,
         });
         let mut explicit: Session =
             serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
@@ -2291,6 +2340,8 @@ mod preflight_tests {
         session.set_cache_prices(crate::pricing::CachePrices {
             read: Some(1.0),
             write: Some(2.0),
+            write_1h: None,
+            split_required: false,
         });
         let mut restored: Session =
             serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
@@ -2314,7 +2365,12 @@ mod preflight_tests {
         ] {
             session.total_cost = 0.0;
             session.output_token_cost = 0.0;
-            session.set_cache_prices(crate::pricing::CachePrices { read, write });
+            session.set_cache_prices(crate::pricing::CachePrices {
+                read,
+                write,
+                write_1h: None,
+                split_required: false,
+            });
             session.charge_usage_delta(usage, true);
             assert_eq!(session.total_cost, expected);
         }
@@ -2377,6 +2433,8 @@ mod preflight_tests {
         main.set_cache_prices(crate::pricing::CachePrices {
             read: Some(4.0),
             write: None,
+            write_1h: None,
+            split_required: false,
         });
         resolved.same_as_session = true;
         let prices =

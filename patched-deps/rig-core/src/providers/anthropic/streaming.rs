@@ -261,6 +261,13 @@ impl GetTokenUsage for StreamingCompletionResponse {
         usage.output_tokens = self.usage.output_tokens as u64;
         usage.cached_input_tokens = self.usage.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.usage.cache_creation_input_tokens.unwrap_or(0);
+        usage.cache_creation =
+            self.usage
+                .cache_creation
+                .map(|split| crate::completion::CacheCreationUsage {
+                    ephemeral_5m_input_tokens: split.ephemeral_5m_input_tokens,
+                    ephemeral_1h_input_tokens: split.ephemeral_1h_input_tokens,
+                });
         usage.total_tokens = usage.input_tokens
             + usage.cached_input_tokens
             + usage.cache_creation_input_tokens

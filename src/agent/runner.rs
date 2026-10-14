@@ -1465,6 +1465,7 @@ impl From<Usage> for UsageDelta {
             total_tokens: usage.total_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation: usage.cache_creation,
             tool_use_prompt_tokens: usage.tool_use_prompt_tokens,
             reasoning_tokens: usage.reasoning_tokens,
         }
@@ -1479,6 +1480,7 @@ impl From<UsageDelta> for Usage {
             total_tokens: delta.total_tokens,
             cached_input_tokens: delta.cached_input_tokens,
             cache_creation_input_tokens: delta.cache_creation_input_tokens,
+            cache_creation: delta.cache_creation,
             tool_use_prompt_tokens: delta.tool_use_prompt_tokens,
             reasoning_tokens: delta.reasoning_tokens,
         }
@@ -1560,6 +1562,12 @@ pub(crate) fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
         cache_creation_input_tokens: left
             .cache_creation_input_tokens
             .saturating_add(right.cache_creation_input_tokens),
+        cache_creation: rig::completion::CacheCreationUsage::add_optional(
+            left.cache_creation_input_tokens,
+            left.cache_creation,
+            right.cache_creation_input_tokens,
+            right.cache_creation,
+        ),
         tool_use_prompt_tokens: left
             .tool_use_prompt_tokens
             .saturating_add(right.tool_use_prompt_tokens),
@@ -1591,6 +1599,12 @@ fn usage_nonnegative_difference(
         total_tokens: difference!(total_tokens),
         cached_input_tokens: difference!(cached_input_tokens),
         cache_creation_input_tokens: difference!(cache_creation_input_tokens),
+        cache_creation: rig::completion::CacheCreationUsage::difference_optional(
+            aggregate.cache_creation_input_tokens,
+            aggregate.cache_creation,
+            observed.cache_creation_input_tokens,
+            observed.cache_creation,
+        ),
         tool_use_prompt_tokens: difference!(tool_use_prompt_tokens),
         reasoning_tokens: difference!(reasoning_tokens),
     }
@@ -8770,6 +8784,7 @@ mod tests {
             total_tokens: 10,
             cached_input_tokens: 10,
             cache_creation_input_tokens: 10,
+            cache_creation: None,
             tool_use_prompt_tokens: 10,
             reasoning_tokens: 10,
         };
@@ -8779,6 +8794,7 @@ mod tests {
             total_tokens: u64::MAX,
             cached_input_tokens: u64::MAX,
             cache_creation_input_tokens: u64::MAX,
+            cache_creation: None,
             tool_use_prompt_tokens: u64::MAX,
             reasoning_tokens: u64::MAX,
         };
@@ -8807,6 +8823,7 @@ mod tests {
             total_tokens: u64::MAX - 1,
             cached_input_tokens: u64::MAX - 1,
             cache_creation_input_tokens: u64::MAX - 1,
+            cache_creation: None,
             tool_use_prompt_tokens: u64::MAX - 1,
             reasoning_tokens: u64::MAX - 1,
         };
@@ -8816,6 +8833,7 @@ mod tests {
             total_tokens: 10,
             cached_input_tokens: 10,
             cache_creation_input_tokens: 10,
+            cache_creation: None,
             tool_use_prompt_tokens: 10,
             reasoning_tokens: 10,
         };
@@ -8825,6 +8843,7 @@ mod tests {
             total_tokens: u64::MAX,
             cached_input_tokens: u64::MAX,
             cache_creation_input_tokens: u64::MAX,
+            cache_creation: None,
             tool_use_prompt_tokens: u64::MAX,
             reasoning_tokens: u64::MAX,
         };
@@ -8849,6 +8868,7 @@ mod tests {
             total_tokens: u64::MAX - 1,
             cached_input_tokens: u64::MAX - 1,
             cache_creation_input_tokens: u64::MAX - 1,
+            cache_creation: None,
             tool_use_prompt_tokens: u64::MAX - 1,
             reasoning_tokens: u64::MAX - 1,
         };
@@ -8858,6 +8878,7 @@ mod tests {
             total_tokens: 10,
             cached_input_tokens: 10,
             cache_creation_input_tokens: 10,
+            cache_creation: None,
             tool_use_prompt_tokens: 10,
             reasoning_tokens: 10,
         };

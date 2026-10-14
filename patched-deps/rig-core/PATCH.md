@@ -202,3 +202,15 @@ bytes. Successful loading acknowledges nothing. Application loopback controls
 cover denied mutation -> canonical next request -> accepted response -> effect,
 copied sibling histories, redaction, spill, pruning, cancellation and pre-dispatch
 authority revocation. Two actual consumer paths use explicit 1 MiB Rust threads.
+
+## Generic cache-write tier carrier (mini-agent-i7ro6.71)
+
+`completion::{CacheCreationUsage, Usage}` additionally carries an optional
+reported five-minute/one-hour write split. Checked aggregation/difference keeps
+a positive unknown component unknown; a complete zero split does not manufacture
+reported usage. Native blocking and streaming `GetTokenUsage` mappings preserve
+the already-validated raw split. Other provider/embedding constructors explicitly
+use `None`, without inferring TTL information from names or request parameters.
+No request TTL, tool execution, hook ordering, transport, or pricing calculation
+is changed by this SDK carrier itself. The application's fake native HTTP tests
+exercise both mappings and cumulative/zero/missing/invalid metrics.

@@ -244,6 +244,7 @@ async fn compress_messages_sums_usage_across_rolling_requests() {
                     total_tokens: 1_100 * n,
                     cached_input_tokens: 10 * n,
                     cache_creation_input_tokens: 5 * n,
+                    cache_creation: None,
                     tool_use_prompt_tokens: 0,
                     reasoning_tokens: 7 * n,
                 },
@@ -269,6 +270,7 @@ async fn compress_messages_sums_usage_across_rolling_requests() {
             total_tokens: 6_600,
             cached_input_tokens: 60,
             cache_creation_input_tokens: 30,
+            cache_creation: None,
             tool_use_prompt_tokens: 0,
             reasoning_tokens: 42,
         }

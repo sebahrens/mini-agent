@@ -142,6 +142,31 @@ fail closed for a capped session. Without a cap they produce a tracking warning;
 observed spend and valid pending receipts remain in memory. Repeated saves and
 receipt retries cannot charge or append the same receipt twice.
 
+New receipts use version 2 to retain a reported native five-minute/one-hour
+cache-write split and a separately captured one-hour rate. The one-hour fallback
+inherits twice the selected base input price unless `cache_write_1h_token_cost`
+explicitly overrides it; an explicit five-minute write override is
+never scaled to infer it. Native input excludes cache tiers. Positive-base
+equivalent-input rounding happens once over the combined tier pool; a free base
+still charges explicitly paid cache tiers directly. Legacy version-1 rows retain
+their original pricing interpretation and reject version-2 metadata. Historical
+rows are not rewritten or repriced. A required split that is absent leaves the
+observation unpriced and blocks subsequent capped work while retaining a valid
+completed answer and its metrics. Tier metadata alone is not proof of reported
+nonzero usage. Request TTL selection and cache-prefix placement are separate
+controls. The owner global `cache_ttl="1h"` selects the native policy, captured
+with every ordinary/auxiliary request. Positive writes missing a required split
+add no fabricated Session/headless/judge cost; the account and ledger retain an
+incomplete/unpriced observation. Default five-minute and version-1 estimates
+keep their existing interpretation. Raw cache controls or transcript overrides
+also require a split because the host cannot attest their effective write TTL.
+Task proxy units use reported tiers or the larger captured write ratio when a
+required split is missing; these conservative units are not dollar quotes.
+
+`/cost` reports known write tiers and the latest recorded model request's
+uncached/cached input. Old positive write totals cannot acquire a fabricated TTL
+breakdown after reload or subsequent reported calls. Reads do not rewrite rows.
+
 `src/spend/report.rs` owns the bounded read-only projection.
 `src/spend/request_tests.rs` owns fake native HTTP fixtures for raw auxiliary
 accounting, cancellation, SDK invalid-tool failures, captured prices and refusal

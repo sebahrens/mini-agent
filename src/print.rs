@@ -1183,24 +1183,21 @@ pub(crate) struct HeadlessPricing {
 
 impl HeadlessPricing {
     pub(crate) fn from_session(session: &Session, cfg: &crate::config::Config) -> Self {
+        let mut cache_prices = session.cache_prices();
+        cache_prices.split_required |= cfg.is_anthropic_native(&session.provider)
+            && cfg.native_cache_split_required(&session.model);
         Self {
             anthropic_native: cfg.is_anthropic_native(&session.provider),
             input_token_cost: session.input_token_cost,
             output_token_cost: session.output_token_cost,
-            cache_prices: session.cache_prices(),
+            cache_prices,
         }
     }
 
     pub(crate) fn cost(self, usage: Usage) -> f64 {
         self.cache_prices.estimate_cost(
             self.anthropic_native,
-            crate::event::UsageDelta {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                ..Default::default()
-            },
+            usage.into(),
             self.input_token_cost,
             self.output_token_cost,
         )
@@ -1953,6 +1950,14 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let mut model_entries = vec![
         ("provider", provider.to_string()),
         ("model", model.to_string()),
+        (
+            "cache-ttl",
+            if cfg.is_anthropic_native(&provider) {
+                cfg.cache_ttl.unwrap_or_default().as_str().to_string()
+            } else {
+                "not applicable (Anthropic-native only)".into()
+            },
+        ),
     ];
     if let Some(temp) = temperature {
         model_entries.push(("temperature", temp.to_string()));
@@ -2702,12 +2707,16 @@ mod tests {
         session.set_cache_prices(crate::pricing::CachePrices {
             read: Some(1.0),
             write: Some(2.0),
+            write_1h: None,
+            split_required: false,
         });
         let pricing = HeadlessPricing::from_session(&session, &crate::config::Config::default());
         session.input_token_cost = 4.0;
         session.set_cache_prices(crate::pricing::CachePrices {
             read: Some(0.2),
             write: Some(5.0),
+            write_1h: None,
+            split_required: false,
         });
         let usage = Usage {
             input_tokens: 1_000_000,

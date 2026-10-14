@@ -83,6 +83,10 @@ pub struct Config {
         deserialize_with = "crate::spend::deserialize_cap"
     )]
     pub max_budget_usd: Option<f64>,
+    /// Owner-selected native Anthropic cache TTL. Project layers cannot alter
+    /// this billing policy. Omission preserves manual five-minute caching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<PromptCacheTtl>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Provider-specific JSON shallow-merged into every completion request body
@@ -1202,6 +1206,27 @@ impl ShowToolDetails {
             ShowToolDetails::Bool(true) => ResolvedShowToolDetails::Unlimited,
             ShowToolDetails::Lines(n) => ResolvedShowToolDetails::Limited(*n),
         }
+    }
+}
+
+impl Config {
+    pub(crate) fn native_cache_split_required(&self, model: &str) -> bool {
+        let extras = resolve_extra_body(self, model);
+        let raw_override = extras.as_ref().is_some_and(|extras| {
+            let marked = |block: &serde_json::Value| {
+                block
+                    .get("cache_control")
+                    .is_some_and(|value| !value.is_null())
+            };
+            marked(extras)
+                || extras.get("system").is_some()
+                || extras.get("messages").is_some()
+                || extras
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|tools| tools.iter().any(marked))
+        });
+        self.cache_ttl == Some(PromptCacheTtl::OneHour) || raw_override
     }
 }
 

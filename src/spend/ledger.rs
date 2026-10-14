@@ -24,6 +24,7 @@ pub(crate) struct Totals {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    pub cache_creation: Option<rig::completion::CacheCreationUsage>,
     pub known_cost: f64,
     pub unpriced_records: usize,
     pub unreported_records: usize,
@@ -45,6 +46,12 @@ impl Totals {
         add!(input_tokens);
         add!(output_tokens);
         add!(cached_input_tokens);
+        self.cache_creation = rig::completion::CacheCreationUsage::add_optional(
+            self.cache_creation_input_tokens,
+            self.cache_creation,
+            row.usage.cache_creation_input_tokens,
+            row.usage.cache_creation,
+        );
         add!(cache_creation_input_tokens);
         self.records += 1;
         self.unreported_records += usize::from(!row.usage_reported);
@@ -84,6 +91,32 @@ pub(crate) struct LedgerSummary {
     pub session: Totals,
     pub session_by_model: BTreeMap<(String, String), Totals>,
     pub session_model_details_capped: bool,
+    pub last_session_request: Option<CacheRequestSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CacheRequestSummary {
+    pub provider: String,
+    pub model: String,
+    pub kind: super::RequestKind,
+    pub usage: crate::event::UsageDelta,
+    pub anthropic_native: bool,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    id: Uuid,
+}
+
+impl CacheRequestSummary {
+    fn from_row(row: &Row) -> Self {
+        Self {
+            provider: row.provider.clone(),
+            model: row.model.clone(),
+            kind: row.kind,
+            usage: row.usage,
+            anthropic_native: row.prices.anthropic_native,
+            timestamp: row.ts,
+            id: row.id,
+        }
+    }
 }
 
 struct Scan {
@@ -536,6 +569,14 @@ fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
         }
         if session_id == Some(row.session_id.as_str()) {
             scanned.summary.session.add(&row)?;
+            if scanned
+                .summary
+                .last_session_request
+                .as_ref()
+                .is_none_or(|previous| (row.ts, row.id) > (previous.timestamp, previous.id))
+            {
+                scanned.summary.last_session_request = Some(CacheRequestSummary::from_row(&row));
+            }
             let key = (row.provider.clone(), row.model.clone());
             if scanned.summary.session_by_model.contains_key(&key)
                 || scanned.summary.session_by_model.len() < MAX_MODEL_DETAILS

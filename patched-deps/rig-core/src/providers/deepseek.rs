@@ -258,6 +258,7 @@ impl GetTokenUsage for Usage {
                 .map(u64::from)
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
+            cache_creation: None,
             tool_use_prompt_tokens: 0,
             reasoning_tokens: self
                 .completion_tokens_details

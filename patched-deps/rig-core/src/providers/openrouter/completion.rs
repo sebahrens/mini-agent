@@ -722,6 +722,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     total_tokens: usage.total_tokens as u64,
                     cached_input_tokens: cached_input,
                     cache_creation_input_tokens: cache_creation,
+                    cache_creation: None,
                     tool_use_prompt_tokens: 0,
                     reasoning_tokens: 0,
                 }

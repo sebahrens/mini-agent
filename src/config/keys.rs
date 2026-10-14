@@ -71,6 +71,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_tokens"),
     key("turn_token_budget"),
     key("max_budget_usd"),
+    key("cache_ttl"),
     key("temperature"),
     key("extra_body"),
     key("reasoning"),

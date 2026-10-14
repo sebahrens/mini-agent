@@ -777,6 +777,7 @@ mod tests {
                     output_token_cost: None,
                     cache_read_token_cost: None,
                     cache_write_token_cost: None,
+                    cache_write_1h_token_cost: None,
                     reserve_tokens: None,
                     temperature: None,
                     extra_body: None,

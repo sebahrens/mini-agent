@@ -2927,7 +2927,10 @@ async fn execute_prompt(
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
 
-    let model = client.completion_model(model_str.to_string());
+    let model = client.completion_model_with_cache_ttl(
+        model_str.to_string(),
+        state.cfg.cache_ttl.unwrap_or_default(),
+    );
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);

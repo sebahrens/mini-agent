@@ -185,6 +185,12 @@ impl GetTokenUsage for Usage {
         usage.output_tokens = self.output_tokens;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or_default();
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or_default();
+        usage.cache_creation =
+            self.cache_creation
+                .map(|split| crate::completion::CacheCreationUsage {
+                    ephemeral_5m_input_tokens: split.ephemeral_5m_input_tokens,
+                    ephemeral_1h_input_tokens: split.ephemeral_1h_input_tokens,
+                });
         usage.total_tokens = self.input_tokens
             + self.cache_read_input_tokens.unwrap_or_default()
             + self.cache_creation_input_tokens.unwrap_or_default()
@@ -300,18 +306,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 .map_err(|_| CompletionError::ResponseError(EMPTY_RESPONSE_ERROR.to_owned()))?
         };
 
-        let usage = completion::Usage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            total_tokens: response.usage.input_tokens
-                + response.usage.cache_read_input_tokens.unwrap_or(0)
-                + response.usage.cache_creation_input_tokens.unwrap_or(0)
-                + response.usage.output_tokens,
-            cached_input_tokens: response.usage.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: response.usage.cache_creation_input_tokens.unwrap_or(0),
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        };
+        let usage = response.usage.token_usage();
 
         Ok(completion::CompletionResponse {
             choice,

@@ -804,7 +804,7 @@ async fn usd_budget_native_advisor_receipt_is_retained_and_next_request_refused(
 
 #[tokio::test]
 async fn usd_budget_native_primary_missing_usage_blocks_paid_but_preserves_known_free_rates() {
-    for case in 0..4 {
+    for case in 0..5 {
         let free = case == 1;
         let root = crate::tests::OwnedTestDirectory::new("cost-primary-missing-usage");
         let with_usage = response("nonempty answer with unreported metrics", false);
@@ -830,6 +830,8 @@ async fn usd_budget_native_primary_missing_usage_blocks_paid_but_preserves_known
             let cache = crate::pricing::CachePrices {
                 read: Some(if case == 2 { 0.5 } else { 0.0 }),
                 write: Some(if case == 3 { 0.5 } else { 0.0 }),
+                write_1h: Some(if case == 4 { 0.5 } else { 0.0 }),
+                split_required: false,
             };
             run = run.with_captured_profile(
                 "cost-wire",
