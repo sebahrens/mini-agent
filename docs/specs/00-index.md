@@ -54,6 +54,7 @@ planning context only; it cannot override the cited section.
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered (see reachability note) | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 | Feature | [goals.md](goals.md) | Delivered; reconciled 2026-09-12 after a post-delivery review (see its shipped-binary status) | Persistent objectives, the round loop, the completion gate, verification tiers, bounds, and the goal surfaces |
+| Feature | [acp-session-runtime-policy.md](acp-session-runtime-policy.md) | Runtime modes, choices and Plan updates implemented; full session parity pending | Per-session permission mode, bounded runtime approvals/denials, actual todo-store updates; persistence and editor resume remain tracked |
 
 **Phase 5 reachability note.** "Delivered" in the row above means the phase owns those concerns and
 their contracts are implemented and regression-tested. It does not mean every one of them is

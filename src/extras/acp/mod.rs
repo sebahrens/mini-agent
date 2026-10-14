@@ -1,6 +1,7 @@
 mod accept;
 pub mod config;
 mod idle;
+mod policy;
 mod tls;
 
 use std::collections::{HashMap, VecDeque};
@@ -53,6 +54,7 @@ struct CommittedTurn {
 
 #[derive(Default)]
 struct SessionHistory {
+    policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
@@ -1117,6 +1119,16 @@ async fn connect_agent(
         .on_receive_request(
             {
                 let state = state.clone();
+                move |req: SetSessionModeRequest, responder, cx| {
+                    let state = state.clone();
+                    async move { handle_set_session_mode(req, responder, cx, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
                 move |req: CloseSessionRequest, responder, _cx| {
                     let state = state.clone();
                     async move { handle_close_session(req, responder, &state).await }
@@ -1295,12 +1307,24 @@ async fn handle_new_session(
         Some(state.cli.resolve_model(&state.cfg).as_str()),
     )
     .map_err(|_| agent_client_protocol::Error::new(-32602, "invalid USD budget configuration"))?;
+    let authority =
+        crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg)
+            .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?
+            .0;
+    let policy = policy::SessionPolicy::new(
+        authority.mode,
+        authority.tools_enabled && authority.permission_checks_enabled,
+    );
+    let modes = policy.modes();
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
     sessions.insert(
         session_id.clone(),
         SessionState {
             spend,
-            history: Arc::new(Mutex::new(SessionHistory::default())),
+            history: Arc::new(Mutex::new(SessionHistory {
+                policy,
+                ..Default::default()
+            })),
             workspace,
             context: Arc::new(context),
             turns: turns.clone(),
@@ -1323,7 +1347,7 @@ async fn handle_new_session(
     state.idle.sessions_changed(sessions.len());
     drop(sessions);
 
-    let resp = NewSessionResponse::new(session_id);
+    let resp = NewSessionResponse::new(session_id).modes(modes);
     responder.respond(resp)
 }
 
@@ -1505,6 +1529,46 @@ fn with_client_mcp_servers<'a>(
         servers.insert(name.clone(), server.clone());
     }
     std::borrow::Cow::Owned(merged)
+}
+
+async fn handle_set_session_mode(
+    req: SetSessionModeRequest,
+    responder: Responder<SetSessionModeResponse>,
+    cx: ConnectionTo<Client>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&req.session_id)
+        .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
+    let turns = lock_unpoisoned(&session.turns);
+    if !turns.queue.is_empty() {
+        return Err(agent_client_protocol::Error::new(
+            -32000,
+            "ACP session already has an active prompt",
+        ));
+    }
+    session
+        .workspace
+        .validate()
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    let history = session
+        .history
+        .try_lock()
+        .map_err(|_| agent_client_protocol::Error::new(-32000, "ACP session history is busy"))?;
+    history
+        .policy
+        .set_mode(req.mode_id.0.as_ref())
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
+    drop(history);
+    drop(turns);
+    drop(sessions);
+    cx.send_notification(SessionNotification::new(
+        req.session_id,
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(req.mode_id)),
+    ))?;
+    responder.respond(SetSessionModeResponse::new())
 }
 
 async fn handle_close_session(
@@ -2172,12 +2236,18 @@ async fn drive_question_request(
     let _ = question.reply.send(answer);
 }
 
+struct BridgePolicy {
+    policy: policy::SessionPolicy,
+    permission: Option<crate::permission::checker::PermCheck>,
+}
+
 async fn drive_permission_bridge(
     cx: ConnectionTo<Client>,
     _activity: idle::Activity,
     session_id: SessionId,
     mut ask_rx: crate::permission::ask::AskReceiver,
     control: Arc<TurnControl>,
+    runtime_policy: Option<BridgePolicy>,
     // Milliseconds this turn spent waiting on the user. A goal's time bound
     // measures how long the agent worked, not how long the person took to
     // answer, so the round subtracts this from its wall clock.
@@ -2188,6 +2258,7 @@ async fn drive_permission_bridge(
     const OPT_ALLOW_ONCE: &str = "allow_once";
     const OPT_ALLOW_ALWAYS: &str = "allow_always";
     const OPT_DENY: &str = "deny";
+    const OPT_DENY_ALWAYS: &str = "deny_always";
 
     loop {
         let ask = tokio::select! {
@@ -2246,7 +2317,7 @@ async fn drive_permission_bridge(
             tool_call_id.clone(),
             ToolCallUpdateFields::new().title(title).content(content),
         );
-        let options = vec![
+        let mut options = vec![
             PermissionOption::new(
                 OPT_ALLOW_ONCE,
                 "Allow once",
@@ -2260,6 +2331,13 @@ async fn drive_permission_bridge(
             .meta(allow_always_meta),
             PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
         ];
+        if runtime_policy.is_some() {
+            options.push(PermissionOption::new(
+                OPT_DENY_ALWAYS,
+                "Deny this exact request for this session",
+                PermissionOptionKind::RejectAlways,
+            ));
+        }
         let req = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
 
         #[cfg(feature = "goal")]
@@ -2276,7 +2354,8 @@ async fn drive_permission_bridge(
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        let (decision, notice) = match response {
+        let mut choice = None;
+        let (mut decision, mut notice) = match response {
             None => (UserDecision::Deny, "Permission request cancelled"),
             Some(Ok(resp)) => match resp.outcome {
                 RequestPermissionOutcome::Cancelled => {
@@ -2285,9 +2364,20 @@ async fn drive_permission_bridge(
                 RequestPermissionOutcome::Selected(sel) => {
                     let id = sel.option_id.0.as_ref();
                     if id == OPT_ALLOW_ALWAYS {
+                        let entries = std::iter::once(suggested.clone())
+                            .chain(ask.additional_allow_patterns.iter().cloned())
+                            .map(|pattern| (ask.tool.to_string(), pattern))
+                            .collect();
+                        choice = Some(policy::Choice::Allow(entries));
                         (UserDecision::AllowAlways(suggested), "Permission approved")
                     } else if id == OPT_ALLOW_ONCE {
                         (UserDecision::AllowOnce, "Permission approved")
+                    } else if id == OPT_DENY_ALWAYS && runtime_policy.is_some() {
+                        choice = Some(policy::Choice::Deny(
+                            ask.tool.to_string(),
+                            ask.input.clone(),
+                        ));
+                        (UserDecision::Deny, "Exact request denied for this session")
                     } else {
                         (UserDecision::Deny, "Permission denied")
                     }
@@ -2299,6 +2389,25 @@ async fn drive_permission_bridge(
                 (UserDecision::Deny, "Permission request failed")
             }
         };
+        if control.is_cancelled() || ask.reply.is_closed() {
+            choice = None;
+            decision = UserDecision::Deny;
+            notice = "Permission request cancelled";
+        } else if let (Some(runtime), Some(selected)) = (&runtime_policy, &choice)
+            && !runtime.policy.can_record(selected)
+        {
+            choice = None;
+            decision = UserDecision::Deny;
+            notice = "Session permission choice capacity exceeded";
+        }
+        if let (Some(runtime), Some(policy::Choice::Deny(tool, input))) = (&runtime_policy, &choice)
+            && let Some(permission) = &runtime.permission
+        {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .add_session_exact_deny(tool, input);
+        }
         // This lifecycle represents the approval request, not the underlying
         // effect. Ordinary tool calls remain owned by the runner's result event.
         if synthetic_tool_call_id {
@@ -2320,7 +2429,20 @@ async fn drive_permission_bridge(
                 tracing::warn!("ACP failed to settle synthetic permission tool call: {error}");
             }
         }
-        let _ = ask.reply.send(decision);
+        // Notification serialization and checker locking are synchronous, but
+        // another owned task may still cancel or abandon this reply meanwhile.
+        if control.is_cancelled() || ask.reply.is_closed() {
+            decision = UserDecision::Deny;
+            choice = None;
+        }
+        // Successful delivery is the accepted selection boundary. Later turn
+        // cancellation does not revoke an already-delivered human choice.
+        if ask.reply.send(decision).is_ok()
+            && let (Some(runtime), Some(choice)) = (&runtime_policy, choice)
+            && let Err(error) = runtime.policy.record(choice)
+        {
+            tracing::error!("ACP session choice could not be retained: {error}");
+        }
     }
     // Drain remaining buffered asks as Deny after control cancelled.
     while let Ok(ask) = ask_rx.try_recv() {
@@ -2749,6 +2871,9 @@ async fn execute_prompt(
     {
         return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
     }
+    // The relay reads the same session-local store the actual tool mutates.
+    // Tool output and arguments are display data, never a second TODO source.
+    let plan_store = todo_store.clone();
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
@@ -2769,6 +2894,7 @@ async fn execute_prompt(
             cx,
             control,
             paused_runner,
+            plan_store,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -2804,6 +2930,7 @@ async fn execute_prompt(
             cx,
             control,
             event_rx,
+            plan_store,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -2811,7 +2938,7 @@ async fn execute_prompt(
     }
 
     let workspace_root = workspace.root();
-    let authority =
+    let mut authority =
         match crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -2819,6 +2946,9 @@ async fn execute_prompt(
             }
         }
         .0;
+    if let Some(mode) = history.policy.mode() {
+        authority.mode = mode;
+    }
     let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_with_cli_at(
         &state.cli,
         &state.cfg,
@@ -2826,6 +2956,7 @@ async fn execute_prompt(
         Some(workspace_root.to_path_buf()),
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    history.policy.apply(&permission);
     if let Some(rx) = ask_rx {
         tokio::spawn(state.idle.admit()?.track(drive_permission_bridge(
             cx.clone(),
@@ -2833,6 +2964,10 @@ async fn execute_prompt(
             session_id.clone(),
             rx,
             control.clone(),
+            Some(BridgePolicy {
+                policy: history.policy.clone(),
+                permission: permission.clone(),
+            }),
             #[cfg(feature = "goal")]
             blocked_ms,
         )));
@@ -3020,6 +3155,7 @@ async fn execute_prompt(
         cx,
         control,
         paused_runner,
+        plan_store,
         #[cfg(feature = "goal")]
         (&state.cfg, &usage_provider),
     )
@@ -3088,18 +3224,28 @@ async fn relay_paused_runner(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
+    plan_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
-        return cancelled_after_runner(&mut runner.event_rx).await;
+        let mut last_plan = Vec::new();
+        return cancelled_after_runner_with_plan(
+            &mut runner.event_rx,
+            &session_id,
+            &cx,
+            &plan_store,
+            &mut last_plan,
+        )
+        .await;
     }
     relay_prompt_events(
         session_id,
         cx,
         control,
         runner.event_rx,
+        plan_store,
         #[cfg(feature = "goal")]
         usage_provider,
     )
@@ -3125,20 +3271,78 @@ fn add_goal_usage(
         .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
 }
 
+/// Publish only the actual session store. A denied or failed `todo_write`
+/// leaves it unchanged, and a successful empty replacement clears the plan.
+fn relay_plan_if_changed(
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    store: &crate::agent::tools::TodoStore,
+    previous: &mut Vec<crate::agent::tools::todo::TodoItem>,
+) {
+    let current = store.snapshot();
+    if current == *previous {
+        return;
+    }
+    let entries = current
+        .iter()
+        .take(crate::agent::tools::todo::MAX_TODO_ITEMS)
+        .map(|item| {
+            let priority = match item.priority.as_str() {
+                "high" => PlanEntryPriority::High,
+                "low" => PlanEntryPriority::Low,
+                _ => PlanEntryPriority::Medium,
+            };
+            let status = match item.status.as_str() {
+                "in_progress" => PlanEntryStatus::InProgress,
+                "completed" => PlanEntryStatus::Completed,
+                _ => PlanEntryStatus::Pending,
+            };
+            let mut entry = PlanEntry::new(
+                item.content
+                    .chars()
+                    .take(crate::agent::tools::todo::MAX_TODO_CONTENT_CHARS)
+                    .collect::<String>(),
+                priority,
+                status,
+            );
+            // ACP v1 has no cancelled status. Preserve the actual status as
+            // metadata rather than presenting abandoned work as completed.
+            if item.status == "cancelled" {
+                entry.meta = Some(serde_json::Map::from_iter([(
+                    "mini-agent-status".to_owned(),
+                    serde_json::json!("cancelled"),
+                )]));
+            }
+            entry
+        })
+        .collect();
+    let notification =
+        SessionNotification::new(session_id.clone(), SessionUpdate::Plan(Plan::new(entries)));
+    match cx.send_notification(notification) {
+        Ok(()) => *previous = current,
+        Err(error) => tracing::warn!(%error, "ACP failed to send plan notification"),
+    }
+}
+
 async fn relay_prompt_events(
     session_id: SessionId,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    plan_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
+    let mut last_plan = Vec::new();
+    relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
     loop {
         let event = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return cancelled_after_runner(&mut rx).await;
+                return cancelled_after_runner_with_plan(
+                    &mut rx, &session_id, &cx, &plan_store, &mut last_plan,
+                ).await;
             }
             event = rx.recv() => event,
         };
@@ -3241,6 +3445,7 @@ async fn relay_prompt_events(
                 if let Err(e) = cx.send_notification(notif) {
                     tracing::warn!("ACP failed to send tool result notification: {}", e);
                 }
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
             }
             AgentEvent::ToolLoop { name, message } => {
                 let text = format!("loop guard ({name}): {message}");
@@ -3300,7 +3505,14 @@ async fn relay_prompt_events(
             AgentEvent::CompactionBoundary { .. } => {
                 tracing::error!("interactive-only compaction boundary reached ACP");
                 control.cancel();
-                return cancelled_after_runner(&mut rx).await;
+                return cancelled_after_runner_with_plan(
+                    &mut rx,
+                    &session_id,
+                    &cx,
+                    &plan_store,
+                    &mut last_plan,
+                )
+                .await;
             }
             AgentEvent::AwaitingUser {
                 question,
@@ -3309,6 +3521,7 @@ async fn relay_prompt_events(
                 // Closing this receiver waits for the exact run and its owned
                 // effects. A future ordinary user prompt gets a fresh slot.
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
                     question: Some(*question),
@@ -3320,6 +3533,7 @@ async fn relay_prompt_events(
             }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
                     question: None,
@@ -3334,6 +3548,7 @@ async fn relay_prompt_events(
                 interactions,
             } => {
                 while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::Refusal,
                     question: None,
@@ -3345,6 +3560,20 @@ async fn relay_prompt_events(
             }
         }
     }
+}
+
+/// Cancellation can win after a tool mutates its store but before the relay
+/// consumes its result event. Publish that actual final state after draining.
+async fn cancelled_after_runner_with_plan(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    store: &crate::agent::tools::TodoStore,
+    previous: &mut Vec<crate::agent::tools::todo::TodoItem>,
+) -> PromptOutcome {
+    let outcome = cancelled_after_runner(rx).await;
+    relay_plan_if_changed(session_id, cx, store, previous);
+    outcome
 }
 
 async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> PromptOutcome {
@@ -4299,6 +4528,275 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn acp53_actual_mode_rpc_is_session_local_and_unknown_modes_leave_it_unchanged() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { unreachable!() }));
+        let state = fixture_state(fixture);
+        let retained = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink = updates.clone();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::CurrentModeUpdate(update) = notification.update {
+                        sink.lock()
+                            .unwrap()
+                            .push(update.current_mode_id.to_string());
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let first = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?;
+                let second = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                assert_eq!(first.modes.as_ref().unwrap().available_modes.len(), 6);
+                let initial = second.modes.unwrap().current_mode_id.to_string();
+                cx.send_request(SetSessionModeRequest::new(
+                    first.session_id.clone(),
+                    SessionModeId::new("readonly"),
+                ))
+                .block_task()
+                .await?;
+                assert!(
+                    cx.send_request(SetSessionModeRequest::new(
+                        first.session_id.clone(),
+                        SessionModeId::new("none")
+                    ))
+                    .block_task()
+                    .await
+                    .is_err()
+                );
+                let sessions = retained.sessions.lock().await;
+                assert_eq!(
+                    sessions[&first.session_id]
+                        .history
+                        .lock()
+                        .await
+                        .policy
+                        .mode(),
+                    Some(crate::permission::SecurityMode::ReadOnly)
+                );
+                assert_eq!(
+                    sessions[&second.session_id]
+                        .history
+                        .lock()
+                        .await
+                        .policy
+                        .mode()
+                        .unwrap()
+                        .to_string(),
+                    initial
+                );
+                drop(sessions);
+                cx.send_request(CloseSessionRequest::new(first.session_id))
+                    .block_task()
+                    .await?;
+                cx.send_request(CloseSessionRequest::new(second.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*updates.lock().unwrap(), vec!["readonly"]);
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_mode_rpc_refuses_an_admitted_pending_turn() {
+        struct Release(Arc<Notify>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let fixture: PromptFixture = {
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(vec![done("settled", vec![Message::assistant("settled")])])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let retained = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client.builder().connect_with(InMemoryAgent(state), async move |cx| {
+            let _release_on_exit = Release(release.clone());
+            let created = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+            let initial = created.modes.unwrap().current_mode_id.to_string();
+            let pending = cx.send_request(prompt(created.session_id.clone(), "pending")).block_task();
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut pending => panic!("prompt ended before the owned pending gate: {result:?}"),
+            }
+            assert!(cx.send_request(SetSessionModeRequest::new(created.session_id.clone(), SessionModeId::new("readonly")))
+                .block_task().await.is_err());
+            {
+                let sessions = retained.sessions.lock().await;
+                assert!(sessions[&created.session_id].history.try_lock().is_err());
+            }
+            release.notify_one();
+            assert_eq!(pending.await?.stop_reason, StopReason::EndTurn);
+            {
+                let sessions = retained.sessions.lock().await;
+                assert_eq!(sessions[&created.session_id].history.lock().await.policy.mode().unwrap().to_string(), initial);
+            }
+            cx.send_request(SetSessionModeRequest::new(created.session_id.clone(), SessionModeId::new("readonly")))
+                .block_task().await?;
+            cx.send_request(CloseSessionRequest::new(created.session_id)).block_task().await?;
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_permission_selections_rebuild_only_the_selected_session_choice() {
+        use crate::permission::{
+            PermissionConfigs, SecurityMode,
+            ask::{AskRequest, UserDecision},
+            checker::{CheckResult, PermissionChecker},
+        };
+        let root = crate::tests::OwnedTestDirectory::new("acp53-rpc-choice");
+        let target = root
+            .path()
+            .join("exact*.txt")
+            .to_string_lossy()
+            .into_owned();
+        for selected in ["allow_always", "deny_always", "unadvertised"] {
+            let policy = policy::SessionPolicy::new(SecurityMode::Guarded, true);
+            let retained = policy.clone();
+            let permission = Some(Arc::new(StdMutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::default(),
+                    SecurityMode::Guarded,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
+            let agent = Agent
+                .builder()
+                .on_receive_request(
+                    async |_: InitializeRequest, responder, _cx| {
+                        responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                    },
+                    on_receive_request!(),
+                )
+                .with_spawned(move |cx| async move {
+                    drive_permission_bridge(
+                        cx,
+                        idle::Activity::default(),
+                        SessionId::new("choice"),
+                        ask_rx,
+                        Arc::new(TurnControl::new()),
+                        Some(BridgePolicy { policy, permission }),
+                        #[cfg(feature = "goal")]
+                        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    )
+                    .await;
+                    Ok(())
+                });
+            let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            let input = target.clone();
+            let connection = Client
+                .builder()
+                .on_receive_request(
+                    move |request: RequestPermissionRequest, responder, _cx| {
+                        requests.send((request, responder)).unwrap();
+                        async { Ok(()) }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(agent, async move |_cx| {
+                    let (reply, receiver) = tokio::sync::oneshot::channel();
+                    ask_tx
+                        .send(
+                            AskRequest {
+                                tool: "write".into(),
+                                input,
+                                tool_call_id: Some("current".into()),
+                                suggested_pattern: None,
+                                additional_allow_patterns: Vec::new(),
+                                reply,
+                            }
+                            .into(),
+                        )
+                        .await
+                        .unwrap();
+                    let (request, responder) = incoming.recv().await.unwrap();
+                    assert!(
+                        request
+                            .options
+                            .iter()
+                            .any(|option| option.kind == PermissionOptionKind::RejectAlways)
+                    );
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            selected,
+                        )),
+                    ))?;
+                    Ok(receiver.await.unwrap())
+                });
+            let decision = tokio::time::timeout(Duration::from_secs(5), connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(decision, UserDecision::AllowAlways(_)),
+                selected == "allow_always"
+            );
+            let next = Some(Arc::new(StdMutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::default(),
+                    SecurityMode::Guarded,
+                    Some(root.path().to_path_buf()),
+                    None,
+                )
+                .unwrap(),
+            )));
+            retained.apply(&next);
+            let result = next
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .check_bound_path("write", &target);
+            assert_eq!(
+                matches!(result, CheckResult::Allowed),
+                selected == "allow_always"
+            );
+            assert_eq!(
+                matches!(result, CheckResult::Denied(_)),
+                selected == "deny_always"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn allow_always_meta_names_the_exact_session_rule_it_installs() {
         use crate::permission::ask::{AskRequest, UserDecision};
 
@@ -4324,6 +4822,7 @@ mod protocol_tests {
                     SessionId::new("allow-always-meta"),
                     ask_rx,
                     control,
+                    None,
                     #[cfg(feature = "goal")]
                     Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 )
@@ -4470,6 +4969,7 @@ mod protocol_tests {
                             SessionId::new("permission-test"),
                             ask_rx,
                             bridge_control,
+                            None,
                             #[cfg(feature = "goal")]
                             Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         )
@@ -4665,6 +5165,276 @@ mod protocol_tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn acp53_cancelled_relay_publishes_actual_store_after_owned_drain() {
+        use rig::tool::Tool;
+
+        struct CancelledRelay {
+            store: crate::agent::tools::TodoStore,
+            rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+            entered: Arc<Notify>,
+        }
+        impl ConnectTo<Client> for CancelledRelay {
+            async fn connect_to(
+                self,
+                client: impl ConnectTo<Agent>,
+            ) -> Result<(), agent_client_protocol::Error> {
+                let rx = Arc::new(StdMutex::new(Some(self.rx)));
+                Agent
+                    .builder()
+                    .on_receive_request(
+                        move |req: PromptRequest, responder: Responder<PromptResponse>, cx| {
+                            let rx = rx.lock().unwrap().take().unwrap();
+                            let store = self.store.clone();
+                            let entered = self.entered.clone();
+                            async move {
+                                let control = Arc::new(TurnControl::new());
+                                control.cancel();
+                                entered.notify_one();
+                                let outcome = relay_prompt_events(
+                                    req.session_id,
+                                    cx,
+                                    control,
+                                    rx,
+                                    store,
+                                    #[cfg(feature = "goal")]
+                                    (&Config::default(), "openai"),
+                                )
+                                .await;
+                                responder.respond(PromptResponse::new(outcome.reason))
+                            }
+                        },
+                        on_receive_request!(),
+                    )
+                    .connect_to(client)
+                    .await
+            }
+        }
+        let store = crate::agent::tools::TodoStore::default();
+        let entered = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let connection = Client.builder().on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                sink.lock().unwrap().push(notification);
+                Ok(())
+            }, agent_client_protocol::on_receive_notification!(),
+        ).connect_with(CancelledRelay { store: store.clone(), rx, entered: entered.clone() }, async move |cx| {
+            let session = SessionId::new("cancelled-plan");
+            let response = cx.send_request(prompt(session.clone(), "cancelled")).block_task();
+            tokio::pin!(response);
+            tokio::select! {
+                _ = entered.notified() => {}
+                outcome = &mut response => panic!("cancelled relay must still drain: {outcome:?}"),
+            }
+            assert!(updates.lock().unwrap().is_empty());
+            let output = crate::agent::tools::todo::WriteTodoList::new_with_store(None, None, store.clone())
+                .call(crate::agent::tools::todo::TodoWriteArgs { todos: vec![crate::agent::tools::todo::TodoItem {
+                    content: "actual write before drained result".to_owned(),
+                    status: "in_progress".into(), priority: "high".into(),
+                }] }).await.unwrap();
+            tx.send(AgentEvent::ToolResult { id: "cancelled-todo".into(), name: "todo_write".into(),
+                output: output.into(), is_error: false }).await.unwrap();
+            tx.send(done("settled", vec![Message::assistant("settled")])).await.unwrap();
+            drop(tx);
+            assert_eq!(response.await?.stop_reason, StopReason::Cancelled);
+            // The terminal response fences its prior queued final Plan update.
+            let updates = updates.lock().unwrap();
+            assert_eq!(updates.len(), 1, "{updates:?}");
+            assert_eq!(updates[0].session_id, session);
+            let SessionUpdate::Plan(plan) = &updates[0].update else { panic!("expected final plan") };
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].content, store.snapshot()[0].content);
+            assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp53_actual_todo_tool_relays_store_changes_clears_and_session_isolation() {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let stores = Arc::new(StdMutex::new(HashMap::<
+            String,
+            crate::agent::tools::TodoStore,
+        >::new()));
+        let fixture: RunnerFixture = {
+            let stores = stores.clone();
+            Arc::new(move |prompt, history| {
+                let store = stores.lock().unwrap().get(&prompt).unwrap().clone();
+                Box::pin(async move {
+                    let todos = match prompt.as_str() {
+                        "clear" => serde_json::json!([]),
+                        "denied" => serde_json::json!([{
+                            "content": "FORGED_DENIED_PLAN", "status": "pending", "priority": "high"
+                        }]),
+                        "invalid" => serde_json::json!([{
+                            "content": "FORGED_INVALID_PLAN", "status": "invalid", "priority": "high"
+                        }]),
+                        "isolated" => serde_json::json!([{
+                            "content": "SECOND_SESSION_ONLY", "status": "pending", "priority": "medium"
+                        }]),
+                        _ => serde_json::json!([
+                            {"content":"inspect", "status":"pending", "priority":"high"},
+                            {"content":"implement", "status":"in_progress", "priority":"medium"},
+                            {"content":"verify", "status":"completed", "priority":"low"},
+                            {"content":"abandoned", "status":"cancelled", "priority":"low"}
+                        ]),
+                    };
+                    let permission = (prompt == "denied").then(|| {
+                        let mut checker = crate::permission::checker::PermissionChecker::new(
+                            &crate::permission::PermissionConfigs::default(),
+                            crate::permission::SecurityMode::Yolo,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        checker.add_session_exact_deny("todo_write", "");
+                        Arc::new(StdMutex::new(checker))
+                    });
+                    let model = rig::test_utils::MockCompletionModel::from_stream_turns(vec![
+                        vec![
+                            rig::test_utils::MockStreamEvent::tool_call(
+                                "todo-call",
+                                "todo_write",
+                                serde_json::json!({"todos": todos}),
+                            ),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ],
+                        vec![
+                            rig::test_utils::MockStreamEvent::text("settled"),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ],
+                    ]);
+                    let agent = rig::agent::AgentBuilder::new(model)
+                        .tool(crate::agent::tools::todo::WriteTodoList::new_with_store(
+                            permission, None, store,
+                        ))
+                        .add_hook(crate::agent::runner::ToolLoopGuard)
+                        .default_max_turns(2)
+                        .build();
+                    crate::agent::runner::spawn_agent_paused(
+                        agent,
+                        prompt,
+                        history,
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    )
+                })
+            })
+        };
+        let state = runner_fixture_state(fixture);
+        let inspect_state = state.clone();
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let ledger_root = crate::tests::OwnedTestDirectory::new("acp53-plan-owned-ledger");
+        let ledger = Arc::new(crate::spend::Ledger::new(ledger_root.path()));
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client.builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                }, agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let first = cx.send_request(NewSessionRequest::new(cwd.clone())).block_task().await?.session_id;
+                let second = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?.session_id;
+                let (first_store, second_store) = {
+                    let mut sessions = inspect_state.sessions.lock().await;
+                    // Inject a real owned ledger and known zero prices for the
+                    // mock provider's actual SDK request account. No ambient
+                    // path override or production admission bypass is needed.
+                    for id in [&first, &second] {
+                        sessions.get_mut(id).unwrap().spend = crate::spend::run::Run::fixture(
+                            crate::spend::Account::new(&id.to_string(), None, 0.0).unwrap(),
+                            ledger.clone(),
+                            &id.to_string(),
+                            crate::spend::PriceSnapshot::capture(Some((0.0, 0.0)), Default::default(), false),
+                        );
+                    }
+                    (sessions[&first].todo_store.clone(), sessions[&second].todo_store.clone())
+                };
+                for case in ["update", "denied", "invalid", "clear"] {
+                    stores.lock().unwrap().insert(case.to_owned(), first_store.clone());
+                }
+                stores.lock().unwrap().insert("isolated".to_owned(), second_store.clone());
+                for case in ["update", "denied", "invalid", "clear", "isolated"] {
+                    let session = if case == "isolated" { &second } else { &first };
+                    let outcome = cx.send_request(prompt(session.clone(), case)).block_task().await?;
+                    assert_eq!(outcome.stop_reason, StopReason::EndTurn, "{case}");
+                    // Fence queued updates through the actual connection before
+                    // draining. All effects and the runner have settled above.
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+                    let updates = std::mem::take(&mut *notifications.lock().unwrap());
+                    let plans = updates.iter().filter_map(|notification| {
+                        if let SessionUpdate::Plan(plan) = &notification.update {
+                            assert_eq!(&notification.session_id, session);
+                            Some(plan)
+                        } else { None }
+                    }).collect::<Vec<_>>();
+                    match case {
+                        "clear" => {
+                            assert_eq!(plans.len(), 2);
+                            assert_eq!(plans[0].entries.len(), 4);
+                            assert!(plans[1].entries.is_empty());
+                            assert!(first_store.is_empty());
+                        }
+                        "isolated" => {
+                            assert_eq!(plans.len(), 1);
+                            assert_eq!(plans[0].entries[0].content, "SECOND_SESSION_ONLY");
+                            assert!(first_store.is_empty());
+                            assert_eq!(second_store.snapshot().len(), 1);
+                        }
+                        _ => {
+                            assert_eq!(plans.len(), 1, "{case}: {plans:?}; actual updates: {updates:?}; actual store: {:?}", first_store.snapshot());
+                            let entries = &plans[0].entries;
+                            assert_eq!(entries.iter().map(|entry| entry.content.as_str()).collect::<Vec<_>>(),
+                                ["inspect", "implement", "verify", "abandoned"]);
+                            assert_eq!(entries[0].priority, PlanEntryPriority::High);
+                            assert_eq!(entries[1].priority, PlanEntryPriority::Medium);
+                            assert_eq!(entries[2].priority, PlanEntryPriority::Low);
+                            assert_eq!(entries[0].status, PlanEntryStatus::Pending);
+                            assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
+                            assert_eq!(entries[2].status, PlanEntryStatus::Completed);
+                            assert_eq!(entries[3].status, PlanEntryStatus::Pending);
+                            assert_eq!(entries[3].meta.as_ref().unwrap()["mini-agent-status"], "cancelled");
+                            assert_eq!(first_store.snapshot().len(), 4);
+                            assert!(second_store.is_empty());
+                            if case != "update" {
+                                assert!(updates.iter().any(|notification| matches!(&notification.update,
+                                    SessionUpdate::ToolCallUpdate(update) if update.fields.status == Some(ToolCallStatus::Failed))),
+                                    "actual typed tool failure must remain failed: {updates:?}");
+                                let expected = if case == "denied" {
+                                    "Permission denied"
+                                } else {
+                                    "todo_write rejected"
+                                };
+                                assert!(updates.iter().any(|notification| matches!(&notification.update,
+                                    SessionUpdate::ToolCallUpdate(update) if serde_json::to_string(&update.fields.content).unwrap().contains(expected))),
+                                    "{case} must reach the actual tool refusal: {updates:?}");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -8665,6 +9435,7 @@ mod question_transport_tests {
                         SessionId::new("question-rpc"),
                         receiver,
                         control,
+                        None,
                         #[cfg(feature = "goal")]
                         Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     )

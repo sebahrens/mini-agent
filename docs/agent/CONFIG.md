@@ -2498,6 +2498,19 @@ rejected instead of queued. Protocol dispatch and work in other sessions remain
 independent. History is not persisted across server restarts, and the agent
 therefore neither advertises nor handles ACP `session/load`.
 
+ACP clients receive per-session permission modes when ordinary tools and
+permission checks are enabled. `session/set_mode` changes that session only
+while it is idle; an active generation, an unknown mode, or disabled checks
+refuses the change. It retains the existing sandbox and tool eligibility.
+`AllowAlways` and `RejectAlways` choices last for this running session, with
+bounded scopes and exact literal denials; they are not saved or imported.
+
+The session's actual todo store produces ACP `Plan` updates after tool results
+and final runner settlement, including cancellation. Rejected writes retain
+the prior plan; clearing it publishes an empty plan. Cancelled tasks retain
+`mini-agent-status: cancelled` metadata because ACP v1 has no cancelled status.
+See [the runtime policy contract](../specs/acp-session-runtime-policy.md).
+
 ACP `session/cancel` stops the active turn for that session and
 returns `cancelled` from its original `session/prompt` request. Cancellation is
 generation-tagged: duplicate notifications are idempotent, a notification after

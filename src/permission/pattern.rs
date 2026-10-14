@@ -23,6 +23,24 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// A runtime denial names data literally, including wildcard characters.
+    #[cfg(feature = "acp")]
+    pub(crate) fn new_literal(input: &str) -> Self {
+        let mut pattern = Self::new_regex(&format!(r"\A{}\z", regex::escape(input)))
+            .expect("escaped bounded literal must compile");
+        pattern.original = input.to_string();
+        pattern.specificity = input.chars().count();
+        pattern.absolute_anchored = is_absolute_path_text(input);
+        pattern
+    }
+
+    #[cfg(feature = "acp")]
+    pub(crate) fn new_literal_path(input: &str) -> Self {
+        let mut pattern = Self::new_literal(&normalize_path_separators(input));
+        pattern.normalize_path_input = true;
+        pattern
+    }
+
     pub fn new(pattern: &str) -> Self {
         let original = pattern.to_string();
         let expanded = crate::fs::expand_tilde(pattern);
