@@ -214,3 +214,14 @@ use `None`, without inferring TTL information from names or request parameters.
 No request TTL, tool execution, hook ordering, transport, or pricing calculation
 is changed by this SDK carrier itself. The application's fake native HTTP tests
 exercise both mappings and cumulative/zero/missing/invalid metrics.
+
+## Native malformed-event diagnostics
+
+Anthropic's streaming JSON decoder reports a static `ResponseError` for a
+nonempty malformed event. Neither raw SSE data nor serde's value-bearing parse
+diagnostic is display data: both can include signatures or redacted thinking.
+This preserves the existing error-yield and empty-event behavior, and changes
+no transport status/source chain, usage observation, or other provider decoder.
+The application fixture exercises malformed signature/redacted/type-tag events
+through real local HTTP, requires failure and zero tool effects, and checks both
+Display and Debug diagnostics without accepting an opaque completed block.

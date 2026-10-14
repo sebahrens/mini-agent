@@ -405,10 +405,13 @@ where
                                     yield result;
                                 }
                             },
-                            Err(e) => {
+                            Err(_) => {
                                 if !sse.data.trim().is_empty() {
                                     yield Err(CompletionError::ResponseError(
-                                        format!("Failed to parse JSON: {} (Data: {})", e, sse.data)
+                                        // Both serde's diagnostic and the raw SSE
+                                        // frame can contain opaque signatures or
+                                        // redacted thinking. Neither is display data.
+                                        "Invalid Anthropic streaming event".into()
                                     ));
                                 }
                             }

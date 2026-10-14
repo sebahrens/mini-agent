@@ -794,3 +794,61 @@ async fn effort46_native_display_deltas_once_preserves_completed_opaque_content(
         }
     }
 }
+
+#[tokio::test]
+async fn effort46_malformed_native_sse_never_reports_opaque_signature_or_redacted_bytes() {
+    for payload in [
+        json!({"type":"content_block_delta","index":"opaque-signature-index-sentinel",
+            "delta":{"type":"signature_delta","signature":"opaque-signature-value-sentinel"}}),
+        json!({"type":"content_block_start","index":"opaque-redacted-index-sentinel",
+            "content_block":{"type":"redacted_thinking","data":"opaque-redacted-value-sentinel"}}),
+        json!({"type":{"private":"opaque-private-value-sentinel"}}),
+    ] {
+        let wire = Wire::new(vec![(true, start() + &event("malformed", payload))]);
+        let AnyModel::Anthropic(model) = wire.client().completion_model_with_cache_ttl(
+            "claude-opus-5-5",
+            crate::config::PromptCacheTtl::default(),
+        ) else {
+            unreachable!()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capture = crate::agent::native_capture::NativeCapture::default();
+        let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+            rig::agent::AgentBuilder::new(model)
+                .preamble("Stable malformed-event control")
+                .max_tokens(1000)
+                .tool(ProbeRead(calls.clone()))
+                .build(),
+        ))
+        .with_native_capture(capture.clone());
+        let outcome = agent
+            .run_print_with_output(
+                "literal malformed-event control",
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                &RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+                Vec::<Message>::new(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await;
+        let error = outcome.failure.expect("actual malformed stream must fail");
+        let rendered = format!("{error}\n{error:?}");
+        assert!(
+            rendered.contains("Invalid Anthropic streaming event"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("opaque-"),
+            "native diagnostic disclosed opaque input: {rendered}"
+        );
+        assert!(
+            capture.snapshot().0.is_empty(),
+            "malformed native data was accepted"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(wire.finish().len(), 1);
+    }
+}
