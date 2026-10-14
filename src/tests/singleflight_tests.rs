@@ -162,3 +162,41 @@ fn dot_messages_and_shortcuts_use_the_same_grammar_idle_or_running() {
         );
     }
 }
+
+#[test]
+fn busy67_views_are_exact_and_mutating_variants_stay_rejected() {
+    for command in [
+        "/help",
+        " /help\tkeys ",
+        "/model",
+        "/sessions",
+        "/sessions --all",
+        "/jobs",
+        "/jobs stop job-id",
+    ] {
+        assert_eq!(
+            classify_submission(true, command),
+            SubmitAction::Run,
+            "{command}"
+        );
+    }
+    for command in [
+        "/model changed",
+        "/model changed extra",
+        "/sessions id",
+        "/sessions delete id",
+        "/sessions --all id",
+        "/help keys extra",
+        "/helpful",
+        "/jobs stop",
+        "/jobs clear",
+        "/jobs stop id extra",
+        "/add file.txt",
+    ] {
+        assert_eq!(
+            classify_submission(true, command),
+            SubmitAction::RejectWhileRunning,
+            "{command}"
+        );
+    }
+}

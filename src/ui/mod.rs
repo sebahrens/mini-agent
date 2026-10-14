@@ -247,6 +247,8 @@ pub(crate) fn refresh_display(
         perm_mode: perm_mode.as_deref(),
         chain_label: chain.label_msg.as_deref(),
         background_jobs: ui.sandbox.running_background_job_count(),
+        todos: ui.session.todos.progress(),
+        queued_inputs: run.pending_inputs.len(),
         btw_cost: btw.cost,
         btw_in: btw.input,
         btw_out: btw.output,
@@ -670,6 +672,8 @@ pub(crate) enum SubmitAction {
 pub(crate) fn allowed_while_running(text: &str) -> bool {
     let t = text.trim_start();
     crate::ui::slash::is_readonly_diagnostic(t)
+        || crate::ui::slash::is_readonly_view(t)
+        || crate::ui::slash::is_jobs_control(t)
         || t == "/queue"
         || t.starts_with("/queue ")
         || t == "/btw"

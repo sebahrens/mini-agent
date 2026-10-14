@@ -904,7 +904,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 6, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
@@ -1876,7 +1876,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/todo.rs",
         "status: status.into(),",
-        2,
+        3,
         "NON-PROCESS",
     ),
     (
@@ -4563,7 +4563,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 5, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 6, "NON-PROCESS"),
     ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
     ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).

@@ -433,9 +433,62 @@ fn rename_session_mutation(session: &mut crate::session::Session, name: &str) ->
     Some(())
 }
 
+fn bounded_catalogue_field(value: &str) -> String {
+    let clipped: String = value.chars().take(128).collect();
+    crate::ui::events::sanitize_output(&clipped)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn show_busy_sessions(ctx: &mut SlashCtx<'_>, all: bool) -> anyhow::Result<()> {
+    let workspace = ctx.workspace.clone();
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let result = scope
+        .run(async move {
+            crate::agent::runner::spawn_blocking_scoped(move || {
+                crate::session::catalogue::list_readonly(&workspace, all)
+            })
+            .await
+        })
+        .await;
+    cleanup.settle().await;
+    let catalogue = result??;
+    write_ok(
+        ctx.renderer,
+        "saved sessions (read-only while a turn runs):",
+    );
+    for row in catalogue.rows {
+        write_result(
+            ctx.renderer,
+            crate::ui::events::sanitize_output(&format!(
+                "  {}  {}  {} ({})",
+                row.id,
+                bounded_catalogue_field(&row.title),
+                bounded_catalogue_field(&row.model),
+                bounded_catalogue_field(&row.provider)
+            )),
+        );
+    }
+    if catalogue.truncated || catalogue.skipped > 0 {
+        write_result(
+            ctx.renderer,
+            format!(
+                "catalogue: skipped {}, truncated {}",
+                catalogue.skipped, catalogue.truncated
+            ),
+        );
+    }
+    Ok(())
+}
+
 async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 || parts[1] == "--all" {
         let all = parts.get(1) == Some(&"--all");
+        if *ctx.is_running {
+            return show_busy_sessions(ctx, all).await;
+        }
         let catalogue = crate::session::catalogue::list(ctx.workspace, all)?;
         ctx.input
             .start_session_picker(catalogue, ctx.workspace.clone(), all);

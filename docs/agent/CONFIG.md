@@ -1588,7 +1588,7 @@ Each segment has:
 | `icon`  | Glyph shown before the value. `true` uses the item's built-in icon; a string sets a custom one (a named icon or a literal glyph). Optional. Needs a Nerd Font. |
 | `priority` | Optional retention priority (0–239): larger values drop later. Safety state and prompt have protected higher priorities. |
 | `min` | Optional literal compact form used before dropping an item; sanitized, never evaluated; mode/sandbox/goal/loop retain their actual value. |
-| `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`, `background_jobs`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
+| `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`, `todos`, `queue`, `background_jobs`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
 
 Items with a built-in icon (used by `icon = true`): `git_branch`, `git_changes`,
 `git_status`, `cwd`, `model`, `cost`, `context_used`/`context_max`/
@@ -1650,6 +1650,8 @@ Available items:
 | `loop`                | Active loop label. |
 | `goal`                | Active goal: its round and status, in brackets. Hidden when there is no goal or it has finished. |
 | `chain`               | Chain-of-prompts label. |
+| `todos`               | Shared todo progress (`todo:<done>/<total>`), counting completed and cancelled items as done. Hidden when empty; a temporarily locked store shows `todo:?`. |
+| `queue`               | Actual inputs waiting behind the active main run (`queue:<n>`; hidden at zero). |
 | `background_jobs`     | Running background shell jobs (`jobs:<n>`; hidden at zero). |
 | `compaction`          | Number of compactions (`cmp:<n>`). |
 | `btw`                 | `/btw` side-question token/cost usage. |

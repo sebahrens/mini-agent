@@ -138,6 +138,7 @@ impl InputEditor {
         let argument_picker = match &self.picker {
             Some(Picker::Prefixed(_, prefix)) => prefix.starts_with('/'),
             Some(Picker::Models(_)) => true,
+            Some(Picker::File(p)) => p.argument_start.is_some(),
             _ => false,
         };
         let handled = match self.picker.as_mut() {
@@ -153,6 +154,7 @@ impl InputEditor {
                     live_model_names: &self.live_model_names,
                     provider_names: &self.provider_names,
                     current_model: self.current_model.clone(),
+                    file_workspace: self.file_workspace.clone(),
                     security_mode: self
                         .permission
                         .as_ref()

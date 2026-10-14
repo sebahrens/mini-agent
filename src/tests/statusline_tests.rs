@@ -12,6 +12,8 @@ fn ctx() -> StatusContext<'static> {
         perm_mode: None,
         chain_label: None,
         background_jobs: 0,
+        todos: Some((0, 0)),
+        queued_inputs: 0,
         btw_cost: 0.0,
         btw_in: 0,
         btw_out: 0,
@@ -832,4 +834,30 @@ fn cache_only_and_subagent_only_legacy_history_never_claims_zero_calls() {
             "calls:?"
         );
     }
+}
+
+#[test]
+fn busy67_numeric_progress_is_sticky_and_invalidates_cached_status() {
+    let session = Session::new("provider", "model", 128_000, "");
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("todos"), seg("queue")],
+        }],
+    };
+    let mut live = ctx();
+    let empty = statusline::cache_key(&session, &live);
+    assert!(statusline::build_lines(&spec, &session, &live)[0].is_empty());
+    live.todos = Some((2, 3));
+    live.queued_inputs = 4;
+    assert_ne!(empty, statusline::cache_key(&session, &live));
+    let text = line_text(&statusline::build_lines(&spec, &session, &live)[0]);
+    assert!(text.contains("todo:2/3") && text.contains("queue:4"));
+    let before = statusline::cache_key(&session, &live);
+    live.todos = None;
+    assert_ne!(before, statusline::cache_key(&session, &live));
+    assert!(line_text(&statusline::build_lines(&spec, &session, &live)[0]).contains("todo:?"));
+    let before = statusline::cache_key(&session, &live);
+    live.queued_inputs = 0;
+    assert_ne!(before, statusline::cache_key(&session, &live));
+    assert!(!line_text(&statusline::build_lines(&spec, &session, &live)[0]).contains("queue:"));
 }

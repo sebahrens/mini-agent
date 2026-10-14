@@ -60,11 +60,13 @@ pub struct FilePicker {
     pub cursor: usize,
     pub matches: Vec<PathBuf>,
     pub selected: usize,
+    pub(crate) argument_start: Option<usize>,
     file_cache: Vec<PathBuf>,
     monochrome: bool,
     loading: bool,
     walk_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
     walk_cancel: Arc<AtomicBool>,
+    walk_workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
 }
 
 impl FilePicker {
@@ -75,12 +77,21 @@ impl FilePicker {
             cursor: 0,
             matches: Vec::new(),
             selected: 0,
+            argument_start: None,
             file_cache: Vec::new(),
             monochrome: false,
             loading: false,
             walk_rx: None,
             walk_cancel: Arc::new(AtomicBool::new(false)),
+            walk_workspace: None,
         }
+    }
+
+    pub(crate) fn set_add_argument(&mut self, start: usize, query: &str) {
+        self.argument_start = Some(start);
+        self.query = query.to_owned();
+        self.cursor = self.query.chars().count();
+        self.filter();
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -99,17 +110,42 @@ impl FilePicker {
     }
 
     pub fn activate(&mut self) {
+        self.activate_at(None, false);
+    }
+
+    pub(crate) fn activate_for_add(
+        &mut self,
+        workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    ) {
+        self.activate_at(workspace, true);
+    }
+
+    fn activate_at(
+        &mut self,
+        workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+        require_binding: bool,
+    ) {
         // Cancel any walk still running from a previous activation before
         // arming a fresh flag for the new one.
         self.walk_cancel.store(true, Ordering::Relaxed);
         self.walk_rx = None;
 
         self.active = true;
+        self.argument_start = None;
         self.query.clear();
         self.cursor = 0;
         self.matches.clear();
         self.selected = 0;
         self.file_cache.clear();
+        self.loading = false;
+        self.walk_workspace = workspace.clone();
+        if require_binding
+            && workspace
+                .as_ref()
+                .is_none_or(|root| root.validate().is_err())
+        {
+            return;
+        }
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             self.loading = true;
@@ -118,7 +154,15 @@ impl FilePicker {
             let (tx, rx) = mpsc::channel();
             self.walk_rx = Some(rx);
             handle.spawn_blocking(move || {
-                walk_files_streaming(".", &cancel, |batch| tx.send(batch).is_ok());
+                if let Some(workspace) = workspace {
+                    if workspace.validate().is_ok() {
+                        walk_files_streaming_path(workspace.root(), &cancel, |batch| {
+                            workspace.validate().is_ok() && tx.send(batch).is_ok()
+                        });
+                    }
+                } else {
+                    walk_files_streaming(".", &cancel, |batch| tx.send(batch).is_ok());
+                }
             });
         } else {
             self.load_files_sync();
@@ -126,7 +170,21 @@ impl FilePicker {
     }
 
     fn load_files_sync(&mut self) {
-        self.file_cache = walk_files(".");
+        if let Some(workspace) = &self.walk_workspace {
+            let mut files = Vec::new();
+            walk_files_streaming_path(workspace.root(), &AtomicBool::new(false), |batch| {
+                if workspace.validate().is_err() {
+                    return false;
+                }
+                files.extend(batch);
+                true
+            });
+            if workspace.validate().is_ok() {
+                self.file_cache = files;
+            }
+        } else {
+            self.file_cache = walk_files(".");
+        }
         self.filter();
     }
 
@@ -147,6 +205,20 @@ impl FilePicker {
     /// Drain walk batches that arrived since the last call. Returns true
     /// when new files arrived or the walk just finished.
     pub fn try_finish_loading(&mut self) -> bool {
+        if self
+            .walk_workspace
+            .as_ref()
+            .is_some_and(|root| root.validate().is_err())
+        {
+            let changed = self.active
+                || self.loading
+                || !self.file_cache.is_empty()
+                || !self.matches.is_empty();
+            self.file_cache.clear();
+            self.matches.clear();
+            self.deactivate();
+            return changed;
+        }
         if !self.loading {
             return false;
         }
@@ -240,6 +312,13 @@ impl FilePicker {
     }
 
     pub fn selected_path(&self) -> Option<&PathBuf> {
+        if self
+            .walk_workspace
+            .as_ref()
+            .is_some_and(|root| root.validate().is_err())
+        {
+            return None;
+        }
         self.matches.get(self.selected)
     }
 
@@ -255,6 +334,9 @@ impl FilePicker {
         }
 
         self.try_finish_loading();
+        if !self.active {
+            return Ok(());
+        }
 
         if self.loading && self.matches.is_empty() {
             return super::draw_picker_message("scanning files...", self.monochrome, floor_row);
@@ -278,7 +360,12 @@ impl FilePicker {
 
             let path = &self.matches[i];
             let mut display = super::display_safe(&path.to_string_lossy()).into_owned();
-            if Path::new(&path).is_dir() {
+            let directory = if let Some(workspace) = &self.walk_workspace {
+                workspace.validate().is_ok() && workspace.root().join(path).is_dir()
+            } else {
+                Path::new(&path).is_dir()
+            };
+            if directory {
                 display.push('/');
             }
             let truncated =
@@ -319,6 +406,14 @@ fn is_dot_entry(entry: &ignore::DirEntry) -> bool {
 /// (directories do not count toward that cap).
 pub(crate) fn walk_files_streaming(
     root: &str,
+    cancel: &AtomicBool,
+    emit: impl FnMut(Vec<PathBuf>) -> bool,
+) {
+    walk_files_streaming_path(Path::new(root), cancel, emit);
+}
+
+fn walk_files_streaming_path(
+    root: &Path,
     cancel: &AtomicBool,
     mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
@@ -386,4 +481,72 @@ pub(crate) fn walk_files(root: &str) -> Vec<PathBuf> {
         true
     });
     files
+}
+
+#[cfg(test)]
+mod captured_add_tests {
+    use super::*;
+    #[tokio::test]
+    async fn busy67_finished_add_picker_rejects_replaced_root_before_enter() {
+        let outer = crate::tests::OwnedTestDirectory::new("add67-finished-root-replaced");
+        let root = outer.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("old-name.txt"), "inert").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding));
+        picker.set_add_argument(5, "old");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while picker.is_loading() {
+                picker.try_finish_loading();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned walk must finish before replacement");
+        assert!(picker.active);
+        assert_eq!(picker.selected_path(), Some(&PathBuf::from("old-name.txt")));
+        std::fs::rename(&root, outer.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement-name.txt"), "untrusted").unwrap();
+
+        let mut draft: compact_str::CompactString = "/add old".into();
+        let mut cursor = draft.len();
+        assert!(super::super::handlers::handle_file_key(
+            &mut draft,
+            &mut cursor,
+            &mut picker,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        assert_eq!(draft.as_str(), "/add old");
+        assert_eq!(cursor, draft.len());
+        assert!(!picker.active && !picker.is_loading());
+        // Finished pickers also revoke cached matches during a normal poll.
+        assert!(picker.try_finish_loading());
+        assert!(picker.matches.is_empty() && picker.file_cache.is_empty());
+        assert!(
+            !picker.try_finish_loading(),
+            "retirement is reported only once"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy67_add_walk_drops_results_when_captured_root_is_replaced() {
+        let outer = crate::tests::OwnedTestDirectory::new("add67-root-replaced");
+        let root = outer.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("old-name.txt"), "inert").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding));
+        picker.set_add_argument(5, "");
+        std::fs::rename(&root, outer.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement-name.txt"), "untrusted").unwrap();
+        assert!(picker.try_finish_loading());
+        assert!(!picker.active && !picker.is_loading() && picker.matches.is_empty());
+    }
 }

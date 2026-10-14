@@ -1384,6 +1384,7 @@ impl<'a> App<'a> {
         );
 
         let mut input = InputEditor::new();
+        input.set_file_workspace(ui.workspace.clone());
         input.set_monochrome(ui.cli.no_color);
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
         input.set_custom_commands(
@@ -2072,6 +2073,7 @@ impl<'a> App<'a> {
     }
 
     fn refresh(&mut self) -> io::Result<()> {
+        self.input.set_file_workspace(self.ui.workspace.clone());
         self.sync_live_model_names(false);
         refresh_display(
             &mut self.renderer,
@@ -2382,6 +2384,7 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        self.input.set_file_workspace(self.ui.workspace.clone());
         #[cfg(feature = "mcp")]
         if crate::startup::heap_future(|| self.handle_mcp_user_event(&ev)).await? {
             return Ok(ControlFlow::Continue(()));
@@ -2707,12 +2710,33 @@ impl<'a> App<'a> {
             self.renderer.invalidate();
             match outcome {
                 crate::ui::pickers::sessions::SessionPick::Reload(all) => {
+                    if self.run.is_running || self.run.pending_turn.is_some() {
+                        self.input.picker = None;
+                        self.renderer.write_line(
+                            "finish or stop the current turn before reopening a session selector",
+                            C_ERROR,
+                        )?;
+                        self.refresh()?;
+                        return Ok(true);
+                    }
                     let catalogue = crate::session::catalogue::list(&self.ui.workspace, all)?;
                     self.input
                         .start_session_picker(catalogue, self.ui.workspace.clone(), all);
                 }
                 crate::ui::pickers::sessions::SessionPick::Cancelled => {}
                 crate::ui::pickers::sessions::SessionPick::Selected(selection) => {
+                    if self.run.is_running
+                        || self.run.pending_turn.is_some()
+                        || self.permission_prompt.is_some()
+                        || self.question_prompt.is_some()
+                    {
+                        self.renderer.write_line(
+                            "finish or stop the current turn before resuming a session",
+                            C_ERROR,
+                        )?;
+                        self.refresh()?;
+                        return Ok(true);
+                    }
                     let selected = (|| -> anyhow::Result<_> {
                         anyhow::ensure!(
                             Arc::ptr_eq(&selection.workspace, &self.ui.workspace),
@@ -2837,11 +2861,11 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if key.code == KeyCode::Char('/') && self.input.buffer.is_empty() {
+        if key.code == KeyCode::Char('/') && self.input.buffer.is_empty() && !self.run.is_running {
             self.refresh_custom_commands();
         }
         #[cfg(feature = "mcp")]
-        if key.code == KeyCode::Char('@') {
+        if key.code == KeyCode::Char('@') && !self.run.is_running {
             self.refresh_custom_commands();
         }
 
@@ -3018,6 +3042,10 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        // Todo tools mutate the shared store before their result is delivered.
+        // Chat paints alone do not refresh the sticky numeric footer.
+        let todo_progress_changed =
+            matches!(&event, AgentEvent::ToolResult { name, .. } if name == "todo_write");
         #[cfg(feature = "git-worktree")]
         if self.chain.git.work.is_some()
             && matches!(&event, AgentEvent::Done { .. } | AgentEvent::Error { .. })
@@ -3309,6 +3337,9 @@ impl<'a> App<'a> {
         }
 
         self.finalize_turn().await?;
+        if todo_progress_changed {
+            self.refresh()?;
+        }
         Ok(())
     }
 
@@ -4578,6 +4609,13 @@ impl<'a> App<'a> {
         if self.handle_instruction_command(text).await? {
             return Ok(());
         }
+        if self.run.is_running && !super::allowed_while_running(text) {
+            self.renderer.write_line(
+                "finish or stop the current turn before changing model, session or context",
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
         if selected_session.is_some()
             && (self.run.is_running
                 || self.permission_prompt.is_some()
@@ -4670,6 +4708,13 @@ impl<'a> App<'a> {
             return result;
         }
 
+        if crate::ui::slash::is_readonly_view(text) || crate::ui::slash::is_jobs_control(text) {
+            if let Err(error) = result {
+                self.renderer
+                    .write_line(&sanitize_output(&error.to_string()), C_ERROR)?;
+            }
+            return Ok(());
+        }
         // /cost is a read-only query, including while a turn is live.
         if name == Some("/cost") {
             return result;
@@ -11021,6 +11066,12 @@ mod plan_approval_tests {
                                 ]}).to_string()}}]})
                             } else if text == "skills-search" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"instruction-search-one","type":"function","function":{"name":"skills_search","arguments":"{\"query\":\"code review\"}"}}]})
+                            } else if text == "todo-progress67" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"todo67","type":"function","function":{"name":"todo_write","arguments":serde_json::json!({"todos":[
+                                    {"content":"done","status":"completed","priority":"medium"},
+                                    {"content":"cancelled","status":"cancelled","priority":"medium"},
+                                    {"content":"pending","status":"pending","priority":"medium"}
+                                ]}).to_string()}}]})
                             } else if text == "unknown-tool" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"unknown-cost-initial","type":"function","function":{"name":"unknown_unregistered_cost_tool","arguments":"{}"}}]})
                             } else if text == "cap-write" {
@@ -11031,7 +11082,7 @@ mod plan_approval_tests {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
                             } else { serde_json::json!({"role":"assistant","content":text}) };
                             let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
-                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again"|"skills-search") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again"|"skills-search"|"todo-progress67") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
                             ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
                         };
                         let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -11401,6 +11452,423 @@ mod plan_approval_tests {
         assert!(app.renderer.captured_output().contains("incompatible"));
         assert!(provider.calls().is_empty());
         provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn busy67_actual_add_completion_tracks_captured_workspace_without_chdir() {
+        let roots = Roots::new();
+        let second = crate::tests::OwnedTestDirectory::new("add67-second-root");
+        let second_workspace =
+            Arc::new(crate::paths::WorkspaceBinding::capture(second.path()).unwrap());
+        let process_cwd = std::env::current_dir().unwrap();
+        let first_workspace = roots.workspace();
+        std::fs::write(
+            first_workspace.root().join("only_first67.txt"),
+            "FIRST_ONLY_CONTENT",
+        )
+        .unwrap();
+        let chosen = "only_second67 雪.txt";
+        std::fs::write(second_workspace.root().join(chosen), "SECOND_ONLY_CONTENT").unwrap();
+        let provider = Provider::new(Vec::new()).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_context_files: true,
+            no_tools: true,
+            api_key: Some("unused-local-key".into()),
+            ..Default::default()
+        };
+        let mut files = crate::context::load(true).for_workspace_binding(true, &first_workspace);
+        let mut session = Session::new("plan80", "owned-model", 128_000, "completion67");
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            first_workspace,
+            SecurityMode::Standard,
+        ));
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            for code in [
+                KeyCode::Char('/'),
+                KeyCode::Char('a'),
+                KeyCode::Char('d'),
+                KeyCode::Char('d'),
+                KeyCode::Enter,
+            ] {
+                key(&mut app, code).await;
+                #[cfg(feature = "mcp")]
+                if code == KeyCode::Char('/') {
+                    app.input
+                        .set_mcp_resources(vec!["mcp:foreign:urn%3AONLY_RESOURCE67".into()]);
+                }
+            }
+            busy67_finish_file_walk(&mut app).await;
+            let Some(crate::ui::input::Picker::File(picker)) = &app.input.picker else {
+                panic!("add command picker missing")
+            };
+            assert!(
+                picker
+                    .matches
+                    .iter()
+                    .any(|path| path == std::path::Path::new("only_first67.txt"))
+            );
+            assert!(
+                !picker
+                    .matches
+                    .iter()
+                    .any(|path| path == std::path::Path::new("Cargo.toml")
+                        || path.to_string_lossy().contains("mcp:"))
+            );
+            key(&mut app, KeyCode::Esc).await;
+            app.input.clear_buffer();
+            // This is the same captured UiContext field changed by workspace/session
+            // activation; the process cwd is deliberately left unchanged.
+            app.ui.workspace = second_workspace.clone();
+            app.ui.sandbox = app
+                .ui
+                .sandbox
+                .clone()
+                .with_workspace_binding(second_workspace.clone());
+            user(&mut app, UserEvent::Paste("/add only_second67".into())).await;
+            key(&mut app, KeyCode::Tab).await;
+            busy67_finish_file_walk(&mut app).await;
+            let Some(crate::ui::input::Picker::File(picker)) = &app.input.picker else {
+                panic!("captured add picker missing")
+            };
+            assert_eq!(picker.matches, vec![std::path::PathBuf::from(chosen)]);
+            key(&mut app, KeyCode::Enter).await;
+            let selected = app.input.buffer.to_string();
+            assert_eq!(
+                crate::ui::slash::split_args(&selected).unwrap(),
+                vec!["/add", chosen]
+            );
+            assert!(app.ui.context.extra_files.is_empty() && app.ui.session.messages.is_empty());
+            crate::startup::heap_future(|| app.run_slash_command(&selected))
+                .await
+                .unwrap();
+            let expected = second_workspace.root().join(chosen);
+            assert_eq!(app.ui.context.extra_files, vec![expected.clone()]);
+            assert_eq!(
+                app.ui.context.extra_file_contents[&expected].as_str(),
+                "SECOND_ONLY_CONTENT"
+            );
+            assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+            assert!(provider.calls().is_empty());
+        }))
+        .await;
+        provider.cancel().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn busy67_finish_file_walk(app: &mut App<'_>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(crate::ui::input::Picker::File(picker)) = &mut app.input.picker else {
+                    panic!("file picker missing")
+                };
+                picker.try_finish_loading();
+                if !picker.is_loading() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn busy67_actual_jobs_list_and_stop_keep_the_running_job_owned() {
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["hold-open"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_context_files: true,
+            no_tools: true,
+            api_key: Some("unused-local-key".into()),
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("plan80", "owned-model", 128_000, "job control");
+        let ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            workspace,
+            SecurityMode::Standard,
+        );
+        let mut app = owned_app(ui);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            user(&mut app, UserEvent::Paste("held main turn".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while provider.calls().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let id = app
+                .ui
+                .sandbox
+                .start_background_command(
+                    "printf BG_%s READY67; sleep 60".into(),
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !app
+                    .ui
+                    .sandbox
+                    .background_job_snapshot(&id)
+                    .unwrap()
+                    .stdout
+                    .windows(10)
+                    .any(|bytes| bytes == b"BG_READY67")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let before = serde_json::to_vec(app.ui.session).unwrap();
+            crate::startup::heap_future(|| app.run_slash_command("/jobs"))
+                .await
+                .unwrap();
+            assert!(app.renderer.captured_output().contains(&id));
+            assert!(
+                !app.renderer.captured_output().contains("BG_READY67"),
+                "job output is not listing metadata"
+            );
+            let stop_command = format!("/jobs stop {id}");
+            crate::startup::heap_future(|| app.run_slash_command(&stop_command))
+                .await
+                .unwrap();
+            assert!(
+                app.renderer
+                    .captured_output()
+                    .contains("stop requested; the job remains owned")
+            );
+            assert_eq!(
+                app.ui.sandbox.background_job_summaries().len(),
+                1,
+                "stop cannot release the registry record"
+            );
+            let terminal = app
+                .ui
+                .sandbox
+                .wait_background_job(&id, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(
+                terminal.status,
+                crate::sandbox::BackgroundJobStatus::Cancelled
+            );
+            assert!(!terminal.descendants_escaped);
+            assert_eq!(app.ui.sandbox.running_background_job_count(), 0);
+            assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+            assert!(app.run.is_running && app.run.agent_rx.is_some());
+            assert_eq!(provider.calls().len(), 1);
+        }))
+        .await;
+        crate::startup::heap_future(|| app.abort_main_run())
+            .await
+            .unwrap();
+        provider.cancel().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn busy67_actual_views_preserve_held_run_and_reject_mutating_selectors() {
+        std::thread::Builder::new()
+            .name("busy67-readonly-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(busy67_actual_views_case));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn busy67_actual_views_case() {
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["todo-progress67", "hold-open"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_context_files: true,
+            tools: vec!["todo_write".into()],
+            api_key: Some("unused-local-key".into()),
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut saved = Session::new(
+            "plan80",
+            "saved-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        saved.name = "SAVED_METADATA67".into();
+        saved.working_dir = workspace.root().to_string_lossy().into();
+        saved.add_message(crate::session::MessageRole::User, "saved first message");
+        crate::session::storage::save_session(&saved).unwrap();
+        let saved_path = crate::session::storage::session_path(&saved.id).unwrap();
+        let saved_bytes = std::fs::read(&saved_path).unwrap();
+        let mut ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            workspace.clone(),
+            SecurityMode::Standard,
+        );
+        let policy = PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Allow),
+            ..Default::default()
+        });
+        ui.permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &policy,
+                SecurityMode::Standard,
+                Some(workspace.root().to_owned()),
+                None,
+            )
+            .unwrap(),
+        )));
+        let mut app = owned_app(ui);
+        app.slash.todo_tools_enabled = true;
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            user(&mut app, UserEvent::Paste("held ordinary turn".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                    let ready =
+                        matches!(&event, AgentEvent::ToolResult { name, .. } if name=="todo_write");
+                    crate::startup::heap_future(|| app.handle_agent_event(event))
+                        .await
+                        .unwrap();
+                    if ready {
+                        break;
+                    }
+                }
+                while provider.calls().len() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.ui.session.todos.progress(), Some((2, 3)));
+            let (_, footer) = app.renderer.last_statusline();
+            assert!(
+                footer.iter().flatten().any(|span| matches!(
+                    span, crate::ui::statusline::StatusSpan::Text { text, .. }
+                    if text == "todo:2/3"
+                )),
+                "the actual tool result refreshes the sticky footer before another input"
+            );
+            app.run.pending_inputs.push_back("queued next turn".into());
+            let before = serde_json::to_vec(app.ui.session).unwrap();
+            let model = app.ui.session.model.clone();
+            let id = app.ui.session.id.clone();
+            let account = app.ui.session.spend_account.snapshot();
+            for command in ["/help", "/model", "/sessions", "/sessions --all", "/jobs"] {
+                crate::startup::heap_future(|| app.run_slash_command(command))
+                    .await
+                    .unwrap();
+            }
+            key(&mut app, KeyCode::Char('?')).await;
+            assert!(app.input.buffer.is_empty());
+            assert!(app.renderer.captured_output().contains("SAVED_METADATA67"));
+            assert!(app.renderer.captured_output().contains("keys:"));
+            assert!(
+                app.renderer
+                    .captured_output()
+                    .contains("current model: owned-model")
+            );
+            assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+            assert_eq!(std::fs::read(&saved_path).unwrap(), saved_bytes);
+            assert!(Arc::ptr_eq(&app.ui.workspace, &workspace));
+            assert_eq!(app.ui.session.spend_account.snapshot(), account);
+            assert_eq!(app.run.pending_inputs.len(), 1);
+            assert!(
+                app.run.is_running && app.run.agent_rx.is_some() && app.run.main_abort.is_some()
+            );
+            assert_eq!(
+                provider.calls().len(),
+                2,
+                "views must not warm another model or start queued work"
+            );
+            for command in [
+                "/model changed",
+                &format!("/sessions {}", saved.id),
+                &format!("/sessions delete {}", saved.id),
+            ] {
+                crate::startup::heap_future(|| app.run_slash_command(command))
+                    .await
+                    .unwrap();
+            }
+            let catalogue = crate::session::catalogue::list_readonly(&workspace, false).unwrap();
+            app.input
+                .start_session_picker(catalogue, workspace.clone(), false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&saved_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            assert!(
+                app.handle_session_picker_event(&UserEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE
+                )))
+                .await
+                .unwrap()
+            );
+            assert_eq!(app.ui.session.id, id);
+            assert_eq!(app.ui.session.model, model);
+            assert_eq!(std::fs::read(&saved_path).unwrap(), saved_bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&saved_path).unwrap().permissions().mode() & 0o777,
+                    0o644,
+                    "stale selector must reject before loading or repairing its record"
+                );
+            }
+            assert_eq!(provider.calls().len(), 2);
+        }))
+        .await;
+        crate::startup::heap_future(|| app.abort_main_run())
+            .await
+            .unwrap();
+        provider.cancel().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

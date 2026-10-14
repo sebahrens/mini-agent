@@ -9,6 +9,7 @@ mod help;
 #[cfg(feature = "hooks")]
 mod hooks;
 pub(crate) mod init;
+mod jobs;
 mod memory;
 #[cfg(feature = "memory")]
 pub(crate) use memory::edit_memory_file;
@@ -695,6 +696,20 @@ pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
     )
 }
 
+/// Exact read-only operator syntax; arguments that mutate route/session never
+/// enter this path just because their command has a query form.
+pub(crate) fn is_readonly_view(text: &str) -> bool {
+    matches!(
+        split_command(text).as_slice(),
+        ["/help"] | ["/help", "keys"] | ["/model"] | ["/sessions"] | ["/sessions", "--all"]
+    )
+}
+
+pub(crate) fn is_jobs_control(text: &str) -> bool {
+    matches!(split_command(text).as_slice(), ["/jobs"])
+        || matches!(split_command(text).as_slice(), ["/jobs", "stop", id] if !id.contains(char::is_whitespace))
+}
+
 /// Split a slash command into at most three fields: the command, its first
 /// argument and the rest of the line. Runs of whitespace separate fields, so
 /// `/cmd  arg` never yields an empty argument; the rest keeps its inner
@@ -887,6 +902,7 @@ pub(crate) async fn handle_slash(
         "/share" => session::handle(&parts, &mut ctx).await,
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => doctor::handle(&parts, &mut ctx),
+        "/jobs" => jobs::handle(&parts, &mut ctx),
         "/help" => {
             help::handle(&parts, &mut ctx);
             Ok(())

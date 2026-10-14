@@ -972,3 +972,28 @@ The learned search continuation regression binds the same production
 user skill packages. It checks the actual intact canonical tool receipt and
 next-request replacement, rather than a test-only context hook or unbound
 publication. Its roots are owned independently and retired on test unwinding.
+
+
+`src/ui/slash/jobs.rs` exposes the existing session-owned background registry to
+operators. `/jobs` uses bounded command metadata, without copying job output;
+`/jobs stop <id>` requests the existing job token's cancellation and keeps the
+registry and process owner intact. Native completion remains the sandbox's responsibility.
+
+Busy `/help`, bare `/model`, and bare `/sessions` views bypass generic model
+warming and session persistence. Session metadata is read by the existing tracked
+blocking-work scope through retained regular-file handles and pure private-file/
+directory validation; neither absent storage nor permissive modes are repaired.
+Idle resume pickers retain their normal private reload behavior, and stale picker
+selection/reload is rejected while a turn is active. Numeric todo/queue status comes
+from the shared TodoStore and actual run queue, rather than parsing model output.
+`/add` completion uses the existing bounded workspace FilePicker, inserts a literal
+quoted operand, and never invokes the model or treats a selected name as a directive.
+
+`/add` completion captures the actual `UiContext.workspace` on each input event
+and refresh, independently of process cwd. Its bounded ignore-aware walk uses
+that canonical root and validates the retained binding before walking, publishing,
+and accepting batches; a workspace replacement or switch retires the old picker.
+Only filesystem completion entries enter this operand picker, with no MCP resource
+strings. Selection supplies a relative literal to the existing explicit operator
+`/add` attachment path; it does not install a model read permission or change the
+existing operator attachment policy.

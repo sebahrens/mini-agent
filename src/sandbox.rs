@@ -3059,27 +3059,36 @@ impl Sandbox {
         Ok(snapshot_background_job(id, job))
     }
 
-    pub(crate) async fn stop_background_job(
+    /// Request cancellation of this registry's exact job. The task and launch
+    /// owner remain retained until the existing worker publishes terminal state.
+    pub(crate) fn request_stop_background_job(
         &self,
         id: &str,
     ) -> Result<BackgroundJobSnapshot, String> {
         validate_background_job_id(id)?;
-        {
-            let mut jobs = self
-                .background_jobs
-                .jobs
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let job = jobs
-                .get_mut(id)
-                .ok_or_else(|| format!("background job not found: {id}"))?;
-            if job.terminal.is_some() {
-                return Ok(snapshot_background_job(id, job));
-            }
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let job = jobs
+            .get_mut(id)
+            .ok_or_else(|| format!("background job not found: {id}"))?;
+        if job.terminal.is_none() {
             job.stop_requested = true;
             job.cancellation.cancel();
         }
+        Ok(snapshot_background_job(id, job))
+    }
 
+    pub(crate) async fn stop_background_job(
+        &self,
+        id: &str,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        let snapshot = self.request_stop_background_job(id)?;
+        if snapshot.status.is_terminal() {
+            return Ok(snapshot);
+        }
         self.wait_background_job(id, std::time::Duration::from_secs(5))
             .await
     }

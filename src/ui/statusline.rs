@@ -58,6 +58,8 @@ pub struct StatusContext<'a> {
     pub perm_mode: Option<&'a str>,
     pub chain_label: Option<&'a str>,
     pub background_jobs: usize,
+    pub todos: Option<(usize, usize)>,
+    pub queued_inputs: usize,
     pub btw_cost: f64,
     pub btw_in: u64,
     pub btw_out: u64,
@@ -167,6 +169,8 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.perm_mode.hash(&mut state);
     ctx.chain_label.hash(&mut state);
     ctx.background_jobs.hash(&mut state);
+    ctx.todos.hash(&mut state);
+    ctx.queued_inputs.hash(&mut state);
     ctx.btw_cost.to_bits().hash(&mut state);
     ctx.btw_in.hash(&mut state);
     ctx.btw_out.hash(&mut state);
@@ -696,6 +700,13 @@ fn resolve_item(
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
         "goal" => ctx.goal_label.map(|s| format!("[{s}]")),
         "chain" => ctx.chain_label.map(|s| s.to_string()),
+        "todos" => match ctx.todos {
+            Some((done, total)) => (total > 0 || always).then(|| format!("todo:{done}/{total}")),
+            None => Some("todo:?".into()),
+        },
+        "queue" => {
+            (ctx.queued_inputs > 0 || always).then(|| format!("queue:{}", ctx.queued_inputs))
+        }
         "background_jobs" => {
             (ctx.background_jobs > 0 || always).then(|| format!("jobs:{}", ctx.background_jobs))
         }
@@ -980,6 +991,10 @@ pub fn default_spec() -> StatusLineConfig {
         seg("goal", None),
         sep(" "),
         seg("mode", None),
+        sep(" "),
+        seg("todos", None),
+        sep(" "),
+        seg("queue", None),
         sep(" "),
         seg("background_jobs", None),
         sep(" "),

@@ -289,6 +289,19 @@ pub(crate) fn validate_checked(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+pub(crate) fn validate_directory_checked(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private directory must be owned, private and real",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub(crate) fn open_checked(
     path: &Path,
     access: PrivateFileAccess,
@@ -1141,12 +1154,20 @@ mod windows {
     }
 
     pub(crate) fn validate_checked(file: &std::fs::File) -> std::io::Result<()> {
+        validate_checked_object(file, false)
+    }
+
+    pub(crate) fn validate_directory_checked(file: &std::fs::File) -> std::io::Result<()> {
+        validate_checked_object(file, true)
+    }
+
+    fn validate_checked_object(file: &std::fs::File, directory: bool) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         let handle = file.as_raw_handle();
         let information = information(handle)?;
-        if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
-            != 0
-            || information._number_of_links != 1
+        if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || (information.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+            || (!directory && information._number_of_links != 1)
         {
             return Err(super::private_file_error());
         }
@@ -2301,3 +2322,11 @@ pub(crate) fn prepare_new_private_file(_: &std::fs::File) -> std::io::Result<()>
 
 #[cfg(all(feature = "mcp", windows))]
 pub(crate) use windows::prepare_new_private_file;
+
+#[cfg(windows)]
+pub(crate) use windows::validate_directory_checked;
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn validate_directory_checked(_file: &std::fs::File) -> std::io::Result<()> {
+    Err(unsupported())
+}

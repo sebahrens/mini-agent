@@ -28,10 +28,11 @@ fn replace_at_span(
     buffer: &mut CompactString,
     at: usize,
     query_len: usize,
+    marker_len: usize,
     replacement: &str,
 ) -> usize {
     let before = &buffer[..at];
-    let after = buffer.get(at + 1 + query_len..).unwrap_or("");
+    let after = buffer.get(at + marker_len + query_len..).unwrap_or("");
     let mut next = String::with_capacity(before.len() + replacement.len() + after.len());
     next.push_str(before);
     next.push_str(replacement);
@@ -54,6 +55,32 @@ fn mention_start(buffer: &str, cursor: usize, query: &str) -> Option<usize> {
     exact.or_else(|| buffer.get(..cursor)?.rfind('@'))
 }
 
+fn completion_start(buffer: &str, cursor: usize, picker: &FilePicker) -> Option<usize> {
+    if let Some(start) = picker.argument_start {
+        (buffer.get(start..cursor) == Some(picker.query.as_str())).then_some(start)
+    } else {
+        mention_start(buffer, cursor, &picker.query)
+    }
+}
+
+/// Literal quoting for the existing /add parser, never a shell expression.
+fn quote_add_path(path: &str) -> Option<String> {
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    if cfg!(windows) {
+        if path.contains('"') {
+            return None;
+        }
+        Some(format!("\"{path}\""))
+    } else {
+        Some(format!(
+            "\"{}\"",
+            path.replace('\\', "\\\\").replace('"', "\\\"")
+        ))
+    }
+}
+
 pub fn handle_file_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -69,8 +96,14 @@ pub fn handle_file_key(
                 *cursor = prev_char_boundary(buffer, *cursor);
                 buffer.remove(*cursor);
             } else {
-                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
-                    *cursor = replace_at_span(buffer, at, 0, "");
+                if let Some(at) = completion_start(buffer, *cursor, picker) {
+                    *cursor = replace_at_span(
+                        buffer,
+                        at,
+                        0,
+                        usize::from(picker.argument_start.is_none()),
+                        "",
+                    );
                 }
                 picker.deactivate();
             }
@@ -107,8 +140,14 @@ pub fn handle_file_key(
                 buffer.remove(*cursor);
                 true
             } else {
-                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
-                    *cursor = replace_at_span(buffer, at, 0, "");
+                if let Some(at) = completion_start(buffer, *cursor, picker) {
+                    *cursor = replace_at_span(
+                        buffer,
+                        at,
+                        0,
+                        usize::from(picker.argument_start.is_none()),
+                        "",
+                    );
                 }
                 picker.deactivate();
                 true
@@ -129,17 +168,40 @@ pub fn handle_file_key(
         KeyCode::Tab if picker.matches.is_empty() => true,
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(path) = picker.selected_path() {
-                let path_str = path.to_string_lossy().to_string();
-                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
-                    *cursor = replace_at_span(buffer, at, picker.query.len(), &path_str);
+                let path_str = if picker.argument_start.is_some() {
+                    let Some(path) = path.to_str().and_then(quote_add_path) else {
+                        return true;
+                    };
+                    format!("{path} ")
+                } else {
+                    path.to_string_lossy().to_string()
+                };
+                if let Some(at) = completion_start(buffer, *cursor, picker) {
+                    *cursor = replace_at_span(
+                        buffer,
+                        at,
+                        picker.query.len(),
+                        usize::from(picker.argument_start.is_none()),
+                        &path_str,
+                    );
                 }
             }
             picker.deactivate();
             true
         }
         KeyCode::Esc => {
-            if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
-                *cursor = replace_at_span(buffer, at, picker.query.len(), "");
+            if picker.argument_start.is_some() {
+                picker.deactivate();
+                return true;
+            }
+            if let Some(at) = completion_start(buffer, *cursor, picker) {
+                *cursor = replace_at_span(
+                    buffer,
+                    at,
+                    picker.query.len(),
+                    usize::from(picker.argument_start.is_none()),
+                    "",
+                );
             }
             picker.deactivate();
             true
@@ -157,6 +219,7 @@ pub struct CommandPickerCtx<'a> {
     pub provider_names: &'a [String],
     /// The session's current model, marked in the `/model` picker.
     pub current_model: Option<String>,
+    pub file_workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// The active security mode, or `None` when no permission system is
     /// running (then `/mode` has no picker and submits as text).
     pub security_mode: Option<crate::permission::SecurityMode>,
@@ -199,7 +262,7 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
         }
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
-        "/queue" => true,
+        "/queue" | "/add" => true,
         "/mode" => ctx.security_mode.is_some(),
         _ => false,
     }
@@ -245,6 +308,12 @@ fn accept_command(
                     );
                     mp.activate();
                     Picker::Models(mp)
+                }
+                "/add" => {
+                    let mut files = FilePicker::new();
+                    files.activate_for_add(ctx.file_workspace.clone());
+                    files.set_add_argument(new_cursor, "");
+                    Picker::File(files)
                 }
                 "/mode" => Picker::Prefixed(mode_picker(ctx.security_mode), "/mode "),
                 other => {
@@ -693,5 +762,31 @@ pub fn handle_models_key(
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod busy67_file_argument_tests {
+    use super::*;
+    #[test]
+    fn literal_path_quoting_roundtrips_without_shell_or_environment_expansion() {
+        for path in [
+            "雪 space.txt",
+            "dollar$HOME@file;touch",
+            "quote'file.txt",
+            "back\\slash.txt",
+        ] {
+            let quoted = quote_add_path(path).unwrap();
+            assert_eq!(crate::ui::slash::split_args(&quoted).unwrap(), vec![path]);
+        }
+        #[cfg(not(windows))]
+        {
+            let path = "both\"and'quotes.txt";
+            assert_eq!(
+                crate::ui::slash::split_args(&quote_add_path(path).unwrap()).unwrap(),
+                vec![path]
+            );
+        }
+        assert!(quote_add_path("control\x1b.txt").is_none());
     }
 }

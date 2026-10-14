@@ -14,6 +14,17 @@ binary's completion script and exits. See [installation instructions](GET_STARTE
 
 All slash commands are available from the TUI input prompt.
 
+While the main agent is running, `/help` (including `/help keys`), bare `/model`,
+`/sessions`, `/sessions --all`, and `/jobs` remain available as views. Busy session
+listing is a bounded text catalogue; it does not open a resume picker, create storage,
+or repair file permissions. Model switches and session load/delete selectors wait until
+the active turn settles. These views do not warm a model, save the session, or advance a
+queued goal. Existing `/queue`, `/btw`, and loop/goal stop controls retain their behavior.
+
+The default footer keeps shared todo progress (`todo:<done>/<total>`) and queued inputs
+(`queue:<n>`) visible when nonempty, subject to the usual whole-item width priorities.
+Completed and cancelled todos count as done; a temporarily locked store displays `todo:?`.
+
 ## Session
 
 | Command | Description |
@@ -38,6 +49,8 @@ All slash commands are available from the TUI input prompt.
 | `/share` | Show what sharing would publish: the HTML export's size, how many tool outputs it contains (tool output can include file contents and secrets such as `.env` values), and that a secret gist is readable by anyone with the link. Nothing is uploaded. |
 | `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). Interrupting or failing the main run drops queued inputs and reports how many were dropped. |
+| `/jobs` | List this session's retained background job IDs, command summaries, statuses and exit codes; captured output is not included. Works while the main agent runs. |
+| `/jobs stop <job-id>` | Request cancellation of that exact owned job. `stopping` is a request, not proof of cleanup; the record stays owned until its process family settles. Works while busy. |
 | `/queue clear` | Empty the queue. |
 | `/queue pop` | Remove the last queued input. |
 | `/welcome` | Show the welcome/onboarding screen. |
@@ -80,6 +93,12 @@ build does not know parks it.
 | `/add <path>...` | Add one or more files to the agent's context (absolute or relative paths). Quote a path that contains spaces (`/add "my notes.md" src/lib.rs`). |
 | `/drop <path>...` | Remove one or more files (or pending media indexes) from the agent's context. |
 | `/drop-all` | Remove all added files from the agent's context. |
+
+After `/add `, Tab opens captured-workspace file completion for the current unquoted operand.
+Enter selects one quoted literal path and leaves the draft in the editor; it does not submit
+a prompt. `$`, `@`, and shell punctuation in a selected name remain literal. Existing quoted
+operands are retained; an unfinished quote or Unix escape is left for manual editing.
+This picker lists workspace files, rather than MCP resources.
 
 Files added with `/add` are included alongside the conversation in each request,
 useful for giving the agent reference documentation or code without cluttering
@@ -756,3 +775,6 @@ search stages its callable and instruction selections until the exact captured t
 host result commits them once. A rewritten or spilled result leaves live callable lookup, routing
 and attribution unchanged; cancellation or a later user turn rejects stale candidates. Existing
 learned ABI, lease, scope and admission checks remain in force.
+
+Typing `?` into an empty input editor shows the keyboard help locally, including while busy.
+A `?` in a nonempty draft or pasted text stays literal; help adds no chat-history entry.

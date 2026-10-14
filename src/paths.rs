@@ -110,6 +110,14 @@ impl WorkspaceBinding {
         })
     }
 
+    /// Validate the retained application-private root without creating it or
+    /// repairing mode/ACL. This is distinct from ordinary public workspaces.
+    pub(crate) fn validate_private_root(&self) -> io::Result<()> {
+        self.validate().map_err(io::Error::other)?;
+        crate::fs::validate_private_directory(&self.directory)?;
+        self.validate().map_err(io::Error::other)
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }

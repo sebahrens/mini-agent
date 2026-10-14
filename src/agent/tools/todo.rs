@@ -49,6 +49,21 @@ impl TodoStore {
         self.lock().clone()
     }
 
+    /// Numeric live status only; task text stays in the store. A held lock is
+    /// unavailable rather than a fabricated empty list.
+    pub(crate) fn progress(&self) -> Option<(usize, usize)> {
+        let todos = match self.0.try_lock() {
+            Ok(todos) => todos,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let done = todos
+            .iter()
+            .filter(|todo| matches!(todo.status.as_str(), "completed" | "cancelled"))
+            .count();
+        Some((done, todos.len()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }
@@ -342,6 +357,28 @@ impl Tool for ReadTodoList {
 
 #[cfg(test)]
 mod validation_tests {
+
+    #[test]
+    fn busy67_progress_counts_terminal_items_without_blocking_on_a_writer() {
+        let store = super::TodoStore::default();
+        assert_eq!(store.progress(), Some((0, 0)));
+        store.replace(
+            ["completed", "cancelled", "pending", "in_progress"]
+                .into_iter()
+                .map(|status| super::TodoItem {
+                    content: "private task content".into(),
+                    status: status.into(),
+                    priority: "medium".into(),
+                })
+                .collect(),
+        );
+        assert_eq!(store.progress(), Some((2, 4)));
+        let held = store.lock();
+        assert_eq!(store.progress(), None);
+        drop(held);
+        store.replace(Vec::new());
+        assert_eq!(store.progress(), Some((0, 0)));
+    }
     use super::*;
     #[tokio::test]
     async fn todo_labels_reject_invalid_values_without_replacing_stored_tasks() {

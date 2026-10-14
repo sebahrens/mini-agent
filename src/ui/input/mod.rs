@@ -332,6 +332,7 @@ pub struct InputEditor {
     /// Text width the input box wraps at, once the renderer has laid it out.
     wrap_width: Option<usize>,
     provider_names: Vec<String>,
+    file_workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// Source of the current security mode for the `/mode` picker.
     permission: Option<crate::permission::checker::PermCheck>,
     editor: Option<String>,
@@ -364,6 +365,7 @@ impl InputEditor {
             current_model: None,
             wrap_width: None,
             provider_names: Vec::new(),
+            file_workspace: None,
             permission: None,
             editor: None,
             kill_ring: Vec::with_capacity(MAX_KILL_RING),
@@ -483,6 +485,23 @@ impl InputEditor {
         self.provider_names = names;
     }
 
+    /// Completion is captured from the UI's actual workspace, not process cwd.
+    pub(crate) fn set_file_workspace(
+        &mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) {
+        if self
+            .file_workspace
+            .as_ref()
+            .is_some_and(|old| !std::sync::Arc::ptr_eq(old, &workspace))
+            && let Some(Picker::File(picker)) = &mut self.picker
+            && picker.argument_start.is_some()
+        {
+            picker.deactivate();
+        }
+        self.file_workspace = Some(workspace);
+    }
+
     /// Share the permission checker so the `/mode` picker can show and
     /// highlight the mode that is current when it opens.
     pub fn set_permission(&mut self, permission: Option<crate::permission::checker::PermCheck>) {
@@ -535,6 +554,49 @@ impl InputEditor {
                 .map(|operand| std::path::PathBuf::from(format!("@{operand}"))),
         );
         self.picker = Some(Picker::File(picker));
+    }
+
+    fn start_add_file_picker(&mut self) -> bool {
+        if self.cursor != self.buffer.len() || !self.buffer.starts_with("/add ") {
+            return false;
+        }
+        // Previously completed quoted operands stay unchanged. An unfinished
+        // quoted/escaped query remains editor text rather than guessing a span.
+        let mut quote = None;
+        let mut escaped = false;
+        let mut start = 5;
+        for (at, c) in self.buffer[5..self.cursor].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !cfg!(windows) {
+                escaped = true;
+                continue;
+            }
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+            } else if matches!(c, '\'' | '"') {
+                quote = Some(c);
+            } else if c.is_whitespace() {
+                start = 5 + at + c.len_utf8();
+            }
+        }
+        let query = &self.buffer[start..self.cursor];
+        if quote.is_some()
+            || (query.contains(['\'', '"']) || (!cfg!(windows) && query.contains('\\')))
+            || query.chars().count() > MAX_PICKER_PASTE_CHARS
+        {
+            return false;
+        }
+        let mut picker = FilePicker::new();
+        picker.set_monochrome(self.monochrome);
+        picker.activate_for_add(self.file_workspace.clone());
+        picker.set_add_argument(start, query);
+        self.picker = Some(Picker::File(picker));
+        true
     }
 
     /// Open the `!` picker over previously run shell commands. Stays closed
@@ -1029,6 +1091,7 @@ impl InputEditor {
                 }
                 None
             }
+            KeyCode::Char('?') if self.buffer.is_empty() => Some("/help keys".into()),
             KeyCode::Char(c) => {
                 if c == '@' && mention_can_start_at(&self.buffer, self.cursor) {
                     self.start_file_picker();
@@ -1057,6 +1120,9 @@ impl InputEditor {
                 self.history_pos = None;
                 self.draft = None;
                 self.yank_pos = None;
+                if c == ' ' && self.buffer.as_str() == "/add " {
+                    self.start_add_file_picker();
+                }
 
                 if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
                     && self.buffer.starts_with("/prompt ")
@@ -1168,6 +1234,9 @@ impl InputEditor {
                 None
             }
             KeyCode::Tab => {
+                if self.start_add_file_picker() {
+                    return None;
+                }
                 self.buffer.insert_str(self.cursor, "  ");
                 self.cursor += 2;
                 self.yank_pos = None;
@@ -1645,5 +1714,53 @@ mod skill_completion_tests {
             picker.char_input(c);
         }
         assert_eq!(picker.selected_name(), Some("/reviewer"));
+    }
+}
+
+#[cfg(test)]
+mod busy67_editor_tests {
+    use super::*;
+    #[test]
+    fn empty_question_is_host_help_but_nonempty_and_paste_are_literal() {
+        let mut editor = InputEditor::new();
+        assert_eq!(
+            editor
+                .handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+                .as_deref(),
+            Some("/help keys")
+        );
+        assert!(editor.buffer.is_empty() && editor.history.is_empty());
+        editor.handle_paste("?".into());
+        assert_eq!(editor.buffer, "?");
+        assert!(
+            editor
+                .handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(editor.buffer, "??");
+    }
+    #[test]
+    fn add_tab_inserts_one_quoted_unicode_operand_and_never_submits() {
+        let mut editor = InputEditor::new();
+        editor.handle_paste("/add 雪".into());
+        assert!(
+            editor
+                .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .is_none()
+        );
+        let Some(Picker::File(picker)) = editor.picker.as_mut() else {
+            panic!("file argument picker missing")
+        };
+        assert_eq!(picker.argument_start, Some(5));
+        picker.test_set_cache(vec![std::path::PathBuf::from("雪 file.txt")]);
+        picker.set_add_argument(5, "雪");
+        assert!(editor.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(
+            crate::ui::slash::split_args(&editor.buffer).unwrap(),
+            vec!["/add", "雪 file.txt"]
+        );
+        assert!(editor.history.is_empty());
+        assert!(!editor.picker.as_ref().unwrap().active());
+        assert_eq!(editor.cursor, editor.buffer.len());
     }
 }

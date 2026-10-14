@@ -20,6 +20,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/help",
     "/history",
     "/init",
+    "/jobs",
     "/memory",
     "/mode",
     "/model",

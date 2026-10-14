@@ -36,7 +36,17 @@ fn run_tutor(terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
     result
 }
 
-pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
+pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
+    if parts.get(1) == Some(&"keys") {
+        keys_lines(&mut |heading, text| {
+            if heading {
+                write_ok(ctx.renderer, text);
+            } else {
+                write_result(ctx.renderer, text);
+            }
+        });
+        return;
+    }
     help_lines(&mut |heading, text| {
         if heading {
             write_ok(ctx.renderer, text);
@@ -44,6 +54,10 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
             write_result(ctx.renderer, text);
         }
     });
+    // A live view never reloads templates while its runner owns context.
+    if *ctx.is_running {
+        return;
+    }
     let commands = crate::context::commands::load_for_workspace(ctx.workspace);
     if !commands.is_empty() {
         write_ok(ctx.renderer, "custom prompt commands:");
@@ -68,7 +82,18 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /skills               list/pick authorized instruction skills for one turn",
     );
-    emit(false, "  /add [path...]         add file(s) to context");
+    emit(
+        false,
+        "  /add [path...]         add file(s) to context (Tab completes paths)",
+    );
+    emit(
+        false,
+        "  /jobs                 list this session's background jobs",
+    );
+    emit(
+        false,
+        "  /jobs stop <job-id>    request an owned job's cancellation",
+    );
     emit(
         false,
         "  /drop <path...>        remove file(s) from context",
@@ -350,7 +375,12 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
             "  /subagent-models <n>   switch subagent to a quick model",
         );
     }
+    keys_lines(emit);
+}
+
+fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "keys:");
+    emit(false, "  ? (empty input)        show these shortcuts");
     emit(false, "  PgUp/PgDn             scroll chat history");
     emit(
         false,

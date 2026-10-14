@@ -153,15 +153,50 @@ pub(crate) fn list(
     workspace: &crate::paths::WorkspaceBinding,
     all: bool,
 ) -> anyhow::Result<Catalogue> {
+    list_mode(workspace, all, false)
+}
+
+/// Explicit metadata view with no creation or mode/ACL repair.
+pub(crate) fn list_readonly(
+    workspace: &crate::paths::WorkspaceBinding,
+    all: bool,
+) -> anyhow::Result<Catalogue> {
+    list_mode(workspace, all, true)
+}
+
+fn list_mode(
+    workspace: &crate::paths::WorkspaceBinding,
+    all: bool,
+    readonly: bool,
+) -> anyhow::Result<Catalogue> {
     workspace.validate().map_err(anyhow::Error::msg)?;
     let mut catalogue = Catalogue::default();
     if crate::paths::artifact_disabled("sessions") {
         return Ok(catalogue);
     }
-    let Some(directory) = super::storage::existing_session_dir()? else {
-        return Ok(catalogue);
+    let directory = if readonly {
+        let directory = crate::paths::process_paths()
+            .expect("startup captures paths")
+            .sessions_dir();
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "unsafe session catalogue directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(catalogue),
+            Err(error) => return Err(error.into()),
+        }
+        directory
+    } else {
+        let Some(directory) = super::storage::existing_session_dir()? else {
+            return Ok(catalogue);
+        };
+        directory
     };
     let retained = crate::paths::WorkspaceBinding::capture(&directory)?;
+    if readonly {
+        retained.validate_private_root()?;
+    }
     let mut entries = Vec::new();
     for (index, entry) in std::fs::read_dir(&directory)?.enumerate() {
         if index >= MAX_ENTRIES {
@@ -197,7 +232,17 @@ pub(crate) fn list(
             continue;
         }
         let candidate = (|| -> anyhow::Result<Header> {
-            let mut file = open_catalogue_file(&path)?;
+            let relative = std::path::PathBuf::from(format!("{stem}.json"));
+            let mut file = if readonly {
+                let file = retained.open_regular_relative(&relative)?;
+                crate::fs::validate_private_file(&file)?;
+                file
+            } else {
+                open_catalogue_file(&path)?
+            };
+            let identity = readonly
+                .then(|| crate::fs::checked_file_metadata(&file))
+                .transpose()?;
             retained.validate().map_err(anyhow::Error::msg)?;
             let length = file.metadata()?.len();
             anyhow::ensure!(
@@ -217,6 +262,17 @@ pub(crate) fn list(
                 anyhow::bail!("catalogue byte budget exhausted");
             }
             total += bytes.len() as u64;
+            if let Some(identity) = identity {
+                crate::fs::validate_private_file(&file)?;
+                let current = retained.open_regular_relative(&relative)?;
+                crate::fs::validate_private_file(&current)?;
+                crate::fs::ensure_same_file(
+                    &path,
+                    &identity,
+                    &crate::fs::checked_file_metadata(&current)?,
+                )?;
+                retained.validate_private_root()?;
+            }
             anyhow::ensure!(
                 bytes.len() as u64 <= MAX_FILE_BYTES,
                 "session grew beyond catalogue budget"
@@ -368,6 +424,39 @@ mod tests {
         super::super::storage::atomic_write(&file, &serde_json::to_string(&session).unwrap())
             .unwrap();
         session
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy67_readonly_catalogue_never_creates_or_repairs_private_storage() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("readonly-catalogue67");
+        let _env = environment(&root);
+        let binding = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let directory = crate::paths::process_paths().unwrap().sessions_dir();
+        assert!(list_readonly(&binding, false).unwrap().rows.is_empty());
+        assert!(!directory.exists());
+        let session = stored(root.path(), "Saved bounded title");
+        assert_eq!(
+            list_readonly(&binding, false).unwrap().rows[0].id,
+            session.id
+        );
+        let path = super::super::storage::session_path(&session.id).unwrap();
+        let contents = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let rejected = list_readonly(&binding, false).unwrap();
+        assert!(rejected.rows.is_empty() && rejected.skipped == 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(list_readonly(&binding, false).is_err());
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
     #[test]
     fn catalogue_filters_workspace_and_all_selection_forks_foreign_trust() {
