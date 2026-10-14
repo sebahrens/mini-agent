@@ -12,6 +12,7 @@ on:
           - full
           - windows-general-sandbox
           - windows-command-family
+          - windows-helper-phase-witness
   push:
     branches:
       - main
@@ -94,6 +95,14 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ] && [ "${SCOPE:-}" = "windows-command-family" ]; then
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "Running only the Windows command-family proof."
+            exit 0
+          fi
+
+          # Private validation-only scope: four phase witness primitives,
+          # never a full-suite or required aggregate status.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${SCOPE:-}" = "windows-helper-phase-witness" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Running only the four Windows helper-phase experiments."
             exit 0
           fi
 
@@ -623,7 +632,7 @@ jobs:
         run: cargo test --locked
 
   windows-default-compile:
-    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family')) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: ((needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family')) || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-helper-phase-witness')) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
@@ -638,8 +647,10 @@ jobs:
       # full libtest also contains Unix-only integration fixtures, so this gate
       # specifically prevents default-feature cfg and compilation drift.
       - name: Compile the Windows default feature suite
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-helper-phase-witness'
         run: cargo test --locked --no-run
       - name: Test native ledger lock and persistence contracts
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-helper-phase-witness'
         shell: pwsh
         run: |
           $filters = @('spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent', 'spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge', 'spend_ledger_concurrent_lock_is_bounded_and_directory_replacement_is_refused')
@@ -652,6 +663,7 @@ jobs:
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native ledger lock or persistence contract failed' }
       - name: Test native one MiB App event loops
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-helper-phase-witness'
         shell: pwsh
         run: |
           $filters = @('actual_standard_app_event_loop_runs_on_one_mib_stack', 'actual_session_picker_event_loop_runs_on_one_mib_stack', 'actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack', 'actual_plan_confirmation_event_loop_runs_on_one_mib_stack')
@@ -669,7 +681,86 @@ jobs:
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native one MiB App event loop failed' }
 
+      - name: Test four native Windows helper phase witnesses
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-helper-phase-witness'
+        shell: pwsh
+        run: |
+          # Read the local commit object's parent, including shallow checkouts;
+          # no extra fetch or inference from an unavailable ancestor is needed.
+          $parents = @(& git cat-file -p HEAD | Where-Object { $_ -match '^parent ' })
+          if ($LASTEXITCODE -ne 0 -or $parents.Count -ne 1) { throw 'Phase source parent unavailable' }
+          $source = $parents[0].Substring(7)
+          if ($source -ne '0af70bda6f9e699101e75e82872222001b410c34') { throw 'Phase source parent identity differs' }
+          $expectedHashes = @{
+            'docs/agent/TOOL_RUNTIME.md' = '7d30bbf7b16517cac6e8f3c47fa5e195568d40e3f66bc18067719d23671c263c'
+            'src/sandbox/windows.rs' = '989bdffb0e41aeeffc7bb4dd0437f8d0f1a901c25c00697dc77db6652a8be299'
+            'src/tests/windows_foreground_job_tests.rs' = '412584c78919e45691e508655b9e61ce2c9ae67a552f10fff699b12d3c862812'
+            'src/tests/windows_phase_witness_tests.rs' = '3db37b07958ee8f51bcea952fcfb967e46a7306cb3f38d1db70390219aba0dac'
+            'tests/fixtures/windows_gh_fixture.rs' = '30d833d28d176f3392ae96fae4885fd78ada5d00b953aee7b167050901cf30e0'
+            'tests/fixtures/windows_phase_probe.rs' = '6c5785925b409e0fe57b3179cf46a7e8de41c9fdcb70b50bc2173f32f22f9c6e'
+          }
+          if ($expectedHashes.Count -ne 6) { throw 'Phase exact six source identities missing' }
+          foreach ($entry in $expectedHashes.GetEnumerator()) {
+            $size = (Get-Item -LiteralPath $entry.Key).Length
+            if ($size -gt 1048576) { throw 'Phase fixed source exceeds diagnostic bound' }
+            $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($entry.Key))
+            $crlf = [regex]::IsMatch($text, '\r\n')
+            $lf = [regex]::IsMatch($text, '(?<!\r)\n')
+            $cr = [regex]::IsMatch($text, '\r(?!\n)')
+            $eol = if (($crlf -and ($lf -or $cr)) -or ($lf -and $cr)) { 'mixed' } elseif ($crlf) { 'crlf' } elseif ($lf) { 'lf' } elseif ($cr) { 'cr' } else { 'none' }
+            $before = (Get-FileHash -LiteralPath $entry.Key -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "PHASE108 fixed_source=$($entry.Key) sha=$before matches=$($before -eq $entry.Value) eol=$eol"
+          }
+          # Materialize only the six reviewed index blobs, with no persistent
+          # Git configuration change and no normalization of the hash assertion.
+          $sourcePaths = @($expectedHashes.Keys | Sort-Object)
+          & git -c core.autocrlf=false checkout-index --force -- @sourcePaths
+          if ($LASTEXITCODE -ne 0) { throw 'Phase fixed source materialization failed' }
+          foreach ($entry in $expectedHashes.GetEnumerator()) {
+            if ((Get-FileHash -LiteralPath $entry.Key -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'Phase source bytes differ' }
+          }
+          $features = 'sandbox,git-worktree'
+          $messages = @(& cargo test --locked --no-default-features --features $features --test windows_gh_fixture --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw 'Phase fixture compilation failed' }
+          $images = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'windows_gh_fixture' -and $_.target.kind -contains 'test' -and $_.executable })
+          if ($images.Count -ne 1) { throw 'Expected one Cargo-discovered phase fixture image' }
+          $fixture = $images[0].executable
+          if (-not (Test-Path -LiteralPath $fixture -PathType Leaf) -or [IO.Path]::GetExtension($fixture) -ne '.exe') { throw 'Phase fixture image missing' }
+          & $fixture --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Existing inert fixture self-test failed' }
+          $filter = 'sandbox::windows::phase_witness_tests::'
+          $listing = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $filter -- --ignored --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Phase witness discovery failed' }
+          $expected = @(
+            'sandbox::windows::phase_witness_tests::windows_phase_witness_known_store_survives_forced_kill_after_exact_retirement: test'
+            'sandbox::windows::phase_witness_tests::windows_phase_witness_target_cannot_inherit_noninheritable_observer: test'
+            'sandbox::windows::phase_witness_tests::windows_phase_witness_whole_request_and_feeder_errors_retire_without_effect: test'
+            'sandbox::windows::phase_witness_tests::windows_phase_witness_invalid_stage_and_none_preserve_fixed_target_outcome: test'
+          ) | Sort-Object
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^sandbox::windows::phase_witness_tests::.*: test$' } | Sort-Object)
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 4 -or $difference.Count -ne 0) { throw 'Expected the exact four phase witness tests' }
+          # Reuse the immutable prior three native passes; only the injector
+          # and its formerly unreached error-matrix subcases changed.
+          $execute = @('sandbox::windows::phase_witness_tests::windows_phase_witness_whole_request_and_feeder_errors_retire_without_effect')
+          if ($execute.Count -ne 1 -or $execute[0] -ne 'sandbox::windows::phase_witness_tests::windows_phase_witness_whole_request_and_feeder_errors_retire_without_effect' -or -not ($expected -contains ($execute[0] + ': test'))) { throw 'Expected only the failed error-matrix case' }
+          $previous = $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE
+          $failed = $false
+          try {
+            $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE = $fixture
+            foreach ($name in $execute) {
+              $result = @(& cargo test --locked --no-default-features --features $features --bin mini-agent $name -- --exact --ignored --nocapture --test-threads=1)
+              $exit = $LASTEXITCODE
+              $result | ForEach-Object { Write-Host $_ }
+              if ($exit -ne 0 -or -not ($result -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) { $failed = $true }
+            }
+          } finally {
+            if ($null -eq $previous) { Remove-Item Env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE -ErrorAction SilentlyContinue } else { $env:MINI_AGENT_WINDOWS_GH_FIXTURE_EXE = $previous }
+          }
+          if ($failed) { throw 'A native phase witness experiment failed' }
+
       - name: Test native Windows GH argv and actual foreground authority
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-helper-phase-witness'
         shell: pwsh
         run: |
           $features = 'git-worktree,sandbox,hooks'
