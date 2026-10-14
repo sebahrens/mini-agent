@@ -536,10 +536,15 @@ async fn run_hook_with_policy_and_limits(
                 }
                 Ok::<(), RunError>(())
             };
-            let read_stdout =
-                capture_pipe(stdout_pipe, OutputStream::Stdout, captured.clone(), limits);
-            let read_stderr =
-                capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits);
+            // Each reader owns an 8 KiB buffer. Keep the same joined readers,
+            // but do not copy that inline future through MaybeDone replacement
+            // on the interactive caller's physical stack.
+            let read_stdout = crate::startup::heap_future(|| {
+                capture_pipe(stdout_pipe, OutputStream::Stdout, captured.clone(), limits)
+            });
+            let read_stderr = crate::startup::heap_future(|| {
+                capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits)
+            });
             let wait = async { child.wait().await.map_err(RunError::Wait) };
             let (_, _, _, status) = tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
             Ok::<_, RunError>(status)

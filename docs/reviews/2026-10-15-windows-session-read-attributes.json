@@ -1,0 +1,14 @@
+{
+  "bead": "mini-agent-4ccbc",
+  "native_observation": {
+    "fixture_failure": "b02c05e1 stopped at first save because the test precreated a Windows private directory with a generic owner. Only Windows fixture creation now uses the existing private-directory API.",
+    "corrected_fixture_commit": "846da19d",
+    "actual_failure": "Job116143084819 reported WINDOWS_PRIVATE_TEMP_FAILURE stage=original_metadata os_code=Some(5), before ReOpenFile or security setup.",
+    "cause": "The retained exclusively-created NtCreateFile temporary handle had GENERIC_WRITE, DELETE and SYNCHRONIZE, but not FILE_READ_ATTRIBUTES required for its pre-write metadata validation."
+  },
+  "fix": "Add FILE_READ_ATTRIBUTES to that one retained temporary handle. Share mode, root binding, exclusive creation, ACL/owner validation, rename/CAS, timeout and cleanup remain unchanged.",
+  "source_patch": "f487e1628aeb3e21a1da9dbb43aa07bc6850abb8e56623c0a6ba07c7f6036763",
+  "diagnostic_branch_commit": "7683d2a0ae4e530d01f19395791c8e2a05fb1735",
+  "validation": "Exact two existing minimal-MCP native storage controls are running at https://github.com/sebahrens/mini-agent/actions/runs/38649629222. No native pass or bead closure claimed yet. Unchanged macOS cfg is covered by the combined tests/lint/install; no redundant local feature matrix.",
+  "separation": "This is session temporary-handle validation. It does not deliver blocked Windows MCP configuration replacement mini-agent-i7ro6.57.1."
+}
