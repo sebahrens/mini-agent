@@ -3419,7 +3419,9 @@ async fn relay_prompt_events(
                 #[cfg(not(feature = "goal"))]
                 let _ = delta;
             }
-            AgentEvent::CompactionBoundary { .. } => {
+            AgentEvent::SteerConsumed { .. }
+            | AgentEvent::SteerRejected { .. }
+            | AgentEvent::CompactionBoundary { .. } => {
                 tracing::error!("interactive-only compaction boundary reached ACP");
                 control.cancel();
                 return cancelled_after_runner(&mut rx).await;

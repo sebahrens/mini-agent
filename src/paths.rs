@@ -730,6 +730,76 @@ impl WorkspaceBinding {
         result
     }
 
+    /// Retire one exact file into a newly-created private sibling directory before
+    /// checking the displaced identity/content. A raced foreign file is retained,
+    /// never deleted; restoration is create-only if its original name is occupied.
+    pub(crate) fn retire_relative_expecting(
+        &self,
+        path: &Path,
+        expected: &crate::fs::CheckedMetadata,
+        base: &crate::fs::ContentDigest,
+    ) -> io::Result<()> {
+        #[cfg(not(unix))]
+        {
+            let _ = (path, expected, base);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "checked file retirement is unsupported on this platform",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
+            self.validate().map_err(io::Error::other)?;
+            let path = self.normalize_relative(path)?;
+            let (parent, name) = self.open_parent(&path, false)?;
+            let current = open_file_no_follow(&parent, &name)?;
+            crate::fs::ensure_same_file(
+                &path,
+                expected,
+                &crate::fs::checked_file_metadata(&current)?,
+            )?;
+            if !base.matches_file(&current)? {
+                return Err(crate::fs::stale_content_error(&path));
+            }
+            drop(current);
+            let quarantine = sibling_temp_name(&name);
+            let mut builder = cap_std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            parent.create_dir_with(&quarantine, &builder)?;
+            let directory = open_dir_no_follow(&parent, &quarantine)?;
+            if let Err(error) = parent.rename(&name, &directory, "retired") {
+                let _ = parent.remove_dir(&quarantine);
+                return Err(error);
+            }
+            let displaced = open_file_no_follow(&directory, OsStr::new("retired"));
+            let matches = displaced.as_ref().ok().is_some_and(|file| {
+                crate::fs::checked_file_metadata(file)
+                    .and_then(|actual| crate::fs::ensure_same_file(&path, expected, &actual))
+                    .is_ok()
+                    && base.matches_file(file).unwrap_or(false)
+            });
+            drop(displaced);
+            if !matches {
+                // hard_link refuses an existing destination. Never overwrite a
+                // concurrently created editor file when rolling back the race.
+                if directory.hard_link("retired", &parent, &name).is_ok() {
+                    directory.remove_file("retired")?;
+                    drop(directory);
+                    parent.remove_dir(&quarantine)?;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "file changed during retirement; displaced bytes retained",
+                ));
+            }
+            directory.remove_file("retired")?;
+            drop(directory);
+            parent.remove_dir(&quarantine)?;
+            self.validate().map_err(io::Error::other)
+        }
+    }
+
     fn open_parent(
         &self,
         path: &Path,

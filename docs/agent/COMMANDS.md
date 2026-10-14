@@ -212,7 +212,8 @@ files are skipped with a warning containing their path and read error.
 | `/editsys similarity` | Use SEARCH/REPLACE with exact/whitespace matching and explicit fuzzy opt-in (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |
 | `/btw <message>` | Ask a quick side question in parallel, without touching the main conversation. It forks the current context (including the main agent's in-flight turn, if any), answers using read-only tools (read/grep/find_files/list_dir, no writes or shell), and prints the answer inline. Works even while the main agent is running. Nothing is written to history; its token cost is shown separately as `btw:$…`. Ctrl-C cancels an in-flight `/btw` without disturbing the main agent. |
-| `/reasoning [on\|off]` | Turn LLM reasoning on or off, or toggle it without an argument (requires model support). |
+| `/effort [low\|medium\|high\|xhigh\|max\|default]` | Inspect or set main-session effort. Changes persist with the session, affect the next request and leave reasoning display preferences unchanged. Stop the active turn first; unsupported backend/model levels are refused. `default` clears the session effort override. |
+| `/reasoning [on\|off]` | Set actual thinking on supported native Claude routes; unsupported off requests explain the restriction. `default` clears an explicit native mode. On other routes this retains the existing prompt preference. |
 | `/thinking` | Alias for `/reasoning`. |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |

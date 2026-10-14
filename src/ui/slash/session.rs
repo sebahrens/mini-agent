@@ -127,6 +127,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     if session.name.is_empty() {
         session.name = CompactString::new("imported");
     }
+    session.file_checkpoints = Default::default();
     session.initialize_read_tracker(ctx.cfg.deny_repeated_reads.unwrap_or(true));
     #[cfg(feature = "goal")]
     let goal_block =
@@ -780,6 +781,7 @@ async fn handle_redo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
 fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     session.pending_question = None;
+    session.file_checkpoints = Default::default();
     session.messages.clear();
     session.total_estimated_tokens = 0;
     session.reset_calibration();
@@ -920,7 +922,10 @@ async fn handle_rewind(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         write_ok(ctx.renderer, "nothing to rewind to");
         return Ok(());
     }
-    ctx.input.start_rewind_picker(targets);
+    ctx.input.start_rewind_picker(
+        targets,
+        crate::ui::pickers::rewind::RewindBinding::capture(ctx.session, ctx.workspace)?,
+    );
     Ok(())
 }
 

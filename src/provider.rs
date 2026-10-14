@@ -19,6 +19,8 @@ use crate::auth::{AuthResolver, ProviderKind, ResolvedCredential};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 
+#[path = "provider_effort.rs"]
+pub(crate) mod effort;
 #[cfg(test)]
 #[path = "provider_effort_tests.rs"]
 mod effort_tests;
@@ -667,6 +669,55 @@ impl AnyClient {
             }
         };
         Ok(AnyAgent::without_skills(inner).with_turn_token_budget(budget))
+    }
+
+    /// Resolve against the actual typed backend, including custom aliases.
+    /// This constructs no agent, starts no hook, and makes no HTTP request.
+    pub(crate) fn resolve_session_reasoning(
+        &self,
+        cfg: &Config,
+        session: &crate::session::Session,
+        controls: effort::SessionReasoning,
+    ) -> Result<(effort::Effective, Option<bool>), effort::ControlError> {
+        let model = self.completion_model_with_cache_ttl(
+            session.model.to_string(),
+            cfg.cache_ttl.unwrap_or_default(),
+        );
+        let protocol = match &model {
+            AnyModel::Anthropic(_) => effort::Protocol::Anthropic,
+            AnyModel::OpenRouter(..) => effort::Protocol::OpenRouter,
+            AnyModel::OpenAI(OpenAiModel::Responses(_)) => effort::Protocol::OpenAiResponses,
+            AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
+            _ => effort::Protocol::Other,
+        };
+        let raw = crate::config::resolve_extra_body(cfg, &session.model);
+        let params = provider_request_params(&model, cfg, raw.clone(), &session.id);
+        let (params, mut effective) = effort::apply(
+            protocol,
+            &session.model,
+            cfg.reasoning.as_ref().and_then(|r| r.effort),
+            controls,
+            params,
+        )?;
+        if effective.source == effort::Source::Raw
+            && raw
+                .as_ref()
+                .and_then(|v| match protocol {
+                    effort::Protocol::Anthropic => v.pointer("/output_config/effort"),
+                    effort::Protocol::OpenAiCompletions => v.get("reasoning_effort"),
+                    _ => v.pointer("/reasoning/effort"),
+                })
+                .is_none()
+            && cfg.reasoning.as_ref().and_then(|r| r.effort).is_some()
+        {
+            effective.source = effort::Source::Config;
+        }
+        let thinking = effort::thinking_enabled(protocol, &session.model, params.as_ref());
+        Ok((effective, thinking))
+    }
+    pub(crate) fn has_native_reasoning_controls(&self, model: &str) -> bool {
+        matches!(self, Self::Anthropic(_))
+            || matches!(self, Self::OpenRouter(_)) && model.starts_with("anthropic/")
     }
 
     #[cfg(test)]
@@ -2185,10 +2236,12 @@ pub struct AnyAgent {
     /// different unit entirely.
     turn_token_budget: Option<u64>,
     spend: Option<crate::spend::run::Run>,
+    file_checkpoints: Option<crate::session::file_checkpoints::Recorder>,
     native_capture: Option<crate::agent::native_capture::NativeCapture>,
     native_host: Option<std::sync::Arc<NativeHostOwner>>,
     question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
+    reasoning_controls: Option<CapturedReasoning>,
     context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "lsp")]
     diagnostic_lsp: Option<crate::extras::lsp::LspManager>,
@@ -2200,6 +2253,13 @@ pub struct AnyAgent {
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
     turn_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct CapturedReasoning {
+    base: Option<serde_json::Value>,
+    effective: Option<effort::Effective>,
+    error: Option<effort::ControlError>,
 }
 
 /// The frontend declares which exact IDs its own transcript transport records.
@@ -2889,10 +2949,12 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            file_checkpoints: None,
             native_capture: None,
             native_host: None,
             question_turn: None,
             completion_verification: None,
+            reasoning_controls: None,
             context_snapshot: None,
             #[cfg(feature = "agent-skills")]
             instructions: None,
@@ -2905,6 +2967,103 @@ impl AnyAgent {
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    fn reasoning_route(&self) -> (effort::Protocol, &str) {
+        use effort::Protocol as P;
+        match &self.inner {
+            AnyAgentInner::Anthropic(a) => (P::Anthropic, &a.model.model),
+            AnyAgentInner::OpenRouter(a) => (P::OpenRouter, &a.model.model),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => {
+                (P::OpenAiResponses, &a.model.model)
+            }
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => {
+                (P::OpenAiCompletions, &a.model.model)
+            }
+            AnyAgentInner::Gemini(a) => (P::Other, &a.model.model),
+            AnyAgentInner::Ollama(a) => (P::Other, &a.model.model),
+        }
+    }
+    fn reasoning_params(&mut self) -> &mut Option<serde_json::Value> {
+        match &mut self.inner {
+            AnyAgentInner::Anthropic(a) => &mut a.additional_params,
+            AnyAgentInner::OpenRouter(a) => &mut a.additional_params,
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &mut a.additional_params,
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &mut a.additional_params,
+            AnyAgentInner::Gemini(a) => &mut a.additional_params,
+            AnyAgentInner::Ollama(a) => &mut a.additional_params,
+        }
+    }
+    /// Recompute from the original configured parameters, never from an earlier
+    /// session override. Clones keep their already-captured invocation policy.
+    pub(crate) fn with_reasoning_controls(
+        mut self,
+        cfg: &Config,
+        controls: effort::SessionReasoning,
+    ) -> Self {
+        let base = match self.reasoning_controls.take() {
+            Some(captured) => captured.base,
+            None => self.reasoning_params().clone(),
+        };
+        let (protocol, model) = self.reasoning_route();
+        let result = effort::apply(
+            protocol,
+            model,
+            cfg.reasoning.as_ref().and_then(|r| r.effort),
+            controls,
+            base.clone(),
+        );
+        let (effective, error) = match result {
+            Ok((params, mut effective)) => {
+                // Provider builders have already merged OpenAI's typed config.
+                // Report its real source rather than calling generated data raw.
+                if effective.source == effort::Source::Raw {
+                    let raw = crate::config::resolve_extra_body(cfg, model);
+                    let raw_effort = match protocol {
+                        effort::Protocol::Anthropic => raw
+                            .as_ref()
+                            .and_then(|v| v.pointer("/output_config/effort")),
+                        effort::Protocol::OpenAiCompletions => {
+                            raw.as_ref().and_then(|v| v.get("reasoning_effort"))
+                        }
+                        _ => raw.as_ref().and_then(|v| v.pointer("/reasoning/effort")),
+                    };
+                    if raw_effort.is_none()
+                        && cfg.reasoning.as_ref().and_then(|r| r.effort).is_some()
+                    {
+                        effective.source = effort::Source::Config;
+                    }
+                }
+                *self.reasoning_params() = params;
+                (Some(effective), None)
+            }
+            Err(error) => (None, Some(error)),
+        };
+        self.reasoning_controls = Some(CapturedReasoning {
+            base,
+            effective,
+            error,
+        });
+        self
+    }
+    pub(crate) fn effective_reasoning(&self) -> Result<effort::Effective, effort::ControlError> {
+        match &self.reasoning_controls {
+            Some(captured) => captured.effective.ok_or(
+                captured
+                    .error
+                    .unwrap_or(effort::ControlError("reasoning controls unavailable")),
+            ),
+            None => Ok(effort::Effective {
+                effort: None,
+                source: effort::Source::Provider,
+                adaptive: false,
+            }),
+        }
+    }
+    fn reasoning_error(&self) -> Option<effort::ControlError> {
+        self.reasoning_controls
+            .as_ref()
+            .and_then(|captured| captured.error)
     }
 
     // Capture is not yet enabled by a frontend: Session/domain policy is a
@@ -2930,6 +3089,14 @@ impl AnyAgent {
         kind: crate::spend::RequestKind,
     ) -> Self {
         self.spend = Some(crate::spend::run::Run::for_session(session, cfg, kind));
+        self
+    }
+
+    pub(crate) fn with_file_checkpoints(
+        mut self,
+        recorder: crate::session::file_checkpoints::Recorder,
+    ) -> Self {
+        self.file_checkpoints = Some(recorder);
         self
     }
 
@@ -3266,10 +3433,12 @@ impl AnyAgent {
             inner,
             turn_token_budget: None,
             spend: None,
+            file_checkpoints: None,
             native_capture: None,
             native_host: None,
             question_turn: None,
             completion_verification: None,
+            reasoning_controls: None,
             context_snapshot: None,
             #[cfg(feature = "agent-skills")]
             instructions: None,
@@ -3407,6 +3576,9 @@ impl AnyAgent {
             {
                 return runner::HeadlessTurn::failed_before_start(error);
             }
+            if let Some(error) = self.reasoning_error() {
+                return runner::HeadlessTurn::failed_before_start(error.into());
+            }
             #[cfg(feature = "hooks")]
             let (hook_prompt, hook_context) = {
                 if let Err(error) = crate::spend::run::admit_current_effect().await {
@@ -3434,6 +3606,8 @@ impl AnyAgent {
             let prompt = hook_prompt.as_str();
             #[cfg(feature = "hooks")]
             let history = crate::extras::hooks::append_context_history(history, &hook_context);
+            #[cfg(feature = "hooks")]
+            crate::session::file_checkpoints::inserted_context(hook_context.len());
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
                 Some(
@@ -3588,6 +3762,7 @@ impl AnyAgent {
                 None => crate::print::run_headless_turn(child).await,
             }
         });
+        let future = crate::session::file_checkpoints::scope(self.file_checkpoints.clone(), future);
         let mut turn = crate::question::scope(self.question_turn.clone(), future).await;
         // SDK hook errors carry a string. Recover the typed budget outcome
         // only when this exact parent-owned run actually refused admission.
@@ -3834,6 +4009,7 @@ impl AnyAgent {
         // The typed dispatch child is large in debug builds. Construct it in
         // the short factory frame while the spend scope still owns every poll.
         let question_turn = self.question_turn.clone();
+        let file_checkpoints = self.file_checkpoints.clone();
         let future = crate::spend::run::scope(
             self.spend.clone(),
             crate::startup::heap_future(|| async move {
@@ -3850,6 +4026,9 @@ impl AnyAgent {
                 if let Some(spend) = crate::spend::run::Run::current()
                     && let Err(error) = work_scope.run(spend.prepare()).await
                 {
+                    return spawn_blocked_runner(error.to_string(), work_scope);
+                }
+                if let Some(error) = self.reasoning_error() {
                     return spawn_blocked_runner(error.to_string(), work_scope);
                 }
                 #[cfg(feature = "hooks")]
@@ -3880,6 +4059,8 @@ impl AnyAgent {
                 let (rewritten, hook_context) = rewritten;
                 #[cfg(feature = "hooks")]
                 let history = crate::extras::hooks::append_context_history(history, &hook_context);
+                #[cfg(feature = "hooks")]
+                crate::session::file_checkpoints::inserted_context(hook_context.len());
                 #[cfg(feature = "hooks")]
                 if let Err(error) = prompt.apply_hook_text(rewritten) {
                     return spawn_blocked_runner(error.to_owned(), work_scope);
@@ -4014,7 +4195,11 @@ impl AnyAgent {
                 paused
             }),
         );
-        crate::question::scope(question_turn, future).await
+        crate::question::scope(
+            question_turn,
+            crate::session::file_checkpoints::scope(file_checkpoints, future),
+        )
+        .await
     }
 
     pub fn spawn_btw(
@@ -4852,7 +5037,7 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "agent-skills")]
         instructions: agent.instructions.clone(),
     }));
-    agent
+    agent.with_reasoning_controls(cfg, Default::default())
 }
 
 /// A task-outcome recorder for the goal driver.
@@ -6469,17 +6654,28 @@ pub(crate) struct NativeRunOwner {
     pub(crate) scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
     cleanup: Option<crate::agent::runner::AgentRunCleanupGuard>,
     pub(crate) outcome: crate::session::native_replay::RetiredNativeOutcome,
-    #[cfg(feature = "hooks")]
     retired_session_end: Option<NativeSessionEndOwner>,
 }
 
-#[cfg(feature = "hooks")]
 pub(crate) struct NativeSessionEndOwner {
     permit: crate::session::native_publication::RetiredSessionEndPermit,
     host: Option<NativeHostGuard>,
 }
-#[cfg(feature = "hooks")]
 impl NativeSessionEndOwner {
+    #[cfg(test)]
+    pub(crate) fn fail_next_control_publication(&mut self) {
+        self.permit.fail_next_control_publication();
+    }
+    pub(crate) async fn update_reasoning(
+        &mut self,
+        session: &mut crate::session::Session,
+        next: effort::SessionReasoning,
+    ) -> anyhow::Result<()> {
+        self.permit
+            .update_reasoning(session, self.host.as_ref(), next)
+            .await
+    }
+    #[cfg(feature = "hooks")]
     pub(crate) async fn run(self, session: &mut crate::session::Session) -> anyhow::Result<()> {
         self.permit.run(session, self.host.as_ref()).await
     }
@@ -6501,11 +6697,9 @@ impl NativeRunOwner {
             scope,
             cleanup: Some(cleanup),
             outcome: crate::session::native_replay::RetiredNativeOutcome::Incomplete,
-            #[cfg(feature = "hooks")]
             retired_session_end: None,
         }
     }
-    #[cfg(feature = "hooks")]
     pub(crate) fn take_retired_session_end(&mut self) -> Option<NativeSessionEndOwner> {
         self.retired_session_end.take()
     }
@@ -6566,7 +6760,6 @@ impl NativeRunOwner {
         if let Some(cleanup) = self.cleanup.take() {
             cleanup.settle().await;
         }
-        #[cfg(feature = "hooks")]
         if result.is_ok()
             && session.native_publication.is_some()
             && let Some(binding) = &self.binding

@@ -2890,7 +2890,13 @@ async fn run_bound_headless_round(
             #[cfg(feature = "agent-skills")]
             let agent = agent.with_instruction_turn(instruction_turn);
             let agent = agent
+                .with_reasoning_controls(cfg, session.reasoning_controls)
                 .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                .with_file_checkpoints(session.file_checkpoints.recorder(
+                    &session.id,
+                    session.messages.len(),
+                    cli.no_session,
+                ))
                 .with_question_turn(Some(question_turn));
             async move {
                 agent
@@ -2946,12 +2952,18 @@ async fn run_bound_headless_round(
         },
         None => ReplayBoundary::CompletedTurn,
     };
+    let file_checkpoints =
+        session
+            .file_checkpoints
+            .recorder(&session.id, session.messages.len(), cli.no_session);
     let bound = heap_future(|| {
         let agent = agent.clone();
         #[cfg(feature = "agent-skills")]
         let agent = agent.with_instruction_turn(instruction_turn);
         let agent = agent
+            .with_reasoning_controls(cfg, session.reasoning_controls)
             .with_spend(Some(spend))
+            .with_file_checkpoints(file_checkpoints.clone())
             .with_question_turn(Some(question_turn));
         std::future::ready(agent.bind_native_turn(
             session,
@@ -2971,6 +2983,7 @@ async fn run_bound_headless_round(
         if let Err(error) = binding.append_owned_startup_context(session, context) {
             return failed(error.into());
         }
+        file_checkpoints.rebase_turn(session.messages.len());
         if let Err(error) = owner.progress(session).await {
             return failed(error);
         }
@@ -3118,7 +3131,13 @@ async fn run_headless_goal_rounds(
                 #[cfg(feature = "agent-skills")]
                 let agent = agent.with_instruction_turn(instruction_turn);
                 let agent = agent
+                    .with_reasoning_controls(cfg, session.reasoning_controls)
                     .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                    .with_file_checkpoints(session.file_checkpoints.recorder(
+                        &session.id,
+                        session.messages.len(),
+                        cli.no_session,
+                    ))
                     .with_question_turn(Some(crate::question::QuestionTurn::default()));
                 #[cfg(feature = "hooks")]
                 let loop_info = loop_round_info(session, loop_mode);
@@ -3253,7 +3272,13 @@ async fn run_headless_goal_rounds_inner(
             #[cfg(feature = "agent-skills")]
             let agent = agent.with_instruction_turn(instruction_turn.clone());
             let agent = agent
+                .with_reasoning_controls(cfg, session.reasoning_controls)
                 .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                .with_file_checkpoints(session.file_checkpoints.recorder(
+                    &session.id,
+                    session.messages.len(),
+                    cli.no_session,
+                ))
                 .with_question_turn(Some(question_turn.clone()));
             #[cfg(feature = "hooks")]
             let loop_info = loop_round_info(session, loop_mode);
@@ -3638,7 +3663,13 @@ async fn run_headless_goal_rounds_inner(
                 #[cfg(feature = "agent-skills")]
                 let round_agent = round_agent.with_instruction_turn(instruction_turn.clone());
                 let round_agent = round_agent
+                    .with_reasoning_controls(cfg, session.reasoning_controls)
                     .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                    .with_file_checkpoints(session.file_checkpoints.recorder(
+                        &session.id,
+                        session.messages.len(),
+                        cli.no_session,
+                    ))
                     .with_question_turn(Some(question_turn.clone()));
                 #[cfg(feature = "hooks")]
                 let loop_info = loop_round_info(session, loop_mode);

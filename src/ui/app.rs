@@ -29,13 +29,13 @@ use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::{PermissionEvent, PermissionState};
-use crate::ui::pickers::rewind::RewindOutcome;
+use crate::ui::pickers::rewind::{RewindBinding, RewindMode, RewindOutcome};
 use crate::ui::question_handler::{QuestionEvent, QuestionState};
 use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
     copy_to_clipboard, read_from_clipboard,
 };
-use crate::ui::slash::{apply_prompt_model, handle_compress};
+use crate::ui::slash::{C_RESULT, apply_prompt_model, handle_compress};
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
@@ -110,6 +110,7 @@ pub(super) mod test_support {
             renderer: Renderer::for_app_test().unwrap(),
             input,
             last_branch_check: std::time::Instant::now(),
+            rewind_escape: None,
             git_status_tx,
             git_status_rx,
             git_status_in_flight: false,
@@ -1154,6 +1155,7 @@ pub(crate) struct App<'a> {
     renderer: Renderer,
     input: InputEditor,
     last_branch_check: std::time::Instant,
+    rewind_escape: Option<std::time::Instant>,
     git_status_tx: mpsc::Sender<GitStatusRefresh>,
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
     git_status_in_flight: bool,
@@ -1699,7 +1701,13 @@ impl<'a> App<'a> {
                 #[cfg(feature = "agent-skills")]
                 let agent = agent.with_instruction_turn(run.instruction_turn.clone());
                 let paused = agent
+                    .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls)
                     .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                    .with_file_checkpoints(ui.session.file_checkpoints.recorder(
+                        &ui.session.id,
+                        pending_turn.message_index(),
+                        ui.cli.no_session,
+                    ))
                     .with_question_turn(run.question_turn.clone())
                     .spawn_runner_paused(
                         prompt,
@@ -1846,6 +1854,7 @@ impl<'a> App<'a> {
             renderer,
             input,
             last_branch_check,
+            rewind_escape: None,
             git_status_tx,
             git_status_rx,
             git_status_in_flight: false,
@@ -2983,6 +2992,37 @@ impl<'a> App<'a> {
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         let action = self.keyboard_action(key);
+        let eligible_escape = key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == crossterm::event::KeyEventKind::Press
+            && self.input.buffer.is_empty()
+            && !self.run.is_running
+            && self.permission_prompt.is_none()
+            && self.question_prompt.is_none()
+            && !self.renderer.selection_active
+            && !self.input.picker.as_ref().is_some_and(Picker::active)
+            && self.chain.plan.pending.is_none()
+            && self.renderer.chain_prompt.is_none();
+        if eligible_escape {
+            let now = std::time::Instant::now();
+            if self
+                .rewind_escape
+                .take()
+                .is_some_and(|previous| now.duration_since(previous) <= Duration::from_millis(500))
+            {
+                self.input.start_rewind_picker(
+                    crate::ui::rewind_targets(self.ui.session),
+                    RewindBinding::capture(self.ui.session, &self.ui.workspace)?,
+                );
+                return Ok(());
+            } else {
+                self.rewind_escape = Some(now);
+                // Arming must preserve the ordinary first Escape, including
+                // leaving Vim insert mode on an empty draft.
+            }
+        } else {
+            self.rewind_escape = None;
+        }
         if self.renderer.selection_active && key.code == KeyCode::Char('y') {
             self.copy_selection_to_clipboard().await?;
             return Ok(());
@@ -3065,19 +3105,69 @@ impl<'a> App<'a> {
         // before falling through to the editor.
         let picker_owned_key = self.input.picker.as_ref().is_some_and(Picker::active);
         if picker_owned_key && self.input.handle_picker_key(key) {
-            if let Some(RewindOutcome::Confirmed(idx)) = self.input.take_rewind_outcome()
-                && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx) > 0
+            if let Some(RewindOutcome::Confirmed(idx, mode, binding)) =
+                self.input.take_rewind_outcome()
             {
-                self.save_session()?;
-                render_session(
-                    &mut self.renderer,
-                    self.ui.session,
-                    self.ui.cli,
-                    self.ui.cfg,
-                    self.ui.context,
-                )?;
-                self.renderer
-                    .write_line("rewound; /redo to restore", Color::Green)?;
+                if !binding.valid(self.ui.session, &self.ui.workspace) {
+                    self.renderer
+                        .write_line("rewind selection is stale; open /rewind again", C_ERROR)?;
+                    return Ok(());
+                }
+                if mode != RewindMode::Conversation {
+                    // Like session publication, this bounded native operation stays
+                    // owned by the foreground key handler through completion.
+                    let restored = self.ui.session.file_checkpoints.restore(
+                        &self.ui.session.id,
+                        idx,
+                        &self.ui.workspace,
+                    );
+                    match restored {
+                        Ok(count) => {
+                            if count > 0 {
+                                self.ui.session.read_tracker.clear();
+                                self.ui.invalidate_prebuild();
+                                self.run.agent = None;
+                            }
+                            self.renderer
+                                .write_line(&format!("restored {count} files"), Color::Green)?;
+                        }
+                        Err(error) => {
+                            // A later per-file publication can fail after earlier
+                            // paths changed. Never retain read/agent caches on that
+                            // partially completed or uncertain restore.
+                            self.ui.session.read_tracker.clear();
+                            self.ui.invalidate_prebuild();
+                            self.run.agent = None;
+                            self.renderer.write_line(
+                                &format!(
+                                    "file rewind refused: {}",
+                                    sanitize_output(&error.to_string())
+                                ),
+                                C_ERROR,
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                }
+                if mode != RewindMode::Files
+                    && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx)
+                        > 0
+                {
+                    self.save_session()?;
+                    render_session(
+                        &mut self.renderer,
+                        self.ui.session,
+                        self.ui.cli,
+                        self.ui.cfg,
+                        self.ui.context,
+                    )?;
+                    self.renderer.write_line(
+                        "conversation rewound; /redo restores conversation only",
+                        Color::Green,
+                    )?;
+                } else {
+                    self.save_session()?;
+                }
             }
             return Ok(());
         }
@@ -3238,11 +3328,22 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
                 super::SubmitAction::Queue => {
+                    if self.ui.cfg.running_input == Some(crate::config::RunningInput::Steer) {
+                        self.submit_steering(&text)?;
+                        return Ok(());
+                    }
                     self.run.pending_inputs.push_back(text.to_string());
                     self.renderer
                         .write_line(&format!("queued: {}", sanitize_output(&text)), C_TOOL)?;
                     return Ok(());
                 }
+            }
+
+            if let Some(message) = text.trim_start().strip_prefix("/steer")
+                && (message.is_empty() || message.starts_with(' '))
+            {
+                self.submit_steering(message.trim_start())?;
+                return Ok(());
             }
 
             // Bypass-slot handlers: /queue and /btw
@@ -3291,6 +3392,12 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        let terminal_steering = matches!(
+            &event,
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. }
+        )
+        .then(|| self.run.steering.clone())
+        .flatten();
         // Todo tools mutate the shared store before their result is delivered.
         // Chat paints alone do not refresh the sticky numeric footer.
         let todo_progress_changed =
@@ -3585,6 +3692,9 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
+        if let Some(steering) = terminal_steering {
+            self.restore_pending_steering(&steering)?;
+        }
         self.finalize_turn().await?;
         if todo_progress_changed {
             self.refresh()?;
@@ -3710,6 +3820,7 @@ impl<'a> App<'a> {
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
     async fn fail_pending_main_turn(&mut self) {
+        let pending_steering = self.run.steering.clone();
         self.chain.plan = Default::default();
         self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
@@ -3757,9 +3868,15 @@ impl<'a> App<'a> {
             }
             let _ = self.save_session();
         }
+        if let Some(steering) = pending_steering
+            && let Err(error) = self.restore_pending_steering(&steering)
+        {
+            tracing::warn!(%error, "pending steering restored despite presentation failure");
+        }
     }
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        let pending_steering = self.run.steering.clone();
         self.chain.plan = Default::default();
         self.renderer.feed_mut().finish_reasoning();
         #[cfg(feature = "git-worktree")]
@@ -3850,6 +3967,9 @@ impl<'a> App<'a> {
             self.settle_success_transaction();
         } else {
             self.save_session()?;
+        }
+        if let Some(steering) = pending_steering {
+            self.restore_pending_steering(&steering)?;
         }
         self.renderer.write_line(
             "interrupted (changes may be partial; review with git diff)",
@@ -4690,6 +4810,48 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn restore_pending_steering(
+        &mut self,
+        steering: &crate::agent::steering::Steering,
+    ) -> anyhow::Result<()> {
+        if let Some(text) = steering.take_pending() {
+            let retained = if self.input.buffer.is_empty() {
+                text
+            } else {
+                format!("{text}\n{}", self.input.buffer)
+            };
+            self.input.load_text(&retained);
+            self.renderer.write_line(
+                "turn ended before another tool boundary; steering restored to draft",
+                C_TOOL,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn submit_steering(&mut self, text: &str) -> anyhow::Result<()> {
+        let result = if self.run.is_running {
+            self.run
+                .steering
+                .as_ref()
+                .ok_or("this run does not accept steering")
+                .and_then(|steering| steering.submit(text))
+        } else {
+            Err("/steer requires an active agent turn")
+        };
+        match result {
+            Ok(()) => self.renderer.write_line(
+                &format!("steering pending: {}", sanitize_output(text)),
+                C_TOOL,
+            )?,
+            Err(reason) => {
+                self.input.load_text(text);
+                self.renderer.write_line(reason, C_ERROR)?;
+            }
+        }
+        Ok(())
+    }
+
     fn echo_main_submission(&mut self, text: &str) -> anyhow::Result<()> {
         for line in text.lines() {
             self.renderer
@@ -4898,6 +5060,193 @@ impl<'a> App<'a> {
         crate::startup::heap_future(|| self.run_slash_command_selected(text, None)).await
     }
 
+    async fn handle_reasoning_control(&mut self, text: &str) -> anyhow::Result<bool> {
+        use crate::config::types::ReasoningEffort as E;
+        use crate::provider::effort::ThinkingMode;
+        let parts = text.split_whitespace().collect::<Vec<_>>();
+        let Some(command) = parts.first().copied() else {
+            return Ok(false);
+        };
+        let native_mode = matches!(command, "/reasoning" | "/thinking")
+            && self
+                .ui
+                .client
+                .has_native_reasoning_controls(&self.ui.session.model);
+        if command != "/effort" && !native_mode {
+            return Ok(false);
+        }
+        let current = self.ui.session.reasoning_controls;
+        if command == "/effort" && parts.len() == 1 {
+            match self
+                .ui
+                .client
+                .resolve_session_reasoning(self.ui.cfg, self.ui.session, current)
+            {
+                Ok((effective, _)) => self.renderer.write_line(
+                    &format!(
+                        "effort: {} ({}){}",
+                        effective.effort.map_or("provider default", E::as_wire_str),
+                        effective.source.label(),
+                        if effective.adaptive {
+                            "; adaptive thinking"
+                        } else {
+                            ""
+                        }
+                    ),
+                    C_RESULT,
+                )?,
+                Err(error) => self.renderer.write_line(&error.to_string(), C_ERROR)?,
+            }
+            return Ok(true);
+        }
+        let mut next = current;
+        if command == "/effort" {
+            next.effort = match parts.as_slice() {
+                [_, "default"] => None,
+                [_, "low"] => Some(E::Low),
+                [_, "medium"] => Some(E::Medium),
+                [_, "high"] => Some(E::High),
+                [_, "xhigh"] => Some(E::Xhigh),
+                [_, "max"] => Some(E::Max),
+                _ => {
+                    self.renderer.write_line(
+                        "usage: /effort [low|medium|high|xhigh|max|default]",
+                        C_ERROR,
+                    )?;
+                    return Ok(true);
+                }
+            };
+        } else {
+            next.thinking = match parts.as_slice() {
+                [_] => {
+                    let enabled = self
+                        .ui
+                        .client
+                        .resolve_session_reasoning(self.ui.cfg, self.ui.session, current)
+                        .ok()
+                        .and_then(|(_, enabled)| enabled);
+                    let Some(enabled) = enabled else {
+                        self.renderer.write_line("this model has no verified thinking mode; use /reasoning on or off with a supported model",C_ERROR)?;
+                        return Ok(true);
+                    };
+                    Some(if enabled {
+                        ThinkingMode::Off
+                    } else {
+                        ThinkingMode::On
+                    })
+                }
+                [_, "on"] => Some(ThinkingMode::On),
+                [_, "off"] => Some(ThinkingMode::Off),
+                [_, "default"] => None,
+                _ => {
+                    self.renderer
+                        .write_line("usage: /reasoning [on|off|default]", C_ERROR)?;
+                    return Ok(true);
+                }
+            };
+        }
+        if self.run.is_running
+            || self.run.native_owner.is_some()
+            || self.run.pending_turn.is_some()
+            || self.permission_prompt.is_some()
+            || self.question_prompt.is_some()
+            || self.ui.session.pending_question.is_some()
+        {
+            self.renderer.write_line(
+                "finish or stop the current turn before changing effort or thinking",
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
+        let effective =
+            match self
+                .ui
+                .client
+                .resolve_session_reasoning(self.ui.cfg, self.ui.session, next)
+            {
+                Ok(effective) => effective,
+                Err(error) => {
+                    self.renderer.write_line(&error.to_string(), C_ERROR)?;
+                    return Ok(true);
+                }
+            };
+        if next == current {
+            self.renderer
+                .write_line("reasoning controls already match this setting", C_RESULT)?;
+            return Ok(true);
+        }
+        let native = crate::session::native_publication::is_native_bearing(self.ui.session)
+            || matches!(&self.ui.client, crate::provider::AnyClient::Anthropic(_));
+        if native && !self.ui.cli.no_session {
+            let result = if let Some(owner) = &mut self.run.native_session_end {
+                crate::startup::heap_future(|| owner.update_reasoning(self.ui.session, next)).await
+            } else if let Some(ticket) = &mut self.ui.native_ticket {
+                let scope = crate::agent::runner::AgentWorkScope::new();
+                let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+                let result = crate::session::native_publication::startup_update_reasoning(
+                    self.ui.session,
+                    ticket,
+                    next,
+                    &scope,
+                )
+                .await;
+                cleanup.settle().await;
+                result
+            } else {
+                Err(anyhow::anyhow!(
+                    "unfinished native context requires recovery before changing reasoning controls"
+                ))
+            };
+            if let Err(error) = result {
+                self.renderer.write_line(&error.to_string(), C_ERROR)?;
+                return Ok(true);
+            }
+        } else {
+            self.ui.session.reasoning_controls = next;
+            if !self.save_session_with_status() {
+                self.ui.session.reasoning_controls = current;
+                return Ok(true);
+            }
+        }
+        if let Some(agent) = self.run.agent.take() {
+            self.run.agent = Some(
+                crate::startup::heap_future(|| {
+                    std::future::ready(agent.with_reasoning_controls(self.ui.cfg, next))
+                })
+                .await,
+            );
+        }
+        self.renderer.write_line(
+            &format!(
+                "effort: {} ({}){}",
+                effective
+                    .0
+                    .effort
+                    .map_or("provider default", E::as_wire_str),
+                effective.0.source.label(),
+                if effective.0.adaptive {
+                    "; adaptive thinking"
+                } else {
+                    ""
+                }
+            ),
+            C_RESULT,
+        )?;
+        if native_mode {
+            self.renderer.write_line(
+                match next.thinking {
+                    Some(ThinkingMode::On) => "thinking: on",
+                    Some(ThinkingMode::Off) => "thinking: off",
+                    None => "thinking: provider default",
+                },
+                C_RESULT,
+            )?;
+        }
+        // Display collapse/off preferences and the original native system
+        // preamble remain independent from these request controls.
+        Ok(true)
+    }
+
     async fn run_slash_command_selected(
         &mut self,
         text: &str,
@@ -4905,6 +5254,9 @@ impl<'a> App<'a> {
     ) -> anyhow::Result<()> {
         #[cfg(feature = "agent-skills")]
         if self.handle_instruction_command(text).await? {
+            return Ok(());
+        }
+        if crate::startup::heap_future(|| self.handle_reasoning_control(text)).await? {
             return Ok(());
         }
         if self.run.is_running && !super::allowed_while_running(text) {
@@ -5538,11 +5890,20 @@ impl<'a> App<'a> {
                         #[cfg(feature = "agent-skills")]
                         let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
                         agent
+                            .with_reasoning_controls(
+                                self.ui.cfg,
+                                self.ui.session.reasoning_controls,
+                            )
                             .with_spend_for_session(
                                 self.ui.session,
                                 self.ui.cfg,
                                 crate::spend::RequestKind::Turn,
                             )
+                            .with_file_checkpoints(self.ui.session.file_checkpoints.recorder(
+                                &self.ui.session.id,
+                                self.ui.session.messages.len(),
+                                self.ui.cli.no_session,
+                            ))
                             .with_question_turn(self.run.question_turn.clone())
                             .spawn_runner_paused(
                                 prompt,
@@ -5671,11 +6032,20 @@ impl<'a> App<'a> {
                         #[cfg(feature = "agent-skills")]
                         let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
                         agent
+                            .with_reasoning_controls(
+                                self.ui.cfg,
+                                self.ui.session.reasoning_controls,
+                            )
                             .with_spend_for_session(
                                 self.ui.session,
                                 self.ui.cfg,
                                 crate::spend::RequestKind::Turn,
                             )
+                            .with_file_checkpoints(self.ui.session.file_checkpoints.recorder(
+                                &self.ui.session.id,
+                                self.ui.session.messages.len(),
+                                self.ui.cli.no_session,
+                            ))
                             .with_question_turn(self.run.question_turn.clone())
                             .spawn_runner_paused(
                                 prompt,
@@ -5783,6 +6153,7 @@ impl<'a> App<'a> {
         interactions: &[Message],
     ) -> anyhow::Result<()> {
         if self.run.native_owner.is_some() {
+            let pending_steering = self.run.steering.clone();
             // A tool-reply boundary is not a completed new-user boundary.
             // Preserve the exact surfaced tail instead of silently dropping
             // signed history into an unbound compaction continuation.
@@ -5795,6 +6166,7 @@ impl<'a> App<'a> {
             preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
             self.run.is_running = false;
             self.run.settle(Duration::from_secs(5)).await?;
+            self.run.steering = pending_steering.clone();
             super::settle_native_main_turn(
                 &mut self.run,
                 self.ui.session,
@@ -5806,6 +6178,10 @@ impl<'a> App<'a> {
             if let Some(prompt) = prompt {
                 self.restore_interrupted_prompt(&prompt);
             }
+            if let Some(steering) = pending_steering {
+                self.restore_pending_steering(&steering)?;
+            }
+            self.run.steering = None;
             self.renderer.write_line("Context is full. Tool results are saved; start a fresh context before compacting this unfinished reply.", C_ERROR)?;
             return Ok(());
         }
@@ -7128,8 +7504,33 @@ mod interrupt_rewind_tests {
             mcp_manager: None,
         };
         let mut app = fixture_app(ui);
-        app.input
-            .start_rewind_picker(crate::ui::rewind_targets(app.ui.session));
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.input.set_vim_enabled(true);
+        app.handle_key_event(escape).await.unwrap();
+        assert_eq!(app.input.vim_label(), "vim:NORMAL");
+        app.input.set_vim_enabled(false);
+        assert!(app.input.picker.is_none());
+        app.rewind_escape = Some(std::time::Instant::now() - Duration::from_millis(501));
+        app.handle_key_event(escape).await.unwrap();
+        assert!(
+            app.input.picker.is_none(),
+            "outside the 500ms window starts a new pair"
+        );
+        app.handle_key_event(escape).await.unwrap();
+        assert!(app.input.picker.as_ref().is_some_and(Picker::active));
+        app.handle_key_event(escape).await.unwrap(); // modal cancellation
+        app.input.load_text("draft");
+        app.handle_key_event(escape).await.unwrap();
+        app.handle_key_event(escape).await.unwrap();
+        assert!(!app.input.picker.as_ref().is_some_and(Picker::active));
+        app.input.load_text("");
+        app.run.is_running = true;
+        app.handle_key_event(escape).await.unwrap();
+        app.handle_key_event(escape).await.unwrap();
+        assert!(!app.input.picker.as_ref().is_some_and(Picker::active));
+        app.run.is_running = false;
+        app.handle_key_event(escape).await.unwrap();
+        app.handle_key_event(escape).await.unwrap();
         for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
             app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                 .await
@@ -7142,6 +7543,151 @@ mod interrupt_rewind_tests {
             serde_json::to_value(&app.ui.session.messages).unwrap(),
             before
         );
+
+        #[cfg(unix)]
+        {
+            std::fs::write(root.path().join("rewound.txt"), "original").unwrap();
+            let write = crate::agent::tools::write::WriteTool::new(None, None, None)
+                .with_workspace(root.path());
+            let tracker = crate::agent::tools::ReadTracker::new(true);
+            let read = crate::agent::tools::read::ReadTool::new_with_tracker(
+                None,
+                None,
+                None,
+                100,
+                tracker.clone(),
+            )
+            .with_workspace(root.path());
+            let overwrite =
+                crate::agent::tools::write::WriteTool::new_with_tracker(None, None, None, tracker)
+                    .with_workspace(root.path());
+            use rig::tool::Tool;
+            let recorder = app
+                .ui
+                .session
+                .file_checkpoints
+                .recorder(&app.ui.session.id, 2, true);
+            crate::session::file_checkpoints::scope(Some(recorder), async {
+                read.call(crate::agent::tools::ReadArgs {
+                    raw_notebook: false,
+                    path: "rewound.txt".into(),
+                    offset: None,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+                overwrite
+                    .call(crate::agent::tools::WriteArgs {
+                        path: "rewound.txt".into(),
+                        content: "modified".into(),
+                        overwrite: true,
+                    })
+                    .await
+                    .unwrap();
+                write
+                    .call(crate::agent::tools::WriteArgs {
+                        path: "created.txt".into(),
+                        content: "new".into(),
+                        overwrite: false,
+                    })
+                    .await
+                    .unwrap();
+            })
+            .await;
+            // A failed/preflight-conflicted restore must also discard caches:
+            // later I/O failures can follow already completed file publications.
+            std::fs::write(root.path().join("rewound.txt"), "operator changed").unwrap();
+            app.ui.prebuild_invalidated.store(false, Ordering::SeqCst);
+            app.input.load_text("");
+            app.handle_key_event(escape).await.unwrap();
+            app.handle_key_event(escape).await.unwrap();
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+                app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("rewound.txt")).unwrap(),
+                "operator changed"
+            );
+            assert!(root.path().join("created.txt").exists());
+            assert!(app.ui.prebuild_invalidated.load(Ordering::SeqCst));
+            assert_eq!(
+                serde_json::to_value(&app.ui.session.messages).unwrap(),
+                before
+            );
+            std::fs::write(root.path().join("rewound.txt"), "modified").unwrap();
+            app.input.load_text("");
+            app.handle_key_event(escape).await.unwrap();
+            app.handle_key_event(escape).await.unwrap();
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+                app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("rewound.txt")).unwrap(),
+                "original"
+            );
+            assert!(!root.path().join("created.txt").exists());
+            assert_eq!(
+                serde_json::to_value(&app.ui.session.messages).unwrap(),
+                before,
+                "files-only preserves exact conversation"
+            );
+            assert!(app.run.agent_rx.is_none() && !app.run.is_running);
+            // Recreate a file, then confirm both. The original mutable history is
+            // still exactly the same picker source; only its recorded file state changed.
+            let recorder = app
+                .ui
+                .session
+                .file_checkpoints
+                .recorder(&app.ui.session.id, 2, true);
+            crate::session::file_checkpoints::scope(
+                Some(recorder),
+                write.call(crate::agent::tools::WriteArgs {
+                    path: "created.txt".into(),
+                    content: "second".into(),
+                    overwrite: false,
+                }),
+            )
+            .await
+            .unwrap();
+            app.input.load_text("");
+            app.handle_key_event(escape).await.unwrap();
+            app.handle_key_event(escape).await.unwrap();
+            for code in [
+                KeyCode::Down,
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ] {
+                app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(app.ui.session.messages.len(), 2);
+            assert_eq!(app.input.buffer, "!printf héllo");
+            assert!(!root.path().join("created.txt").exists());
+            assert!(app.ui.session.redo());
+        }
+        app.input.load_text("");
+        app.handle_key_event(escape).await.unwrap();
+        app.handle_key_event(escape).await.unwrap();
+        let identity = app.ui.session.id.clone();
+        app.ui.session.id = "successor".into();
+        for code in [KeyCode::Enter, KeyCode::Enter] {
+            app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            app.ui.session.messages.len(),
+            4,
+            "stale selection cannot truncate successor history"
+        );
+        app.ui.session.id = identity;
     }
 
     #[tokio::test]
@@ -11930,6 +12476,14 @@ fn skill_description(text: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_native_steer_fixture(
+    ui: UiContext<'_>,
+    stop_at_boundary: bool,
+) -> Session {
+    plan_approval_tests::drive_native_steer_fixture(ui, stop_at_boundary).await
+}
+
+#[cfg(test)]
 pub(crate) async fn drive_native_fixture_turn(ui: UiContext<'_>, prompt: &str) {
     plan_approval_tests::drive_native_fixture_turns(ui, &[prompt], false).await;
 }
@@ -11950,6 +12504,11 @@ pub(crate) async fn drive_native_stale_session_end_fixture(ui: UiContext<'_>) ->
         true,
     )
     .await
+}
+
+#[cfg(test)]
+pub(crate) async fn drive_native_effort_fixture(ui: UiContext<'_>) -> Vec<Session> {
+    plan_approval_tests::drive_native_effort_fixture(ui).await
 }
 
 #[cfg(all(test, feature = "agent-skills"))]
@@ -12180,6 +12739,461 @@ mod plan_approval_tests {
     async fn key(app: &mut App<'_>, code: KeyCode) {
         user(app, UserEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))).await;
     }
+    pub(super) async fn drive_native_steer_fixture(
+        ui: UiContext<'_>,
+        stop_at_boundary: bool,
+    ) -> Session {
+        let mut app = owned_app(ui);
+        user(&mut app, UserEvent::Paste("original steering task".into())).await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(app.run.is_running);
+        user(
+            &mut app,
+            UserEvent::Paste("/steer redirect the running task".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(app.run.pending_inputs.is_empty());
+        if stop_at_boundary {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.run.is_running {
+                    let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                    crate::startup::heap_future(|| app.handle_agent_event(event))
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(app.input.buffer.contains("redirect the running task"));
+            assert!(
+                !app.renderer
+                    .captured_output()
+                    .contains("steering delivered")
+            );
+        } else {
+            assert!(finish_turn(&mut app).await);
+            assert!(app.run.native_blocked.is_none());
+            assert!(
+                app.renderer
+                    .captured_output()
+                    .contains("steering delivered")
+            );
+        }
+        let sessions = crate::paths::WorkspaceBinding::capture(
+            &crate::paths::process_paths().unwrap().sessions_dir(),
+        )
+        .unwrap();
+        let saved = crate::session::storage::load_session_exact_read_only(
+            &sessions,
+            app.ui.session.id.as_ref(),
+            &app.ui.workspace,
+        )
+        .unwrap()
+        .unwrap();
+        #[cfg(feature = "hooks")]
+        if !stop_at_boundary {
+            app.finish_session_end().await.unwrap();
+        }
+        saved
+    }
+
+    #[tokio::test]
+    async fn steering_compaction_presentation_failure_restores_pending_text() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(Vec::new()).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        let pending = PendingMainTurn::capture(app.ui.session, "original task");
+        {
+            let app = &mut app.0;
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        }
+        let steering = crate::agent::steering::Steering::default();
+        steering.enable();
+        steering
+            .submit("retained redirect after compact error")
+            .unwrap();
+        app.run.steering = Some(steering);
+        app.run.is_running = true;
+        app.run.pending_compaction_pressure = Some(0.9);
+        app.renderer.fail_next_write_for_test();
+        let error = app
+            .handle_agent_event(AgentEvent::CompactionBoundary {
+                interactions: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("owned test output failure"));
+        assert!(!app.run.is_running);
+        assert!(
+            app.input
+                .buffer
+                .contains("retained redirect after compact error")
+        );
+        assert!(app.input.buffer.contains("original task"));
+        assert_eq!(provider.calls().len(), 0);
+        drop(app);
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn steering_without_another_boundary_restores_draft_on_finish_or_cancel() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for cancel in [false, true] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec![if cancel {
+                "hold-open"
+            } else {
+                "FINAL_WITHOUT_TOOL"
+            }])
+            .await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            user(&mut app, UserEvent::Paste("original task".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            user(
+                &mut app,
+                UserEvent::Paste("/steer retained redirect".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            app.input.load_text("existing draft");
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !app
+                        .renderer
+                        .captured_output()
+                        .contains("STREAM_WITHOUT_FINAL")
+                    {
+                        let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                        crate::startup::heap_future(|| app.handle_agent_event(event))
+                            .await
+                            .unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                app.abort_main_run().await.unwrap();
+            } else {
+                assert!(finish_turn(&mut app).await);
+            }
+            assert!(app.input.buffer.contains("retained redirect"));
+            assert!(app.input.buffer.contains("existing draft"));
+            assert!(
+                !app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .any(|row| row.role == MessageRole::User
+                        && row.content.contains("retained redirect"))
+            );
+            assert!(!app.run.is_running);
+            assert_eq!(provider.calls().len(), 1);
+            drop(app);
+            provider.cancel().await;
+        }
+    }
+
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    #[tokio::test]
+    async fn steering_cancel_during_prompt_hook_retains_text_and_reaps_owned_process() {
+        use crate::tests::process_state::{ProcessIdentity, ProcessState};
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let _workspace = crate::extras::hooks::retain_test_workspace_selection();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::extras::hooks::reset_dispatcher();
+            }
+        }
+        let _reset = Reset;
+        let roots = Roots::new();
+        let pid = roots.directory.path().join("steer-hook.pid");
+        let settings = serde_json::json!({"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/sh","args":["-c",r#"input=$(cat); case "$input" in *redirect*) printf '%s\n' "$$" > "$1"; sleep 30;; esac"#,"owned-steering-hook",pid],"trust":"trusted","timeout":60}]}]});
+        let hooks = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
+        crate::extras::hooks::init_dispatcher(
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&hooks).unwrap(),
+        );
+        crate::extras::hooks::set_active_workspace(roots.directory.path());
+        let provider = Provider::new(vec!["ask-read", "MUST_NOT_DISPATCH"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        user(&mut app, UserEvent::Paste("original task".into())).await;
+        key(&mut app, KeyCode::Enter).await;
+        user(
+            &mut app,
+            UserEvent::Paste("/steer retained redirect".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        let identity = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&pid)
+                    && value.ends_with('\n') {
+                    break ProcessIdentity::capture(value.trim().parse().unwrap()).unwrap();
+                }
+                tokio::select! {
+                    event = app.run.agent_rx.as_mut().unwrap().recv() => {
+                        let event = event.unwrap();
+                        assert!(!matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::SteerConsumed { .. }));
+                        crate::startup::heap_future(|| app.handle_agent_event(event)).await.unwrap();
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        }).await.unwrap();
+        assert!(matches!(
+            identity.state().unwrap(),
+            ProcessState::Live { .. }
+        ));
+        app.abort_main_run().await.unwrap();
+        assert_eq!(identity.state().unwrap(), ProcessState::Gone);
+        assert!(app.input.buffer.contains("retained redirect"));
+        assert_eq!(provider.calls().len(), 1);
+        assert!(
+            !app.ui
+                .session
+                .messages
+                .iter()
+                .any(|row| row.role == MessageRole::User
+                    && row.content.contains("retained redirect"))
+        );
+        drop(app);
+        provider.cancel().await;
+    }
+
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    #[tokio::test]
+    async fn steering_user_prompt_hooks_block_or_append_separate_canonical_context() {
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let _workspace = crate::extras::hooks::retain_test_workspace_selection();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::extras::hooks::reset_dispatcher();
+            }
+        }
+        let _reset = Reset;
+        for blocked in [false, true] {
+            let roots = Roots::new();
+            let decision = if blocked {
+                r#"printf '%s' '{"decision":"block","reason":"STEERING79_BLOCKED"}'"#
+            } else {
+                r#"printf '%s' '{"additionalContext":"STEERING79_CONTEXT"}'"#
+            };
+            let command = format!("input=$(cat); case \"$input\" in *redirect*) {decision};; esac");
+            let settings = serde_json::json!({"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/sh","args":["-c",command],"trust":"trusted","timeout":5}]}]});
+            let hooks = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
+            crate::extras::hooks::init_dispatcher(
+                crate::extras::hooks::dispatcher::HookDispatcher::from_config(&hooks).unwrap(),
+            );
+            crate::extras::hooks::set_active_workspace(roots.directory.path());
+            let provider = Provider::new(vec!["ask-read", "AFTER_HOOK"]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                tools: vec!["read".into()],
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            user(&mut app, UserEvent::Paste("original task".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            user(&mut app, UserEvent::Paste("/steer redirect literal".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(finish_turn(&mut app).await);
+            let calls = provider.calls();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].to_string().contains("redirect literal"), !blocked);
+            assert_eq!(
+                app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .filter(|row| row.role == MessageRole::User
+                        && row.content.as_str() == "redirect literal")
+                    .count(),
+                usize::from(!blocked)
+            );
+            if blocked {
+                assert!(
+                    app.renderer
+                        .captured_output()
+                        .contains("STEERING79_BLOCKED")
+                );
+            } else {
+                assert!(calls[1].to_string().contains("STEERING79_CONTEXT"));
+                assert_eq!(
+                    app.ui
+                        .session
+                        .messages
+                        .iter()
+                        .filter(|row| row.role == MessageRole::System
+                            && row.content.contains("STEERING79_CONTEXT"))
+                        .count(),
+                    1
+                );
+            }
+            drop(app);
+            provider.finish().await;
+            crate::extras::hooks::reset_dispatcher();
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_enter_mode_and_explicit_command_use_one_pending_slot() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        for mode in [
+            crate::config::RunningInput::Queue,
+            crate::config::RunningInput::Steer,
+        ] {
+            let roots = Roots::new();
+            let provider = Provider::new(vec!["ask-read", "AFTER_STEER", "AFTER_QUEUE"]).await;
+            let mut cfg = provider.config();
+            cfg.running_input = Some(mode);
+            let cli = crate::cli::Cli {
+                no_session: true,
+                tools: vec!["read".into()],
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            user(&mut app, UserEvent::Paste("original task".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            user(&mut app, UserEvent::Paste("redirect literal".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            if mode == crate::config::RunningInput::Queue {
+                assert_eq!(
+                    app.run.pending_inputs.pop_front().as_deref(),
+                    Some("redirect literal")
+                );
+                user(
+                    &mut app,
+                    UserEvent::Paste("/steer explicit redirect".into()),
+                )
+                .await;
+                key(&mut app, KeyCode::Enter).await;
+            }
+            let selected = if mode == crate::config::RunningInput::Queue {
+                "explicit redirect"
+            } else {
+                "redirect literal"
+            };
+            user(&mut app, UserEvent::Paste("/steer second pending".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            assert_eq!(app.input.buffer.as_str(), "second pending");
+            assert!(app.run.pending_inputs.is_empty());
+            assert!(finish_turn(&mut app).await);
+            assert_eq!(provider.calls().len(), 2);
+            assert!(provider.calls()[1].to_string().contains(selected));
+            assert!(!provider.calls()[0].to_string().contains(selected));
+            assert_eq!(
+                app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .filter(|row| row.role == MessageRole::User && row.content.as_str() == selected)
+                    .count(),
+                1
+            );
+            drop(app);
+            provider.cancel().await;
+        }
+    }
+
     pub(super) async fn drive_native_fixture_turns(
         ui: UiContext<'_>,
         prompts: &[&str],
@@ -12245,6 +13259,172 @@ mod plan_approval_tests {
         }
         #[cfg(not(feature = "hooks"))]
         assert!(!stale_end);
+        saved
+    }
+
+    pub(super) async fn drive_native_effort_fixture(ui: UiContext<'_>) -> Vec<Session> {
+        use crate::config::types::ReasoningEffort as E;
+        let mut app = owned_app(ui);
+        let load = |app: &App<'_>| {
+            let sessions = crate::paths::WorkspaceBinding::capture(
+                &crate::paths::process_paths().unwrap().sessions_dir(),
+            )
+            .unwrap();
+            crate::session::storage::load_session_exact_read_only(
+                &sessions,
+                app.ui.session.id.as_ref(),
+                &app.ui.workspace,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let mut saved = Vec::new();
+        user(
+            &mut app,
+            UserEvent::Paste("first literal TUI prompt".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(app.run.is_running);
+        app.run_slash_command("/effort max").await.unwrap();
+        assert_eq!(
+            app.ui.session.reasoning_controls.effort, None,
+            "active input must retain its captured effort"
+        );
+        assert!(finish_turn(&mut app).await);
+        let first = load(&app);
+        assert_eq!(
+            (first.total_input_tokens, first.total_output_tokens),
+            (10, 2)
+        );
+        let before = serde_json::to_value(&*app.ui.session).unwrap();
+        for invalid in ["/effort high extra", "/effort made-up", "/reasoning off"] {
+            app.run_slash_command(invalid).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(&*app.ui.session).unwrap(),
+                before,
+                "unsupported control changed canonical state"
+            );
+        }
+        app.run_slash_command("/effort").await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&*app.ui.session).unwrap(),
+            before,
+            "query mutated the session"
+        );
+        let next = crate::provider::effort::SessionReasoning {
+            effort: Some(E::Max),
+            ..Default::default()
+        };
+        let mut imported: Session = serde_json::from_value(before.clone()).unwrap();
+        assert!(
+            app.run
+                .native_session_end
+                .as_mut()
+                .unwrap()
+                .update_reasoning(&mut imported, next)
+                .await
+                .is_err(),
+            "same-ID imported data must not borrow the retired owner's value permit"
+        );
+        let mut stale = app.ui.session.clone();
+        stale.total_input_tokens += 1;
+        assert!(
+            app.run
+                .native_session_end
+                .as_mut()
+                .unwrap()
+                .update_reasoning(&mut stale, next)
+                .await
+                .is_err(),
+            "an old owner must not upgrade an edited snapshot"
+        );
+        assert_eq!(serde_json::to_value(&*app.ui.session).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(load(&app)).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        app.run_slash_command("/effort max").await.unwrap();
+        assert_eq!(app.ui.session.reasoning_controls.effort, Some(E::Max));
+        let changed = load(&app);
+        assert_eq!(changed.reasoning_controls.effort, Some(E::Max));
+        assert_eq!(changed.native_frontier.refusal(), None);
+        assert_eq!(
+            serde_json::to_value(changed.native_history_snapshot()).unwrap(),
+            serde_json::to_value(first.native_history_snapshot()).unwrap()
+        );
+        assert_eq!(
+            (changed.total_input_tokens, changed.total_output_tokens),
+            (10, 2)
+        );
+        saved.push(first);
+        user(
+            &mut app,
+            UserEvent::Paste("second literal TUI prompt".into()),
+        )
+        .await;
+        key(&mut app, KeyCode::Enter).await;
+        assert!(finish_turn(&mut app).await);
+        let second = load(&app);
+        assert_eq!(second.reasoning_controls.effort, Some(E::Max));
+        assert_eq!(
+            (second.total_input_tokens, second.total_output_tokens),
+            (20, 4)
+        );
+        saved.push(second);
+        app.run_slash_command("/effort default").await.unwrap();
+        let reset = load(&app);
+        assert_eq!(reset.reasoning_controls.effort, None);
+        assert_eq!(reset.native_frontier.refusal(), None);
+        assert_eq!(
+            (reset.total_input_tokens, reset.total_output_tokens),
+            (20, 4)
+        );
+        app.run
+            .native_session_end
+            .as_mut()
+            .unwrap()
+            .fail_next_control_publication();
+        app.run_slash_command("/effort medium").await.unwrap();
+        let failed = load(&app);
+        assert_eq!(
+            failed.native_frontier.refusal(),
+            Some(crate::session::native_replay::RestartReason::InFlight)
+        );
+        assert_eq!(
+            (failed.total_input_tokens, failed.total_output_tokens),
+            (20, 4)
+        );
+        assert_eq!(
+            failed.reasoning_controls.effort,
+            Some(E::Medium),
+            "the sealed current value is durably denied before its final checkpoint"
+        );
+        user(
+            &mut app,
+            UserEvent::Paste("literal prompt after failed effort save".into()),
+        )
+        .await;
+        let refused = crate::startup::heap_future(|| {
+            app.handle_user_event(UserEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+        })
+        .await;
+        assert!(
+            refused.is_err(),
+            "failed control publication must stop the next request before dispatch"
+        );
+        assert!(!app.run.is_running);
+        assert_eq!(
+            (
+                app.ui.session.total_input_tokens,
+                app.ui.session.total_output_tokens
+            ),
+            (20, 4)
+        );
+        assert!(load(&app).native_frontier.refusal().is_some());
         saved
     }
 

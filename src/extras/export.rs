@@ -45,6 +45,7 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         "total_real_input_tokens": session.total_real_input_tokens,
         "total_cost": session.total_cost,
         "generated_title": replay.generated_title,
+        "reasoning_controls": replay.reasoning_controls,
         "compactions": replay.compactions,
         "tool_call_provenance": replay.tool_call_provenance,
     });
@@ -175,6 +176,8 @@ struct JsonlSessionHeader {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ImportedReplayMetadata {
     #[serde(default)]
+    pub(crate) reasoning_controls: crate::provider::effort::SessionReasoning,
+    #[serde(default)]
     pub generated_title: Option<CompactString>,
     #[serde(default)]
     pub compactions: Vec<crate::session::Compaction>,
@@ -198,6 +201,7 @@ impl ImportedReplayMetadata {
             .filter_map(|message| message.tool_call_id.as_deref())
             .collect();
         Self {
+            reasoning_controls: session.reasoning_controls,
             generated_title: session.generated_title.clone(),
             compactions: if session.compacted_context().0.is_some() {
                 session.compactions.clone()
@@ -220,6 +224,8 @@ impl ImportedReplayMetadata {
     }
 
     pub fn apply(&self, session: &mut Session) {
+        session.file_checkpoints = Default::default();
+        session.reasoning_controls = self.reasoning_controls;
         session.generated_title = self.generated_title.clone();
         session.compactions = self.compactions.clone();
         for compaction in &mut session.compactions {
@@ -1033,4 +1039,42 @@ pub(crate) async fn upload_gist(
         .and_then(|u| u.as_str())
         .map(str::to_string)
         .context("GitHub API response did not include html_url")
+}
+
+#[cfg(test)]
+mod effort_control_tests {
+    use super::*;
+    #[test]
+    fn effort46_live_jsonl_and_native_roundtrip_only_closed_settings() {
+        use crate::provider::effort::{SessionReasoning, ThinkingMode};
+        let mut original = Session::new("anthropic", "claude-sonnet-4-6", 128_000, "");
+        original.reasoning_controls = SessionReasoning {
+            effort: Some(crate::config::types::ReasoningEffort::Max),
+            thinking: Some(ThinkingMode::On),
+        };
+        original.add_message(MessageRole::User, "literal prompt");
+        let jsonl = session_to_jsonl(&original).unwrap();
+        let ParsedSessionFile::Jsonl(import) = parse_session_file(&jsonl).unwrap() else {
+            panic!("wrong format")
+        };
+        let mut restored = Session::new("anthropic", "claude-sonnet-4-6", 128_000, "");
+        import.replay.apply(&mut restored);
+        assert_eq!(restored.reasoning_controls, original.reasoning_controls);
+        assert!(restored.native_publication.is_none());
+        assert!(restored.native_history_snapshot().is_none());
+        let json = serde_json::to_string(&original).unwrap();
+        let native = crate::session::storage::decode_session_json(&json).unwrap();
+        assert_eq!(native.reasoning_controls, original.reasoning_controls);
+        for replacement in [
+            r#"{"effort":"unknown"}"#,
+            r#"{"effort":"max","grant":true}"#,
+        ] {
+            let mut lines = jsonl.lines();
+            let mut header: serde_json::Value =
+                serde_json::from_str(lines.next().unwrap()).unwrap();
+            header["reasoning_controls"] = serde_json::from_str(replacement).unwrap();
+            let malformed = format!("{}\n{}\n", header, lines.collect::<Vec<_>>().join("\n"));
+            assert!(parse_session_file(&malformed).is_err());
+        }
+    }
 }

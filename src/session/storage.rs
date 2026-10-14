@@ -361,7 +361,12 @@ fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<
         }
     };
     match decode_session_json(&json) {
-        Ok(session) => Some(session),
+        Ok(session) => {
+            if path.file_stem().and_then(|stem| stem.to_str()) == Some(session.id.as_str()) {
+                session.file_checkpoints.trust_owned_load();
+            }
+            Some(session)
+        }
         Err(error) => {
             skipped.note(path, &error);
             None
@@ -431,6 +436,7 @@ pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
                 "persisted session ID mismatch: requested {id}, found {}",
                 session.id
             );
+            session.file_checkpoints.trust_owned_load();
             Ok(Some(session))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

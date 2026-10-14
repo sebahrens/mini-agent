@@ -90,6 +90,14 @@ impl UsageDelta {
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    SteerConsumed {
+        messages: Vec<rig::completion::Message>,
+        checkpoint: Option<crate::session::file_checkpoints::SteeringHandoff>,
+    },
+    #[cfg_attr(not(feature = "hooks"), allow(dead_code))]
+    SteerRejected {
+        reason: String,
+    },
     Token(CompactString),
     Reasoning(CompactString),
     ToolCall {

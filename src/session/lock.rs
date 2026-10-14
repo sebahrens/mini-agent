@@ -501,6 +501,7 @@ pub fn fork_session(source: &Session) -> anyhow::Result<Session> {
     let mut fork =
         super::storage::decode_session_json(&super::storage::serialize_bounded_session(source)?)?;
     fork.native_frontier = source.native_frontier.fork();
+    fork.file_checkpoints = Default::default();
     fork.id = CompactString::new(Uuid::new_v4().to_string());
     if !fork.name.is_empty() {
         fork.name = CompactString::new(format!("{} (fork)", fork.name));

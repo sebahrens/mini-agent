@@ -476,6 +476,27 @@ impl AgentRun {
         &self.new_messages
     }
 
+    /// Driver-only canonical input insertion while parked before a model call.
+    pub(crate) fn append_input(&mut self, messages: &[Message]) -> Result<(), PromptError> {
+        if !matches!(self.state, RunState::AwaitingModel)
+            || messages.iter().any(|message| match message {
+                Message::System { .. } => true,
+                Message::User { content } => content
+                    .iter()
+                    .any(|c| !matches!(c, crate::message::UserContent::Text(_))),
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .any(|c| !matches!(c, crate::message::AssistantContent::Text(_))),
+            })
+        {
+            return Err(self.cancel_error(
+                "canonical input injection requires ordinary text at a model boundary",
+            ));
+        }
+        self.new_messages.extend_from_slice(messages);
+        Ok(())
+    }
+
     /// The full conversation: input history followed by [`Self::messages`].
     pub fn full_history(&self) -> Vec<Message> {
         build_full_history(self.chat_history.as_deref(), self.new_messages.clone())

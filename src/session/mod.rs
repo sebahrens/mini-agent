@@ -1,6 +1,7 @@
 pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
+pub(crate) mod file_checkpoints;
 pub mod lock;
 pub(crate) mod native_publication;
 pub(crate) mod native_replay;
@@ -609,6 +610,12 @@ pub struct Session {
     /// unless that opt-in setting is on (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<CompactString>,
+    /// Closed session data only; never a runtime permission or replay owner.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider::effort::SessionReasoning::is_default"
+    )]
+    pub(crate) reasoning_controls: crate::provider::effort::SessionReasoning,
     /// Bounded clarification data only: imported records never recreate a
     /// waiter or approval. A new ordinary user turn supplies the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -720,6 +727,11 @@ pub struct Session {
     /// persisted; startup recreates it from the active configuration.
     #[serde(skip)]
     pub(crate) read_tracker: crate::agent::tools::ReadTracker,
+    #[serde(
+        default,
+        skip_serializing_if = "file_checkpoints::FileCheckpoints::is_empty"
+    )]
+    pub(crate) file_checkpoints: file_checkpoints::FileCheckpoints,
     /// Artifact handoff shared by every rebuild of this logical session.
     #[serde(skip)]
     pub(crate) tool_result_spills: ToolResultSpillStore,
@@ -973,6 +985,7 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             generated_title: None,
+            reasoning_controls: Default::default(),
             native_history: None,
             retired_native_history: Vec::new(),
             native_frontier: native_replay::NativeFrontier::default(),
@@ -1015,6 +1028,7 @@ impl Session {
             #[cfg(feature = "goal")]
             goal_store: crate::extras::goal::GoalStore::default(),
             read_tracker: crate::agent::tools::ReadTracker::default(),
+            file_checkpoints: Default::default(),
             tool_result_spills: ToolResultSpillStore::default(),
             #[cfg(feature = "agent-skills")]
             instruction_owner: Default::default(),
@@ -1880,6 +1894,7 @@ impl Session {
             self.calibrated_tool_results_cleared =
                 self.calibrated_tool_results_cleared.min(remaining_results);
         }
+        self.file_checkpoints.retire_from(new_len);
         self.messages.truncate(new_len);
         self.retain_visible_replay_metadata();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
@@ -2266,6 +2281,7 @@ impl Session {
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
         self.messages.insert(0, summary_msg);
+        self.file_checkpoints.compact_prefix(first_kept_index);
         self.prune_tool_call_provenance();
 
         // Recompute total from remaining messages so the count is always

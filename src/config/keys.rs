@@ -152,6 +152,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("keys")
         .described("Keyboard actions and chord lists")
         .shaped(ConfigShape::StringArrayMap),
+    key("running_input").described("Enter while running: queue (default) or steer at the next tool boundary").shaped(ConfigShape::String),
     key("vim_mode")
         .described("Enable modal input editing")
         .shaped(ConfigShape::Bool),

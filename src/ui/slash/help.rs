@@ -173,7 +173,11 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     }
     emit(
         false,
-        "  /reasoning [on|off]    set or toggle LLM reasoning",
+        "  /effort [level|default] session effort; low/medium/high/xhigh/max",
+    );
+    emit(
+        false,
+        "  /reasoning [on|off]    set or toggle supported model thinking",
     );
     emit(false, "  /thinking              alias for /reasoning");
     emit(
@@ -219,16 +223,20 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(
         false,
-        "  /redo                  restore the last /undo or rewind",
+        "  /redo                  restore conversation from /undo or rewind",
     );
     emit(
         false,
-        "  /rewind                rewind to an earlier turn (picker)",
+        "  /rewind                conversation/files/both; also double Esc",
     );
     emit(false, "  /retry                 retry last prompt");
     emit(
         false,
         "  /queue                 list input queued while agent is busy",
+    );
+    emit(
+        false,
+        "  /steer <message>       redirect the active turn at its next tool boundary",
     );
     emit(false, "  /queue clear           clear the queue");
     emit(

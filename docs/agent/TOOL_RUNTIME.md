@@ -1253,3 +1253,23 @@ sandbox, formatter and LSP. Write children are serialized; each operation
 retains its own ordinary permission check, and prompts identify the child.
 Their JS profile remains read-only and they gain no MCP, nested delegation or
 memory mutation. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).
+
+### Mid-turn steering
+
+In the interactive UI, `/steer <message>` holds one pending text message (up to
+64 KiB) for the next settled tool batch. It does not interrupt tools or start a
+second turn. The runner runs `UserPromptSubmit` at that boundary, appends accepted
+context notices and the user message to the SDK's canonical transcript, and
+reports delivery before the next completion request. Later requests and saved
+sessions retain that message exactly once. A blocked hook reports its reason.
+If the turn ends without another tool boundary, pending text returns to the draft.
+
+Ordinary Enter still queues input by default. Set `running_input = "steer"` to
+steer instead; `running_input = "queue"` preserves the default. Commands and
+attachments keep their existing handling. Steering has no headless or ACP input
+surface and grants no additional tool permission.
+
+`src/agent/steering.rs` owns the bounded invocation-local slot and hook. The
+patched SDK's `RequestPatch::append_input` adds ordinary text to the real run
+state before request preparation; unlike `RequestPatch::history`, it is durable
+canonical input rather than a one-request history replacement.

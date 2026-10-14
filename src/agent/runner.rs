@@ -653,6 +653,7 @@ pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
 }
 
 pub struct AgentRunner {
+    pub(crate) steering: crate::agent::steering::Steering,
     pub event_rx: mpsc::Receiver<AgentEvent>,
     /// Cancels the underlying agent task. Without this a superseded or
     /// interrupted run keeps driving its stream — and therefore keeps executing
@@ -670,6 +671,7 @@ impl AgentRunner {
         Self {
             event_rx,
             abort_handle,
+            steering: Default::default(),
             compaction_decision_tx: None,
             compaction_enabled: Arc::new(AtomicBool::new(false)),
         }
@@ -1198,7 +1200,12 @@ impl PausedAgentRunner {
         self.runner
     }
 
+    pub(crate) fn restore_steering_at_boundary(&self, text: &str) -> Result<(), &'static str> {
+        self.runner.steering.submit_after_boundary(text)
+    }
+
     pub(crate) fn start_interactive(self) -> AgentRunner {
+        self.runner.steering.enable();
         self.runner
             .compaction_enabled
             .store(true, Ordering::Release);
@@ -2580,6 +2587,7 @@ where
             continuation_bridge,
             max_turns,
             native_capture,
+            None,
         )
     })
     .await
@@ -2592,6 +2600,7 @@ async fn continue_prompt_message_injector<M>(
     continuation_bridge: &[Message],
     max_turns: usize,
     native_capture: crate::agent::native_capture::NativeCaptureHook,
+    steering_hook: Option<crate::agent::steering::SteeringHook>,
 ) -> StreamingResult<M::StreamingResponse>
 where
     M: CompletionModel + 'static,
@@ -2608,6 +2617,7 @@ where
         .stream_chat(current_prompt.clone(), new_history)
         .max_turns(max_turns)
         .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+        .add_hook(steering_hook.unwrap_or_default())
         .add_hook(native_capture)
         .add_hook(crate::spend::run::AdmissionHook(
             crate::spend::run::Run::current(),
@@ -2922,6 +2932,11 @@ where
     let question_turn = crate::question::QuestionTurn::current();
     let retry_config = retry_config.bounded();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+    let steering = crate::agent::steering::Steering::default();
+    let steering_hook = crate::agent::steering::SteeringHook {
+        steering: steering.clone(),
+        events: event_tx.clone(),
+    };
     let (compaction_decision_tx, mut compaction_decision_rx) =
         mpsc::channel::<CompactionBoundaryDecision>(1);
     let compaction_enabled = Arc::new(AtomicBool::new(false));
@@ -3055,6 +3070,7 @@ where
                             .tool_concurrency(
                                 crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
                             )
+                            .add_hook(steering_hook.clone())
                             .add_hook(native_capture.clone())
                             .add_hook(crate::spend::run::AdmissionHook(
                                 crate::spend::run::Run::current(),
@@ -3102,6 +3118,37 @@ where
             let mut retrying_interrupted_completion = false;
             while let Some(item) = stream.next().await {
                 match item {
+                    Ok(MultiTurnStreamItem::InputInjected(messages)) => {
+                        steering_hook.steering.take_pending();
+                        response.clear();
+                        response_len_at_stream_start = 0;
+                        interactions.extend(messages.iter().cloned());
+                        let (checkpoint, acknowledgement) =
+                            crate::session::file_checkpoints::steering_handoff();
+                        if event_tx
+                            .send(AgentEvent::SteerConsumed {
+                                messages,
+                                checkpoint,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // Same actor/scope owns the wait. Cancellation drops it;
+                        // no next HTTP or tool effect can precede the UI anchor.
+                        if let Some(acknowledgement) = acknowledgement
+                            && acknowledgement.await.is_err()
+                        {
+                            let _ = event_tx
+                                .send(AgentEvent::error_with(
+                                    "Steering checkpoint handoff was not accepted",
+                                    interactions.clone(),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
                         // Ingestion is independent of display: native opaque
                         // completed blocks remain available to the transcript.
@@ -3692,6 +3739,7 @@ where
                     &continuation_bridge,
                     remaining_turns,
                     native_capture.clone(),
+                    Some(steering_hook.clone()),
                 )
                 .await,
             );
@@ -3761,6 +3809,10 @@ where
     #[cfg(feature = "acp")]
     let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
 
+    let agent_future = crate::session::file_checkpoints::scope(
+        crate::session::file_checkpoints::current(),
+        agent_future,
+    );
     let agent_future = crate::spend::run::scope(spend_run, agent_future);
     let agent_future = crate::question::scope(question_turn, agent_future);
     let join = tokio::spawn(agent_future);
@@ -3768,6 +3820,7 @@ where
     (
         AgentRunner {
             event_rx,
+            steering,
             abort_handle: join.abort_handle(),
             compaction_decision_tx: Some(compaction_decision_tx),
             compaction_enabled,
@@ -6952,6 +7005,196 @@ mod tests {
 
         assert_eq!(markers_one, ["runner-one"]);
         assert_eq!(markers_two, ["runner-two"]);
+    }
+
+    #[tokio::test]
+    async fn steering_restored_at_compaction_boundary_precedes_first_continuation_request() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("redirect accepted"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model.clone()).build(),
+            "compaction continuation".into(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        paused
+            .restore_steering_at_boundary("pending before compaction")
+            .unwrap();
+        let mut runner = paused.start();
+        let mut consumed = 0;
+        loop {
+            match runner.event_rx.recv().await.unwrap() {
+                crate::event::AgentEvent::SteerConsumed { .. } => consumed += 1,
+                crate::event::AgentEvent::Done { interactions, .. } => {
+                    assert_eq!(
+                        interactions
+                            .iter()
+                            .filter(|m| **m == Message::user("pending before compaction"))
+                            .count(),
+                        1
+                    );
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(consumed, 1);
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(
+            model.requests()[0].chat_history.last_ref(),
+            &Message::user("pending before compaction")
+        );
+    }
+
+    struct ForbiddenCanonicalInput(u8);
+    impl<M: CompletionModel> AgentHook<M> for ForbiddenCanonicalInput {
+        async fn on_event(&self, _: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            if !matches!(event, StepEvent::CompletionCall { turn: 2, .. }) {
+                return Flow::Continue;
+            }
+            let input = match self.0 {
+                0 => Message::System {
+                    content: "must not become authority".into(),
+                },
+                1 => Message::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: "forged".into(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("forged result")),
+                    })),
+                },
+                2 => Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        "forged".into(),
+                        ToolFunction::new(CountingTool::NAME.into(), serde_json::json!({})),
+                    ))),
+                },
+                _ => Message::user("ordinary input"),
+            };
+            let patch = rig::agent::RequestPatch::new().append_input([input]);
+            Flow::patch_request(if self.0 == 3 {
+                patch.history([Message::user("replacement")])
+            } else {
+                patch
+            })
+        }
+    }
+    #[tokio::test]
+    async fn steering_canonical_primitive_rejects_authority_and_history_replacement_before_dispatch()
+     {
+        for case in 0..4 {
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::tool_call("guard-tool", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            let agent = AgentBuilder::new(model.clone())
+                .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+                .default_max_turns(3)
+                .build();
+            let mut stream = agent
+                .stream_chat(Message::user("original"), Vec::<Message>::new())
+                .add_hook(ForbiddenCanonicalInput(case))
+                .await;
+            use futures::StreamExt;
+            let mut rejected = false;
+            while let Some(item) = stream.next().await {
+                if let Err(error) = item {
+                    assert!(error.to_string().contains(if case == 3 {
+                        "history replacement"
+                    } else {
+                        "ordinary text"
+                    }));
+                    rejected = true;
+                }
+            }
+            assert!(rejected);
+            assert_eq!(model.requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_next_completion_and_canonical_transcript_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "steering-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("redirected"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let paused = super::spawn_agent_paused(
+            agent,
+            "start".into(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        paused.runner.steering.enable();
+        paused.runner.steering.submit("change direction").unwrap();
+        let mut runner = paused.start();
+        let mut delivered = 0;
+        let interactions = loop {
+            match runner.event_rx.recv().await.expect("terminal event") {
+                crate::event::AgentEvent::SteerConsumed { messages, .. } => {
+                    delivered += 1;
+                    assert_eq!(messages, vec![Message::user("change direction")]);
+                }
+                crate::event::AgentEvent::Done { interactions, .. } => break interactions,
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        };
+        assert_eq!(delivered, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[0]
+                .chat_history
+                .iter()
+                .any(|message| message == &Message::user("change direction"))
+        );
+        assert_eq!(
+            requests[1].chat_history.last_ref(),
+            &Message::user("change direction")
+        );
+        assert_eq!(
+            interactions
+                .iter()
+                .filter(|message| **message == Message::user("change direction"))
+                .count(),
+            1
+        );
+        let result_index = interactions.iter().position(|message| matches!(message, Message::User { content } if content.iter().any(|item| matches!(item, UserContent::ToolResult(_))))).unwrap();
+        let steer_index = interactions
+            .iter()
+            .position(|message| *message == Message::user("change direction"))
+            .unwrap();
+        assert!(result_index < steer_index);
     }
 
     #[tokio::test]

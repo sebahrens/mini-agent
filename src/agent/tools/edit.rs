@@ -1286,6 +1286,18 @@ impl EditTool {
         // Apply last-to-first so earlier byte positions remain valid
         ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
 
+        let mut checkpoint = match bound_workspace {
+            Some(workspace) => crate::session::file_checkpoints::prepare(
+                workspace,
+                relative,
+                Some(content.as_bytes()),
+                disclose_source,
+            ),
+            None => {
+                crate::session::file_checkpoints::skipped();
+                None
+            }
+        };
         let mut modified = content;
 
         for (byte_start, byte_end, replace) in &ranges {
@@ -1337,6 +1349,10 @@ impl EditTool {
             )
             .await?;
         }
+        crate::session::file_checkpoints::published();
+        if let Some(checkpoint) = &mut checkpoint {
+            checkpoint.committed(output.as_bytes());
+        }
         // Publication succeeded against the exact source identity and bytes.
         // Invalidate overwrite proof before optional formatter approval/effects.
         self.read_tracker.untrack_read_path(&path);
@@ -1356,6 +1372,12 @@ impl EditTool {
             }
             None => None,
         };
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.formatted(match &formatted {
+                Some(f) => f.content.as_deref(),
+                None => Some(&output),
+            });
+        }
         let excerpts = match &formatted {
             Some(formatted) => formatted
                 .content

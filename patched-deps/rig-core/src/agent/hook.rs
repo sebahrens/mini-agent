@@ -685,7 +685,8 @@ impl<M: CompletionModel> StepEvent<'_, M> {
 /// value for this turn, a `None` value inherits it. The patch is **per-turn and
 /// non-sticky** — it never changes the agent's baseline, so the next turn
 /// re-fires [`CompletionCall`](StepEvent::CompletionCall) and resolves from the
-/// baseline again.
+/// baseline again. `append_input` is the explicit exception: it appends ordinary
+/// text to the canonical run and is retained on later turns.
 ///
 /// # Merge behavior
 ///
@@ -701,6 +702,7 @@ impl<M: CompletionModel> StepEvent<'_, M> {
 /// | `temperature`, `max_tokens`, `tool_choice` | last writer wins (warns on conflict) | replaces |
 /// | `active_tools` | set **intersection** (warns when empty) | narrows the advertised set |
 /// | `history` | last writer wins (warns on conflict) | replaces the messages sent this turn |
+/// | `append_input` | append in hook order | appends to canonical input; incompatible with `history` |
 ///
 /// `active_tools` intersects rather than last-writer-wins because it is an
 /// allow-list guardrail: two narrowing hooks must compose as *narrowing*. All
@@ -743,6 +745,10 @@ pub struct RequestPatch {
     /// what messages are sent. `None` sends the real history. The enabling
     /// primitive for context-window compaction / summarization middleware.
     pub history: Option<Vec<Message>>,
+    /// Append trusted canonical input at the next model boundary. Unlike
+    /// `history`, these messages remain in the run transcript and future calls.
+    /// Only ordinary user/assistant messages are accepted; tool content is rejected.
+    pub append_input: Vec<Message>,
 }
 
 /// Last-writer-wins merge for a scalar patch field, warning on a real conflict.
@@ -848,6 +854,12 @@ impl RequestPatch {
         self
     }
 
+    /// Append canonical input in registration order before the next request.
+    pub fn append_input(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
+        self.append_input.extend(messages);
+        self
+    }
+
     /// Whether this patch has no effect (all fields unset).
     pub(crate) fn is_empty(&self) -> bool {
         self.preamble.is_none()
@@ -858,6 +870,7 @@ impl RequestPatch {
             && self.additional_params.is_none()
             && self.extra_context.is_empty()
             && self.history.is_none()
+            && self.append_input.is_empty()
     }
 
     /// Merge a later hook's patch onto this one (registration order: `self` is
@@ -866,6 +879,7 @@ impl RequestPatch {
     pub(crate) fn merge(mut self, later: RequestPatch) -> RequestPatch {
         // extra_context: append (earlier hooks' documents first).
         self.extra_context.extend(later.extra_context);
+        self.append_input.extend(later.append_input);
 
         // additional_params: shallow-merge when both are objects (later wins per
         // key), otherwise the later non-None value wins wholesale — mirroring the

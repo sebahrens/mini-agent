@@ -1,0 +1,97 @@
+{
+  "bead": "mini-agent-i7ro6.79",
+  "base": "44e964b2947a3cb2e81ac568b0f8c94724cdfce6",
+  "implementation": {
+    "input": "One pending operator text message, at most 64 KiB; default Enter queues, running_input=steer or explicit /steer uses the bounded slot.",
+    "boundary": "SDK CompletionCall after an atomic tool batch appends accepted text/context to AgentRun canonical messages before request preparation. No next-turn substitution, request-history rewrite or completed-boundary fabrication.",
+    "persistence": "Typed InputInjected becomes SteerConsumed; live TUI rows and SDK FinalResponse contain the same append-only input exactly once. Native Prepared capture attests the real append.",
+    "ownership": "Hook dispatch uses existing spawn_async_scoped ownership; cancellation reaps hook work before runner channel closure. Slot remains retained until canonical insertion is acknowledged.",
+    "continuation": "Pending input survives mid-turn compaction and is armed on the already-settled boundary before continuation HTTP. Unconsumed input returns to the draft after finish/cancellation."
+  },
+  "reviews": [
+    {
+      "reviewer": "adversarial",
+      "findings": [],
+      "residual_risks": [
+        "Hosted platform CI remains the integration owner; physical proof here is macOS."
+      ],
+      "testing_gaps": []
+    },
+    {
+      "reviewer": "reliability",
+      "findings": [],
+      "residual_risks": [
+        "Hosted platform CI remains the integration owner; physical proof here is macOS."
+      ],
+      "testing_gaps": []
+    },
+    {
+      "reviewer": "testing",
+      "findings": [],
+      "residual_risks": [
+        "Hosted platform CI remains the integration owner; physical proof here is macOS."
+      ],
+      "testing_gaps": []
+    }
+  ],
+  "resolved_findings": [
+    "Retain the pending text across cancellation while UserPromptSubmit is awaiting.",
+    "Own synchronous hook execution through cancellation so the actual child is reaped before cleanup completes.",
+    "Transfer pending steering across compaction and apply it before the first continuation request.",
+    "Reject system/tool injection and conflicting request-history replacements before dispatch.",
+    "Persist injected hook context separately from literal user text and sanitize hook rejection presentation.",
+    "Retain the original steering slot across every fallible compaction preparation step and clear it only after the replacement runner accepts the handoff.",
+    "Recover pending text in the existing failed-turn transition and native context-full LiveToolReply retirement path."
+  ],
+  "validation": {
+    "default_unique_tests": 17,
+    "owning_logs": [
+      "/private/tmp/mini-agent-steer79-final-owning.log",
+      "/private/tmp/mini-agent-steer79-callers.log",
+      "/private/tmp/mini-agent-steer79-hook-cancel-final.log"
+    ],
+    "installation": {
+      "command": "cargo install --path . --debug --locked --root /private/tmp/mini-agent-steer79-install",
+      "elapsed_seconds": 43.96,
+      "log": "/private/tmp/mini-agent-steer79-install-locked.log"
+    },
+    "installed_physical_proof": {
+      "binary": "/private/tmp/mini-agent-steer79-install/bin/mini-agent",
+      "binary_sha256": "9beb8571fb813e39de097b6bd3fbd18af07719d89649b391ee16203c70107ffb",
+      "stack_bytes": 1048576,
+      "external_calls": 0,
+      "passed": true,
+      "posts": 3,
+      "healthy_saves": 2,
+      "steering_rows": 1,
+      "usage": [
+        30,
+        6
+      ],
+      "normal_quit": 0,
+      "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-steer79-installed-axolnyor/home/sessions/dc81e987-84e6-4add-9b7c-71ad70c4858b.json",
+      "errors": []
+    },
+    "scope": "Indexed UI submission and continuation callers, shared SDK boundary and changed hooks cfg only. No full-suite gate.",
+    "compaction_followup": {
+      "base": "f830ca63",
+      "logs": [
+        "/private/tmp/mini-agent-steer79-followup-owning.log",
+        "/private/tmp/mini-agent-steer79-followup-native.log"
+      ],
+      "result": "4 unique focused tests pass: actual App renderer failure, native context-full LiveToolReply, existing canonical native success and first-continuation handoff.",
+      "superseded_assertion": "The first native-stop test incorrectly expected a refused frontier. The corrected assertion requires the existing exact LiveToolReply boundary and rejects CompletedTurn.",
+      "reused_evidence": "The 1 MiB installed normal steering/next-user proof and no-hooks cfg proof cover unchanged normal delivery paths; the successor changes only compaction/failure retention plus test-only fixtures."
+    }
+  },
+  "navigation": {
+    "tool": "code-indexer",
+    "session": "37c80c91-e41a-4dbb-a29d-e9acdaa5974a",
+    "maps": [
+      "/private/tmp/mini-agent-steer79-ui-callers.json",
+      "/private/tmp/mini-agent-steer79-continuation-callers.json",
+      "/private/tmp/mini-agent-steer79-sdk-boundary-grep.json"
+    ],
+    "limitation": "SDK caller graph returned no edge; indexed bounded grep confirmed the shared drive_agent call site."
+  }
+}

@@ -36,7 +36,8 @@ pub async fn ensure_agent(
     *agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
-            .await,
+            .await
+            .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
     );
     // The builder captured these counts from the actual preamble and actual
     // registered tools. Never reread added/suffix files after building it.
@@ -91,6 +92,41 @@ pub async fn handle_agent_event(
             .observe(&event);
     }
     match event {
+        AgentEvent::SteerConsumed { messages, checkpoint } => {
+            finalize_response_segment(renderer, run)?;
+            // Earlier assistant text was already persisted before tool calls;
+            // reset the segment so Done cannot duplicate it around this user row.
+            run.response_buf.clear();
+            run.response_start_block = None;
+            let mut user_turn = None;
+            for message in messages {
+                match message {
+                    rig::completion::Message::System { .. } => return Err(anyhow::anyhow!("steering cannot inject system authority")),
+                    rig::completion::Message::User { content } => {
+                        for item in content {
+                            if let rig::message::UserContent::Text(text) = item {
+                                user_turn = Some(ui.session.messages.len());
+                                ui.session.add_message(MessageRole::User, &text.text);
+                                renderer.write_line(&format!("> {}", sanitize_output(&text.text)), Color::Green)?;
+                            }
+                        }
+                    }
+                    rig::completion::Message::Assistant { content, .. } => {
+                        for item in content {
+                            if let rig::message::AssistantContent::Text(text) = item {
+                                ui.session.add_message(MessageRole::System, &text.text);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.acknowledge(ui.session, user_turn.ok_or_else(|| anyhow::anyhow!("steering user row missing"))?)?;
+            }
+            renderer.write_line("steering delivered", C_TOOL)?;
+        }
+        AgentEvent::SteerRejected { reason } => { renderer.write_line(&sanitize_output(&reason), C_ERROR)?; }
+
         AgentEvent::Reasoning(text) => {
             if text.is_empty() {
                 return Ok(());
@@ -1011,7 +1047,13 @@ async fn finish_goal_round(
             #[cfg(feature = "agent-skills")]
             let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
             let paused = round_agent
+                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls)
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                .with_file_checkpoints(ui.session.file_checkpoints.recorder(
+                    &ui.session.id,
+                    ui.session.messages.len(),
+                    ui.cli.no_session,
+                ))
                 .with_question_turn(run.question_turn.clone())
                 .spawn_runner_paused(
                     relaunch.prompt,

@@ -68,7 +68,6 @@ pub(crate) struct NativePublicationTicket {
     // another writer enter while this actor's publication can still run.
     writer: super::lock::NativeWriterGuard,
     paired: bool,
-    #[cfg(feature = "hooks")]
     actor_pair: Option<std::sync::Weak<ActorPairInner>>,
     #[cfg(test)]
     fail_final_before_replace: bool,
@@ -88,13 +87,10 @@ struct ActorState {
     writer: Option<super::lock::NativeWriterGuard>,
     refusal: Option<(u64, RestartReason)>,
     consumed: bool,
-    #[cfg(feature = "hooks")]
     session_end_issued: bool,
-    #[cfg(feature = "hooks")]
     acknowledged_retirement: Option<AcknowledgedRetirement>,
 }
 
-#[cfg(feature = "hooks")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AcknowledgedRetirement {
     revision: u64,
@@ -132,16 +128,11 @@ impl NativeActorPair {
                 writer: Some(writer),
                 refusal: None,
                 consumed: false,
-                #[cfg(feature = "hooks")]
                 session_end_issued: false,
-                #[cfg(feature = "hooks")]
                 acknowledged_retirement: None,
             }),
         }));
-        #[cfg(feature = "hooks")]
-        {
-            ticket.actor_pair = Some(Arc::downgrade(&pair.0));
-        }
+        ticket.actor_pair = Some(Arc::downgrade(&pair.0));
         Ok(pair)
     }
 
@@ -586,7 +577,6 @@ fn begin_blocking(
             epoch: snapshot.native_frontier.current(),
             writer,
             paired: false,
-            #[cfg(feature = "hooks")]
             actor_pair: None,
             #[cfg(test)]
             fail_final_before_replace: false,
@@ -608,6 +598,27 @@ pub(crate) async fn begin_owned(
         .await??;
     session.native_publication = Some(publication);
     Ok(ticket)
+}
+
+/// Before the first model, only the retained, unpaired startup ticket may
+/// adopt an explicit control. It stays InFlight; no completed boundary is made.
+pub(crate) async fn startup_update_reasoning(
+    session: &mut Session,
+    ticket: &mut NativePublicationTicket,
+    next: crate::provider::effort::SessionReasoning,
+    scope: &Arc<crate::agent::runner::AgentWorkScope>,
+) -> anyhow::Result<()> {
+    checked_publication(session)?;
+    ensure_actor_value(session, ticket)?;
+    anyhow::ensure!(
+        !ticket.paired,
+        "native control update requires the idle startup owner"
+    );
+    if session.reasoning_controls != next {
+        session.reasoning_controls = next;
+        progress_owned(session, ticket, scope).await?;
+    }
+    Ok(())
 }
 
 /// Only the current actor's exact mutable ticket can seal a changed snapshot.
@@ -955,7 +966,6 @@ pub(crate) async fn publish_refused_owned(
                 );
                 state.phase = Phase::Retired;
                 drop(state);
-                #[cfg(feature = "hooks")]
                 acknowledge_retired_actor(
                     &ticket,
                     &publication,
@@ -1113,7 +1123,6 @@ fn retire_blocking_using(
     }
     result?;
     drop(state);
-    #[cfg(feature = "hooks")]
     acknowledge_retired_actor(
         &ticket,
         &publication,
@@ -1123,7 +1132,6 @@ fn retire_blocking_using(
     Ok(publication)
 }
 
-#[cfg(feature = "hooks")]
 fn acknowledge_retired_actor(
     ticket: &NativePublicationTicket,
     publication: &NativePublication,
@@ -1178,14 +1186,14 @@ pub(crate) async fn retire_owned(
 
 /// A runtime-only value permit from an already retired, published actor. This
 /// role can run SessionEnd without inventing another model completion.
-#[cfg(feature = "hooks")]
 pub(crate) struct RetiredSessionEndPermit {
     publication: NativePublication,
     epoch: u64,
     outcome: RetiredNativeOutcome,
+    #[cfg(test)]
+    fail_next_control_publication: bool,
 }
 
-#[cfg(feature = "hooks")]
 impl RetiredSessionEndPermit {
     pub(crate) fn from_retired_actor(
         session: &Session,
@@ -1225,9 +1233,98 @@ impl RetiredSessionEndPermit {
             publication: publication.clone(),
             epoch: session.native_frontier.current(),
             outcome: acknowledged.outcome,
+            #[cfg(test)]
+            fail_next_control_publication: false,
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_control_publication(&mut self) {
+        self.fail_next_control_publication = true;
+    }
+
+    /// An explicit idle control may change only this closed setting. The
+    /// existing completed actor supplies the outcome; the command supplies no
+    /// model-completion witness and cannot heal a refused/live-tool boundary.
+    pub(crate) async fn update_reasoning(
+        &mut self,
+        session: &mut Session,
+        host: Option<&crate::provider::NativeHostGuard>,
+        next: crate::provider::effort::SessionReasoning,
+    ) -> anyhow::Result<()> {
+        let publication = checked_publication(session)?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&publication.owner, &self.publication.owner)
+                && publication.revision == self.publication.revision
+                && publication.digest == self.publication.digest
+                && session.native_frontier.current() == self.epoch
+                && session.native_frontier.ready()
+                && self.outcome == RetiredNativeOutcome::Completed,
+            "finish or recover the current native context before changing effort"
+        );
+        let history = session
+            .native_history_snapshot()
+            .ok_or(RestartReason::UnavailableSource)?;
+        anyhow::ensure!(
+            history.saved_boundary()? == super::native_replay::ReplayBoundary::CompletedTurn,
+            "finish the native tool reply before changing effort"
+        );
+        if let Some(host) = host {
+            host.validate()?;
+        }
+        if session.reasoning_controls == next {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let fail = std::mem::take(&mut self.fail_next_control_publication);
+        let previous = session.reasoning_controls;
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        cleanup.retain_until_settled(self.publication.owner.lease.begin_write()?);
+        // The old value is durably denied before mutation. An interrupted
+        // setter never restores healthy data or reruns lifecycle hooks.
+        let result = async {
+            let mut ticket = begin_owned(session, &scope).await?;
+            session.reasoning_controls = next;
+            let mut check = session.clone();
+            check.reasoning_controls = previous;
+            anyhow::ensure!(
+                digest(&check)? == self.publication.digest,
+                "session context changed while updating effort"
+            );
+            progress_owned(session, &mut ticket, &scope).await?;
+            let snapshot = session.clone();
+            let host = host.cloned();
+            let outcome = self.outcome;
+            let publication = scope
+                .run(async move {
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        retire_blocking_using(snapshot, ticket, outcome, |snapshot, in_flight| {
+                            if let Some(host) = &host {
+                                host.validate()?;
+                            }
+                            #[cfg(test)]
+                            if fail {
+                                anyhow::bail!(
+                                    "controlled effort publication failure before replacement"
+                                );
+                            }
+                            write_projection(snapshot, in_flight)
+                        })
+                    })
+                    .await
+                })
+                .await??;
+            session.native_publication = Some(publication.clone());
+            self.publication = publication;
+            Ok(())
+        }
+        .await;
+        cleanup.settle().await;
+        result
+    }
+
+    #[cfg(feature = "hooks")]
     pub(crate) async fn run(
         self,
         session: &mut Session,

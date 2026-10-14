@@ -254,6 +254,7 @@ impl WriteTool {
             }
             let mut preview_before = None;
             let mut created = false;
+            let mut checkpoint;
             match workspace.open_relative(relative) {
                 Ok(mut existing) => {
                     if !args.overwrite {
@@ -286,6 +287,12 @@ impl WriteTool {
                                 .to_owned(),
                         );
                     }
+                    checkpoint = crate::session::file_checkpoints::prepare(
+                        workspace,
+                        relative,
+                        Some(&current),
+                        super::mutation_diff::preimage_allowed(&self.permission, &expanded, true),
+                    );
                     workspace.replace_relative_atomic_expecting(
                         relative,
                         args.content.as_bytes(),
@@ -294,6 +301,8 @@ impl WriteTool {
                     )?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    checkpoint =
+                        crate::session::file_checkpoints::prepare(workspace, relative, None, true);
                     workspace
                         .create_relative_atomic(relative, args.content.as_bytes())
                         .map_err(|error| match error.kind() {
@@ -307,6 +316,10 @@ impl WriteTool {
                         workspace, relative, error,
                     ));
                 }
+            }
+            crate::session::file_checkpoints::published();
+            if let Some(checkpoint) = &mut checkpoint {
+                checkpoint.committed(args.content.as_bytes());
             }
             self.read_tracker.untrack_read_path(&expanded);
             let formatted = match &self.formatter {
@@ -329,6 +342,9 @@ impl WriteTool {
                 Some(formatted) => formatted.content.as_deref(),
                 None => Some(args.content.as_str()),
             };
+            if let Some(checkpoint) = &checkpoint {
+                checkpoint.formatted(final_content);
+            }
             let mut diff = if created {
                 final_content.and_then(|content| {
                     MutationDiff::replacement(&expanded, None, content, self.diff_options)
@@ -464,6 +480,7 @@ impl WriteTool {
         })?)
         .await?;
         let created = existing.is_none();
+        crate::session::file_checkpoints::skipped();
         if let Some(base) = existing {
             crate::fs::atomic_write_resolved_expecting(path, &args.content, approved_parent, base)
                 .await?;
@@ -472,6 +489,7 @@ impl WriteTool {
                 .await
                 .map_err(|error| create_error(&expanded, error))?;
         }
+        crate::session::file_checkpoints::published();
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
         let formatted = match &self.formatter {
             Some(formatter) => {

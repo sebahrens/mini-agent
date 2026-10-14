@@ -3,7 +3,10 @@ pub(crate) use app::drive_native_instruction_fixture;
 #[cfg(all(test, feature = "hooks"))]
 pub(crate) use app::drive_native_stale_session_end_fixture;
 #[cfg(test)]
-pub(crate) use app::{drive_native_fixture_turn, drive_native_fixture_turns};
+pub(crate) use app::{
+    drive_native_effort_fixture, drive_native_fixture_turn, drive_native_fixture_turns,
+    drive_native_steer_fixture,
+};
 mod app;
 #[cfg(feature = "multimodal")]
 mod clipboard_image;
@@ -249,10 +252,21 @@ pub(crate) fn refresh_display(
         goal_label: None,
         prompt_name: ui.context.current_prompt_name.as_deref(),
         reasoning_effort: ui
-            .cfg
-            .reasoning
-            .as_ref()
-            .and_then(|reasoning| reasoning.effort)
+            .session
+            .reasoning_controls
+            .effort
+            .or_else(|| {
+                run.agent
+                    .as_ref()
+                    .and_then(|agent| agent.effective_reasoning().ok())
+                    .and_then(|effective| effective.effort)
+            })
+            .or_else(|| {
+                ui.cfg
+                    .reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort)
+            })
             .map(|effort| effort.as_wire_str()),
         perm_mode: perm_mode.as_deref(),
         chain_label: chain.label_msg.as_deref(),
@@ -738,9 +752,12 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
     crate::ui::slash::is_readonly_diagnostic(t)
         || crate::ui::slash::is_readonly_view(t)
         || crate::ui::slash::is_jobs_control(t)
+        || t.trim_end() == "/effort"
         || t == "/queue"
         || crate::ui::slash::is_input_control(t)
         || t.starts_with("/queue ")
+        || t == "/steer"
+        || t.starts_with("/steer ")
         || t == "/btw"
         || t.starts_with("/btw ")
         || goal_control_while_running(t)
@@ -1172,9 +1189,24 @@ pub(crate) async fn start_main_run(
             });
         }
     }
-    let agent = run.agent.as_ref().unwrap().clone();
+    let agent = crate::startup::heap_future(|| {
+        std::future::ready(
+            run.agent
+                .as_ref()
+                .unwrap()
+                .clone()
+                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
+        )
+    })
+    .await;
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+    let file_checkpoints = ui.session.file_checkpoints.recorder(
+        &ui.session.id,
+        pending_turn.message_index(),
+        ui.cli.no_session,
+    );
+    let agent = agent.with_file_checkpoints(file_checkpoints.clone());
     let mut pending_turn = Some(pending_turn);
     run.native_checkpointed = false;
     let runner = if let Some(mut owner) = native_owner.take() {
@@ -1211,6 +1243,7 @@ pub(crate) async fn start_main_run(
                 .as_mut()
                 .unwrap()
                 .rebase_after_owned_startup_context(ui.session);
+            file_checkpoints.rebase_turn(pending_turn.as_ref().unwrap().message_index());
             owner.progress(ui.session).await?;
         }
         if let Some(ticket) = &mut owner.ticket {
@@ -1265,6 +1298,7 @@ pub(crate) async fn start_main_run(
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         paused.start_interactive()
     };
+    run.steering = Some(runner.steering);
     run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
@@ -1307,10 +1341,7 @@ pub(crate) async fn settle_native_main_turn(
         return Err(error);
     }
     run.native_checkpointed = true;
-    #[cfg(feature = "hooks")]
-    {
-        run.native_session_end = owner.take_retired_session_end();
-    }
+    run.native_session_end = owner.take_retired_session_end();
     attachment?;
     Ok(())
 }
@@ -1492,6 +1523,9 @@ pub(crate) async fn mid_turn_compact_and_respawn(
 ) -> anyhow::Result<()> {
     // The runner sent the boundary event and returned voluntarily. Dropping
     // its handle is bookkeeping, not cancellation of a tool or provider call.
+    // Retain the old slot through every fallible preparation step. The App
+    // failure transition can then recover it if rendering or respawn fails.
+    let previous_steering = run.steering.clone();
     run.main_abort.take();
     run.is_running = false;
     run.agent_rx = None;
@@ -1551,11 +1585,25 @@ pub(crate) async fn mid_turn_compact_and_respawn(
         ui.session,
         ui.cfg.resolve_keep_recent_tool_results(),
     );
-    let agent = run.agent.as_ref().unwrap().clone();
+    let agent = crate::startup::heap_future(|| {
+        std::future::ready(
+            run.agent
+                .as_ref()
+                .unwrap()
+                .clone()
+                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
+        )
+    })
+    .await;
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_turn(run.instruction_turn.clone());
     let paused = agent
         .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+        .with_file_checkpoints(ui.session.file_checkpoints.recorder(
+            &ui.session.id,
+            ui.session.messages.len(),
+            ui.cli.no_session,
+        ))
         .with_question_turn(run.question_turn.clone())
         .spawn_runner_paused(
             MID_TURN_CONTINUE_PROMPT.to_string(),
@@ -1569,7 +1617,19 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     let mut paused = paused;
     #[cfg(feature = "hooks")]
     adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
+    if let Some(text) = previous_steering
+        .as_ref()
+        .and_then(|steering| steering.pending_text())
+    {
+        paused
+            .restore_steering_at_boundary(&text)
+            .map_err(anyhow::Error::msg)?;
+    }
     let runner = paused.start_interactive();
+    run.steering = Some(runner.steering);
+    if let Some(previous) = previous_steering {
+        previous.take_pending();
+    }
     run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);

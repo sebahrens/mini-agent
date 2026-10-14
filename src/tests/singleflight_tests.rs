@@ -200,3 +200,15 @@ fn busy67_views_are_exact_and_mutating_variants_stay_rejected() {
         );
     }
 }
+
+#[test]
+fn steering_command_bypasses_running_gate_without_matching_other_commands() {
+    for text in ["/steer", "/steer redirect", "  /steer literal message"] {
+        assert!(allowed_while_running(text));
+        assert_eq!(classify_submission(true, text), SubmitAction::Run);
+    }
+    assert_eq!(
+        classify_submission(true, "/steering"),
+        SubmitAction::RejectWhileRunning
+    );
+}

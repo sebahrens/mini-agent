@@ -1468,7 +1468,7 @@ and an out-of-range `include` value fails every request.
 
 ```toml
 [reasoning]
-effort = "medium"            # none | minimal | low | medium | high | xhigh
+effort = "medium"            # low | medium | high | xhigh | max (provider/model dependent; OpenAI also none/minimal)
 summary = "auto"             # auto | concise | detailed
 encrypted_content = true     # default: true
 store = true                 # omit to leave the provider default alone
@@ -1488,6 +1488,40 @@ request into a provider error.
 Only the keys you set are sent: with no `effort` and no `summary` no `reasoning`
 object is built at all, and with no `store` the provider's own default is left
 untouched.
+
+### Native Claude and session overrides
+
+The main native Anthropic adapter maps effort to `output_config.effort` and
+selects adaptive thinking on models that support it. OpenRouter's Anthropic
+routes instead receive `reasoning.effort`; native fields are not substituted for
+the gateway protocol. Unset controls retain the provider defaults. Raw controls
+keep their existing precedence over global typed config; an explicit session
+`/effort` override owns its effort and compatible thinking mode. Schema output
+format and effort share the same native `output_config`.
+
+`/effort` reports the effective level/source. `/effort low|medium|high|xhigh|max`
+persists the main-session override, and `/effort default` clears it. Supported
+levels depend on the actual adapter and model: Opus/Sonnet4.6 omit `xhigh`, and
+Opus4.5 supports only low/medium/high. Unknown model capabilities and unsupported
+levels are refused. Native OpenAI does not accept the new `max` value here.
+
+Native `/reasoning on|off|default` controls request thinking without changing the
+signed system prefix or the feed's display preference. Models such as Opus5.5
+cannot disable thinking; lower effort is available instead. No manual thinking
+budget or summarized display is invented. Separately built auxiliary models keep
+their own policy; session overrides belong to main-session work.
+
+An idle native control change retains the exact acknowledged model boundary and
+current host/workspace owner. It publishes InFlight before changing the closed
+setting, then republishes the same proven completed boundary after the owned
+write. It cannot heal an unfinished context or change a parked tool reply.
+Model-visible history, permissions, accounting and receipts remain unchanged.
+
+See the primary [effort](https://platform.claude.com/docs/en/build-with-claude/effort),
+[thinking](https://platform.claude.com/docs/en/build-with-claude/thinking) and
+[OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+contracts. `src/provider_effort.rs` owns the closed protocol/model compatibility
+and precedence rules; its model table requires deliberate updates for new IDs.
 
 **Encrypted reasoning content is requested by default**, including when no
 `[reasoning]` table is configured. A persisted reasoning item can only be
@@ -1740,7 +1774,7 @@ Available items:
 | `compaction`          | Number of compactions (`cmp:<n>`). |
 | `btw`                 | `/btw` side-question token/cost usage. |
 | `reasoning`           | Shows `reasoning` when reasoning is enabled (hidden when off). |
-| `reasoning_effort`    | Configured `[reasoning] effort` (`effort:<level>`; hidden when unset). The built-in default layout shows it after the model. |
+| `reasoning_effort`    | Effective main-session effort (`effort:<level>`; hidden when unset). The built-in default layout shows it after the model. |
 | `message_count`       | Number of messages in the session. |
 | `session_age`         | Time since the session was created (e.g. `5m`, `2h10m`). |
 | `session_updated`     | Time since the last message (same format). |
@@ -3598,3 +3632,8 @@ JS broker permission notifications retain the parent invocation's existing work
 scope when crossing the parent-local permission receiver. Hook subprocesses
 remain part of that turn's cancellation and cleanup; no scope or hook context is
 serialized into the worker protocol.
+
+`running_input = "queue"` (default) queues ordinary Enter submissions while an
+interactive turn runs. Use `"steer"` to deliver them at the next settled tool
+boundary instead. `/steer <message>` explicitly steers regardless of this setting.
+Only one steer may wait at a time; a second remains in the input draft.

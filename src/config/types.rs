@@ -585,10 +585,10 @@ impl Default for AdvisorConfig {
 
 /// How much internal reasoning a reasoning-capable model should spend.
 ///
-/// Maps to the OpenAI Responses API's `reasoning.effort` and to Chat
-/// Completions' top-level `reasoning_effort`. Values match the provider wire
-/// spellings exactly, so an unknown value is rejected at config parse time
-/// rather than turning every request into a provider error.
+/// The actual provider adapter maps these values to its request format:
+/// OpenAI reasoning fields, native Claude `output_config.effort`, or
+/// OpenRouter `reasoning.effort`. Support is validated against the selected
+/// provider and model; parsing a known level does not imply model support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -598,6 +598,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -610,6 +611,7 @@ impl ReasoningEffort {
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
             ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -711,4 +713,24 @@ pub enum TerminalNotify {
     /// `OSC 777 ; notify ; <title> ; <body> BEL` (rxvt-unicode, foot,
     /// Ghostty, WezTerm, VTE-based terminals with the patch).
     Osc777,
+}
+
+/// Where ordinary Enter sends text while an interactive turn is running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunningInput {
+    #[default]
+    Queue,
+    Steer,
+}
+
+#[cfg(test)]
+mod running_input_tests {
+    #[test]
+    fn running_input_defaults_to_queue_and_rejects_unknown_modes() {
+        assert_eq!(super::RunningInput::default(), super::RunningInput::Queue);
+        let cfg: crate::config::Config = toml::from_str("running_input = 'steer'").unwrap();
+        assert_eq!(cfg.running_input, Some(super::RunningInput::Steer));
+        assert!(toml::from_str::<crate::config::Config>("running_input = 'replace'").is_err());
+    }
 }

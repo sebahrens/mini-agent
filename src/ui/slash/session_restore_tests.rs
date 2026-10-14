@@ -1085,11 +1085,16 @@ fn rewind_shell_picker_restores_only_the_command_and_keeps_redo_complete() {
     session.add_message(MessageRole::User, "later prompt");
     let before = serde_json::to_value(&session.messages).unwrap();
     let mut input = InputEditor::new();
-    input.start_rewind_picker(crate::ui::rewind_targets(&session));
+    let root = crate::tests::OwnedTestDirectory::new("rewind-shell-binding");
+    let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+    input.start_rewind_picker(
+        crate::ui::rewind_targets(&session),
+        crate::ui::pickers::rewind::RewindBinding::capture(&session, &workspace).unwrap(),
+    );
     for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
         assert!(input.handle_picker_key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
-    let Some(RewindOutcome::Confirmed(index)) = input.take_rewind_outcome() else {
+    let Some(RewindOutcome::Confirmed(index, _, _)) = input.take_rewind_outcome() else {
         panic!("the actual picker must confirm the selected shell turn");
     };
     assert_eq!(index, 2);

@@ -107,6 +107,8 @@ pub enum MultiTurnStreamItem<R> {
     /// }
     /// ```
     CompletionCall(CompletionCall),
+    /// Trusted input appended to the canonical run before this model request.
+    InputInjected(Vec<Message>),
     /// The final result from the stream: the unified [`PromptResponse`] shared
     /// with the blocking surface.
     FinalResponse(PromptResponse),
@@ -501,7 +503,7 @@ where
             };
 
             match step {
-                AgentRunStep::CallModel { prompt, history, turn } => {
+                AgentRunStep::CallModel { mut prompt, mut history, turn } => {
                     if runner.max_turns > 1 {
                         tracing::info!("Current conversation Turns: {}/{}", turn, runner.max_turns);
                     }
@@ -515,6 +517,23 @@ where
                             }
                             CompletionCallOutcome::Proceed(request_patch) => request_patch,
                         };
+
+                    if let Some(patch) = &request_patch
+                        && !patch.append_input.is_empty()
+                    {
+                        if patch.history.is_some() {
+                            yield Err(StreamingError::Prompt(Box::new(run.cancel_error("canonical input injection cannot combine with a history replacement"))));
+                            break 'outer;
+                        }
+                        if let Err(error) = run.append_input(&patch.append_input) {
+                            yield Err(StreamingError::Prompt(Box::new(error)));
+                            break 'outer;
+                        }
+                        let mut full = run.full_history();
+                        prompt = full.pop().expect("injected input is nonempty");
+                        history = full;
+                        yield Ok(DriveItem::Item(MultiTurnStreamItem::InputInjected(patch.append_input.clone())));
+                    }
 
                     // Record this turn's base system prompt — the patched-or-baseline
                     // preamble, before any output-mode augmentation the request builder

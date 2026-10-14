@@ -1,0 +1,46 @@
+{
+  "base": "b02c05e1769f4d917becef23c5972be6f1886afa",
+  "beads": [
+    "mini-agent-i7ro6.35",
+    "mini-agent-i7ro6.46",
+    "mini-agent-i7ro6.79"
+  ],
+  "owner_sources": {
+    "rewind": "bd1a4eff4b2d145da1a90d9a58c01bb0a71a0aee5cf5cb4a45784a57bde4f4e4",
+    "steering": "a188e159650ab379e403575afdbc80d456d4b3f9f35b06e1f5595da0faadaace",
+    "steering_failure_retention": "5dea492d62286925f4345c1ab4c259ff2c4957809fe9d97edc8ca2dd5b92f3b8",
+    "effort": "420ab92ca8797813b7b74fecd2247b064de320c74efd06553614b08c15c2ac7f",
+    "steering_checkpoint_handoff": "af9641e12c16169d0ed0c2a1d3dd06d92b68a6dbd9097972c39643777b552435"
+  },
+  "merge_review": {
+    "scope": "Critical ownership and mutation boundaries plus actual overlapping hunks; consolidated owner testing/adversarial/reliability reviews reused.",
+    "conflicts": "Three additive conflicts retained both test fixture groups, both UI test exports, imported checkpoint-authority reset and closed reasoning settings.",
+    "resolved_findings": [
+      "Pending steering survived normal delivery but was lost on compaction presentation failure/native context-full retirement. Preserve old slot until successful replacement and recover draft in existing failure transitions.",
+      "Writes after injected steering originally retained the earlier user checkpoint anchor. A consuming same-session/store token now blocks next SDK poll until the UI appends and acknowledges its actual user row; foreign, dropped and cancelled handoffs cannot continue effects."
+    ],
+    "preserved": [
+      "Rewind all-file preflight and per-file identity/content checks, imported/forked authority refusal, bounded private preimages and explicit partial-restoration reporting.",
+      "Canonical append-only steering at real SDK boundaries, cancellation ownership, literal user messages, native signatures and exact live/completed boundary distinction.",
+      "Effort setter requires exact acknowledged old-value native ownership, denies the old snapshot before mutation, preserves canonical history/accounting and never heals failed/live context."
+    ]
+  },
+  "test_selection": {
+    "navigation": "Owner code-indexer maps, Root indexed boundary implementation/terminal sources and physical merge inspection; missing SDK graph edges confirmed by file-specific search.",
+    "combined": "/private/tmp/mini-agent-35-46-79-merged-tests.log",
+    "included": "Changed steering/continuation, checkpoint/rewind/compaction, effort/body/persistence, config ownership and both exact subprocess source inventories.",
+    "reused": "Owner minimal/no-hooks rows and unchanged TTL/stats, JS containment, sandbox, receipt arithmetic and standalone process-lifecycle proofs. No full local suite or redundant feature matrix."
+  },
+  "limitations": [
+    "Checked Windows workspace file replacement/retirement remains unsupported and fails closed; conversation rewind remains available.",
+    "Rewind covers native Write/Edit, including owned children; arbitrary shell effects are not checkpointed and multiple-file restoration is not crash-atomic.",
+    "No paid provider token-volume experiment. Effort proves actual request controls and session behavior; unrelated native recovery limitations are not represented as delivered.",
+    "Hosted full CI remains required; a focused Windows diagnostic cannot publish ci-success."
+  ],
+  "final_validation": {
+    "combined_tests": "36 affected tests pass:26 in ordinary sandbox and10 loopback fixture cases rerun with listener permission (1.32s). Initial10 failures were TcpListener bind EPERM, not product failures.",
+    "loopback_log": "/private/tmp/mini-agent-35-46-79-loopback-tests.log",
+    "strict_lint": "running",
+    "installed_proofs": "pending one combined install"
+  }
+}

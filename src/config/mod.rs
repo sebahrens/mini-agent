@@ -126,6 +126,8 @@ pub struct Config {
     pub keys: Option<keybindings::KeyOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vim_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_input: Option<RunningInput>,
     /// Runtime-only MCP source records; never configuration or launch trust.
     #[cfg(feature = "mcp")]
     #[serde(skip)]

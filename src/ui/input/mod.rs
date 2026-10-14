@@ -674,11 +674,15 @@ impl InputEditor {
 
     /// Open the `/rewind` picker over the given `(message_index,
     /// preview)` user turns. No-op when there is nothing to rewind to.
-    pub fn start_rewind_picker(&mut self, targets: Vec<(usize, String)>) {
+    pub(crate) fn start_rewind_picker(
+        &mut self,
+        targets: Vec<(usize, String)>,
+        binding: crate::ui::pickers::rewind::RewindBinding,
+    ) {
         if targets.is_empty() {
             return;
         }
-        let mut picker = RewindPicker::new(targets);
+        let mut picker = RewindPicker::new(targets, binding);
         picker.set_monochrome(self.monochrome);
         picker.activate();
         self.picker = Some(Picker::Rewind(picker));

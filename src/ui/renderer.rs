@@ -555,6 +555,8 @@ pub struct Renderer {
     #[cfg(test)]
     test_output: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
     #[cfg(test)]
+    test_fail_next_write: std::cell::Cell<bool>,
+    #[cfg(test)]
     test_native_size_query: Option<NativeSizeQuery>,
     #[cfg(test)]
     native_size_queries: std::cell::Cell<usize>,
@@ -635,6 +637,7 @@ struct Notice {
 #[cfg(test)]
 enum TestOutput {
     Capture(Arc<std::sync::Mutex<Vec<u8>>>),
+    Fail,
     Stdout(io::Stdout),
 }
 
@@ -642,6 +645,10 @@ enum TestOutput {
 impl Write for TestOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
+            Self::Fail => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "owned test output failure",
+            )),
             Self::Capture(capture) => capture
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -651,6 +658,10 @@ impl Write for TestOutput {
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
+            Self::Fail => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "owned test output failure",
+            )),
             Self::Capture(capture) => capture
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -668,6 +679,8 @@ impl Renderer {
         Ok(Renderer {
             #[cfg(test)]
             test_output: None,
+            #[cfg(test)]
+            test_fail_next_write: std::cell::Cell::new(false),
             #[cfg(test)]
             test_native_size_query: None,
             #[cfg(test)]
@@ -751,7 +764,15 @@ impl Renderer {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        self.test_fail_next_write.set(true);
+    }
+
+    #[cfg(test)]
     fn writer(&self) -> TestOutput {
+        if self.test_fail_next_write.replace(false) {
+            return TestOutput::Fail;
+        }
         match &self.test_output {
             Some(bytes) => TestOutput::Capture(Arc::clone(bytes)),
             None => TestOutput::Stdout(io::stdout()),

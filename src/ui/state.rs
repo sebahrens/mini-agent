@@ -256,6 +256,7 @@ pub(crate) struct PendingMainTurn {
 
 struct SessionRollback {
     messages_len: usize,
+    file_checkpoint_revision: u64,
     compactions_len: usize,
     updated_at: compact_str::CompactString,
     total_estimated_tokens: u64,
@@ -275,6 +276,7 @@ impl PendingMainTurn {
             session_id: session.id.clone(),
             session_before: SessionRollback {
                 messages_len: session.messages.len(),
+                file_checkpoint_revision: session.file_checkpoints.revision(),
                 compactions_len: session.compactions.len(),
                 updated_at: session.updated_at.clone(),
                 total_estimated_tokens: session.total_estimated_tokens,
@@ -292,6 +294,10 @@ impl PendingMainTurn {
             #[cfg(feature = "memory")]
             memory_summaries: Vec::new(),
         }
+    }
+
+    pub(crate) fn message_index(&self) -> usize {
+        self.session_before.messages_len
     }
 
     pub(crate) fn prompt(&self) -> &str {
@@ -374,7 +380,8 @@ impl PendingMainTurn {
         response_buf: &str,
         turn_trace: &[compact_str::CompactString],
     ) -> bool {
-        !response_buf.trim().is_empty()
+        session.file_checkpoints.revision() != self.session_before.file_checkpoint_revision
+            || !response_buf.trim().is_empty()
             || !turn_trace.is_empty()
             || session.messages.len()
                 > self
@@ -504,7 +511,6 @@ impl PendingMainTurn {
 #[derive(Default)]
 pub(crate) struct AgentRunState {
     pub(crate) native_checkpointed: bool,
-    #[cfg(feature = "hooks")]
     pub(crate) native_session_end: Option<crate::provider::NativeSessionEndOwner>,
     /// Current native actor's exact writer and prepared-history binding.
     pub(crate) native_owner: Option<crate::provider::NativeRunOwner>,
@@ -520,6 +526,7 @@ pub(crate) struct AgentRunState {
     /// projection rather than recomputing it after in-turn results are added.
     pub request_tool_results_cleared: usize,
     pub pending_inputs: VecDeque<String>,
+    pub(crate) steering: Option<crate::agent::steering::Steering>,
     pub agent_line_started: bool,
     pub response_buf: String,
     pub response_start_block: Option<usize>,
@@ -591,6 +598,7 @@ impl AgentRunState {
         self.agent_rx = None;
         self.main_abort = None;
         self.compaction_decision_tx = None;
+        self.steering = None;
         Ok(())
     }
 }

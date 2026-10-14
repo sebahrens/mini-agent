@@ -5,9 +5,53 @@ use crate::ui::pickers::list::ListPicker;
 /// What the user settled on after driving the rewind picker to completion.
 pub enum RewindOutcome {
     /// Rewind the conversation to just before the message at this index.
-    Confirmed(usize),
+    Confirmed(usize, RewindMode, RewindBinding),
     /// Back out without changing anything.
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RewindMode {
+    Conversation,
+    Files,
+    Both,
+}
+#[derive(Clone)]
+pub(crate) struct RewindBinding {
+    session: String,
+    history: [u8; 32],
+    checkpoints: [u8; 32],
+    source: crate::session::file_checkpoints::FileCheckpoints,
+    workspace: [u8; 32],
+}
+impl RewindBinding {
+    pub(crate) fn capture(
+        session: &crate::session::Session,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        Ok(Self {
+            session: session.id.to_string(),
+            history: Sha256::digest(serde_json::to_vec(&session.messages)?).into(),
+            checkpoints: Sha256::digest(serde_json::to_vec(&session.file_checkpoints)?).into(),
+            source: session.file_checkpoints.clone(),
+            workspace: workspace
+                .compatibility_fingerprint()
+                .map_err(anyhow::Error::msg)?,
+        })
+    }
+    pub(crate) fn valid(
+        &self,
+        session: &crate::session::Session,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> bool {
+        Self::capture(session, workspace).is_ok_and(|current| {
+            self.session == current.session
+                && self.history == current.history
+                && self.checkpoints == current.checkpoints
+                && self.workspace == current.workspace
+        })
+    }
 }
 
 enum Stage {
@@ -17,7 +61,9 @@ enum Stage {
     Confirm,
 }
 
-const CONFIRM_REWIND: &str = "Rewind and start from here";
+const CONFIRM_REWIND: &str = "Conversation only";
+const CONFIRM_FILES: &str = "Restore files only";
+const CONFIRM_BOTH: &str = "Restore files and conversation";
 const CONFIRM_CANCEL: &str = "Cancel";
 
 /// A two-level modal picker for `/rewind`: first pick an earlier
@@ -26,6 +72,7 @@ const CONFIRM_CANCEL: &str = "Cancel";
 /// loop, which owns the session and performs the actual rewind.
 pub struct RewindPicker {
     active: bool,
+    binding: RewindBinding,
     stage: Stage,
     list: ListPicker,
     /// `(message_index, preview)` for each rewind-able user turn, in order. The
@@ -36,11 +83,12 @@ pub struct RewindPicker {
 }
 
 impl RewindPicker {
-    pub fn new(targets: Vec<(usize, String)>) -> Self {
+    pub(crate) fn new(targets: Vec<(usize, String)>, binding: RewindBinding) -> Self {
         let mut list = ListPicker::new();
         list.set_items(targets.iter().map(|(_, p)| p.clone()).collect());
         RewindPicker {
             active: false,
+            binding,
             stage: Stage::PickMessage,
             list,
             targets,
@@ -98,14 +146,32 @@ impl RewindPicker {
                 if let Some(&(idx, _)) = self.targets.get(self.list.selected) {
                     self.chosen = Some(idx);
                     self.stage = Stage::Confirm;
-                    self.list
-                        .set_items(vec![CONFIRM_REWIND.to_string(), CONFIRM_CANCEL.to_string()]);
+                    self.list.set_items(vec![
+                        CONFIRM_REWIND.to_string(),
+                        format!(
+                            "{CONFIRM_FILES} — {}",
+                            self.binding.source.summary_from(&self.binding.session, idx)
+                        ),
+                        format!(
+                            "{CONFIRM_BOTH} — {}",
+                            self.binding.source.summary_from(&self.binding.session, idx)
+                        ),
+                        CONFIRM_CANCEL.to_string(),
+                    ]);
                     self.list.activate();
                 }
             }
             Stage::Confirm => {
-                self.outcome = Some(if self.list.selected == 0 {
-                    RewindOutcome::Confirmed(self.chosen.unwrap_or(0))
+                self.outcome = Some(if self.list.selected < 3 {
+                    RewindOutcome::Confirmed(
+                        self.chosen.unwrap_or(0),
+                        match self.list.selected {
+                            1 => RewindMode::Files,
+                            2 => RewindMode::Both,
+                            _ => RewindMode::Conversation,
+                        },
+                        self.binding.clone(),
+                    )
                 } else {
                     RewindOutcome::Cancelled
                 });
@@ -152,7 +218,16 @@ mod tests {
     }
 
     fn picker() -> RewindPicker {
-        let mut p = RewindPicker::new(vec![(1, "first".to_string()), (3, "second".to_string())]);
+        let mut p = RewindPicker::new(
+            vec![(1, "first".to_string()), (3, "second".to_string())],
+            RewindBinding {
+                session: "test".into(),
+                history: [0; 32],
+                checkpoints: [0; 32],
+                source: Default::default(),
+                workspace: [0; 32],
+            },
+        );
         p.activate();
         p
     }
@@ -166,7 +241,7 @@ mod tests {
         p.handle(key(KeyCode::Enter)); // confirm "Rewind and start from here"
         assert!(matches!(
             p.take_outcome(),
-            Some(RewindOutcome::Confirmed(3))
+            Some(RewindOutcome::Confirmed(3, RewindMode::Conversation, _))
         ));
         assert!(!p.active());
     }
@@ -175,7 +250,9 @@ mod tests {
     fn confirm_step_cancel_option_backs_out() {
         let mut p = picker();
         p.handle(key(KeyCode::Enter)); // confirm step for first target
-        p.handle(key(KeyCode::Down)); // move to "Cancel"
+        for _ in 0..3 {
+            p.handle(key(KeyCode::Down));
+        } // move to "Cancel"
         p.handle(key(KeyCode::Enter));
         assert!(matches!(p.take_outcome(), Some(RewindOutcome::Cancelled)));
         assert!(!p.active());
