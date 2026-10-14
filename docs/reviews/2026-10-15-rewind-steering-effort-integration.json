@@ -10,14 +10,16 @@
     "steering": "a188e159650ab379e403575afdbc80d456d4b3f9f35b06e1f5595da0faadaace",
     "steering_failure_retention": "5dea492d62286925f4345c1ab4c259ff2c4957809fe9d97edc8ca2dd5b92f3b8",
     "effort": "420ab92ca8797813b7b74fecd2247b064de320c74efd06553614b08c15c2ac7f",
-    "steering_checkpoint_handoff": "af9641e12c16169d0ed0c2a1d3dd06d92b68a6dbd9097972c39643777b552435"
+    "steering_checkpoint_handoff": "af9641e12c16169d0ed0c2a1d3dd06d92b68a6dbd9097972c39643777b552435",
+    "combined_hook_readers": "ca5e9f3b6ecacff01f001442de906ed28d5bf8572af98ca35f69eb8137131058"
   },
   "merge_review": {
     "scope": "Critical ownership and mutation boundaries plus actual overlapping hunks; consolidated owner testing/adversarial/reliability reviews reused.",
     "conflicts": "Three additive conflicts retained both test fixture groups, both UI test exports, imported checkpoint-authority reset and closed reasoning settings.",
     "resolved_findings": [
       "Pending steering survived normal delivery but was lost on compaction presentation failure/native context-full retirement. Preserve old slot until successful replacement and recover draft in existing failure transitions.",
-      "Writes after injected steering originally retained the earlier user checkpoint anchor. A consuming same-session/store token now blocks next SDK poll until the UI appends and acknowledges its actual user row; foreign, dropped and cancelled handoffs cannot continue effects."
+      "Writes after injected steering originally retained the earlier user checkpoint anchor. A consuming same-session/store token now blocks next SDK poll until the UI appends and acknowledges its actual user row; foreign, dropped and cancelled handoffs cannot continue effects.",
+      "Actual combined OpenRouter first turn exceeded a physical1MiB stack while try_join replaced inline8KiB pipe-reader futures. Only the two readers are now constructed through heap_future; joined IO, limits, timeout and cleanup are unchanged."
     ],
     "preserved": [
       "Rewind all-file preflight and per-file identity/content checks, imported/forked authority refusal, bounded private preimages and explicit partial-restoration reporting.",
@@ -40,7 +42,114 @@
   "final_validation": {
     "combined_tests": "36 affected tests pass:26 in ordinary sandbox and10 loopback fixture cases rerun with listener permission (1.32s). Initial10 failures were TcpListener bind EPERM, not product failures.",
     "loopback_log": "/private/tmp/mini-agent-35-46-79-loopback-tests.log",
-    "strict_lint": "running",
-    "installed_proofs": "pending one combined install"
+    "strict_lint": "All targets -D warnings PASS47.03s; after the measured hook change PASS18.37s.",
+    "installed_proofs": {
+      "rewind": {
+        "path": "/private/tmp/mini-agent-rewind35-native-76qbgwys/report.json",
+        "root": "/private/tmp/mini-agent-rewind35-native-76qbgwys",
+        "binary": "/private/tmp/mini-agent-35-46-79-final-install/bin/mini-agent",
+        "binary_sha256": "3e7755f1a123c27e460c77b3f2fcf122ef6d03eec875cef11a35bc0e42505496",
+        "assertions": {
+          "actual_read_then_overwrite_and_create_recorded": true,
+          "hook_context_checkpoint_anchor_matches_actual_user": true,
+          "escape_escape_both_restores_exact_crlf_unicode_and_removes_creation_without_http": true,
+          "redo_is_conversation_only": true,
+          "files_only_keeps_exact_conversation_and_no_http": true,
+          "unrelated_file_preserved": true,
+          "content_addressed_private_preimage_persisted": true,
+          "normal_quit": true,
+          "exact_native_pid_retired": true
+        },
+        "calls": [
+          [
+            "GET",
+            "/v1/models"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ]
+        ],
+        "errors": [],
+        "native_pid": 11510,
+        "physical_stack_bytes": 1048576,
+        "listener_joined": true,
+        "passed": true
+      },
+      "steering": {
+        "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-steer79-installed-wmr5hsl_/report.json",
+        "binary": "/private/tmp/mini-agent-35-46-79-final-install/bin/mini-agent",
+        "binary_sha256": "3e7755f1a123c27e460c77b3f2fcf122ef6d03eec875cef11a35bc0e42505496",
+        "stack_bytes": 1048576,
+        "external_calls": 0,
+        "passed": true,
+        "posts": 3,
+        "healthy_saves": 2,
+        "steering_rows": 1,
+        "usage": [
+          30,
+          6
+        ],
+        "normal_quit": 0,
+        "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-steer79-installed-wmr5hsl_/home/sessions/95265e9a-c355-4542-86c0-8440165f8af0.json",
+        "errors": []
+      },
+      "effort": {
+        "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-effort46-tui-installed-exvcplzq/report.json",
+        "binary": "/private/tmp/mini-agent-35-46-79-final-install/bin/mini-agent",
+        "binary_sha256": "3e7755f1a123c27e460c77b3f2fcf122ef6d03eec875cef11a35bc0e42505496",
+        "stack_bytes": 1048576,
+        "external_provider_calls": 0,
+        "effort_wire_levels": [
+          "low",
+          "max"
+        ],
+        "effort_saved_immediately": true,
+        "passed": true,
+        "tui_posts": 2,
+        "normal_quit": 0,
+        "immediate_healthy_saves": 2,
+        "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-effort46-tui-installed-exvcplzq/home/sessions/f6bb2d23-0e74-458e-8896-d747c438df22.json",
+        "observed_usage": [
+          20,
+          4
+        ],
+        "opaque_bytes_not_rendered": true,
+        "canonical_session_start_notices": 1,
+        "canonical_prompt_notices": 2,
+        "literal_users_unchanged": true,
+        "errors": []
+      }
+    },
+    "hook_controls": "Nine actual pipe/stdin/output-cap/timeout/descendant cancellation controls PASS0.43s; /private/tmp/mini-agent-combined-hook-readers-tests.log.",
+    "installation": "cargo install --path . --debug --locked --offline PASS11.66s; /private/tmp/mini-agent-combined-hook-readers-install.log. Initial online attempt stopped after registry retries; no dependency changes.",
+    "measured_stack_reduction": {
+      "binary": "3e7755f1a123c27e460c77b3f2fcf122ef6d03eec875cef11a35bc0e42505496",
+      "matching_active_frames_saved_bytes": 284544,
+      "run_hook_frame_before": 111232,
+      "run_hook_frame_after": 10816,
+      "evidence": "/private/tmp/mini-agent-rewind35-combined-frame-size-comparison.json",
+      "method": "Read-only exact installed before/after prologues; no additional build or native launch."
+    }
   }
 }

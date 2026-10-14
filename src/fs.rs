@@ -2465,11 +2465,13 @@ fn atomic_write_platform(
         let mut handle = std::ptr::null_mut();
         // SAFETY: all structures and the UTF-16 name remain live for the call;
         // RootDirectory is an identity-verified directory handle; FILE_CREATE
-        // provides exclusive creation relative to that handle.
+        // provides exclusive creation relative to that handle. Metadata is
+        // validated on this retained object before private bytes are written;
+        // GENERIC_WRITE does not include FILE_READ_ATTRIBUTES on Windows.
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                GENERIC_WRITE | DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
                 &object_attributes,
                 &mut io_status,
                 std::ptr::null(),
