@@ -1,0 +1,59 @@
+{
+  "beads": ["mini-agent-i7ro6.71", "mini-agent-i7ro6.81.3"],
+  "memory_source": "839cddaa9a020cd52a50489e6aec9a64ded056c7",
+  "azure_source": "2d92e3d63bb43fb0fbc7c0125c084fd803bdd245",
+  "integration": "Both merges were conflict-free. Memory production source matched its accepted branch before the Azure merge. The combined provider diff contains only Azure's reviewed factory, endpoint, auth and module changes.",
+  "review": {
+    "findings": [],
+    "memory": [
+      "Only the fresh builder-owned Memory range moves; saved native system and signed history remain unchanged.",
+      "New sessions append bounded, deduplicated canonical snapshots, including an explicit clear; old sessions retain their original layout.",
+      "Request notices, canonical rows and file-checkpoint anchors use the same emitted notice count, with and without hooks.",
+      "Pending notices reserve their full size; persisted notices are already counted."
+    ],
+    "azure": [
+      "Azure v1 uses existing SDK Responses/chat converters and bounded redirect-aware HTTP.",
+      "Typed API-key and caller-supplied Entra credentials remain exclusive and isolated from OpenAI credentials.",
+      "Tenant endpoint validation precedes auth resolution; no shared deployment default is invented."
+    ]
+  },
+  "validation": {
+    "indexed_selection": "File-qualified memory, main-session, checkpoint, auth and provider-factory callers, verified against the physical source.",
+    "merged_rust": {
+      "passed": 34,
+      "failed": 0,
+      "seconds": 1.83,
+      "log": "/private/tmp/mini-agent-memory-azure-merged-tests.log",
+      "selection_note": "The cache71 substring also selected unchanged cache accounting tests; these passed but will not be repeated for memory-only edits."
+    },
+    "reused": [
+      "Memory owner default/advisor strict checks, actual native three-turn update/deduplication and legacy two-turn resume, no-hooks native/checkpoint controls, feature-off and ACP/export/memory carrier checks.",
+      "Azure owner 37 affected tests, both actual v1 wire protocols with tool replay and credential isolation, strict checks and installed acceptance.",
+      "Existing unchanged TTL pricing, reporting and native containment proofs."
+    ],
+    "required_debug_install": "/private/tmp/mini-agent-memory-azure-merged-install.log",
+    "same_binary_sha256": "931904ff7809e185805e57d4fddf269d6bb8d061c2cd658338472d4751065ff8",
+    "installed_memory": {
+      "passed": true,
+      "stack_bytes": 1048576,
+      "posts": 2,
+      "normal_quit": 0,
+      "contracts": "Memory A-to-B appends snapshots, keeps tools/system identical and one-hour markers, preserves prior signature once without rendering it, keeps literal users, records both healthy saves and usage20/4.",
+      "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-cache71-memory-installed-pt28kasm/report.json"
+    },
+    "installed_azure": {
+      "passed": true,
+      "stack_bytes": 1048576,
+      "posts": 2,
+      "normal_exit": 0,
+      "contracts": "Actual Responses tool call reads its owned file once, returns the exact call ID, reports usage20/4 and persists the completed session.",
+      "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-azure81-installed-_68tzx6n/report.json"
+    },
+    "external_provider_calls": 0
+  },
+  "limits": [
+    "Local wire contracts do not prove paid cloud cache-hit performance.",
+    "Azure Entra token refresh remains with the caller's existing identity tooling.",
+    "Bedrock, Vertex and Copilot remain separate open children of81."
+  ]
+}
