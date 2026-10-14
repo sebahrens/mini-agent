@@ -1059,7 +1059,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn format45_non_utf8_canonical_workspace_is_skipped_without_lossy_alias() {
+    async fn format45_non_utf8_workspace_is_refused_before_write_or_formatter() {
         use super::super::{WriteArgs, WriteTool};
         use rig::tool::Tool;
         use std::os::unix::ffi::OsStringExt;
@@ -1082,13 +1082,14 @@ mod tests {
                     }),
             )
             .await
-            .unwrap();
+            .unwrap_err();
         scope.wait_idle().await;
-        assert!(result.contains("path is not UTF-8"));
         assert_eq!(
-            std::fs::read_to_string(actual.join("source.rs")).unwrap(),
-            "committed\n"
+            result.to_string(),
+            "bound workspace path is not valid UTF-8"
         );
+        assert!(!actual.join("source.rs").exists());
+        assert_eq!(scope.active_children(), 0);
         assert!(!root.path().join("workspace_�").exists());
         assert!(!root.path().join("formatter.marker").exists());
     }
@@ -1100,7 +1101,8 @@ mod tests {
         let (root, workspace, formatter) = fixture(0);
         // APFS rejects invalid UTF-8 filenames. This portable control supplies
         // an exact OsString operand without inventing a lossy filesystem name;
-        // Linux additionally exercises the real captured workspace above.
+        // Linux additionally proves the existing tool boundary refuses a real
+        // non-UTF-8 workspace before mutation or formatter dispatch above.
         let path = root
             .path()
             .join(std::ffi::OsString::from_vec(b"source_\xff.rs".to_vec()));

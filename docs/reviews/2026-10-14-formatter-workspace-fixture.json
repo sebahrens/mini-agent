@@ -1,0 +1,31 @@
+{
+  "bead": "mini-agent-i7ro6.45.1",
+  "trigger": "CI38588237972 exact56dd Linux minimal2323pass1fail and rich2640pass1fail, shared incorrect success unwrap at1085; current guard correctly returns bound workspace path is not valid UTF-8",
+  "test_only": true,
+  "production_prefix_sha256": "d38f4035a4319f38ca9375e108351b7bfe9dfffaf3059b86e1e7bd8d581b418b",
+  "production_same": true,
+  "indexed_contracts": [
+    "src/agent/tools/mod.rs:907 check_perm_bound_path -> logical_relative_path -> to_str beforepermission/effects, static ToolError::Msg",
+    "src/agent/tools/mod.rs:433 ToolError Display prints exact contained static message",
+    "format45_non_utf8_operand_refuses_before_lookup_or_permission_on_all_unix_hosts remains direct actual formatter refusal proof"
+  ],
+  "changed_test": "format45_non_utf8_workspace_is_refused_before_write_or_formatter",
+  "assertions": [
+    "actual WriteTool Err exact static message",
+    "no source file",
+    "no active scopedchildren",
+    "no lossy alias",
+    "no formatter marker"
+  ],
+  "selected_local": "cargo test --locked --offline --bin mini-agent -- format45_non_utf8_ --test-threads=1; exact portable1 onmacOS; Linux-only case not selected locally",
+  "reused": "Installed finalbinary0cd3f15e productionunchanged; all root4/9/3/Seatbelt1 and owner strict/installed1MiB valid unchanged production. No install/fullsuite/featurematrix/inventory repeat needed.",
+  "native_linux": "Owning red actual hostedLinux observed; corrected nativeLinux gate waits pushedsourceCI. No localLinux pass claim.",
+  "full_source_sha256": "2270a282a54bdb98a44054cd6a413be8d1e2352618eae27c4027bf35e0d585ec",
+  "patch_sha256": "1e5910034f026bf66a9696c592d6f36a53f62e2c0a7ca8d66c7f4ab62e7bd4d4",
+  "local_result": "1 portable test passed0.01s;3977 filtered. Linux-only fixture remains unexecuted onmacOS.",
+  "peer_review": {
+    "path": "/private/tmp/mini-agent-format451-peer-review.json",
+    "sha256": "ad879237fd38b3b8edb4fc9ebd67e9386ae551caac4a2e3721aa07600a6a0a5c",
+    "decision": "full bounded patch/actual guard/Write order/ToolErrorDisplay accepted; no further tests requested"
+  }
+}
