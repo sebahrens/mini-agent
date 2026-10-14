@@ -1410,7 +1410,11 @@ mod windows {
                 // CheckedMetadata retains a duplicate of its supplied handle.
                 // Pin identity without leaving the initializer's writable
                 // handle alive and falsifying every ShareAccess=0 experiment.
-                let metadata = relative_open(&directory, LEAF, 0, ALL_SHARES).unwrap();
+                // NtCreateFile needs the specific attribute right for the
+                // identity query below. This grants no data read/write/delete
+                // access and leaves the subsequent ShareAccess=0 probe intact.
+                let metadata =
+                    relative_open(&directory, LEAF, FILE_READ_ATTRIBUTES, ALL_SHARES).unwrap();
                 let expected = crate::fs::checked_file_metadata(&metadata).unwrap();
                 Self {
                     directory,

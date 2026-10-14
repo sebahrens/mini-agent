@@ -1563,7 +1563,9 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
         "a file rewritten after reading must not advance synchronization"
     );
     assert!(manager.notify_changed(&source).await.is_some());
-    let first = wait_for_file(&sync_log).await;
+    // Creation precedes the child's append. A complete first JSON line is the
+    // synchronization witness; an empty newly-created file is not one.
+    let first = wait_for_file_contains(&sync_log, "\n").await;
     assert!(first.contains("textDocument/didOpen"), "{first}");
     assert!(first.contains("\"version\":1"), "{first}");
     assert!(!first.contains("textDocument/didChange"), "{first}");

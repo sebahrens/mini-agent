@@ -2295,7 +2295,7 @@ mod js_tests {
             .iter()
             .map(|definition| definition.name.as_str())
             .collect::<Vec<_>>();
-        let first_preamble = build_registered_preamble(
+        let mut first_preamble = build_registered_preamble(
             &context,
             false,
             workspace.root(),
@@ -2304,7 +2304,17 @@ mod js_tests {
             &cli,
             None,
         );
+        // This fixture has enabled native file tools and no authored sources.
+        // The production builder appends the static first-touch policy to the
+        // base compositor; it does not discover source contents on rebuild.
+        first_preamble.push_str(crate::context::instructions::POLICY);
         assert_eq!(agent.preamble.as_deref(), Some(first_preamble.as_str()));
+        assert_eq!(
+            first_preamble
+                .matches(crate::context::instructions::POLICY)
+                .count(),
+            1
+        );
         assert!(first_preamble.contains("CACHE_PERSONA_SENTINEL"));
         assert!(first_preamble.contains("CACHE_APPEND_SENTINEL"));
         assert!(first_preamble.contains("## Safety"));
@@ -2319,7 +2329,7 @@ mod js_tests {
             .iter()
             .map(|definition| definition.name.as_str())
             .collect::<Vec<_>>();
-        let second_preamble = build_registered_preamble(
+        let mut second_preamble = build_registered_preamble(
             &context,
             false,
             workspace.root(),
@@ -2328,6 +2338,7 @@ mod js_tests {
             &cli,
             None,
         );
+        second_preamble.push_str(crate::context::instructions::POLICY);
         let second_tools = serde_json::to_vec(&second_definitions).unwrap();
 
         assert_eq!(first_preamble.as_bytes(), second_preamble.as_bytes());
