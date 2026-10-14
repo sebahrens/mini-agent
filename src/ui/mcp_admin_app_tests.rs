@@ -330,6 +330,7 @@ async fn actual_app_auth_unknown_server_is_nonfatal_and_status_is_bounded_withou
                 selected: false,
                 inactive: Some("not trusted".into()),
                 digest: None,
+                authority: None,
             }],
         );
     }
@@ -420,6 +421,59 @@ async fn actual_app_permission_prompt_refuses_config_mutation_without_answering_
     assert!(server.requests.lock().unwrap().is_empty());
     drop(app);
     server.finish().await;
+}
+
+#[tokio::test]
+async fn config69_actual_cli_mcp_keeps_original_file_gate_before_connect_and_rpc() {
+    use rig::tool::ToolDyn;
+    let root = crate::tests::OwnedTestDirectory::new("config69-cli-mcp-wire");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let base = config(root.path(), &server);
+    let global = base.provenance.global_file.as_ref().unwrap();
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(global).unwrap()).unwrap();
+    raw["mcp_servers"] = serde_json::json!({"owned":{"url":server.url(),"allow_local":true,"headers":{"Authorization":"ORIGINAL_SECRET"}}});
+    crate::config::atomic_config_write(global, &raw.to_string()).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut cfg = config::mcp_config_in_workspace_at(&workspace, global).unwrap();
+    let overrides = config::layers::parse_overrides(&[
+        "mcp_servers.owned.headers.Authorization='CLI_SECRET'".into(),
+    ])
+    .unwrap();
+    config::layers::apply_overrides(&mut cfg, &overrides).unwrap();
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let tools = manager
+        .collect_tools_with_timeouts(None, None, Default::default())
+        .await;
+    assert_eq!(tools.len(), 1);
+    let positive = tools[0].call("{}".into()).await;
+    let first_calls = server.method_count("tools/call");
+    // Valid JSON with identical effective settings but changed original bytes
+    // must revoke both the retained tool and a newly attempted connection.
+    std::fs::write(global, format!("{}\n", raw)).unwrap();
+    let denied = tools[0].call("{}".into()).await;
+    let final_calls = server.method_count("tools/call");
+    let before_sockets = server.accepted.load(std::sync::atomic::Ordering::Acquire);
+    let stale =
+        crate::extras::mcp::McpClientManager::connect_config_in_binding(&cfg, &workspace).await;
+    let stale_handles = stale.handles.len();
+    stale.shutdown().await;
+    let after_sockets = server.accepted.load(std::sync::atomic::Ordering::Acquire);
+    drop(tools);
+    manager.shutdown().await;
+    server.assert_no_provider_request();
+    server.finish().await;
+    assert!(positive.unwrap().contains("actual owned echo"));
+    assert_eq!((first_calls, final_calls), (1, 1));
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("configuration source changed")
+    );
+    assert_eq!((stale_handles, after_sockets - before_sockets), (0, 0));
 }
 
 /// Uses the production initial factory and its lazy UI caller. Cleanup occurs

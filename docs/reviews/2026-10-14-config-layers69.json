@@ -1,0 +1,88 @@
+{
+  "bead": "mini-agent-i7ro6.69",
+  "base": "56dd28dfaf598db4b63b8d2a9ca1aa1bc3dc4fd2",
+  "source_patch_sha256": "35b1a0efaf0e247d4a4b4a90841a0392cb20ff2644580fbaba8a9406ec4a1c82",
+  "source_review": "Root full code review + independent full18file peer accepted; final generic finite helper Rootread",
+  "selected_proofs": {
+    "initial_complete": "bounds/discovery3, CLI/schema5, pure Doctor10, layered12, clone/schema/MCP3, partial CLI/ancestor2, source report1, catalogue/diagnostic5, configured MCP native2 (unchanged results reused)",
+    "normalization": "selected9 PASS then finite successor8 + corrected exact1 PASS",
+    "source_inventory": "only exact production inventory and Windows creation scanner2 PASS; no exemptions needed",
+    "minimal": "original exact CLI/schema/source/null/trusted5 PASS; final new finite3 PASS",
+    "strict": "default first strict39.43s + finite strict26.53s; minimal strict27.46s retained, new finite path compiled minimal3",
+    "install": "final required cargo install --path . --debug --locked --offline PASS14.62s",
+    "installed": "invalid budget base/CLI0provider0hook, configured matched hook real normal-stack positive; no-hook physical1048576-byte headless2POST/TUI2POST/normalquit0; schema invalid-global no read/write, invalid CLI no value disclosure/no writes, captured workspace and precedence"
+  },
+  "logs": {
+    "json-normalization-owning": {
+      "path": "/private/tmp/mini-agent-config69-json-normalization-owning.log",
+      "sha256": "c191f59df2c85e9e2bf91fdfcedd12f447337e3d913944663cc60fc1017998a2"
+    },
+    "selected-inventory": {
+      "path": "/private/tmp/mini-agent-config69-selected-inventory.log",
+      "sha256": "d53ab5af02fcae40844ac7d8b9afe8c3b057a7ce3a145693c0fd74f773ab17ee"
+    },
+    "mcp-normalized-native-final": {
+      "path": "/private/tmp/mini-agent-config69-mcp-normalized-native-final.log",
+      "sha256": "5c21fe50234d93cbafbdadf28f2fe993af1436522e8a950cd4347a39a18c16c8"
+    },
+    "minimal-owning": {
+      "path": "/private/tmp/mini-agent-config69-minimal-owning.log",
+      "sha256": "14eba3bb58cf20c6aadf779acf90500828832bcd822a0e17c18280dee139275c"
+    },
+    "strict-default-final": {
+      "path": "/private/tmp/mini-agent-config69-strict-default-final.log",
+      "sha256": "c388ff539326a562f0d263c1efb2d40106ac5678dcbed6a2b3bcde3d31000ac4"
+    },
+    "strict-minimal": {
+      "path": "/private/tmp/mini-agent-config69-strict-minimal.log",
+      "sha256": "201709ee59bf756c9d39befad1a7d1cfccdfc0a377763be64bf2fb03adfb02a9"
+    },
+    "finite-owning": {
+      "path": "/private/tmp/mini-agent-config69-finite-owning.log",
+      "sha256": "d08d63cf5ea8cd2f9434180311299eddd2b99a050bbbe0e0820e9f49df37955d"
+    },
+    "nonfinite-final": {
+      "path": "/private/tmp/mini-agent-config69-nonfinite-final.log",
+      "sha256": "203b0cd5e2a1792ba41ede4f00192eaf23215dcecff7d31feb46378acd8c0277"
+    },
+    "finite-minimal": {
+      "path": "/private/tmp/mini-agent-config69-finite-minimal.log",
+      "sha256": "7b667784040a09e2aa10a6d8bd45a5530acaa82d3d1c7f83ebd9d3ab626e1270"
+    },
+    "finite-strict": {
+      "path": "/private/tmp/mini-agent-config69-finite-strict.log",
+      "sha256": "8b04ab799f0923accb89850852ea998a7ba010ff56201e06720a8ceb0d334b82"
+    },
+    "finite-install": {
+      "path": "/private/tmp/mini-agent-config69-finite-install.log",
+      "sha256": "5fdfa85174622e334d833235f73c2de8d6f9d5850f95e8b6c4003827d3a052c6"
+    },
+    "final-installed-isolated": {
+      "path": "/private/tmp/mini-agent-config69-final-installed-isolated.log",
+      "sha256": "4bd4f73d11eee6127ac1fdff9d2f080a25c1f217203edf5ac7e6a2681a188e1a"
+    }
+  },
+  "native": {
+    "driver": "/private/tmp/mini-agent-config69-installed-native.py",
+    "driver_sha256": "cc8331a5e595918f838e7b13d9b9ac230c887191d37768b9fd8929ee7a593f33",
+    "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-config69-installed-jc4qvnky/report.json",
+    "report_sha256": "3ff2eaee1e162a0f0c46683a87b04172307c190cc4a676ac5866cf8c6fb49a3b",
+    "binary": "/private/tmp/mini-agent-config69-install/bin/mini-agent",
+    "binary_sha256": "eb17de1282ff279b0b872e13cead4a308d5e03867d8a24171f70dc347125eea6"
+  },
+  "test_map": "/private/tmp/mini-agent-config69-final-test-map.json",
+  "limits": [
+    "Configured-hook physical1MiB headless read-tool fails on BOTH retained pre69 and final69 exact causal fixture; separate mini-agent-i7ro6.115, no stack/factory policy changes in69",
+    "Windows native execution not performed for69; existing retained/private primitives unchanged except bounded retained-handle duplication compiled default/minimal",
+    "No paid/external provider fixture; no whole suite or arbitrary feature matrix"
+  ],
+  "remaining": "Root merge/integration with73 StringArrayMap keys and Bool vim_mode registry entries and push/closure. No source blocker or additional69 acceptance gate pending.",
+  "integration": {
+    "base": "ac246c8d8229fa1ca1fcdcb19608c26004538afd",
+    "owner_commit": "9b22d5e0efa403df2d86cd7d562bb7c4124e74dc",
+    "changes": "Preserved both module declarations and documentation sections; keys has StringArrayMap shape and vim_mode Bool shape. Added actual keyboard literal\u2192typed merge control.",
+    "tests": "Four unchanged owning schema/null/nonfinite/project-keyboard-trust controls PASS; one new CLI keyboard schema/typed control PASS after correcting expectation: unknown action is rejected during parse, earlier than merge. No production repair for that test assumption.",
+    "log": "/private/tmp/mini-agent-69-73-keyboard-integration-final.log",
+    "review": "Independent peer read all18 files in coherent35b boundary. Root reviewed entire finite helper/correction and the integration changes; unchanged frozen reviews reused."
+  }
+}

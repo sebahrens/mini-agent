@@ -89,6 +89,17 @@ pub struct Cli {
     )]
     pub completions: Option<clap_complete::Shell>,
 
+    #[arg(long = "config", value_name = "KEY=VALUE", action = clap::ArgAction::Append,
+        help = "Override a config key with literal TOML (repeatable; dedicated flags win)")]
+    pub config_overrides: Vec<String>,
+
+    #[arg(
+        long,
+        exclusive = true,
+        help = "Print the generated configuration JSON Schema and exit"
+    )]
+    pub config_schema: bool,
+
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
     pub print: bool,
 

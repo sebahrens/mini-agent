@@ -2120,9 +2120,131 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         &permission_rule_entries(&rules_cfg),
     );
 
+    append_section(
+        &mut output,
+        "Config sources (key names only; tables show merge history)",
+        &config_source_entries(cli, cfg),
+    );
+
     append_config_warnings(&mut output, &cfg.load_warnings);
 
     write_output(io::stdout().lock(), &output)
+}
+
+fn config_source_entries(cli: &cli::Cli, cfg: &config::Config) -> Vec<(&'static str, String)> {
+    let mut explicit = std::collections::BTreeSet::new();
+    for (key, active) in [
+        ("provider", cli.provider.is_some()),
+        ("model", cli.model.is_some()),
+        ("max_tokens", cli.max_tokens.is_some()),
+        ("max_agent_turns", cli.max_agent_turns.is_some()),
+        ("max_budget_usd", cli.max_budget_usd.is_some()),
+        ("temperature", cli.temperature.is_some()),
+        ("no_tools", cli.no_tools),
+        ("no_context_files", cli.no_context_files),
+        ("default_prompt", cli.load_prompt.is_some()),
+        ("sandbox", cli.sandbox || cli.no_sandbox),
+        ("sandbox-backend", cli.sandbox_backend.is_some()),
+        ("shell", cli.shell.is_some()),
+        ("edit_system", cli.edit_system.is_some()),
+        (
+            "windows-appcontainer-read-roots",
+            !cli.windows_appcontainer_read_roots.is_empty(),
+        ),
+        (
+            "windows-appcontainer-write-roots",
+            !cli.windows_appcontainer_write_roots.is_empty(),
+        ),
+        ("restrictive", cli.restrictive),
+        ("accept_all", cli.accept_all),
+        ("yolo", cli.yolo),
+        (
+            "default_permission_mode",
+            cli.read_only || cli.guarded || cli.dangerously_skip_permissions,
+        ),
+        ("permission-allow", !cli.allow.is_empty()),
+        ("permission-deny", !cli.deny.is_empty()),
+        ("permission-allow-prefix", !cli.allow_prefix.is_empty()),
+    ] {
+        if active {
+            explicit.insert(key);
+        }
+    }
+    if cli.resolve_quick_model(cfg).is_some() {
+        explicit.extend(["model", "provider"]);
+    }
+    #[cfg(feature = "goal")]
+    {
+        if cli.goal_args.goal_max_rounds.is_some() || cli.goal_args.goal_continuation.is_some() {
+            explicit.insert("goal");
+        }
+        if !cli.goal_args.goal_check.is_empty() {
+            explicit.insert("goal_checks");
+        }
+    }
+    #[cfg(feature = "git-worktree")]
+    {
+        if cli.wt_auto_merge || cli.parallel {
+            explicit.insert("wt-auto-merge");
+        }
+        if cli.wt_base_dir.is_some() {
+            explicit.insert("wt-base-dir");
+        }
+    }
+    #[cfg(feature = "acp")]
+    {
+        if cli.acp_host.is_some() {
+            explicit.insert("acp_host");
+        }
+        if cli.acp_port.is_some() {
+            explicit.insert("acp_port");
+        }
+    }
+    #[cfg(feature = "advisor")]
+    if cli.advisor
+        || cli.advisor_model.is_some()
+        || cli.advisor_max_uses.is_some()
+        || cli.advisor_human_handoff.is_some()
+        || cli.advisor_kilobytes_limit.is_some()
+    {
+        explicit.insert("advisor");
+    }
+    config::keys::CONFIG_KEYS
+        .iter()
+        .map(|key| {
+            let source = if explicit.contains(key.name) {
+                "dedicated CLI/environment override".to_owned()
+            } else if key.name == "model"
+                && cli.resolve_provider(cfg) == "openrouter"
+                && std::env::var("OPENROUTER_MODEL").is_ok_and(|model| !model.is_empty())
+            {
+                "environment OPENROUTER_MODEL".to_owned()
+            } else {
+                cfg.provenance
+                    .sources
+                    .get(key.name)
+                    .map(|layers| {
+                        layers
+                            .iter()
+                            .map(|layer| layer.label())
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    })
+                    .unwrap_or_else(|| "compiled default/unset".into())
+            };
+            let unavailable = key
+                .feature
+                .is_some_and(|feature| !config::keys::feature_enabled(feature));
+            (
+                key.name,
+                if unavailable {
+                    format!("{source}; unavailable in this build, preserved")
+                } else {
+                    source
+                },
+            )
+        })
+        .collect()
 }
 
 fn permission_rule_entries(cfg: &config::Config) -> Vec<(&'static str, String)> {
@@ -3274,5 +3396,48 @@ mod headless_output_policy_tests {
         assert!(text.contains("`````text"));
         assert_eq!(text.matches("</stdin_reference>").count(), 1);
         assert!(text.contains("> > hostile"));
+    }
+}
+
+#[cfg(test)]
+mod config69_source_tests {
+    use super::*;
+    #[test]
+    fn config69_source_report_keeps_only_catalogue_names_and_precedence() {
+        let mut cfg = config::Config::default();
+        cfg.provenance.record(&toml::from_str("model='SECRET'\n[permission-deny]\nSECRET_TOOL=['SECRET_PATH']\nPRIVATE_UNKNOWN='PRIVATE_VALUE'\n").unwrap(),config::ConfigLayer::Global);
+        cfg.provenance.record(
+            &toml::from_str("[permission-deny]\nOTHER_SECRET_TOOL=['OTHER_SECRET_PATH']\n")
+                .unwrap(),
+            config::ConfigLayer::Local,
+        );
+        let cli = cli::Cli {
+            model: Some("SECRET_CLI".into()),
+            ..Default::default()
+        };
+        let entries = config_source_entries(&cli, &cfg);
+        assert_eq!(
+            entries.iter().find(|(key, _)| *key == "model").unwrap().1,
+            "dedicated CLI/environment override"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(key, _)| *key == "permission-deny")
+                .unwrap()
+                .1,
+            "global + project-local"
+        );
+        let shown = format!("{entries:?}");
+        for secret in [
+            "SECRET_TOOL",
+            "SECRET_PATH",
+            "PRIVATE_UNKNOWN",
+            "PRIVATE_VALUE",
+            "SECRET_CLI",
+        ] {
+            assert!(!shown.contains(secret));
+        }
+        assert_eq!(entries.len(), config::keys::CONFIG_KEYS.len());
     }
 }

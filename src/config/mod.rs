@@ -1,6 +1,9 @@
+mod finite;
 pub(crate) mod keybindings;
 pub(crate) mod keys;
+pub(crate) mod layers;
 pub mod load;
+pub(crate) mod schema;
 pub mod types;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -45,15 +48,71 @@ pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 
 /// Captured layer participation for diagnostics. Only catalogue key names
 /// are retained; neither values nor unknown user-authored names are copied.
-/// A table can have contributions from both layers after a deep merge.
+/// A table records its merge chain; individual overwritten dynamic fields
+/// are not attributed or copied into diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigProvenance {
     pub(crate) global_file: Option<std::path::PathBuf>,
+    #[cfg(feature = "mcp")]
+    pub(crate) global_digest: Option<String>,
     pub(crate) global_status: Option<&'static str>,
     pub(crate) global_keys: BTreeSet<&'static str>,
     pub(crate) project_file: Option<std::path::PathBuf>,
     pub(crate) project_keys: BTreeSet<&'static str>,
     pub(crate) project_trust: Option<&'static str>,
+    pub(crate) local_file: Option<std::path::PathBuf>,
+    pub(crate) local_keys: BTreeSet<&'static str>,
+    pub(crate) local_trust: Option<&'static str>,
+    pub(crate) sources: BTreeMap<&'static str, BTreeSet<ConfigLayer>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ConfigLayer {
+    Global,
+    Project,
+    Local,
+    Cli,
+}
+
+impl ConfigLayer {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Local => "project-local",
+            Self::Cli => "CLI --config",
+        }
+    }
+}
+
+impl ConfigProvenance {
+    pub(crate) fn record(&mut self, value: &toml::Value, layer: ConfigLayer) {
+        let Some(table) = value.as_table() else {
+            return;
+        };
+        for (spelling, value) in table {
+            let Some(key) = keys::lookup(spelling) else {
+                continue;
+            };
+            if value.as_table().is_some_and(|table| table.is_empty()) {
+                continue;
+            }
+            let sources = self.sources.entry(key.name).or_default();
+            if !value.is_table() {
+                sources.clear();
+            }
+            sources.insert(layer);
+            for (kind, keys) in [
+                (ConfigLayer::Global, &mut self.global_keys),
+                (ConfigLayer::Project, &mut self.project_keys),
+                (ConfigLayer::Local, &mut self.local_keys),
+            ] {
+                if layer == kind {
+                    keys.insert(key.name);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +129,10 @@ pub struct Config {
     #[cfg(feature = "mcp")]
     #[serde(skip)]
     pub(crate) mcp_origins: HashMap<String, Vec<crate::extras::mcp::project::ServerOrigin>>,
+    /// Validated invocation-only MCP overlays; never persisted or diagnostic data.
+    #[cfg(feature = "mcp")]
+    #[serde(skip)]
+    pub(crate) mcp_cli_overrides: layers::McpOverrides,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]

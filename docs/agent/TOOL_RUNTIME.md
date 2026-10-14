@@ -1093,3 +1093,27 @@ formatter status. Dropping a cancelled tool future cannot promise a reply, but t
 original committed bytes are not rolled back and its scoped process owner retains
 the existing retirement/forced-exit contract. An empty map preserves legacy tool
 output exactly.
+
+
+### Configuration layer ownership
+
+`config/layers.rs` selects one bounded nearest project/local pair independently
+from the retained execution workspace and parses literal repeated CLI overrides.
+Each selected file uses the existing bounded no-follow regular-file reader and
+independent path/SHA trust binding. Invalid nearest candidates do not cause
+ancestor fallback. Project financial/cache ceilings and permission-cycle policy
+remain global-only. `config/schema.rs` emits a side-effect-free structural editor
+schema directly from `CONFIG_KEYS`; opaque/dynamic object semantics remain runtime
+checks. `--print-config` reports canonical key names and layer participation only.
+
+Configured MCP origins retain bounded immutable file contributors under CLI
+composition: private global source, current-workspace `.mcp.json`, selected project
+config, and selected local config. Each carries its exact retained source root,
+regular-file identity, raw SHA and original bounded definition baseline. Admission
+rechecks the actual execution workspace, ancestor membership, current source
+bytes/identity and each file's current independent trust. CLI-only MCP declarations
+come only from validated operator argv. Effective replacement does not erase file
+revocation. Existing manager DNS/handshake/per-effect gates and ordinary MCP
+permissions are unchanged. Diagnostic origin labels never confer launch authority.
+
+`src/config/finite.rs` performs a bounded, allocation-free read-only serde traversal before CLI/project JSON normalization. Every serialized non-finite float is refused with a static value-redacted error; neither a base policy nor an overlay can turn into JSON null and erase a cap. It creates no second configuration/value, grant, writer, or effect owner.

@@ -34,3 +34,6 @@ __pycache__/
 
 # Large research datasets downloaded from external sources
 /research/operational-risk-datasets/downloads/
+
+# Machine-local project config, independent from reviewed project defaults.
+.zerostack/config.local.toml

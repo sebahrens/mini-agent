@@ -24,16 +24,52 @@ If none exists, mini-agent creates `config.toml` in that same directory.
 left under the former data-root location is migrated before config creation.
 The source is retained for rollback.
 
-**Project-local override**: if `.zerostack/config.toml` exists in the
-current working directory, it is merged over the global config at startup.
-Any subset of keys may be set — tables (e.g. `mcp_servers`, `quick_models`,
-`api_keys`) merge per key, scalars and arrays replace the global value, and
-keys absent from the local file keep their global values. If sensitive values
-cannot be activated, startup prints a notice identifying the project config;
-an ordinary benign merge is visible only in diagnostic logging.
-Edits made by the setup UI and first-start prompts are applied as a structural
-delta to the global file; unchanged project-local values are never copied into
-global configuration.
+**Project layers and CLI overrides**: from the captured working directory,
+mini-agent walks upward and selects the nearest directory containing either
+`.zerostack/config.toml` or `.zerostack/config.local.toml`. It uses that one pair;
+a local-only pair is valid. The walk stops at the first `.git` marker, before
+entering an ancestor HOME or filesystem root, and after at most 64 directories.
+A malformed, linked, oversized, or unavailable nearest candidate is refused;
+mini-agent does not silently fall back to a more distant file. This discovery
+never changes the execution workspace or loads an ancestor `.mcp.json`, prompts,
+instructions, or skills.
+
+Precedence is global config → selected `config.toml` → selected
+`config.local.toml` → repeated `--config key=value` → existing dedicated flags.
+Tables merge by key; scalars and arrays replace. Each project file has its own
+canonical path/SHA-256 approval; approval for `config.toml` does not activate
+sensitive local values. `.zerostack/config.local.toml` is ignored by this repository.
+Existing global-only financial/cache and permission-cycle policy stays global-only.
+
+`--config` accepts literal TOML, including dotted paths and quoted dynamic names:
+
+```sh
+mini-agent --config 'max_tokens=4096' --config 'model="example/model"' -p 'hello'
+mini-agent --config 'mcp_servers.local.args=["--read-only"]' --print-config
+```
+
+There is no shell, environment, or file expansion. Overrides are bounded to 64
+arguments, 32 KiB each, and 256 KiB combined; structure is bounded before parsing.
+Invalid-value diagnostics omit the supplied values. Partial dynamic objects are
+validated against the composed config before provider/integration dispatch.
+CLI overrides are invocation-only; setup edits save a structural global delta,
+so unchanged local or CLI values are not copied into the global file. MCP refresh
+retains invocation overlays and revalidates every captured contributing file,
+even when CLI values replace all displayed server fields. A change or replacement
+of any participating file invalidates its existing MCP proof; restart or an explicit
+MCP configuration mutation reloads the current sources.
+
+`--print-config` includes source labels for every canonical key. Table labels
+show their merge history (individual overwritten dynamic fields are not exposed),
+rather than inventing one winner; compiled defaults,
+unavailable feature keys and dedicated CLI/environment overrides are identified.
+Source labels omit credential/header names and values. `--config-schema` prints
+JSON Schema and exits before config/storage loading or probes. The schema comes
+from the canonical key catalogue, includes aliases and feature availability,
+and checks structural types and closed scalar enums. Dynamic integration object
+contents still require runtime validation and trust/permission checks. The
+embedded example is `data/config.sample.toml`.
+
 
 ```toml
 # .zerostack/config.toml
@@ -3457,6 +3493,10 @@ content-addressed cache namespaces and never repoint explicitly imported package
 Imported catalogue metadata is bounded separately to 1,024 names and 4,096 aggregate signature entries,
 with 8 MiB of lexical-load content. List descriptions are sanitized to one line and 384 UTF-8 bytes;
 model search metadata has a separate final encoded 8 KiB limit.
+
+Configuration merges preserve JSON nulls and unsigned 64-bit values from global JSON/YAML files. Literal CLI and project layers retain TOML date/time representation. Internal merge normalization is capped at 8 MiB encoded JSON, 128 levels, and 65,536 structural items before allocating its decoded value; input-layer limits remain unchanged.
+
+Non-finite floating-point values are refused before merge normalization, including values nested in opaque settings. They are never rewritten into null or an unset budget. The preflight visits at most 65,536 values/fields and 128 nested serialization containers/wrappers.
 
 ## Keyboard bindings and Vim editing
 

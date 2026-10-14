@@ -184,6 +184,14 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
 }
 
 async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
+    if cli.config_schema {
+        use std::io::Write as _;
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &config::schema::generate())?;
+        std::io::stdout().lock().write_all(b"\n")?;
+        return Ok(());
+    }
+    let config_overrides =
+        config::layers::parse_overrides(&cli.config_overrides).map_err(anyhow::Error::msg)?;
     if let Err(error) = output_schema::prepare(&mut cli) {
         print::emit_headless_preflight_failure(&cli, std::path::Path::new("."), &error.to_string())
             .await?;
@@ -207,7 +215,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     if cli.doctor {
-        let cfg = config::load_for_diagnostics(&app_paths);
+        let mut cfg = config::load_for_diagnostics_in_workspace(&app_paths, &workspace);
+        config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
         let mut report =
             diagnostics::DoctorReport::capture(&cli, &cfg, &app_paths, None, None, true);
         report.section("Terminal");
@@ -307,7 +316,14 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     logging::install_panic_hook();
     logging::init(&cli, is_interactive);
 
-    let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths, is_interactive);
+    let (mut cfg, is_first_startup) =
+        config::load_in_workspace(&app_paths, &workspace, is_interactive);
+
+    let loaded_warning_count = cfg.load_warnings.len();
+    config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
+    for warning in &cfg.load_warnings[loaded_warning_count..] {
+        eprintln!("warning: {warning}");
+    }
 
     #[cfg(feature = "skills")]
     extras::js::skills::operations::set_json_output(cli.learned_skill_json);

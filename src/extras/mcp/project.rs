@@ -18,6 +18,247 @@ pub(crate) struct ServerOrigin {
     pub selected: bool,
     pub inactive: Option<String>,
     pub digest: Option<String>,
+    pub(crate) authority: Option<std::sync::Arc<OriginAuthority>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum SourceKind {
+    GlobalConfig,
+    ProjectConfig,
+    ProjectMcp,
+}
+
+#[derive(Clone)]
+struct FileSource {
+    root: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    relative: std::path::PathBuf,
+    expected: String,
+    identity: crate::fs::CheckedMetadata,
+    baseline: Box<[u8]>,
+    kind: SourceKind,
+    trust_store: Option<std::path::PathBuf>,
+}
+
+/// Runtime authority is never deserialized and never rendered as source data.
+#[derive(Clone)]
+pub(crate) struct OriginAuthority {
+    files: Vec<FileSource>,
+    cli: bool,
+}
+
+impl std::fmt::Debug for OriginAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginAuthority")
+            .field("file_count", &self.files.len())
+            .field("cli", &self.cli)
+            .finish_non_exhaustive()
+    }
+}
+
+fn bounded_baseline(value: &impl serde::Serialize) -> Result<Box<[u8]>, &'static str> {
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_VALUE_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("MCP baseline exceeds bounds"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Bounded(Vec::new());
+    serde_json::to_writer(&mut writer, value).map_err(|_| "MCP baseline exceeds bounds")?;
+    let mut value: Value = serde_json::from_slice(&writer.0).map_err(|_| "invalid MCP baseline")?;
+    value.sort_all_objects();
+    writer.0.clear();
+    serde_json::to_writer(&mut writer, &value).map_err(|_| "MCP baseline exceeds bounds")?;
+    Ok(writer.0.into_boxed_slice())
+}
+
+impl OriginAuthority {
+    pub(crate) fn file(
+        root: &crate::paths::WorkspaceBinding,
+        relative: &Path,
+        expected: &str,
+        baseline: &impl serde::Serialize,
+        kind: SourceKind,
+        prior: Option<&std::sync::Arc<Self>>,
+        trust_store: Option<&Path>,
+    ) -> Result<std::sync::Arc<Self>, &'static str> {
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid MCP source digest");
+        }
+        match kind {
+            SourceKind::ProjectConfig
+                if relative != Path::new(".zerostack/config.toml")
+                    && relative != Path::new(".zerostack/config.local.toml") =>
+            {
+                return Err("invalid MCP project config source");
+            }
+            SourceKind::ProjectMcp if relative != Path::new(".mcp.json") => {
+                return Err("invalid MCP project source");
+            }
+            SourceKind::GlobalConfig if relative.components().count() != 1 => {
+                return Err("invalid MCP global source");
+            }
+            _ => {}
+        }
+        if prior.is_some_and(|prior| {
+            prior
+                .files
+                .iter()
+                .filter(|old| old.root.root().join(&old.relative) != root.root().join(relative))
+                .count()
+                >= 4
+        }) {
+            return Err("MCP contributor limit exceeded");
+        }
+        let baseline = bounded_baseline(baseline)?;
+        let root = std::sync::Arc::new(root.try_clone().map_err(|_| "MCP source root changed")?);
+        let snapshot = if kind == SourceKind::GlobalConfig {
+            FileSnapshot::read_private(&root, relative)
+        } else {
+            FileSnapshot::read(&root, relative)
+        }
+        .map_err(|_| "MCP source is unavailable")?;
+        if digest(&snapshot.content) != expected {
+            return Err("MCP source changed during capture");
+        }
+        let identity = snapshot.identity.ok_or("MCP source is absent")?;
+        let mut files = prior.map(|prior| prior.files.clone()).unwrap_or_default();
+        files.retain(|old| old.root.root().join(&old.relative) != root.root().join(relative));
+        files.push(FileSource {
+            root,
+            relative: relative.into(),
+            expected: expected.into(),
+            identity,
+            baseline,
+            kind,
+            trust_store: trust_store.map(Path::to_path_buf),
+        });
+        Ok(std::sync::Arc::new(Self {
+            files,
+            cli: prior.is_some_and(|prior| prior.cli),
+        }))
+    }
+
+    /// Only the actual validated command-line composition calls this constructor.
+    pub(crate) fn operator_cli(prior: Option<&std::sync::Arc<Self>>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            files: prior.map(|prior| prior.files.clone()).unwrap_or_default(),
+            cli: true,
+        })
+    }
+
+    fn current(&self, workspace: &crate::paths::WorkspaceBinding, name: &str) -> bool {
+        if self.files.is_empty() {
+            return self.cli;
+        }
+        self.files.iter().all(|source| {
+            if source.kind != SourceKind::GlobalConfig {
+                let Ok(descendant) = workspace.root().strip_prefix(source.root.root()) else {
+                    return false;
+                };
+                if source.root.root().parent().is_none()
+                    || descendant.components().count() > 64
+                    || (source.kind == SourceKind::ProjectMcp && !descendant.as_os_str().is_empty())
+                {
+                    return false;
+                }
+            }
+            let Ok(snapshot) = (if source.kind == SourceKind::GlobalConfig {
+                FileSnapshot::read_private(&source.root, &source.relative)
+            } else {
+                FileSnapshot::read(&source.root, &source.relative)
+            }) else {
+                return false;
+            };
+            let Some(identity) = &snapshot.identity else {
+                return false;
+            };
+            if crate::fs::ensure_same_file(&source.relative, &source.identity, identity).is_err()
+                || digest(&snapshot.content) != source.expected
+            {
+                return false;
+            }
+            let baseline = match source.kind {
+                SourceKind::GlobalConfig => {
+                    let Ok(cfg) = crate::config::parse_config_content(
+                        &source.root.root().join(&source.relative),
+                        &snapshot.content,
+                    ) else {
+                        return false;
+                    };
+                    let Some(server) = cfg
+                        .mcp_servers
+                        .as_ref()
+                        .and_then(|servers| servers.get(name))
+                    else {
+                        return false;
+                    };
+                    bounded_baseline(server)
+                }
+                SourceKind::ProjectConfig => {
+                    if !source.trust_store.as_ref().is_some_and(|trust| {
+                        crate::config::project_config_relative_is_trusted_at_readonly(
+                            trust,
+                            &source.root,
+                            &source.relative,
+                        )
+                    }) {
+                        return false;
+                    }
+                    let Ok(value) = crate::config::parse_project_toml(&snapshot.content) else {
+                        return false;
+                    };
+                    let Some(server) = value
+                        .get("mcp_servers")
+                        .and_then(|servers| servers.get(name))
+                    else {
+                        return false;
+                    };
+                    bounded_baseline(server)
+                }
+                SourceKind::ProjectMcp => {
+                    if !source.trust_store.as_ref().is_some_and(|trust| {
+                        crate::config::project_mcp_is_trusted_at(
+                            trust,
+                            &source.root,
+                            &snapshot.content,
+                        )
+                    }) {
+                        return false;
+                    }
+                    let Ok(value) = raw_definitions(&snapshot.content) else {
+                        return false;
+                    };
+                    let Some(server) = value.get(name) else {
+                        return false;
+                    };
+                    bounded_baseline(server)
+                }
+            };
+            baseline.is_ok_and(|baseline| baseline == source.baseline)
+                && source.root.validate().is_ok()
+        }) && workspace.validate().is_ok()
+    }
+
+    fn commitment(&self) -> Vec<(&Path, &Path, &str, SourceKind)> {
+        self.files
+            .iter()
+            .map(|file| {
+                (
+                    file.root.root(),
+                    file.relative.as_path(),
+                    file.expected.as_str(),
+                    file.kind,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Captured launch source retained by its exact connected client. Diagnostic
@@ -68,6 +309,10 @@ impl ServerSourceProof {
                 origin.selected,
                 &origin.inactive,
                 &origin.digest,
+                origin
+                    .authority
+                    .as_ref()
+                    .map(|authority| (authority.commitment(), authority.cli)),
             )
         });
         // Built-in registrations intentionally cannot be serialized into user
@@ -110,6 +355,9 @@ pub(crate) fn server_source_is_current(
     };
     if !origin.selected || origin.inactive.is_some() {
         return false;
+    }
+    if let Some(authority) = &origin.authority {
+        return authority.current(workspace, name);
     }
     if let Some(expected) = &origin.digest {
         let Ok(snapshot) = FileSnapshot::read(workspace, Path::new(&origin.source)) else {
@@ -340,6 +588,27 @@ pub(crate) fn load_in_workspace(
     }
     let servers = cfg.mcp_servers.get_or_insert_with(HashMap::new);
     for (name, value) in definitions {
+        let prior = cfg
+            .mcp_origins
+            .get(&name)
+            .and_then(|origins| origins.iter().find(|origin| origin.selected))
+            .and_then(|origin| origin.authority.as_ref());
+        let authority = if trusted {
+            Some(
+                OriginAuthority::file(
+                    workspace,
+                    Path::new(".mcp.json"),
+                    &digest,
+                    &value,
+                    SourceKind::ProjectMcp,
+                    prior,
+                    Some(trust_path),
+                )
+                .map_err(str::to_owned)?,
+            )
+        } else {
+            None
+        };
         let resolved = if trusted {
             resolve_definition(value, &|name| std::env::var(name).ok())
         } else {
@@ -359,6 +628,7 @@ pub(crate) fn load_in_workspace(
             selected: inactive.is_none(),
             inactive,
             digest: Some(digest.clone()),
+            authority,
         });
     }
     Ok(())
@@ -720,6 +990,7 @@ mod publication_tests {
             selected: true,
             inactive: None,
             digest: None,
+            authority: None,
         };
         assert!(!server_source_is_current(
             &workspace,

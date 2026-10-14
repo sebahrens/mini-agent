@@ -145,7 +145,14 @@ impl McpClientManager {
                 continue;
             }
             let mut captured = Vec::new();
-            for layer in layers.iter().take(4) {
+            // Keep the current selected source visible within the same fixed
+            // diagnostic cap when CLI adds a fifth (non-file) layer.
+            for layer in layers
+                .iter()
+                .filter(|layer| layer.selected)
+                .chain(layers.iter().filter(|layer| !layer.selected))
+                .take(4)
+            {
                 if layer.source.len() > 1024
                     || layer.source.chars().any(char::is_control)
                     || layer.inactive.as_ref().is_some_and(|reason| {
@@ -731,6 +738,7 @@ mod tests {
             selected: true,
             inactive: None,
             digest: Some("a".repeat(64)),
+            authority: None,
         };
         let mut origins: HashMap<_, _> = (0..140)
             .map(|index| (format!("server{index:03}"), vec![origin.clone()]))
@@ -772,6 +780,31 @@ mod tests {
                 .outcome,
             health::AttemptOutcome::Failed
         );
+    }
+
+    #[test]
+    fn config69_selected_cli_origin_survives_bounded_diagnostic_history() {
+        let layers = (0..5)
+            .map(|index| project::ServerOrigin {
+                source: if index == 4 {
+                    "CLI --config".into()
+                } else {
+                    format!("config-{index}")
+                },
+                selected: index == 4,
+                inactive: None,
+                digest: None,
+                authority: None,
+            })
+            .collect();
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        manager.capture_origins(&HashMap::from([("owned".into(), layers)]));
+        let (captured, omitted) = manager.origins_snapshot();
+        assert!(omitted);
+        assert_eq!(captured["owned"].len(), 4);
+        assert_eq!(captured["owned"][0].source, "CLI --config");
+        assert!(captured["owned"][0].selected);
+        assert!(manager.handles.is_empty());
     }
 
     /// Returns a Command config pointing at a binary that exits immediately

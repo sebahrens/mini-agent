@@ -1,0 +1,16 @@
+# Embedded structural schema example. Commands and project-sensitive fields
+# still require their ordinary runtime trust and permission checks.
+model = "example/model"
+provider = "openrouter"
+max_tokens = 4096
+cache_ttl = "5m"
+no_tools = false
+headless_questions = "error"
+reasoning_display = "collapsed"
+permission-modes = ["standard"]
+[format]
+rs = "rustfmt {file}"
+[permission-deny]
+read = ["private/**"]
+[lsp]
+enabled = "auto"

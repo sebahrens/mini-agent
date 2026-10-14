@@ -803,10 +803,15 @@ impl App<'_> {
                     .write_line(&sanitize_output(&error), C_ERROR)?;
             }
             Ok(Completion::Prepared {
-                cfg,
+                mut cfg,
                 approval,
                 remove,
             }) => {
+                if let Err(error) = self.ui.cfg.mcp_cli_overrides.apply(&mut cfg) {
+                    self.renderer.write_line(error, C_ERROR)?;
+                    self.refresh()?;
+                    return Ok(());
+                }
                 // A project content edit invalidates every old receipt from
                 // that file. Retire those handles before asking about new trust.
                 let old = self.mcp_current_config().mcp_origins.clone();
@@ -956,7 +961,12 @@ impl App<'_> {
                     C_AGENT,
                 )?;
             }
-            Ok(Completion::Trusted { cfg, remove }) => {
+            Ok(Completion::Trusted { mut cfg, remove }) => {
+                if let Err(error) = self.ui.cfg.mcp_cli_overrides.apply(&mut cfg) {
+                    self.renderer.write_line(error, C_ERROR)?;
+                    self.refresh()?;
+                    return Ok(());
+                }
                 self.ui
                     .mcp_manager
                     .get_or_insert_with(|| McpClientManager::from_handles(Vec::new()))

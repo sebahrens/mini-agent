@@ -110,6 +110,32 @@ impl WorkspaceBinding {
         })
     }
 
+    /// Duplicate this exact retained directory capability without reopening its
+    /// pathname. Partial failure drops every already-created owned duplicate.
+    #[cfg(any(test, feature = "mcp"))]
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        self.try_clone_with(|capability, _directory| capability.try_clone())
+    }
+
+    #[cfg(any(test, feature = "mcp"))]
+    fn try_clone_with(
+        &self,
+        duplicate: impl FnOnce(&cap_std::fs::Dir, &std::fs::File) -> io::Result<cap_std::fs::Dir>,
+    ) -> io::Result<Self> {
+        self.validate().map_err(io::Error::other)?;
+        let directory = self.directory.try_clone()?;
+        let capability = duplicate(&self.capability, &directory)?;
+        let clone = Self {
+            root: self.root.clone(),
+            directory,
+            capability,
+            identity: self.identity.clone(),
+        };
+        self.validate().map_err(io::Error::other)?;
+        clone.validate().map_err(io::Error::other)?;
+        Ok(clone)
+    }
+
     /// Validate the retained application-private root without creating it or
     /// repairing mode/ACL. This is distinct from ordinary public workspaces.
     pub(crate) fn validate_private_root(&self) -> io::Result<()> {
@@ -3978,5 +4004,49 @@ mod tests {
         assert!(!canonical.exists());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod config69_clone_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn config69_retained_clone_partial_failure_and_replacement_are_closed() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-clone");
+        let directory = root.path().join("source");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("control"), "original").unwrap();
+        let binding = WorkspaceBinding::capture(&directory).unwrap();
+        let mut failed_duplicate = None;
+        assert!(
+            binding
+                .try_clone_with(|_, duplicate| {
+                    failed_duplicate = Some(duplicate.as_raw_fd());
+                    Err(io::Error::other("controlled capability clone failure"))
+                })
+                .is_err()
+        );
+        // SAFETY: F_GETFD observes the integer only; it never owns, closes or
+        // mutates a descriptor. The failed operation must drop its duplicate.
+        assert_eq!(
+            unsafe { libc::fcntl(failed_duplicate.unwrap(), libc::F_GETFD) },
+            -1
+        );
+        let clone = binding.try_clone().unwrap();
+        drop(binding);
+        assert!(clone.validate().is_ok());
+        assert_eq!(
+            std::io::read_to_string(clone.open_regular_relative(Path::new("control")).unwrap())
+                .unwrap(),
+            "original"
+        );
+        std::fs::rename(&directory, root.path().join("retained")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("control"), "replacement").unwrap();
+        assert!(clone.validate().is_err());
+        assert!(clone.try_clone().is_err());
     }
 }

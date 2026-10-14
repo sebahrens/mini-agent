@@ -9,7 +9,8 @@ use std::io;
 
 use crate::config::keys;
 use crate::config::{
-    Config, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine, StatusLineSegment,
+    Config, ConfigLayer, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine,
+    StatusLineSegment,
 };
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
@@ -285,6 +286,16 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 }
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+        super::layers::validate_toml_bounds_with_limit(content, MAX_PRIVATE_CONFIG_BYTES).map_err(
+            |_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "config TOML structure exceeds bounds (values omitted)",
+                )
+            },
+        )?;
+    }
     let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => toml::from_str(content).map_err(|error| {
             io::Error::new(
@@ -308,6 +319,10 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
         }),
     }?;
     cfg.provenance.global_file = Some(path.to_path_buf());
+    #[cfg(feature = "mcp")]
+    {
+        cfg.provenance.global_digest = Some(crate::extras::mcp::project::digest(content));
+    }
     cfg.provenance.global_status = Some("loaded");
     let spellings: Vec<String> =
         if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
@@ -335,6 +350,12 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
     cfg.provenance.global_keys = spellings
         .iter()
         .filter_map(|spelling| keys::lookup(spelling).map(|key| key.name))
+        .collect();
+    cfg.provenance.sources = cfg
+        .provenance
+        .global_keys
+        .iter()
+        .map(|key| (*key, [ConfigLayer::Global].into()))
         .collect();
     Ok(cfg)
 }
@@ -526,7 +547,7 @@ pub fn save_quick_model(
     Ok(())
 }
 
-fn rich_default_config() -> Config {
+pub(super) fn rich_default_config() -> Config {
     Config {
         quick_models: Some(default_quick_models()),
         provider: Some(CompactString::new("openrouter")),
@@ -694,6 +715,7 @@ fn rich_default_config() -> Config {
     }
 }
 
+#[cfg(test)]
 pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     let local_config_path = paths.project_config_file();
     load_from_path(
@@ -704,10 +726,62 @@ pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     )
 }
 
+/// Configuration discovery is separate from the captured execution workspace.
+pub(crate) fn load_in_workspace(
+    paths: &AppPaths,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    interactive: bool,
+) -> (Config, bool) {
+    let home = crate::paths::process_home_dir();
+    let sources = super::layers::discover(workspace, home.as_deref())
+        .unwrap_or_else(|error| fatal_config_load(format!("error: {error} (values omitted)")));
+    let result = load_from_path_with_sources(
+        pick_existing(&paths.config_dir),
+        None,
+        &paths.project_config_trust_file(),
+        interactive,
+        Some(workspace),
+        sources.as_ref(),
+    );
+    workspace
+        .validate()
+        .unwrap_or_else(|_| fatal_config_load("error: startup workspace changed".into()));
+    result
+}
+
 /// Inspect configuration without creating files, repairing permissions,
 /// prompting for trust, or exiting on errors. Diagnostics contain only fixed
 /// error classes: parser excerpts and credential values must not escape.
+#[cfg(test)]
 pub(crate) fn load_for_diagnostics(paths: &AppPaths) -> Config {
+    let sources = paths
+        .project_dir
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|root| {
+            crate::paths::WorkspaceBinding::capture(root)
+                .map(std::sync::Arc::new)
+                .map_err(|_| "config root unavailable")
+                .and_then(|workspace| {
+                    super::layers::discover(&workspace, crate::paths::process_home_dir().as_deref())
+                })
+        })
+        .unwrap_or(Ok(None));
+    load_for_diagnostics_with_sources(paths, sources)
+}
+
+pub(crate) fn load_for_diagnostics_in_workspace(
+    paths: &AppPaths,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+) -> Config {
+    let sources = super::layers::discover(workspace, crate::paths::process_home_dir().as_deref());
+    load_for_diagnostics_with_sources(paths, sources)
+}
+
+fn load_for_diagnostics_with_sources(
+    paths: &AppPaths,
+    sources: Result<Option<super::layers::ProjectLayers>, &'static str>,
+) -> Config {
     let path = pick_existing(&paths.config_dir);
     let mut cfg = match read_private_content_mode(&path, MAX_PRIVATE_CONFIG_BYTES, true, false) {
         Ok(content) => match parse_config_content(&path, &content) {
@@ -733,6 +807,11 @@ pub(crate) fn load_for_diagnostics(paths: &AppPaths) -> Config {
             cfg
         }
     };
+    #[cfg(feature = "mcp")]
+    if capture_global_mcp_origins(&mut cfg, &path).is_err() {
+        cfg.load_warnings
+            .push("configured MCP source could not be captured (values omitted)".into());
+    }
     cfg.provenance.global_file = Some(path);
     let unknown = keys::unknown_key_warnings("global config", cfg.preserved.keys());
     cfg.load_warnings.extend(std::iter::repeat_n(
@@ -746,30 +825,48 @@ pub(crate) fn load_for_diagnostics(paths: &AppPaths) -> Config {
             .map(|_| "global retry policy was clamped".into()),
     );
     let user_retry = cfg.retry.clone();
-    if let Some(project) = paths.project_config_file() {
-        match std::fs::symlink_metadata(&project) {
-            Ok(_) => {
-                if apply_local_override_with_confirmation_mode(
+    match sources {
+        Ok(Some(sources)) => {
+            for path in [sources.project.as_deref(), sources.local.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let relative = path
+                    .strip_prefix(sources.source.root())
+                    .expect("captured config source path");
+                let before = cfg.clone();
+                let result = apply_captured_override(
                     &mut cfg,
-                    &project,
+                    &sources.source,
+                    relative,
                     &paths.project_config_trust_file(),
                     false,
                     &|_| false,
                     false,
-                )
-                .is_err()
-                {
-                    cfg.provenance.project_file = Some(project);
-                    cfg.provenance.project_trust = Some("unreadable or invalid; inactive");
-                    cfg.load_warnings
-                        .push("project config could not be inspected (values omitted)".into());
+                );
+                if result.is_err() || sources.source.validate().is_err() {
+                    cfg = before;
+                    let layer = if path
+                        .file_name()
+                        .is_some_and(|name| name == "config.local.toml")
+                    {
+                        ConfigLayer::Local
+                    } else {
+                        ConfigLayer::Project
+                    };
+                    set_layer_status(&mut cfg, layer, path, "unreadable or invalid; inactive");
+                    cfg.load_warnings.push(
+                        "selected project config could not be inspected (values omitted)".into(),
+                    );
+                    // Invalid nearest sources do not cause parent fallback.
+                    break;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => cfg
-                .load_warnings
-                .push("project config path is unavailable".into()),
         }
+        Ok(None) => {}
+        Err(_) => cfg
+            .load_warnings
+            .push("nearest project config discovery was refused (values omitted)".into()),
     }
     let capped = cfg.retry.cap_at(&user_retry);
     cfg.load_warnings.extend(
@@ -810,6 +907,301 @@ mod doctor_config_tests {
             credentials_dir: root.join("credentials"),
             project_dir: Some(root.join("workspace/.zerostack")),
         }
+    }
+
+    #[test]
+    fn config69_upward_local_independent_trust_cli_precedence_and_save_delta() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-layers");
+        let mut paths = paths(root.path());
+        let repo = root.path().join("workspace");
+        let child = repo.join("sub/deep");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::create_dir(repo.join(".zerostack")).unwrap();
+        paths.project_dir = Some(child.join(".zerostack"));
+        let global = paths.config_dir.join("config.toml");
+        atomic_config_write(
+            &global,
+            "model='global'\nprovider='ollama'\nchat_left_margin=1\nmax_budget_usd=0.5\n",
+        )
+        .unwrap();
+        let project = repo.join(".zerostack/config.toml");
+        let local = repo.join(".zerostack/config.local.toml");
+        std::fs::write(
+            &project,
+            "model='project'\nprovider='anthropic'\nchat_left_margin=2\nmax_budget_usd=0.01\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            "model='local'\nprovider='openai'\nchat_left_margin=3\nmax_budget_usd=0.02\n",
+        )
+        .unwrap();
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&child).unwrap());
+        let sources = super::super::layers::discover(&workspace, None)
+            .unwrap()
+            .unwrap();
+        let load = || {
+            load_from_path_with_sources(
+                global.clone(),
+                None,
+                &paths.project_config_trust_file(),
+                false,
+                Some(&workspace),
+                Some(&sources),
+            )
+            .0
+        };
+        let mut cfg = load();
+        assert_eq!(cfg.model.as_deref(), Some("local"));
+        assert_eq!(cfg.provider.as_deref(), Some("ollama"));
+        assert_eq!(cfg.chat_left_margin, Some(3));
+        assert_eq!(cfg.max_budget_usd, Some(0.5));
+        assert_eq!(
+            cfg.provenance.sources["chat_left_margin"],
+            [ConfigLayer::Local].into()
+        );
+        trust_project_config(&project, &paths.project_config_trust_file()).unwrap();
+        cfg = load();
+        assert_eq!(cfg.model.as_deref(), Some("local"));
+        assert_eq!(cfg.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.provenance.local_trust, Some("sensitive keys inactive"));
+        trust_project_config(&local, &paths.project_config_trust_file()).unwrap();
+        cfg = load();
+        assert_eq!(cfg.model.as_deref(), Some("local"));
+        assert_eq!(cfg.provider.as_deref(), Some("openai"));
+        let overrides = super::super::layers::parse_overrides(&[
+            "model=\"cli\"".into(),
+            "chat_left_margin=4".into(),
+        ])
+        .unwrap();
+        super::super::layers::apply_overrides(&mut cfg, &overrides).unwrap();
+        let cli = crate::cli::Cli {
+            model: Some("dedicated".into()),
+            ..Default::default()
+        };
+        assert_eq!(cli.resolve_model(&cfg), "dedicated");
+        assert_eq!(cfg.provenance.sources["model"], [ConfigLayer::Cli].into());
+        let before = cfg.clone();
+        cfg.temperature = Some(0.25);
+        save_config_changes_at(&global, &before, &cfg).unwrap();
+        let saved =
+            parse_config_content(&global, &std::fs::read_to_string(&global).unwrap()).unwrap();
+        assert_eq!(saved.model.as_deref(), Some("global"));
+        assert_eq!(saved.chat_left_margin, Some(1));
+        assert_eq!(saved.temperature, Some(0.25));
+        assert_eq!(workspace.root(), child.canonicalize().unwrap());
+        let diagnosed = load_for_diagnostics_in_workspace(&paths, &workspace);
+        assert_eq!(diagnosed.model.as_deref(), Some("local"));
+        assert_eq!(
+            diagnosed.provenance.local_trust,
+            Some("content-bound trusted")
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn config69_mcp_file_baseline_survives_full_cli_overlay_and_replacement() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-mcp-cli");
+        let paths = paths(root.path());
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&root.path().join("workspace")).unwrap(),
+        );
+        let global = paths.config_dir.join("config.toml");
+        let original = "provider='ollama'\n[mcp_servers.local]\ncommand='original'\nargs=['old']\n[mcp_servers.local.env]\nSECRET_NAME='SECRET_VALUE'\n";
+        atomic_config_write(&global, original).unwrap();
+        let mut cfg = load_from_path_with_sources(
+            global.clone(),
+            None,
+            &paths.project_config_trust_file(),
+            false,
+            Some(&workspace),
+            None,
+        )
+        .0;
+        let overrides = super::super::layers::parse_overrides(&[
+            "mcp_servers.local={command='changed',args=['new'],env={SECRET_NAME='CLI_SECRET'}}"
+                .into(),
+        ])
+        .unwrap();
+        super::super::layers::apply_overrides(&mut cfg, &overrides).unwrap();
+        let origin = cfg.mcp_origins["local"]
+            .iter()
+            .find(|origin| origin.selected)
+            .unwrap()
+            .clone();
+        let server = cfg.mcp_servers.as_ref().unwrap()["local"].clone();
+        let proof = crate::extras::mcp::project::ServerSourceProof::capture(
+            workspace.clone(),
+            "local".into(),
+            Some(server),
+            Some(origin.clone()),
+            true,
+        );
+        assert!(proof.is_current());
+        let shown = format!("{origin:?}");
+        for secret in ["SECRET_NAME", "SECRET_VALUE", "CLI_SECRET"] {
+            assert!(!shown.contains(secret));
+        }
+        atomic_config_write(&global, original).unwrap();
+        assert!(
+            !proof.is_current(),
+            "same bytes at a replaced inode cannot inherit retained source authority"
+        );
+        let mut fresh = load_from_path_with_sources(
+            global.clone(),
+            None,
+            &paths.project_config_trust_file(),
+            false,
+            Some(&workspace),
+            None,
+        )
+        .0;
+        super::super::layers::apply_overrides(&mut fresh, &overrides).unwrap();
+        let fresh_origin = fresh.mcp_origins["local"]
+            .iter()
+            .find(|origin| origin.selected)
+            .unwrap();
+        assert!(crate::extras::mcp::project::server_source_is_current(
+            &workspace,
+            "local",
+            fresh.mcp_servers.as_ref().unwrap().get("local"),
+            Some(fresh_origin)
+        ));
+        std::fs::write(
+            &global,
+            format!("{original}# changed despite identical effective CLI server\n"),
+        )
+        .unwrap();
+        assert!(!crate::extras::mcp::project::server_source_is_current(
+            &workspace,
+            "local",
+            fresh.mcp_servers.as_ref().unwrap().get("local"),
+            Some(fresh_origin)
+        ));
+        let mut cli_only = Config::default();
+        super::super::layers::apply_overrides(&mut cli_only, &overrides).unwrap();
+        let origin = cli_only.mcp_origins["local"]
+            .iter()
+            .find(|origin| origin.selected)
+            .unwrap();
+        assert!(crate::extras::mcp::project::server_source_is_current(
+            &workspace,
+            "local",
+            cli_only.mcp_servers.as_ref().unwrap().get("local"),
+            Some(origin)
+        ));
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn config69_mcp_ancestor_local_trust_refresh_and_foreign_workspace() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-mcp-sources");
+        let mut paths = paths(root.path());
+        let repo = root.path().join("workspace");
+        let child = repo.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::create_dir(repo.join(".zerostack")).unwrap();
+        paths.project_dir = Some(child.join(".zerostack"));
+        let global = paths.config_dir.join("config.toml");
+        atomic_config_write(
+            &global,
+            "provider='ollama'\n[mcp_servers.local]\ncommand='host-command'\nargs=['global']\n",
+        )
+        .unwrap();
+        let project = repo.join(".zerostack/config.toml");
+        let local = repo.join(".zerostack/config.local.toml");
+        std::fs::write(&project, "[mcp_servers.local]\nargs=['project']\n").unwrap();
+        std::fs::write(&local, "[mcp_servers.local]\nargs=['local']\n").unwrap();
+        // An ancestor .mcp.json is not part of config discovery, even with
+        // malformed bytes. Loading it would create an observable warning.
+        std::fs::write(repo.join(".mcp.json"), "NOT A JSON MCP FILE").unwrap();
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&child).unwrap());
+        let sources = super::super::layers::discover(&workspace, None)
+            .unwrap()
+            .unwrap();
+        let load = || {
+            load_from_path_with_sources(
+                global.clone(),
+                None,
+                &paths.project_config_trust_file(),
+                false,
+                Some(&workspace),
+                Some(&sources),
+            )
+            .0
+        };
+        trust_project_config(&project, &paths.project_config_trust_file()).unwrap();
+        let cfg = load();
+        let args = |cfg: &Config| match &cfg.mcp_servers.as_ref().unwrap()["local"] {
+            McpServerConfig::Command { args, .. } => args.clone(),
+            _ => panic!("fixture command"),
+        };
+        assert_eq!(args(&cfg), ["project"]);
+        assert!(
+            !cfg.load_warnings
+                .iter()
+                .any(|warning| warning.contains("MCP file"))
+        );
+        let origin = cfg.mcp_origins["local"]
+            .iter()
+            .find(|origin| origin.selected)
+            .unwrap();
+        assert!(crate::extras::mcp::project::server_source_is_current(
+            &workspace,
+            "local",
+            cfg.mcp_servers.as_ref().unwrap().get("local"),
+            Some(origin)
+        ));
+        trust_project_config(&local, &paths.project_config_trust_file()).unwrap();
+        let mut cfg = load();
+        assert_eq!(args(&cfg), ["local"]);
+        let overrides =
+            super::super::layers::parse_overrides(&["mcp_servers.local.args=['CLI']".into()])
+                .unwrap();
+        super::super::layers::apply_overrides(&mut cfg, &overrides).unwrap();
+        let mut refreshed =
+            mcp_config_in_workspace_with_paths(&workspace, &global, &paths).unwrap();
+        assert_eq!(args(&refreshed), ["local"]);
+        cfg.mcp_cli_overrides.apply(&mut refreshed).unwrap();
+        // Replayed Prepared completion after exact-handle retirement is
+        // idempotent; it cannot double the retained invocation overlay list.
+        cfg.mcp_cli_overrides.apply(&mut refreshed).unwrap();
+        assert_eq!(args(&refreshed), ["CLI"]);
+        let origin = refreshed.mcp_origins["local"]
+            .iter()
+            .find(|origin| origin.selected)
+            .unwrap()
+            .clone();
+        let server = refreshed.mcp_servers.as_ref().unwrap()["local"].clone();
+        let proof = crate::extras::mcp::project::ServerSourceProof::capture(
+            workspace.clone(),
+            "local".into(),
+            Some(server.clone()),
+            Some(origin.clone()),
+            true,
+        );
+        assert!(proof.is_current());
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let foreign = crate::paths::WorkspaceBinding::capture(&foreign).unwrap();
+        assert!(!crate::extras::mcp::project::server_source_is_current(
+            &foreign,
+            "local",
+            Some(&server),
+            Some(&origin)
+        ));
+        std::fs::write(&local, "[mcp_servers.local]\nargs=['changed']\n").unwrap();
+        assert!(!proof.is_current());
+        assert_eq!(
+            args(&refreshed),
+            ["CLI"],
+            "unchanged CLI display is not source authority"
+        );
     }
 
     #[test]
@@ -956,12 +1348,33 @@ fn fatal_config_load(message: String) -> ! {
     }
 }
 
+#[cfg(test)]
 fn load_from_path(
     path: PathBuf,
     local_config_path: Option<&Path>,
     project_trust_path: &Path,
     interactive: bool,
 ) -> (Config, bool) {
+    load_from_path_with_sources(
+        path,
+        local_config_path,
+        project_trust_path,
+        interactive,
+        None,
+        None,
+    )
+}
+
+fn load_from_path_with_sources(
+    path: PathBuf,
+    local_config_path: Option<&Path>,
+    project_trust_path: &Path,
+    interactive: bool,
+    workspace: Option<&std::sync::Arc<crate::paths::WorkspaceBinding>>,
+    sources: Option<&super::layers::ProjectLayers>,
+) -> (Config, bool) {
+    #[cfg(not(feature = "mcp"))]
+    let _ = workspace;
     let is_first_startup = !path_entry_exists(&path).unwrap_or_else(|error| {
         fatal_config_load(format!(
             "error: failed to inspect config path ({}): {}\n\
@@ -1041,67 +1454,99 @@ fn load_from_path(
     );
     #[cfg(feature = "mcp")]
     {
-        if let Some(servers) = &cfg.mcp_servers {
-            for name in servers.keys() {
-                cfg.mcp_origins.entry(name.clone()).or_default().push(
-                    crate::extras::mcp::project::ServerOrigin {
-                        source: path.display().to_string(),
-                        selected: true,
-                        inactive: None,
-                        digest: None,
-                    },
-                );
-            }
-        }
-        if let Some(root) = local_config_path
-            .and_then(Path::parent)
-            .and_then(Path::parent)
+        capture_global_mcp_origins(&mut cfg, &path).unwrap_or_else(|_| {
+            fatal_config_load("error: global MCP config source changed or exceeds bounds".into())
+        });
+        let retained = workspace.cloned().or_else(|| {
+            local_config_path
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(|root| crate::paths::WorkspaceBinding::capture(root).ok())
+                .map(std::sync::Arc::new)
+        });
+        if let Some(workspace) = retained
+            && let Err(error) = crate::extras::mcp::project::load_in_workspace(
+                &mut cfg,
+                &workspace,
+                project_trust_path,
+                interactive,
+                &confirm_project_config_trust,
+            )
         {
-            match crate::paths::WorkspaceBinding::capture(root) {
-                Ok(workspace) => {
-                    if let Err(error) = crate::extras::mcp::project::load_in_workspace(
-                        &mut cfg,
-                        &workspace,
-                        project_trust_path,
-                        interactive,
-                        &confirm_project_config_trust,
-                    ) {
-                        emit_config_warnings(&mut warnings, vec![error]);
-                    }
-                }
-                Err(_) => emit_config_warnings(
-                    &mut warnings,
-                    vec!["project MCP workspace identity is unavailable".into()],
-                ),
-            }
+            emit_config_warnings(&mut warnings, vec![error]);
         }
     }
-    if let Some(local_config_path) = local_config_path {
-        if local_config_path.exists() {
+
+    if let Some(sources) = sources {
+        let owner_retry = cfg.retry.clone();
+        for path in [sources.project.as_deref(), sources.local.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let relative = path
+                .strip_prefix(sources.source.root())
+                .expect("captured config source path");
+            sources
+                .source
+                .validate()
+                .unwrap_or_else(|_| fatal_config_load("error: config source root changed".into()));
+            let outcome = apply_captured_override(
+                &mut cfg,
+                &sources.source,
+                relative,
+                project_trust_path,
+                interactive,
+                &confirm_project_config_trust,
+                true,
+            )
+            .unwrap_or_else(|_| {
+                fatal_config_load(
+                    "error: selected project config is invalid or changed (values omitted)".into(),
+                )
+            });
+            if matches!(
+                outcome,
+                ProjectConfigTrustOutcome::SkippedHeadless
+                    | ProjectConfigTrustOutcome::Declined
+                    | ProjectConfigTrustOutcome::TrustUnavailable
+            ) {
+                eprintln!(
+                    "note: project-local executable/security settings are inactive; benign settings were applied from {}",
+                    path.display()
+                );
+            }
+            sources
+                .source
+                .validate()
+                .unwrap_or_else(|_| fatal_config_load("error: config source root changed".into()));
+            let clamped = cfg.retry.cap_at(&owner_retry);
             emit_config_warnings(
                 &mut warnings,
-                project_config_unknown_key_warnings(local_config_path),
+                clamped_retry_warnings(&cfg, clamped, "project config", path),
             );
         }
-        let user_retry = cfg.retry.clone();
-        apply_local_override(
-            &mut cfg,
-            local_config_path,
-            project_trust_path,
-            interactive,
-            &confirm_project_config_trust,
-        );
-        // A repository may only tighten the user's retry policy.
-        let clamped = cfg.retry.cap_at(&user_retry);
-        emit_config_warnings(
-            &mut warnings,
-            clamped_retry_warnings(
-                &cfg,
-                clamped,
-                "project config (may only tighten the global retry policy)",
+    } else {
+        if let Some(local_config_path) = local_config_path {
+            let user_retry = cfg.retry.clone();
+            apply_local_override(
+                &mut cfg,
                 local_config_path,
-            ),
-        );
+                project_trust_path,
+                interactive,
+                &confirm_project_config_trust,
+            );
+            // A repository may only tighten the user's retry policy.
+            let clamped = cfg.retry.cap_at(&user_retry);
+            emit_config_warnings(
+                &mut warnings,
+                clamped_retry_warnings(
+                    &cfg,
+                    clamped,
+                    "project config (may only tighten the global retry policy)",
+                    local_config_path,
+                ),
+            );
+        }
     }
 
     emit_config_warnings(&mut warnings, cfg.shell_exact_allow_warnings());
@@ -1119,6 +1564,7 @@ fn load_from_path(
         )),
     }
 
+    emit_config_warnings(&mut warnings, std::mem::take(&mut cfg.load_warnings));
     cfg.load_warnings = warnings;
 
     (cfg, is_first_startup)
@@ -1388,6 +1834,7 @@ fn capture_project_config(path: &Path) -> io::Result<(crate::paths::WorkspaceBin
     Ok((workspace, relative))
 }
 
+#[cfg(test)]
 fn captured_project_config_content(
     path: &Path,
 ) -> io::Result<(crate::paths::WorkspaceBinding, PathBuf, String)> {
@@ -1396,6 +1843,7 @@ fn captured_project_config_content(
     Ok((workspace, relative, content))
 }
 
+#[cfg(test)]
 fn read_project_config_content(path: &Path) -> io::Result<String> {
     captured_project_config_content(path).map(|(_, _, content)| content)
 }
@@ -1515,40 +1963,48 @@ fn split_project_override(
     ))
 }
 
-fn merge_config_value(base: &Config, mut local: toml::Value) -> Result<Config, String> {
-    // Only the owner CLI/global config sets financial policy. Strip
-    // ignored project caps before recording diagnostic provenance.
+#[cfg(test)]
+fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, String> {
+    merge_config_value_layer(base, local, ConfigLayer::Project)
+}
+
+fn merge_config_value_layer(
+    base: &Config,
+    mut local: toml::Value,
+    layer: ConfigLayer,
+) -> Result<Config, String> {
     if let Some(table) = local.as_table_mut() {
         table.remove("max_budget_usd");
         table.remove("cache_ttl");
     }
     let mut provenance = base.provenance.clone();
-    if let Some(table) = local.as_table() {
-        provenance.project_keys.extend(
-            table
-                .iter()
-                .filter(|(_, value)| !value.as_table().is_some_and(|table| table.is_empty()))
-                .filter_map(|(spelling, _)| keys::lookup(spelling).map(|key| key.name)),
-        );
-        for (spelling, value) in table {
-            if !value.is_table()
-                && let Some(key) = keys::lookup(spelling)
-            {
-                provenance.global_keys.remove(key.name);
-            }
-        }
-    }
-    let mut base_toml = toml::Value::try_from(base)
-        .map_err(|_| "base config could not be normalized".to_string())?;
-    deep_merge_toml(&mut base_toml, local);
-    let mut merged: Config = base_toml
-        .try_into()
+    provenance.record(&local, layer);
+    let mut serializable = base.clone();
+    strip_injected_mcp_defaults(&mut serializable);
+    let mut value = super::layers::normalized_json(&serializable).map_err(str::to_owned)?;
+    super::layers::deep_merge_json(
+        &mut value,
+        super::layers::normalized_json(&local).map_err(str::to_owned)?,
+    );
+    let value = super::layers::normalized_json(&value).map_err(str::to_owned)?;
+    let mut merged: Config = serde_json::from_value(value)
         .map_err(|_| "merged project config has an invalid value".to_string())?;
+    #[cfg(feature = "mcp")]
+    if merged.mcp_servers.as_ref().is_some_and(|servers| {
+        servers.len() > 128
+            || servers.keys().any(|name| {
+                name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+            })
+    }) {
+        return Err("configured MCP catalogue exceeds bounds".into());
+    }
     merged.provenance = provenance;
     merged.load_warnings = base.load_warnings.clone();
     #[cfg(feature = "mcp")]
     {
         merged.mcp_origins = base.mcp_origins.clone();
+        merged.mcp_cli_overrides = base.mcp_cli_overrides.clone();
+        inject_mcp_defaults(&mut merged);
     }
     Ok(merged)
 }
@@ -1590,22 +2046,95 @@ fn sensitive_settings_summary(value: &toml::Value) -> String {
 }
 
 #[cfg(feature = "mcp")]
+fn capture_global_mcp_origins(cfg: &mut Config, path: &Path) -> Result<(), &'static str> {
+    let Some(servers) = &cfg.mcp_servers else {
+        return Ok(());
+    };
+    if servers.is_empty() {
+        return Ok(());
+    }
+    if servers.len() > 128 {
+        return Err("configured MCP server count exceeds bounds");
+    }
+    let parent = path.parent().ok_or("global config parent is unavailable")?;
+    let source = crate::paths::WorkspaceBinding::capture(parent)
+        .map_err(|_| "global MCP config source is unavailable")?;
+    let expected = cfg
+        .provenance
+        .global_digest
+        .as_deref()
+        .ok_or("global MCP source bytes are unavailable")?;
+    for (name, server) in servers {
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err("configured MCP name exceeds bounds");
+        }
+        let authority = crate::extras::mcp::project::OriginAuthority::file(
+            &source,
+            Path::new(
+                path.file_name()
+                    .ok_or("global config name is unavailable")?,
+            ),
+            expected,
+            server,
+            crate::extras::mcp::project::SourceKind::GlobalConfig,
+            None,
+            None,
+        )?;
+        cfg.mcp_origins.entry(name.clone()).or_default().push(
+            crate::extras::mcp::project::ServerOrigin {
+                source: path.display().to_string(),
+                selected: true,
+                inactive: None,
+                digest: None,
+                authority: Some(authority),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mcp")]
 fn record_project_mcp_origins(
     cfg: &mut Config,
     value: &toml::Value,
+    workspace: &crate::paths::WorkspaceBinding,
     relative: &Path,
     digest: &str,
     trusted: bool,
-) {
+    trust_store: &Path,
+) -> Result<(), String> {
     let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
-        return;
+        return Ok(());
     };
-    let source = relative
-        .iter()
-        .map(|part| part.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    for name in servers.keys() {
+    if servers.len() > 128 {
+        return Err("configured MCP server count exceeds bounds".into());
+    }
+    let source = workspace.root().join(relative).display().to_string();
+    for (name, baseline) in servers {
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err("configured MCP name exceeds bounds".into());
+        }
+        let prior = cfg
+            .mcp_origins
+            .get(name)
+            .and_then(|origins| origins.iter().find(|origin| origin.selected))
+            .and_then(|origin| origin.authority.as_ref());
+        let authority = if trusted {
+            Some(
+                crate::extras::mcp::project::OriginAuthority::file(
+                    workspace,
+                    relative,
+                    digest,
+                    baseline,
+                    crate::extras::mcp::project::SourceKind::ProjectConfig,
+                    prior,
+                    Some(trust_store),
+                )
+                .map_err(str::to_owned)?,
+            )
+        } else {
+            None
+        };
         let origins = cfg.mcp_origins.entry(name.clone()).or_default();
         origins.retain(|origin| origin.source != source);
         if trusted {
@@ -1618,8 +2147,10 @@ fn record_project_mcp_origins(
             selected: trusted,
             inactive: (!trusted).then(|| "project content is not trusted".into()),
             digest: Some(digest.into()),
+            authority,
         });
     }
+    Ok(())
 }
 
 fn apply_local_override_with_confirmation(
@@ -1647,42 +2178,88 @@ fn apply_local_override_with_confirmation_mode(
     confirm: &dyn Fn(&str) -> bool,
     repair: bool,
 ) -> Result<ProjectConfigTrustOutcome, String> {
-    let (workspace, relative, content) = captured_project_config_content(path)
-        .map_err(|error| format!("failed to read project config: {error}"))?;
-    cfg.provenance.project_file = Some(path.to_path_buf());
-    cfg.provenance.project_trust = Some("sensitive keys inactive");
+    let (workspace, relative) = capture_project_config(path)
+        .map_err(|_| "project config root is unavailable (values omitted)".to_string())?;
+    apply_captured_override(
+        cfg,
+        &workspace,
+        &relative,
+        trust_store_path,
+        interactive,
+        confirm,
+        repair,
+    )
+}
+
+fn set_layer_status(cfg: &mut Config, layer: ConfigLayer, path: &Path, status: &'static str) {
+    if layer == ConfigLayer::Local {
+        cfg.provenance.local_file = Some(path.to_path_buf());
+        cfg.provenance.local_trust = Some(status);
+    } else {
+        cfg.provenance.project_file = Some(path.to_path_buf());
+        cfg.provenance.project_trust = Some(status);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_captured_override(
+    cfg: &mut Config,
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    trust_store_path: &Path,
+    interactive: bool,
+    confirm: &dyn Fn(&str) -> bool,
+    repair: bool,
+) -> Result<ProjectConfigTrustOutcome, String> {
+    let path = workspace.root().join(relative);
+    let path = path.as_path();
+    let layer = if relative
+        .file_name()
+        .is_some_and(|name| name == "config.local.toml")
+    {
+        ConfigLayer::Local
+    } else {
+        ConfigLayer::Project
+    };
+    let content = read_project_config_text_in_workspace(workspace, relative)
+        .map_err(|_| "project config is unreadable (values omitted)".to_string())?;
+    set_layer_status(cfg, layer, path, "sensitive keys inactive");
     let (benign, sensitive, sensitive_keys) = split_project_override(&content)?;
-    if !repair {
-        let local = parse_project_toml(&content)?;
-        let warnings = keys::unknown_key_warnings(
-            "project config",
-            local
-                .as_table()
-                .into_iter()
-                .flat_map(|table| table.keys().map(String::as_str)),
-        );
+    let local = parse_project_toml(&content)?;
+    let unknown = keys::unknown_key_warnings(
+        "project config",
+        local
+            .as_table()
+            .into_iter()
+            .flat_map(|table| table.keys().map(String::as_str)),
+    );
+    if repair {
+        cfg.load_warnings.extend(unknown);
+    } else {
         cfg.load_warnings.extend(std::iter::repeat_n(
             "project config has an unknown or unavailable key (name/value omitted)".into(),
-            warnings.len(),
+            unknown.len(),
         ));
     }
     #[allow(unused_mut)]
-    let mut benign_cfg = merge_config_value(cfg, benign)?;
+    let mut benign_cfg = merge_config_value_layer(cfg, benign, layer)?;
     #[cfg(feature = "mcp")]
     record_project_mcp_origins(
         &mut benign_cfg,
         &sensitive,
-        &relative,
+        workspace,
+        relative,
         &crate::extras::mcp::project::digest(&content),
         false,
-    );
+        trust_store_path,
+    )?;
     if sensitive_keys.is_empty() {
         *cfg = benign_cfg;
-        cfg.provenance.project_trust = Some("benign keys only");
+        set_layer_status(cfg, layer, path, "benign keys only");
         return Ok(ProjectConfigTrustOutcome::NoSensitiveKeys);
     }
 
-    let binding = match checked_project_config_binding(&workspace, &relative, &content) {
+    let binding = match checked_project_config_binding(workspace, relative, &content) {
         Ok(binding) => binding,
         Err(error) => {
             *cfg = benign_cfg;
@@ -1705,17 +2282,19 @@ fn apply_local_override_with_confirmation_mode(
 
     if store.bindings.contains(&binding) {
         #[allow(unused_mut)]
-        let mut trusted = merge_config_value(&benign_cfg, sensitive.clone())?;
+        let mut trusted = merge_config_value_layer(&benign_cfg, sensitive.clone(), layer)?;
         #[cfg(feature = "mcp")]
         record_project_mcp_origins(
             &mut trusted,
             &sensitive,
-            &relative,
+            workspace,
+            relative,
             &binding.config_sha256,
             true,
-        );
+            trust_store_path,
+        )?;
         *cfg = trusted;
-        cfg.provenance.project_trust = Some("content-bound trusted");
+        set_layer_status(cfg, layer, path, "content-bound trusted");
         return Ok(ProjectConfigTrustOutcome::AlreadyTrusted);
     }
 
@@ -1748,16 +2327,26 @@ fn apply_local_override_with_confirmation_mode(
         return Ok(ProjectConfigTrustOutcome::Declined);
     }
 
+    if read_project_config_text_in_workspace(workspace, relative)
+        .ok()
+        .as_deref()
+        != Some(content.as_str())
+    {
+        *cfg = benign_cfg;
+        return Err("project config changed during approval (values omitted)".into());
+    }
     #[allow(unused_mut)]
-    let mut trusted_cfg = merge_config_value(&benign_cfg, sensitive.clone())?;
+    let mut trusted_cfg = merge_config_value_layer(&benign_cfg, sensitive.clone(), layer)?;
     #[cfg(feature = "mcp")]
     record_project_mcp_origins(
         &mut trusted_cfg,
         &sensitive,
-        &relative,
+        workspace,
+        relative,
         &binding.config_sha256,
         true,
-    );
+        trust_store_path,
+    )?;
     store.bindings.retain(|existing| {
         existing.canonical_project != binding.canonical_project
             || existing.canonical_config != binding.canonical_config
@@ -1771,7 +2360,7 @@ fn apply_local_override_with_confirmation_mode(
         return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
     }
     *cfg = trusted_cfg;
-    cfg.provenance.project_trust = Some("content-bound approved");
+    set_layer_status(cfg, layer, path, "content-bound approved");
     Ok(ProjectConfigTrustOutcome::Approved)
 }
 
@@ -1807,6 +2396,26 @@ pub(crate) fn project_config_is_trusted_in_workspace_readonly(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> bool {
     project_config_is_trusted_in_workspace_mode(paths, workspace, false)
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn project_config_relative_is_trusted_at_readonly(
+    trust_store: &Path,
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+) -> bool {
+    if relative != Path::new(".zerostack/config.toml")
+        && relative != Path::new(".zerostack/config.local.toml")
+    {
+        return false;
+    }
+    let Ok((_, binding)) = read_project_config_in_workspace(workspace, relative) else {
+        return false;
+    };
+    let Ok(store) = load_project_config_trust_mode(trust_store, false) else {
+        return false;
+    };
+    workspace.validate().is_ok() && store.bindings.contains(&binding)
 }
 
 fn project_config_is_trusted_in_workspace_mode(
@@ -1893,13 +2502,10 @@ pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, 
 /// Parse a project-local TOML config with its top-level keys rewritten to
 /// their canonical spellings, so trust classification and merging see
 /// `permission_deny` exactly as they see `permission-deny`.
-fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
-    let mut local: toml::Value = toml::from_str(local_toml).map_err(|error| {
-        format!(
-            "project config is not valid TOML ({})",
-            keys::describe_toml_error(local_toml, &error)
-        )
-    })?;
+pub(crate) fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
+    super::layers::validate_toml_bounds(local_toml).map_err(str::to_owned)?;
+    let mut local: toml::Value = toml::from_str(local_toml)
+        .map_err(|_| "project config is not valid TOML (values omitted)".to_string())?;
     if let Some(table) = local.as_table_mut() {
         keys::canonicalize_top_level_keys(table)?;
     }
@@ -1908,6 +2514,7 @@ fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
 
 /// Unknown-key warnings for the project-local config at `path`. Unreadable or
 /// invalid files yield none: loading them reports its own error.
+#[cfg(test)]
 fn project_config_unknown_key_warnings(path: &Path) -> Vec<String> {
     let Ok(content) = read_project_config_content(path) else {
         return Vec::new();
@@ -1922,24 +2529,6 @@ fn project_config_unknown_key_warnings(path: &Path) -> Vec<String> {
             .as_table()
             .map(|table| keys::unknown_key_warnings(&source, table.keys().map(String::as_str)))
             .unwrap_or_default(),
-    }
-}
-
-/// Deep-merge `over` into `base`: objects merge recursively per key, any
-/// other value replaces.
-fn deep_merge_toml(base: &mut toml::Value, over: toml::Value) {
-    match (base, over) {
-        (toml::Value::Table(b), toml::Value::Table(o)) => {
-            for (k, v) in o {
-                match b.get_mut(&k) {
-                    Some(existing) => deep_merge_toml(existing, v),
-                    None => {
-                        b.insert(k, v);
-                    }
-                }
-            }
-        }
-        (slot, v) => *slot = v,
     }
 }
 
@@ -1995,6 +2584,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
                 selected: true,
                 inactive: None,
                 digest: None,
+                authority: None,
             });
         }
     }
@@ -2336,7 +2926,7 @@ fn apply_json_delta(
 
 /// Drop injected built-in MCP servers (never user-defined ones, whatever
 /// their name) so they are neither persisted nor diffed as config changes.
-fn strip_injected_mcp_defaults(_cfg: &mut Config) {
+pub(super) fn strip_injected_mcp_defaults(_cfg: &mut Config) {
     #[cfg(feature = "mcp")]
     if let Some(ref mut servers) = _cfg.mcp_servers {
         servers.retain(|_, server| server.trusted_identity().is_none());
@@ -2662,6 +3252,43 @@ mod project_config_trust_tests {
         })
         .unwrap();
         assert_eq!(cfg.update_check, Some(true));
+    }
+
+    #[test]
+    fn config69_trusted_merge_preserves_json_values_and_toml_datetime() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-json-trusted");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "provider='openrouter'\nchat_left_margin=7\nmax_budget_usd=1000\n[extra_body.metadata]\ndate=1979-05-27T07:32:00Z\nvalues=[3]\n";
+        std::fs::write(&path, text).unwrap();
+        let expected: Config = toml::from_str(text).unwrap();
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider":"openrouter", "max_tokens":u64::MAX, "max_budget_usd":0.5,
+            "extra_body":{"metadata":{"nullable":null,"unsigned":u64::MAX,"values":[1,2]}}
+        }))
+        .unwrap();
+        let preserved: Config = toml::from_str("future_date=1979-05-27T07:32:00Z\n").unwrap();
+        cfg.preserved = preserved.preserved;
+        let preserved_before = toml::to_string(&cfg.preserved).unwrap();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true)
+                .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::Approved);
+        assert_eq!(cfg.max_tokens, Some(u64::MAX));
+        assert_eq!(cfg.max_budget_usd, Some(0.5));
+        assert_eq!(cfg.chat_left_margin, Some(7));
+        let metadata = &cfg.extra_body.as_ref().unwrap()["metadata"];
+        assert_eq!(metadata["nullable"], serde_json::Value::Null);
+        assert_eq!(metadata["unsigned"].as_u64(), Some(u64::MAX));
+        assert_eq!(metadata["values"], serde_json::json!([3]));
+        assert_eq!(
+            metadata["date"],
+            expected.extra_body.unwrap()["metadata"]["date"]
+        );
+        assert_eq!(toml::to_string(&cfg.preserved).unwrap(), preserved_before);
     }
 
     #[test]
@@ -4228,6 +4855,17 @@ pub(crate) fn mcp_config_in_workspace_at(
     workspace: &crate::paths::WorkspaceBinding,
     path: &Path,
 ) -> io::Result<Config> {
+    let paths =
+        AppPaths::from_process(Some(workspace.root().to_path_buf())).map_err(io::Error::other)?;
+    mcp_config_in_workspace_with_paths(workspace, path, &paths)
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_config_in_workspace_with_paths(
+    workspace: &crate::paths::WorkspaceBinding,
+    path: &Path,
+    paths: &AppPaths,
+) -> io::Result<Config> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("global config has no parent"))?;
@@ -4242,45 +4880,35 @@ pub(crate) fn mcp_config_in_workspace_at(
     } else {
         Config::default()
     };
-    if let Some(servers) = &cfg.mcp_servers {
-        for name in servers.keys() {
-            cfg.mcp_origins.entry(name.clone()).or_default().push(
-                crate::extras::mcp::project::ServerOrigin {
-                    source: path.display().to_string(),
-                    selected: true,
-                    inactive: None,
-                    digest: None,
-                },
-            );
-        }
-    }
-    let paths =
-        AppPaths::from_process(Some(workspace.root().to_path_buf())).map_err(io::Error::other)?;
+    capture_global_mcp_origins(&mut cfg, path).map_err(io::Error::other)?;
     let trust = paths.project_config_trust_file();
     crate::extras::mcp::project::load_in_workspace(&mut cfg, workspace, &trust, false, &|_| false)
         .map_err(io::Error::other)?;
-    match read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml")) {
-        Ok((content, binding)) => {
-            let local = parse_project_toml(&content).map_err(io::Error::other)?;
-            let trusted = load_project_config_trust_mode(&trust, false)?
-                .bindings
-                .contains(&binding);
-            if trusted {
-                cfg = merge_config_value(&cfg, local.clone()).map_err(io::Error::other)?;
-            }
-            record_project_mcp_origins(
+    let actual = std::sync::Arc::new(workspace.try_clone()?);
+    if let Some(sources) =
+        super::layers::discover(&actual, crate::paths::process_home_dir().as_deref())
+            .map_err(io::Error::other)?
+    {
+        let owner_retry = cfg.retry.clone();
+        for path in [sources.project.as_deref(), sources.local.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let relative = path
+                .strip_prefix(sources.source.root())
+                .expect("captured config source path");
+            apply_captured_override(
                 &mut cfg,
-                &local,
-                Path::new(".zerostack/config.toml"),
-                &binding.config_sha256,
-                trusted,
-            );
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(io::Error::other(
-                "project TOML MCP authority is unavailable",
-            ));
+                &sources.source,
+                relative,
+                &trust,
+                false,
+                &|_| false,
+                false,
+            )
+            .map_err(io::Error::other)?;
+            cfg.retry.cap_at(&owner_retry);
+            sources.source.validate().map_err(io::Error::other)?;
         }
     }
     inject_mcp_defaults(&mut cfg);
