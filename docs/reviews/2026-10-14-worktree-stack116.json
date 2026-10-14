@@ -1,0 +1,56 @@
+{
+  "issue": "mini-agent-i7ro6.116",
+  "base": "3e8e3bf357bce92a7e279f9a524e248ea7c45822",
+  "problem": "The physical 1 MiB installed TUI overflows during worktree workspace refresh and again during post-merge MCP reconnection.",
+  "change": "Construct the captured DEFER_INIT/first-goal runner futures, worktree refresh/merge futures, and bound/unbound MCP connect futures in existing short heap_future factories. Arguments, current task-local scope, semaphore permit, source proof, await/result and cleanup order stay unchanged.",
+  "evidence": {
+    "baseline_binary": "/private/tmp/mini-agent-worktree116-failed-binary",
+    "baseline_sha256": "ff3240a0d7748b179b4ae6f1c4b45b423b3ba694ac812d569ec07ecd8b8373cf",
+    "baseline_uuid": "7961C5A0-EC83-3CF1-A131-A52C062DE33A",
+    "baseline_crash_report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-wwfohq3h/report.json",
+    "baseline_debugger": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-yr1qv2jj/lldb.log",
+    "reached_merge_debugger": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-60vz8tgx/lldb.log",
+    "prologues_before": "/private/tmp/mini-agent-worktree116-prologues-before.txt",
+    "prologues_after": "/private/tmp/mini-agent-worktree116-prologues-final-mcp.txt",
+    "arm64_sp_delta_bytes_including_32_byte_saved_register_area": {
+      "slash_result_before": 209872,
+      "slash_result_after": 124096,
+      "merge_before": 83376,
+      "merge_after": 38304,
+      "mcp_connector_map_before": 46560,
+      "mcp_connector_map_after": 19040
+    },
+    "install_log": "/private/tmp/mini-agent-worktree116-install-final-mcp.log",
+    "install_seconds": 10.26,
+    "final_binary": "/private/tmp/mini-agent-worktree116-install/bin/mini-agent",
+    "final_sha256": "76b810ee8643f4fe38439be1d1bd51b4a02a63b82ce1d78cc06364f43be02a0a",
+    "final_uuid": "A6AE4509-FD04-376D-850A-CE288B8D263C",
+    "unchanged_native_driver": "/private/tmp/mini-agent-worktree43-native-one-mib-driver.py",
+    "final_native_report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-4a9xsuby/report.json",
+    "final_native_result": "PASS: physical 1048576-byte stack, actual /worktree then clean /wt-merge, exact target bytes, source path/ref removed, empty exact status stdout/stderr, zero provider POSTs, quit0, cleanup clean.",
+    "fixture_note": "The unchanged causal driver has three ignored enable-* keys and therefore retains configured default built-in MCP reconnection. It issues no model requests or MCP tools. The new Rust App regression uses only an owned loopback HTTP500 MCP responder."
+  },
+  "validation": [
+    {
+      "command": "cargo test --locked --offline --bin mini-agent -- worktree116_actual_app_switch_and_mcp_rebind_run_on_one_mib_stack actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack worktree_rebind_preserves_no_context_files --test-threads=1 --nocapture",
+      "result": "3 PASS",
+      "log": "/private/tmp/mini-agent-worktree116-owning-final.log"
+    },
+    {
+      "command": "cargo test --locked --offline --bin mini-agent -- worktree116_actual_app_switch_and_mcp_rebind_run_on_one_mib_stack actual_initial_mcp_source_revocation_opens_zero_sockets_and_current_source_connects actual_initial_mcp_source_revoked_during_handshake_retires_candidate retained_source_revoked_after_endpoint_lookup_makes_zero_connections --test-threads=1 --nocapture",
+      "result": "4 PASS on final production source",
+      "log": "/private/tmp/mini-agent-worktree116-final-connector-owning.log"
+    },
+    {
+      "command": "cargo test --locked --offline --bin mini-agent -- production_subprocess_sites_have_a_trust_classification current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes --test-threads=1",
+      "result": "Production classification PASS. Existing baseline Windows exact ownership gap fails second filter; independently repaired and passed by Root in 1ffd84c9. This patch changes only the two existing inert App thread occurrence counts6\u21927; preserve Root policy data.",
+      "log": "/private/tmp/mini-agent-worktree116-inventory.log"
+    }
+  ],
+  "scoped_selection": {
+    "App::handle_slash_result": "actual native TUI create/merge exercises the changed production route; new realGit/MCP App1MiB and existing context/Git App1MiB cover the caller; no-context rebind control preserves source exclusion.",
+    "McpClientManager::connect_all_with_binding": "File-qualified indexed caller trace confirms connect_config_in_binding and connect_all_in_binding. Existing actual current-source/pre-connect, post-DNS and in-handshake revocation controls cover unchanged authorization/retirement around the boxed child.",
+    "inventory_data": "Only occurrence counts for the new in-process fixed-stack test thread change; scanner and containment assertions unchanged."
+  },
+  "limits": "No full-suite, feature sweep, process-policy, stack-limit or deadline change. The historical gesi4.3 false-dirty cause remains unreproduced and is a separate verified-current-behavior regression."
+}

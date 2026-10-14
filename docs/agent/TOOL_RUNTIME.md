@@ -1203,3 +1203,22 @@ proved by that cleanup bound, the explicit self-check terminates fatally rather
 than detaching an owner or declaring availability. Recovery state is preserved.
 The scalar and feeder primitives have prior finite native Windows proof; an
 actual observed installed check remains the owning integration witness.
+
+Clipboard image input lives in `ui/clipboard_image.rs`. Only an explicit paste
+in the idle ordinary editor requests an image; approval/question/picker keys
+and background turns do not read it. Fixed macOS AppKit/JXA, Linux
+`wl-paste`/`xclip`, and Windows STA PowerShell clipboard adapters run through the
+existing owned support-command path with a three-second limit and bounded
+stdout/stderr. Helper output never becomes a command or pathname. Complete PNG
+bytes are capped before decoding base64, with bounded header dimensions; no
+new image codec or process registry is introduced.
+
+Clipboard images join `pending_media` with runtime display metadata. The input
+footer shows their image number and PNG dimensions; `/drop 0` removes the first
+pending attachment. The next ordinary turn carries the literal text and images
+in one canonical user message. Its exact bytes persist inline in the private
+session JSON and survive resume; `--no-session` stays ephemeral. Existing
+canonical limits apply: 2 MiB per image, 4 MiB total and eight images per turn.
+The transaction retains attachments for rollback when preparation or a
+zero-progress turn fails. Active hooks, spend and permission admission use the
+same typed runner path; a text hook cannot rewrite an ordered image prompt.

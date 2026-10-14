@@ -1,0 +1,63 @@
+{
+  "bead": "mini-agent-i7ro6.74",
+  "patch_sha256": "8e5457aec7a274691a292705a6f901f9da27b9672e63503f20a30a678a405b82",
+  "verdict": "ready_for_parent_integration",
+  "native_report": "/private/tmp/mini-agent-clipboard74-native-3rhj9jp_/report.json",
+  "native": {
+    "root": "/private/tmp/mini-agent-clipboard74-native-3rhj9jp_",
+    "binary": "/private/tmp/mini-agent-clipboard74-install/bin/mini-agent",
+    "binary_sha256": "5018929d742e68617413fbf4ae0c27b3af944802521c26b83cb9f8b12ad93207",
+    "assertions": {
+      "paste_stages_without_model_request": true,
+      "drop_removes_without_model_request": true,
+      "actual_next_message_carries_exact_image_and_unicode_text": true,
+      "normal_quit": true,
+      "exact_native_pid_retired": true,
+      "exact_image_and_text_saved_inline": true,
+      "saved_image_replayed_without_path_reread": true
+    },
+    "errors": [],
+    "calls": [
+      [
+        "GET",
+        "/v1/models"
+      ],
+      [
+        "POST",
+        "/v1/chat/completions"
+      ],
+      [
+        "POST",
+        "/v1/chat/completions"
+      ]
+    ],
+    "image_sha256": "14b8f86b095de847397182acb384e2e1cfed10d47695c58a6c34dfe4c47017de",
+    "native_pid": 68729,
+    "physical_stack_bytes": 1048576,
+    "clipboard_fixture_exit": 0,
+    "clipboard_restore": "restored",
+    "listener_joined": true,
+    "passed": true
+  },
+  "source_scope": {
+    "files": 13,
+    "no_dependency_changes": true,
+    "no_new_grants": true,
+    "images_inline_in_canonical_session_user": true,
+    "no_model_calls_at_paste_or_drop": true,
+    "existing_sandbox_support_owner": true
+  },
+  "limits": [
+    "PNG signature+IHDR bounds are checked; no new PNG codec/CRC/decompression library claimed",
+    "clipboard images stage only in an idle ordinary editor, matching existing /add mutation availability",
+    "no new grant/MCP/ACP/financial API/backend fallback/source string execution",
+    "no full feature matrix, full UI/hooks/worker suites or unchanged native reaper repeats"
+  ],
+  "indexer_test_map": "/private/tmp/mini-agent-clipboard74-final-owned-indexed-test-map.json",
+  "review": {
+    "testing": "new bounded decoder/staging/canonical roundtrip + actual App modal/rollback/image-only admission + key cfg default/core + real OS save/resume proof",
+    "reliability": "exact existing3s bounded support process; nonzero/truncation/descendant failure rejected; no payload stderr disclosure; transaction restores pending media",
+    "adversarial": "fixed scripts and argv, environment allowlist only desktop IPC; no API keys; no URI/path reread; bounds before decode/encode; image header validation is not a full codec",
+    "agent_native": "typed canonical input uses existing owned runner and ordinary budget/permission/Question hooks; paste/drop adds no effect authorization"
+  }
+}

@@ -218,6 +218,11 @@ impl Default for KeyBindings {
 }
 
 impl KeyBindings {
+    fn default_available(&self, spec: &ActionSpec) -> bool {
+        !spec.windows_only_default
+            || self.native_clipboard
+            || (cfg!(feature = "multimodal") && spec.action == KeyAction::PasteClipboard)
+    }
     pub(crate) fn from_overrides(settings: Option<&KeyOverrides>) -> Result<Self, &'static str> {
         let mut result = Self::default();
         let Some(settings) = settings else {
@@ -263,7 +268,7 @@ impl KeyBindings {
         SPECS
             .iter()
             .filter(|spec| spec.editor == editor)
-            .filter(|spec| !spec.windows_only_default || self.native_clipboard)
+            .filter(|spec| self.default_available(spec))
             .filter(|spec| {
                 !self
                     .overrides
@@ -287,7 +292,7 @@ impl KeyBindings {
         SPECS
             .iter()
             .filter(|spec| spec.editor == editor)
-            .filter(|spec| !spec.windows_only_default || self.native_clipboard)
+            .filter(|spec| self.default_available(spec))
             .any(|spec| {
                 self.overrides
                     .iter()
@@ -347,7 +352,7 @@ impl KeyBindings {
                         .iter()
                         .map(|chord| chord.describe())
                         .collect::<Vec<_>>()
-                } else if spec.windows_only_default && !self.native_clipboard {
+                } else if !self.default_available(spec) {
                     Vec::new()
                 } else {
                     spec.defaults
@@ -427,7 +432,10 @@ fn legacy_default_event(key: KeyEvent, editor: bool, windows: bool) -> Option<Ke
         {
             return Some(key);
         }
-        if windows && key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::CONTROL {
+        if (windows || cfg!(feature = "multimodal"))
+            && key.code == KeyCode::Char('v')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
             return Some(key);
         }
         return match key.code {
@@ -561,6 +569,36 @@ mod tests {
             ])))
             .is_err()
         );
+    }
+
+    #[test]
+    fn clipboard74_default_and_override_keep_exact_paste_modifiers_and_feature_boundary() {
+        let defaults = KeyBindings::default();
+        let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(
+            defaults.action(paste, false),
+            (cfg!(windows) || cfg!(feature = "multimodal")).then_some(KeyAction::PasteClipboard)
+        );
+        assert_eq!(
+            defaults.action(
+                KeyEvent::new(
+                    KeyCode::Char('v'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
+                false
+            ),
+            None
+        );
+        let configured = KeyBindings::from_overrides(Some(&BTreeMap::from([(
+            "paste_clipboard".into(),
+            vec!["f6".into()],
+        )])))
+        .unwrap();
+        assert_eq!(
+            configured.action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), false),
+            Some(KeyAction::PasteClipboard)
+        );
+        assert_eq!(configured.action(paste, false), None);
     }
 
     #[test]

@@ -298,20 +298,25 @@ impl McpClientManager {
                             origin,
                             declared_source,
                         );
-                        client::McpClientHandle::connect_in_binding_guarded(
-                            CompactString::new(name.clone()),
-                            &cfg,
-                            &binding,
-                            &|| proof.is_current(),
-                        )
+                        let source_is_current = || proof.is_current();
+                        crate::startup::heap_future(|| {
+                            client::McpClientHandle::connect_in_binding_guarded(
+                                CompactString::new(name.clone()),
+                                &cfg,
+                                &binding,
+                                &source_is_current,
+                            )
+                        })
                         .await
                         .map(|handle| handle.with_source_proof(proof))
                     } else {
-                        client::McpClientHandle::connect_in(
-                            CompactString::new(name.clone()),
-                            &cfg,
-                            &workspace,
-                        )
+                        crate::startup::heap_future(|| {
+                            client::McpClientHandle::connect_in(
+                                CompactString::new(name.clone()),
+                                &cfg,
+                                &workspace,
+                            )
+                        })
                         .await
                     };
                     if let Ok(handle) = &result {

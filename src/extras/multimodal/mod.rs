@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 /// Maximum file size for media attachments: 20 MiB.
 pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Runtime-only clipboard display metadata. The image itself is persisted as
+/// canonical user content, never a pathname to reread.
+#[derive(Debug, Clone)]
+pub struct ClipboardImageInfo {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Represents a media file attached to a user message.
 /// The raw bytes are held in memory and converted to rig message content
 /// when the message is submitted.
@@ -13,6 +21,7 @@ pub enum MediaAttachment {
         path: PathBuf,
         data: Vec<u8>,
         mime: String,
+        clipboard: Option<ClipboardImageInfo>,
     },
     Audio {
         path: PathBuf,
@@ -176,7 +185,12 @@ pub fn load_attachment(path: &Path) -> std::io::Result<MediaAttachment> {
     // We already know the mime from detect_media — dispatch on the prefix.
     let path = path.to_path_buf();
     Ok(if mime.starts_with("image/") {
-        MediaAttachment::Image { path, data, mime }
+        MediaAttachment::Image {
+            path,
+            data,
+            mime,
+            clipboard: None,
+        }
     } else if mime.starts_with("audio/") {
         MediaAttachment::Audio { path, data, mime }
     } else {

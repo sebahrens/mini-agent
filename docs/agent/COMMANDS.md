@@ -814,3 +814,13 @@ picker or validates and saves one setting. The picker shows current startup
 values, types, sources and restart requirements. Sensitive project changes require
 approval of the exact candidate; current permission/provider authority is unchanged.
 See [interactive settings](CONFIG.md#interactive-settings-editor).
+
+With the `multimodal` feature, Ctrl+V can paste a clipboard image into an idle
+prompt (terminals may reserve Ctrl+V; an empty bracketed paste also requests an
+image). The input footer shows `[image 1: WIDTHxHEIGHT png]`; type a question or
+press Enter to send the image alone. `/drop 0` removes the first pending
+attachment. Pasting stages data and makes no model request. Sent clipboard
+images are saved inline with the session, rather than reopened from a file on
+resume. Images over 2 MiB, more than eight images, or over 4 MiB total are
+rejected. macOS uses its system clipboard service, Linux needs `wl-paste` or
+`xclip`, and Windows uses its system PowerShell clipboard service.

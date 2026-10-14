@@ -905,6 +905,25 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    // Fixed operator clipboard helpers delegate to the existing bounded owner.
+    (
+        "src/ui/clipboard_image.rs",
+        "let mut command = tokio::process::Command::new(\"/usr/bin/osascript\");",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_image.rs",
+        "let mut command = tokio::process::Command::new(program);",
+        2,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_image.rs",
+        "mut command: tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
     // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
     ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     // Owned one-MiB native capture consumer, joined before fixture teardown.
@@ -922,7 +941,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 6, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 7, "NON-PROCESS"),
     (
         "src/ui/app.rs",
         r#"std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{"#,
@@ -1555,6 +1574,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "let status = isolated.status().unwrap();",
         1,
         "TEST-ONLY",
+    ),
+    // Inert source-policy search string, not a process constructor.
+    (
+        "src/sandbox.rs",
+        r#"let launch = parent_transport.find("Command::new(executable)").unwrap();"#,
+        1,
+        "NON-PROCESS",
     ),
     // Explicit installed self-check observer: one joined Rust writer, same
     // fixed production helper constructor/creation boundary; no new target.
@@ -4349,6 +4375,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/ui/clipboard_image.rs",
+        "mut command: tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/ui/app.rs",
         r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
         1,
@@ -4676,7 +4708,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 6, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 7, "NON-PROCESS"),
     (
         "src/ui/app.rs",
         r#"std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{"#,
@@ -4988,6 +5020,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    // Inert source-policy search string, not a process constructor.
+    (
+        "src/sandbox.rs",
+        r#"let launch = parent_transport.find("Command::new(executable)").unwrap();"#,
+        1,
+        "NON-PROCESS",
+    ),
     // Explicit installed self-check observer: one joined Rust writer, same
     // fixed production helper constructor/creation boundary; no new target.
     (
@@ -5191,6 +5230,7 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
+    ("src/ui/clipboard_image.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),
 ];
 

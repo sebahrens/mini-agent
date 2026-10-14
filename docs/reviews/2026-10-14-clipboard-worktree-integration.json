@@ -1,0 +1,122 @@
+{
+  "base": "1ffd84c9d387bdc0616cbcf70c2fd040ae3bcfd0",
+  "beads": [
+    "mini-agent-i7ro6.74",
+    "mini-agent-i7ro6.116"
+  ],
+  "review": "Root read complete final clipboard13-file patch and worktree4-file patch, including bounded helper/scripts, canonical user input/persistence, modal/rollback paths and MCP scope/currentness/retirement. Found clipboard borrowed-command ownership omission; corrected with exact NON-PROCESS entry. No remaining source blocker.",
+  "integration_change": "Classify inert source-policy search-string introduced in1ffd as NON-PROCESS in both exact checked tables; scanner and negative controls unchanged.",
+  "validation": [
+    {
+      "result": "4 PASS,1 initial scanner failure",
+      "log": "/private/tmp/mini-agent-wave47-integrated-owning.log",
+      "filters": [
+        "worktree116_actual_app_switch_and_mcp_rebind_run_on_one_mib_stack",
+        "clipboard74_actual_app_stages_drops_and_restores_typed_draft_without_modal_reads",
+        "production_subprocess_sites_have_a_trust_classification",
+        "windows_capable_production_process_terminals_use_creation_boundary",
+        "current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes"
+      ]
+    },
+    {
+      "result": "PASS after exact inert-string classification",
+      "log": "/private/tmp/mini-agent-wave47-inventory-final.log",
+      "filter": "production_subprocess_sites_have_a_trust_classification"
+    },
+    {
+      "result": "PASS final complete ownership tables, including negative controls",
+      "log": "/private/tmp/mini-agent-wave47-inventory-ownership-final.log",
+      "filter": "current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes"
+    },
+    {
+      "result": "PASS29.98s",
+      "command": "cargo clippy --features advisor --all-targets --locked --offline -- -D warnings",
+      "log": "/private/tmp/mini-agent-wave47-strict.log"
+    },
+    {
+      "result": "PASS16.46s",
+      "command": "cargo install --path . --debug --features advisor --locked --offline --root /private/tmp/mini-agent-wave47-install",
+      "log": "/private/tmp/mini-agent-wave47-install.log"
+    }
+  ],
+  "reused": "Unchanged clipboard decoder/caps/keybinding/core-feature/typed prompt and rollback controls, and unchanged MCP source-revocation/currentness controls, recorded in owning74/116 proofs. No full-suite or unchanged sandbox runtime repeat.",
+  "native": {
+    "clipboard": {
+      "report": "/private/tmp/mini-agent-clipboard74-native-bb5ukhhd/report.json",
+      "sha256": "44488aa70c2f90f465a45dd4075e3be0aeff5fc69307d2569156578261de867c",
+      "result": {
+        "root": "/private/tmp/mini-agent-clipboard74-native-bb5ukhhd",
+        "binary": "/private/tmp/mini-agent-wave47-install/bin/mini-agent",
+        "binary_sha256": "4a4074fd13ae69583fce3f8fce32f665480951a391eb2efece761ee382de8679",
+        "assertions": {
+          "paste_stages_without_model_request": true,
+          "drop_removes_without_model_request": true,
+          "actual_next_message_carries_exact_image_and_unicode_text": true,
+          "normal_quit": true,
+          "exact_native_pid_retired": true,
+          "exact_image_and_text_saved_inline": true,
+          "saved_image_replayed_without_path_reread": true
+        },
+        "errors": [],
+        "calls": [
+          [
+            "GET",
+            "/v1/models"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ],
+          [
+            "POST",
+            "/v1/chat/completions"
+          ]
+        ],
+        "image_sha256": "14b8f86b095de847397182acb384e2e1cfed10d47695c58a6c34dfe4c47017de",
+        "native_pid": 77751,
+        "physical_stack_bytes": 1048576,
+        "clipboard_fixture_exit": 0,
+        "clipboard_restore": "restored",
+        "listener_joined": true,
+        "passed": true
+      }
+    },
+    "worktree": {
+      "report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-z0uetqyy/report.json",
+      "sha256": "a537a1d46663af6850d638d58d331ea019f76822866735b9fc272fc2c433ec19",
+      "result": {
+        "root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-clean-worktree43-z0uetqyy",
+        "binary": "/private/tmp/mini-agent-wave47-install/bin/mini-agent",
+        "binary_sha256": "4a4074fd13ae69583fce3f8fce32f665480951a391eb2efece761ee382de8679",
+        "historical_cause": "unreproduced; current acceptance only",
+        "main_before_launch": {
+          "stdout_hex": "",
+          "stderr_hex": ""
+        },
+        "upstream": "origin/main",
+        "source_before_merge": {
+          "stdout_hex": "",
+          "stderr_hex": ""
+        },
+        "main_after_merge": {
+          "stdout_hex": "",
+          "stderr_hex": ""
+        },
+        "passed": true,
+        "physical_stack_bytes": 1048576,
+        "dirty_prompt": false,
+        "auto_commit_prompt": false,
+        "exact_target_bytes": true,
+        "source_worktree_and_branch_removed": true,
+        "provider_posts": 0,
+        "normal_quit": 0,
+        "cleanup_errors": []
+      }
+    }
+  },
+  "limits": [
+    "Native live clipboard proof is macOS; no Windows/Linux live clipboard claim.",
+    "The separate historical false-dirty cause remains unreproduced;116 has reproduced stack-overflow cause and same-driver fix proof.",
+    "Hosted new-head CI remains required; no green claim yet."
+  ]
+}

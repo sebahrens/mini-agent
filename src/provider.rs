@@ -3228,6 +3228,33 @@ impl AnyAgent {
         .start_interactive()
     }
 
+    /// Ordinary interactive entry with bounded canonical user content. The
+    /// same captured Run, Question turn, hooks and start barrier remain owned
+    /// by the existing paused runner implementation.
+    pub(crate) async fn spawn_runner_input<H>(
+        self,
+        prompt: crate::agent::input::PromptInput,
+        history: H,
+        retry_config: RetryConfig,
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    ) -> AgentRunner
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
+        crate::startup::heap_future(|| {
+            self.spawn_runner_paused_input_in_scope(
+                prompt,
+                history.into(),
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+                runner::AgentWorkScope::new(),
+            )
+        })
+        .await
+        .start_interactive()
+    }
+
     /// Builds an agent runner behind a start barrier. ACP uses this to publish
     /// cancellation ownership and the abort handle before model/tool execution.
     pub(crate) async fn spawn_runner_paused<H>(

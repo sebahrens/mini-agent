@@ -2440,12 +2440,14 @@ fn subagent_replay_messages(
 }
 
 #[cfg(feature = "multimodal")]
-pub fn media_to_messages(media: &[crate::extras::multimodal::MediaAttachment]) -> Vec<Message> {
+pub fn media_to_messages<'a>(
+    media: impl IntoIterator<Item = &'a crate::extras::multimodal::MediaAttachment>,
+) -> Vec<Message> {
     use rig::OneOrMany;
     use rig::completion::message::UserContent;
 
     media
-        .iter()
+        .into_iter()
         .map(|m| match m {
             crate::extras::multimodal::MediaAttachment::Image { data, mime, .. } => Message::User {
                 content: OneOrMany::one(UserContent::image_raw(

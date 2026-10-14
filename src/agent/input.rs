@@ -8,7 +8,7 @@ impl PromptInput {
     pub(crate) fn text(text: String) -> Self {
         Self { text, user: None }
     }
-    #[cfg(any(feature = "acp", test))]
+    #[cfg(any(feature = "acp", feature = "multimodal", test))]
     #[allow(
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"

@@ -1,4 +1,6 @@
 mod app;
+#[cfg(feature = "multimodal")]
+mod clipboard_image;
 #[cfg(test)]
 pub(crate) use app::retire_scoped_task;
 #[cfg(all(test, feature = "git-worktree"))]
@@ -258,17 +260,42 @@ pub(crate) fn refresh_display(
     };
     let base_statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
     let vim_label = input.vim_status_label();
-    let statusline_key = if vim_label.is_empty() {
+    #[cfg(feature = "multimodal")]
+    let image_label = clipboard_image::labels(&ui.session.pending_media);
+    #[cfg(not(feature = "multimodal"))]
+    let image_label = String::new();
+    let statusline_key = if vim_label.is_empty() && image_label.is_empty() {
         base_statusline_key
     } else {
         use std::hash::{Hash, Hasher};
         let mut state = std::collections::hash_map::DefaultHasher::new();
         base_statusline_key.hash(&mut state);
         vim_label.hash(&mut state);
+        image_label.hash(&mut state);
         state.finish()
     };
     let statusline = renderer.cached_statusline(statusline_key, || {
         let mut lines = crate::ui::statusline::build(ui.session, &statusline_ctx);
+        if !image_label.is_empty() {
+            if lines.is_empty() {
+                lines.push(Vec::new());
+            }
+            let line = &mut lines[0];
+            line.insert(
+                0,
+                crate::ui::statusline::StatusSpan::Text {
+                    text: format!("{image_label} "),
+                    fg: None,
+                    bg: None,
+                    layout: crate::ui::statusline::SpanLayout::Item {
+                        priority: 0,
+                        plain: format!("{image_label} "),
+                        compact: None,
+                        dynamic_color: false,
+                    },
+                },
+            );
+        }
         if !vim_label.is_empty()
             && let Some(line) = lines.first_mut()
         {
@@ -1025,6 +1052,8 @@ pub(crate) async fn start_main_run(
     slash: &SlashState,
     prebuild: &mut Option<prebuild::AgentPrebuild>,
 ) -> anyhow::Result<()> {
+    #[cfg(feature = "multimodal")]
+    let user = clipboard_image::user_message(&ui.session.pending_media, text)?;
     // A goal that asked the user a question is waiting, not finished. The
     // answer is the thing it was waiting for, so typing one resumes it — the
     // guide has always said so, and without this the user has to discover
@@ -1038,6 +1067,8 @@ pub(crate) async fn start_main_run(
 
     #[allow(unused_mut)]
     let mut pending_turn = PendingMainTurn::capture(ui.session, text);
+    #[cfg(feature = "multimodal")]
+    pending_turn.set_user(user);
     #[cfg(feature = "memory")]
     if ui
         .context
@@ -1068,7 +1099,17 @@ pub(crate) async fn start_main_run(
             history
         } else {
             let mut h = history.to_vec();
-            h.extend(crate::agent::runner::media_to_messages(media));
+            h.extend(crate::agent::runner::media_to_messages(
+                media.iter().filter(|item| {
+                    !matches!(
+                        item,
+                        crate::extras::multimodal::MediaAttachment::Image {
+                            clipboard: Some(_),
+                            ..
+                        }
+                    )
+                }),
+            ));
             h.into()
         }
     };
@@ -1106,8 +1147,8 @@ pub(crate) async fn start_main_run(
         agent
             .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
             .with_question_turn(question_turn)
-            .spawn_runner(
-                text.to_string(),
+            .spawn_runner_input(
+                pending_turn.input(),
                 history,
                 ui.cfg.retry.clone(),
                 #[cfg(feature = "hooks")]
@@ -1171,7 +1212,11 @@ pub(crate) fn mark_main_turn_started(
     run: &mut AgentRunState,
     pending_turn: PendingMainTurn,
 ) {
-    session.add_message(MessageRole::User, pending_turn.prompt());
+    if let Some(user) = pending_turn.user() {
+        session.add_user_message(user.clone());
+    } else {
+        session.add_message(MessageRole::User, pending_turn.prompt());
+    }
     run.pending_turn = Some(pending_turn);
 }
 

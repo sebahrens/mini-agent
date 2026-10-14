@@ -203,6 +203,7 @@ impl AgentBuildCtx<'_> {
 /// either transition.
 pub(crate) struct PendingMainTurn {
     prompt: String,
+    user: Option<crate::session::user::PersistedUserMessage>,
     session_id: compact_str::CompactString,
     session_before: SessionRollback,
     started_at: Option<compact_str::CompactString>,
@@ -228,6 +229,7 @@ impl PendingMainTurn {
     pub(crate) fn capture(session: &Session, prompt: &str) -> Self {
         Self {
             prompt: prompt.to_string(),
+            user: None,
             session_id: session.id.clone(),
             session_before: SessionRollback {
                 messages_len: session.messages.len(),
@@ -250,6 +252,23 @@ impl PendingMainTurn {
 
     pub(crate) fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn set_user(&mut self, user: Option<crate::session::user::PersistedUserMessage>) {
+        self.user = user;
+    }
+
+    pub(crate) fn user(&self) -> Option<&crate::session::user::PersistedUserMessage> {
+        self.user.as_ref()
+    }
+
+    pub(crate) fn input(&self) -> crate::agent::input::PromptInput {
+        #[cfg(feature = "multimodal")]
+        if let Some(user) = &self.user {
+            return crate::agent::input::PromptInput::user(user.clone());
+        }
+        crate::agent::input::PromptInput::text(self.prompt.clone())
     }
 
     pub(crate) fn record_started(&mut self, timestamp: compact_str::CompactString) {

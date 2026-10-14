@@ -2090,6 +2090,58 @@ impl<'a> App<'a> {
         }
     }
 
+    #[cfg(feature = "multimodal")]
+    fn clipboard_image_allowed(&self) -> bool {
+        !self.run.is_running
+            && self.run.pending_turn.is_none()
+            && self.permission_prompt.is_none()
+            && self.question_prompt.is_none()
+            && self.renderer.chain_prompt.is_none()
+            && !self.renderer.chain_but_mode
+            && !self.input.picker.as_ref().is_some_and(Picker::active)
+    }
+
+    #[cfg(feature = "multimodal")]
+    async fn paste_clipboard_image(
+        &mut self,
+        reader: &dyn super::clipboard_image::ClipboardImageReader,
+    ) -> anyhow::Result<bool> {
+        if !self.clipboard_image_allowed() {
+            return Ok(false);
+        }
+        let session_id = self.ui.session.id.clone();
+        let workspace = self.ui.workspace.clone();
+        let result = reader.read(&self.ui.sandbox).await;
+        if self.ui.session.id != session_id
+            || !Arc::ptr_eq(&workspace, &self.ui.workspace)
+            || workspace.validate().is_err()
+            || !self.clipboard_image_allowed()
+        {
+            self.renderer.write_line(
+                "clipboard image was not attached: session or workspace changed",
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
+        match result.and_then(|image| {
+            image
+                .map(|image| {
+                    super::clipboard_image::stage_image(&mut self.ui.session.pending_media, image)
+                })
+                .transpose()
+        }) {
+            Ok(Some(_label)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(error) => {
+                self.renderer.write_line(
+                    &format!("clipboard image was not attached: {error}"),
+                    C_ERROR,
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
     fn refresh(&mut self) -> io::Result<()> {
         self.input.set_file_workspace(self.ui.workspace.clone());
         self.sync_live_model_names(false);
@@ -2590,6 +2642,16 @@ impl<'a> App<'a> {
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
             }
             UserEvent::Paste(data) => {
+                #[cfg(feature = "multimodal")]
+                if data.is_empty() && self.clipboard_image_allowed() {
+                    crate::startup::heap_future(|| {
+                        self.paste_clipboard_image(&super::clipboard_image::SystemClipboard)
+                    })
+                    .await?;
+                } else {
+                    self.input.handle_paste(data);
+                }
+                #[cfg(not(feature = "multimodal"))]
                 self.input.handle_paste(data);
             }
             #[cfg(feature = "goal")]
@@ -2614,6 +2676,16 @@ impl<'a> App<'a> {
                         return Ok(ControlFlow::Continue(()));
                     }
                     Some(KeyAction::PasteClipboard) => {
+                        #[cfg(feature = "multimodal")]
+                        if self.clipboard_image_allowed()
+                            && crate::startup::heap_future(|| {
+                                self.paste_clipboard_image(&super::clipboard_image::SystemClipboard)
+                            })
+                            .await?
+                        {
+                            self.refresh()?;
+                            return Ok(ControlFlow::Continue(()));
+                        }
                         match read_from_clipboard() {
                             Ok(text) => self.input.handle_paste(text),
                             Err(error) => self.renderer.write_line(
@@ -3004,7 +3076,25 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        let submitted = if self.renderer.chain_but_mode || picker_owned_key {
+        #[cfg(feature = "multimodal")]
+        let clipboard_only = self.clipboard_image_allowed()
+            && self.input.buffer.trim().is_empty()
+            && self.input.keybindings.action(key, true) == Some(KeyAction::Submit)
+            && self.ui.session.pending_media.iter().any(|item| {
+                matches!(
+                    item,
+                    crate::extras::multimodal::MediaAttachment::Image {
+                        clipboard: Some(_),
+                        ..
+                    }
+                )
+            });
+        #[cfg(not(feature = "multimodal"))]
+        let clipboard_only = false;
+        let submitted = if clipboard_only {
+            self.input.clear_buffer();
+            Some(compact_str::CompactString::new(""))
+        } else if self.renderer.chain_but_mode || picker_owned_key {
             self.input.handle_operator_draft_key(key)
         } else {
             self.input.handle_key(key)
@@ -3039,7 +3129,12 @@ impl<'a> App<'a> {
                 return Ok(());
             }
 
-            match classify_submission(self.run.is_running, &text, &self.ui.context.prompts) {
+            let submission = if clipboard_only {
+                super::SubmitAction::Run
+            } else {
+                classify_submission(self.run.is_running, &text, &self.ui.context.prompts)
+            };
+            match submission {
                 super::SubmitAction::Run => {}
                 super::SubmitAction::Ignore => {
                     return Ok(());
@@ -4278,6 +4373,20 @@ impl<'a> App<'a> {
         text: &str,
         question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "multimodal")]
+        if let Err(error) =
+            super::clipboard_image::user_message(&self.ui.session.pending_media, text)
+        {
+            self.input.load_text(text);
+            self.renderer.write_line(
+                &format!(
+                    "Image message not started: {}",
+                    sanitize_output(&error.to_string())
+                ),
+                C_ERROR,
+            )?;
+            return Ok(());
+        }
         #[cfg(feature = "mcp")]
         if self
             .mcp_admin
@@ -4322,6 +4431,18 @@ impl<'a> App<'a> {
             .session
             .is_irreducible_with_pending(reserve, pending_tokens)
         {
+            #[cfg(feature = "multimodal")]
+            if self.ui.session.pending_media.iter().any(|item| {
+                matches!(
+                    item,
+                    crate::extras::multimodal::MediaAttachment::Image {
+                        clipboard: Some(_),
+                        ..
+                    }
+                )
+            }) {
+                self.input.load_text(text);
+            }
             let available = self
                 .ui
                 .session
@@ -5212,7 +5333,8 @@ impl<'a> App<'a> {
                             path,
                             self.ui.cli.resolve_no_context_files(self.ui.cfg),
                         )?;
-                        self.refresh_worktree_workspace_context().await?;
+                        crate::startup::heap_future(|| self.refresh_worktree_workspace_context())
+                            .await?;
                         self.renderer.write_line(
                             &format!(
                                 "worktree created: branch '{}' at {}",
@@ -5223,8 +5345,10 @@ impl<'a> App<'a> {
                         )?;
                     }
                     crate::extras::git_worktree::DeferredWorktreeAction::Merge { info, target } => {
-                        self.handle_worktree_merge(info.clone(), target.clone(), true)
-                            .await?;
+                        crate::startup::heap_future(|| {
+                            self.handle_worktree_merge(info.clone(), target.clone(), true)
+                        })
+                        .await?;
                     }
                     crate::extras::git_worktree::DeferredWorktreeAction::Exit { main_path } => {
                         super::rebind_worktree_workspace(
@@ -5290,24 +5414,26 @@ impl<'a> App<'a> {
                             None,
                         ));
                 }
-                let agent = self.run.agent.as_ref().unwrap().clone();
-                #[cfg(feature = "agent-skills")]
-                let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
-                let runner = agent
-                    .with_spend_for_session(
-                        self.ui.session,
-                        self.ui.cfg,
-                        crate::spend::RequestKind::Turn,
-                    )
-                    .with_question_turn(self.run.question_turn.clone())
-                    .spawn_runner(
-                        prompt,
-                        history,
-                        self.ui.cfg.retry.clone(),
-                        #[cfg(feature = "hooks")]
-                        None,
-                    )
-                    .await;
+                let runner = crate::startup::heap_future(|| {
+                    let agent = self.run.agent.as_ref().unwrap().clone();
+                    #[cfg(feature = "agent-skills")]
+                    let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
+                    agent
+                        .with_spend_for_session(
+                            self.ui.session,
+                            self.ui.cfg,
+                            crate::spend::RequestKind::Turn,
+                        )
+                        .with_question_turn(self.run.question_turn.clone())
+                        .spawn_runner(
+                            prompt,
+                            history,
+                            self.ui.cfg.retry.clone(),
+                            #[cfg(feature = "hooks")]
+                            None,
+                        )
+                })
+                .await;
                 self.run.compaction_decision_tx = runner.compaction_decision_tx;
                 self.run.agent_rx = Some(runner.event_rx);
                 self.run.main_abort = Some(runner.abort_handle);
@@ -5411,24 +5537,26 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
-                    let agent = self.run.agent.as_ref().unwrap().clone();
-                    #[cfg(feature = "agent-skills")]
-                    let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
-                    let runner = agent
-                        .with_spend_for_session(
-                            self.ui.session,
-                            self.ui.cfg,
-                            crate::spend::RequestKind::Turn,
-                        )
-                        .with_question_turn(self.run.question_turn.clone())
-                        .spawn_runner(
-                            prompt,
-                            Vec::new(),
-                            self.ui.cfg.retry.clone(),
-                            #[cfg(feature = "hooks")]
-                            None,
-                        )
-                        .await;
+                    let runner = crate::startup::heap_future(|| {
+                        let agent = self.run.agent.as_ref().unwrap().clone();
+                        #[cfg(feature = "agent-skills")]
+                        let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
+                        agent
+                            .with_spend_for_session(
+                                self.ui.session,
+                                self.ui.cfg,
+                                crate::spend::RequestKind::Turn,
+                            )
+                            .with_question_turn(self.run.question_turn.clone())
+                            .spawn_runner(
+                                prompt,
+                                Vec::new(),
+                                self.ui.cfg.retry.clone(),
+                                #[cfg(feature = "hooks")]
+                                None,
+                            )
+                    })
+                    .await;
                     self.run.compaction_decision_tx = runner.compaction_decision_tx;
                     self.run.agent_rx = Some(runner.event_rx);
                     self.run.main_abort = Some(runner.abort_handle);
@@ -6073,7 +6201,8 @@ impl<'a> App<'a> {
                 )
                 .await?;
                 if refresh_ui {
-                    self.refresh_worktree_workspace_context().await?;
+                    crate::startup::heap_future(|| self.refresh_worktree_workspace_context())
+                        .await?;
                 }
                 match merge_result {
                     Ok(()) => {
@@ -6130,7 +6259,10 @@ impl<'a> App<'a> {
                             self.ui.cli.resolve_no_context_files(self.ui.cfg),
                         )?;
                         if refresh_ui {
-                            self.refresh_worktree_workspace_context().await?;
+                            crate::startup::heap_future(|| {
+                                self.refresh_worktree_workspace_context()
+                            })
+                            .await?;
                         }
                         let _ = self.renderer.write_line(
                             "merge aborted, restored original state; worktree and branch retained",
@@ -6148,7 +6280,10 @@ impl<'a> App<'a> {
                             self.ui.cli.resolve_no_context_files(self.ui.cfg),
                         )?;
                         if refresh_ui {
-                            self.refresh_worktree_workspace_context().await?;
+                            crate::startup::heap_future(|| {
+                                self.refresh_worktree_workspace_context()
+                            })
+                            .await?;
                         }
                         let _ = self.renderer.write_line(
                             &format!(
@@ -6554,6 +6689,7 @@ mod initial_turn_tests {
                 path: std::path::PathBuf::from("attachment.png"),
                 data: vec![1, 2, 3, 4],
                 mime: "image/png".into(),
+                clipboard: None,
             });
         let mut pending = PendingMainTurn::capture(&session, "describe attachment");
         assert_eq!(pending.take_pending_media(&mut session).len(), 1);
@@ -8383,6 +8519,146 @@ mod permission_loop_tests {
         crate::session::lock::release_session(&fork_id);
     }
 
+    #[cfg(feature = "multimodal")]
+    #[tokio::test]
+    async fn clipboard74_actual_app_stages_drops_and_restores_typed_draft_without_modal_reads() {
+        use super::super::clipboard_image::{self, ClipboardImage, ClipboardImageReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct FakeClipboard(AtomicUsize);
+        impl ClipboardImageReader for FakeClipboard {
+            fn read<'a>(
+                &'a self,
+                _sandbox: &'a crate::sandbox::Sandbox,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = io::Result<Option<ClipboardImage>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    clipboard_image::decode_png(clipboard_image::tests::png()).map(Some)
+                })
+            }
+        }
+        let root = crate::tests::OwnedTestDirectory::new("clipboard74-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut cfg = fixture_config();
+        cfg.max_budget_usd = Some(0.0);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        app.input.buffer = "literal 雪".into();
+        app.input.cursor = app.input.buffer.len();
+        let reader = FakeClipboard(AtomicUsize::new(0));
+        assert!(
+            crate::startup::heap_future(|| app.paste_clipboard_image(&reader))
+                .await
+                .unwrap()
+        );
+        assert_eq!(reader.0.load(Ordering::SeqCst), 1);
+        assert_eq!(app.input.buffer, "literal 雪");
+        assert_eq!(app.input.cursor, "literal 雪".len());
+        assert_eq!(app.ui.session.pending_media.len(), 1);
+        assert!(app.ui.session.messages.is_empty());
+        assert!(!app.run.is_running);
+        app.refresh().unwrap();
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("[image 1: 1x1 png]")
+        );
+        crate::startup::heap_future(|| app.run_slash_command("/drop 0"))
+            .await
+            .unwrap();
+        assert!(app.ui.session.pending_media.is_empty());
+        assert!(clipboard_image::labels(&app.ui.session.pending_media).is_empty());
+        assert!(
+            crate::startup::heap_future(|| app.paste_clipboard_image(&reader))
+                .await
+                .unwrap()
+        );
+
+        let user = clipboard_image::user_message(&app.ui.session.pending_media, &app.input.buffer)
+            .unwrap();
+        let mut pending = PendingMainTurn::capture(app.ui.session, &app.input.buffer);
+        pending.set_user(user.clone());
+        pending.take_pending_media(app.ui.session);
+        assert!(app.ui.session.pending_media.is_empty());
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        assert_eq!(app.ui.session.messages.len(), 1);
+        assert_eq!(app.ui.session.messages[0].user, user);
+        assert!(
+            !app.run
+                .pending_turn
+                .as_ref()
+                .unwrap()
+                .has_progress(app.ui.session, "", &[])
+        );
+        assert_eq!(
+            crate::ui::rollback_pending_main_turn(&mut app.run, app.ui.session).unwrap(),
+            "literal 雪"
+        );
+        assert_eq!(app.ui.session.pending_media.len(), 1);
+        assert!(app.ui.session.messages.is_empty());
+        assert_eq!(app.input.buffer, "literal 雪");
+        let reads = reader.0.load(Ordering::SeqCst);
+        app.run.is_running = true;
+        assert!(!app.paste_clipboard_image(&reader).await.unwrap());
+        app.run.is_running = false;
+        app.input.start_command_picker();
+        assert!(!app.paste_clipboard_image(&reader).await.unwrap());
+        app.input.picker = None;
+        app.renderer.chain_prompt = Some(ChainPrompt {
+            question: "operator approval".into(),
+        });
+        assert!(!app.paste_clipboard_image(&reader).await.unwrap());
+        assert_eq!(reader.0.load(Ordering::SeqCst), reads);
+        assert!(app.run.agent_rx.is_none());
+        app.renderer.chain_prompt = None;
+        let too_long = "x".repeat(crate::session::user::MAX_USER_TEXT_BYTES + 1);
+        crate::startup::heap_future(|| {
+            app.start_main_run_prepared(&too_long, crate::question::QuestionOrigin::NewUserTurn)
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.input.buffer.as_str(), too_long);
+        assert_eq!(app.ui.session.pending_media.len(), 1);
+        assert!(app.ui.session.messages.is_empty());
+        assert!(!app.run.is_running);
+        assert!(app.run.agent_rx.is_none());
+        app.input.clear_buffer();
+        let before = app.renderer.captured_output();
+        crate::startup::heap_future(|| {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        })
+        .await
+        .unwrap();
+        let after = app.renderer.captured_output();
+        assert!(
+            after[before.len()..].contains("USD budget: further model requests/effects stopped"),
+            "image-only Enter must enter ordinary budget admission"
+        );
+        assert_eq!(app.ui.session.pending_media.len(), 1);
+        assert!(app.ui.session.messages.is_empty());
+        assert!(!app.run.is_running);
+        assert!(app.run.agent_rx.is_none());
+    }
+
     #[tokio::test]
     async fn actual_mode_cycle_preserves_drafts_queue_and_unanswered_permission() {
         use crate::permission::{SecurityMode, checker::PermissionChecker};
@@ -9638,6 +9914,94 @@ mod workspace_session_picker_tests {
                         );
                         assert!(app.renderer.captured_output().contains("ONE_MIB_SAVED_ROW"));
                         assert!(app.input.picker.is_none());
+                    }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[cfg(all(feature = "git-worktree", feature = "mcp"))]
+    #[test]
+    fn worktree116_actual_app_switch_and_mcp_rebind_run_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .name("worktree-mcp-one-mib".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::startup::heap_future(|| async {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        #[cfg(feature = "hooks")]
+                        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+                        let root = crate::tests::OwnedTestDirectory::new("worktree116");
+                        let bindings = ["ZS_CONFIG_DIR", "ZS_DATA_DIR", "ZS_LOCAL_DATA_DIR", "ZS_STATE_DIR", "ZS_CACHE_DIR", "ZS_CREDENTIALS_DIR"]
+                            .map(|name| (name, Some(root.path().join(name).into_os_string())));
+                        let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
+                        let repository = root.path().join("repository");
+                        let base = root.path().join("worktrees");
+                        std::fs::create_dir(&repository).unwrap();
+                        std::fs::create_dir(&base).unwrap();
+                        let git = crate::git::runner::GitRunner::default();
+                        for arguments in [vec!["init", "-b", "main"], vec!["-c", "user.name=Owned116", "-c", "user.email=owned116@example.invalid", "commit", "--allow-empty", "-m", "initial"]] {
+                            git.run(&repository, "worktree116 fixture", arguments, crate::git::runner::QUERY_LIMITS).await.unwrap();
+                        }
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let address = listener.local_addr().unwrap();
+                        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let observed = requests.clone();
+                        let (stop, mut server_stop) = tokio::sync::oneshot::channel::<()>();
+                        // Poll the owned loopback responder in this same join, with no detached task.
+                        let server = async move {
+                            loop {
+                                let accepted = tokio::select! {
+                                    _ = &mut server_stop => break,
+                                    result = listener.accept() => result.unwrap(),
+                                };
+                                let (mut stream, _) = accepted;
+                                let mut bytes = Vec::new();
+                                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                                    let mut chunk = [0; 1024];
+                                    let count = stream.read(&mut chunk).await.unwrap();
+                                    assert_ne!(count, 0);
+                                    bytes.extend_from_slice(&chunk[..count]);
+                                    assert!(bytes.len() <= 16 * 1024);
+                                }
+                                assert!(bytes.starts_with(b"POST /mcp "), "only MCP initialize is expected");
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                            }
+                        };
+                        let cli = crate::cli::Cli { no_session: true, no_context_files: true, no_tools: true, wt_base_dir: Some(base.to_str().unwrap().to_owned()), ..Default::default() };
+                        let cfg: config::Config = serde_json::from_value(serde_json::json!({
+                            "session_title_model":"off", "lsp":{"enabled":false},
+                            "mcp_servers":{"owned116":{"url":format!("http://{address}/mcp"),"allow_local":true}},
+                            "custom_providers":{"owned116":{"provider_type":"openai","base_url":"http://127.0.0.1:9/v1","api_style":"completions"}}
+                        })).unwrap();
+                        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&repository).unwrap());
+                        let mut session = Session::new("owned116", "unused-model", 128_000, repository.to_str().unwrap());
+                        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+                        let client = crate::provider::create_client("owned116", Some("unused-local-key"), &cfg.custom_providers_map(), cfg.api_keys.as_ref()).unwrap();
+                        let ui = UiContext::new(&cli, &cfg, &mut session, &mut context, workspace.clone(), client, None, None, crate::sandbox::Sandbox::new(false,"none").with_workspace_binding(workspace), None);
+                        let mut app = fixture_app(ui);
+                        app.deferred_user_events.extend([
+                            UserEvent::Paste("/worktree owned116".into()),
+                            UserEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            UserEvent::Quit,
+                        ]);
+                        let run = async {
+                            let result = crate::startup::heap_future(|| app.run_inner()).await;
+                            let _ = stop.send(());
+                            result
+                        };
+                        let (_, result) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(server, run) }).await.unwrap();
+                        result.unwrap();
+                        assert!(requests.load(Ordering::SeqCst) > 0, "actual MCP handshake path must be polled");
+                        assert_eq!(app.ui.workspace.root(), base.join("owned116"));
+                        app.ui.workspace.validate().unwrap();
+                        assert!(app.renderer.captured_output().contains("worktree created: branch 'owned116'"));
+                        assert!(!app.run.is_running && app.run.agent_rx.is_none());
                     }));
             })
             .unwrap()
