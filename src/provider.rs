@@ -2943,13 +2943,29 @@ impl AnyAgent {
         self.instructions = Some(services);
         self
     }
-    #[cfg(all(feature = "agent-skills", feature = "subagents"))]
-    pub(crate) fn without_instruction_context(mut self) -> Self {
-        self.instructions = None;
-        self.instruction_turn = None;
+    #[cfg(feature = "subagents")]
+    pub(crate) fn for_subagent_report_repair(mut self) -> Self {
+        #[cfg(feature = "agent-skills")]
+        {
+            self.instructions = None;
+            self.instruction_turn = None;
+        }
         #[cfg(feature = "skills")]
         {
             self.skills = None;
+        }
+        fn guard<M: rig::completion::CompletionModel>(agent: &mut Agent<M>) {
+            agent
+                .hooks
+                .push(crate::extras::subagents::builder::ReportRepairGuard);
+        }
+        match &mut self.inner {
+            AnyAgentInner::OpenRouter(agent) => guard(agent),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => guard(agent),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => guard(agent),
+            AnyAgentInner::Anthropic(agent) => guard(agent),
+            AnyAgentInner::Gemini(agent) => guard(agent),
+            AnyAgentInner::Ollama(agent) => guard(agent),
         }
         self
     }
@@ -3515,102 +3531,102 @@ impl AnyAgent {
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
     ) -> runner::SubagentRunOutput {
+        let future = crate::startup::heap_future(|| async {
+            #[cfg(feature = "skills")]
+            let _turn_guard = if self.skills.is_some() {
+                Some(self.turn_gate.lock().await)
+            } else {
+                None
+            };
+            #[cfg(feature = "agent-skills")]
+            let inner =
+                match crate::startup::heap_future(|| self.prepared_instruction_inner(prompt)).await
+                {
+                    Ok(inner) => inner,
+                    Err(error) => {
+                        return runner::SubagentRunOutput {
+                            response: Err(error),
+                            usage: Default::default(),
+                        };
+                    }
+                };
+            let prompt = prompt.to_string();
+            #[cfg(not(feature = "agent-skills"))]
+            let inner = &self.inner;
+            match &inner {
+                AnyAgentInner::OpenRouter(a) => {
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
+                }
+                AnyAgentInner::OpenAI(a) => match a {
+                    OpenAiAgent::Responses(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
+                    OpenAiAgent::Completions(a) => {
+                        runner::run_subagent(
+                            a,
+                            &prompt,
+                            max_turns,
+                            event_tx,
+                            retry_config,
+                            usage_ledger,
+                        )
+                        .await
+                    }
+                },
+                AnyAgentInner::Anthropic(a) => {
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
+                }
+                AnyAgentInner::Gemini(a) => {
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
+                }
+                AnyAgentInner::Ollama(a) => {
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
+                }
+            }
+        });
         let future = crate::spend::run::scope(
             self.spend.clone().or_else(crate::spend::run::Run::current),
-            async {
-                #[cfg(feature = "skills")]
-                let _turn_guard = if self.skills.is_some() {
-                    Some(self.turn_gate.lock().await)
-                } else {
-                    None
-                };
-                #[cfg(feature = "agent-skills")]
-                let inner =
-                    match crate::startup::heap_future(|| self.prepared_instruction_inner(prompt))
-                        .await
-                    {
-                        Ok(inner) => inner,
-                        Err(error) => {
-                            return runner::SubagentRunOutput {
-                                response: Err(error),
-                                usage: Default::default(),
-                            };
-                        }
-                    };
-                let prompt = prompt.to_string();
-                #[cfg(not(feature = "agent-skills"))]
-                let inner = &self.inner;
-                match &inner {
-                    AnyAgentInner::OpenRouter(a) => {
-                        runner::run_subagent(
-                            a,
-                            &prompt,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                        )
-                        .await
-                    }
-                    AnyAgentInner::OpenAI(a) => match a {
-                        OpenAiAgent::Responses(a) => {
-                            runner::run_subagent(
-                                a,
-                                &prompt,
-                                max_turns,
-                                event_tx,
-                                retry_config,
-                                usage_ledger,
-                            )
-                            .await
-                        }
-                        OpenAiAgent::Completions(a) => {
-                            runner::run_subagent(
-                                a,
-                                &prompt,
-                                max_turns,
-                                event_tx,
-                                retry_config,
-                                usage_ledger,
-                            )
-                            .await
-                        }
-                    },
-                    AnyAgentInner::Anthropic(a) => {
-                        runner::run_subagent(
-                            a,
-                            &prompt,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                        )
-                        .await
-                    }
-                    AnyAgentInner::Gemini(a) => {
-                        runner::run_subagent(
-                            a,
-                            &prompt,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                        )
-                        .await
-                    }
-                    AnyAgentInner::Ollama(a) => {
-                        runner::run_subagent(
-                            a,
-                            &prompt,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                        )
-                        .await
-                    }
-                }
-            },
+            future,
         );
         crate::question::scope(None, future).await
     }

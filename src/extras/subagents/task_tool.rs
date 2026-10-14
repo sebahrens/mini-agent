@@ -311,6 +311,7 @@ fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolErro
 
 #[derive(Clone, Debug)]
 struct ResolvedSpecialization {
+    write_mode: bool,
     prompt: String,
     result_notice: Option<String>,
     #[cfg(any(test, feature = "hooks"))]
@@ -399,6 +400,7 @@ fn resolve_persona_runtime(
         provider_name: resolved_provider,
         max_turns: specialization.max_turns(max_turns),
         execution: builder::PersonaExecution {
+            write_mode: specialization.write_mode,
             tools: specialization.tools.clone(),
             // The same global or quick-model `extra_body` the main agent
             // would send for this model; persona params are merged on top.
@@ -440,6 +442,7 @@ fn resolve_specialization(
     #[cfg(any(test, feature = "hooks"))]
     let source = definition.source_description(agent_type);
     Ok(Some(ResolvedSpecialization {
+        write_mode: definition.mode.as_deref() == Some("write"),
         prompt: definition.prompt,
         result_notice,
         #[cfg(any(test, feature = "hooks"))]
@@ -471,6 +474,7 @@ fn permission_input(
 }
 
 pub struct TaskTool {
+    write_tools: Option<builder::WriteChildTools>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
@@ -497,6 +501,7 @@ impl TaskTool {
         deny_repeated_reads: bool,
     ) -> Self {
         Self {
+            write_tools: None,
             permission,
             ask_tx,
             workspace: None,
@@ -512,6 +517,11 @@ impl TaskTool {
             #[cfg(feature = "js")]
             read_only_js: None,
         }
+    }
+
+    pub(crate) fn with_write_tools(mut self, tools: builder::WriteChildTools) -> Self {
+        self.write_tools = Some(tools);
+        self
     }
 
     pub(crate) fn with_response_max_tokens(mut self, max_tokens: u64) -> Self {
@@ -586,7 +596,7 @@ impl Tool for TaskTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Search and investigate the codebase via a fresh-context, read-only investigation subagent. \
+        "Delegate work via a fresh-context subagent, read-only by default. A trusted mode: write persona may implement edits only when [subagents] allow_write = true; the parent permissions and sandbox still apply. \
 Use for any cross-file question: where is X used, how does Y work, \
 find/list/count all X across the codebase, what calls Z, audit Q. \
 The subagent uses its configured subset of read, grep, file discovery, \
@@ -656,7 +666,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
-                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Every specialist runs as a read-only investigation subagent: its persona changes focus, never write access or tools beyond the read-only set. Available specialists:\n{specialist_descriptions}")
+                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time. Available specialists:\n{specialist_descriptions}")
                 }
             },
             // Exclusivity is stated in the descriptions and enforced by
@@ -696,14 +706,14 @@ editing in a known location, grepping for a literal you will act on immediately.
             config
         };
 
-        let limits = limits.validate()?;
+        let mut limits = limits.validate()?;
         let prompts = prepare_task_prompts(&args, limits)?;
 
         let agent_type = args.agent_type.clone();
         let permission_source = agent_type.as_deref().map(|agent_type| {
             crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
         });
-        let permission_input = permission_input(
+        let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
             permission_source.as_deref(),
@@ -713,7 +723,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             &self.permission,
             &self.ask_tx,
             Self::NAME,
-            &permission_input,
+            &delegation_input,
         )
         .await?;
 
@@ -721,6 +731,33 @@ editing in a known location, grepping for a literal you will act on immediately.
         // not read them until the delegation itself has been authorized.
         let specialization =
             resolve_specialization(agent_type.as_deref(), self.workspace.as_deref())?;
+        let write_mode = specialization
+            .as_ref()
+            .is_some_and(|persona| persona.write_mode);
+        if write_mode {
+            if !config
+                .subagents
+                .as_ref()
+                .is_some_and(|policy| policy.allow_write)
+            {
+                return Err(ToolError::Msg(
+                    "task: write personas require [subagents] allow_write = true".into(),
+                ));
+            }
+            if self.write_tools.is_none() || self.workspace.is_none() {
+                return Err(ToolError::Msg("task: write persona requires the parent's captured workspace and tool environment".into()));
+            }
+            let input = permission_input(
+                &prompts,
+                agent_type.as_deref(),
+                permission_source.as_deref(),
+                Some(
+                    "write-capable child: eligible write/edit/shell tools; parent's permissions and sandbox; one child at a time",
+                ),
+            );
+            check_perm(&self.permission, &self.ask_tx, Self::NAME, &input).await?;
+            limits.max_concurrency = 1;
+        }
         #[cfg(feature = "hooks")]
         let (hook_agent_type, hook_agent_source) =
             hook_identity(agent_type.as_deref(), specialization.as_ref());
@@ -823,7 +860,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             self.deny_repeated_reads,
         )
         .with_workspace_binding(self.workspace.clone())
-        .with_workspace_instructions(self.instructions.clone());
+        .with_workspace_instructions(self.instructions.clone())
+        .with_write_tools(if write_mode {
+            self.write_tools.clone()
+        } else {
+            None
+        });
+        let child_name = agent_type.clone().unwrap_or_else(|| "explore".into());
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, containment_status)) = read_only_js {
             authorization.with_read_only_js(sandbox, containment_status, &config)
@@ -848,6 +891,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .as_ref()
                 .map(|services| services.fork_for_read_only_child());
             let specialization = specialization.clone();
+            let child_name = child_name.clone();
             #[cfg(feature = "hooks")]
             let hook_agent_type = hook_agent_type.clone();
             #[cfg(feature = "hooks")]
@@ -878,7 +922,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     cache_split_required,
                 )
             });
-            let future = Box::pin(async move {
+            let future = crate::startup::heap_future(|| async move {
                 if let Some(spend) = &spend_profile
                     && let Err(error) = spend.admit()
                 {
@@ -973,10 +1017,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 if let Ok(response) = run.response.as_ref() {
                     let violations = report_contract_violations(response);
                     if !violations.is_empty() {
-                        #[cfg(feature = "agent-skills")]
-                        let repair_agent = agent.clone().without_instruction_context();
-                        #[cfg(not(feature = "agent-skills"))]
-                        let repair_agent = agent.clone();
+                        let repair_agent = agent.clone().for_subagent_report_repair();
                         let repair = repair_agent
                             .run_subagent(
                                 &report_repair_prompt(response, &violations),
@@ -1005,6 +1046,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 );
                 ChildExecution { output, cost_units }
             });
+            let future = Box::pin(crate::permission::ask::scope_subagent(
+                child_name, write_mode, future,
+            ));
             ScheduledChild {
                 future,
                 cancellation_cost,
@@ -1962,11 +2006,9 @@ mod tests {
         assert!(names.iter().any(|name| name == "rust-security-review"));
         let description = agent_type["description"].as_str().unwrap();
         assert!(description.contains("rust-security-review:"));
-        assert!(description.contains("read-only investigation subagent"));
-        assert!(
-            tool.description()
-                .contains("read-only investigation subagent")
-        );
+        assert!(description.contains("read-only by default"));
+        assert!(description.contains("allow_write = true"));
+        assert!(tool.description().contains("read-only by default"));
         assert_eq!(description.lines().count(), names.len() + 1);
         assert!(crate::agent::prompt::TASK_TOOL_PROMPT.contains("agent_type"));
         assert_eq!(
@@ -2165,6 +2207,7 @@ mod tests {
     #[test]
     fn hook_identity_uses_the_resolved_specialist_and_source() {
         let specialization = ResolvedSpecialization {
+            write_mode: false,
             prompt: "review carefully".into(),
             result_notice: None,
             source: "trusted project override /workspace/.zerostack/agents/review.md".into(),
@@ -2188,12 +2231,70 @@ mod tests {
 
     fn runtime_specialization() -> ResolvedSpecialization {
         ResolvedSpecialization {
+            write_mode: false,
             prompt: "review carefully".into(),
             result_notice: None,
             source: "compiled-in default".into(),
             tools: Some(vec![crate::context::agents::AgentTool::Read]),
             model: Some("fast-review".into()),
             turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_persona_requires_global_opt_in_and_captured_parent_environment() {
+        let root = crate::tests::OwnedTestDirectory::new("write-persona-opt-in");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+        ]);
+        let paths = crate::paths::process_paths().unwrap();
+        crate::paths::ensure_private_directory(&paths.agents_dir()).unwrap();
+        crate::fs::private_atomic_write_sync(&paths.agents_dir().join("implementer.md"),
+            b"---\nmode: write\ntools: Read, Edit, Write, Bash\n---\nImplement the delegated objective.").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let definition =
+            crate::context::agents::lookup_for_workspace("implementer", Some(&workspace)).unwrap();
+        assert_eq!(definition.tools.as_ref().unwrap().len(), 4);
+        for allow in [false, true] {
+            let mut config = crate::config::Config::default();
+            config.subagents = Some(crate::config::types::SubagentPolicy { allow_write: allow });
+            let client = crate::provider::create_client(
+                "openrouter",
+                Some("unused-local-test-key"),
+                &config.custom_providers_map(),
+                None,
+            )
+            .unwrap();
+            let configured = crate::extras::subagents::SubagentConfig {
+                client,
+                provider_name: "openrouter".into(),
+                model_name: "test/model".into(),
+                fallback_notice: None,
+                api_key: None,
+                max_turns: 2,
+                config,
+            };
+            let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
+            let args = serde_json::from_value(serde_json::json!({"prompts":["edit the selected file"],"agent_type":"implementer"})).unwrap();
+            let error = crate::extras::subagents::scope_test_config(configured, task.call(args))
+                .await
+                .unwrap_err()
+                .to_string();
+            if allow {
+                assert!(
+                    error.contains("parent's captured workspace and tool environment"),
+                    "{error}"
+                );
+            } else {
+                assert!(error.contains("allow_write = true"), "{error}");
+            }
         }
     }
 

@@ -113,3 +113,26 @@ async fn subagent_stop_block_forces_continuation_with_reason() {
         SubagentStopGate::Release => panic!("expected Continue"),
     }
 }
+
+#[cfg(all(feature = "subagents", unix))]
+#[tokio::test]
+async fn subagent_start_reports_actual_read_and_write_modes() {
+    let dispatcher = dispatcher_with(
+        "SubagentStart",
+        None,
+        vec![handler(
+            r#"input=$(cat); case "$input" in *'"agent_mode":"write"'*) echo '{"additionalContext":"write"}';; *) echo '{"additionalContext":"read"}';; esac"#,
+        )],
+    );
+    let context = ctx();
+    for (write, expected) in [(false, "read"), (true, "write")] {
+        let extra = crate::permission::ask::scope_subagent(
+            "implementer".into(),
+            write,
+            gate_subagent_start(&dispatcher, &context, "implementer", "user-global"),
+        )
+        .await;
+        assert_eq!(extra.as_deref(), Some(expected));
+    }
+    assert_eq!(crate::permission::ask::subagent_mode(), "read");
+}

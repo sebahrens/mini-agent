@@ -14,3 +14,7 @@ rs = "rustfmt {file}"
 read = ["private/**"]
 [lsp]
 enabled = "auto"
+
+# Optional implementation personas; each definition must also select mode: write.
+[subagents]
+allow_write = false

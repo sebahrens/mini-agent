@@ -615,6 +615,7 @@ async fn resolve_permission(
             if ask_tx
                 .send(
                     AskRequest {
+                    agent_name: crate::permission::ask::subagent_name(),
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),
                     #[cfg(feature = "acp")]

@@ -275,6 +275,10 @@ impl PermissionState {
                 workspace.root().display()
             ));
         }
+        let header = match &request.agent_name {
+            Some(name) => format!("[subagent: {name}] {header}"),
+            None => header,
+        };
         let header = sanitize_for_review(&header);
         let options = sanitize_for_review(&options);
         renderer.write_line(&header, C_PERM)?;

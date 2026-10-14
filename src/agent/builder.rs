@@ -1070,6 +1070,20 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             .with_workspace_binding(workspace.clone())
             .with_workspace_instructions(instructions.clone())
             .with_response_max_tokens(cli.resolve_max_tokens(cfg));
+            let task_tool =
+                task_tool.with_write_tools(crate::extras::subagents::builder::WriteChildTools {
+                    sandbox: sandbox.clone(),
+                    write_enabled: cli.tool_is_eligible(cfg, "write"),
+                    edit_enabled: cli.tool_is_eligible(cfg, "edit"),
+                    shell_enabled: shell_tool_enabled,
+                    max_text_file_size,
+                    max_shell_output_lines: max_bash_output_lines,
+                    shell_timeout_secs: cfg.resolve_shell_timeout_secs(),
+                    diff_options: cfg.mutation_diff_options(),
+                    formatter: formatter.clone(),
+                    #[cfg(feature = "lsp")]
+                    lsp: lsp_manager.clone(),
+                });
             #[cfg(feature = "agent-skills")]
             let task_tool =
                 task_tool.with_instruction_discovery_disabled(cli.resolve_no_context_files(cfg));

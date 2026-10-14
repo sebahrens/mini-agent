@@ -68,6 +68,13 @@ impl RoundCollector {
                     self.mutating_tool_calls += 1;
                 }
             }
+            #[cfg(feature = "subagents")]
+            AgentEvent::SubagentToolCall { name, .. } => {
+                self.tool_calls += 1;
+                if crate::agent::runner::tool_may_mutate_workspace(name.as_str()) {
+                    self.mutating_tool_calls += 1;
+                }
+            }
             AgentEvent::Verification { passed, .. } => {
                 self.verify_ran = true;
                 self.verify_passed = Some(*passed);
@@ -468,6 +475,23 @@ mod tests {
             summary.mutating_tool_calls, 1,
             "only the edit can have changed the workspace"
         );
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn the_collector_accounts_for_child_edits() {
+        let mut collector = RoundCollector::new();
+        collector.observe(&AgentEvent::SubagentToolCall {
+            name: "read".into(),
+            args: serde_json::json!({}),
+        });
+        collector.observe(&AgentEvent::SubagentToolCall {
+            name: "edit".into(),
+            args: serde_json::json!({}),
+        });
+        let summary = collector.finish(&goal(), RoundEnd::Done, 0);
+        assert_eq!(summary.tool_calls, 2);
+        assert_eq!(summary.mutating_tool_calls, 1);
     }
 
     /// Compaction run on the round's behalf is the round's spend

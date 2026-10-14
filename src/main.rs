@@ -578,8 +578,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     }
 
     startup.start_openrouter_pricing_refresh();
-    startup.init_features().await?;
-    let prompts = startup.resolve_prompts().await;
+    startup::heap_future(|| startup.init_features()).await?;
+    let prompts = startup::heap_future(|| startup.resolve_prompts()).await;
     startup.finish_openrouter_pricing_refresh().await;
     prompts?;
     startup::heap_future(|| startup.dispatch()).await

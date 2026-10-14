@@ -262,6 +262,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("deny_repeated_reads").shaped(ConfigShape::Bool),
     key("show_cost_always").described("Show the session cost in the status bar even when it is $0.0000 (e.g. when the model has no per-token pricing configured). Default: false.").shaped(ConfigShape::Bool),
     gated("subagents", "task_enabled").shaped(ConfigShape::Bool),
+    gated("subagents", "subagents").shaped(ConfigShape::Object),
     gated("subagents", "subagent_model").shaped(ConfigShape::String),
     gated("subagents", "subagent_provider").shaped(ConfigShape::String),
     key("colors").shaped(ConfigShape::Object),

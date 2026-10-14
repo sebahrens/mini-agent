@@ -23,6 +23,9 @@ pub(crate) enum AgentTool {
     Grep,
     FindFiles,
     ListDir,
+    Write,
+    Edit,
+    Shell,
     #[cfg(feature = "js")]
     Js,
     #[cfg(feature = "skills")]
@@ -45,6 +48,9 @@ impl AgentTool {
             "grep" => Some(Self::Grep),
             "glob" | "find" | "find_files" | "findfiles" => Some(Self::FindFiles),
             "list" | "list_dir" | "listdir" => Some(Self::ListDir),
+            "write" => Some(Self::Write),
+            "edit" => Some(Self::Edit),
+            "bash" | "shell" => Some(Self::Shell),
             #[cfg(feature = "js")]
             "js" | "javascript" => Some(Self::Js),
             #[cfg(feature = "skills")]
@@ -172,7 +178,7 @@ fn normalize_agent_definition(
         .transpose()?;
     let parsed_tools = mapping
         .get(serde_yaml_ng::Value::String("tools".into()))
-        .map(parse_agent_tools)
+        .map(|value| parse_agent_tools(value, mode.as_deref() == Some("write")))
         .transpose()?;
     let (tools, tool_narrowing_notice) = match parsed_tools {
         Some((tools, notice)) => (Some(tools), notice),
@@ -264,6 +270,7 @@ fn normalize_agent_definition(
 
 fn parse_agent_tools(
     value: &serde_yaml_ng::Value,
+    write_mode: bool,
 ) -> Result<(Vec<AgentTool>, Option<String>), &'static str> {
     let names = if let Some(list) = value.as_sequence() {
         list.iter()
@@ -295,7 +302,9 @@ fn parse_agent_tools(
         {
             return Err("frontmatter tool names must be printable ASCII and at most 64 characters");
         }
-        if let Some(tool) = AgentTool::parse(name) {
+        if let Some(tool) = AgentTool::parse(name).filter(|tool| {
+            write_mode || !matches!(tool, AgentTool::Write | AgentTool::Edit | AgentTool::Shell)
+        }) {
             if !tools.contains(&tool) {
                 tools.push(tool);
             }
@@ -308,7 +317,11 @@ fn parse_agent_tools(
         let more = if ignored.len() > MAX_NOTICE_NAMES {
             format!(" (and {} more)", ignored.len() - MAX_NOTICE_NAMES)
         } else { String::new() };
-        format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools")
+        if write_mode {
+            format!("tools {names}{more} ignored: write personas support only installed tools")
+        } else {
+            format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools")
+        }
     });
     Ok((tools, notice))
 }

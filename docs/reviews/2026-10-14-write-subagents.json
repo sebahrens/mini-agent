@@ -1,0 +1,153 @@
+{
+  "bead": "mini-agent-i7ro6.55",
+  "source_base": "d22318447d70dcba31f3ffc6e76882c86b721693",
+  "status": "Implemented; final merged installed acceptance follows hooks/native composition. Bead stays in progress until that passes.",
+  "contracts": [
+    "Default allow_write=false; trusted persona must select mode:write",
+    "Actual parent checker/approval channel, tool eligibility, physical workspace, sandbox, deadlines, formatter and LSP are captured together",
+    "Read/Edit/Write share child read proof; write children serialize with parent task lane",
+    "Approval labels and hook mode are attribution only; no permission pattern or capability grant changes",
+    "Child JS stays read-only and nested task/memory mutation/MCP tools remain absent",
+    "Report repair clears instruction/skill context and denies tools at definition and execution boundaries",
+    "Child tool calls count toward goal mutation/tool accounting"
+  ],
+  "navigation": {
+    "method": "Code-indexer exact implementations and file-qualified callers plus bounded source-string search for startup ordering fixture",
+    "artifacts": [
+      "/private/tmp/mini-agent-write55-subagent-hook-bounded-trace.json",
+      "/private/tmp/mini-agent-wave51-subagent-provider-callers.json"
+    ],
+    "affected": [
+      "TaskTool activation/repair",
+      "AnyAgent provider dispatch",
+      "run_subagent",
+      "headless stream/event handling",
+      "startup setup factories",
+      "SubagentStart/Stop gates"
+    ]
+  },
+  "stack_fix": {
+    "cause": "Actual owned LLDB 1MiB trace showed nested parent event handling (~151KiB) plus SDK stream construction and lifecycle state. Isolate event handling from recursive stream polling and construct aggregate futures/stream on heap in short factories.",
+    "unchanged": [
+      "Physical1MiB limit",
+      "Deadlines",
+      "Scheduling",
+      "Task-local contexts",
+      "Cancellation",
+      "Permission and containment checks",
+      "Usage/transcript/failed-turn handling"
+    ],
+    "observed_pass": {
+      "passed": true,
+      "binary": "/private/tmp/mini-agent-write55-event-frame-install/bin/mini-agent",
+      "binary_sha256": "f1d2e45f9e37e52e6e2fe9772ebc909c85da598b10204ac23781bc71421015ee",
+      "stack_bytes": 1048576,
+      "external_provider_calls": 0,
+      "configured_concurrency": 4,
+      "write_children_serialized": true,
+      "runs": [
+        {
+          "allow_write": false,
+          "posts": 2,
+          "exit": 0,
+          "files": {
+            "first.txt": "before\n",
+            "second.txt": "before\n"
+          }
+        },
+        {
+          "allow_write": true,
+          "posts": 8,
+          "exit": 0,
+          "files": {
+            "first.txt": "after\n",
+            "second.txt": "after\n"
+          }
+        }
+      ]
+    },
+    "diagnostic_markers": "Removed from source before final checks",
+    "durable_probe": "scripts/probes/write_subagents_stack.py"
+  },
+  "validation": {
+    "reused": "107 owning subagent/config/persona/goal checks PASS0.57s before final allocation-only changes; new repair and callers separately checked",
+    "default_callers": {
+      "path": "/private/tmp/mini-agent-write55-final-callers.log",
+      "sha256": "276deea3c0437b6ccec94038a4aa8bc9459b7697174dafebe1c30670cd3f0607"
+    },
+    "default_callers_result": "95 PASS9.86s",
+    "hook_and_stack_contracts": {
+      "path": "/private/tmp/mini-agent-write55-final-contracts.log",
+      "sha256": "49a976dc79d7453bf6def24f07485fca264d4564f099fc1bc657a5e2d8861f58"
+    },
+    "hook_and_stack_result": "Actual hook mode1 PASS plus startup1MiB1 PASS",
+    "startup_order": {
+      "path": "/private/tmp/mini-agent-write55-startup-ordering.log",
+      "sha256": "3a49ea823aae679de82db07324ff4b5e6827096ef0dad2225afa0bb6b212c5e4"
+    },
+    "startup_order_result": "1 PASS",
+    "minimal": {
+      "path": "/private/tmp/mini-agent-write55-final-minimal.log",
+      "sha256": "99e9f72f7ac062aa5acb75fb86460039acc9023d89528b72072465ad4a8ec5ab"
+    },
+    "minimal_result": "4 PASS0.15s; no-default-features subagents",
+    "strict": {
+      "path": "/private/tmp/mini-agent-write55-final-strict.log",
+      "sha256": "c9e5e412736d0b940b1d014f4b3fc872fd5b70b07de3a233463c0d89f578c7e6"
+    },
+    "strict_result": "Default+advisor all-target Clippy -D warnings PASS47.04s",
+    "final_installed": "Pending merged source proof; no full suite repeated"
+  },
+  "review": {
+    "personas": [
+      "agent-native-architecture",
+      "adversarial-reviewer",
+      "reliability-reviewer",
+      "testing-reviewer"
+    ],
+    "findings_remaining": [],
+    "fixed_findings": [
+      "max_turns1 can still execute tools: explicit repair guard now prevents requested effects",
+      "Unit tests missed supported-stack activation overflow: actual installed fixture exposed it and now passes"
+    ],
+    "checks": [
+      "Trusted persona controls focus only until config and parent authorization permit write profile",
+      "Negative edit/shell/parent eligibility and approved edit exercise actual tools",
+      "Startup pricing cleanup order remains verified",
+      "Native/hook composition is validated separately after merge"
+    ],
+    "phase6": "Canonical containment invariants read. JS change only supplies display attribution to parent AskRequest; no worker protocol/grant/runtime changes."
+  },
+  "source_sha256": {
+    "data/config.sample.toml": "81184992fa6293b77a59ca42619e13a15313ea957b567b46070e1731878d765f",
+    "docs/agent/CONFIG.md": "702b7a9c7b29e80d6a4b33121668a1635c3b051c15ec359517554482d07f7532",
+    "docs/agent/SUBAGENTS.md": "9667c31075c09e234ffedcd1f50109aff32be768404f23054ba1446b921b3a27",
+    "docs/agent/TOOL_RUNTIME.md": "a0d83b9d22df7225c3d40fa8fbda8968979e2062800e31c022a3da34ce207b36",
+    "patched-deps/rig-core/src/agent/prompt_request/streaming.rs": "53aa5c60970c29ed89cb2de6284afe2f8f691f3ea0fbb4881b7d2c24d3e5a993",
+    "src/agent/builder.rs": "d3388c6669be8a8ed197694abb1435d0b8fbb76f7bff152d2e3d6042188498bc",
+    "src/agent/runner.rs": "82dc57ce58377c6513eade37ac6c6c0815a0a9db864e073a2cedaca74d930292",
+    "src/agent/tools/mod.rs": "562dff432eb49163e5b83a4858e70d139b27e50ca648dee31fccfb6cc8546016",
+    "src/config/keys.rs": "dac035717ffaa3aa38da7c9d008604c964e7ea2c494477b0fe4f675a2cafaa5f",
+    "src/config/load.rs": "fe62bfa58403a6df92ef62d13c433126e3e52696a6e9becebda45e6e388d932a",
+    "src/config/mod.rs": "10ef7ca76a41a66bf60d65340b1f6e298f1fa574ee77b4ab89706f65f766d9a2",
+    "src/config/types.rs": "c69095a661c879cdf76895195bd9b4583fa00f9276a1dc14058dc124f2448fec",
+    "src/context/agents.rs": "377e17e478674a5506b21f15af3e01f3878186072b0356423466f2f3ac12e0aa",
+    "src/extras/acp/mod.rs": "4512fdc15042e6222e47af6f3f922b1bedb08549c53f1ac9302ae6b7ac58a560",
+    "src/extras/goal/driver.rs": "995f2ec1a188cb6f3a95f77a44d8784e2c2fa75d50a40883486fb2a343432895",
+    "src/extras/hooks/envelope.rs": "8b3f143f768d35e082cebc7ceff53de011751a360a4c56a732763f01759bfc2b",
+    "src/extras/hooks/mod.rs": "943c88756afe73016f510c762a76e18f72db696a7fab7d39ed3690c4ac81cd61",
+    "src/extras/js/tool.rs": "52b00f066cc0616d9a8ae879f49724b1687ad2d563c7cf2778a4edc10d979422",
+    "src/extras/subagents/builder.rs": "d5a4ac94f56d465b024711d2faf9bade98f21fc09082679e8dbf74158bbb1dae",
+    "src/extras/subagents/prompt.rs": "77136f71083d1d3cbe349b4ac488d1a5d6f2a92994df9171f768e349bc64ef4e",
+    "src/extras/subagents/task_tool.rs": "a6a4488f2c1faaf57d8ffb972036e59954a4a5dc07f0f173cd270dc4c1fb0313",
+    "src/main.rs": "4035fb50479ada1f57d7c12ff534b5eef723ce0b0e928dc15777c9a01f833c9f",
+    "src/permission/ask.rs": "8bd02a920d4dce538a15a08c71fc57b076403eb6ef3254ee3da662f37061cb55",
+    "src/provider.rs": "39a4adc3f6c5b3d08acd2f8def91fea4ab9b6ff7b5911e2f5bd120f868d7ac59",
+    "src/startup.rs": "a8ef0873994376b5c08d33a16c7c404b9153064c8f6cda7c833340a2cc95309a",
+    "src/tests/hooks/subagent_lifecycle_tests.rs": "97078045bbdeb28f7a02fafd012c7b5ce9586509677a4c077ff0956d8a1abc73",
+    "src/ui/app.rs": "da9ee59a4f321b536cdfe064c6132142e96f5ac341850df7160e8d731e52b8ae",
+    "src/ui/mcp_admin_app_tests.rs": "205cd90583088329a3be947dadaeaec3e062cd2f82d1a35e34ea60eaa5e08dad",
+    "src/ui/permission_handler.rs": "3e5b2cb7679fc2fd9986ded973234bbfa1b006942a234ffa21041d4eaa8354c4",
+    "scripts/probes/write_subagents_stack.py": "4d9669208f63e527a1571ed12baf5470046f20d2278c290e43363ea3e5bf0178"
+  }
+}

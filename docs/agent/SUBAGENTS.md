@@ -1,12 +1,12 @@
 ---
-description: "Parallel read-only subagents in mini-agent: the task tool, model and provider overrides, and per-agent tool limits."
+description: "Default read-only and opt-in implementation subagents in mini-agent: the task tool, model and provider overrides, and per-agent tool limits."
 ---
 
-# Subagents (read-only codebase exploration)
+# Subagents
 
 ## Overview
 
-Subagents let the main agent delegate **precise read-only investigations** to a
+By default, subagents let the main agent delegate **precise read-only investigations** to a
 **read-only child agent**. Each subagent receives a specific technical question
 (e.g. "Where is MCP support implemented?") and returns a focused answer.
 This keeps the main agent's context clean while enabling thorough lookups.
@@ -16,7 +16,7 @@ Avoid broad instructions like "check all documentation" — instead ask precise
 questions that can be answered with a few file reads and searches.
 
 When the main agent calls the `task` tool, one subagent is scheduled per
-prompt. Multiple prompts use **bounded parallelism**. Each subagent has access
+prompt. Multiple prompts use **bounded parallelism**. By default, each subagent has access
 only to read tools and returns a summary of findings, which the main agent then
 incorporates into its response.
 
@@ -150,9 +150,53 @@ data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
-In the `task` tool schema every specialist is labelled a read-only
-investigation subagent: a persona changes the child's focus, never its write
-access or tools beyond the read-only set.
+The `task` schema describes specialists as read-only by default and documents
+the explicit opt-in for implementation personas.
+
+### Opt-in implementation personas
+
+Enable workspace-writing children explicitly in the parent configuration:
+
+```toml
+[subagents]
+allow_write = true
+```
+
+A definition from user-global configuration, compiled-in defaults, or a trusted
+project must also select `mode: write`, for example `agents/implementer.md`:
+
+```yaml
+---
+mode: write
+tools: Read, Grep, Edit, Write, Shell
+---
+Implement the delegated change, verify it, and report the result.
+```
+
+On Unix, the installed binary regression can be replayed with
+`python3 scripts/probes/write_subagents_stack.py --binary /path/to/mini-agent`.
+It uses an owned local provider and a physical 1 MiB stack, checks default
+refusal, and verifies two real read/edit/report children execute serially even
+when configured concurrency is four. Artifacts remain in the printed temporary
+directory; no external provider credentials or requests are used.
+
+Call `task` with `agent_type: "implementer"`. A write persona is refused when
+`allow_write` is absent or false. The task approval describes its write-capable
+execution; each operation still uses the parent's exact permission checker and
+approval channel. Approval prompts identify the child without altering tool
+names, paths, or persisted grant patterns. Write/Edit share the child's read
+tracker, captured workspace, formatter and LSP connection. Shell inherits the
+parent's sandbox, output cap and deadline, and is absent when disabled for the
+parent. A persona's `tools` can only narrow the eligible tool set.
+
+Write children run one at a time within a task call, regardless of
+`task_max_concurrency`; the parent's existing exclusive task lane orders task
+calls with other parent mutations. This does not provide cross-process file
+locking. Their edits count toward goal-round mutation accounting. They receive
+neither nested task delegation nor memory writes, MCP, or additional JS effect
+authority. Their JS realm remains read-only. The same report contract and
+bounded scheduler cancellation apply. Existing personas without `mode: write`
+keep their read-only tool set even when the global opt-in is enabled.
 
 A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
 same-named definition, this file replaces nothing: the host appends it under a
@@ -188,7 +232,8 @@ project definition wins, the host also prefixes the task result with its
 winning project directory's `<name>.md` source. This makes a repository-controlled
 replacement visible to the calling agent instead of silently presenting it as
 the compiled-in specialist. `SubagentStart` and `SubagentStop` hook envelopes
-carry that resolved `agent_type` and definition source; unspecialized children
+carry that resolved `agent_type` and definition source. `SubagentStart` also
+includes `agent_mode: "read"` or `"write"` for the actual child profile; unspecialized children
 use `explore` and the compiled-in explorer source. The TUI also renders a
 specialist-start line containing the same type and source before nested child
 tool activity.
@@ -228,7 +273,7 @@ mode: review
   one-line narrowing notice (up to eight ignored names, then an omitted count).
   Declarations accept at most 128 entries with nonempty printable ASCII names
   of at most 64 characters; malformed lists or names still reject the definition.
-  Write-capable subagents remain separate work tracked by mini-agent-i7ro6.55.
+  `mode: write` also accepts `Write`, `Edit`, and `Bash`/`Shell` under the explicit global opt-in.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
@@ -239,7 +284,8 @@ mode: review
   `[reasoning] effort`. The older `effort` key is still accepted as a
   deprecated alias and logs a warning; setting both `turn_budget` and `effort`
   rejects the definition.
-- `mode` remains the prompt default used when the persona is selected for the
+- `mode: write` selects an implementation child only with the global opt-in.
+  Other `mode` values remain the prompt default used when the persona is selected for the
   main loop through `/agent`. Child-only `tools`, `model`, and `turn_budget`
   settings do not alter main-loop authority.
 
@@ -269,7 +315,7 @@ into the following turn. Project definitions and project prompt directives
 participate only after the existing project-config trust check succeeds.
 
 The host appends the repository-as-untrusted, prompt-injection reporting,
-honest-unknowns, read-only, and no-shell rules after the specialization,
+honest-unknowns and the selected read-only or write-mode rules after the specialization,
 already-loaded architecture context, and user suffix. A specialization supplies
 domain heuristics and its return contract, but the delegated objective remains
 authoritative for scope: persona checklists do not mandate a whole-repository
@@ -329,13 +375,13 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_read`   | Read memory files (long-term, notes…)  |
 | `memory_search` | Keyword search across all memory       |
 
-### Explicitly excluded
+### Default profile exclusions
 
 | Tool           | Reason                                  |
 |----------------|-----------------------------------------|
-| `write`        | Subagent is read-only by design         |
-| `edit`         | Subagent is read-only by design         |
-| `bash`         | Children stay inside the read-only containment boundary; they cannot run builds or tests and must say so |
+| `write`        | Available only to an opted-in `mode: write` child         |
+| `edit`         | Available only to an opted-in `mode: write` child         |
+| `bash`         | Only opted-in write children receive the parent’s eligible `shell`; default children cannot run builds or tests |
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |
@@ -351,7 +397,7 @@ same path-containment and approval rules as the parent:
 - **Path containment**: reads outside the workspace binding are denied or sent
   through the parent approval channel, exactly as they would be for the main
   agent.
-- **No mutation tools**: the child has no `write`, `edit`, `bash`, or
+- **Default profile has no mutation tools**: the child has no `write`, `edit`, `bash`, or
   `mcp_tool`. Its optional JS realm has no writer, network, process, or
   session-state globals and its broker grant contains only read authority, so
   it cannot modify files, run commands, or reach external services regardless

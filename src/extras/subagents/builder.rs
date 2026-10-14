@@ -7,6 +7,33 @@ use crate::provider::{AnyAgent, AnyAgentInner, AnyModel, OpenAiAgent, OpenAiMode
 use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 
+/// Report restatement is a text-only model call, even for writing personas.
+#[derive(Clone, Copy)]
+pub(crate) struct ReportRepairGuard;
+impl<M: CompletionModel> rig::agent::AgentHook<M> for ReportRepairGuard {
+    async fn on_event(
+        &self,
+        _: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        match event {
+            rig::agent::StepEvent::CompletionCall { .. } => rig::agent::Flow::patch_request(
+                rig::agent::RequestPatch::new().active_tools(Vec::<String>::new()),
+            ),
+            rig::agent::StepEvent::ToolCall { .. } => {
+                rig::agent::Flow::terminate("task: report repair cannot execute tools")
+            }
+            _ => rig::agent::Flow::cont(),
+        }
+    }
+    fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+        matches!(
+            kind,
+            rig::agent::StepEventKind::CompletionCall | rig::agent::StepEventKind::ToolCall
+        )
+    }
+}
+
 /// The parent session's authorization context inherited by a subagent.
 ///
 /// Keeping the checker and approval channel together makes it impossible to
@@ -16,6 +43,7 @@ use rig::completion::CompletionModel;
 /// this same context must be inherited rather than replaced.
 #[derive(Clone)]
 pub(crate) struct SubagentAuthorization {
+    write_tools: Option<WriteChildTools>,
     #[cfg(feature = "multimodal")]
     image_support: tools::read_image::ImageReadSupport,
     permission: Option<PermCheck>,
@@ -25,6 +53,22 @@ pub(crate) struct SubagentAuthorization {
     instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
     #[cfg(feature = "js")]
     read_only_js: Option<ReadOnlyJsAuthorization>,
+}
+
+/// Captured from the actual parent builder, including its tool eligibility.
+#[derive(Clone)]
+pub(crate) struct WriteChildTools {
+    pub(crate) sandbox: crate::sandbox::Sandbox,
+    pub(crate) write_enabled: bool,
+    pub(crate) edit_enabled: bool,
+    pub(crate) shell_enabled: bool,
+    pub(crate) max_text_file_size: Option<u64>,
+    pub(crate) max_shell_output_lines: Option<u64>,
+    pub(crate) shell_timeout_secs: u64,
+    pub(crate) diff_options: tools::mutation_diff::DiffOptions,
+    pub(crate) formatter: Option<std::sync::Arc<tools::format_after_edit::FormatAfterEdit>>,
+    #[cfg(feature = "lsp")]
+    pub(crate) lsp: Option<crate::extras::lsp::LspManager>,
 }
 
 #[cfg(feature = "js")]
@@ -37,6 +81,7 @@ struct ReadOnlyJsAuthorization {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PersonaExecution {
+    pub(crate) write_mode: bool,
     /// `None` installs the complete read-only child tool set. `Some` is always
     /// a narrowing parsed from trusted persona metadata.
     pub(crate) tools: Option<Vec<AgentTool>>,
@@ -71,6 +116,7 @@ impl SubagentAuthorization {
         deny_repeated_reads: bool,
     ) -> Self {
         Self {
+            write_tools: None,
             #[cfg(feature = "multimodal")]
             image_support: tools::read_image::ImageReadSupport::default(),
             permission,
@@ -81,6 +127,11 @@ impl SubagentAuthorization {
             #[cfg(feature = "js")]
             read_only_js: None,
         }
+    }
+
+    pub(crate) fn with_write_tools(mut self, tools: Option<WriteChildTools>) -> Self {
+        self.write_tools = tools;
+        self
     }
 
     pub(crate) fn with_workspace_binding(
@@ -174,7 +225,7 @@ impl SubagentAuthorization {
             self.ask_tx.clone(),
             Some(max_text_file_size),
             max_read_lines,
-            read_tracker,
+            read_tracker.clone(),
         );
         let grep = tools::GrepTool::new(
             self.permission.clone(),
@@ -214,6 +265,47 @@ impl SubagentAuthorization {
         }
         if enabled(AgentTool::ListDir) {
             tools.push(Box::new(list));
+        }
+        if let (Some(parent), Some(workspace)) = (&self.write_tools, &self.workspace) {
+            if parent.write_enabled && enabled(AgentTool::Write) {
+                let tool = tools::WriteTool::new_with_tracker(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    parent.max_text_file_size,
+                    read_tracker.clone(),
+                )
+                .with_workspace_binding(workspace.clone())
+                .with_diff_options(parent.diff_options)
+                .with_formatter(parent.formatter.clone());
+                #[cfg(feature = "lsp")]
+                let tool = tool.with_lsp(parent.lsp.clone());
+                tools.push(Box::new(tool));
+            }
+            if parent.edit_enabled && enabled(AgentTool::Edit) {
+                let tool = tools::EditTool::new_with_tracker(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    parent.max_text_file_size,
+                    read_tracker,
+                )
+                .with_workspace_binding(workspace.clone())
+                .with_diff_options(parent.diff_options)
+                .with_formatter(parent.formatter.clone());
+                #[cfg(feature = "lsp")]
+                let tool = tool.with_lsp(parent.lsp.clone());
+                tools.push(Box::new(tool));
+            }
+            if parent.shell_enabled && enabled(AgentTool::Shell) {
+                tools.push(Box::new(
+                    tools::ShellTool::new(
+                        self.permission.clone(),
+                        self.ask_tx.clone(),
+                        parent.sandbox.clone(),
+                        parent.max_shell_output_lines,
+                    )
+                    .with_foreground_timeout_secs(parent.shell_timeout_secs),
+                ));
+            }
         }
         tools
     }
@@ -271,11 +363,24 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         specialization,
         suffix.as_deref(),
     );
+    if persona.write_mode {
+        // Only the host's own read-only rules are replaced; authored persona
+        // text is retained verbatim and never supplies execution authority.
+        let policy_start = preamble
+            .rfind(prompt::NON_OVERRIDABLE_EXPLORE_RULES)
+            .expect("host policy is always appended");
+        preamble.truncate(policy_start);
+        preamble.push_str(&prompt::write_rules());
+        preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
+    }
 
     #[cfg(feature = "agent-skills")]
     preamble.push_str(crate::extras::skills::selection::POLICY);
 
     let mut captured = authorization.clone();
+    if !persona.write_mode {
+        captured.write_tools = None;
+    }
     captured.instructions = authorization
         .instructions
         .as_ref()
@@ -1052,6 +1157,174 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    #[tokio::test]
+    async fn report_repair_cannot_execute_a_requested_tool() {
+        use futures::StreamExt;
+        use rig::agent::AgentBuilder;
+        use rig::streaming::StreamingPrompt;
+        use rig::test_utils::{MockCompletionModel, MockExtensionsProbeTool, MockStreamEvent};
+        use rig::tool::Tool;
+        let probe = MockExtensionsProbeTool::default();
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call(
+                "unexpected-repair-effect",
+                MockExtensionsProbeTool::NAME,
+                serde_json::json!({}),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(probe.clone())
+            .add_hook(super::ReportRepairGuard)
+            .build();
+        let mut stream = agent
+            .stream_prompt("Restate the previous report, without tool work.")
+            .max_turns(1)
+            .await;
+        let mut failed = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "a tool call in the text-only repair must be refused"
+        );
+        assert!(probe.observed().is_none(), "repair must not execute a tool");
+    }
+
+    fn writable_parent(
+        root: &Path,
+        ask: Option<crate::permission::ask::AskSender>,
+    ) -> SubagentAuthorization {
+        let mut authorization = parent_authorization(root, ask);
+        let configs = PermissionConfigs {
+            glob: serde_json::from_value(
+                serde_json::json!({"read":"allow", "edit":"ask", "write":"deny", "shell":"deny"}),
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        authorization.permission = Some(Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &configs,
+                SecurityMode::Standard,
+                Some(root.to_path_buf()),
+                Some(vec!["standard".into()]),
+            )
+            .unwrap(),
+        )));
+        authorization.with_write_tools(Some(super::WriteChildTools {
+            sandbox: crate::sandbox::Sandbox::new(false, "auto").with_workspace_binding(Arc::new(
+                crate::paths::WorkspaceBinding::capture(root).unwrap(),
+            )),
+            write_enabled: true,
+            edit_enabled: true,
+            shell_enabled: true,
+            max_text_file_size: Some(1024 * 1024),
+            max_shell_output_lines: Some(100),
+            shell_timeout_secs: 5,
+            diff_options: Default::default(),
+            formatter: None,
+            #[cfg(feature = "lsp")]
+            lsp: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn write_child_edit_uses_parent_approval_and_shared_read_proof() {
+        let root = TempDir::new("write-approval");
+        let path = root.path().join("child.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let authorization = writable_parent(root.path(), Some(tx));
+        let tools = filesystem_tools(&authorization);
+        let read = tools.iter().find(|tool| tool.name() == "read").unwrap();
+        let edit = tools.iter().find(|tool| tool.name() == "edit").unwrap();
+        read.call(serde_json::json!({"path":"child.txt"}).to_string())
+            .await
+            .unwrap();
+        let edit = crate::permission::ask::scope_subagent("implementer".into(), true,
+            edit.call(serde_json::json!({"path":"child.txt", "block":"<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE"}).to_string()));
+        let approve = async {
+            let request = rx.recv().await.unwrap().into_permission();
+            assert_eq!(request.agent_name.as_deref(), Some("implementer"));
+            assert_eq!(request.tool, "edit");
+            assert_eq!(
+                Path::new(&request.input),
+                std::fs::canonicalize(&path).unwrap()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+            request.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(edit, approve)
+        })
+        .await
+        .expect("child approval must settle");
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(rx.try_recv().is_err());
+        assert!(crate::permission::ask::subagent_name().is_none());
+    }
+
+    #[tokio::test]
+    async fn write_child_denials_and_parent_tool_selection_stay_authoritative() {
+        let root = TempDir::new("write-denied");
+        let existing = root.path().join("existing.txt");
+        std::fs::write(&existing, "before\n").unwrap();
+        let authorization = writable_parent(root.path(), None);
+        let tools = filesystem_tools(&authorization);
+        assert!(tools.iter().all(|tool| tool.name() != "task"));
+        let write = tools.iter().find(|tool| tool.name() == "write").unwrap();
+        assert!(
+            write
+                .call(serde_json::json!({"path":"denied.txt", "content":"never"}).to_string())
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join("denied.txt").exists());
+        tools
+            .iter()
+            .find(|tool| tool.name() == "read")
+            .unwrap()
+            .call(serde_json::json!({"path":"existing.txt"}).to_string())
+            .await
+            .unwrap();
+        let error = tools.iter().find(|tool| tool.name() == "edit").unwrap()
+            .call(serde_json::json!({"path":"existing.txt", "block":"<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE"}).to_string()).await.unwrap_err();
+        assert!(error.to_string().contains("Permission denied"), "{error}");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "before\n");
+        let shell = tools.iter().find(|tool| tool.name() == "shell").unwrap();
+        assert!(
+            shell
+                .call(serde_json::json!({"command":"exit 0"}).to_string())
+                .await
+                .is_err()
+        );
+        let mut narrowed = authorization;
+        narrowed.write_tools.as_mut().unwrap().shell_enabled = false;
+        assert!(
+            filesystem_tools(&narrowed)
+                .iter()
+                .all(|tool| tool.name() != "shell")
+        );
+        let selected = narrowed.filesystem_tools(
+            1024,
+            100,
+            100,
+            100,
+            Some(100),
+            Some(&[crate::context::agents::AgentTool::Read]),
+        );
+        assert_eq!(
+            selected.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            ["read"]
+        );
+    }
+
     fn tool_input(name: &str, path: &Path) -> String {
         match name {
             "read" => serde_json::json!({ "path": path }).to_string(),
@@ -1375,6 +1648,7 @@ mod provider_param_tests {
     fn persona() -> PersonaExecution {
         let config = zdr_config();
         PersonaExecution {
+            write_mode: false,
             tools: None,
             provider_extra_body: config.extra_body.clone(),
             additional_params: Some(serde_json::json!({"user": "persona-tenant"})),

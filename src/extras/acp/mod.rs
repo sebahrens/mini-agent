@@ -2237,6 +2237,10 @@ async fn drive_permission_bridge(
         } else {
             ask.tool.to_string()
         };
+        let title = match &ask.agent_name {
+            Some(name) => format!("[subagent: {name}] {title}"),
+            None => title,
+        };
         let tool_call_id = ToolCallId::new(
             ask.tool_call_id
                 .clone()
@@ -4371,6 +4375,7 @@ mod protocol_tests {
                 ask_tx
                     .send(
                         AskRequest {
+                            agent_name: None,
                             tool: "write".into(),
                             input: requested.to_owned(),
                             tool_call_id: Some("write-call".to_owned()),
@@ -4429,6 +4434,7 @@ mod protocol_tests {
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let (descendants, exact) = crate::permission::pattern::search_root_allow_scope("/repo");
         let ask = crate::permission::ask::AskRequest {
+            agent_name: None,
             tool: "grep".into(),
             input: "/repo".to_owned(),
             tool_call_id: None,
@@ -4449,6 +4455,7 @@ mod protocol_tests {
 
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let shell = crate::permission::ask::AskRequest {
+            agent_name: None,
             tool: "shell".into(),
             input: "rm -rf *".to_owned(),
             tool_call_id: None,
@@ -4525,6 +4532,7 @@ mod protocol_tests {
                         let send_ask = |name: &str| {
                             let (reply, receiver) = tokio::sync::oneshot::channel();
                             let ask = AskRequest {
+                                agent_name: None,
                                 tool: "shell".into(),
                                 input: name.to_owned(),
                                 tool_call_id: (!synthetic).then(|| name.to_owned()),

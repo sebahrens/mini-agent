@@ -1837,7 +1837,7 @@ impl Startup {
             // (mini-agent-rnpjm).
             #[cfg(feature = "hooks")]
             if !self.native_session_end_done {
-                crate::extras::hooks::dispatch_session_end("exit").await;
+                heap_future(|| crate::extras::hooks::dispatch_session_end("exit")).await;
             }
             result
         } else {
@@ -4843,10 +4843,10 @@ mod tests {
             .find("startup.start_openrouter_pricing_refresh();")
             .expect("pricing refresh start missing");
         let features = main
-            .find("startup.init_features().await?;")
+            .find("startup::heap_future(|| startup.init_features()).await?;")
             .expect("feature initialization missing");
         let prompts = main
-            .find("let prompts = startup.resolve_prompts().await;")
+            .find("let prompts = startup::heap_future(|| startup.resolve_prompts()).await;")
             .expect("prompt result was not retained for pricing cleanup");
         let cleanup = main
             .find("startup.finish_openrouter_pricing_refresh().await;")

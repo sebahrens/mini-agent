@@ -3555,3 +3555,10 @@ history. Restart applies saved changes subject to higher local/CLI precedence.
 captured layer overrides it. The immutable startup-effective list remains labelled
 as such until restart. `--config-preservation-check` retains its existing bounded
 round-trip check of the global writer.
+
+### Writable subagents
+
+`[subagents] allow_write = true` enables trusted `mode: write` personas for the
+`task` tool. It defaults to false. Each child inherits the parent's eligible
+tools, permissions, workspace and sandbox; write children are serialized within
+each call. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).

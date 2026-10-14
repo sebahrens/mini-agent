@@ -457,6 +457,14 @@ pub(crate) fn streaming_error_into_prompt(err: StreamingError) -> PromptError {
     }
 }
 
+// Keep construction of the large drive stream out of AgentRunner::stream's
+// async poll frame. Nested tool-driven agents share their caller's stack;
+// constructing the by-value stream there duplicates its state in debug builds.
+#[inline(never)]
+fn heap_stream<S: Stream>(make: impl FnOnce() -> S) -> Pin<Box<S>> {
+    Box::pin(make())
+}
+
 /// The single agent drive loop, shared by the blocking and streaming surfaces.
 ///
 /// Owns the medium-independent loop — `next_step` dispatch, the `CompletionCall`
@@ -1437,15 +1445,17 @@ where
         // The blocking surface folds this same engine; the streaming surface
         // forwards intermediate items (the final response item is the last one)
         // and ends on `Done`.
-        let driver = drive_agent(
-            self,
-            source,
-            run,
-            agent_span.clone(),
-            created_agent_span,
-            memory_handle,
-            true,
-        )
+        let driver = heap_stream(|| {
+            drive_agent(
+                self,
+                source,
+                run,
+                agent_span.clone(),
+                created_agent_span,
+                memory_handle,
+                true,
+            )
+        })
         .filter_map(|item| {
             std::future::ready(match item {
                 Ok(DriveItem::Item(item)) => Some(Ok(item)),

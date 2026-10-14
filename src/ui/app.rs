@@ -7749,6 +7749,7 @@ mod permission_loop_tests {
         let (reply, receiver) = oneshot::channel();
         (
             AskRequest {
+                agent_name: None,
                 tool: "shell".into(),
                 input: input.into(),
                 #[cfg(feature = "acp")]
@@ -10095,6 +10096,7 @@ mod workspace_session_picker_tests {
                         let mut decision = if pending_permission {
                             let (reply, decision) = tokio::sync::oneshot::channel();
                             app.begin_permission_request(crate::permission::ask::AskRequest {
+                                agent_name: None,
                                 tool: "bash".into(),
                                 input: "owned unanswered command".into(),
                                 #[cfg(feature = "acp")]

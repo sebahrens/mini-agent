@@ -575,6 +575,9 @@ pub struct Config {
     pub task_enabled: Option<bool>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<types::SubagentPolicy>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_model: Option<CompactString>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]

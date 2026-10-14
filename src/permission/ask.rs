@@ -71,6 +71,32 @@ pub(crate) fn current_tool_call_id() -> Option<String> {
 pub type AskSender = mpsc::Sender<UserRequest>;
 pub type AskReceiver = mpsc::Receiver<UserRequest>;
 
+tokio::task_local! {
+    static SUBAGENT_ORIGIN: (String, bool);
+}
+
+#[cfg(feature = "subagents")]
+pub(crate) async fn scope_subagent<F: std::future::Future>(
+    name: String,
+    write: bool,
+    future: F,
+) -> F::Output {
+    SUBAGENT_ORIGIN.scope((name, write), future).await
+}
+
+pub(crate) fn subagent_name() -> Option<String> {
+    SUBAGENT_ORIGIN.try_with(|origin| origin.0.clone()).ok()
+}
+
+#[cfg(feature = "hooks")]
+pub(crate) fn subagent_mode() -> &'static str {
+    if SUBAGENT_ORIGIN.try_with(|origin| origin.1).unwrap_or(false) {
+        "write"
+    } else {
+        "read"
+    }
+}
+
 #[cfg(feature = "mcp")]
 tokio::task_local! {static MCP_ASK_ORIGIN: Option<crate::extras::mcp::elicitation::AskOrigin>;}
 #[cfg(feature = "mcp")]
@@ -161,6 +187,8 @@ pub struct QuestionRequest {
 
 #[derive(Debug)]
 pub struct AskRequest {
+    /// Display attribution only; tool/input and grant patterns remain exact.
+    pub agent_name: Option<String>,
     pub tool: CompactString,
     pub input: String,
     /// Internal call identity emitted to ACP for this exact tool call.

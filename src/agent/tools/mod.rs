@@ -613,6 +613,7 @@ async fn handle_ask_inner(
     ask_tx
         .send(
             AskRequest {
+                agent_name: crate::permission::ask::subagent_name(),
                 tool: CompactString::new(tool),
                 input: input.to_string(),
                 #[cfg(feature = "acp")]

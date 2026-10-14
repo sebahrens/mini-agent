@@ -42,6 +42,7 @@ pub(crate) enum EventFields {
     SubagentStart {
         agent_type: String,
         agent_source: String,
+        agent_mode: String,
     },
     #[cfg(any(feature = "subagents", test))]
     SubagentStop {
@@ -108,7 +109,10 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
         EventFields::SubagentStart {
             agent_type,
             agent_source,
-        } => json!({ "agent_type": agent_type, "agent_source": agent_source }),
+            agent_mode,
+        } => {
+            json!({ "agent_type": agent_type, "agent_source": agent_source, "agent_mode": agent_mode })
+        }
         #[cfg(any(feature = "subagents", test))]
         EventFields::SubagentStop {
             stop_hook_active,

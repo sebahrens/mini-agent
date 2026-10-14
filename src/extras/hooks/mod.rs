@@ -512,6 +512,7 @@ pub(crate) async fn gate_subagent_start(
             envelope::EventFields::SubagentStart {
                 agent_type: canonical.clone(),
                 agent_source: agent_source.to_string(),
+                agent_mode: crate::permission::ask::subagent_mode().into(),
             },
         )
         .await;
@@ -530,7 +531,9 @@ pub(crate) async fn dispatch_subagent_start(
     agent_source: &str,
 ) -> Option<String> {
     let dispatcher = get_dispatcher()?;
-    gate_subagent_start(&dispatcher, &best_effort_ctx(), agent_type, agent_source).await
+    let ctx = best_effort_ctx();
+    crate::startup::heap_future(|| gate_subagent_start(&dispatcher, &ctx, agent_type, agent_source))
+        .await
 }
 
 /// Outcome of dispatching `SubagentStop`: release the child's result, or
@@ -582,13 +585,16 @@ pub(crate) async fn dispatch_subagent_stop(
     let Some(dispatcher) = get_dispatcher() else {
         return SubagentStopGate::Release;
     };
-    gate_subagent_stop(
-        &dispatcher,
-        &best_effort_ctx(),
-        agent_type,
-        agent_source,
-        stop_hook_active,
-    )
+    let ctx = best_effort_ctx();
+    crate::startup::heap_future(|| {
+        gate_subagent_stop(
+            &dispatcher,
+            &ctx,
+            agent_type,
+            agent_source,
+            stop_hook_active,
+        )
+    })
     .await
 }
 

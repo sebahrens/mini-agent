@@ -382,6 +382,7 @@ async fn actual_app_permission_prompt_refuses_config_mutation_without_answering_
     let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
     let (reply, mut decision) = tokio::sync::oneshot::channel();
     let request = crate::permission::ask::AskRequest {
+        agent_name: None,
         tool: "shell".into(),
         input: "literal held native request".into(),
         #[cfg(feature = "acp")]

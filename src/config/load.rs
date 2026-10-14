@@ -566,6 +566,8 @@ pub(super) fn rich_default_config() -> Config {
         #[cfg(feature = "subagents")]
         task_max_concurrency: Some(4),
         #[cfg(feature = "subagents")]
+        subagents: None,
+        #[cfg(feature = "subagents")]
         task_max_output_bytes: Some(256 * 1024),
         #[cfg(feature = "subagents")]
         task_max_cost_units: Some(500_000),

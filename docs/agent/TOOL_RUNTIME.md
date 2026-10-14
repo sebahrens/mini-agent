@@ -1242,3 +1242,14 @@ reads grant no raw text overwrite proof. Known text-only models and unsupported
 transport formats return an explicit error. Exact image data survives canonical
 save/reload and backend tool follow-ups, within existing native/session envelope
 limits. See [Image reads](IMAGE_READ.md) for protocol, capability and replay limits.
+
+
+### Opt-in writing subagents
+
+The `task` tool remains read-only by default. `[subagents] allow_write = true`
+also permits trusted `mode: write` personas with the parent's eligible
+Write/Edit/Shell implementations, checker, approval channel, workspace,
+sandbox, formatter and LSP. Write children are serialized; each operation
+retains its own ordinary permission check, and prompts identify the child.
+Their JS profile remains read-only and they gain no MCP, nested delegation or
+memory mutation. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).
