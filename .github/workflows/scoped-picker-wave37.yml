@@ -1,0 +1,65 @@
+name: Scoped native Windows picker acceptance
+
+on:
+  push:
+    branches: [codex/windows-picker67-wave37]
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+
+jobs:
+  windows-picker:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+      - name: Assert reviewed source identity
+        shell: pwsh
+        run: |
+          $candidate = 'c7516cdf34aa4b2f91eae2a422e871b003993127'
+          git diff --exit-code $candidate HEAD -- src Cargo.toml Cargo.lock patched-deps .github/workflows/ci.yml scripts/tests/test_phase6_ci_workflow.py docs/agent/MCP_CONFIGURATION.md
+          if ($LASTEXITCODE -ne 0) { throw 'Picker source differs from reviewed candidate' }
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: stable
+          cache-on-failure: true
+      # The unchanged candidate's required Windows debug installation passed
+      # in scoped native run 38537135070. Only the outstanding picker tests run.
+      - name: Execute the exact three native picker controls
+        shell: pwsh
+        run: |
+          $filters = @(
+            'busy67_actual_add_completion_tracks_captured_workspace_without_chdir',
+            'busy67_actual_picker_native_write_error_is_propagated',
+            'captured_picker_messages_lists_and_unwind_restore_the_native_fault'
+          )
+          $expected = @(
+            'ui::app::plan_approval_tests::busy67_actual_add_completion_tracks_captured_workspace_without_chdir: test',
+            'ui::app::plan_approval_tests::busy67_actual_picker_native_write_error_is_propagated: test',
+            'ui::pickers::test_surface::captured_picker_messages_lists_and_unwind_restore_the_native_fault: test'
+          )
+          $listing = @(& cargo test --locked --bin mini-agent -- @filters --list 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Picker test discovery failed' }
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match ': test$' })
+          if ($actual.Count -ne 3 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Expected exactly the three native picker controls'
+          }
+          $output = @(& cargo test --locked --bin mini-agent -- @filters --nocapture --test-threads=1 2>&1)
+          $testExit = $LASTEXITCODE
+          $output | Write-Output
+          if ($testExit -ne 0) { throw 'Native picker control failed' }
+          foreach ($name in $expected) {
+            $passLine = 'test ' + $name.Substring(0, $name.Length - 6) + ' ... ok'
+            if (@($output | Where-Object { $_.ToString() -eq $passLine }).Count -ne 1) {
+              throw 'A named native picker control did not pass exactly once'
+            }
+          }
+          if (-not ($output -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) {
+            throw 'Native picker controls did not execute exactly three passing tests'
+          }
