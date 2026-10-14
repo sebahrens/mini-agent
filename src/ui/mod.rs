@@ -1,6 +1,6 @@
 #[cfg(all(test, feature = "agent-skills"))]
 pub(crate) use app::drive_native_instruction_fixture;
-#[cfg(all(test, feature = "hooks"))]
+#[cfg(all(test, feature = "hooks", feature = "agent-skills"))]
 pub(crate) use app::drive_native_stale_session_end_fixture;
 #[cfg(test)]
 pub(crate) use app::{

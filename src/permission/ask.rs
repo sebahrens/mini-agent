@@ -88,7 +88,7 @@ pub(crate) fn subagent_name() -> Option<String> {
     SUBAGENT_ORIGIN.try_with(|origin| origin.0.clone()).ok()
 }
 
-#[cfg(feature = "hooks")]
+#[cfg(all(feature = "hooks", any(feature = "subagents", test)))]
 pub(crate) fn subagent_mode() -> &'static str {
     if SUBAGENT_ORIGIN.try_with(|origin| origin.1).unwrap_or(false) {
         "write"

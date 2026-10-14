@@ -12490,7 +12490,7 @@ pub(crate) async fn drive_native_fixture_turns(
     plan_approval_tests::drive_native_fixture_turns(ui, prompts, false).await
 }
 
-#[cfg(all(test, feature = "hooks"))]
+#[cfg(all(test, feature = "hooks", feature = "agent-skills"))]
 pub(crate) async fn drive_native_stale_session_end_fixture(ui: UiContext<'_>) -> Vec<Session> {
     plan_approval_tests::drive_native_fixture_turns(
         ui,

@@ -20,7 +20,9 @@ def validate_native_step(workflow):
     job = job_body(workflow, "windows-default-compile")
     if "runs-on: windows-latest" not in job or job.count("- name: " + STEP) != 1:
         raise AssertionError("one owning native Windows step is required")
-    body = job.split("- name: " + STEP, 1)[1].split("\n  #", 1)[0]
+    # A following step may have its own checked commands. Count only this
+    # step's compilation/discovery/proof exits, independently of comments.
+    body = job.split("- name: " + STEP, 1)[1].split("\n      - ", 1)[0]
     required = [
         "shell: pwsh", "$features = 'git-worktree,sandbox,hooks'",
         "--test windows_gh_fixture --no-run --message-format=json",
@@ -279,6 +281,21 @@ class WindowsGhCiTests(unittest.TestCase):
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 validate_native_step(original.replace(before, after))
 
+    def test_adjacent_step_cannot_supply_a_missing_native_exit_check(self):
+        workflow = WORKFLOW.read_text()
+        adjacent = """
+      - name: Independent checked proof
+        shell: pwsh
+        run: |
+          if ($LASTEXITCODE -ne 0) { throw 'Independent proof failed' }
+"""
+        workflow = workflow.replace("\n      # Reproduce the failing minimal-MCP row", adjacent + "\n      # Reproduce the failing minimal-MCP row", 1)
+        self.assertIn("Independent checked proof", workflow)
+        body = validate_native_step(workflow)
+        self.assertNotIn("Independent checked proof", body)
+        with self.assertRaises(AssertionError):
+            validate_native_step(workflow.replace("          if ($LASTEXITCODE -ne 0) { throw 'Native GH test fixture compilation failed' }\n", "", 1))
+
 
 
 def condition_value(expression: str, event: str, scope: str, code: str) -> bool:
@@ -313,22 +330,29 @@ def admitted_jobs(workflow: str, event: str, scope: str, code: str) -> set[str]:
 
 
 def validate_scope(workflow: str) -> None:
-    if admitted_jobs(workflow, "workflow_dispatch", "windows-command-family", "false") != {"changes", "windows-default-compile"}:
-        raise AssertionError("command-family dispatch must admit exactly its existing native job and change detector")
+    for scope in ("windows-command-family", "windows-session-storage"):
+        if admitted_jobs(workflow, "workflow_dispatch", scope, "false") != {"changes", "windows-default-compile"}:
+            raise AssertionError(f"{scope} dispatch must admit exactly its existing native job and change detector")
     if admitted_jobs(workflow, "workflow_dispatch", "windows-general-sandbox", "true") != {"changes", "windows-general-sandbox-policy"}:
         raise AssertionError("existing general-sandbox scope changed")
-    for event, scope in (("workflow_dispatch", "unknown"), ("workflow_dispatch", ""), ("push", "windows-command-family"), ("pull_request", "windows-command-family")):
+    for event, scope in (
+        ("workflow_dispatch", "unknown"), ("workflow_dispatch", ""),
+        ("workflow_dispatch", "windows-command-family-extra"),
+        ("workflow_dispatch", "windows-session-storage-extra"),
+        ("push", "windows-command-family"), ("pull_request", "windows-command-family"),
+        ("push", "windows-session-storage"), ("pull_request", "windows-session-storage"),
+    ):
         expected = {"changes"} if event == "workflow_dispatch" else {"changes", "fmt", "ci-success"}
         if admitted_jobs(workflow, event, scope, "false") != expected:
             raise AssertionError("manual native admission must match the exact event and scope")
     header = workflow.split("  push:", 1)[0]
-    if "          - windows-command-family\n" not in header or "          SCOPE: ${{ inputs.scope }}\n" not in job_body(workflow, "changes"):
+    if any(f"          - {scope}\n" not in header for scope in ("windows-command-family", "windows-session-storage")) or "          SCOPE: ${{ inputs.scope }}\n" not in job_body(workflow, "changes"):
         raise AssertionError("dispatch choice and captured scope environment are required")
     all_jobs = set(workflow_jobs(workflow))
     for event in ("push", "pull_request", "workflow_dispatch"):
         if admitted_jobs(workflow, event, "full", "true") != all_jobs:
             raise AssertionError(f"full code gate changed for {event}")
-    for scope in ("windows-command-family", "windows-general-sandbox", "unknown", ""):
+    for scope in ("windows-command-family", "windows-session-storage", "windows-general-sandbox", "unknown", ""):
         if "ci-success" in admitted_jobs(workflow, "workflow_dispatch", scope, "true"):
             raise AssertionError("partial or unknown manual scope must not publish ci-success")
     native_job = job_body(workflow, "windows-default-compile")
@@ -345,8 +369,9 @@ class WindowsCommandFamilyCiTests(unittest.TestCase):
         workflow = WORKFLOW.read_text()
         aggregate = job_body(workflow, "ci-success").splitlines()[0]
         for old, new in (
-            ("(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-command-family'))", "needs.changes.outputs.code == 'true'"),
+            ("(needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows-command-family' || inputs.scope == 'windows-session-storage')))", "needs.changes.outputs.code == 'true'"),
             ("inputs.scope == 'windows-command-family'", "inputs.scope != 'windows-general-sandbox'"),
+            (" || inputs.scope == 'windows-session-storage'", ""),
             (aggregate, aggregate.replace("inputs.scope == 'full'", "inputs.scope != 'windows-general-sandbox'")),
         ):
             with self.subTest(new=new):
