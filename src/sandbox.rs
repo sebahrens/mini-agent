@@ -5695,7 +5695,10 @@ mod sandbox_tests {
         assert!(!source.contains("CreateRestrictedToken"));
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
-        assert!(source.contains("fn run_production_preflight() -> Result<(), String>"));
+        assert!(source.contains(
+            "fn run_production_preflight(diagnostics: Option<&PreflightDiagnostics>) -> Result<(), String>"
+        ));
+        assert!(source.contains("general_sandbox_preflight_observed(None)"));
         assert!(source.contains("const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration"));
         assert!(source.contains("const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration"));
         assert!(source.contains(".spawn_guarded_until(run_deadline)"));
@@ -5737,7 +5740,9 @@ mod sandbox_tests {
             .expect("bounded Windows production helper missing");
         assert_eq!(
             bounded_helper
-                .matches("terminate_and_reap_owned_helper(&mut child, cleanup_deadline)")
+                .matches(
+                    "terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)",
+                )
                 .count(),
             2,
             "deadline and poll failure must both clean up the owned helper"
