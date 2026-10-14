@@ -785,3 +785,14 @@ model picker then use the completed cache. Refresh does not change the active
 model, session context window or captured prices. Live-only IDs with no known
 catalogue/configured price show `(no price known)`; available IDs do not imply
 image, tool or reasoning support. Startup for baked providers remains offline.
+
+## Input editing preferences
+
+`/keys` shows the effective configured keyboard actions. `/vim [on|off]` toggles
+Vim editing for this UI session; `vim_mode = true` enables it at startup.
+Escape switches Insert to Normal, `i` resumes insertion, `hjkl` moves, `w`/`b`
+moves by word, `dd` deletes a line, `u` undoes input edits, and `/` searches
+literally (`n` repeats, Escape cancels). The status bar shows the current mode
+and search query. These commands affect the input only and remain available
+while a model turn runs. Use `[keys]` in trusted config to replace shortcuts;
+see [Input keyboard settings](input-keybindings.md).

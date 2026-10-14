@@ -701,13 +701,24 @@ pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
 pub(crate) fn is_readonly_view(text: &str) -> bool {
     matches!(
         split_command(text).as_slice(),
-        ["/help"] | ["/help", "keys"] | ["/model"] | ["/sessions"] | ["/sessions", "--all"]
+        ["/help"]
+            | ["/help", "keys"]
+            | ["/keys"]
+            | ["/model"]
+            | ["/sessions"]
+            | ["/sessions", "--all"]
     )
 }
 
 pub(crate) fn is_jobs_control(text: &str) -> bool {
     matches!(split_command(text).as_slice(), ["/jobs"])
         || matches!(split_command(text).as_slice(), ["/jobs", "stop", id] if !id.contains(char::is_whitespace))
+}
+
+/// Input preferences never settle history, rebuild an agent or warm a model
+/// list, including their invalid syntax/usage responses.
+pub(crate) fn is_input_control(text: &str) -> bool {
+    matches!(split_command(text).first().copied(), Some("/keys" | "/vim"))
 }
 
 /// Split a slash command into at most three fields: the command, its first
@@ -882,7 +893,7 @@ pub(crate) async fn handle_slash(
             content::handle(&parts, &mut ctx).await
         }
         "/cost" | "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys"
-        | "/advisor" => settings::handle(&parts, &mut ctx).await,
+        | "/advisor" | "/keys" | "/vim" => settings::handle(&parts, &mut ctx).await,
         "/sessions" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind" | "/retry"
         | "/quit" | "/exit" | "/history" => session::handle(&parts, &mut ctx).await,
         #[cfg(feature = "export")]

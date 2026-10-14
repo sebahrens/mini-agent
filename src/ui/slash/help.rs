@@ -75,6 +75,14 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "commands:");
     emit(
         false,
+        "  /keys                 list effective configured keyboard bindings",
+    );
+    emit(
+        false,
+        "  /vim [on|off]         toggle input Vim editing for this UI session",
+    );
+    emit(
+        false,
         "  /cost                 session by model and UTC daily/all-time usage estimates",
     );
     #[cfg(feature = "agent-skills")]

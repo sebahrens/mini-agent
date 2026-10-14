@@ -15,6 +15,7 @@ use rig::message::Message;
 use tokio::sync::mpsc;
 
 use crate::config;
+use crate::config::keybindings::{KeyAction, KeyBindings};
 use crate::event::{AgentEvent, BtwEvent, UserEvent};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
@@ -90,6 +91,9 @@ pub(super) mod test_support {
     use super::*;
 
     pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
+        let mut input = InputEditor::new();
+        input.keybindings = KeyBindings::from_overrides(ui.cfg.keys.as_ref()).unwrap();
+        input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
         let (git_status_tx, git_status_rx) = mpsc::channel(1);
         let (btw_tx, btw_rx) = mpsc::channel(1);
         let (title_tx, title_rx) = mpsc::channel(1);
@@ -104,7 +108,7 @@ pub(super) mod test_support {
                 todo_tools_enabled: false,
             },
             renderer: Renderer::for_app_test().unwrap(),
-            input: InputEditor::new(),
+            input,
             last_branch_check: std::time::Instant::now(),
             git_status_tx,
             git_status_rx,
@@ -672,12 +676,14 @@ pub(crate) enum InterruptTarget {
     Exit,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardShortcut {
     CopySelection,
     Paste,
 }
 
+#[cfg(test)]
 pub(crate) fn clipboard_shortcut(
     key: KeyEvent,
     native_clipboard_available: bool,
@@ -725,6 +731,7 @@ mod mouse_selection_tests {
 /// The lazygit shortcut, Ctrl+O. It used to be Ctrl+H, but many terminals
 /// send `^H` for Backspace and crossterm cannot tell the two apart, so Ctrl+H
 /// stays backspace in the editor and pickers.
+#[cfg(test)]
 fn is_lazygit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('o' | 'O'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1352,6 +1359,8 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
+        let keybindings =
+            KeyBindings::from_overrides(ui.cfg.keys.as_ref()).map_err(anyhow::Error::msg)?;
         let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
             mouse_capture: ui.cfg.resolve_mouse_capture(),
             title_status: ui.cfg.resolve_terminal_title(),
@@ -1384,6 +1393,8 @@ impl<'a> App<'a> {
         );
 
         let mut input = InputEditor::new();
+        input.keybindings = keybindings;
+        input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
         input.set_file_workspace(ui.workspace.clone());
         input.set_monochrome(ui.cli.no_color);
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
@@ -2446,14 +2457,28 @@ impl<'a> App<'a> {
         crate::startup::heap_future(|| self.handle_standard_user_event(ev)).await
     }
 
+    /// Modal/operator choices retain their raw default keys. Configuration
+    /// cannot synthesize an approval or steal a picker's query/navigation.
+    fn keyboard_action(&self, key: KeyEvent) -> Option<KeyAction> {
+        if self.permission_prompt.is_some()
+            || self.question_prompt.is_some()
+            || self.renderer.chain_prompt.is_some()
+            || self.renderer.chain_but_mode
+            || self.input.picker.as_ref().is_some_and(Picker::active)
+        {
+            KeyBindings::default().action(key, false)
+        } else {
+            self.input.keybindings.action(key, false)
+        }
+    }
+
     async fn handle_standard_user_event(
         &mut self,
         ev: UserEvent,
     ) -> anyhow::Result<ControlFlow<(), ()>> {
         // A pending approval is never answered by mode cycling. Pickers keep
         // their own BackTab navigation, and modified shortcuts remain ignored.
-        if matches!(&ev, UserEvent::Key(key) if key.code == KeyCode::BackTab
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT))
+        if matches!(&ev, UserEvent::Key(key) if self.keyboard_action(*key) == Some(KeyAction::CycleMode))
             && !self
                 .input
                 .picker
@@ -2572,13 +2597,23 @@ impl<'a> App<'a> {
                 self.handle_goal_verification_event(event).await?;
             }
             UserEvent::Key(key) => {
-                match clipboard_shortcut(key, cfg!(windows)) {
-                    Some(ClipboardShortcut::CopySelection) => {
+                let action = self.keyboard_action(key);
+                match action {
+                    Some(KeyAction::ToggleVim) => {
+                        self.input.set_vim_enabled(!self.input.vim_enabled());
+                        self.refresh()?;
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    Some(KeyAction::ShowKeys) => {
+                        crate::startup::heap_future(|| self.run_slash_command("/keys")).await?;
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    Some(KeyAction::CopySelection) => {
                         self.copy_selection_to_clipboard().await?;
                         self.refresh()?;
                         return Ok(ControlFlow::Continue(()));
                     }
-                    Some(ClipboardShortcut::Paste) => {
+                    Some(KeyAction::PasteClipboard) => {
                         match read_from_clipboard() {
                             Ok(text) => self.input.handle_paste(text),
                             Err(error) => self.renderer.write_line(
@@ -2589,12 +2624,10 @@ impl<'a> App<'a> {
                         self.refresh()?;
                         return Ok(ControlFlow::Continue(()));
                     }
-                    None => {}
+                    _ => {}
                 }
-                let is_ctrl_c =
-                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                let is_ctrl_d =
-                    key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
+                let is_ctrl_c = action == Some(KeyAction::Interrupt);
+                let is_ctrl_d = action == Some(KeyAction::Eof);
                 if is_ctrl_c || is_ctrl_d {
                     let validation_active = self.run.validation_active();
                     match interrupt_target(
@@ -2624,8 +2657,12 @@ impl<'a> App<'a> {
                                 IdleInterrupt::Exit => return Ok(ControlFlow::Break(())),
                                 IdleInterrupt::ClearDraft => self.input.discard_draft(),
                                 IdleInterrupt::EditorKey => {
-                                    crate::startup::heap_future(|| self.handle_key_event(key))
-                                        .await?;
+                                    let editor_key = KeyBindings::canonical(KeyAction::Eof)
+                                        .expect("default EOF key");
+                                    crate::startup::heap_future(|| {
+                                        self.handle_key_event(editor_key)
+                                    })
+                                    .await?;
                                 }
                             }
                         }
@@ -2782,6 +2819,7 @@ impl<'a> App<'a> {
     }
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let action = self.keyboard_action(key);
         if self.renderer.selection_active && key.code == KeyCode::Char('y') {
             self.copy_selection_to_clipboard().await?;
             return Ok(());
@@ -2791,9 +2829,7 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        let ctrl_r =
-            key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl_r {
+        if action == Some(KeyAction::CycleReasoning) {
             let current = self.renderer.feed().reasoning_display();
             let display = current.next();
             let mut before = self.ui.cfg.clone();
@@ -2821,22 +2857,36 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        match key.code {
-            KeyCode::PageUp => {
+        match action {
+            Some(KeyAction::PageUp) => {
                 self.renderer.scroll_page_up();
                 return Ok(());
             }
-            KeyCode::PageDown => {
+            Some(KeyAction::PageDown) => {
                 self.renderer.scroll_page_down();
                 return Ok(());
             }
             _ => {}
         }
-        match transcript_scroll_key(
-            key,
-            self.input.buffer.is_empty(),
-            self.input.picker.as_ref().is_some_and(|p| p.active()),
-        ) {
+        let scroll_key = match action {
+            Some(KeyAction::TranscriptTop | KeyAction::TranscriptBottom) => {
+                KeyBindings::canonical(action.unwrap())
+            }
+            _ if !self.input.keybindings.removed_default(key, false)
+                && !self.input.keybindings.removed_default(key, true)
+                && !self.input.keybindings.is_explicit_binding(key) =>
+            {
+                Some(key)
+            }
+            _ => None,
+        };
+        match scroll_key.and_then(|key| {
+            transcript_scroll_key(
+                key,
+                self.input.buffer.is_empty(),
+                self.input.picker.as_ref().is_some_and(|p| p.active()),
+            )
+        }) {
             Some(TranscriptScroll::Top) => {
                 self.renderer.scroll_to_top();
                 return Ok(());
@@ -2848,9 +2898,10 @@ impl<'a> App<'a> {
             None => {}
         }
 
-        if self.input.picker.as_ref().is_some_and(|p| p.active())
-            && self.input.handle_picker_key(key)
-        {
+        // Retain the raw picker context even when a caret key closes it
+        // before falling through to the editor.
+        let picker_owned_key = self.input.picker.as_ref().is_some_and(Picker::active);
+        if picker_owned_key && self.input.handle_picker_key(key) {
             if let Some(RewindOutcome::Confirmed(idx)) = self.input.take_rewind_outcome()
                 && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx) > 0
             {
@@ -2876,7 +2927,7 @@ impl<'a> App<'a> {
             self.refresh_custom_commands();
         }
 
-        if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if action == Some(KeyAction::OpenEditor) {
             self.pause_event_thread();
             let result = self.input.open_in_editor(&mut self.terminal_guard);
             self.rebind_event_thread();
@@ -2893,7 +2944,7 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if is_lazygit_key(key) {
+        if action == Some(KeyAction::Lazygit) {
             self.run_lazygit().await?;
             return Ok(());
         }
@@ -2953,7 +3004,12 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if let Some(mut text) = self.input.handle_key(key) {
+        let submitted = if self.renderer.chain_but_mode || picker_owned_key {
+            self.input.handle_operator_draft_key(key)
+        } else {
+            self.input.handle_key(key)
+        };
+        if let Some(mut text) = submitted {
             #[cfg(feature = "loop")]
             if self.renderer.is_scrolling() {
                 self.renderer.scroll_to_bottom()?;
@@ -4715,7 +4771,10 @@ impl<'a> App<'a> {
             return result;
         }
 
-        if crate::ui::slash::is_readonly_view(text) || crate::ui::slash::is_jobs_control(text) {
+        if crate::ui::slash::is_readonly_view(text)
+            || crate::ui::slash::is_jobs_control(text)
+            || crate::ui::slash::is_input_control(text)
+        {
             if let Err(error) = result {
                 self.renderer
                     .write_line(&sanitize_output(&error.to_string()), C_ERROR)?;
@@ -8015,6 +8074,199 @@ mod permission_loop_tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn keys73_actual_app_routes_remaps_keys_vim_and_retains_raw_approval() {
+        let root = crate::tests::OwnedTestDirectory::new("keys73-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut cfg = fixture_config();
+        cfg.keys = Some(std::collections::BTreeMap::from([
+            ("line_start".into(), vec!["f2".into()]),
+            ("interrupt".into(), vec!["f3".into()]),
+            ("cycle_mode".into(), vec!["f4".into()]),
+            ("toggle_vim".into(), vec!["f5".into()]),
+            ("show_keys".into(), vec!["f6".into()]),
+            ("delete_forward".into(), vec!["ctrl+r".into()]),
+        ]));
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        app.input.load_text("雪猫 draft");
+        let key = |code, modifiers| UserEvent::Key(KeyEvent::new(code, modifiers));
+        let _ = app
+            .handle_user_event(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.input.cursor, app.input.buffer.len());
+        let _ = app
+            .handle_user_event(key(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.input.cursor, 0);
+        let reasoning = app.renderer.feed().reasoning_display();
+        let _ = app
+            .handle_user_event(key(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.input.buffer, "猫 draft");
+        assert_eq!(app.renderer.feed().reasoning_display(), reasoning);
+        let session_before = serde_json::to_vec(app.ui.session).unwrap();
+        let _ = app
+            .handle_user_event(key(KeyCode::F(6), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.renderer.captured_output().contains("line_start: f2"));
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), session_before);
+        assert!(!app.run.is_running && app.run.agent.is_none());
+        let _ = app
+            .handle_user_event(key(KeyCode::F(5), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let _ = app
+            .handle_user_event(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.input.vim_label(), "vim:NORMAL");
+        assert!(app.renderer.captured_output().contains("vim:NORMAL"));
+        let pending = PendingMainTurn::capture(app.ui.session, "active request");
+        crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+        app.run.is_running = true;
+        let (ask, mut decision) = request("exact requested shell operation");
+        app.begin_permission_request(ask).unwrap();
+        assert!(app.permission_prompt.is_some());
+        let _ = app
+            .handle_user_event(key(KeyCode::F(5), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.input.vim_enabled());
+        assert!(matches!(
+            decision.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(app.ui.session.permission_allowlist.is_empty());
+        let _ = app
+            .handle_user_event(key(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(matches!(replied(decision).await, UserDecision::Deny));
+        app.run.is_running = false;
+        crate::startup::heap_future(|| app.run_slash_command("/vim off"))
+            .await
+            .unwrap();
+        assert!(!app.input.vim_enabled());
+        assert!(matches!(
+            app.handle_user_event(key(KeyCode::F(3), KeyModifiers::NONE))
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        ));
+        assert!(app.input.buffer.is_empty());
+        assert!(matches!(
+            app.handle_user_event(key(KeyCode::F(3), KeyModifiers::NONE))
+                .await
+                .unwrap(),
+            ControlFlow::Break(())
+        ));
+    }
+
+    #[tokio::test]
+    async fn keys73_actual_app_picker_fallback_retains_raw_keys_after_close() {
+        let root = crate::tests::OwnedTestDirectory::new("keys73-picker-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut cfg = fixture_config();
+        cfg.vim_mode = Some(true);
+        cfg.keys = Some(std::collections::BTreeMap::from([
+            ("line_start".into(), vec!["f2".into()]),
+            ("undo".into(), vec!["f3".into()]),
+            ("submit".into(), vec!["f4".into()]),
+        ]));
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("picker-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let key = |code, modifiers| UserEvent::Key(KeyEvent::new(code, modifiers));
+        for query in ["/mo", "@read"] {
+            app.input.clear_buffer();
+            for c in query.chars() {
+                let _ = app
+                    .handle_user_event(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            assert!(app.input.picker.as_ref().is_some_and(Picker::active));
+            let cursor = app.input.cursor;
+            for code in [KeyCode::F(2), KeyCode::F(3), KeyCode::F(4)] {
+                let _ = app
+                    .handle_user_event(key(code, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+                assert_eq!(app.input.buffer, query);
+                assert_eq!(app.input.cursor, cursor);
+                assert!(app.input.picker.as_ref().is_some_and(Picker::active));
+                assert!(!app.run.is_running);
+            }
+            // Raw caret editing closes the picker, then keeps the raw key
+            // for that same event despite the configured replacement.
+            let _ = app
+                .handle_user_event(key(KeyCode::Home, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert!(!app.input.picker.as_ref().is_some_and(Picker::active));
+            assert_eq!(app.input.cursor, 0);
+            app.input.set_cursor(app.input.buffer.len());
+            let _ = app
+                .handle_user_event(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            assert_eq!(app.input.cursor, app.input.buffer.len());
+            let _ = app
+                .handle_user_event(key(KeyCode::F(2), KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert_eq!(app.input.cursor, 0);
+        }
+        app.input.clear_buffer();
+        for c in "/help".chars() {
+            let _ = app
+                .handle_user_event(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert!(app.input.picker.as_ref().is_some_and(Picker::active));
+        let _ = app
+            .handle_user_event(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.input.buffer.is_empty());
+        assert!(!app.input.picker.as_ref().is_some_and(Picker::active));
+        assert!(!app.run.is_running);
+        assert!(app.renderer.captured_output().contains("/keys"));
     }
 
     #[tokio::test]

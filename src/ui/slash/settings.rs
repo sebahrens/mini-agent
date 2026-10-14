@@ -5,6 +5,40 @@ use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
+        "/keys" => {
+            if parts.len() != 1 {
+                write_error(ctx.renderer, "usage: /keys");
+                return Ok(());
+            }
+            write_ok(
+                ctx.renderer,
+                "effective keyboard bindings (editor/App; modal choices retain raw keys):",
+            );
+            for line in ctx.input.keybindings.describe() {
+                write_result(ctx.renderer, line);
+            }
+            Ok(())
+        }
+        "/vim" => {
+            let enabled = match parts {
+                ["/vim"] => !ctx.input.vim_enabled(),
+                ["/vim", "on"] => true,
+                ["/vim", "off"] => false,
+                _ => {
+                    write_error(ctx.renderer, "usage: /vim [on|off]");
+                    return Ok(());
+                }
+            };
+            ctx.input.set_vim_enabled(enabled);
+            write_ok(
+                ctx.renderer,
+                format!(
+                    "vim editing: {} (this UI session)",
+                    if enabled { "on" } else { "off" }
+                ),
+            );
+            Ok(())
+        }
         "/cost" => {
             if parts.len() != 1 {
                 write_error(ctx.renderer, "usage: /cost");

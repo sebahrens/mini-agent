@@ -86,6 +86,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_agent_turns"),
     key("verify_command"),
     key("format"),
+    key("keys"),
+    key("vim_mode"),
     gated("goal", "goal"),
     gated("goal", "goal_checks"),
     gated("goal", "goal_judge_model"),

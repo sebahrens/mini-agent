@@ -21,6 +21,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/history",
     "/init",
     "/jobs",
+    "/keys",
     "/memory",
     "/mode",
     "/model",
@@ -44,6 +45,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/toggle",
     "/tutor",
     "/undo",
+    "/vim",
     "/welcome",
 ];
 

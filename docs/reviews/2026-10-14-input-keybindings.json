@@ -1,0 +1,77 @@
+{
+  "bead": "mini-agent-i7ro6.73",
+  "base": "d2aa95bcacd02441aaf49dc2c24335373daa0dfd",
+  "changes": [
+    "Validated bounded trusted keyboard action/chord overrides; explicit chords replace default aliases, empty lists unbind",
+    "Input Vim Insert/Normal/literal Search with UTF8 motions and bounded undo; /keys and /vim session controls",
+    "Actual App routing and status rendering; raw picker and approval choices preserve operator input, including an event that closes a picker"
+  ],
+  "source_sha256": {
+    "docs/agent/COMMANDS.md": "b5d625515a37a77553436b955c3e00a6d49cac4ce4a1dd7a09b73dbeb4bdb428",
+    "docs/agent/CONFIG.md": "a862148f7a7b78c6625d88754b9efa428678856a536f5fd603daf506044f30b9",
+    "docs/agent/input-keybindings.md": "7488473fbd96cd3e96c06eff5605f4c912469b9827cdad5d23cfaefce70a5b6e",
+    "src/config/keybindings.rs": "7d41606a3f716ddcb2cde2b0b0f69945dc762e5e7eeb5a2dbe8cadca6be65296",
+    "src/config/keys.rs": "c9e1422a7de21878d0ab76d6970d501188ad79f4e5a654e88cb1c8bf65eb5215",
+    "src/config/load.rs": "442b3b64ca8e5114e4644b0af9946d5adfffb4e08a01a66c0215d4522647e1e8",
+    "src/config/mod.rs": "fbf4e08a39abfc53f261841a892d438b671264efc3917968ceca7b159d03c520",
+    "src/tests/input_tests.rs": "176018ab2509f0b0581d2e0272c3734a107c2fc1dcb6f8e693423e270ceb15f8",
+    "src/ui/app.rs": "3fc05ba6cce1ff2ce364e65e3b90e8aafccc4f76d2ecac5722efb053456ee7bf",
+    "src/ui/input/mod.rs": "b54c96f7d4da71612a0f3193d2e6ca24f6a1d4d7ea796030c428482963a3a95a",
+    "src/ui/input/vim.rs": "21e0e6d8ea28cce9ca3fe9c2006493d9333df9c7c654e88617163b9e07557db1",
+    "src/ui/mod.rs": "0484168382ba4cfba24dd1da69003fd97da5086c4738e528df7fb57b9e357e29",
+    "src/ui/pickers/list.rs": "4852c14855743c90f6150b2feacefc880cf04b973ef5b2877a7e8733f28538b8",
+    "src/ui/slash/help.rs": "ac78f95561fb0a79cc34db378226ff5430e678c3b7f2d96f42b5abf251531384",
+    "src/ui/slash/mod.rs": "226575ba605259b9ff48e7284eeaf73567653f554b2cddcd41d7b2a2e900c807",
+    "src/ui/slash/settings.rs": "d328643c4a7f6721b5662ce008f30120a64ca6da326c54b7901db564f1229dff"
+  },
+  "selection": "code-indexer located owning parser/input/paste/App/config-trust/status/slash symbols and affected callers; local full suite omitted",
+  "validation": {
+    "prior_default_advisor_owning": "22 passed, includes actual standard and session-picker event loops on 1 MiB threads",
+    "final_picker": "7 passed; actual command/file App fallback, full /help raw Enter with submit=f4, six existing caret-picker controls",
+    "other_owning": "Earlier minimal input19, parser3/Vim3, config catalogue and status controls retained for unchanged source",
+    "strict": "Final default+advisor all-target Clippy -D warnings passed 17.33s; prior minimal strict passed",
+    "install": "cargo install --path . --debug --features advisor --locked --offline --root /private/tmp/mini-agent-keys73-install passed 8.77s",
+    "native": {
+      "root": "/private/tmp/mini-agent-keys73-native-qgi110o5",
+      "binary": "/private/tmp/mini-agent-keys73-install/bin/mini-agent",
+      "binary_sha256": "adf48193a6bfb5d20f55209797a3b8868cd11ca5ca1b5ca2576a4962f417af9a",
+      "assertions": {
+        "configured_startup_insert": true,
+        "configured_show_keys": true,
+        "removed_default_does_not_move_cursor": true,
+        "remapped_motion_keeps_unicode_draft": true,
+        "normal_delete_and_undo": true,
+        "literal_search_query_visible": true,
+        "picker_does_not_apply_remapped_motion": true,
+        "picker_close_retains_raw_caret_key": true,
+        "full_command_picker_retains_raw_enter": true,
+        "actual_vim_command": true,
+        "normal_quit_exit_zero": true,
+        "native_process_retired": true,
+        "completion_posts_zero": true
+      },
+      "calls": [
+        [
+          "GET",
+          "/v1/models"
+        ]
+      ],
+      "errors": [],
+      "stack_bytes": 1048576,
+      "native_pid": 15610,
+      "listener_joined": true,
+      "passed": true
+    }
+  },
+  "review": {
+    "independent_full_patch_sha256": "27b1fa9342064fd8e4750f7a9350d166927c82d7351df1a91b53c1878a3cc970",
+    "peer_review_sha256": "fb7b04ff4d4ce99ef114f992e041294aac6cb4c8604f07782e3b8d626ecee5ea",
+    "finding": "Configured editor fallback could act inside a raw picker. App now captures picker ownership before handling and uses raw fallback for that event; direct editor callers also bypass mappings while a picker is active. Actual regression passed."
+  },
+  "retained_failed_controls": [
+    "Initial new regression assumed Ctrl+A closes the picker; existing caret policy closes Home/End/arrows/Delete. Test corrected to Home; production caret policy unchanged.",
+    "Native help footer assertion first looked for an off-screen /keys entry; corrected to visible footer.",
+    "Native /vim on driver initially sent Enter after configuring submit=f4; the draft had left its picker on space. Driver corrected to configured F4."
+  ],
+  "hosted_ci": "Fresh CI must be observed after integration and push; prior main CI does not cover this change."
+}

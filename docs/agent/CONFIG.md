@@ -3457,3 +3457,24 @@ content-addressed cache namespaces and never repoint explicitly imported package
 Imported catalogue metadata is bounded separately to 1,024 names and 4,096 aggregate signature entries,
 with 8 MiB of lexical-load content. List descriptions are sanitized to one line and 384 UTF-8 bytes;
 model search metadata has a separate final encoded 8 KiB limit.
+
+## Keyboard bindings and Vim editing
+
+Set `vim_mode = true` to start the input in Vim Insert mode. Set trusted `[keys]`
+action arrays to replace shortcuts, for example:
+
+```toml
+vim_mode = true
+
+[keys]
+line_start = ["f2"]
+open_editor = ["ctrl+x"]
+undo = ["ctrl+z"]
+```
+
+`/keys` lists the effective action/chord map. Empty arrays disable an action;
+explicit chords must be unique. At most eight chords per action are accepted,
+with a 40-byte limit per chord. Ctrl, Alt, Shift, Super, named navigation keys,
+F1–F24 and single Unicode characters are supported. Project keyboard settings
+require trust. Approval and picker choices keep their raw operator keys. See
+[Input keyboard settings](input-keybindings.md) for editing and undo limits.

@@ -4302,3 +4302,25 @@ fn format45_config_map_is_sensitive_and_merges_only_in_the_trusted_layer() {
     assert_eq!(keys::lookup("format").unwrap().name, "format");
     assert!(Config::default().format.is_empty());
 }
+
+#[cfg(test)]
+#[test]
+fn keys73_keyboard_maps_and_vim_require_project_trust() {
+    let input = "vim_mode = true\n[keys]\nline_start = ['f2']\nsubmit = []\n";
+    let (benign, sensitive, names) = split_project_override(input).unwrap();
+    assert!(names.contains("keys") && names.contains("vim_mode"));
+    assert!(benign.get("keys").is_none() && benign.get("vim_mode").is_none());
+    let untrusted = merge_config_value(&Config::default(), benign).unwrap();
+    assert!(untrusted.keys.is_none() && untrusted.vim_mode.is_none());
+    let trusted = merge_config_value(&untrusted, sensitive).unwrap();
+    assert_eq!(trusted.keys.as_ref().unwrap()["line_start"], ["f2"]);
+    assert_eq!(trusted.vim_mode, Some(true));
+    assert!(keys::lookup("keys").is_some() && keys::lookup("vim_mode").is_some());
+    assert!(
+        merge_config_value(
+            &Config::default(),
+            toml::from_str("[keys]\nunknown_private_action = ['private_chord']").unwrap()
+        )
+        .is_err()
+    );
+}

@@ -1,3 +1,4 @@
+pub(crate) mod keybindings;
 pub(crate) mod keys;
 pub mod load;
 pub mod types;
@@ -58,6 +59,13 @@ pub struct ConfigProvenance {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "keybindings::deserialize_keys"
+    )]
+    pub keys: Option<keybindings::KeyOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vim_mode: Option<bool>,
     /// Runtime-only MCP source records; never configuration or launch trust.
     #[cfg(feature = "mcp")]
     #[serde(skip)]

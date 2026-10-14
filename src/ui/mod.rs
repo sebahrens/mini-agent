@@ -4,7 +4,9 @@ pub(crate) use app::retire_scoped_task;
 #[cfg(all(test, feature = "git-worktree"))]
 pub(crate) use app::retire_workspace_owners_and_complete_merge;
 #[cfg(test)]
-pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};
+pub(crate) use app::{ClipboardShortcut, clipboard_shortcut};
+#[cfg(test)]
+pub(crate) use app::{InterruptTarget, interrupt_target};
 pub(crate) mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
@@ -254,9 +256,38 @@ pub(crate) fn refresh_display(
         btw_out: btw.output,
         sandbox_label: crate::ui::statusline::sandbox_label(&ui.sandbox),
     };
-    let statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
+    let base_statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
+    let vim_label = input.vim_status_label();
+    let statusline_key = if vim_label.is_empty() {
+        base_statusline_key
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        base_statusline_key.hash(&mut state);
+        vim_label.hash(&mut state);
+        state.finish()
+    };
     let statusline = renderer.cached_statusline(statusline_key, || {
-        crate::ui::statusline::build(ui.session, &statusline_ctx)
+        let mut lines = crate::ui::statusline::build(ui.session, &statusline_ctx);
+        if !vim_label.is_empty()
+            && let Some(line) = lines.first_mut()
+        {
+            line.insert(
+                0,
+                crate::ui::statusline::StatusSpan::Text {
+                    text: format!("{vim_label} "),
+                    fg: None,
+                    bg: None,
+                    layout: crate::ui::statusline::SpanLayout::Item {
+                        priority: 0,
+                        plain: format!("{vim_label} "),
+                        compact: None,
+                        dynamic_color: false,
+                    },
+                },
+            );
+        }
+        lines
     });
     renderer.draw_bottom(
         &input.buffer,
@@ -675,6 +706,7 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
         || crate::ui::slash::is_readonly_view(t)
         || crate::ui::slash::is_jobs_control(t)
         || t == "/queue"
+        || crate::ui::slash::is_input_control(t)
         || t.starts_with("/queue ")
         || t == "/btw"
         || t.starts_with("/btw ")

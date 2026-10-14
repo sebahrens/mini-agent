@@ -306,10 +306,16 @@ fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+mod vim;
+
 const MAX_KILL_RING: usize = 30;
 const MAX_PICKER_PASTE_CHARS: usize = 256;
 
 pub struct InputEditor {
+    pub(crate) keybindings: crate::config::keybindings::KeyBindings,
+    vim: vim::VimState,
+    undo: std::collections::VecDeque<(CompactString, usize)>,
+    undo_bytes: usize,
     pub buffer: CompactString,
     pub cursor: usize,
     history: Vec<CompactString>,
@@ -344,6 +350,10 @@ pub struct InputEditor {
 impl InputEditor {
     pub fn new() -> Self {
         InputEditor {
+            keybindings: crate::config::keybindings::KeyBindings::default(),
+            vim: vim::VimState::default(),
+            undo: std::collections::VecDeque::new(),
+            undo_bytes: 0,
             buffer: CompactString::new(""),
             cursor: 0,
             history: Vec::new(),
@@ -403,6 +413,7 @@ impl InputEditor {
     }
 
     pub fn clear_buffer(&mut self) {
+        self.clear_undo();
         self.buffer.clear();
         self.cursor = 0;
         self.history_pos = None;
@@ -422,6 +433,7 @@ impl InputEditor {
     /// Replace the input buffer with `text`, cursor at the end. Used by the
     /// rewind flow to drop the chosen user turn back into the box for editing.
     pub fn load_text(&mut self, text: &str) {
+        self.clear_undo();
         self.buffer = CompactString::new(text);
         // `cursor` is a byte offset into `buffer` (sliced as `buffer[..cursor]`
         // and advanced by `len_utf8()` elsewhere), so end-of-buffer is the byte
@@ -801,6 +813,12 @@ impl InputEditor {
     }
 
     pub fn handle_paste(&mut self, data: String) {
+        let before = self.undo_snapshot();
+        self.handle_paste_inner(data);
+        self.record_undo(before);
+    }
+
+    fn handle_paste_inner(&mut self, data: String) {
         let data = sanitize_paste(&data);
         if data.is_empty() {
             return;
@@ -846,11 +864,186 @@ impl InputEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        self.clamp_cursor();
+        if self.picker.as_ref().is_some_and(Picker::active) {
+            return self.handle_operator_draft_key(key);
+        }
+        let editor_event = self.keybindings.effective_editor_event(key);
+        let before = self.undo_snapshot();
+        let action = self.vim.action(key);
+        let submitted = if action == vim::VimAction::Pass {
+            if self.keybindings.action(key, true)
+                == Some(crate::config::keybindings::KeyAction::Undo)
+            {
+                self.apply_vim_action(vim::VimAction::Undo);
+                return None;
+            }
+            editor_event.and_then(|event| self.handle_editor_key(event))
+        } else {
+            self.apply_vim_action(action);
+            None
+        };
+        if editor_event.is_some_and(is_backward_delete) {
+            self.reopen_command_picker_for_slash_word();
+        }
+        if submitted.is_some()
+            || (action == vim::VimAction::Pass
+                && editor_event.is_some_and(|event| {
+                    event.code == KeyCode::Enter
+                        && !event
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                })
+                && self.buffer.is_empty())
+        {
+            self.clear_undo();
+            self.vim.mode = vim::VimMode::Insert;
+        } else if action != vim::VimAction::Undo {
+            self.record_undo(before);
+        }
+        submitted
+    }
+
+    /// Operator modal drafts use the original editor keys, without Vim or
+    /// configured shortcuts that might otherwise consume literal choices.
+    pub(crate) fn handle_operator_draft_key(&mut self, key: KeyEvent) -> Option<CompactString> {
         let submitted = self.handle_editor_key(key);
         if is_backward_delete(key) {
             self.reopen_command_picker_for_slash_word();
         }
+        self.clear_undo();
         submitted
+    }
+
+    pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        self.vim.set_enabled(enabled);
+        self.clear_undo();
+    }
+
+    pub(crate) fn vim_enabled(&self) -> bool {
+        self.vim.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vim_label(&self) -> &str {
+        self.vim.label()
+    }
+
+    pub(crate) fn vim_status_label(&self) -> CompactString {
+        if self.vim.enabled && self.vim.mode == vim::VimMode::Search {
+            format!("{} /{}", self.vim.label(), self.vim.search).into()
+        } else {
+            self.vim.label().into()
+        }
+    }
+
+    fn clear_undo(&mut self) {
+        self.undo.clear();
+        self.undo_bytes = 0;
+    }
+
+    fn undo_snapshot(&mut self) -> Option<(CompactString, usize)> {
+        if !self.vim.enabled
+            && !self
+                .keybindings
+                .has_override(crate::config::keybindings::KeyAction::Undo)
+        {
+            return None;
+        }
+        if self.buffer.len() > 2 * 1024 * 1024 {
+            self.clear_undo();
+            return None;
+        }
+        Some((self.buffer.clone(), self.cursor))
+    }
+
+    fn record_undo(&mut self, before: Option<(CompactString, usize)>) {
+        let Some(before) = before else { return };
+        if self.buffer.len() > 2 * 1024 * 1024 {
+            self.clear_undo();
+            return;
+        }
+        if before.0 == self.buffer {
+            return;
+        }
+        self.undo_bytes += before.0.len();
+        self.undo.push_back(before);
+        while self.undo.len() > 32 || self.undo_bytes > 2 * 1024 * 1024 {
+            if let Some((text, _)) = self.undo.pop_front() {
+                self.undo_bytes -= text.len();
+            }
+        }
+    }
+
+    fn apply_vim_action(&mut self, action: vim::VimAction) {
+        use vim::VimAction;
+        match action {
+            VimAction::Left => self.cursor = prev_char_boundary(&self.buffer, self.cursor),
+            VimAction::Right | VimAction::InsertAfter => {
+                self.cursor = next_char_boundary(&self.buffer, self.cursor);
+            }
+            VimAction::Up | VimAction::Down => {
+                let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
+                let line = if action == VimAction::Up {
+                    line.saturating_sub(1)
+                } else {
+                    (line + 1).min(count_lines(&self.buffer) - 1)
+                };
+                self.cursor = line_col_to_cursor(&self.buffer, line, col);
+            }
+            VimAction::WordNext => self.cursor = vim::next_word_start(&self.buffer, self.cursor),
+            VimAction::WordPrevious => {
+                self.cursor = vim::previous_word_start(&self.buffer, self.cursor);
+            }
+            VimAction::LineStart | VimAction::InsertLineStart => {
+                self.cursor = line_start(&self.buffer, self.cursor);
+            }
+            VimAction::LineEnd | VimAction::InsertLineEnd => {
+                self.cursor = line_end(&self.buffer, self.cursor);
+            }
+            VimAction::Delete => {
+                if self.cursor < self.buffer.len() {
+                    self.buffer.remove(self.cursor);
+                }
+            }
+            VimAction::DeleteLine => {
+                let start = line_start(&self.buffer, self.cursor);
+                let end = line_end(&self.buffer, self.cursor);
+                let (start, end) = if end < self.buffer.len() {
+                    (start, end + 1)
+                } else if start > 0 {
+                    (start - 1, end)
+                } else {
+                    (start, end)
+                };
+                let deleted: CompactString = self.buffer[start..end].into();
+                self.buffer.replace_range(start..end, "");
+                self.cursor = start.min(self.buffer.len());
+                self.push_kill(deleted);
+            }
+            VimAction::Undo => {
+                if let Some((text, cursor)) = self.undo.pop_back() {
+                    self.undo_bytes -= text.len();
+                    self.buffer = text;
+                    self.cursor = cursor;
+                    self.close_query_picker();
+                    self.history_pos = None;
+                    self.draft = None;
+                }
+            }
+            VimAction::BeginSearch => self.vim.search_origin = self.cursor,
+            VimAction::Find => {
+                if let Some(query) = &self.vim.last_search
+                    && let Some(cursor) = vim::find_literal(&self.buffer, self.cursor, query)
+                {
+                    self.cursor = cursor;
+                }
+            }
+            VimAction::CancelSearch => self.cursor = self.vim.search_origin,
+            VimAction::Pass | VimAction::Consume => {}
+        }
+        self.clamp_cursor();
+        self.yank_pos = None;
     }
 
     /// After deleting back to a bare `/command` word (for example out of an

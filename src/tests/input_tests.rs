@@ -12,6 +12,147 @@ fn type_str(editor: &mut InputEditor, s: &str) {
 }
 
 #[test]
+fn keys73_actual_vim_line_delete_undo_and_unicode_motions() {
+    let mut editor = InputEditor::new();
+    editor.load_text("雪猫 foo\nsecond\nlast");
+    editor.set_vim_enabled(true);
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Esc));
+    assert_eq!(editor.vim_label(), "vim:NORMAL");
+    type_str(&mut editor, "w");
+    assert_eq!(&editor.buffer[editor.cursor..], "foo\nsecond\nlast");
+    type_str(&mut editor, "b");
+    assert_eq!(editor.cursor, 0);
+    type_str(&mut editor, "jdd");
+    assert_eq!(editor.buffer.as_str(), "雪猫 foo\nlast");
+    type_str(&mut editor, "u");
+    assert_eq!(editor.buffer.as_str(), "雪猫 foo\nsecond\nlast");
+    assert!(editor.buffer.is_char_boundary(editor.cursor));
+    editor.set_cursor(editor.buffer.len());
+    type_str(&mut editor, "dd");
+    assert_eq!(editor.buffer.as_str(), "雪猫 foo\nsecond");
+    type_str(&mut editor, "u");
+    assert_eq!(editor.buffer.as_str(), "雪猫 foo\nsecond\nlast");
+    type_str(&mut editor, "i雪");
+    assert!(editor.buffer.ends_with("last雪"));
+    assert_eq!(editor.vim_label(), "vim:INSERT");
+}
+
+#[test]
+fn keys73_actual_vim_literal_search_cancel_and_repeat() {
+    let mut editor = InputEditor::new();
+    editor.load_text("雪[. foo 雪[.");
+    editor.set_vim_enabled(true);
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "/[.");
+    assert_eq!(editor.vim_label(), "vim:SEARCH");
+    assert_eq!(editor.buffer.as_str(), "雪[. foo 雪[.");
+    editor.handle_key(press(KeyCode::Enter));
+    assert_eq!(&editor.buffer[editor.cursor..], "[. foo 雪[.");
+    type_str(&mut editor, "n");
+    assert_eq!(&editor.buffer[editor.cursor..], "[.");
+    let cursor = editor.cursor;
+    type_str(&mut editor, "/unknown");
+    editor.handle_key(press(KeyCode::Esc));
+    assert_eq!(editor.cursor, cursor);
+    assert_eq!(editor.vim_label(), "vim:NORMAL");
+    type_str(&mut editor, "n");
+    assert_eq!(&editor.buffer[editor.cursor..], "[. foo 雪[.");
+}
+
+#[test]
+fn keys73_actual_vim_paste_undo_does_not_cross_load_or_submission() {
+    let mut editor = InputEditor::new();
+    editor.load_text("before");
+    editor.set_vim_enabled(true);
+    editor.handle_paste("雪\r\nnext".to_owned());
+    assert_eq!(editor.buffer.as_str(), "before雪\nnext");
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "u");
+    assert_eq!(editor.buffer.as_str(), "before");
+    type_str(&mut editor, "iX");
+    editor.load_text("another context");
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "u");
+    assert_eq!(editor.buffer.as_str(), "another context");
+    let submitted = editor.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(submitted.as_str(), "another context");
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "u");
+    assert!(editor.buffer.is_empty());
+    editor.set_vim_enabled(false);
+    assert!(!editor.vim_enabled());
+    assert_eq!(editor.vim_label(), "");
+    type_str(&mut editor, "hjkl");
+    assert_eq!(editor.buffer.as_str(), "hjkl");
+}
+
+#[test]
+fn keys73_actual_editor_remap_replaces_defaults_and_keeps_altgr() {
+    use crate::config::keybindings::KeyBindings;
+    let settings = std::collections::BTreeMap::from([
+        ("line_start".into(), vec!["f2".into()]),
+        ("delete_backward".into(), vec!["f3".into()]),
+        ("submit".into(), vec!["ctrl+s".into()]),
+        ("undo".into(), vec!["ctrl+z".into()]),
+    ]);
+    let mut editor = InputEditor::new();
+    editor.keybindings = KeyBindings::from_overrides(Some(&settings)).unwrap();
+    editor.load_text("雪猫end");
+    editor.handle_key(ctrl('a'));
+    assert_eq!(editor.cursor, editor.buffer.len());
+    editor.handle_key(press(KeyCode::F(2)));
+    assert_eq!(editor.cursor, 0);
+    editor.handle_key(press(KeyCode::Right));
+    editor.handle_key(press(KeyCode::Backspace));
+    assert_eq!(editor.buffer.as_str(), "雪猫end");
+    editor.handle_key(press(KeyCode::F(3)));
+    assert_eq!(editor.buffer.as_str(), "猫end");
+    editor.handle_key(ctrl('z'));
+    assert_eq!(editor.buffer.as_str(), "雪猫end");
+    editor.set_cursor(editor.buffer.len());
+    editor.handle_key(KeyEvent::new(
+        KeyCode::Char('€'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ));
+    assert_eq!(editor.buffer.as_str(), "雪猫end€");
+    assert_eq!(editor.handle_key(press(KeyCode::Enter)), None);
+    assert_eq!(editor.buffer.as_str(), "雪猫end€");
+    assert_eq!(editor.handle_key(ctrl('s')).unwrap(), "雪猫end€");
+    assert!(editor.buffer.is_empty());
+    editor.handle_key(ctrl('z'));
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
+fn keys73_undo_refuses_oversized_history_and_blank_remapped_submission() {
+    use crate::config::keybindings::KeyBindings;
+    let mut editor = InputEditor::new();
+    editor.keybindings = KeyBindings::from_overrides(Some(&std::collections::BTreeMap::from([
+        ("submit".into(), vec!["ctrl+s".into()]),
+        ("undo".into(), vec!["ctrl+z".into()]),
+    ])))
+    .unwrap();
+    type_str(&mut editor, "  ");
+    assert_eq!(editor.handle_key(ctrl('s')), None);
+    editor.handle_key(ctrl('z'));
+    assert!(editor.buffer.is_empty());
+    type_str(&mut editor, "small");
+    editor.handle_paste("x".repeat(2 * 1024 * 1024 + 1));
+    let oversized_len = editor.buffer.len();
+    editor.handle_key(ctrl('z'));
+    assert_eq!(editor.buffer.len(), oversized_len);
+    editor.load_text("fresh");
+    editor.set_vim_enabled(true);
+    editor.handle_key(press(KeyCode::Esc));
+    editor.handle_operator_draft_key(press(KeyCode::Char('h')));
+    assert_eq!(editor.buffer, "freshh");
+    editor.handle_operator_draft_key(press(KeyCode::Enter));
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
 fn typing_ascii_keeps_cursor_in_sync() {
     let mut editor = InputEditor::new();
     type_str(&mut editor, "hello");
