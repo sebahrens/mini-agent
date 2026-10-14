@@ -697,6 +697,9 @@ mod readonly_import_tests {
             &crate::fs::checked_path_metadata(&path).unwrap(),
         )
         .unwrap();
+        // The readonly identity proof is complete. Retire its held descriptor
+        // before this fixture deliberately replaces the snapshot for negatives.
+        drop(before);
         let absent = uuid::Uuid::new_v4().to_string();
         assert!(
             load_session_exact_read_only(&sessions, &absent, &workspace)
