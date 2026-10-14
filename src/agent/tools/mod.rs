@@ -15,6 +15,10 @@ pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
 pub(crate) mod read;
+// Draft image-read codec boundary; production admission/transport wiring is
+// intentionally not enabled until the owning image-read integration is ready.
+#[cfg(all(test, feature = "multimodal"))]
+mod read_image;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
 pub(crate) mod todo;
