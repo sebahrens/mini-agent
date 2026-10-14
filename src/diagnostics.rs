@@ -160,6 +160,9 @@ impl DoctorReport {
                         format!("config api_keys.{name} (value omitted)")
                     }
                     Ok(CredentialSource::NotRequired) => "not required".into(),
+                    Ok(CredentialSource::AwsDefaultChain) => {
+                        "AWS SDK credential chain (resolved on request; values omitted)".into()
+                    }
                     Err(_) => "missing; configure this route's credentials".into(),
                 }
             }

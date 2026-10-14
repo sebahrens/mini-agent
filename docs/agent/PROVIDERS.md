@@ -1,10 +1,10 @@
 ---
-description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
+description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, AWS Bedrock, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
 ---
 
 # Providers
 
-mini-agent supports six built-in providers and allows custom provider
+mini-agent supports seven built-in providers and allows custom provider
 definitions for OpenAI-compatible endpoints.
 
 ## Built-in Providers
@@ -14,6 +14,7 @@ definitions for OpenAI-compatible endpoints.
 | OpenRouter | `openrouter`        | `OPENROUTER_API_KEY`        |
 | OpenAI     | `openai`            | `OPENAI_API_KEY`            |
 | Azure OpenAI | `azure` / `azure-openai` | `AZURE_OPENAI_API_KEY` |
+| AWS Bedrock (Claude) | `bedrock` / `aws-bedrock` | AWS SDK chain or `AWS_BEARER_TOKEN_BEDROCK` |
 | Anthropic  | `anthropic`         | `ANTHROPIC_API_KEY`         |
 | Gemini     | `gemini` / `google` | `GEMINI_API_KEY`            |
 | Ollama     | `ollama`            | (no key required)           |
@@ -97,6 +98,65 @@ explains deployment names and Entra token scope.
 ## Provider Recipes
 
 - [MiniMax](providers/Minimax.md)
+
+## AWS Bedrock Claude Messages
+
+Select `provider = "bedrock"`, set `AWS_REGION` (or `AWS_DEFAULT_REGION`), and
+configure the exact Bedrock Claude model or inference-profile ID:
+
+```toml
+provider = "bedrock"
+model = "us.anthropic.claude-sonnet-5"
+```
+
+This backend uses the current native Anthropic Messages endpoint,
+`https://bedrock-runtime.REGION.amazonaws.com/anthropic/v1/messages`, with
+streaming tools and usage. It supports Claude models exposed by that API; it
+does not translate other Bedrock model families into Claude requests. No common
+model/deployment default is assumed.
+
+Without an API key, the official AWS SDK resolves credentials lazily and signs
+each request with SigV4 for service `bedrock`. Its environment, shared-key profile,
+SSO, assume-role, web-identity, ECS, and EC2 credential providers remain available.
+Use your existing AWS identity setup; mini-agent does not initiate an AWS login.
+Credential HTTP uses strict TLS, bounded response bytes and deadlines, and does
+not inherit model/gateway headers or disabled TLS verification. Credential
+acquisition is cancelled with the owning request and bounded to 30 seconds.
+
+The optional AWS `credential_process` method is **disabled**. When using SDK
+credentials, a selected profile or `source_profile` chain containing it is
+explicitly rejected before SDK
+credential fallback or model dispatch, even if environment keys are available.
+The upstream process launcher lacks the bounded output/cancellation ownership
+required here. Use one of the supported credential methods instead. This is an
+AWS-specific limitation, unrelated to Anthropic/OpenAI OAuth login.
+
+Alternatively, `AWS_BEARER_TOKEN_BEDROCK`, `--api-key`, or `api_keys.bedrock`
+selects the native Messages API's `x-api-key` authentication. CLI, environment,
+and config precedence matches the other providers. This source always uses exclusive `x-api-key` auth
+and never inherits `ANTHROPIC_API_KEY`. Azure/OpenAI credentials are also never
+borrowed.
+
+A custom gateway must use its own configured key unless
+`inherit_builtin_key = true` explicitly grants AWS credential inheritance:
+
+```toml
+[custom_providers.bedrock-gateway]
+provider_type = "bedrock"
+base_url = "https://gateway.example/anthropic"
+api_key_env = "MY_BEDROCK_GATEWAY_KEY"
+model = "my-bedrock-model-id"
+```
+
+The SDK's Anthropic request/SSE converters are reused without rewriting model,
+system, tools, messages, or canonical replay data. `src/provider_bedrock.rs`
+owns endpoint/auth selection, signing and the AWS credential HTTP adapter;
+`src/provider_bedrock_tests.rs` covers the external contract. The existing
+`ProviderHttpClient` owns dispatch, deadlines, redirect policy, request-specific
+retry metadata, cancellation, and accounting.
+
+See [AWS native Messages](https://docs.aws.amazon.com/en_en/bedrock/latest/userguide/inference-messages-api.html)
+and the [AWS Rust credential chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html).
 
 ## Custom Providers
 

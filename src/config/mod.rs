@@ -640,7 +640,8 @@ impl Config {
     ///
     /// Keyed on the resolved provider *kind*, not the user-facing name: a
     /// custom provider registered under any name but with
-    /// `provider_type = "anthropic"` still hits the native route, while
+    /// `provider_type = "anthropic"` or native Bedrock Claude Messages still
+    /// hits the native route, while
     /// OpenRouter — even when serving a Claude model — normally uses the OpenAI
     /// shape (`input_tokens` already includes cached) and must not. Defensive
     /// normalization of non-native gateways uses their reported total instead.
@@ -653,7 +654,7 @@ impl Config {
             .unwrap_or(provider);
         matches!(
             crate::auth::ProviderKind::from_name(kind_name),
-            Some(crate::auth::ProviderKind::Anthropic)
+            Some(crate::auth::ProviderKind::Anthropic | crate::auth::ProviderKind::Bedrock)
         )
     }
 

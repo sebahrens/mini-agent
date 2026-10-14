@@ -681,7 +681,7 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `azure`, `anthropic`, `gemini`/`google`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
+| `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `azure`, `bedrock`, `anthropic`, `gemini`/`google`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
 | `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-pro`.                                                                                                                            |
 | `max_tokens`              | integer | Maximum tokens for a single model response (the per-request output cap sent to the provider). Default: `16384`. This never limits a whole turn; see `turn_token_budget`.     |
 | `turn_token_budget`       | integer | Optional cumulative fail-closed cap for one agentic turn: the sum of input+output tokens across every completion call the turn makes. Unset by default (no cap; turns are still bounded by `max_agent_turns`). Deliberately separate from `max_tokens` — a multi-tool-call turn legitimately accumulates many responses' worth of prompt tokens. |

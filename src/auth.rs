@@ -7,6 +7,7 @@ pub enum ProviderKind {
     OpenRouter,
     OpenAI,
     Azure,
+    Bedrock,
     Anthropic,
     Gemini,
     Ollama,
@@ -18,6 +19,7 @@ impl ProviderKind {
             "openrouter" => Some(Self::OpenRouter),
             "openai" | "custom" => Some(Self::OpenAI), // "custom" is an alias for OpenAI client
             "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
+            "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
             "anthropic" => Some(Self::Anthropic),
             "gemini" | "google" => Some(Self::Gemini),
             "ollama" => Some(Self::Ollama),
@@ -101,6 +103,7 @@ mod diagnostic_source_tests {
 pub enum ResolvedCredential {
     ApiKey(String),
     Bearer(String),
+    AwsDefaultChain,
 }
 
 /// The selected credential's origin, containing no credential bytes.
@@ -110,12 +113,14 @@ pub enum CredentialSource {
     Environment(String),
     Config(String),
     NotRequired,
+    AwsDefaultChain,
 }
 
 impl ResolvedCredential {
     pub fn secret(&self) -> &str {
         match self {
             Self::ApiKey(value) | Self::Bearer(value) => value,
+            Self::AwsDefaultChain => "",
         }
     }
 }
@@ -125,6 +130,7 @@ impl std::fmt::Debug for ResolvedCredential {
         formatter.write_str(match self {
             Self::ApiKey(_) => "ApiKey([REDACTED])",
             Self::Bearer(_) => "Bearer([REDACTED])",
+            Self::AwsDefaultChain => "AwsDefaultChain",
         })
     }
 }
@@ -328,6 +334,18 @@ impl AuthResolver {
             }
         }
 
+        // The AWS SDK resolves and refreshes credentials lazily per request.
+        // Explicit alternate key envs and isolated routes must never inherit it.
+        if self.provider_kind == ProviderKind::Bedrock
+            && custom.is_none()
+            && self.api_key_env_override.is_none()
+        {
+            return Ok((
+                ResolvedCredential::AwsDefaultChain,
+                CredentialSource::AwsDefaultChain,
+            ));
+        }
+
         // Ollama doesn't require an API key
         if self.provider_kind == ProviderKind::Ollama {
             return Ok((
@@ -379,6 +397,7 @@ impl ProviderKind {
         match self {
             ProviderKind::OpenAI => "OPENAI_API_KEY",
             ProviderKind::Azure => "AZURE_OPENAI_API_KEY",
+            ProviderKind::Bedrock => "AWS_BEARER_TOKEN_BEDROCK",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::Ollama => "OLLAMA_API_KEY",
@@ -394,7 +413,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "https://api.openai.com/v1",
             // Azure has no shared tenant endpoint. Explicit custom routes
             // cannot receive a vendor-key exemption by matching an example.
-            ProviderKind::Azure => "",
+            ProviderKind::Azure | ProviderKind::Bedrock => "",
             ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
             ProviderKind::Ollama => "http://localhost:11434",
@@ -420,6 +439,7 @@ impl ProviderKind {
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::OpenAI => "openai",
             ProviderKind::Azure => "azure",
+            ProviderKind::Bedrock => "bedrock",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",
