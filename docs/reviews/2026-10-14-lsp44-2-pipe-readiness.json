@@ -22,5 +22,19 @@
   },
   "validation": "Owning two final failed-stdin/last-reader controls PASS and unchanged real positive protocol control PASS reused; exact owner test map /private/tmp/mini-agent-lsp44-2-final-owned-indexed-test-map.json.",
   "reuse": "No production behavior or dependency change. Prior combined debug install and native74/116 evidence remain applicable; no production reinstall or unrelated feature sweep for this test-only successor.",
-  "remaining": "Fresh hosted Linux/macOS parallel acceptance required before closure; historical CI foreign-reader PID not identified, causal mechanism controlled and reproduced."
+  "remaining": "Fresh hosted Linux/macOS parallel acceptance required before closure; historical CI foreign-reader PID not identified, causal mechanism controlled and reproduced.",
+  "hosted_correction": {
+    "run": 38624467401,
+    "linux_job": 116061810293,
+    "observed": "Kernel pipe witness control passed. Broken-stdin failed only because wait_for_file captured an empty create-before-write marker snapshot. Readiness now requires completed literal closed marker and actual last-reader departure under the same5s timeout before the original one sync; all failure cleanup/stopped-by-write assertions retained.",
+    "validation": {
+      "result": "2 PASS0.14s",
+      "filters": [
+        "lsp_process_broken_stdin_is_terminal_and_reaped",
+        "lsp_pipe_peer_closed_witness_requires_last_reader_departure"
+      ],
+      "log": "/private/tmp/mini-agent-wave47-lsp-marker-final.log",
+      "command": "cargo test --bin mini-agent --features advisor --locked --offline -- lsp_process_broken_stdin_is_terminal_and_reaped lsp_pipe_peer_closed_witness_requires_last_reader_departure --test-threads=1"
+    }
+  }
 }

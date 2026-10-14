@@ -1625,24 +1625,26 @@ async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
         .await
         .expect("fixture must initialize before closing stdin");
     let parent_pid = wait_for_pid(&lease).await;
-    #[cfg(unix)]
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let marker = wait_for_file(&closed).await;
-    // An unrelated fork can retain the anonymous pipe's reader until exec,
-    // even after this exact server closes fd0. Observe actual peer departure
-    // before the original first-sync assertion; never retry sync_document.
-    #[cfg(unix)]
+    // Creating the marker precedes writing its bytes. An unrelated fork can
+    // also retain the pipe reader until exec after this server closes fd0.
+    // Observe both completed publication and actual peer departure before the
+    // original first sync; never retry sync_document.
     let peer_closed = tokio::time::timeout_at(ready_deadline, async {
         loop {
-            if client.stdin_reader_closed_for_test().await? {
-                return Ok::<_, std::io::Error>(());
+            if fs::read_to_string(&closed).is_ok_and(|value| value == "closed") {
+                #[cfg(unix)]
+                let peer_gone = client.stdin_reader_closed_for_test().await?;
+                #[cfg(not(unix))]
+                let peer_gone = true;
+                if peer_gone {
+                    return Ok::<_, std::io::Error>(());
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await;
-    #[cfg(not(unix))]
-    let peer_closed = Ok::<_, tokio::time::error::Elapsed>(Ok::<_, std::io::Error>(()));
 
     let ready = matches!(peer_closed, Ok(Ok(())));
     let document = read_stable_document(&source).await.unwrap();
@@ -1657,10 +1659,9 @@ async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
     assert_process_reaped(parent_pid).await;
     drop(client);
     fixture.cleanup().await;
-    assert_eq!(marker, "closed");
     assert!(
         ready,
-        "stdin peer did not retire within the existing fixture bound: {peer_closed:?}"
+        "stdin marker/peer did not settle within the existing fixture bound: {peer_closed:?}"
     );
     assert!(
         sync.is_none(),
