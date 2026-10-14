@@ -150,6 +150,10 @@ of subsequent requests. Production credentials and paid endpoints are not used.
 private ledger: a child retains an inherited descriptor while successful and
 corrupt-tail reader/writer operations retire. The controls check immediate lock
 release, unchanged corrupt bytes, exact receipts and idempotent persistence.
+The native Windows default CI job runs the existing idempotent persistence,
+corrupt-tail and bounded contention controls before its process-lifecycle
+fixtures. These exercise the platform's reader/writer lock contract separately
+from the Unix inherited-descriptor witness.
 
 The status bar's `calls` counter is display metadata on the same session account.
 Only deduplicated accepted receipts with a canonical usage report increment it,

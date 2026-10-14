@@ -628,6 +628,18 @@ jobs:
       # specifically prevents default-feature cfg and compilation drift.
       - name: Compile the Windows default feature suite
         run: cargo test --locked --no-run
+      - name: Test native ledger lock and persistence contracts
+        shell: pwsh
+        run: |
+          $filters = @('spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent', 'spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge', 'spend_ledger_concurrent_lock_is_bounded_and_directory_replacement_is_refused')
+          $listing = @(& cargo test --locked --bin mini-agent -- @filters --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Ledger contract test discovery failed' }
+          $expected = $filters | ForEach-Object { "spend::ledger::tests::$($_): test" } | Sort-Object
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^spend::ledger::tests::.*: test$' } | Sort-Object)
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 3 -or $difference.Count -ne 0) { throw 'Expected the exact three ledger contract controls' }
+          & cargo test --locked --bin mini-agent -- @filters --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native ledger lock or persistence contract failed' }
       - name: Test native one MiB App event loops
         shell: pwsh
         run: |
