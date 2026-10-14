@@ -2383,6 +2383,17 @@ mod js_tests {
     #[cfg(feature = "memory")]
     #[test]
     fn cache71_memory_changes_leave_static_preamble_and_ranges_unchanged() {
+        let roots = crate::tests::OwnedTestDirectory::new("cache71-memory-prefix");
+        let bindings = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(roots.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
         let mut context = empty_context();
         let mut projected = Vec::new();
         for value in ["MEMORY_A_雪", "MEMORY_B_changed"] {
