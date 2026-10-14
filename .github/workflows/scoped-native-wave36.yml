@@ -1,0 +1,141 @@
+name: Scoped native wave36 acceptance
+
+on:
+  push:
+    branches: [codex/native57-retirement-wave36]
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+
+jobs:
+  windows-retirement:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+      - name: Assert immutable candidate source
+        shell: pwsh
+        run: |
+          $candidate = 'c7516cdf34aa4b2f91eae2a422e871b003993127'
+          $parent = (git rev-parse HEAD^).Trim()
+          if ($LASTEXITCODE -ne 0 -or $parent -ne $candidate) { throw 'Wrong native candidate parent' }
+          git diff --exit-code $candidate HEAD -- src .github/workflows/ci.yml scripts/tests/test_phase6_ci_workflow.py docs/agent/MCP_CONFIGURATION.md
+          if ($LASTEXITCODE -ne 0) { throw 'Native source differs from reviewed candidate' }
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: stable
+          cache-on-failure: true
+      - name: Install required debug binary
+        shell: pwsh
+        run: |
+          cargo install --path . --debug --locked --root "$env:RUNNER_TEMP/wave36-default-install"
+          if ($LASTEXITCODE -ne 0) { throw 'Debug installation failed' }
+      - name: Execute exact four native retirement and lease controls
+        shell: pwsh
+        run: |
+          $filter = 'fs::private::windows::operator_config_lease_probe::'
+          $expected = @(
+            'fs::private::windows::operator_config_lease_probe::exact_relative_lease_surviving_mapping_and_data_conflicts: test',
+            'fs::private::windows::operator_config_lease_probe::namespace_alias_and_private_metadata_are_observed_before_any_candidate_write: test',
+            'fs::private::windows::operator_config_lease_probe::reader_lease_precedes_marker_and_late_marker_refuses_admission: test',
+            'fs::private::windows::operator_config_lease_probe::retained_retirement_preserves_full_surviving_readonly_views_and_refuses_conflicts: test'
+          )
+          $discovered = @(cargo test --locked --bin mini-agent $filter -- --list 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Windows MCP lease experiment discovery failed' }
+          $actual = @($discovered | Where-Object { $_ -match '^fs::private::windows::operator_config_lease_probe::.*: test$' })
+          if ($actual.Count -ne 4 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw 'Exact four native Windows MCP lease experiments were not discovered'
+          }
+          $native = @(cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1 2>&1)
+          $nativeExit = $LASTEXITCODE
+          $native | Write-Output
+          if ($nativeExit -ne 0) { throw 'Native Windows MCP lease experiment failed' }
+          if (-not ($native -match '^test result: ok\. 4 passed; 0 failed; 0 ignored;')) {
+            throw 'Native Windows MCP lease experiment did not execute exactly four passing tests'
+          }
+  macos-output-guards:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+      - name: Assert immutable candidate source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = 'c7516cdf34aa4b2f91eae2a422e871b003993127'
+          git diff --exit-code 'c7516cdf34aa4b2f91eae2a422e871b003993127' HEAD -- src .github/workflows/ci.yml scripts/tests/test_phase6_ci_workflow.py docs/agent/MCP_CONFIGURATION.md
+          echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: stable
+          cache-on-failure: true
+      - name: Install required debug binary
+        shell: bash
+        run: |
+          cargo install --path . --debug --locked --no-default-features --features js,sandbox --root "$RUNNER_TEMP/wave36-macos-install"
+      - name: Confirm the worker profile denies named FIFOs on this runner
+        shell: bash
+        env:
+          MINI_AGENT_REQUIRE_REAL_SANDBOX: '1'
+        run: |
+          test_name='sandbox::worker::platform::tests::seatbelt_profile_denies_named_fifos_but_keeps_inherited_pipes'
+          echo 'PHASE6_NAMED_FIFO=failed' >> "$GITHUB_ENV"
+          output=$(cargo test --locked --no-default-features --features js \
+            "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
+          printf '%s\n' "$output"
+          if grep -q 'skipping:' <<< "$output"; then
+            echo 'PHASE6_NAMED_FIFO=skipped-seatbelt-unusable' >> "$GITHUB_ENV"
+            echo "named-FIFO regression skipped instead of running under Seatbelt" >&2
+            exit 1
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"
+          echo 'PHASE6_NAMED_FIFO=denied' >> "$GITHUB_ENV"
+      - name: Require the real Seatbelt general command sandbox on this runner
+        shell: bash
+        env:
+          MINI_AGENT_REQUIRE_REAL_SANDBOX: '1'
+        run: |
+          guarded_tests=(
+            'sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend'
+            'sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases'
+            'sandbox::sandbox_tests::seatbelt_workspace_gitfile_target_directory_cannot_be_renamed'
+            'tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads'
+            'extras::js::host::tests::spawn_uses_real_macos_seatbelt_write_boundary'
+          )
+          for test_name in "${guarded_tests[@]}"; do
+            status=0
+            output=$(cargo test --locked --no-default-features --features js,sandbox \
+              "$test_name" -- --exact --nocapture --test-threads=1 2>&1) || status=$?
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ]; then
+              echo "$test_name failed with status $status" >&2
+              exit "$status"
+            fi
+            if grep -qi 'skipping' <<< "$output"; then
+              echo "$test_name skipped instead of running under Seatbelt" >&2
+              exit 1
+            fi
+            if ! grep -Fxq "test $test_name ... ok" <<< "$output" \
+              || ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"; then
+              echo "$test_name did not run and pass exactly once" >&2
+              exit 1
+            fi
+          done
+      - name: Confirm the Seatbelt facts behind the one-time worker image
+        shell: bash
+        env:
+          MINI_AGENT_REQUIRE_REAL_SANDBOX: '1'
+        run: |
+          output=$(cargo test --locked --no-default-features --features js \
+            extras::js::tests::worker_containment::macos_js_worker_containment \
+            -- --exact --ignored --nocapture --test-threads=1 2>&1)
+          printf '%s\n' "$output"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "$output"
