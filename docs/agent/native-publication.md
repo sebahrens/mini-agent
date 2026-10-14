@@ -32,12 +32,11 @@ publishes its retired boundary. Immediate private reload retains the native
 opaque blocks. A failed final write leaves the durable InFlight checkpoint; a
 changed workspace, permission or instruction policy refuses replay.
 
-Interactive and ACP adoption, automatic goal/loop rounds, explicit recovery,
-and native schema-repair continuations remain unfinished. Native-bearing data
-opened through an unadopted interactive/loop lane refuses before startup
-effects. Fresh interactive behavior is unchanged; no opaque replay is enabled
-there by this checkpoint. Native automatic work refuses rather than silently
-falling back to an unbound transcript. A valid primary schema answer works; an
+Ordinary interactive turns now use the same strict writer and actual native
+binding as plain print. ACP adoption, automatic goal/loop rounds, explicit
+recovery, and native schema-repair continuations remain unfinished. Unadopted
+loop lanes refuse before startup effects. Native automatic work refuses rather
+than silently falling back to an unbound transcript. A valid primary schema answer works; an
 invalid native answer cannot enter the generic schema repair path.
 
 The writer retains the private sessions directory and exact lock inode.
@@ -181,6 +180,39 @@ runtime writer authority.
 Configured SessionStart has an actual successful handler control. Resuming
 that saved native Session with `--no-session` refuses before a second handler
 or HTTP request, while a fresh explicit `--no-session` invocation runs the
-handler and model without creating a saved native checkpoint. These controls
-do not claim UserPromptSubmit parity, interactive/ACP adoption, or automatic
-round ownership.
+handler and model without creating a saved native checkpoint. The configured
+UserPromptSubmit command has the same admitted/early-refused controls through
+its actual provider gate. Neither startup hook can run when native preflight
+fails. ACP native publication and automatic round ownership remain separate
+controller work.
+
+## Ordinary interactive turns
+
+An ordinary TUI submission transfers its startup ticket, or durably opens its
+next ticket, before building the native model. The actual paused runner shares
+that exact scope and binding. Its literal or typed User row and current snapshot
+are recorded before releasing the start barrier. Terminal event handling joins
+the actual actor, projects usage once through the normal events, attaches the
+complete canonical capture and publishes before settling input side effects.
+Immediate read-only reload is checked after each accepted turn, both within one
+App and after rebuilding from the saved Session.
+
+SessionEnd uses a private, one-use runtime permit issued only by the already
+retired model and its acknowledged publication. It retains the exact published
+value and live host guard. The paired writer records that exact final revision,
+digest and outcome at acknowledgment; an older actor cannot borrow the newest
+value from its shared publisher. A changed value or permission/source owner refuses
+before cleanup effects. A healthy boundary first becomes durably InFlight; the
+configured hook then runs in its own existing cleanup scope. Only after all
+admitted hook children are reaped may the unchanged original model boundary be
+published again. Hook completion does not create another model-completion
+witness. A previously refused boundary remains refused. Cancellation retains the
+writer through hook or file cleanup.
+
+Actual authored instruction controls pin the same content in two native TUI
+turns while the catalogue generation increases. Their top-level system and tool
+bytes remain identical. Changing the authored payload then refuses before any
+third HTTP request; the first two accepted usage receipts remain unchanged.
+Native pressure currently parks its complete bound tool reply rather than
+starting an unbound compactor. Automatic round, explicit fresh-context/recovery,
+and all metadata mutation paths still require their own controller adoption.

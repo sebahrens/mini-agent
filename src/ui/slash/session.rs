@@ -681,7 +681,10 @@ async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     ctx.context.chain_declined.clear();
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     #[cfg(feature = "hooks")]
-    crate::extras::hooks::dispatch_session_start("clear").await;
+    {
+        let notices = crate::extras::hooks::dispatch_session_start("clear").await;
+        crate::extras::hooks::append_context_session(ctx.session, &notices.into_notices());
+    }
     Ok(())
 }
 

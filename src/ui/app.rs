@@ -197,6 +197,8 @@ mod dot_command_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -315,6 +317,8 @@ mod btw_pricing_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -374,6 +378,8 @@ mod btw_pricing_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -1363,7 +1369,9 @@ impl<'a> App<'a> {
         ask_rx: Option<mpsc::Receiver<crate::permission::ask::UserRequest>>,
         auto_trigger_msg: Option<String>,
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
-        #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
+        #[cfg(feature = "hooks")] mut session_start_task: Option<
+            tokio::task::JoinHandle<crate::extras::hooks::OwnedSessionStartContext>,
+        >,
     ) -> anyhow::Result<Self> {
         let keybindings =
             KeyBindings::from_overrides(ui.cfg.keys.as_ref()).map_err(anyhow::Error::msg)?;
@@ -1629,9 +1637,13 @@ impl<'a> App<'a> {
         if auto_trigger_msg.is_some()
             && let Some(task) = session_start_task.take()
         {
-            let joined = task.await;
-            if let Some(owner) = &ui.native_startup {
-                owner.hook_retired(joined)?;
+            match task.await {
+                Ok(context) => ui.adopt_session_start_context(context),
+                Err(error) => {
+                    if let Some(owner) = &ui.native_startup {
+                        owner.hook_retired(Err(error))?;
+                    }
+                }
             }
         }
 
@@ -1645,47 +1657,72 @@ impl<'a> App<'a> {
             }
             renderer.write_line("", Color::White)?;
 
-            event_handler::ensure_agent(&mut run.agent, &mut ui, slash.reasoning_enabled).await;
-            run.request_tool_results_cleared = ui
-                .session
-                .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
-            let initial_turn = AutoTriggerTurn::prepare(
-                ui.session,
-                trigger_msg,
-                ui.cfg.resolve_keep_recent_tool_results(),
-            );
-            let (prompt, history, pending_turn) = initial_turn.into_runner_inputs();
-            run.question_turn = Some(crate::question::QuestionTurn::default());
-            ui.session.pending_question = None;
-            #[cfg(feature = "agent-skills")]
+            if matches!(&ui.client, crate::provider::AnyClient::Anthropic(_))
+                || ui.session.native_history_snapshot().is_some()
             {
-                run.instruction_turn = Some(crate::extras::skills::session::InstructionTurn::new(
-                    ui.instruction_services()?,
-                    None,
-                ));
+                let mut no_prebuild = None;
+                crate::startup::heap_future(|| {
+                    super::start_main_run(
+                        trigger_msg,
+                        true,
+                        crate::question::QuestionOrigin::NewUserTurn,
+                        &mut run,
+                        &mut ui,
+                        &slash,
+                        &mut no_prebuild,
+                    )
+                })
+                .await?;
+            } else {
+                event_handler::ensure_agent(&mut run.agent, &mut ui, slash.reasoning_enabled).await;
+                run.request_tool_results_cleared = ui
+                    .session
+                    .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
+                let initial_turn = AutoTriggerTurn::prepare(
+                    ui.session,
+                    trigger_msg,
+                    ui.cfg.resolve_keep_recent_tool_results(),
+                );
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+                let (prompt, history, mut pending_turn) = initial_turn.into_runner_inputs();
+                run.question_turn = Some(crate::question::QuestionTurn::default());
+                ui.session.pending_question = None;
+                #[cfg(feature = "agent-skills")]
+                {
+                    run.instruction_turn =
+                        Some(crate::extras::skills::session::InstructionTurn::new(
+                            ui.instruction_services()?,
+                            None,
+                        ));
+                }
+                let agent = run.agent.as_ref().unwrap().clone();
+                #[cfg(feature = "agent-skills")]
+                let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+                let paused = agent
+                    .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                    .with_question_turn(run.question_turn.clone())
+                    .spawn_runner_paused(
+                        prompt,
+                        history,
+                        ui.cfg.retry.clone(),
+                        #[cfg(feature = "hooks")]
+                        None,
+                    )
+                    .await;
+                #[cfg(feature = "hooks")]
+                let mut paused = paused;
+                #[cfg(feature = "hooks")]
+                super::adopt_runner_hook_context(&mut paused, Some(&mut pending_turn), ui.session);
+                let runner = paused.start_interactive();
+                run.compaction_decision_tx = runner.compaction_decision_tx;
+                run.agent_rx = Some(runner.event_rx);
+                run.main_abort = Some(runner.abort_handle);
+                run.is_running = true;
+                if let Some(ss) = ui.status_signals.as_ref() {
+                    ss.send_start();
+                }
+                record_started_main_turn(pending_turn, &mut run, &mut ui);
             }
-            let agent = run.agent.as_ref().unwrap().clone();
-            #[cfg(feature = "agent-skills")]
-            let agent = agent.with_instruction_turn(run.instruction_turn.clone());
-            let runner = agent
-                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-                .with_question_turn(run.question_turn.clone())
-                .spawn_runner(
-                    prompt,
-                    history,
-                    ui.cfg.retry.clone(),
-                    #[cfg(feature = "hooks")]
-                    None,
-                )
-                .await;
-            run.compaction_decision_tx = runner.compaction_decision_tx;
-            run.agent_rx = Some(runner.event_rx);
-            run.main_abort = Some(runner.abort_handle);
-            run.is_running = true;
-            if let Some(ss) = ui.status_signals.as_ref() {
-                ss.send_start();
-            }
-            record_started_main_turn(pending_turn, &mut run, &mut ui);
         }
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
@@ -1785,9 +1822,13 @@ impl<'a> App<'a> {
 
         #[cfg(feature = "hooks")]
         if let Some(task) = session_start_task.take() {
-            let joined = task.await;
-            if let Some(owner) = &ui.native_startup {
-                owner.hook_retired(joined)?;
+            match task.await {
+                Ok(context) => ui.adopt_session_start_context(context),
+                Err(error) => {
+                    if let Some(owner) = &ui.native_startup {
+                        owner.hook_retired(Err(error))?;
+                    }
+                }
             }
         }
 
@@ -1859,6 +1900,34 @@ impl<'a> App<'a> {
                 })
                 .await;
         });
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(super) async fn finish_session_end(&mut self) -> anyhow::Result<()> {
+        if let Some(owner) = self.run.native_session_end.take() {
+            owner.run(self.ui.session).await
+        } else if !self.ui.cli.no_session
+            && crate::session::native_publication::is_native_bearing(self.ui.session)
+        {
+            // An idle startup has no completed model boundary to publish.
+            // Retain its original denied ticket through exact hook cleanup.
+            let ticket = self.ui.native_ticket.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unfinished native context requires recovery before session cleanup"
+                )
+            })?;
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+            cleanup.retain_until_settled(ticket);
+            scope
+                .run(crate::extras::hooks::dispatch_session_end("exit"))
+                .await;
+            cleanup.settle().await;
+            Ok(())
+        } else {
+            crate::extras::hooks::dispatch_session_end("exit").await;
+            Ok(())
+        }
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
@@ -2041,7 +2110,12 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn teardown(mut self) {
+        self.teardown_owners().await;
+    }
+
+    pub(super) async fn teardown_owners(&mut self) {
         // The owning actor must retire before its manager/services are closed,
         // including callers that leave without entering the normal run wrapper.
         #[cfg(feature = "mcp")]
@@ -2082,7 +2156,7 @@ impl<'a> App<'a> {
         #[cfg(feature = "lsp")]
         crate::extras::lsp::shutdown_live_managers().await;
         #[cfg(feature = "mcp")]
-        if let Some(mgr) = self.ui.mcp_manager {
+        if let Some(mgr) = self.ui.mcp_manager.take() {
             mgr.shutdown().await;
         }
     }
@@ -3611,7 +3685,12 @@ impl<'a> App<'a> {
             // iteration, or other continuation remains active. Commit the
             // complete transaction at that boundary, then discard rollback
             // state even when persistence warned and retained the prior file.
-            let persisted = self.save_session_with_status();
+            let persisted = if self.run.native_checkpointed {
+                self.run.native_checkpointed = false;
+                true
+            } else {
+                self.save_session_with_status()
+            };
             let pending = self
                 .run
                 .pending_turn
@@ -3644,6 +3723,15 @@ impl<'a> App<'a> {
         self.run.is_running = false;
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI failed-run cleanup failed");
+        }
+        if let Err(error) = super::settle_native_main_turn(
+            &mut self.run,
+            self.ui.session,
+            crate::session::native_replay::RetiredNativeOutcome::Incomplete,
+        )
+        .await
+        {
+            tracing::warn!(%error, "unfinished native context remains unavailable");
         }
         self.cancel_pending_permissions();
         #[cfg(feature = "git-worktree")]
@@ -3697,6 +3785,15 @@ impl<'a> App<'a> {
         }
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI interrupted-run cleanup failed");
+        }
+        if let Err(error) = super::settle_native_main_turn(
+            &mut self.run,
+            self.ui.session,
+            crate::session::native_replay::RetiredNativeOutcome::Incomplete,
+        )
+        .await
+        {
+            tracing::warn!(%error, "unfinished native context remains unavailable");
         }
         self.cancel_pending_permissions();
         #[cfg(feature = "git-worktree")]
@@ -5411,52 +5508,67 @@ impl<'a> App<'a> {
                     .strip_prefix("DEFER_INIT:")
                     .unwrap_or("")
                     .to_string();
-                self.ensure_agent().await;
-                self.run.request_tool_results_cleared =
-                    self.ui.session.tool_results_cleared_for_retention(
-                        self.ui.cfg.resolve_keep_recent_tool_results(),
-                    );
-                let history =
-                    crate::agent::runner::convert_history_shared_with_tool_result_retention(
-                        self.ui.session,
-                        self.ui.cfg.resolve_keep_recent_tool_results(),
-                    );
-                self.run.question_turn = Some(crate::question::QuestionTurn::default());
-                self.ui.session.pending_question = None;
-                #[cfg(feature = "agent-skills")]
+                if matches!(&self.ui.client, crate::provider::AnyClient::Anthropic(_))
+                    || self.ui.session.native_history_snapshot().is_some()
                 {
-                    self.run.instruction_turn =
-                        Some(crate::extras::skills::session::InstructionTurn::new(
-                            self.ui.instruction_services()?,
-                            None,
-                        ));
-                }
-                let runner = crate::startup::heap_future(|| {
-                    let agent = self.run.agent.as_ref().unwrap().clone();
-                    #[cfg(feature = "agent-skills")]
-                    let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
-                    agent
-                        .with_spend_for_session(
+                    crate::startup::heap_future(|| self.start_internal_main_run(&prompt)).await?;
+                } else {
+                    self.ensure_agent().await;
+                    self.run.request_tool_results_cleared =
+                        self.ui.session.tool_results_cleared_for_retention(
+                            self.ui.cfg.resolve_keep_recent_tool_results(),
+                        );
+                    let history =
+                        crate::agent::runner::convert_history_shared_with_tool_result_retention(
                             self.ui.session,
-                            self.ui.cfg,
-                            crate::spend::RequestKind::Turn,
-                        )
-                        .with_question_turn(self.run.question_turn.clone())
-                        .spawn_runner(
-                            prompt,
-                            history,
-                            self.ui.cfg.retry.clone(),
-                            #[cfg(feature = "hooks")]
-                            None,
-                        )
-                })
-                .await;
-                self.run.compaction_decision_tx = runner.compaction_decision_tx;
-                self.run.agent_rx = Some(runner.event_rx);
-                self.run.main_abort = Some(runner.abort_handle);
-                self.run.is_running = true;
-                if let Some(ss) = self.ui.status_signals.as_ref() {
-                    ss.send_start();
+                            self.ui.cfg.resolve_keep_recent_tool_results(),
+                        );
+                    self.run.question_turn = Some(crate::question::QuestionTurn::default());
+                    self.ui.session.pending_question = None;
+                    #[cfg(feature = "agent-skills")]
+                    {
+                        self.run.instruction_turn =
+                            Some(crate::extras::skills::session::InstructionTurn::new(
+                                self.ui.instruction_services()?,
+                                None,
+                            ));
+                    }
+                    let paused = crate::startup::heap_future(|| {
+                        let agent = self.run.agent.as_ref().unwrap().clone();
+                        #[cfg(feature = "agent-skills")]
+                        let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
+                        agent
+                            .with_spend_for_session(
+                                self.ui.session,
+                                self.ui.cfg,
+                                crate::spend::RequestKind::Turn,
+                            )
+                            .with_question_turn(self.run.question_turn.clone())
+                            .spawn_runner_paused(
+                                prompt,
+                                history,
+                                self.ui.cfg.retry.clone(),
+                                #[cfg(feature = "hooks")]
+                                None,
+                            )
+                    })
+                    .await;
+                    #[cfg(feature = "hooks")]
+                    let mut paused = paused;
+                    #[cfg(feature = "hooks")]
+                    super::adopt_runner_hook_context(
+                        &mut paused,
+                        self.run.pending_turn.as_mut(),
+                        self.ui.session,
+                    );
+                    let runner = paused.start_interactive();
+                    self.run.compaction_decision_tx = runner.compaction_decision_tx;
+                    self.run.agent_rx = Some(runner.event_rx);
+                    self.run.main_abort = Some(runner.abort_handle);
+                    self.run.is_running = true;
+                    if let Some(ss) = self.ui.status_signals.as_ref() {
+                        ss.send_start();
+                    }
                 }
             }
             Err(e) if e.to_string().starts_with("DEFER_REVIEW:") => {
@@ -5554,7 +5666,7 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
-                    let runner = crate::startup::heap_future(|| {
+                    let paused = crate::startup::heap_future(|| {
                         let agent = self.run.agent.as_ref().unwrap().clone();
                         #[cfg(feature = "agent-skills")]
                         let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
@@ -5565,7 +5677,7 @@ impl<'a> App<'a> {
                                 crate::spend::RequestKind::Turn,
                             )
                             .with_question_turn(self.run.question_turn.clone())
-                            .spawn_runner(
+                            .spawn_runner_paused(
                                 prompt,
                                 Vec::new(),
                                 self.ui.cfg.retry.clone(),
@@ -5574,6 +5686,15 @@ impl<'a> App<'a> {
                             )
                     })
                     .await;
+                    #[cfg(feature = "hooks")]
+                    let mut paused = paused;
+                    #[cfg(feature = "hooks")]
+                    super::adopt_runner_hook_context(
+                        &mut paused,
+                        self.run.pending_turn.as_mut(),
+                        self.ui.session,
+                    );
+                    let runner = paused.start_interactive();
                     self.run.compaction_decision_tx = runner.compaction_decision_tx;
                     self.run.agent_rx = Some(runner.event_rx);
                     self.run.main_abort = Some(runner.abort_handle);
@@ -5661,6 +5782,33 @@ impl<'a> App<'a> {
         pressure: f64,
         interactions: &[Message],
     ) -> anyhow::Result<()> {
+        if self.run.native_owner.is_some() {
+            // A tool-reply boundary is not a completed new-user boundary.
+            // Preserve the exact surfaced tail instead of silently dropping
+            // signed history into an unbound compaction continuation.
+            let prompt = self
+                .run
+                .pending_turn
+                .as_ref()
+                .map(|turn| turn.prompt().to_string());
+            self.ui.session.adopt_provider_tool_identity(interactions);
+            preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+            self.run.is_running = false;
+            self.run.settle(Duration::from_secs(5)).await?;
+            super::settle_native_main_turn(
+                &mut self.run,
+                self.ui.session,
+                crate::session::native_replay::RetiredNativeOutcome::LiveToolReply,
+            )
+            .await?;
+            self.settle_success_transaction();
+            self.discard_interrupted_queue();
+            if let Some(prompt) = prompt {
+                self.restore_interrupted_prompt(&prompt);
+            }
+            self.renderer.write_line("Context is full. Tool results are saved; start a fresh context before compacting this unfinished reply.", C_ERROR)?;
+            return Ok(());
+        }
         mid_turn_compact_and_respawn(
             pressure,
             interactions,
@@ -6955,6 +7103,8 @@ mod interrupt_rewind_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -7033,6 +7183,8 @@ mod interrupt_rewind_tests {
             let ui = UiContext {
                 native_startup: None,
                 native_ticket: None,
+                #[cfg(feature = "hooks")]
+                pending_session_start_context: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -7178,6 +7330,8 @@ mod interrupt_rewind_tests {
             let ui = UiContext {
                 native_startup: None,
                 native_ticket: None,
+                #[cfg(feature = "hooks")]
+                pending_session_start_context: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -7358,6 +7512,8 @@ mod interrupt_rewind_tests {
                 let ui = UiContext {
                     native_startup: None,
                     native_ticket: None,
+                    #[cfg(feature = "hooks")]
+                    pending_session_start_context: None,
                     cli: &cli,
                     cfg: &cfg,
                     session: &mut session,
@@ -7464,6 +7620,8 @@ mod explicit_shell_persistence_tests {
         UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli,
             cfg,
             session,
@@ -7722,6 +7880,8 @@ mod permission_loop_tests {
         UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli,
             cfg,
             session,
@@ -9251,6 +9411,8 @@ mod mutation_consumer_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -9417,6 +9579,8 @@ mod compaction_visibility_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -9550,6 +9714,8 @@ mod custom_command_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -10326,6 +10492,8 @@ mod usd_budget_app_tests {
             let ui = UiContext {
                 native_startup: None,
                 native_ticket: None,
+                #[cfg(feature = "hooks")]
+                pending_session_start_context: None,
                 cli: &cli,
                 cfg: &cfg,
                 session: &mut session,
@@ -10429,6 +10597,8 @@ mod usd_budget_app_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -11326,6 +11496,8 @@ mod context_diagnostic_tests {
         let ui = UiContext {
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             cli: &cli,
             cfg: &cfg,
             session: &mut session,
@@ -11758,6 +11930,37 @@ fn skill_description(text: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_native_fixture_turn(ui: UiContext<'_>, prompt: &str) {
+    plan_approval_tests::drive_native_fixture_turns(ui, &[prompt], false).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn drive_native_fixture_turns(
+    ui: UiContext<'_>,
+    prompts: &[&str],
+) -> Vec<Session> {
+    plan_approval_tests::drive_native_fixture_turns(ui, prompts, false).await
+}
+
+#[cfg(all(test, feature = "hooks"))]
+pub(crate) async fn drive_native_stale_session_end_fixture(ui: UiContext<'_>) -> Vec<Session> {
+    plan_approval_tests::drive_native_fixture_turns(
+        ui,
+        &["first literal TUI prompt", "second literal TUI prompt"],
+        true,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "agent-skills"))]
+pub(crate) async fn drive_native_instruction_fixture(
+    ui: UiContext<'_>,
+    package: &std::path::Path,
+) -> Vec<Session> {
+    plan_approval_tests::drive_native_instruction_fixture(ui, package).await
+}
+
+#[cfg(test)]
 mod plan_approval_tests {
     use super::test_support::fixture_app;
     use super::*;
@@ -11977,6 +12180,137 @@ mod plan_approval_tests {
     async fn key(app: &mut App<'_>, code: KeyCode) {
         user(app, UserEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))).await;
     }
+    pub(super) async fn drive_native_fixture_turns(
+        ui: UiContext<'_>,
+        prompts: &[&str],
+        stale_end: bool,
+    ) -> Vec<Session> {
+        let mut app = owned_app(ui);
+        let mut saved = Vec::new();
+        for prompt in prompts {
+            user(&mut app, UserEvent::Paste((*prompt).into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(
+                app.run.is_running,
+                "actual Enter did not start the native actor"
+            );
+            assert!(finish_turn(&mut app).await, "native actor did not complete");
+            assert!(
+                app.run.native_owner.is_none(),
+                "actor ticket outlived retirement"
+            );
+            assert!(
+                app.run.native_blocked.is_none(),
+                "valid native context was refused"
+            );
+            assert!(
+                app.run.pending_turn.is_none(),
+                "completed literal turn did not settle"
+            );
+            let sessions = crate::paths::WorkspaceBinding::capture(
+                &crate::paths::process_paths().unwrap().sessions_dir(),
+            )
+            .unwrap();
+            saved.push(
+                crate::session::storage::load_session_exact_read_only(
+                    &sessions,
+                    app.ui.session.id.as_ref(),
+                    &app.ui.workspace,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        #[cfg(feature = "hooks")]
+        if stale_end {
+            let path = crate::paths::process_paths()
+                .unwrap()
+                .sessions_dir()
+                .join(format!("{}.json", app.ui.session.id));
+            let before = std::fs::read(&path).unwrap();
+            app.ui
+                .permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .set_mode(SecurityMode::Yolo);
+            assert!(
+                app.finish_session_end().await.is_err(),
+                "changed live permission policy must refuse cleanup effects"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else {
+            app.finish_session_end().await.unwrap();
+        }
+        #[cfg(not(feature = "hooks"))]
+        assert!(!stale_end);
+        saved
+    }
+
+    #[cfg(feature = "agent-skills")]
+    pub(super) async fn drive_native_instruction_fixture(
+        ui: UiContext<'_>,
+        package: &std::path::Path,
+    ) -> Vec<Session> {
+        let mut app = owned_app(ui);
+        let mut generations = Vec::new();
+        let mut saved = Vec::new();
+        for _ in 0..2 {
+            crate::startup::heap_future(|| app.run_slash_command("/reviewer code review"))
+                .await
+                .unwrap();
+            assert!(app.run.is_running);
+            assert!(finish_turn(&mut app).await);
+            let selected = app
+                .run
+                .instruction_turn
+                .as_ref()
+                .unwrap()
+                .prepare("code review")
+                .await
+                .unwrap();
+            assert_eq!(selected.selected.len(), 1);
+            generations.push(selected.generation);
+            let sessions = crate::paths::WorkspaceBinding::capture(
+                &crate::paths::process_paths().unwrap().sessions_dir(),
+            )
+            .unwrap();
+
+            saved.push(
+                crate::session::storage::load_session_exact_read_only(
+                    &sessions,
+                    app.ui.session.id.as_ref(),
+                    &app.ui.workspace,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        assert!(
+            generations[1] > generations[0],
+            "actual catalogue refresh must change generation"
+        );
+        std::fs::write(package.join("SKILL.md"), "---\nname: reviewer\ndescription: Review code carefully\n---\nCHANGED_NATIVE_REVIEW_GUIDANCE\n").unwrap();
+        crate::startup::heap_future(|| app.run_slash_command("/reviewer code review"))
+            .await
+            .unwrap();
+        assert!(app.run.is_running);
+        assert!(
+            !finish_turn(&mut app).await,
+            "changed authored body must not complete old native chain"
+        );
+        assert!(app.ui.session.native_frontier.refusal().is_some());
+        assert_eq!(
+            (
+                app.ui.session.total_input_tokens,
+                app.ui.session.total_output_tokens
+            ),
+            (20, 4)
+        );
+        saved
+    }
+
     async fn begin(app: &mut App<'_>) {
         user(app, UserEvent::Paste(".plan add the selected flag".into())).await;
         key(app, KeyCode::Enter).await;
@@ -14679,7 +15013,7 @@ mod config_editor68_tests {
                 let mut context=crate::context::load(true).for_workspace_binding(true,&workspace);
                 let mut session=Session::new("editor68","test-model",128_000,root.path().to_str().unwrap());
                 let before=serde_json::to_vec(&session).unwrap();
-                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,native_startup:None,native_ticket:None,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
+                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,native_startup:None,native_ticket: None, #[cfg(feature = "hooks")] pending_session_start_context: None,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
                     #[cfg(feature="skills")] skill_services:Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
                     #[cfg(feature="mcp")] mcp_manager:None,
                 };

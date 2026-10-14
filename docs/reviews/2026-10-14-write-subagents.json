@@ -1,7 +1,7 @@
 {
   "bead": "mini-agent-i7ro6.55",
   "source_base": "d22318447d70dcba31f3ffc6e76882c86b721693",
-  "status": "Implemented; final merged installed acceptance follows hooks/native composition. Bead stays in progress until that passes.",
+  "status": "Delivered with final merged installed read/edit/report and default-refusal proofs at 1MiB.",
   "contracts": [
     "Default allow_write=false; trusted persona must select mode:write",
     "Actual parent checker/approval channel, tool eligibility, physical workspace, sandbox, deadlines, formatter and LSP are captured together",
@@ -96,7 +96,41 @@
       "sha256": "c9e5e412736d0b940b1d014f4b3fc872fd5b70b07de3a233463c0d89f578c7e6"
     },
     "strict_result": "Default+advisor all-target Clippy -D warnings PASS47.04s",
-    "final_installed": "Pending merged source proof; no full suite repeated"
+    "final_installed": {
+      "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-write55-installed-eoon1j03/report.json",
+      "sha256": "6dc756d0a4750acb67eb47df44231f7a24ea5a63efe697b9b3ade1d026b83852",
+      "report": {
+        "passed": true,
+        "binary": "/private/tmp/mini-agent-55-60-final-install/bin/mini-agent",
+        "binary_sha256": "15488ed4deb986d70c765744705b6d8767a5607cbc414de62d6ecd2ec653cfe8",
+        "stack_bytes": 1048576,
+        "external_provider_calls": 0,
+        "configured_concurrency": 4,
+        "write_children_serialized": true,
+        "runs": [
+          {
+            "allow_write": false,
+            "posts": 2,
+            "exit": 0,
+            "files": {
+              "first.txt": "before\n",
+              "second.txt": "before\n"
+            }
+          },
+          {
+            "allow_write": true,
+            "posts": 8,
+            "exit": 0,
+            "files": {
+              "first.txt": "after\n",
+              "second.txt": "after\n"
+            }
+          }
+        ]
+      }
+    },
+    "merged_callers": "16 actual integration controls PASS2.12s + attribution/permission transport1 PASS0.12s + named failed-publication2 PASS0.65s",
+    "merged_strict": "PASS37.86s; install --locked PASS31.97s"
   },
   "review": {
     "personas": [
@@ -149,5 +183,6 @@
     "src/ui/mcp_admin_app_tests.rs": "205cd90583088329a3be947dadaeaec3e062cd2f82d1a35e34ea60eaa5e08dad",
     "src/ui/permission_handler.rs": "3e5b2cb7679fc2fd9986ded973234bbfa1b006942a234ffa21041d4eaa8354c4",
     "scripts/probes/write_subagents_stack.py": "4d9669208f63e527a1571ed12baf5470046f20d2278c290e43363ea3e5bf0178"
-  }
+  },
+  "source_snapshot": "Initial feature commit2c93906e; final .60 composition source hashes recorded in native-hooks-integration review."
 }

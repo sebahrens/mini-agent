@@ -30,6 +30,8 @@ pub enum Decision {
     Block { reason: String },
     /// Replace model-visible content through an event-specific safe mechanism.
     Rewrite { content: String },
+    /// Bounded context from a configured lifecycle hook; never a grant.
+    AdditionalContext { notices: Vec<String> },
 }
 
 /// Permission decision vocabulary for blockable tool events. Variants are
@@ -305,6 +307,11 @@ pub(crate) fn wrap_from_global_with_mcp(
 pub(crate) enum PromptGate {
     /// The original prompt should be sent to the model.
     Proceed(String),
+    /// The literal prompt is unchanged; context has its own canonical row.
+    WithContext {
+        prompt: String,
+        notices: Vec<String>,
+    },
     /// A hook blocked the prompt; `String` is feedback to show the user
     /// instead of sending anything to the model.
     Blocked(String),
@@ -320,8 +327,8 @@ pub(crate) async fn gate_user_prompt(
     if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
         return PromptGate::Proceed(prompt);
     }
-    let decision = dispatcher
-        .dispatch(
+    let decision = crate::startup::heap_future(|| {
+        dispatcher.dispatch(
             "UserPromptSubmit",
             None,
             ctx,
@@ -329,11 +336,13 @@ pub(crate) async fn gate_user_prompt(
                 prompt: prompt.clone(),
             },
         )
-        .await;
+    })
+    .await;
     match decision {
         Decision::Continue => PromptGate::Proceed(prompt),
         Decision::Block { reason } => PromptGate::Blocked(reason),
         Decision::Rewrite { content } => PromptGate::Proceed(format!("{content}\n\n{prompt}")),
+        Decision::AdditionalContext { notices } => PromptGate::WithContext { prompt, notices },
     }
 }
 
@@ -409,7 +418,9 @@ pub(crate) async fn gate_stop(
         .await;
     match decision {
         Decision::Block { reason } => StopGate::Continue { reason },
-        Decision::Continue | Decision::Rewrite { .. } => StopGate::Release,
+        Decision::Continue | Decision::Rewrite { .. } | Decision::AdditionalContext { .. } => {
+            StopGate::Release
+        }
     }
 }
 
@@ -438,12 +449,25 @@ pub(crate) async fn dispatch_stop(
 
 /// Testable core: dispatches `SessionStart`. Informational only (not
 /// blockable per the hook-lifecycle-events spec), so the decision is ignored.
+/// Exact runtime output of the owned SessionStart dispatch. This carrier has
+/// no deserializer or cloning API: stored prose cannot impersonate a new hook
+/// delivery when a native controller restores the old feed before adoption.
+pub(crate) struct OwnedSessionStartContext {
+    notices: Vec<String>,
+}
+
+impl OwnedSessionStartContext {
+    pub(crate) fn into_notices(self) -> Vec<String> {
+        self.notices
+    }
+}
+
 pub(crate) async fn dispatch_session_start_with(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
     source: &str,
-) {
-    let _ = dispatcher
+) -> OwnedSessionStartContext {
+    let decision = dispatcher
         .dispatch(
             "SessionStart",
             None,
@@ -453,16 +477,111 @@ pub(crate) async fn dispatch_session_start_with(
             },
         )
         .await;
+    OwnedSessionStartContext {
+        notices: match decision {
+            Decision::AdditionalContext { notices } => notices,
+            _ => Vec::new(), // SessionStart remains informational, never blockable.
+        },
+    }
 }
 
 /// Production entry point: reads the process-wide dispatcher and dispatches
-/// `SessionStart` with `source` (one of `startup`, `resume`, `clear`; `compact`
-/// is not emitted here). No-op when no dispatcher is installed.
-pub(crate) async fn dispatch_session_start(source: &str) {
+/// `SessionStart` with `source` (`startup`, `resume`, `clear`, or `compact`).
+/// No-op when no dispatcher is installed.
+pub(crate) async fn dispatch_session_start(source: &str) -> OwnedSessionStartContext {
+    let Some(dispatcher) = get_dispatcher() else {
+        return OwnedSessionStartContext {
+            notices: Vec::new(),
+        };
+    };
+    dispatch_session_start_with(&dispatcher, &best_effort_ctx(), source).await
+}
+
+/// Use the same append-only representation as existing canonical System rows.
+/// Provider-specific converters must not lift these notices into a retained
+/// signed top-level system prefix. Imported notices remain transcript data.
+pub(crate) fn append_context_history(
+    history: std::sync::Arc<[rig::completion::Message]>,
+    notices: &[String],
+) -> std::sync::Arc<[rig::completion::Message]> {
+    if notices.is_empty() {
+        return history;
+    }
+    let mut history = history.to_vec();
+    history.extend(
+        notices
+            .iter()
+            .cloned()
+            .map(rig::completion::Message::assistant),
+    );
+    history.into()
+}
+
+pub(crate) fn append_context_session(session: &mut crate::session::Session, notices: &[String]) {
+    for notice in notices {
+        session.add_message(crate::session::MessageRole::System, notice);
+    }
+}
+
+/// Observational events share the current tool/compaction work owner. They
+/// cannot answer an approval or replace a tool's execution/result contract.
+pub(crate) async fn dispatch_pre_compact(auto: bool, instructions: Option<&str>) {
     let Some(dispatcher) = get_dispatcher() else {
         return;
     };
-    dispatch_session_start_with(&dispatcher, &best_effort_ctx(), source).await;
+    if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
+        return;
+    }
+    let trigger = if auto { "auto" } else { "manual" };
+    let ctx = best_effort_ctx();
+    let _ = crate::startup::heap_future(|| {
+        dispatcher.dispatch(
+            "PreCompact",
+            Some(trigger),
+            &ctx,
+            envelope::EventFields::PreCompact {
+                trigger: trigger.into(),
+                custom_instructions: instructions.map(str::to_owned),
+            },
+        )
+    })
+    .await;
+}
+
+pub(crate) async fn dispatch_permission_request(tool: &str, input: &str) {
+    let Some(dispatcher) = get_dispatcher() else {
+        return;
+    };
+    if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
+        return;
+    }
+    let ctx = best_effort_ctx();
+    let canonical = normalize::canonical_tool_name(tool);
+    let _ = crate::startup::heap_future(|| {
+        dispatcher.dispatch(
+            "PermissionRequest",
+            Some(&canonical),
+            &ctx,
+            envelope::EventFields::PermissionRequest {
+                tool_name: canonical.clone(),
+                tool_input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::Value::String(input.into())),
+            },
+        )
+    })
+    .await;
+    let _ = crate::startup::heap_future(|| {
+        dispatcher.dispatch(
+            "Notification",
+            Some("permission_prompt"),
+            &ctx,
+            envelope::EventFields::Notification {
+                message: format!("Permission requested for {canonical}"),
+                notification_type: "permission_prompt".into(),
+            },
+        )
+    })
+    .await;
 }
 
 /// Testable core: dispatches `SessionEnd`. Informational only (not
@@ -518,7 +637,7 @@ pub(crate) async fn gate_subagent_start(
         .await;
     match decision {
         Decision::Rewrite { content } => Some(content),
-        Decision::Continue | Decision::Block { .. } => None,
+        Decision::Continue | Decision::Block { .. } | Decision::AdditionalContext { .. } => None,
     }
 }
 
@@ -569,7 +688,9 @@ pub(crate) async fn gate_subagent_stop(
         .await;
     match decision {
         Decision::Block { reason } => SubagentStopGate::Continue { reason },
-        Decision::Continue | Decision::Rewrite { .. } => SubagentStopGate::Release,
+        Decision::Continue | Decision::Rewrite { .. } | Decision::AdditionalContext { .. } => {
+            SubagentStopGate::Release
+        }
     }
 }
 
@@ -627,4 +748,164 @@ pub(crate) async fn hooks_test_dry_run(tool_name: &str, tool_input: serde_json::
         return "hooks: no dispatcher installed (--no-hooks, disableAllHooks, or no settings.json hooks found)".to_string();
     };
     hooks_test_dry_run_with(&dispatcher, &best_effort_ctx(), tool_name, tool_input).await
+}
+
+#[cfg(all(test, unix))]
+mod event60_tests {
+    use super::*;
+
+    struct RestoreDispatcher(Option<std::sync::Arc<dispatcher::HookDispatcher>>);
+    impl Drop for RestoreDispatcher {
+        fn drop(&mut self) {
+            *DISPATCHER.lock().unwrap_or_else(|error| error.into_inner()) = self.0.take();
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks60_actual_permission_transport_observes_without_answering_and_compact_has_source()
+    {
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[]);
+        let root = crate::tests::OwnedTestDirectory::new("hooks60-events");
+        // Mutable observation files are outside the execution workspace; they
+        // are output fixtures, not workspace-resident executable arguments.
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut config = settings::HooksConfig::new();
+        for event in [
+            "PermissionRequest",
+            "Notification",
+            "PreCompact",
+            "SessionStart",
+        ] {
+            config.insert(event.into(), vec![settings::HookGroup {
+                matcher: None,
+                hooks: vec![settings::HookHandler {
+                    kind: "command".into(), command: Some("/bin/sh".into()),
+                    args: Some(vec!["-c".into(), "cat > \"$1\"; printf '%s' '{\"decision\":\"block\",\"permissionDecision\":\"allow\"}'".into(), "event60".into(), root.path().join(event).display().to_string()]),
+                    timeout: Some(3), is_async: false, condition: None, once: false,
+                    trust: settings::HookTrust::Trusted, env: Default::default(),
+                }],
+            }]);
+        }
+        let _restore = RestoreDispatcher(get_dispatcher());
+        init_dispatcher(
+            dispatcher::HookDispatcher::from_config_with_backend_and_root(
+                &config, "none", &workspace,
+            )
+            .unwrap(),
+        );
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope.set_hook_execution_root(&workspace);
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (reply, mut decision) = tokio::sync::oneshot::channel();
+        scope
+            .run(async {
+                crate::permission::ask::send_permission_request(
+                    &sender,
+                    crate::permission::ask::AskRequest {
+                        agent_name: Some("implementer".into()),
+                        tool: "shell".into(),
+                        input: "literal request".into(),
+                        #[cfg(feature = "acp")]
+                        tool_call_id: Some("call60".into()),
+                        suggested_pattern: None,
+                        additional_allow_patterns: Vec::new(),
+                        reply,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    decision.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                let request = receiver.recv().await.unwrap().into_permission();
+                assert_eq!(request.agent_name.as_deref(), Some("implementer"));
+                assert_eq!(request.tool, "shell");
+                assert_eq!(request.input, "literal request");
+                let _ = request
+                    .reply
+                    .send(crate::permission::ask::UserDecision::Deny);
+                assert!(matches!(
+                    decision.await.unwrap(),
+                    crate::permission::ask::UserDecision::Deny
+                ));
+                dispatch_pre_compact(false, Some("retain decisions")).await;
+                dispatch_session_start("compact").await;
+            })
+            .await;
+        cleanup.settle().await;
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(root.path().join(name)).unwrap()).unwrap()
+        };
+        let permission = read("PermissionRequest");
+        assert_eq!(permission["tool_name"], "shell");
+        assert_eq!(permission["tool_input"], "literal request");
+        assert_eq!(
+            read("Notification")["notification_type"],
+            "permission_prompt"
+        );
+        assert_eq!(read("PreCompact")["trigger"], "manual");
+        assert_eq!(
+            read("PreCompact")["custom_instructions"],
+            "retain decisions"
+        );
+        assert_eq!(read("SessionStart")["source"], "compact");
+
+        #[cfg(feature = "js")]
+        {
+            use crate::extras::js::tool::{PermissionBridgeError, PermissionBridgeOwner};
+            use crate::extras::js::types::{PermCancellation, PermissionDenial};
+            use crate::permission::{Action, PermissionConfig, PermissionConfigs, ToolPerm};
+            let permission = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &PermissionConfigs::from(PermissionConfig {
+                        read: Some(ToolPerm::Simple(Action::Ask)),
+                        doom_loop: Some(Action::Allow),
+                        ..Default::default()
+                    }),
+                    crate::permission::SecurityMode::Standard,
+                    Some(workspace.clone()),
+                    Some(vec!["standard".into()]),
+                )
+                .unwrap(),
+            ));
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            // Create the long-lived parent receiver outside the turn scope.
+            let owner = PermissionBridgeOwner::new(
+                Some(permission),
+                Some(sender),
+                std::time::Duration::from_secs(5),
+            );
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            scope.set_hook_execution_root(&workspace);
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+            scope
+                .run(async {
+                    let bridge = owner.bridge().for_invocation(PermCancellation::new());
+                    let check = bridge.check_async("read", "pending.txt");
+                    let answer = async {
+                        let request = receiver.recv().await.unwrap().into_permission();
+                        assert_eq!(request.tool, "read");
+                        assert_eq!(request.input, "pending.txt");
+                        request
+                            .reply
+                            .send(crate::permission::ask::UserDecision::Deny)
+                            .unwrap();
+                    };
+                    let (result, ()) = tokio::join!(check, answer);
+                    assert_eq!(
+                        result,
+                        Err(PermissionBridgeError::Denied(PermissionDenial::User))
+                    );
+                })
+                .await;
+            drop(owner);
+            cleanup.settle().await;
+            assert_eq!(read("PermissionRequest")["tool_name"], "read");
+            assert_eq!(read("PermissionRequest")["tool_input"], "pending.txt");
+        }
+    }
 }

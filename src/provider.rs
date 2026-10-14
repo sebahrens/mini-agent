@@ -2239,6 +2239,61 @@ pub(crate) struct NativeTurnBinding {
     reason = "shared API is intentionally dormant before its frontend consumer lands"
 )]
 impl NativeTurnBinding {
+    /// Consume only the exact runtime SessionStart result, after restoring
+    /// the untouched saved feed and before pairing or preparing this actor.
+    /// Imported System prose cannot call this path or broaden an old anchor.
+    #[cfg(feature = "hooks")]
+    pub(crate) fn append_owned_startup_context(
+        &mut self,
+        session: &mut crate::session::Session,
+        context: crate::extras::hooks::OwnedSessionStartContext,
+    ) -> Result<(), crate::session::native_replay::RestartReason> {
+        use crate::session::native_replay::{RestartReason, bounded_serialized, feed_digest};
+        if session.id != self.session_id
+            || session.native_frontier.current() != self.epoch
+            || !session.native_frontier.ready()
+            || session.messages.len() != self.message_start
+            || !self.preappend_matches(session)?
+            || self
+                .retirement_claimed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RestartReason::ChangedPrefix);
+        }
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or(RestartReason::UnavailableSource)?;
+        if capture.actor_pair().is_some() {
+            return Err(RestartReason::UnavailableSource);
+        }
+        // The existing capture fence rejects any Prepared/accepted callback.
+        // Reassert the same private host owner; this grants no new authority.
+        capture.bind_host(self.host.clone())?;
+        if let Some(host) = &self.host {
+            host.validate()?;
+        }
+        let notices = context.into_notices();
+        if notices.is_empty() {
+            return Ok(());
+        }
+        let limit = crate::session::storage::MAX_SESSION_BYTES;
+        bounded_serialized(session, limit)?;
+        bounded_serialized(&notices, limit)?;
+        // Stage bounded data first. No canonical row, binding witness or
+        // request history changes if the complete saved value does not fit.
+        let mut next = session.clone();
+        crate::extras::hooks::append_context_session(&mut next, &notices);
+        bounded_serialized(&next, limit)?;
+        let preappend = feed_digest(&next.messages, &next.compactions)?;
+        let history = crate::extras::hooks::append_context_history(self.history.clone(), &notices);
+        *session = next;
+        self.message_start = session.messages.len();
+        self.preappend = preappend;
+        self.history = history;
+        Ok(())
+    }
+
     pub(crate) fn pair_publication(
         &self,
         session: &crate::session::Session,
@@ -3352,6 +3407,33 @@ impl AnyAgent {
             {
                 return runner::HeadlessTurn::failed_before_start(error);
             }
+            #[cfg(feature = "hooks")]
+            let (hook_prompt, hook_context) = {
+                if let Err(error) = crate::spend::run::admit_current_effect().await {
+                    return runner::HeadlessTurn::failed_before_start(error);
+                }
+                let gate = match runner::await_headless_work(crate::startup::heap_future(|| {
+                    crate::extras::hooks::dispatch_user_prompt_submit(prompt.to_owned())
+                }))
+                .await
+                {
+                    Ok(gate) => gate,
+                    Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                };
+                match gate {
+                    crate::extras::hooks::PromptGate::Proceed(prompt) => (prompt, Vec::new()),
+                    crate::extras::hooks::PromptGate::WithContext { prompt, notices } => {
+                        (prompt, notices)
+                    }
+                    crate::extras::hooks::PromptGate::Blocked(reason) => {
+                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(reason));
+                    }
+                }
+            };
+            #[cfg(feature = "hooks")]
+            let prompt = hook_prompt.as_str();
+            #[cfg(feature = "hooks")]
+            let history = crate::extras::hooks::append_context_history(history, &hook_context);
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
                 Some(
@@ -3382,7 +3464,7 @@ impl AnyAgent {
             let prompt = prompt.to_string();
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
-            match &inner {
+            let turn = match &inner {
                 AnyAgentInner::OpenRouter(a) => {
                     crate::startup::heap_future(|| {
                         runner::run_print_with_output_and_verification(
@@ -3490,7 +3572,15 @@ impl AnyAgent {
                     })
                     .await
                 }
-            }
+            };
+            #[cfg(feature = "hooks")]
+            let turn = {
+                let mut turn = turn;
+                turn.interactions
+                    .splice(0..0, hook_context.into_iter().map(Message::system));
+                turn
+            };
+            turn
         });
         let future = crate::spend::run::scope(self.spend.clone(), async {
             match native_pair {
@@ -3635,6 +3725,7 @@ impl AnyAgent {
     /// before spawning: its outcome decides whether the runner spawns at all
     /// (a hook can block the prompt outright) and, if so, with what prompt
     /// (a hook can rewrite it).
+    #[cfg(test)]
     pub async fn spawn_runner<H>(
         self,
         prompt: String,
@@ -3652,33 +3743,6 @@ impl AnyAgent {
             #[cfg(feature = "hooks")]
             loop_info,
         )
-        .await
-        .start_interactive()
-    }
-
-    /// Ordinary interactive entry with bounded canonical user content. The
-    /// same captured Run, Question turn, hooks and start barrier remain owned
-    /// by the existing paused runner implementation.
-    pub(crate) async fn spawn_runner_input<H>(
-        self,
-        prompt: crate::agent::input::PromptInput,
-        history: H,
-        retry_config: RetryConfig,
-        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> AgentRunner
-    where
-        H: Into<std::sync::Arc<[Message]>>,
-    {
-        crate::startup::heap_future(|| {
-            self.spawn_runner_paused_input_in_scope(
-                prompt,
-                history.into(),
-                retry_config,
-                #[cfg(feature = "hooks")]
-                loop_info,
-                runner::AgentWorkScope::new(),
-            )
-        })
         .await
         .start_interactive()
     }
@@ -3705,6 +3769,30 @@ impl AnyAgent {
             loop_info,
             runner::AgentWorkScope::new(),
         )
+        .await
+    }
+
+    /// Construct the exact typed User behind the existing owned start barrier.
+    pub(crate) async fn spawn_runner_paused_input<H>(
+        self,
+        prompt: crate::agent::input::PromptInput,
+        history: H,
+        retry_config: RetryConfig,
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    ) -> runner::PausedAgentRunner
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
+        crate::startup::heap_future(|| {
+            self.spawn_runner_paused_input_in_scope(
+                prompt,
+                history.into(),
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+                runner::AgentWorkScope::new(),
+            )
+        })
         .await
     }
 
@@ -3765,17 +3853,33 @@ impl AnyAgent {
                     return spawn_blocked_runner(error.to_string(), work_scope);
                 }
                 #[cfg(feature = "hooks")]
+                if let Err(error) = work_scope
+                    .run(crate::spend::run::admit_current_effect())
+                    .await
+                {
+                    return spawn_blocked_runner(error.to_string(), work_scope);
+                }
+                #[cfg(feature = "hooks")]
                 let rewritten = match work_scope
-                    .run(crate::extras::hooks::dispatch_user_prompt_submit(
-                        prompt.literal_text().to_owned(),
-                    ))
+                    .run(crate::startup::heap_future(|| {
+                        crate::extras::hooks::dispatch_user_prompt_submit(
+                            prompt.literal_text().to_owned(),
+                        )
+                    }))
                     .await
                 {
                     crate::extras::hooks::PromptGate::Blocked(feedback) => {
                         return spawn_blocked_runner(feedback, work_scope);
                     }
-                    crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
+                    crate::extras::hooks::PromptGate::Proceed(prompt) => (prompt, Vec::new()),
+                    crate::extras::hooks::PromptGate::WithContext { prompt, notices } => {
+                        (prompt, notices)
+                    }
                 };
+                #[cfg(feature = "hooks")]
+                let (rewritten, hook_context) = rewritten;
+                #[cfg(feature = "hooks")]
+                let history = crate::extras::hooks::append_context_history(history, &hook_context);
                 #[cfg(feature = "hooks")]
                 if let Err(error) = prompt.apply_hook_text(rewritten) {
                     return spawn_blocked_runner(error.to_owned(), work_scope);
@@ -3801,7 +3905,7 @@ impl AnyAgent {
                 let native_capture = self.native_capture;
                 #[cfg(not(feature = "agent-skills"))]
                 let inner = self.inner;
-                match inner {
+                let paused = match inner {
                     AnyAgentInner::OpenRouter(a) => {
                         runner::spawn_agent_paused_input_in_scope_with_native_capture(
                             a,
@@ -3904,7 +4008,10 @@ impl AnyAgent {
                             crate::agent::native_capture::NativeCaptureHook::default(),
                         )
                     }
-                }
+                };
+                #[cfg(feature = "hooks")]
+                let paused = paused.with_hook_context(hook_context);
+                paused
             }),
         );
         crate::question::scope(question_turn, future).await
@@ -6351,5 +6458,138 @@ mod lsp_health_agent_tests {
                 .unwrap()
                 .contains("private document contents")
         );
+    }
+}
+
+/// The canonical invocation retains its writer through model, hook
+/// and I/O retirement. Drop transfers it to the existing scoped cleanup owner.
+pub(crate) struct NativeRunOwner {
+    pub(crate) ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    pub(crate) binding: Option<NativeTurnBinding>,
+    pub(crate) scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    cleanup: Option<crate::agent::runner::AgentRunCleanupGuard>,
+    pub(crate) outcome: crate::session::native_replay::RetiredNativeOutcome,
+    #[cfg(feature = "hooks")]
+    retired_session_end: Option<NativeSessionEndOwner>,
+}
+
+#[cfg(feature = "hooks")]
+pub(crate) struct NativeSessionEndOwner {
+    permit: crate::session::native_publication::RetiredSessionEndPermit,
+    host: Option<NativeHostGuard>,
+}
+#[cfg(feature = "hooks")]
+impl NativeSessionEndOwner {
+    pub(crate) async fn run(self, session: &mut crate::session::Session) -> anyhow::Result<()> {
+        self.permit.run(session, self.host.as_ref()).await
+    }
+}
+impl NativeRunOwner {
+    pub(crate) fn new(
+        ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    ) -> Self {
+        Self::with_scope(ticket, crate::agent::runner::AgentWorkScope::new())
+    }
+    pub(crate) fn with_scope(
+        ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+        scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    ) -> Self {
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        Self {
+            ticket,
+            binding: None,
+            scope,
+            cleanup: Some(cleanup),
+            outcome: crate::session::native_replay::RetiredNativeOutcome::Incomplete,
+            #[cfg(feature = "hooks")]
+            retired_session_end: None,
+        }
+    }
+    #[cfg(feature = "hooks")]
+    pub(crate) fn take_retired_session_end(&mut self) -> Option<NativeSessionEndOwner> {
+        self.retired_session_end.take()
+    }
+    pub(crate) async fn progress(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> anyhow::Result<()> {
+        if let Some(ticket) = &mut self.ticket {
+            crate::session::native_publication::progress_owned(session, ticket, &self.scope)
+                .await?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn finish(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> anyhow::Result<()> {
+        // SessionEnd may have admitted async command children after the
+        // model retired. Cancel and join that exact scope before publishing.
+        // Its cleanup owner retains the unique ticket even if this await drops.
+        if let Some(mut cleanup) = self.cleanup.take() {
+            let retained = std::sync::Arc::new(std::sync::Mutex::new(self.ticket.take()));
+            cleanup.retain_until_settled(retained.clone());
+            cleanup.settle().await;
+            self.ticket = retained.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        // The completed hook scope is cancelled. Final file work gets a new
+        // owned IO scope; the binding still proves exact model retirement.
+        self.scope = crate::agent::runner::AgentWorkScope::new();
+        self.cleanup = Some(crate::agent::runner::AgentRunCleanupGuard::auxiliary(
+            self.scope.clone(),
+        ));
+        let result = async {
+            // The actual model cleanup has closed its scope. Seal current
+            // canonical observations through the fresh owned IO scope before
+            // the final publication; never enqueue into a retired actor scope.
+            if session.native_frontier.refusal().is_none() {
+                self.progress(session).await?;
+            }
+            if let Some(ticket) = self.ticket.take() {
+                let binding = self
+                    .binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("native model did not settle"))?;
+                if session.native_frontier.refusal().is_some() {
+                    binding
+                        .publish_refused_owned(session, ticket, &self.scope)
+                        .await?;
+                } else {
+                    binding
+                        .publish_retired_owned(session, ticket, self.outcome, &self.scope)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.settle().await;
+        }
+        #[cfg(feature = "hooks")]
+        if result.is_ok()
+            && session.native_publication.is_some()
+            && let Some(binding) = &self.binding
+            && let Some(pair) = binding
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.actor_pair())
+        {
+            self.retired_session_end = Some(NativeSessionEndOwner {
+                permit:
+                    crate::session::native_publication::RetiredSessionEndPermit::from_retired_actor(
+                        session, &pair,
+                    )?,
+                host: binding.host.clone(),
+            });
+        }
+        result
+    }
+}
+impl Drop for NativeRunOwner {
+    fn drop(&mut self) {
+        if let (Some(cleanup), Some(ticket)) = (&mut self.cleanup, self.ticket.take()) {
+            cleanup.retain_until_settled(ticket);
+        }
     }
 }

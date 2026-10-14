@@ -53,6 +53,8 @@ struct CommittedTurn {
 
 #[derive(Default)]
 struct SessionHistory {
+    #[cfg(feature = "hooks")]
+    hooks_started: bool,
     pending_question: Option<crate::question::QuestionRequired>,
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
@@ -116,10 +118,36 @@ impl SessionHistory {
         messages
     }
 
+    #[cfg(feature = "hooks")]
+    fn record_hook_context(&mut self, notices: Vec<String>) {
+        if notices.is_empty() {
+            return;
+        }
+        let messages = notices
+            .into_iter()
+            .map(Message::assistant)
+            .collect::<Vec<_>>();
+        let serialized_bytes = serde_json::to_vec(&messages)
+            .map_or(MAX_ACP_HISTORY_BYTES.saturating_add(1), |bytes| bytes.len());
+        self.serialized_bytes = self.serialized_bytes.saturating_add(serialized_bytes);
+        self.turns.push_back(CommittedTurn {
+            messages,
+            serialized_bytes,
+        });
+    }
+
     fn commit_completed_turn(&mut self, prompt: &str, interactions: Vec<Message>) {
         let mut messages = Vec::with_capacity(interactions.len() + 1);
+        let notices = interactions
+            .iter()
+            .take_while(|message| matches!(message, Message::System { .. }))
+            .count();
+        messages.extend(interactions[..notices].iter().map(|message| match message {
+            Message::System { content } => Message::assistant(content.clone()),
+            _ => unreachable!(),
+        }));
         messages.push(Message::user(prompt));
-        messages.extend(interactions);
+        messages.extend(interactions.into_iter().skip(notices));
 
         // Rig messages are serializable. Treat an unexpected serialization failure
         // as oversized so history remains bounded instead of retaining it forever.
@@ -2888,6 +2916,9 @@ async fn execute_prompt(
     #[cfg(feature = "goal")]
     let mut compaction_usage = crate::event::UsageDelta::default();
     if history.needs_compaction() {
+        #[cfg(feature = "hooks")]
+        crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
+            .await;
         let quick_models = crate::config::quick_models_map(&state.cfg);
         let context_window =
             state
@@ -2937,6 +2968,14 @@ async fn execute_prompt(
         let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
         };
+        #[cfg(feature = "hooks")]
+        {
+            let notices = crate::startup::heap_future(|| {
+                crate::extras::hooks::dispatch_session_start("compact")
+            })
+            .await;
+            history.record_hook_context(notices.into_notices());
+        }
         #[cfg(feature = "goal")]
         {
             compaction_usage = usage;
@@ -2954,6 +2993,7 @@ async fn execute_prompt(
             .await;
         Arc::new(refreshed)
     };
+    #[cfg(not(feature = "hooks"))]
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
 
@@ -2969,6 +3009,44 @@ async fn execute_prompt(
     // run against this session's workspace, independent of other sessions.
     #[cfg(feature = "hooks")]
     work_scope.set_hook_execution_root(workspace.root());
+    #[cfg(feature = "hooks")]
+    let prior_history = {
+        if !history.hooks_started {
+            if let Some(dispatcher) = crate::extras::hooks::get_dispatcher() {
+                let hook_ctx = crate::extras::hooks::HookCtx {
+                    session_id: session_id.to_string(),
+                    session_path: String::new(),
+                    cwd: workspace.root().to_string_lossy().into_owned(),
+                    permission_mode: permission
+                        .as_ref()
+                        .map(|permission| {
+                            permission
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .mode()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "standard".into()),
+                };
+                let Some(notices) = run_owned_pre_run(
+                    &control,
+                    &work_scope,
+                    crate::extras::hooks::dispatch_session_start_with(
+                        &dispatcher,
+                        &hook_ctx,
+                        "startup",
+                    ),
+                )
+                .await
+                else {
+                    return Ok(PromptOutcome::cancelled(None));
+                };
+                history.record_hook_context(notices.into_notices());
+            }
+            history.hooks_started = true;
+        }
+        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results())
+    };
     #[cfg(feature = "mcp")]
     {
         *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
@@ -3120,12 +3198,16 @@ async fn relay_paused_runner(
     paused_runner: crate::agent::runner::PausedAgentRunner,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
+    #[cfg(feature = "hooks")]
+    let mut paused_runner = paused_runner;
+    #[cfg(feature = "hooks")]
+    let notices = paused_runner.take_hook_context();
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
         return cancelled_after_runner(&mut runner.event_rx).await;
     }
-    relay_prompt_events(
+    let outcome = relay_prompt_events(
         session_id,
         cx,
         control,
@@ -3133,7 +3215,17 @@ async fn relay_paused_runner(
         #[cfg(feature = "goal")]
         usage_provider,
     )
-    .await
+    .await;
+    #[cfg(feature = "hooks")]
+    let outcome = {
+        let mut outcome = outcome;
+        if !notices.is_empty() {
+            let progress = outcome.progress.get_or_insert_with(Vec::new);
+            progress.splice(0..0, notices.into_iter().map(Message::system));
+        }
+        outcome
+    };
+    outcome
 }
 
 /// Add one usage report to an ACP goal round's token total, normalised for

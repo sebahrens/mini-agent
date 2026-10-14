@@ -109,3 +109,42 @@ fn subagent_stop_envelope_carries_agent_type_and_stop_hook_active() {
     assert_eq!(envelope["agent_source"], "compiled-in explorer");
     assert_eq!(envelope["stop_hook_active"], false);
 }
+
+#[test]
+fn hooks60_compaction_notification_and_permission_envelopes_preserve_common_identity() {
+    let compact = build_envelope(
+        &ctx(),
+        "PreCompact",
+        EventFields::PreCompact {
+            trigger: "manual".into(),
+            custom_instructions: Some("keep decisions".into()),
+        },
+    );
+    assert_eq!(compact["trigger"], "manual");
+    assert_eq!(compact["custom_instructions"], "keep decisions");
+    let notification = build_envelope(
+        &ctx(),
+        "Notification",
+        EventFields::Notification {
+            message: "approval awaits".into(),
+            notification_type: "permission_prompt".into(),
+        },
+    );
+    assert_eq!(notification["notification_type"], "permission_prompt");
+    let permission = build_envelope(
+        &ctx(),
+        "PermissionRequest",
+        EventFields::PermissionRequest {
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({"command":"literal request"}),
+        },
+    );
+    assert_eq!(permission["tool_name"], "bash");
+    assert_eq!(permission["tool_input"]["command"], "literal request");
+    for envelope in [compact, notification, permission] {
+        assert_eq!(envelope["session_id"], "sess-1");
+        assert_eq!(envelope["session_path"], "/tmp/sess.json");
+        assert_eq!(envelope["cwd"], "/repo");
+        assert!(envelope.get("transcript_path").is_none());
+    }
+}

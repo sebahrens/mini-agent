@@ -16,7 +16,8 @@ Workspace compatibility uses a bounded borrowed path and retained physical root
 identity, validated before and after projection. Same-path replacement is refused.
 This digest is compatibility data, never a directory capability or approval.
 
-These shared APIs are dormant in ordinary frontends. Full native replay, strict
-pre-effect publication, explicit durable recovery, live effort controls and
-memory/cache-prefix placement remain unfinished. Across-process failed-save
-fencing requires the separate strict publication controller.
+Plain print and ordinary interactive turns use these APIs through the strict
+publication controller described in `native-publication.md`. ACP and automatic
+round adoption, explicit durable recovery, live effort controls and remaining
+memory/cache-prefix placement are still unfinished. Imported compatibility data
+never creates that controller's runtime writer or actor permits.

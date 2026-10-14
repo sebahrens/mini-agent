@@ -204,6 +204,22 @@ pub struct AskRequest {
     pub reply: oneshot::Sender<UserDecision>,
 }
 
+/// Keep hook observation inside the caller's existing cancellable work scope,
+/// before the frontend adopts the exact reply sender. Hook output never grants.
+pub(crate) async fn send_permission_request(
+    sender: &AskSender,
+    request: AskRequest,
+) -> Result<(), mpsc::error::SendError<UserRequest>> {
+    #[cfg(feature = "hooks")]
+    if !request.reply.is_closed() {
+        crate::startup::heap_future(|| {
+            crate::extras::hooks::dispatch_permission_request(&request.tool, &request.input)
+        })
+        .await;
+    }
+    sender.send(request.into()).await
+}
+
 #[derive(Debug, Clone)]
 pub enum UserDecision {
     AllowOnce,

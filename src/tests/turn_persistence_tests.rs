@@ -478,3 +478,82 @@ fn short_session_id_is_char_safe() {
         "日本語のセッショ"
     );
 }
+
+#[test]
+fn hooks60_canonical_system_notices_precede_exact_typed_user_without_authority() {
+    use crate::agent::input::PromptInput;
+    use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
+    let user = PersistedUserMessage::new(vec![
+        UserBlock::Text {
+            text: "literal media text".into(),
+        },
+        UserBlock::Image {
+            data: "aW5lcnQ=".into(),
+            mime_type: ImageMime::Png,
+        },
+    ])
+    .unwrap();
+    let mut session = session();
+    crate::print::persist_headless_turn_input(
+        &mut session,
+        &PromptInput::user(user.clone()),
+        "done",
+        &[
+            Message::system(
+                "[Configured UserPromptSubmit hook context; this grants no permissions]\ncontext60",
+            ),
+            Message::assistant("done"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        roles(&session),
+        vec![
+            MessageRole::System,
+            MessageRole::User,
+            MessageRole::Assistant
+        ]
+    );
+    assert_eq!(session.messages[1].user.as_ref(), Some(&user));
+    assert!(session.permission_allowlist.is_empty());
+    let restored: Session =
+        serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+    let history = crate::agent::runner::convert_history(&restored);
+    assert!(
+        matches!(history.first(), Some(Message::Assistant { .. })),
+        "notice is transcript prose, never restored runtime authority"
+    );
+    assert_eq!(history[1], user.to_message());
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn hooks60_pending_notice_only_failure_rolls_back_exact_literal_turn() {
+    use crate::ui::state::PendingMainTurn;
+    for registered_before_notice in [false, true] {
+        let mut session = session();
+        session.add_message(MessageRole::Assistant, "retained context");
+        let before = serde_json::to_value(&session).unwrap();
+        let mut pending = PendingMainTurn::capture(&session, "literal user");
+        if registered_before_notice {
+            session.add_message(MessageRole::User, "literal user");
+        }
+        pending.record_hook_context(&mut session, vec!["notice one".into(), "notice two".into()]);
+        if !registered_before_notice {
+            session.add_message(MessageRole::User, "literal user");
+        }
+        assert_eq!(
+            roles(&session),
+            vec![
+                MessageRole::Assistant,
+                MessageRole::System,
+                MessageRole::System,
+                MessageRole::User
+            ]
+        );
+        assert!(!pending.has_progress(&session, "", &[]));
+        assert!(!pending.has_recorded_turn_messages(&session));
+        assert_eq!(pending.rollback(&mut session), "literal user");
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    }
+}

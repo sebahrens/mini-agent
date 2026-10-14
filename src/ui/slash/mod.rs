@@ -495,6 +495,10 @@ pub async fn handle_compress(
         TuiCompactionGate::Cut(cut_idx) => cut_idx,
     };
 
+    #[cfg(feature = "hooks")]
+    crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(auto, instructions))
+        .await;
+
     // Announce only once we know compression will actually run.
     if auto {
         renderer.write_line("auto-compacting...", crossterm::style::Color::DarkGrey)?;
@@ -570,6 +574,14 @@ pub async fn handle_compress(
     #[cfg(feature = "goal")]
     if let Some(collector) = run.goal_round.as_mut() {
         collector.add_usage(usage);
+    }
+
+    #[cfg(feature = "hooks")]
+    {
+        let notices =
+            crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
+                .await;
+        crate::extras::hooks::append_context_session(ui.session, &notices.into_notices());
     }
 
     run.agent = Some(

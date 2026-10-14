@@ -32,6 +32,18 @@ pub(crate) enum EventFields {
         goal_status: Option<String>,
         goal_round: Option<u64>,
     },
+    PreCompact {
+        trigger: String,
+        custom_instructions: Option<String>,
+    },
+    Notification {
+        message: String,
+        notification_type: String,
+    },
+    PermissionRequest {
+        tool_name: String,
+        tool_input: Value,
+    },
     SessionStart {
         source: String,
     },
@@ -102,6 +114,24 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
             "goal_id": goal_id,
             "goal_status": goal_status,
             "goal_round": goal_round,
+        }),
+        EventFields::PreCompact {
+            trigger,
+            custom_instructions,
+        } => json!({
+            "trigger": trigger, "custom_instructions": custom_instructions,
+        }),
+        EventFields::Notification {
+            message,
+            notification_type,
+        } => json!({
+            "message": message, "notification_type": notification_type,
+        }),
+        EventFields::PermissionRequest {
+            tool_name,
+            tool_input,
+        } => json!({
+            "tool_name": tool_name, "tool_input": tool_input,
         }),
         EventFields::SessionStart { source } => json!({ "source": source }),
         EventFields::SessionEnd { reason } => json!({ "reason": reason }),

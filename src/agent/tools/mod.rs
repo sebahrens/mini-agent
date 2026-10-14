@@ -610,22 +610,21 @@ async fn handle_ask_inner(
         suggested => (suggested, additional_allow_patterns),
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    ask_tx
-        .send(
-            AskRequest {
-                agent_name: crate::permission::ask::subagent_name(),
-                tool: CompactString::new(tool),
-                input: input.to_string(),
-                #[cfg(feature = "acp")]
-                tool_call_id: crate::permission::ask::current_tool_call_id(),
-                suggested_pattern,
-                additional_allow_patterns: additional_allow_patterns.clone(),
-                reply: reply_tx,
-            }
-            .into(),
-        )
-        .await
-        .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
+    crate::permission::ask::send_permission_request(
+        ask_tx,
+        AskRequest {
+            agent_name: crate::permission::ask::subagent_name(),
+            tool: CompactString::new(tool),
+            input: input.to_string(),
+            #[cfg(feature = "acp")]
+            tool_call_id: crate::permission::ask::current_tool_call_id(),
+            suggested_pattern,
+            additional_allow_patterns: additional_allow_patterns.clone(),
+            reply: reply_tx,
+        },
+    )
+    .await
+    .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
     let decision = reply_rx.await;
     if let Some(required) = crate::question::required() {
         return Err(ToolError::Msg(required.to_string()));

@@ -1,3 +1,9 @@
+#[cfg(all(test, feature = "agent-skills"))]
+pub(crate) use app::drive_native_instruction_fixture;
+#[cfg(all(test, feature = "hooks"))]
+pub(crate) use app::drive_native_stale_session_end_fixture;
+#[cfg(test)]
+pub(crate) use app::{drive_native_fixture_turn, drive_native_fixture_turns};
 mod app;
 #[cfg(feature = "multimodal")]
 mod clipboard_image;
@@ -1054,6 +1060,34 @@ pub(crate) async fn start_main_run(
 ) -> anyhow::Result<()> {
     #[cfg(feature = "multimodal")]
     let user = clipboard_image::user_message(&ui.session.pending_media, text)?;
+    anyhow::ensure!(
+        run.native_owner.is_none(),
+        "the previous native context is still settling"
+    );
+    if let Some(reason) = run.native_blocked {
+        return Err(reason.into());
+    }
+    let native = matches!(&ui.client, crate::provider::AnyClient::Anthropic(_))
+        || ui.session.native_history_snapshot().is_some();
+    #[cfg(feature = "goal")]
+    anyhow::ensure!(
+        !native || !ui.session.goal_store.is_live(),
+        "native automatic goal work requires its round publication owner; the input is retained"
+    );
+    let mut native_owner = if native {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let ticket = if ui.cli.no_session {
+            None
+        } else {
+            Some(match ui.native_ticket.take() {
+                Some(ticket) => ticket,
+                None => crate::session::native_publication::begin_owned(ui.session, &scope).await?,
+            })
+        };
+        Some(crate::provider::NativeRunOwner::with_scope(ticket, scope))
+    } else {
+        None
+    };
     // A goal that asked the user a question is waiting, not finished. The
     // answer is the thing it was waiting for, so typing one resumes it — the
     // guide has always said so, and without this the user has to discover
@@ -1141,21 +1175,96 @@ pub(crate) async fn start_main_run(
     let agent = run.agent.as_ref().unwrap().clone();
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_turn(run.instruction_turn.clone());
-    // Construct this measured large child in the short factory frame. The
-    // exact request/profile scope and its owned await remain on this turn.
-    let runner = crate::startup::heap_future(|| {
-        agent
-            .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-            .with_question_turn(question_turn)
-            .spawn_runner_input(
-                pending_turn.input(),
+    let mut pending_turn = Some(pending_turn);
+    run.native_checkpointed = false;
+    let runner = if let Some(mut owner) = native_owner.take() {
+        use crate::session::native_replay::ReplayBoundary;
+        let spend = crate::spend::run::Run::for_session(
+            ui.session,
+            ui.cfg,
+            crate::spend::RequestKind::Turn,
+        );
+        owner.scope.run(async { spend.prepare().await }).await?;
+        let boundary = match ui.session.native_history_snapshot() {
+            Some(saved) => saved.saved_boundary()?,
+            None => ReplayBoundary::CompletedTurn,
+        };
+        #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+        let (agent, mut binding) = crate::startup::heap_future(|| {
+            std::future::ready(
+                agent
+                    .with_spend(Some(spend))
+                    .with_question_turn(question_turn)
+                    .bind_native_turn(
+                        ui.session,
+                        history,
+                        boundary,
+                        crate::provider::RecordedToolIds::Lifecycle,
+                    ),
+            )
+        })
+        .await?;
+        #[cfg(feature = "hooks")]
+        if let Some(context) = ui.pending_session_start_context.take() {
+            binding.append_owned_startup_context(ui.session, context)?;
+            pending_turn
+                .as_mut()
+                .unwrap()
+                .rebase_after_owned_startup_context(ui.session);
+            owner.progress(ui.session).await?;
+        }
+        if let Some(ticket) = &mut owner.ticket {
+            binding.pair_publication(ui.session, ticket)?;
+        }
+        let history = binding.history();
+        owner.binding = Some(binding);
+        let scope = owner.scope.clone();
+        let paused = crate::startup::heap_future(|| {
+            agent.spawn_runner_paused_input_in_scope(
+                pending_turn.as_ref().unwrap().input(),
                 history,
                 ui.cfg.retry.clone(),
                 #[cfg(feature = "hooks")]
                 None,
+                scope,
             )
-    })
-    .await;
+        })
+        .await;
+        #[cfg(feature = "hooks")]
+        let mut paused = paused;
+        #[cfg(feature = "hooks")]
+        adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
+        let pending = pending_turn.take().unwrap();
+        if record_chat_history {
+            record_started_main_turn(pending, run, ui);
+        } else {
+            mark_main_turn_started(ui.session, run, pending);
+        }
+        // The exact literal/typed input is durable as denied data before the
+        // paused model's start barrier is released.
+        owner.progress(ui.session).await?;
+        run.native_owner = Some(owner);
+        paused.start_interactive()
+    } else {
+        let paused = crate::startup::heap_future(|| {
+            agent
+                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                .with_question_turn(question_turn)
+                .spawn_runner_paused_input(
+                    pending_turn.as_ref().unwrap().input(),
+                    history,
+                    ui.cfg.retry.clone(),
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+        })
+        .await;
+        #[cfg(feature = "hooks")]
+        let mut paused = paused;
+        #[cfg(feature = "hooks")]
+        adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
+        paused.start_interactive()
+    };
     run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
@@ -1163,11 +1272,46 @@ pub(crate) async fn start_main_run(
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_start();
     }
-    if record_chat_history {
-        record_started_main_turn(pending_turn, run, ui);
-    } else {
-        mark_main_turn_started(ui.session, run, pending_turn);
+    if let Some(pending_turn) = pending_turn {
+        if record_chat_history {
+            record_started_main_turn(pending_turn, run, ui);
+        } else {
+            mark_main_turn_started(ui.session, run, pending_turn);
+        }
     }
+    Ok(())
+}
+
+/// Attaches only the completed capture of the exact retired foreground actor.
+/// Usage was already applied by its real UsageDelta events.
+pub(crate) async fn settle_native_main_turn(
+    run: &mut AgentRunState,
+    session: &mut Session,
+    outcome: crate::session::native_replay::RetiredNativeOutcome,
+) -> anyhow::Result<()> {
+    let Some(mut owner) = run.native_owner.take() else {
+        return Ok(());
+    };
+    owner.outcome = outcome;
+    let binding = owner
+        .binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("native model did not settle"))?;
+    let attachment = binding.settle_into_with_outcome(session, outcome);
+    if let Err(reason) = attachment {
+        run.native_blocked = Some(reason);
+    }
+    let publication = owner.finish(session).await;
+    if let Err(error) = publication {
+        run.native_blocked = Some(crate::session::native_replay::RestartReason::InFlight);
+        return Err(error);
+    }
+    run.native_checkpointed = true;
+    #[cfg(feature = "hooks")]
+    {
+        run.native_session_end = owner.take_retired_session_end();
+    }
+    attachment?;
     Ok(())
 }
 
@@ -1205,6 +1349,20 @@ pub(crate) fn record_goal_round_boundary(
     };
     mark_main_turn_started(session, run, PendingMainTurn::capture(session, next_prompt));
     Ok(settled)
+}
+
+#[cfg(feature = "hooks")]
+pub(crate) fn adopt_runner_hook_context(
+    paused: &mut crate::agent::runner::PausedAgentRunner,
+    pending: Option<&mut PendingMainTurn>,
+    session: &mut Session,
+) {
+    let notices = paused.take_hook_context();
+    if let Some(pending) = pending {
+        pending.record_hook_context(session, notices);
+    } else {
+        crate::extras::hooks::append_context_session(session, &notices);
+    }
 }
 
 pub(crate) fn mark_main_turn_started(
@@ -1396,10 +1554,10 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     let agent = run.agent.as_ref().unwrap().clone();
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_turn(run.instruction_turn.clone());
-    let runner = agent
+    let paused = agent
         .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
         .with_question_turn(run.question_turn.clone())
-        .spawn_runner(
+        .spawn_runner_paused(
             MID_TURN_CONTINUE_PROMPT.to_string(),
             history,
             ui.cfg.retry.clone(),
@@ -1407,6 +1565,11 @@ pub(crate) async fn mid_turn_compact_and_respawn(
             None,
         )
         .await;
+    #[cfg(feature = "hooks")]
+    let mut paused = paused;
+    #[cfg(feature = "hooks")]
+    adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
+    let runner = paused.start_interactive();
     run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
@@ -1521,7 +1684,9 @@ pub async fn run_interactive(
     ask_rx: Option<AskReceiver>,
     auto_trigger_msg: Option<String>,
     #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
-    #[cfg(feature = "hooks")] session_start_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "hooks")] session_start_task: Option<
+        tokio::task::JoinHandle<crate::extras::hooks::OwnedSessionStartContext>,
+    >,
 ) -> anyhow::Result<()> {
     let mut app = crate::startup::heap_future(|| {
         app::App::new(
@@ -1537,7 +1702,9 @@ pub async fn run_interactive(
     })
     .await?;
     let result = app.run().await;
-    app.teardown().await;
+    app.teardown_owners().await;
+    #[cfg(feature = "hooks")]
+    let result = result.and(crate::startup::heap_future(|| app.finish_session_end()).await);
     result
 }
 

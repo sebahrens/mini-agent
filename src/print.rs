@@ -1531,6 +1531,19 @@ pub(crate) fn persist_headless_turn_input(
     response: &str,
     interactions: &[Message],
 ) -> anyhow::Result<()> {
+    // Only host gates produce leading System notices in an observed turn.
+    // Persist their append-only transcript representation before the exact
+    // initial User so reload/native feed order matches the actual request.
+    let notices = interactions
+        .iter()
+        .take_while(|message| matches!(message, Message::System { .. }))
+        .count();
+    for message in &interactions[..notices] {
+        if let Message::System { content } = message {
+            session.add_message(MessageRole::System, content);
+        }
+    }
+    let interactions = &interactions[notices..];
     if let Some(user) = prompt.persisted_user() {
         session.add_user_message(user.clone());
     } else {

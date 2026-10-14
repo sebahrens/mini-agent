@@ -441,3 +441,62 @@ fn no_hooks_flag_excludes_non_managed_but_not_managed() {
     assert!(!dispatcher.is_empty());
     assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 1);
 }
+
+#[test]
+fn hooks60_claude_project_settings_require_exact_trust_and_cannot_disable_global_hooks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = crate::tests::OwnedTestDirectory::new("hooks60-claude-settings");
+    let global = root.path().join("global.json");
+    let native = root.path().join(".zerostack/settings.json");
+    let compatibility = root.path().join(".claude/settings.json");
+    let managed = root.path().join("missing-managed.json");
+    let store = root.path().join("trusted.json");
+    write_settings(
+        &global,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+    );
+    write_settings(
+        &compatibility,
+        r#"{"disableAllHooks":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo 'approved value'"}]}]}}"#,
+    );
+    let load = |headless, confirm: &dyn Fn(&str) -> bool| {
+        trust::build_dispatcher_from_paths(
+            &global,
+            &native,
+            &managed,
+            root.path(),
+            false,
+            headless,
+            &store,
+            confirm,
+        )
+    };
+    let denied = load(true, &|_| panic!("headless must not prompt"));
+    assert_eq!(
+        denied.handlers_for("PreToolUse", "bash").len(),
+        1,
+        "global guard survives project disableAllHooks"
+    );
+    let confirmations = AtomicUsize::new(0);
+    let accepted = load(false, &|description| {
+        confirmations.fetch_add(1, Ordering::SeqCst);
+        assert!(description.contains(r#"argv=["echo","approved value"]"#));
+        true
+    });
+    assert_eq!(confirmations.load(Ordering::SeqCst), 1);
+    assert_eq!(accepted.handlers_for("PreToolUse", "bash").len(), 2);
+    let reloaded = load(true, &|_| panic!("exact prior approval needs no prompt"));
+    assert_eq!(reloaded.handlers_for("PreToolUse", "bash").len(), 2);
+    write_settings(
+        &compatibility,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo changed"}]}]}}"#,
+    );
+    let changed = load(true, &|_| {
+        panic!("headless changed binding must not prompt")
+    });
+    assert_eq!(
+        changed.handlers_for("PreToolUse", "bash").len(),
+        1,
+        "changed argv requires fresh approval"
+    );
+}

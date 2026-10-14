@@ -517,7 +517,9 @@ pub(crate) struct Startup {
     pub client: AnyClient,
     native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
     native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
-    native_headless: Option<NativeHeadlessOwner>,
+    native_headless: Option<provider::NativeRunOwner>,
+    #[cfg(feature = "hooks")]
+    pending_session_start_context: Option<crate::extras::hooks::OwnedSessionStartContext>,
     #[cfg(feature = "hooks")]
     native_session_end_done: bool,
     pub is_interactive: bool,
@@ -537,7 +539,8 @@ pub(crate) struct Startup {
     pub session_resumed: bool,
     pub resume_override_pending: bool,
     #[cfg(feature = "hooks")]
-    session_start_task: Option<tokio::task::JoinHandle<()>>,
+    session_start_task:
+        Option<tokio::task::JoinHandle<crate::extras::hooks::OwnedSessionStartContext>>,
 }
 
 type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRouterModelInfo>;
@@ -691,6 +694,11 @@ async fn compact_headless_session_if_needed(
         #[cfg(feature = "memory")]
         context.memory.as_deref(),
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
+            #[cfg(feature = "hooks")]
+            crate::startup::heap_future(|| {
+                crate::extras::hooks::dispatch_pre_compact(true, instructions)
+            })
+            .await;
             client
                 .compress_messages_observed(
                     &model,
@@ -719,6 +727,14 @@ async fn compact_headless_session_if_needed(
             return Err(failure.context(HeadlessCompactionUsage(usage)));
         }
     };
+
+    #[cfg(feature = "hooks")]
+    if compacted.is_some() {
+        let notices =
+            crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
+                .await;
+        crate::extras::hooks::append_context_session(session, &notices.into_notices());
+    }
 
     #[cfg(feature = "memory")]
     if let Some(compacted) = &compacted {
@@ -1233,12 +1249,12 @@ impl Startup {
         let editor_session = cli.acp_enabled;
         #[cfg(not(feature = "acp"))]
         let editor_session = false;
-        let adopted_native_frontend = cli.print && !cli.is_loop_mode();
+        let adopted_native_frontend = (cli.print || is_interactive) && !cli.is_loop_mode();
         anyhow::ensure!(
             editor_session
                 || adopted_native_frontend
                 || !crate::session::native_publication::is_native_bearing(&session),
-            "this saved native context requires the headless print frontend; interactive and automatic-round replay are not available yet"
+            "this saved native context requires the headless print frontend or interactive frontend; automatic-round replay is not available yet"
         );
         let mut native_startup = if !editor_session
             && adopted_native_frontend
@@ -1291,6 +1307,8 @@ impl Startup {
             native_startup,
             native_ticket: None,
             native_headless: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             #[cfg(feature = "hooks")]
             native_session_end_done: false,
             is_interactive,
@@ -1594,6 +1612,12 @@ impl Startup {
         // started, so slow hooks do not serialize those cold-start paths.
         #[cfg(feature = "hooks")]
         {
+            // Select once before the hook can acquire its execution-root lease.
+            // Rebinding during dispatch would invalidate an in-flight startup
+            // hook even when the selected pathname is identical.
+            self.workspace.validate().map_err(anyhow::Error::msg)?;
+            crate::extras::hooks::set_active_workspace(self.workspace.root());
+            self.workspace.validate().map_err(anyhow::Error::msg)?;
             crate::extras::hooks::set_active_session(&self.session.id);
             let source = if self.session_resumed {
                 "resume"
@@ -1602,7 +1626,7 @@ impl Startup {
             }
             .to_string();
             let hook = heap_future(|| async move {
-                crate::extras::hooks::dispatch_session_start(&source).await;
+                crate::extras::hooks::dispatch_session_start(&source).await
             });
             self.session_start_task = Some(match &self.native_startup {
                 Some(owner) => owner.spawn_hook(hook).await,
@@ -1809,8 +1833,6 @@ impl Startup {
     /// state nor its construction is reserved in this frame, which stays on the
     /// stack for the whole run.
     pub(crate) async fn dispatch(mut self: Box<Self>) -> anyhow::Result<()> {
-        #[cfg(feature = "hooks")]
-        crate::extras::hooks::set_active_workspace(self.workspace.root());
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
@@ -1825,9 +1847,22 @@ impl Startup {
         if self.cli.print {
             #[cfg(feature = "hooks")]
             if let Some(task) = self.session_start_task.take() {
-                let joined = task.await;
-                if let Some(owner) = &self.native_startup {
-                    owner.hook_retired(joined)?;
+                match task.await {
+                    Ok(context) => {
+                        if self.native_startup.is_some() {
+                            self.pending_session_start_context = Some(context);
+                        } else {
+                            crate::extras::hooks::append_context_session(
+                                &mut self.session,
+                                &context.into_notices(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(owner) = &self.native_startup {
+                            owner.hook_retired(Err(error))?;
+                        }
+                    }
                 }
             }
             self.join_native_startup().await?;
@@ -1845,9 +1880,22 @@ impl Startup {
             if self.cli.loop_mode {
                 #[cfg(feature = "hooks")]
                 if let Some(task) = self.session_start_task.take() {
-                    let joined = task.await;
-                    if let Some(owner) = &self.native_startup {
-                        owner.hook_retired(joined)?;
+                    match task.await {
+                        Ok(context) => {
+                            if self.native_startup.is_some() {
+                                self.pending_session_start_context = Some(context);
+                            } else {
+                                crate::extras::hooks::append_context_session(
+                                    &mut self.session,
+                                    &context.into_notices(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(owner) = &self.native_startup {
+                                owner.hook_retired(Err(error))?;
+                            }
+                        }
                     }
                 }
                 self.join_native_startup().await?;
@@ -2133,6 +2181,8 @@ impl Startup {
                     compaction_usage,
                     &mut self.native_ticket,
                     &mut self.native_headless,
+                    #[cfg(feature = "hooks")]
+                    &mut self.pending_session_start_context,
                     #[cfg(feature = "hooks")]
                     false,
                 )
@@ -2579,9 +2629,6 @@ impl Startup {
         )
         .await?;
 
-        #[cfg(feature = "hooks")]
-        crate::extras::hooks::dispatch_session_end("exit").await;
-
         Ok(())
     }
 }
@@ -2740,6 +2787,8 @@ pub(crate) async fn run_goal_rounds_for_loop(
 
     let mut native_ticket = None;
     let mut native_owner = None;
+    #[cfg(feature = "hooks")]
+    let mut startup_context = None;
     let rounds = heap_future(|| {
         run_headless_goal_rounds(
             agent,
@@ -2754,6 +2803,8 @@ pub(crate) async fn run_goal_rounds_for_loop(
             crate::event::UsageDelta::default(),
             &mut native_ticket,
             &mut native_owner,
+            #[cfg(feature = "hooks")]
+            &mut startup_context,
             #[cfg(feature = "hooks")]
             true,
         )
@@ -2811,84 +2862,6 @@ pub(crate) async fn run_goal_rounds_for_loop(
 /// The agent is reused between rounds: the goal preamble block is static for
 /// the goal's life, so a rebuild would produce an identical system prompt.
 #[allow(clippy::too_many_arguments)]
-/// The canonical headless invocation retains its writer through model, hook
-/// and I/O retirement. Drop transfers it to the existing scoped cleanup owner.
-struct NativeHeadlessOwner {
-    ticket: Option<crate::session::native_publication::NativePublicationTicket>,
-    binding: Option<provider::NativeTurnBinding>,
-    scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
-    cleanup: Option<crate::agent::runner::AgentRunCleanupGuard>,
-    outcome: crate::session::native_replay::RetiredNativeOutcome,
-}
-impl NativeHeadlessOwner {
-    fn new(ticket: Option<crate::session::native_publication::NativePublicationTicket>) -> Self {
-        let scope = crate::agent::runner::AgentWorkScope::new();
-        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
-        Self {
-            ticket,
-            binding: None,
-            scope,
-            cleanup: Some(cleanup),
-            outcome: crate::session::native_replay::RetiredNativeOutcome::Incomplete,
-        }
-    }
-    async fn progress(&mut self, session: &mut Session) -> anyhow::Result<()> {
-        if let Some(ticket) = &mut self.ticket {
-            crate::session::native_publication::progress_owned(session, ticket, &self.scope)
-                .await?;
-        }
-        Ok(())
-    }
-    async fn finish(&mut self, session: &mut Session) -> anyhow::Result<()> {
-        // SessionEnd may have admitted async command children after the
-        // model retired. Cancel and join that exact scope before publishing.
-        // Its cleanup owner retains the unique ticket even if this await drops.
-        if let Some(mut cleanup) = self.cleanup.take() {
-            let retained = std::sync::Arc::new(std::sync::Mutex::new(self.ticket.take()));
-            cleanup.retain_until_settled(retained.clone());
-            cleanup.settle().await;
-            self.ticket = retained.lock().unwrap_or_else(|e| e.into_inner()).take();
-        }
-        // The completed hook scope is cancelled. Final file work gets a new
-        // owned IO scope; the binding still proves exact model retirement.
-        self.scope = crate::agent::runner::AgentWorkScope::new();
-        self.cleanup = Some(crate::agent::runner::AgentRunCleanupGuard::auxiliary(
-            self.scope.clone(),
-        ));
-        let result = async {
-            if let Some(ticket) = self.ticket.take() {
-                let binding = self
-                    .binding
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("native model did not settle"))?;
-                if session.native_frontier.refusal().is_some() {
-                    binding
-                        .publish_refused_owned(session, ticket, &self.scope)
-                        .await?;
-                } else {
-                    binding
-                        .publish_retired_owned(session, ticket, self.outcome, &self.scope)
-                        .await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup.settle().await;
-        }
-        result
-    }
-}
-impl Drop for NativeHeadlessOwner {
-    fn drop(&mut self) {
-        if let (Some(cleanup), Some(ticket)) = (&mut self.cleanup, self.ticket.take()) {
-            cleanup.retain_until_settled(ticket);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_bound_headless_round(
     agent: &provider::AnyAgent,
     session: &mut Session,
@@ -2899,7 +2872,10 @@ async fn run_bound_headless_round(
     output: crate::print::HeadlessOutputPolicy,
     question_turn: crate::question::QuestionTurn,
     native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
-    native_owner: &mut Option<NativeHeadlessOwner>,
+    native_owner: &mut Option<provider::NativeRunOwner>,
+    #[cfg(feature = "hooks")] startup_context: &mut Option<
+        crate::extras::hooks::OwnedSessionStartContext,
+    >,
     #[cfg(feature = "agent-skills")] instruction_turn: Option<
         std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
     >,
@@ -2946,7 +2922,7 @@ async fn run_bound_headless_round(
     if !cli.no_session && native_ticket.is_none() {
         return failed(anyhow::anyhow!("native context requires its startup owner"));
     }
-    *native_owner = Some(NativeHeadlessOwner::new(native_ticket.take()));
+    *native_owner = Some(provider::NativeRunOwner::new(native_ticket.take()));
     let owner = native_owner.as_mut().unwrap();
     let spend = crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Turn);
     if let Err(error) = owner.scope.run(async { spend.prepare().await }).await {
@@ -2985,10 +2961,20 @@ async fn run_bound_headless_round(
         ))
     })
     .await;
-    let (agent, binding) = match bound {
+    #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+    let (agent, mut binding) = match bound {
         Ok(value) => value,
         Err(error) => return failed(error.into()),
     };
+    #[cfg(feature = "hooks")]
+    if let Some(context) = startup_context.take() {
+        if let Err(error) = binding.append_owned_startup_context(session, context) {
+            return failed(error.into());
+        }
+        if let Err(error) = owner.progress(session).await {
+            return failed(error);
+        }
+    }
     if let Some(ticket) = &mut owner.ticket
         && let Err(error) = binding.pair_publication(session, ticket)
     {
@@ -3076,7 +3062,10 @@ async fn run_headless_goal_rounds(
     // the loop onto the goal driver must not silently empty those fields for
     // everyone who reads them.
     native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
-    native_owner: &mut Option<NativeHeadlessOwner>,
+    native_owner: &mut Option<provider::NativeRunOwner>,
+    #[cfg(feature = "hooks")] startup_context: &mut Option<
+        crate::extras::hooks::OwnedSessionStartContext,
+    >,
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
     // Plain print has no goal engine to poll. Keep the independently
@@ -3112,6 +3101,8 @@ async fn run_headless_goal_rounds(
                     crate::question::QuestionTurn::default(),
                     native_ticket,
                     native_owner,
+                    #[cfg(feature = "hooks")]
+                    startup_context,
                     #[cfg(feature = "agent-skills")]
                     instruction_turn,
                     #[cfg(feature = "hooks")]
@@ -3168,6 +3159,8 @@ async fn run_headless_goal_rounds(
             native_ticket,
             native_owner,
             #[cfg(feature = "hooks")]
+            startup_context,
+            #[cfg(feature = "hooks")]
             loop_mode,
         )
     })
@@ -3195,7 +3188,10 @@ async fn run_headless_goal_rounds_inner(
     // the loop onto the goal driver must not silently empty those fields for
     // everyone who reads them.
     native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
-    native_owner: &mut Option<NativeHeadlessOwner>,
+    native_owner: &mut Option<provider::NativeRunOwner>,
+    #[cfg(feature = "hooks")] startup_context: &mut Option<
+        crate::extras::hooks::OwnedSessionStartContext,
+    >,
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
     let question_turn = crate::question::QuestionTurn::default();
@@ -3240,6 +3236,8 @@ async fn run_headless_goal_rounds_inner(
                 question_turn.clone(),
                 native_ticket,
                 native_owner,
+                #[cfg(feature = "hooks")]
+                startup_context,
                 #[cfg(feature = "agent-skills")]
                 instruction_turn.clone(),
                 #[cfg(feature = "hooks")]

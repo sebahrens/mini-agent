@@ -1107,6 +1107,13 @@ pub(crate) fn current_headless_diagnostics() -> Option<(
         .ok()
 }
 
+/// Parent-local ownership for hook work crossing the JS permission receiver.
+/// This reference is never serialized or passed into a worker.
+#[cfg(all(feature = "hooks", feature = "js"))]
+pub(crate) fn current_hook_work_scope() -> Option<Arc<AgentWorkScope>> {
+    AGENT_WORK_SCOPE.try_with(Arc::clone).ok()
+}
+
 pub(crate) fn current_work_cancellation() -> Option<AgentWorkCancellation> {
     AGENT_WORK_SCOPE
         .try_with(|scope| scope.cancellation_handle())
@@ -1145,6 +1152,9 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 
 pub(crate) struct PausedAgentRunner {
     runner: AgentRunner,
+    /// Canonical context is adopted by the frontend before releasing start.
+    #[cfg(feature = "hooks")]
+    hook_context: Vec<String>,
     start_tx: tokio::sync::oneshot::Sender<()>,
     #[cfg(any(test, feature = "acp"))]
     work_scope: Arc<AgentWorkScope>,
@@ -1158,10 +1168,23 @@ impl PausedAgentRunner {
     ) -> Self {
         Self {
             runner,
+            #[cfg(feature = "hooks")]
+            hook_context: Vec::new(),
             start_tx,
             #[cfg(any(test, feature = "acp"))]
             work_scope,
         }
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn with_hook_context(mut self, notices: Vec<String>) -> Self {
+        self.hook_context = notices;
+        self
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn take_hook_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.hook_context)
     }
 
     /// The caller publishes this handle before releasing the start barrier.

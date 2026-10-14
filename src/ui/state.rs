@@ -35,6 +35,8 @@ pub(crate) struct UiContext<'a> {
     pub sandbox: Sandbox,
     pub native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
     pub native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
+    #[cfg(feature = "hooks")]
+    pub pending_session_start_context: Option<crate::extras::hooks::OwnedSessionStartContext>,
     /// One-way invalidation of this UI's single startup snapshot, shared with
     /// its owner so clearing the agent cache cannot make the snapshot current.
     pub prebuild_invalidated: Arc<std::sync::atomic::AtomicBool>,
@@ -54,6 +56,20 @@ impl<'a> UiContext<'a> {
         self.native_startup = startup;
         self.native_ticket = ticket;
         self
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn adopt_session_start_context(
+        &mut self,
+        context: crate::extras::hooks::OwnedSessionStartContext,
+    ) {
+        if matches!(&self.client, AnyClient::Anthropic(_))
+            || crate::session::native_publication::is_native_bearing(self.session)
+        {
+            self.pending_session_start_context = Some(context);
+        } else {
+            crate::extras::hooks::append_context_session(self.session, &context.into_notices());
+        }
     }
 
     /// App calls this after awaiting the exact configured SessionStart task.
@@ -134,6 +150,8 @@ impl<'a> UiContext<'a> {
             sandbox,
             native_startup: None,
             native_ticket: None,
+            #[cfg(feature = "hooks")]
+            pending_session_start_context: None,
             prebuild_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
@@ -230,6 +248,8 @@ pub(crate) struct PendingMainTurn {
     session_before: SessionRollback,
     started_at: Option<compact_str::CompactString>,
     tool_output_paths: Vec<std::path::PathBuf>,
+    #[cfg(feature = "hooks")]
+    hook_notice_count: usize,
     #[cfg(feature = "memory")]
     memory_summaries: Vec<(String, Option<usize>)>,
 }
@@ -267,6 +287,8 @@ impl PendingMainTurn {
             },
             started_at: None,
             tool_output_paths: Vec::new(),
+            #[cfg(feature = "hooks")]
+            hook_notice_count: 0,
             #[cfg(feature = "memory")]
             memory_summaries: Vec::new(),
         }
@@ -293,6 +315,51 @@ impl PendingMainTurn {
         crate::agent::input::PromptInput::text(self.prompt.clone())
     }
 
+    #[cfg(feature = "hooks")]
+    pub(crate) fn rebase_after_owned_startup_context(&mut self, session: &Session) {
+        assert!(self.started_at.is_none() && self.tool_output_paths.is_empty());
+        let mut rebased = Self::capture(session, &self.prompt);
+        rebased.user = self.user.take();
+        #[cfg(feature = "multimodal")]
+        {
+            rebased.session_before.pending_media =
+                std::mem::take(&mut self.session_before.pending_media);
+        }
+        *self = rebased;
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn record_hook_context(&mut self, session: &mut Session, notices: Vec<String>) {
+        for notice in notices {
+            // User rows may already be registered by an automatic phase. Keep
+            // this exact context before that literal User, never inside it.
+            let insert = self
+                .session_before
+                .messages_len
+                .saturating_add(self.hook_notice_count);
+            let before_user = session.messages.get(insert).is_some_and(|row| {
+                row.role == crate::session::MessageRole::User && row.content.as_str() == self.prompt
+            });
+            session.add_message(crate::session::MessageRole::System, &notice);
+            if before_user {
+                let row = session.messages.pop().expect("just appended hook context");
+                session.messages.insert(insert, row);
+            }
+            self.hook_notice_count = self.hook_notice_count.saturating_add(1);
+        }
+    }
+
+    fn initial_message_count(&self) -> usize {
+        #[cfg(feature = "hooks")]
+        {
+            1usize.saturating_add(self.hook_notice_count)
+        }
+        #[cfg(not(feature = "hooks"))]
+        {
+            1
+        }
+    }
+
     pub(crate) fn record_started(&mut self, timestamp: compact_str::CompactString) {
         self.started_at = Some(timestamp);
     }
@@ -309,7 +376,11 @@ impl PendingMainTurn {
     ) -> bool {
         !response_buf.trim().is_empty()
             || !turn_trace.is_empty()
-            || session.messages.len() > self.session_before.messages_len.saturating_add(1)
+            || session.messages.len()
+                > self
+                    .session_before
+                    .messages_len
+                    .saturating_add(self.initial_message_count())
             || session.compactions.len() != self.session_before.compactions_len
             || {
                 #[cfg(feature = "memory")]
@@ -324,7 +395,11 @@ impl PendingMainTurn {
     }
 
     pub(crate) fn has_recorded_turn_messages(&self, session: &Session) -> bool {
-        session.messages.len() > self.session_before.messages_len.saturating_add(1)
+        session.messages.len()
+            > self
+                .session_before
+                .messages_len
+                .saturating_add(self.initial_message_count())
     }
 
     pub(crate) fn finalize_unresolved_tool_calls(&self, session: &mut Session) {
@@ -428,6 +503,12 @@ impl PendingMainTurn {
 /// stream and abort handle, queued user input, and streaming-response scratch.
 #[derive(Default)]
 pub(crate) struct AgentRunState {
+    pub(crate) native_checkpointed: bool,
+    #[cfg(feature = "hooks")]
+    pub(crate) native_session_end: Option<crate::provider::NativeSessionEndOwner>,
+    /// Current native actor's exact writer and prepared-history binding.
+    pub(crate) native_owner: Option<crate::provider::NativeRunOwner>,
+    pub(crate) native_blocked: Option<crate::session::native_replay::RestartReason>,
     pub agent: Option<AnyAgent>,
     pub is_running: bool,
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,

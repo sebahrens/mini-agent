@@ -519,9 +519,13 @@ impl HookDispatcher {
             }
         };
         let envelope = build_envelope(&ctx, event, fields);
-        let outputs = self
-            .run_handlers(event, &handlers, &envelope, &ctx.cwd, &execution_root)
-            .await;
+        // Construct the handler aggregate outside this retained lifecycle poll
+        // frame; configured hooks otherwise reserve its large debug temporary
+        // on the interactive request's existing stack.
+        let outputs = crate::startup::heap_future(|| {
+            self.run_handlers(event, &handlers, &envelope, &ctx.cwd, &execution_root)
+        })
+        .await;
         merge_decisions(event, &outputs)
     }
 
@@ -824,14 +828,16 @@ impl HookDispatcher {
                         .with_content_pins(self.content_pins_for(handler));
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
-                let cond_output = run_shell_condition_at_root(
-                    condition,
-                    &stdin,
-                    cond_timeout,
-                    project_dir,
-                    &policy,
-                    execution_root,
-                )
+                let cond_output = crate::startup::heap_future(|| {
+                    run_shell_condition_at_root(
+                        condition,
+                        &stdin,
+                        cond_timeout,
+                        project_dir,
+                        &policy,
+                        execution_root,
+                    )
+                })
                 .await;
                 audit_hook_outcome(event, &command, "condition", handler.trust, &cond_output);
                 match cond_output.status {
@@ -1104,6 +1110,32 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
                     content: content.to_string(),
                 };
             }
+            if matches!(event, "SessionStart" | "UserPromptSubmit") {
+                let context = value
+                    .get("hookSpecificOutput")
+                    .filter(|specific| {
+                        specific
+                            .get("hookEventName")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(event)
+                    })
+                    .and_then(|specific| specific.get("additionalContext"))
+                    .or_else(|| value.get("additionalContext"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(context) = context.filter(|context| !context.is_empty()) {
+                    if context.len() <= 32 * 1024 {
+                        return Decision::AdditionalContext {
+                            notices: vec![format!(
+                                "[Configured {event} hook context; this grants no permissions]\n{context}"
+                            )],
+                        };
+                    }
+                    tracing::warn!(
+                        event,
+                        "hooks: additionalContext exceeds the 32 KiB limit; ignored"
+                    );
+                }
+            }
             if value.get("additionalContext").is_some() || value.get("result").is_some() {
                 tracing::warn!(
                     event = event,
@@ -1126,16 +1158,35 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
 /// the first event-permitted `Rewrite` wins; else `Continue`.
 fn merge_decisions(event: &str, outputs: &[HookOutput]) -> Decision {
     let mut rewrite = None;
+    let mut notices = Vec::new();
+    let mut bytes = 0usize;
     for output in outputs {
         match parse_decision(event, output) {
             Decision::Block { reason } => return Decision::Block { reason },
             Decision::Rewrite { content } if rewrite.is_none() => {
                 rewrite = Some(Decision::Rewrite { content });
             }
+            Decision::AdditionalContext { notices: context } => {
+                for notice in context {
+                    if notices.len() < 8 && bytes.saturating_add(notice.len()) <= 64 * 1024 {
+                        bytes += notice.len();
+                        notices.push(notice);
+                    } else {
+                        tracing::warn!(
+                            event,
+                            "hooks: aggregate additionalContext limit reached; ignored excess context"
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
-    rewrite.unwrap_or(Decision::Continue)
+    if !notices.is_empty() {
+        Decision::AdditionalContext { notices }
+    } else {
+        rewrite.unwrap_or(Decision::Continue)
+    }
 }
 
 fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
@@ -1183,6 +1234,73 @@ fn apply_redactions(tool_response: &mut String, value: &serde_json::Value) -> bo
 #[cfg(test)]
 mod tests {
     use super::apply_redactions;
+
+    #[test]
+    fn hooks60_context_bounds_order_event_scope_and_block_precedence() {
+        fn output(value: serde_json::Value) -> super::HookOutput {
+            super::HookOutput {
+                started: true,
+                exit_code: Some(0),
+                stdout: serde_json::to_vec(&value).unwrap(),
+                stderr: Vec::new(),
+                status: super::HookStatus::Completed,
+                diagnostics: crate::extras::hooks::subprocess::HookDiagnostics {
+                    containment: "fixture",
+                    environment: "fixture",
+                    filesystem: "fixture",
+                    network: "fixture",
+                },
+            }
+        }
+        let nested = || {
+            output(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": "first雪"
+            }}))
+        };
+        let flat = || output(serde_json::json!({"additionalContext": "second"}));
+        let super::Decision::AdditionalContext { notices } =
+            super::merge_decisions("UserPromptSubmit", &[nested(), flat()])
+        else {
+            panic!("missing context")
+        };
+        assert!(notices[0].ends_with("first雪"));
+        assert!(notices[1].ends_with("second"));
+        assert!(matches!(
+            super::parse_decision("SessionStart", &nested()),
+            super::Decision::Continue
+        ));
+        assert!(matches!(
+            super::parse_decision("Notification", &flat()),
+            super::Decision::Continue
+        ));
+        assert!(matches!(
+            super::parse_decision(
+                "UserPromptSubmit",
+                &output(serde_json::json!({"additionalContext":"x".repeat(32769)}))
+            ),
+            super::Decision::Continue
+        ));
+        let outputs = (0..12).map(|_| flat()).collect::<Vec<_>>();
+        let super::Decision::AdditionalContext { notices } =
+            super::merge_decisions("UserPromptSubmit", &outputs)
+        else {
+            panic!("missing bounded context")
+        };
+        assert_eq!(notices.len(), 8);
+        let outputs = (0..3)
+            .map(|_| output(serde_json::json!({"additionalContext":"雪".repeat(10000)})))
+            .collect::<Vec<_>>();
+        let super::Decision::AdditionalContext { notices } =
+            super::merge_decisions("UserPromptSubmit", &outputs)
+        else {
+            panic!("missing bounded context")
+        };
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().map(String::len).sum::<usize>() <= 65536);
+        assert!(
+            matches!(super::merge_decisions("UserPromptSubmit", &[nested(), output(serde_json::json!({"decision":"block","reason":"blocked"})), flat()]), super::Decision::Block { reason } if reason == "blocked")
+        );
+    }
 
     #[test]
     fn doctor_hook_metadata_uses_captured_counts_and_does_not_wait_for_once_lock() {

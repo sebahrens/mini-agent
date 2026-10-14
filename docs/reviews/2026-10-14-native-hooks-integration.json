@@ -1,0 +1,366 @@
+{
+  "beads": [
+    "mini-agent-i7ro6.60",
+    "mini-agent-i7ro6.46.4",
+    "mini-agent-i4yzr"
+  ],
+  "source_base": "d22318447d70dcba31f3ffc6e76882c86b721693",
+  "owner_patch_sha256": "920455d23b990547035d45e7c8c8895f3a32150f4dcefa5549b16ee864ae1630",
+  "owner_source_sha256": {
+    "docs/agent/CONFIG.md": "d471df6cb039020b9c4842a6d7c022a3ac372b78618673bd2b179db3005451b9",
+    "docs/agent/native-compatibility.md": "009eeac01bd2ffd5124bb37c706aecfc50a4100fcb4d5d124dbb0c4d06e4bb80",
+    "docs/agent/native-publication.md": "aaef28606f20b224091050e731d7f10d9e59146f6da34ecd4e1376c4422d5dba",
+    "src/agent/runner.rs": "d0c8697820037b83780c7e37df78ec7d67190f417ee5cd82ee71c5934225d3f0",
+    "src/agent/tools/mod.rs": "f6ce4f9be62fed6473fe9967c35b672e6e740d98941d874d6d04fc2870be205c",
+    "src/extras/acp/mod.rs": "29c0dc253db570708e927e7053a25eec79e97949a4666ab045e2978f55e48fe4",
+    "src/extras/hooks/dispatcher.rs": "e0fd88b66d36bc8fb32966c01222583842ae93d1bc9f4a12d83733ebcff321fa",
+    "src/extras/hooks/envelope.rs": "3fcbe4f6a448dd6ba899b0ab023b9009932fa6849fdca38e43d042a997921979",
+    "src/extras/hooks/mod.rs": "f99c334184c8379bf39af6f9bd156cb362c9bc202a3a787b4a3fe8e495070385",
+    "src/extras/hooks/settings.rs": "73a4f9faeda7721a8576215b4d03ae8ca14d215e8408f28d978ad57b3824d2b4",
+    "src/extras/hooks/trust.rs": "30b1018aa0dfe4e565c484babb7e198a318ae03d2663db8ccd0dc959bb7e635a",
+    "src/extras/js/tool.rs": "de202d4f0a6281dfd7608c2d610a76a2899f8da5517c082ffc4ebc0df6c3e859",
+    "src/permission/ask.rs": "e7b234f563542a2e861b1bff3590f3d9056b4a938a814e13ac56edafd457d5d9",
+    "src/print.rs": "c4c2b380b15a193488aacaac1660f573d9e4db0ce156a68452c5e210accfe0b5",
+    "src/provider.rs": "61d87622ee6d83665cd5226fd917c186963a4ef5a4878a8e6d139791380974c9",
+    "src/provider_effort_replay_probe.rs": "8afc58cc037f9be11a0aac3fb050162abbe87d3f931a3985d4b0ec81f853e643",
+    "src/provider_effort_tests.rs": "d198b0312bc86e7c2bafa8e377dd70b8ee0aa8e5fa48e5bce03c8bf3a4f6ff49",
+    "src/session/native_publication.rs": "1de38d509bf6bfb95ef0843bfa14c33bb837fda158d5b0e7ad3535711f872642",
+    "src/startup.rs": "29b545dd32e75f6f719fd03bedc235cfb4cc5305cdb16a92a7e44192e867d542",
+    "src/tests/hooks/envelope_tests.rs": "2211d85e4f6496e6de71acc2c316826ebb2ac34dd0954db4ea4e200086f7c61f",
+    "src/tests/hooks/prompt_gate_tests.rs": "d69eadfcddddc80632bd3ec9e231b22a8be7e6a2db88273a96cc3045a8516f92",
+    "src/tests/hooks/trust_tests.rs": "afa9946a5cc2e510703b444a656db3ac1e1dff446e84e693f4f6acbe1b3d351f",
+    "src/tests/turn_persistence_tests.rs": "6aa79467bb900093194159b783dfa76de505849ca5d69dbdb02b016e09d1cf5b",
+    "src/ui/app.rs": "71a40c175c58e58edce5b9145d4d7d7890aa3cc67b9a4685e865a7e75b9824c7",
+    "src/ui/event_handler.rs": "9e347c02160d86440c425c94195b016569459466af4ec4d84aa51bdd9efadfe6",
+    "src/ui/mod.rs": "661c1c93fae3c8709ed0af103106cc61bcc3211a2b665237913262bdc89ac65c",
+    "src/ui/slash/mod.rs": "3990e1d66a7322e158ec0b789815c94a48868e3597afefb7ac29063d693cd1e7",
+    "src/ui/slash/session.rs": "0df6d5ae01525f0c6376396d6d6b27e5adbad4378dd693917be7361211f17802",
+    "src/ui/state.rs": "dff8314e5be80e2682d5f1b24efd9ea40f04c9dec012e3657be23af4a4aca931"
+  },
+  "owner_validation": {
+    "manifest_gates": [
+      {
+        "name": "conditions",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--features",
+          "advisor",
+          "--bin",
+          "mini-agent",
+          "if_condition_",
+          "--",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 28.35504758299794,
+        "log": "/private/tmp/mini-agent-native60-final-conditions.log"
+      },
+      {
+        "name": "lease",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--features",
+          "advisor",
+          "--bin",
+          "mini-agent",
+          "rebind_during_condition_invalidates_handler_launch_lease",
+          "--",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 0.26355958404019475,
+        "log": "/private/tmp/mini-agent-native60-final-lease.log"
+      },
+      {
+        "name": "paused",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--features",
+          "advisor",
+          "--bin",
+          "mini-agent",
+          "hooks60_actual_paused_gate",
+          "--",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 0.27774558297824115,
+        "log": "/private/tmp/mini-agent-native60-final-paused.log"
+      },
+      {
+        "name": "strict",
+        "command": [
+          "cargo",
+          "clippy",
+          "--offline",
+          "--all-targets",
+          "--features",
+          "advisor",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "seconds": 46.02756479103118,
+        "log": "/private/tmp/mini-agent-native60-final-strict.log"
+      }
+    ],
+    "evidence_sha256": {
+      "/private/tmp/mini-agent-native60-combined-actual-frontends-v2.log": "c7b397288ef53e8ecf3b943b07179708ddc860f971d17f85bdf8f590193a95e3",
+      "/private/tmp/mini-agent-native60-final-conditions.log": "446a11c9b0c0f56d4c9013221ed8a5c94acfe7395eafaccab978bd44637c27c4",
+      "/private/tmp/mini-agent-native60-final-lease.log": "fbcced14b84e22cc2c5916557c84c1a8afd9c443772ec54137716619495566cf",
+      "/private/tmp/mini-agent-native60-final-paused.log": "c9ae14d653e7b4abdaa93f69da8118acb7d91ffc22ab7b4e8d01270a70fc6233",
+      "/private/tmp/mini-agent-native60-final-strict.log": "3bce16b855c24ad38e0bd4b254b985be05cea859324a7719018602e58165ae2b",
+      "/private/tmp/mini-agent-native60-handler-factory-install.log": "499a67a6b5d74ff3a38929574ec2c7814eaee776de3cfeb3caaab806bcd92baf",
+      "/private/tmp/mini-agent-native60-handler-factory-generic.log": "a90dcd001016fa064f214678ea43aef0d79b4ca7a6e45b82796b11e91e411382",
+      "/private/tmp/mini-agent-native60-handler-factory-native.log": "9043f31e9621b5302a613450e2fb572a4c644a7323124f829715222bbc469a52",
+      "/private/tmp/mini-agent-native60-final-frame-prologues.log": "edf5e3283262e03ba745f2f81bf99624a4fceaa515397cdbdb3294d145b51fc8",
+      "/private/tmp/mini-agent-native60-final-frame-sizes.json": "75420ae2b3b526a3cb1071c3497f462f6353f35e7344bd4c159d4c03744ec2f2",
+      "/private/tmp/mini-agent-native60-stack-owning-callers.json": "b8781024d7315494567014d0694c5d5d519fd22e5c064a3033445caf7d5ca86a",
+      "/private/tmp/mini-agent-native46-tui-exact-final-value-negative.log": "5cb42c42729d2690b5697baf8bc608bf6985d453122d39ea07b2f158cbce6171",
+      "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-hooks60-installed-rrmf1txf/report.json": "60147ed098c0113c233302afa507b8c2d0b3da49d60fd370424c150240f89872",
+      "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-native60-tui-installed-o1j4v509/report.json": "ae92755da5fc7afdbe2b0f0523c25864189a30085cca19f2b417f00bb426298c"
+    },
+    "binary": {
+      "path": "/private/tmp/mini-agent-native60-handler-factory-install/bin/mini-agent",
+      "sha256": "183445f98a60a72636050c65f71798862a8e620a7308468851ba72887a2b83df",
+      "stack_bytes": 1048576
+    },
+    "test_map": {
+      "patch_sha256": "920455d23b990547035d45e7c8c8895f3a32150f4dcefa5549b16ee864ae1630",
+      "commit": "42dd03b922d10131e5b06f3a46d85c81d785f008",
+      "selection": "file-qualified code-indexer callers plus concentrated physical defining-file reads; graph-only homonyms rejected; older TUI map text before factory is qualified stale and current native60-stack-owning-callers used for current dispatcher/start owners",
+      "index_state": "/private/tmp/mini-agent-native-tui-e620-index",
+      "indexed_evidence": "/private/tmp/mini-agent-native60-stack-owning-callers.json",
+      "rows": [
+        {
+          "changed": "ui::start_main_run / settle_native_main_turn + App terminal handling",
+          "confirmed_callers": [
+            "App::start_main_run_prepared",
+            "App AutoTrigger/DEFER_INIT",
+            "event_handler Done/AwaitingUser/Error after exact scope settlement"
+          ],
+          "tests": [
+            "provider::effort_tests::replay_probe::effort46_actual_tui_changed_policy_refuses_retired_session_end_before_effects",
+            "provider::effort_tests::replay_probe::effort46_actual_tui_native_instruction_rebuild_generation_and_changed_body",
+            "provider::effort_tests::replay_probe::effort46_actual_tui_live_app_two_turns_publish_each_boundary",
+            "provider::effort_tests::replay_probe::effort46_actual_tui_two_turns_publish_and_reload_native_context",
+            "provider::effort_tests::replay_probe::effort46_actual_tui_session_end_retires_held_hook_before_healthy_reload"
+          ],
+          "cfg": "default+advisor; hooks enabled; native actual Anthropic loopback",
+          "proof": "/private/tmp/mini-agent-native60-combined-actual-frontends-v2.log"
+        },
+        {
+          "changed": "NativeRunOwner / RetiredSessionEndPermit / App::finish_session_end",
+          "confirmed_callers": [
+            "ui::run_interactive after App::teardown_owners",
+            "NativeRunOwner::finish after acknowledged final writer",
+            "same App actual terminal lifecycle"
+          ],
+          "tests": [
+            "native_session_end_permit_is_bound_to_its_acknowledged_retired_value",
+            "effort46_actual_tui_session_end_retires_held_hook_before_healthy_reload",
+            "effort46_actual_tui_changed_policy_refuses_retired_session_end_before_effects"
+          ],
+          "cfg": "hooks; lower exact-role negative + actual retired model/hook positives",
+          "proof": "/private/tmp/mini-agent-native46-tui-exact-final-value-negative.log"
+        },
+        {
+          "changed": "OwnedSessionStartContext transfer / append_owned_startup_context / provider paused hook carrier",
+          "confirmed_callers": [
+            "Startup dispatch_print and run_bound_headless_round",
+            "UiContext::adopt_session_start_context",
+            "ui::start_main_run bind-old-feed then exact carrier consumption before progress and start"
+          ],
+          "tests": [
+            "provider::effort_tests::replay_probe::effort46_actual_session_start_context_resumes_saved_native_prefix",
+            "provider::effort_tests::replay_probe::effort46_actual_headless_no_session_resume_refuses_before_session_start_effect",
+            "provider::effort_tests::replay_probe::effort46_actual_headless_fresh_no_session_runs_configured_start_hook_without_checkpoint"
+          ],
+          "cfg": "hooks default+advisor; actual command handlers and native save/reload",
+          "proof": "/private/tmp/mini-agent-native60-combined-actual-frontends-v2.log"
+        },
+        {
+          "changed": "HookDispatcher::dispatch construction / synchronous condition construction in run_handlers",
+          "confirmed_callers": [
+            "hooks::gate_user_prompt -> HookDispatcher::dispatch -> run_handlers",
+            "actual provider paused UserPromptSubmit",
+            "real configured SessionStart/UserPromptSubmit installed drivers"
+          ],
+          "tests": [
+            "if_condition_true_runs_the_handler",
+            "if_condition_false_skips_the_handler",
+            "if_condition_broken_command_fails_closed_and_runs_anyway",
+            "rebind_during_condition_invalidates_handler_launch_lease",
+            "hooks60_actual_paused_gate_keeps_media_and_canonical_notice_before_start",
+            "hooks60_actual_paused_gate_cancellation_retires_hook_before_zero_http"
+          ],
+          "cfg": "unix actual command; default+advisor; both actual configured 1MiB drivers",
+          "proof": "/private/tmp/mini-agent-native60-final-gates.json"
+        }
+      ],
+      "beads": {
+        "mini-agent-i7ro6.60": "coherent events/context transport plus actual configured headless1/TUI2/ACP2 installed physical1MiB; Root integration/issue acceptance remains owner decision",
+        "mini-agent-i7ro6.46.4": "prior reviewed publication controls unchanged + current actual failed final/separate-process denied reload/early hooks/no-session, held SessionEnd and configured physical proof; no acrossprocess failed-save healthy claim",
+        "i4yzr": "actual native instruction generation/body control: unchanged authored payload across new generation keeps system/tools equal; changed body refuses thirdHTTP with20/4+two receipts preserved",
+        "mini-agent-i7ro6.46": "ordinary TUI now enabled; automatic rounds, explicit recovery/metadata, loop/schema and ACP strict native publication remain open",
+        "mini-agent-i7ro6.71": "TTL accounting delivered; memory cache-prefix placement remains open"
+      },
+      "reused": "15 actual consumers passed before final allocation-only hook changes; new condition3/lease1/paused2 and both final installed physical drivers passed afterward; no full suite or inventory27 rerun",
+      "native_windows": "unchanged lower/rooted native Windows acceptance remains explicit separate hosted pending; this Mac proof does not claim Windows execution",
+      "remaining": "continue full native ACP/automatic/recovery/loop/schema/memory work after coherent landing; do not describe dormant APIs or refusals as full feature delivery"
+    }
+  },
+  "integration": {
+    "onto": "2c93906e",
+    "conflicts": [
+      "CONFIG: retain writable-subagent and hook sections plus CI fixture row",
+      "ordinary permission request: use hook transport and preserve child attribution",
+      "JS permission request: use hook transport and preserve child attribution"
+    ],
+    "additional_fixture": "Actual hook transport roundtrip preserves implementer label and exact shell input while hook attempts cannot approve; frontend still replies deny.",
+    "review_scope": "Only actual merge/integration boundaries; full owner reviews and unchanged rows reused",
+    "review_findings_remaining": [],
+    "critical_checks": [
+      "Saved native feed is bound before consuming runtime-only owned startup carrier",
+      "Only the new unprepared binding receives updated bounded preappend witness; imported/saved anchors remain strict",
+      "Canonical literal/typed user row and hook notice are saved denied before paused start barrier releases",
+      "Retired SessionEnd permit is one-shot and bound to the exact actor ACKed revision/digest/epoch/outcome",
+      "Host guard and writer ownership retained through hook/child settlement; final publication preserves exact retired outcome",
+      "Hook event output cannot grant permissions; project trust and launch leases remain authoritative",
+      "No new worker protocol or direct worker network/filesystem authority"
+    ]
+  },
+  "merged_validation": {
+    "actual_callers": "16 PASS2.12s; actual TUI/startup/no-session/native retired-negative/paused/write/repair/hook-mode controls",
+    "caller_log_sha256": "92c4f65fbf4ddd3ef6da7cddeb404b9e9c4c9e69d470f9bdc3258f3904bccfbd",
+    "permission_transport": "1 PASS0.12s, implementer attribution preserved and hook cannot answer approval",
+    "strict": "Default+advisor all-target Clippy -D warnings PASS37.86s",
+    "final_installed": {
+      "write": {
+        "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-write55-installed-eoon1j03/report.json",
+        "sha256": "6dc756d0a4750acb67eb47df44231f7a24ea5a63efe697b9b3ade1d026b83852",
+        "report": {
+          "passed": true,
+          "binary": "/private/tmp/mini-agent-55-60-final-install/bin/mini-agent",
+          "binary_sha256": "15488ed4deb986d70c765744705b6d8767a5607cbc414de62d6ecd2ec653cfe8",
+          "stack_bytes": 1048576,
+          "external_provider_calls": 0,
+          "configured_concurrency": 4,
+          "write_children_serialized": true,
+          "runs": [
+            {
+              "allow_write": false,
+              "posts": 2,
+              "exit": 0,
+              "files": {
+                "first.txt": "before\n",
+                "second.txt": "before\n"
+              }
+            },
+            {
+              "allow_write": true,
+              "posts": 8,
+              "exit": 0,
+              "files": {
+                "first.txt": "after\n",
+                "second.txt": "after\n"
+              }
+            }
+          ]
+        }
+      },
+      "hooks": {
+        "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-hooks60-installed-o9sjuisa/report.json",
+        "sha256": "5697fafd19a2ccd3727f761a9e9c9f06ec566f4df88f05885ac9a38ff1ab73a8",
+        "report": {
+          "passed": true,
+          "binary": "/private/tmp/mini-agent-55-60-final-install/bin/mini-agent",
+          "binary_sha256": "15488ed4deb986d70c765744705b6d8767a5607cbc414de62d6ecd2ec653cfe8",
+          "stack_bytes": 1048576,
+          "headless_posts": 1,
+          "tui_posts": 2,
+          "acp_posts": 2,
+          "external_provider_calls": 0,
+          "canonical_system_sessions": [
+            "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-hooks60-installed-o9sjuisa/home/sessions/bfc76fd4-7134-4b28-958c-d13c3749cb42.json",
+            "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-hooks60-installed-o9sjuisa/home/sessions/f91e733b-4680-40a3-a969-7cf2b2120d98.json"
+          ],
+          "literal_users_preserved": true,
+          "top_level_system_unchanged": true,
+          "errors": []
+        }
+      },
+      "native": {
+        "path": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-native60-tui-installed-07a4ify2/report.json",
+        "sha256": "1aba509162c783623445d263b1e855b4b627ab3a9c84412a6ae2bc1b2d12d92e",
+        "report": {
+          "binary": "/private/tmp/mini-agent-55-60-final-install/bin/mini-agent",
+          "binary_sha256": "15488ed4deb986d70c765744705b6d8767a5607cbc414de62d6ecd2ec653cfe8",
+          "stack_bytes": 1048576,
+          "external_provider_calls": 0,
+          "passed": true,
+          "tui_posts": 2,
+          "normal_quit": 0,
+          "immediate_healthy_saves": 2,
+          "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-native60-tui-installed-07a4ify2/home/sessions/6284a1eb-51fe-45ec-b2fe-9dc28ba85065.json",
+          "observed_usage": [
+            20,
+            4
+          ],
+          "opaque_bytes_not_rendered": true,
+          "canonical_session_start_notices": 1,
+          "canonical_prompt_notices": 2,
+          "literal_users_unchanged": true,
+          "errors": []
+        }
+      }
+    },
+    "permission_log_sha256": "52b0f3f30cbdc6400afd7b9cebd7d8f646f8c5f9b0e36a5ea698df3e50f820c2",
+    "named_failed_publication": "2 PASS0.65s on final source: failed final retains InFlight and second-final failure denies separate-process reload",
+    "failed_publication_log_sha256": "e129feaacee75aab5b999dfebe532e15aeb4647e96b62b7f6f5c13b0c9461bc1",
+    "strict_log_sha256": "f5aff11b4881e3832fc7ed85af1d1d3a69d854aea1f466635d6ce47b5abf2b90",
+    "install": "cargo install --path . --debug --locked PASS31.97s",
+    "binary_sha256": "15488ed4deb986d70c765744705b6d8767a5607cbc414de62d6ecd2ec653cfe8",
+    "environment_reference": "1 PASS1.115s; no public environment controls added"
+  },
+  "remaining_scope": "Full46 adaptive/effort/recovery/automatic/loop/schema/ACP and71 memory cache-prefix remain open; Windows legacy second-save failure remains separate.",
+  "status": "Delivered .60, .46.4 and i4yzr with final merged installed proofs; parent scope remains open.",
+  "merged_source_sha256": {
+    "docs/agent/CONFIG.md": "493890f7d625af150e670f84781aaf8fa5a42e4d2725287f3a0c6509a2dab169",
+    "docs/agent/native-compatibility.md": "009eeac01bd2ffd5124bb37c706aecfc50a4100fcb4d5d124dbb0c4d06e4bb80",
+    "docs/agent/native-publication.md": "aaef28606f20b224091050e731d7f10d9e59146f6da34ecd4e1376c4422d5dba",
+    "src/agent/runner.rs": "54f0914adbc82bcf563ca25e2cbc2b3b1df33e8b9470be0d4e51f4efa6241b05",
+    "src/agent/tools/mod.rs": "adc6053e15152dc267247fe6f8898fbc867cab58e72443b23e6d49a7f8758e44",
+    "src/extras/acp/mod.rs": "4a77afc23182d2ff4a9426e25a03a83baec06d614f135282f07f7dd736c4578e",
+    "src/extras/hooks/dispatcher.rs": "e0fd88b66d36bc8fb32966c01222583842ae93d1bc9f4a12d83733ebcff321fa",
+    "src/extras/hooks/envelope.rs": "91636fa4077435ada1b1e030f2d2f05ccc81a778cf15206b636663be3f2997cf",
+    "src/extras/hooks/mod.rs": "8d6843221aeed6cecca3d9850f70751f0e445955ea5a09b96c57d637feca9e6e",
+    "src/extras/hooks/settings.rs": "73a4f9faeda7721a8576215b4d03ae8ca14d215e8408f28d978ad57b3824d2b4",
+    "src/extras/hooks/trust.rs": "30b1018aa0dfe4e565c484babb7e198a318ae03d2663db8ccd0dc959bb7e635a",
+    "src/extras/js/tool.rs": "555f6d3edad253898786890fcee1ce30b2899de34c9ec6231c7dbb479672191d",
+    "src/permission/ask.rs": "c508d2bc08f30f6c13262b5007f798edf7378f8e181ee843f3e30dfa12fac6ac",
+    "src/print.rs": "c4c2b380b15a193488aacaac1660f573d9e4db0ce156a68452c5e210accfe0b5",
+    "src/provider.rs": "63ccb77ba4f399f0288075bad472fb1ae5d8c9af2b39c4966df8fa15eae1295c",
+    "src/provider_effort_replay_probe.rs": "8afc58cc037f9be11a0aac3fb050162abbe87d3f931a3985d4b0ec81f853e643",
+    "src/provider_effort_tests.rs": "d198b0312bc86e7c2bafa8e377dd70b8ee0aa8e5fa48e5bce03c8bf3a4f6ff49",
+    "src/session/native_publication.rs": "1de38d509bf6bfb95ef0843bfa14c33bb837fda158d5b0e7ad3535711f872642",
+    "src/startup.rs": "7d5491cde6d6f0ba4a152ced824f6869180b7893f65d2ed847de823bc9442891",
+    "src/tests/hooks/envelope_tests.rs": "2211d85e4f6496e6de71acc2c316826ebb2ac34dd0954db4ea4e200086f7c61f",
+    "src/tests/hooks/prompt_gate_tests.rs": "d69eadfcddddc80632bd3ec9e231b22a8be7e6a2db88273a96cc3045a8516f92",
+    "src/tests/hooks/trust_tests.rs": "afa9946a5cc2e510703b444a656db3ac1e1dff446e84e693f4f6acbe1b3d351f",
+    "src/tests/turn_persistence_tests.rs": "6aa79467bb900093194159b783dfa76de505849ca5d69dbdb02b016e09d1cf5b",
+    "src/ui/app.rs": "5f04d3a4af20c630483f58e758e47f03b19d613375a945dd297d97a5813aff37",
+    "src/ui/event_handler.rs": "9e347c02160d86440c425c94195b016569459466af4ec4d84aa51bdd9efadfe6",
+    "src/ui/mod.rs": "661c1c93fae3c8709ed0af103106cc61bcc3211a2b665237913262bdc89ac65c",
+    "src/ui/slash/mod.rs": "3990e1d66a7322e158ec0b789815c94a48868e3597afefb7ac29063d693cd1e7",
+    "src/ui/slash/session.rs": "0df6d5ae01525f0c6376396d6d6b27e5adbad4378dd693917be7361211f17802",
+    "src/ui/state.rs": "dff8314e5be80e2682d5f1b24efd9ea40f04c9dec012e3657be23af4a4aca931"
+  }
+}

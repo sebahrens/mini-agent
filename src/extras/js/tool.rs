@@ -97,6 +97,8 @@ struct PermissionEnvelope {
     request: PermRequest,
     kind: PermissionCheckKind,
     invocation_cancellation: Option<PermCancellation>,
+    #[cfg(feature = "hooks")]
+    hook_work_scope: Option<Arc<crate::agent::runner::AgentWorkScope>>,
     reply: PermissionReply,
 }
 
@@ -105,6 +107,8 @@ pub(crate) struct PermissionBridge {
     tx: tokio_mpsc::UnboundedSender<PermissionEnvelope>,
     shutdown: PermCancellation,
     invocation_cancellation: Option<PermCancellation>,
+    #[cfg(feature = "hooks")]
+    hook_work_scope: Option<Arc<crate::agent::runner::AgentWorkScope>>,
     host_call_cancellation: Option<PermCancellation>,
     timeout: Duration,
     /// The same checker the receiver task consults, read only for the
@@ -124,6 +128,8 @@ impl PermissionBridge {
             tx,
             shutdown,
             invocation_cancellation: None,
+            #[cfg(feature = "hooks")]
+            hook_work_scope: None,
             host_call_cancellation: None,
             timeout,
             deny_source: None,
@@ -150,6 +156,10 @@ impl PermissionBridge {
     pub(crate) fn for_invocation(&self, cancellation: PermCancellation) -> Self {
         let mut bridge = self.clone();
         bridge.invocation_cancellation = Some(cancellation);
+        #[cfg(feature = "hooks")]
+        {
+            bridge.hook_work_scope = crate::agent::runner::current_hook_work_scope();
+        }
         bridge
     }
 
@@ -193,6 +203,8 @@ impl PermissionBridge {
                 request,
                 kind,
                 invocation_cancellation: self.invocation_cancellation.clone(),
+                #[cfg(feature = "hooks")]
+                hook_work_scope: self.hook_work_scope.clone(),
                 reply: PermissionReply::Sync(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -288,6 +300,8 @@ impl PermissionBridge {
                 request,
                 kind,
                 invocation_cancellation: self.invocation_cancellation.clone(),
+                #[cfg(feature = "hooks")]
+                hook_work_scope: self.hook_work_scope.clone(),
                 reply: PermissionReply::Async(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -548,6 +562,8 @@ async fn process_permission_request(
         request,
         kind,
         invocation_cancellation,
+        #[cfg(feature = "hooks")]
+        hook_work_scope,
         reply,
     } = envelope;
     let request_id = request.id();
@@ -565,13 +581,20 @@ async fn process_permission_request(
             }
             PermOutcome::TimedOut
         }
-        outcome = resolve_permission(
-            &request,
-            kind,
-            permission,
-            ask_tx,
-            invocation_cancellation.as_ref(),
-        ) => outcome,
+        outcome = async {
+            let resolve = crate::startup::heap_future(|| resolve_permission(
+                &request,
+                kind,
+                permission,
+                ask_tx,
+                invocation_cancellation.as_ref(),
+            ));
+            #[cfg(feature = "hooks")]
+            if let Some(scope) = hook_work_scope {
+                return scope.run(resolve).await;
+            }
+            resolve.await
+        } => outcome,
     };
 
     reply.send(PermResponse::new(request_id, outcome));
@@ -612,10 +635,10 @@ async fn resolve_permission(
             let _prompt_guard =
                 invocation_cancellation.map(PermCancellation::begin_permission_prompt);
             let (reply_tx, reply_rx) = oneshot::channel();
-            if ask_tx
-                .send(
-                    AskRequest {
-                    agent_name: crate::permission::ask::subagent_name(),
+            if crate::permission::ask::send_permission_request(
+                &ask_tx,
+                AskRequest {
+            agent_name: crate::permission::ask::subagent_name(),
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),
                     #[cfg(feature = "acp")]
@@ -625,11 +648,10 @@ async fn resolve_permission(
                     suggested_pattern: None,
                     additional_allow_patterns: Vec::new(),
                     reply: reply_tx,
-                }
-                    .into(),
-                )
-                .await
-                .is_err()
+                },
+            )
+            .await
+            .is_err()
             {
                 return PermOutcome::BackendFailure(PermissionBackendFailure::AskChannelClosed);
             }

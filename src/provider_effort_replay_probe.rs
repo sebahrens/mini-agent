@@ -2909,6 +2909,10 @@ async fn native_headless_frontend_control(
             "type":"command", "command":"/bin/sh",
             "args":["-c", r#"printf 'actual SessionStart\n' >> "$1""#, "start-proof", roots.path().join("start.effects")],
             "trust":"trusted", "timeout":5
+        }]}], "UserPromptSubmit":[{"hooks":[{
+            "type":"command", "command":"/bin/sh",
+            "args":["-c", r#"printf 'actual UserPromptSubmit\n' >> "$1""#, "prompt-proof", roots.path().join("prompt.effects")],
+            "trust":"trusted", "timeout":5
         }]}]});
         let config = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
         crate::extras::hooks::init_dispatcher(
@@ -3005,6 +3009,10 @@ async fn native_headless_frontend_control(
                 assert_eq!(
                     std::fs::read(roots.path().join("start.effects")).unwrap(),
                     b"actual SessionStart\n"
+                );
+                assert_eq!(
+                    std::fs::read(roots.path().join("prompt.effects")).unwrap(),
+                    b"actual UserPromptSubmit\n"
                 );
             } else {
                 assert!(error.to_string().contains("headless print frontend"));
@@ -3135,6 +3143,10 @@ async fn native_headless_frontend_control(
                 std::fs::read(roots.path().join("start.effects")).unwrap(),
                 b"actual SessionStart\n"
             );
+            assert_eq!(
+                std::fs::read(roots.path().join("prompt.effects")).unwrap(),
+                b"actual UserPromptSubmit\n"
+            );
         }
         if no_session_case == Some(true) {
             assert!(
@@ -3206,8 +3218,9 @@ fn effort46_actual_headless_frontend_on_one_mib() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(crate::startup::heap_future(|| {
-                    native_headless_frontend_control(false, false, false, false, false, None)
+                .block_on(crate::startup::heap_future(|| async {
+                    native_headless_frontend_control(false, false, false, false, false, None).await;
+                    native_tui_frontend_control(false, false, false, false).await;
                 }))
         })
         .unwrap()
@@ -3380,4 +3393,590 @@ async fn image_read64_native_exact_tool_image_tail_is_bound_and_reloadable() {
     assert_eq!(requests[0]["system"], requests[1]["system"]);
     assert!(requests[1].to_string().contains("image-signature"));
     assert!(requests[1].to_string().contains("image/png"));
+}
+
+#[tokio::test]
+async fn effort46_actual_tui_two_turns_publish_and_reload_native_context() {
+    native_tui_frontend_control(false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn effort46_actual_tui_live_app_two_turns_publish_each_boundary() {
+    native_tui_frontend_control(true, false, false, false).await;
+}
+
+#[cfg(feature = "agent-skills")]
+#[tokio::test]
+async fn effort46_actual_tui_native_instruction_rebuild_generation_and_changed_body() {
+    native_tui_frontend_control(true, true, false, false).await;
+}
+
+#[cfg(all(
+    feature = "agent-skills",
+    feature = "hooks",
+    any(target_os = "macos", target_os = "linux")
+))]
+#[tokio::test]
+async fn effort46_actual_tui_session_end_retires_held_hook_before_healthy_reload() {
+    native_tui_frontend_control(true, false, true, false).await;
+}
+
+#[cfg(all(
+    feature = "agent-skills",
+    feature = "hooks",
+    any(target_os = "macos", target_os = "linux")
+))]
+#[tokio::test]
+async fn effort46_actual_tui_changed_policy_refuses_retired_session_end_before_effects() {
+    native_tui_frontend_control(true, false, false, true).await;
+}
+
+async fn native_tui_frontend_control(
+    same_app: bool,
+    authored: bool,
+    held_end: bool,
+    stale_end: bool,
+) {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = crate::tests::OwnedTestDirectory::new("native-tui-frontend");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+    let _hook_gate = if held_end {
+        let release = roots.path().join("tui-end.release");
+        let gate = crate::tests::process_gate::ProcessGate::new(&release).unwrap();
+        let settings = json!({"SessionEnd":[{"hooks":[
+            {"type":"command","command":"/bin/sh","args":["-c", r#"printf '%s\n' "$$" > "$1"; IFS= read -r release < "$2""#, "held-tui-end", roots.path().join("tui-end.pid"), release], "trust":"trusted","async":true,"timeout":60},
+            {"type":"command","command":"/bin/sh","args":["-c", r#"while [ ! -f "$1" ]; do sleep 0.01; done"#, "tui-end-observer", roots.path().join("tui-end.observed")], "trust":"trusted","timeout":15}
+        ]}]});
+        let config = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
+        crate::extras::hooks::init_dispatcher(
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&config).unwrap(),
+        );
+        crate::extras::hooks::set_active_workspace(roots.path());
+        Some(gate)
+    } else if stale_end {
+        let settings = json!({"SessionEnd":[{"hooks":[{"type":"command","command":"/bin/sh","args":["-c", r#"printf 'effect\n' >> "$1""#, "stale-tui-end", roots.path().join("stale-end.effects")],"trust":"trusted","timeout":5}]}]});
+        let config = crate::extras::hooks::settings::parse_hooks_config(&settings).unwrap();
+        crate::extras::hooks::init_dispatcher(
+            crate::extras::hooks::dispatcher::HookDispatcher::from_config(&config).unwrap(),
+        );
+        crate::extras::hooks::set_active_workspace(roots.path());
+        None
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "hooks", any(target_os = "macos", target_os = "linux"))))]
+    assert!(!held_end && !stale_end);
+    #[cfg(feature = "hooks")]
+    struct Reset;
+    #[cfg(feature = "hooks")]
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::extras::hooks::reset_dispatcher();
+        }
+    }
+    #[cfg(feature = "hooks")]
+    let _reset = (held_end || stale_end).then_some(Reset);
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+    let wire = Wire::new(vec![
+        (
+            true,
+            start()
+                + &thinking(0, "", "TUI canonical signature one")
+                + &(if same_app {
+                    redacted(1)
+                } else {
+                    text(1, "first TUI answer")
+                })
+                + &finish(),
+        ),
+        (
+            true,
+            start()
+                + &thinking(0, "", "TUI canonical signature two")
+                + &text(1, "second TUI answer")
+                + &finish(),
+        ),
+    ]);
+    let cfg: crate::config::Config = serde_json::from_value(json!({
+        "session_title_model":"off", "compact_enabled":false,
+        "custom_providers":{"effort-tui":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"native-test":{"provider":"effort-tui","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let cli = crate::cli::Cli {
+        api_key: Some("unused-native-key".into()),
+        no_tools: true,
+        no_context_files: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    let paths = crate::paths::process_paths().unwrap();
+    #[cfg(feature = "agent-skills")]
+    let _immutable_cleanup =
+        crate::extras::skills::session::ImmutableFixtureCleanup(roots.path().to_path_buf());
+    let package = roots.path().join(".claude/skills/reviewer");
+    if authored {
+        let config = roots.path().join(".zerostack/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "model='native-test'\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("SKILL.md"), "---\nname: reviewer\ndescription: Review code carefully\n---\nSTABLE_NATIVE_REVIEW_GUIDANCE\n").unwrap();
+    }
+    let mut session = crate::session::Session::new(
+        "effort-tui",
+        "claude-opus-5-5",
+        128_000,
+        workspace.root().to_str().unwrap(),
+    );
+    #[cfg(feature = "agent-skills")]
+    {
+        session.instruction_owner = Arc::new(
+            crate::extras::skills::session::InstructionOwner::for_test(None),
+        );
+    }
+    session.working_dir = workspace.root().to_string_lossy().into();
+    session.set_input_output_prices(Some((2.0, 4.0)));
+    let sid = session.id.to_string();
+    let _release = Release(sid.clone());
+    let mut snapshots = Vec::new();
+    for (round, prompt) in ["first literal TUI prompt", "second literal TUI prompt"]
+        .into_iter()
+        .enumerate()
+    {
+        if !same_app || round == 0 {
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let client = crate::provider::create_client(
+                "effort-tui",
+                cli.api_key.as_deref(),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap();
+            let permission = stale_end.then(|| {
+                Arc::new(std::sync::Mutex::new(
+                    crate::permission::checker::PermissionChecker::new(
+                        &crate::permission::PermissionConfigs::default(),
+                        crate::permission::SecurityMode::Standard,
+                        Some(workspace.root().to_path_buf()),
+                        None,
+                    )
+                    .unwrap(),
+                ))
+            });
+            let ui = crate::ui::state::UiContext::new(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace.clone(),
+                client,
+                permission,
+                None,
+                crate::sandbox::Sandbox::new(false, "none")
+                    .with_workspace_binding(workspace.clone()),
+                None,
+            );
+            #[cfg(feature = "agent-skills")]
+            if authored {
+                snapshots = crate::startup::heap_future(|| {
+                    crate::ui::drive_native_instruction_fixture(ui, &package)
+                })
+                .await;
+            } else if same_app {
+                #[cfg(feature = "hooks")]
+                if stale_end {
+                    snapshots = crate::startup::heap_future(|| {
+                        crate::ui::drive_native_stale_session_end_fixture(ui)
+                    })
+                    .await;
+                    assert!(!roots.path().join("stale-end.effects").exists());
+                } else {
+                    let driving = crate::startup::heap_future(|| {
+                        crate::ui::drive_native_fixture_turns(
+                            ui,
+                            &["first literal TUI prompt", "second literal TUI prompt"],
+                        )
+                    });
+                    #[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+                    if held_end {
+                        use crate::tests::process_state::{ProcessIdentity, ProcessState};
+                        let observer = async {
+                            loop {
+                                if let Ok(text) =
+                                    std::fs::read_to_string(roots.path().join("tui-end.pid"))
+                                    && text.ends_with('\n')
+                                    && let Ok(pid) = text.trim().parse::<u32>()
+                                {
+                                    let identity = ProcessIdentity::capture(pid).unwrap();
+                                    assert!(matches!(
+                                        identity.state().unwrap(),
+                                        ProcessState::Live { .. }
+                                    ));
+                                    let sessions = crate::paths::WorkspaceBinding::capture(
+                                        &paths.sessions_dir(),
+                                    )
+                                    .unwrap();
+                                    let pending =
+                                        crate::session::storage::load_session_exact_read_only(
+                                            &sessions, &sid, &workspace,
+                                        )
+                                        .unwrap()
+                                        .unwrap();
+                                    assert_eq!(
+                                        pending.native_frontier.refusal(),
+                                        Some(
+                                            crate::session::native_replay::RestartReason::InFlight
+                                        )
+                                    );
+                                    assert_eq!(
+                                        (pending.total_input_tokens, pending.total_output_tokens),
+                                        (20, 4)
+                                    );
+                                    std::fs::write(
+                                        roots.path().join("tui-end.observed"),
+                                        b"observed exact hook",
+                                    )
+                                    .unwrap();
+                                    return identity;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        };
+                        let (completed, identity) = tokio::join!(
+                            tokio::time::timeout(Duration::from_secs(5), driving),
+                            tokio::time::timeout(Duration::from_secs(5), observer)
+                        );
+                        snapshots =
+                            completed.expect("native SessionEnd outlived its owned cleanup");
+                        let identity = identity.expect("configured SessionEnd did not run");
+                        assert_eq!(
+                            identity.state().unwrap(),
+                            ProcessState::Gone,
+                            "healthy native publication preceded exact hook reaping"
+                        );
+                        let sessions =
+                            crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+                        let saved = crate::session::storage::load_session_exact_read_only(
+                            &sessions, &sid, &workspace,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(saved.native_frontier.refusal(), None);
+                        assert_eq!(
+                            (saved.total_input_tokens, saved.total_output_tokens),
+                            (20, 4)
+                        );
+                    } else {
+                        snapshots = driving.await;
+                    }
+                    #[cfg(not(all(
+                        feature = "hooks",
+                        any(target_os = "macos", target_os = "linux")
+                    )))]
+                    {
+                        snapshots = driving.await;
+                    }
+                }
+                #[cfg(not(feature = "hooks"))]
+                {
+                    snapshots = crate::startup::heap_future(|| {
+                        crate::ui::drive_native_fixture_turns(
+                            ui,
+                            &["first literal TUI prompt", "second literal TUI prompt"],
+                        )
+                    })
+                    .await;
+                }
+            } else {
+                crate::startup::heap_future(|| crate::ui::drive_native_fixture_turn(ui, prompt))
+                    .await;
+                let sessions =
+                    crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+                snapshots = vec![
+                    crate::session::storage::load_session_exact_read_only(
+                        &sessions, &sid, &workspace,
+                    )
+                    .unwrap()
+                    .unwrap(),
+                ];
+            }
+            #[cfg(not(feature = "agent-skills"))]
+            {
+                assert!(!authored && !held_end && !stale_end);
+                if same_app {
+                    snapshots = crate::startup::heap_future(|| {
+                        crate::ui::drive_native_fixture_turns(
+                            ui,
+                            &["first literal TUI prompt", "second literal TUI prompt"],
+                        )
+                    })
+                    .await;
+                } else {
+                    crate::startup::heap_future(|| {
+                        crate::ui::drive_native_fixture_turn(ui, prompt)
+                    })
+                    .await;
+                    let sessions =
+                        crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+                    snapshots = vec![
+                        crate::session::storage::load_session_exact_read_only(
+                            &sessions, &sid, &workspace,
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    ];
+                }
+            }
+        }
+        let saved = snapshots[if same_app { round } else { 0 }].clone();
+        assert_eq!(saved.native_frontier.refusal(), None);
+        assert!(saved.native_history_snapshot().unwrap().host.is_some());
+        assert_eq!(
+            (saved.total_input_tokens, saved.total_output_tokens),
+            ((round as u64 + 1) * 10, (round as u64 + 1) * 2)
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|row| row.role == crate::session::MessageRole::User)
+                .count(),
+            round + 1
+        );
+        let summary = crate::spend::Ledger::new(&paths.state_dir)
+            .summary_for_session(&sid)
+            .unwrap();
+        let paid_rounds = if same_app { 2 } else { round + 1 };
+        assert_eq!(summary.session.records, paid_rounds);
+        assert!((summary.session.known_cost - paid_rounds as f64 * 0.000028).abs() < 1e-12);
+        if !same_app {
+            crate::session::lock::release_session(&sid);
+            session = saved;
+        }
+    }
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["system"], bodies[1]["system"]);
+    if authored {
+        assert!(
+            bodies[0]["system"]
+                .to_string()
+                .contains("STABLE_NATIVE_REVIEW_GUIDANCE")
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.to_string().contains("CHANGED_NATIVE_REVIEW_GUIDANCE"))
+        );
+    }
+    assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+    let replayed = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["signature"] == "TUI canonical signature one")
+        .count();
+    assert_eq!(replayed, 1);
+}
+
+#[cfg(all(feature = "hooks", any(target_os = "macos", target_os = "linux")))]
+#[tokio::test]
+async fn effort46_actual_session_start_context_resumes_saved_native_prefix() {
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = crate::tests::OwnedTestDirectory::new("native-startup-context-resume");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::extras::hooks::reset_dispatcher();
+        }
+    }
+    let _reset = Reset;
+    let notice = json!({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"OWNED_STARTUP_CONTEXT_雪"}}).to_string();
+    let settings = json!({"hooks":{"SessionStart":[{"hooks":[{
+        "type":"command", "command":"/bin/sh", "trust":"trusted", "timeout":5,
+        "args":["-c",r#"printf 'start\n' >> "$2"; printf '%s\n' "$1""#,"startup-context",notice,roots.path().join("hook.effects")]
+    }]}]}});
+    crate::fs::private_atomic_write_sync(
+        &roots.path().join("config/settings.json"),
+        serde_json::to_vec(&settings).unwrap().as_slice(),
+    )
+    .unwrap();
+    let hooks = crate::extras::hooks::settings::parse_hooks_config(&settings["hooks"]).unwrap();
+    crate::extras::hooks::init_dispatcher(
+        crate::extras::hooks::dispatcher::HookDispatcher::from_config(&hooks).unwrap(),
+    );
+    let wire = Wire::new(vec![
+        (
+            true,
+            start()
+                + &thinking(0, "", "startup-first-signature")
+                + &text(1, "first owned startup answer")
+                + &finish(),
+        ),
+        (
+            true,
+            start()
+                + &thinking(0, "", "startup-second-signature")
+                + &text(1, "second owned startup answer")
+                + &finish(),
+        ),
+    ]);
+    let cfg:crate::config::Config=serde_json::from_value(json!({
+        "session_title_model":"off",
+        "custom_providers":{"native-startup":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"startup-test":{"provider":"native-startup","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    let paths = crate::paths::process_paths().unwrap();
+    struct Release(Option<String>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(id) = &self.0 {
+                crate::session::lock::release_session(id);
+            }
+        }
+    }
+    let mut release = Release(None);
+    let mut id = None;
+    for (round, prompt) in [
+        "first literal startup prompt",
+        "second literal startup prompt",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cli = crate::cli::Cli {
+            api_key: Some("unused-native-key".into()),
+            quick_model: Some("startup-test".into()),
+            session: id.clone(),
+            print: true,
+            quiet: true,
+            no_context_files: true,
+            no_tools: true,
+            no_sandbox: true,
+            message: vec![prompt.into()],
+            ..Default::default()
+        };
+        let mut startup = crate::startup::heap_future(|| async {
+            Box::new(
+                crate::startup::Startup::init(
+                    cli,
+                    cfg.clone(),
+                    paths.clone(),
+                    workspace.clone(),
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap(),
+            )
+        })
+        .await;
+        let sid = startup.session.id.to_string();
+        release.0 = Some(sid.clone());
+        startup.init_features().await.unwrap();
+        startup.resolve_prompts().await.unwrap();
+        crate::startup::heap_future(|| startup.dispatch())
+            .await
+            .unwrap();
+        let sessions_root = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+        let saved =
+            crate::session::storage::load_session_exact_read_only(&sessions_root, &sid, &workspace)
+                .unwrap()
+                .unwrap();
+        assert_eq!(saved.native_frontier.refusal(), None);
+        assert!(saved.native_publication.is_none());
+        assert_eq!(
+            (saved.total_input_tokens, saved.total_output_tokens),
+            ((round as u64 + 1) * 10, (round as u64 + 1) * 2)
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|row| row.role == crate::session::MessageRole::System
+                    && row.content.contains("OWNED_STARTUP_CONTEXT_雪"))
+                .count(),
+            round + 1
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|row| row.role == crate::session::MessageRole::User)
+                .count(),
+            round + 1
+        );
+        assert_eq!(
+            std::fs::read_to_string(roots.path().join("hook.effects")).unwrap(),
+            "start\n".repeat(round + 1)
+        );
+        let ledger = crate::spend::Ledger::new(&paths.state_dir)
+            .summary_for_session(&sid)
+            .unwrap();
+        assert_eq!(ledger.session.records, round + 1);
+        assert!((ledger.session.known_cost - (round as f64 + 1.0) * 0.000028).abs() < 1e-12);
+        crate::session::lock::release_session(&sid);
+        id = Some(sid);
+    }
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["system"], bodies[1]["system"]);
+    assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+    let messages = serde_json::to_string(&bodies[1]["messages"]).unwrap();
+    assert_eq!(messages.matches("startup-first-signature").count(), 1);
+    assert_eq!(messages.matches("OWNED_STARTUP_CONTEXT_雪").count(), 2);
+    assert!(
+        messages.contains("first literal startup prompt")
+            && messages.contains("second literal startup prompt")
+    );
 }

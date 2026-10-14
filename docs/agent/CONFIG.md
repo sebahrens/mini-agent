@@ -1051,8 +1051,8 @@ registration, never inferred from an alias or rewritten input.
 ### Events
 
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`,
-`Stop`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`.
-`PreCompact` and `Notification` are not currently implemented.
+`Stop`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`,
+`PreCompact`, `Notification`, `PermissionRequest`.
 
 Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting
@@ -1086,8 +1086,14 @@ model-visible output.
 `SubagentStart` can set `"additionalContext"` to prepend text to the child
 prompt. Both subagent lifecycle envelopes include the resolved `agent_type`
 and `agent_source` (for example, a project override path or the compiled-in
-explorer). `UserPromptSubmit` cannot alter the submitted prompt; an
-`"additionalContext"` field from that event is ignored. `Stop` and
+explorer). `SessionStart` and `UserPromptSubmit` may return `additionalContext`
+(flat, or under matching `hookSpecificOutput.hookEventName`). It becomes a
+separate transcript notice. Persistent sessions record a canonical System row;
+request conversion uses append-only transcript prose. It never replaces the literal User text/media or changes the top-level system
+prefix. A notice grants no permissions. Each context is limited to 32 KiB;
+at most eight notices/64 KiB after framing are retained per event in declared
+order, and excess context is ignored with a static warning. `SessionStart`
+remains informational; a prompt hook's block still wins over context. `Stop` and
 `SubagentStop` can set
 `"decision": "block"` with a `"reason"` to force the agent (or subagent) to
 continue instead of finishing, using `reason` as the next instruction; `Stop`
@@ -3562,3 +3568,33 @@ round-trip check of the global writer.
 `task` tool. It defaults to false. Each child inherits the parent's eligible
 tools, permissions, workspace and sandbox; write children are serialized within
 each call. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).
+
+### Hook event parity
+
+`PreCompact` observes an actual compaction before summarization. Its envelope has
+`trigger` (`manual` or `auto`) and `custom_instructions` (nullable). A successful
+compaction emits `SessionStart` with `source: "compact"`; a budget no-op does not.
+`PermissionRequest` observes the exact tool name and input before its approval is
+sent to the frontend, followed by a `Notification` with
+`notification_type: "permission_prompt"`. These events run in the caller's
+existing cancellable work scope. Their output cannot approve a request, change
+permission policy, or replace a tool result; the frontend still owns the reply.
+
+Project `.claude/settings.json` hook groups load alongside native project hook
+settings. Each project binding still requires the existing exact trust approval;
+headless runs skip unapproved or changed bindings. Project `disableAllHooks`
+cannot turn off global or managed guards. No global Claude configuration is
+implicitly imported.
+
+A handler may omit `args` and put a quoted command line in `command` (for example
+`"command": "echo 'two words'"`). This only tokenizes argv; it performs no shell
+expansion. Name a shell explicitly when needed, or use separate `command` and
+`args` fields for literal executable paths and arguments. Existing single-program
+bindings retain their trust identity. Command strings are limited to 32 KiB and
+128 words; malformed quoting and shell composition are rejected with redacted
+errors.
+
+JS broker permission notifications retain the parent invocation's existing work
+scope when crossing the parent-local permission receiver. Hook subprocesses
+remain part of that turn's cancellation and cleanup; no scope or hook context is
+serialized into the worker protocol.

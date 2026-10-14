@@ -704,3 +704,325 @@ async fn skill61_combined_search_does_not_publish_learned_bundle_before_intact_r
         }
     }
 }
+
+#[cfg(all(feature = "hooks", unix))]
+fn hooks60_install_context_dispatcher(root: &std::path::Path, command: Option<String>) {
+    use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+    let mut config = HooksConfig::new();
+    for event in ["SessionStart", "UserPromptSubmit"] {
+        let command = command.clone().unwrap_or_else(|| {
+            format!("printf '%s' '{{\"additionalContext\":\"{event}_HOOK60_CONTEXT\"}}'")
+        });
+        config.insert(
+            event.into(),
+            vec![HookGroup {
+                matcher: None,
+                hooks: vec![HookHandler {
+                    kind: "command".into(),
+                    command: Some("/bin/sh".into()),
+                    args: Some(vec!["-c".into(), command]),
+                    timeout: Some(5),
+                    is_async: false,
+                    condition: None,
+                    once: false,
+                    trust: HookTrust::Trusted,
+                    env: Default::default(),
+                }],
+            }],
+        );
+    }
+    let dispatcher =
+        crate::extras::hooks::dispatcher::HookDispatcher::from_config_with_backend_and_root(
+            &config, "seatbelt", root,
+        )
+        .unwrap();
+    crate::extras::hooks::init_dispatcher(dispatcher);
+}
+
+#[cfg(all(feature = "hooks", feature = "multimodal", unix))]
+#[tokio::test]
+async fn hooks60_actual_paused_gate_keeps_media_and_canonical_notice_before_start() {
+    use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
+    let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("hooks60-paused");
+    hooks60_install_context_dispatcher(root.path(), None);
+    let user=PersistedUserMessage::new(vec![UserBlock::Text {text:"LITERAL_BEFORE60".into()},UserBlock::Image {data:"iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAFElEQVR4nGPkSjnBAAZMEIqBgQEAFUoBOkiAy7EAAAAASUVORK5CYII=".into(),mime_type:ImageMime::Png},UserBlock::Text {text:"LITERAL_AFTER60".into()}]).unwrap();
+    let original = user.to_message();
+    let wire = Wire::new(vec![(
+        true,
+        start() + &text(0, "hook context observed") + &finish(),
+    )]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("Stable root policy")
+            .max_tokens(100)
+            .build(),
+    ));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let mut paused = crate::startup::heap_future(|| {
+        agent.spawn_runner_paused_input_in_scope(
+            crate::agent::input::PromptInput::user(user.clone()),
+            Vec::<Message>::new(),
+            RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            None,
+            scope.clone(),
+        )
+    })
+    .await;
+    let notices = paused.take_hook_context();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("UserPromptSubmit_HOOK60_CONTEXT"));
+    let mut session = crate::session::Session::new("native-test", "fixture", 32_000, "");
+    crate::extras::hooks::append_context_session(&mut session, &notices);
+    session.add_user_message(user);
+    assert_eq!(
+        session.messages[0].role,
+        crate::session::MessageRole::System
+    );
+    assert_eq!(
+        session.messages[1].user.as_ref().unwrap().to_message(),
+        original
+    );
+    let mut runner = paused.start_interactive();
+    let mut done = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { .. } => {
+                    done = true;
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => {
+                    runner
+                        .compaction_decision_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("actual paused runner did not retire");
+    cleanup.settle().await;
+    assert!(done);
+    let requests = wire.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0]["system"].to_string().contains("HOOK60_CONTEXT"));
+    let messages = requests[0]["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "assistant");
+    assert!(messages[0].to_string().contains("HOOK60_CONTEXT"));
+    assert_eq!(messages[1]["role"], "user");
+    let parts = messages[1]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0]["text"], "LITERAL_BEFORE60");
+    assert_eq!(parts[2]["text"], "LITERAL_AFTER60");
+    assert_eq!(parts[1]["type"], "image");
+}
+
+#[cfg(all(feature = "hooks", unix))]
+#[tokio::test]
+async fn hooks60_actual_headless_gate_commits_system_notices_and_native_feed() {
+    use crate::session::native_replay::{ReplayBoundary, RetiredNativeOutcome};
+    let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("hooks60-native");
+    hooks60_install_context_dispatcher(root.path(), None);
+    let notices = crate::extras::hooks::dispatch_session_start_with(
+        &crate::extras::hooks::get_dispatcher().unwrap(),
+        &crate::extras::hooks::HookCtx {
+            session_id: "hook60".into(),
+            session_path: String::new(),
+            cwd: root.path().display().to_string(),
+            permission_mode: "standard".into(),
+        },
+        "startup",
+    )
+    .await
+    .into_notices();
+    assert_eq!(notices.len(), 1);
+    let signed = start()
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"HOOK60_NATIVE_SIGNATURE"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        )
+        + &text(1, "native hook context accepted")
+        + &finish();
+    let wire = Wire::new(vec![(true, signed)]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let mut session = crate::session::Session::new("native-test", "claude-opus-5-5", 32_000, "");
+    crate::extras::hooks::append_context_session(&mut session, &notices);
+    let prices = crate::print::HeadlessPricing::from_session(&session, &Config::default());
+    let generic = crate::agent::runner::convert_history(&session);
+    let (agent, binding) = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("Stable native root policy")
+            .max_tokens(100)
+            .build(),
+    ))
+    .bind_native_turn(
+        &session,
+        generic.into(),
+        ReplayBoundary::CompletedTurn,
+        RecordedToolIds::Canonical,
+    )
+    .unwrap();
+    let retry = RetryConfig {
+        max_attempts: 1,
+        ..Default::default()
+    };
+    let turn = crate::startup::heap_future(|| {
+        agent.run_print_with_output(
+            "EXACT_LITERAL_HOOK60",
+            crate::print::HeadlessOutputPolicy::legacy(false, false),
+            &retry,
+            binding.history(),
+            None,
+        )
+    })
+    .await;
+    assert!(turn.failure.is_none(), "{:?}", turn.failure);
+    assert!(matches!(
+        turn.interactions.first(),
+        Some(Message::System { .. })
+    ));
+    assert_eq!(
+        binding.commit_canonical_into_with_outcome(
+            &mut session,
+            "EXACT_LITERAL_HOOK60",
+            &turn.response,
+            &turn.interactions,
+            turn.usage.into(),
+            prices,
+            RetiredNativeOutcome::Completed
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|row| row.role == crate::session::MessageRole::System)
+            .count(),
+        2
+    );
+    let row = session
+        .messages
+        .iter()
+        .find(|row| row.role == crate::session::MessageRole::User)
+        .unwrap();
+    assert_eq!(row.content, "EXACT_LITERAL_HOOK60");
+    let restored =
+        crate::session::storage::decode_session_json(&serde_json::to_string(&session).unwrap())
+            .unwrap();
+    let replay = restored
+        .native_restore_history(
+            crate::session::native_replay::HistoryProtocol::AnthropicMessages,
+            ReplayBoundary::CompletedTurn,
+        )
+        .unwrap();
+    let bytes = serde_json::to_string(&replay).unwrap();
+    assert!(bytes.contains("HOOK60_NATIVE_SIGNATURE"));
+    assert!(bytes.contains("UserPromptSubmit_HOOK60_CONTEXT"));
+    assert!(bytes.contains("SessionStart_HOOK60_CONTEXT"));
+    let requests = wire.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0]["system"].to_string().contains("HOOK60_CONTEXT"));
+    assert!(
+        requests[0]["messages"]
+            .to_string()
+            .contains("UserPromptSubmit_HOOK60_CONTEXT")
+    );
+}
+
+#[cfg(all(feature = "hooks", unix))]
+#[tokio::test]
+async fn hooks60_actual_paused_gate_cancellation_retires_hook_before_zero_http() {
+    use crate::tests::process_state::{ProcessIdentity, ProcessState};
+    let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("hooks60-cancel");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let pid = root.path().join("hook.pid");
+    let operand = format!("'{}'", pid.to_str().unwrap().replace('\'', "'\\''"));
+    let command = format!("printf '%s\\n' \"$$\" > {}; exec /bin/sleep 30", operand);
+    hooks60_install_context_dispatcher(&workspace, Some(command));
+    let wire = Wire::new(Vec::new());
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("stable cancellation control")
+            .max_tokens(100)
+            .build(),
+    ));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let wait = async {
+        let identity = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&pid).await
+                    && value.ends_with('\n')
+                    && let Ok(pid) = value.trim().parse::<u32>()
+                {
+                    break ProcessIdentity::capture(pid).unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual configured hook never started");
+        scope.cancellation_handle().cancel();
+        identity
+    };
+    let constructing = crate::startup::heap_future(|| {
+        agent.spawn_runner_paused_input_in_scope(
+            crate::agent::input::PromptInput::text("cancel actual hook".into()),
+            Vec::<Message>::new(),
+            RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            None,
+            scope.clone(),
+        )
+    });
+    let (mut paused, identity) = tokio::join!(constructing, wait);
+    assert!(paused.take_hook_context().is_empty());
+    let mut runner = paused.start_interactive();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runner.event_rx.recv().await.is_some() {}
+    })
+    .await
+    .unwrap();
+    cleanup.settle().await;
+    assert!(matches!(
+        identity.state().unwrap(),
+        ProcessState::Gone | ProcessState::Exited | ProcessState::Replaced
+    ));
+    assert!(wire.finish().is_empty());
+}

@@ -363,6 +363,7 @@ pub async fn handle_agent_event(
             run.response_start_block = None;
             run.agent_line_started = false;
             run.settle(std::time::Duration::from_secs(5)).await?;
+            crate::ui::settle_native_main_turn(run, ui.session, crate::session::native_replay::RetiredNativeOutcome::LiveToolReply).await?;
             #[cfg(feature = "goal")]
             if ui.session.goal_store.is_active() {
                 let collector = run.goal_round.take().unwrap_or_default();
@@ -396,6 +397,7 @@ pub async fn handle_agent_event(
             run.response_buf.clear();
             run.response_start_block = None;
             run.settle(std::time::Duration::from_secs(5)).await?;
+            crate::ui::settle_native_main_turn(run, ui.session, crate::session::native_replay::RetiredNativeOutcome::Incomplete).await?;
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let safe = sanitize_output(&e);
             renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
@@ -500,6 +502,12 @@ async fn handle_agent_done(
     commit_turn_response(ui.session, &response, &interactions);
     ui.session.reanchor_calibration_to_current_messages();
     run.settle(std::time::Duration::from_secs(5)).await?;
+    crate::ui::settle_native_main_turn(
+        run,
+        ui.session,
+        crate::session::native_replay::RetiredNativeOutcome::Completed,
+    )
+    .await?;
 
     finalize_response_segment(renderer, run)?;
     if run.response_buf.is_empty() && !run.agent_line_started {
@@ -530,14 +538,16 @@ async fn handle_agent_done(
         .cfg
         .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
 
-    if should_auto_compact_between_turns(
-        ui.cfg.resolve_compact_enabled(),
-        ui.session.needs_compaction_after_tool_result_pruning(
-            reserve,
-            ui.cfg.resolve_keep_recent_tool_results(),
-        ),
-        loop_running,
-    ) {
+    if ui.session.native_history_snapshot().is_none()
+        && should_auto_compact_between_turns(
+            ui.cfg.resolve_compact_enabled(),
+            ui.session.needs_compaction_after_tool_result_pruning(
+                reserve,
+                ui.cfg.resolve_keep_recent_tool_results(),
+            ),
+            loop_running,
+        )
+    {
         let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
@@ -1000,10 +1010,10 @@ async fn finish_goal_round(
             };
             #[cfg(feature = "agent-skills")]
             let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
-            let runner = round_agent
+            let paused = round_agent
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .with_question_turn(run.question_turn.clone())
-                .spawn_runner(
+                .spawn_runner_paused(
                     relaunch.prompt,
                     history,
                     ui.cfg.retry.clone(),
@@ -1011,6 +1021,11 @@ async fn finish_goal_round(
                     None,
                 )
                 .await;
+            #[cfg(feature = "hooks")]
+            let mut paused = paused;
+            #[cfg(feature = "hooks")]
+            super::adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
+            let runner = paused.start_interactive();
             run.compaction_decision_tx = runner.compaction_decision_tx;
             run.agent_rx = Some(runner.event_rx);
             run.main_abort = Some(runner.abort_handle);

@@ -68,6 +68,8 @@ pub(crate) struct NativePublicationTicket {
     // another writer enter while this actor's publication can still run.
     writer: super::lock::NativeWriterGuard,
     paired: bool,
+    #[cfg(feature = "hooks")]
+    actor_pair: Option<std::sync::Weak<ActorPairInner>>,
     #[cfg(test)]
     fail_final_before_replace: bool,
 }
@@ -86,6 +88,19 @@ struct ActorState {
     writer: Option<super::lock::NativeWriterGuard>,
     refusal: Option<(u64, RestartReason)>,
     consumed: bool,
+    #[cfg(feature = "hooks")]
+    session_end_issued: bool,
+    #[cfg(feature = "hooks")]
+    acknowledged_retirement: Option<AcknowledgedRetirement>,
+}
+
+#[cfg(feature = "hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcknowledgedRetirement {
+    revision: u64,
+    digest: [u8; 32],
+    epoch: u64,
+    outcome: RetiredNativeOutcome,
 }
 
 /// Exact invocation pair. This cannot be restored from saved compatibility
@@ -109,7 +124,7 @@ impl NativeActorPair {
         anyhow::ensure!(!ticket.paired, "native actor ticket already paired");
         let writer = ticket.publication.owner.lease.begin_write()?;
         ticket.paired = true;
-        Ok(Self(Arc::new(ActorPairInner {
+        let pair = Self(Arc::new(ActorPairInner {
             owner: Arc::clone(&ticket.publication.owner),
             epoch: ticket.epoch,
             state: Mutex::new(ActorState {
@@ -117,8 +132,17 @@ impl NativeActorPair {
                 writer: Some(writer),
                 refusal: None,
                 consumed: false,
+                #[cfg(feature = "hooks")]
+                session_end_issued: false,
+                #[cfg(feature = "hooks")]
+                acknowledged_retirement: None,
             }),
-        })))
+        }));
+        #[cfg(feature = "hooks")]
+        {
+            ticket.actor_pair = Some(Arc::downgrade(&pair.0));
+        }
+        Ok(pair)
     }
 
     pub(crate) fn claim_retired(
@@ -562,6 +586,8 @@ fn begin_blocking(
             epoch: snapshot.native_frontier.current(),
             writer,
             paired: false,
+            #[cfg(feature = "hooks")]
+            actor_pair: None,
             #[cfg(test)]
             fail_final_before_replace: false,
         },
@@ -928,6 +954,14 @@ pub(crate) async fn publish_refused_owned(
                     "native refusal acknowledgment was interrupted"
                 );
                 state.phase = Phase::Retired;
+                drop(state);
+                #[cfg(feature = "hooks")]
+                acknowledge_retired_actor(
+                    &ticket,
+                    &publication,
+                    cutoff,
+                    RetiredNativeOutcome::Incomplete,
+                )?;
                 writing.acknowledge();
                 Ok::<(), anyhow::Error>(())
             })
@@ -1078,7 +1112,49 @@ fn retire_blocking_using(
             .refuse_expected(ticket.epoch, RestartReason::IncompleteTurn);
     }
     result?;
+    drop(state);
+    #[cfg(feature = "hooks")]
+    acknowledge_retired_actor(
+        &ticket,
+        &publication,
+        snapshot.native_frontier.current(),
+        outcome,
+    )?;
     Ok(publication)
+}
+
+#[cfg(feature = "hooks")]
+fn acknowledge_retired_actor(
+    ticket: &NativePublicationTicket,
+    publication: &NativePublication,
+    epoch: u64,
+    outcome: RetiredNativeOutcome,
+) -> anyhow::Result<()> {
+    let Some(pair) = ticket
+        .actor_pair
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        Arc::ptr_eq(&pair.owner, &publication.owner),
+        "native retirement belongs to another writer"
+    );
+    let mut actor = pair.state.lock().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(
+        actor.phase == ActorPhase::Retired
+            && actor.consumed
+            && actor.acknowledged_retirement.is_none(),
+        "native actor retirement was already acknowledged"
+    );
+    actor.acknowledged_retirement = Some(AcknowledgedRetirement {
+        revision: publication.revision,
+        digest: publication.digest,
+        epoch,
+        outcome,
+    });
+    Ok(())
 }
 
 pub(crate) async fn retire_owned(
@@ -1098,6 +1174,135 @@ pub(crate) async fn retire_owned(
         .await??;
     session.native_publication = Some(publication);
     Ok(())
+}
+
+/// A runtime-only value permit from an already retired, published actor. This
+/// role can run SessionEnd without inventing another model completion.
+#[cfg(feature = "hooks")]
+pub(crate) struct RetiredSessionEndPermit {
+    publication: NativePublication,
+    epoch: u64,
+    outcome: RetiredNativeOutcome,
+}
+
+#[cfg(feature = "hooks")]
+impl RetiredSessionEndPermit {
+    pub(crate) fn from_retired_actor(
+        session: &Session,
+        pair: &NativeActorPair,
+    ) -> anyhow::Result<Self> {
+        let publication = checked_publication(session)?;
+        let mut actor = pair.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            Arc::ptr_eq(&pair.0.owner, &publication.owner)
+                && actor.phase == ActorPhase::Retired
+                && actor.consumed
+                && !actor.session_end_issued,
+            "session cleanup requires its retired model owner"
+        );
+        let acknowledged = actor
+            .acknowledged_retirement
+            .ok_or_else(|| anyhow::anyhow!("native retirement was not durably acknowledged"))?;
+        anyhow::ensure!(
+            acknowledged.revision == publication.revision
+                && acknowledged.digest == publication.digest
+                && acknowledged.epoch == session.native_frontier.current(),
+            "session cleanup value belongs to another retired actor"
+        );
+        let state = publication
+            .owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        validate_revision(publication, &state)?;
+        anyhow::ensure!(
+            state.phase == Phase::Retired,
+            "session cleanup precedes publication"
+        );
+        actor.session_end_issued = true;
+        Ok(Self {
+            publication: publication.clone(),
+            epoch: session.native_frontier.current(),
+            outcome: acknowledged.outcome,
+        })
+    }
+
+    pub(crate) async fn run(
+        self,
+        session: &mut Session,
+        host: Option<&crate::provider::NativeHostGuard>,
+    ) -> anyhow::Result<()> {
+        let publication = checked_publication(session)?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&publication.owner, &self.publication.owner)
+                && publication.revision == self.publication.revision
+                && publication.digest == self.publication.digest
+                && session.native_frontier.current() == self.epoch,
+            "session cleanup context changed after its model retired"
+        );
+        {
+            let state = publication
+                .owner
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            validate_revision(publication, &state)?;
+            anyhow::ensure!(
+                state.phase == Phase::Retired,
+                "session cleanup context is no longer retired"
+            );
+        }
+        if let Some(host) = host {
+            host.validate()?;
+        }
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        // Even a denied final checkpoint retains exact root/lock authority
+        // through hook cleanup. It never receives a healthy replacement.
+        let writer = self.publication.owner.lease.begin_write()?;
+        let ticket = Arc::new(Mutex::new(None));
+        cleanup.retain_until_settled((writer, ticket.clone()));
+        if session.native_frontier.ready() {
+            let active = begin_owned(session, &scope).await?;
+            *ticket.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
+        }
+        scope
+            .run(crate::extras::hooks::dispatch_session_end("exit"))
+            .await;
+        cleanup.settle().await;
+        // The hook scope is closed. Its exact model boundary is unchanged;
+        // all final IO is owned separately, just as in model publication.
+        let mut ticket = ticket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let unchanged = digest(session)? == self.publication.digest;
+        let valid_host = host.map_or(Ok(()), |host| host.validate());
+        if !unchanged || valid_host.is_err() {
+            if session.native_frontier.ready() {
+                let _ = session
+                    .native_frontier
+                    .refuse_expected(self.epoch, RestartReason::ChangedPrefix);
+            }
+            anyhow::bail!(
+                "session context changed during cleanup; start a fresh context to continue"
+            );
+        }
+        if let Some(ticket) = ticket.take() {
+            let io = crate::agent::runner::AgentWorkScope::new();
+            let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(io.clone());
+            let retained = Arc::new(Mutex::new(Some(ticket)));
+            cleanup.retain_until_settled(retained.clone());
+            let ticket = retained
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap();
+            let result = retire_owned(session, ticket, self.outcome, &io).await;
+            cleanup.settle().await;
+            result?;
+        }
+        Ok(())
+    }
 }
 
 /// Runs the existing owned helper in a new process; never writes the checkpoint.
@@ -2258,6 +2463,59 @@ mod tests {
             assert_eq!(
                 imported(&session).native_frontier.refusal(),
                 Some(RestartReason::InFlight)
+            );
+        });
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn native_session_end_permit_is_bound_to_its_acknowledged_retired_value() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-retired-cleanup-value");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        runtime().block_on(async {
+            let mut actors = Vec::new();
+            for _ in 0..2 {
+                let io = crate::agent::runner::AgentWorkScope::new();
+                let mut ticket = begin_owned(&mut session, &io).await.unwrap();
+                let pair = NativeActorPair::pair(&session, &mut ticket).unwrap();
+                let scope = crate::agent::runner::AgentWorkScope::new();
+                let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope);
+                // Lower ownership fixture only: real scope/model retirement,
+                // without claiming a provider protocol completion witness.
+                let mut model =
+                    NativeModelOwner::new(std::future::ready(()), pair.clone(), cleanup).unwrap();
+                model.model().await;
+                model.settle().await;
+                pair.claim_retired(&session, &ticket).unwrap();
+                retire_owned(&mut session, ticket, RetiredNativeOutcome::Completed, &io)
+                    .await
+                    .unwrap();
+                actors.push(pair);
+            }
+            let before = super::super::storage::serialize_bounded_session(&session).unwrap();
+            assert!(
+                RetiredSessionEndPermit::from_retired_actor(&session, &actors[0]).is_err(),
+                "an older retired actor cannot borrow the latest value from the same publisher"
+            );
+            let deserialized: Session = serde_json::from_str(&before).unwrap();
+            assert!(
+                RetiredSessionEndPermit::from_retired_actor(&deserialized, &actors[1]).is_err()
+            );
+            let _permit =
+                RetiredSessionEndPermit::from_retired_actor(&session, &actors[1]).unwrap();
+            assert!(
+                RetiredSessionEndPermit::from_retired_actor(&session, &actors[1]).is_err(),
+                "cleanup role is issued once"
+            );
+            assert_eq!(
+                super::super::storage::serialize_bounded_session(&session).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(imported(&session)).unwrap(),
+                serde_json::to_value(&session).unwrap()
             );
         });
     }

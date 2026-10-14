@@ -180,9 +180,20 @@ fn load_settings_file(path: &Path) -> SourceConfig {
         hooks: HashMap::new(),
         disable_all_hooks: false,
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
         return empty;
     };
+    let mut content = String::new();
+    if file
+        .take(1024 * 1024 + 1)
+        .read_to_string(&mut content)
+        .is_err()
+        || content.len() > 1024 * 1024
+    {
+        tracing::warn!("hooks: settings exceed bounds or are not UTF-8, ignoring");
+        return empty;
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
         tracing::warn!("hooks: {}: invalid JSON, ignoring", path.display());
         return empty;
@@ -445,7 +456,13 @@ fn build_dispatcher_from_paths_with_backend(
     sandbox_backend: &str,
 ) -> HookDispatcher {
     let global = load_settings_file(global_path);
-    let project = load_settings_file(project_path);
+    let compatibility_path = project_root.join(".claude/settings.json");
+    let mut project = load_settings_file(&compatibility_path);
+    if project_path != compatibility_path {
+        let native_project = load_settings_file(project_path);
+        project.disable_all_hooks |= native_project.disable_all_hooks;
+        merge_into(&mut project.hooks, native_project.hooks);
+    }
     let managed = load_settings_file(managed_path);
 
     // A repository-controlled `disableAllHooks` value must not disable
