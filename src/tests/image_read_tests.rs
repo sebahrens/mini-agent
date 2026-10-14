@@ -533,6 +533,8 @@ async fn image_read64_feature_off_retains_data_but_refuses_read_and_dispatch() {
             false,
             &Default::default(),
             history.clone(),
+            #[cfg(feature = "hooks")]
+            None,
         )
         .await;
     assert!(turn.failure.unwrap().to_string().contains("multimodal"));

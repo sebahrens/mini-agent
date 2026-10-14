@@ -1,0 +1,128 @@
+{
+  "bead": "mini-agent-i7ro6.108.2",
+  "baseline": "779e6ac449ad6053a864d339b471e21a0fa89358",
+  "patch": "/private/tmp/mini-agent-windows108-sha2-debug-final.patch",
+  "patch_sha256": "46e68f9dd38ae22b91d9498385dfcda5898d51eddabb89a98290c3fee17689b9",
+  "changed_files": [
+    "Cargo.toml"
+  ],
+  "change": "Only version-qualified dev profile sha2@0.11.0 opt-level=3. Overall app opt0, release profile, dependency source/version/lockfile, algorithms, image/source/Ready proofs and original 5+5 deadlines unchanged. sha2@0.10 untouched.",
+  "measurement": {
+    "before": {
+      "elapsed_ns": [
+        808973791,
+        808027791,
+        815344792
+      ],
+      "median_ms": 808.973791,
+      "log": "/private/tmp/mini-agent-sha2-debug-before.log",
+      "log_sha256": "cdda5cd04225c24798c2d13142a4d6548a8034fc9b4f7f0e35b9111e2600cd7a"
+    },
+    "after": {
+      "elapsed_ns": [
+        62628500,
+        62496125,
+        62349125
+      ],
+      "median_ms": 62.496125,
+      "log": "/private/tmp/mini-agent-sha2-debug-after.log",
+      "log_sha256": "aac1fbda90df2b1e3721fe0d152e5d5af68d33d23a7d18a3a30ce1f644ab7084"
+    },
+    "median_speedup": 12.94438320775888
+  },
+  "input": {
+    "binary": "/private/tmp/mini-agent-wave50-install/bin/mini-agent",
+    "binary_sha256": "b2391d5f04450aafe36c70a2049199ac28256d0de4964b0d5df9486b0bf3a37d",
+    "binary_bytes": 132597904,
+    "source_head": "779e6ac449ad6053a864d339b471e21a0fa89358",
+    "source_sha256": "2242ce9f7c348aa9f4e16881b021ef4cbb44f39de4ed1eb378704c2a40fc3dea",
+    "root": "/private/tmp/mini-agent-sha2-debug-measure",
+    "scope": "Same directsha2.11 full64KiB streaming loop, same immutable approved actualbinary, warmedfile pages, same Rustcompiler; MacCPU result is not absoluteWindows preflight evidence."
+  },
+  "dependency_lock_exact_matches_baseline": [
+    {
+      "name": "block-buffer",
+      "version": "0.12.1",
+      "checksum": "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "checksum": "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+    },
+    {
+      "name": "const-oid",
+      "version": "0.10.2",
+      "checksum": "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+    },
+    {
+      "name": "cpufeatures",
+      "version": "0.3.1",
+      "checksum": "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+    },
+    {
+      "name": "crypto-common",
+      "version": "0.2.2",
+      "checksum": "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+    },
+    {
+      "name": "digest",
+      "version": "0.11.3",
+      "checksum": "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+    },
+    {
+      "name": "hybrid-array",
+      "version": "0.4.14",
+      "checksum": "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+    },
+    {
+      "name": "libc",
+      "version": "0.2.189",
+      "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+    },
+    {
+      "name": "sha2",
+      "version": "0.11.0",
+      "checksum": "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+    },
+    {
+      "name": "typenum",
+      "version": "1.20.1",
+      "checksum": "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+    }
+  ],
+  "identical_test_source_sha256": "2242ce9f7c348aa9f4e16881b021ef4cbb44f39de4ed1eb378704c2a40fc3dea",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (Homebrew)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.3\n",
+  "source_hashes": {
+    "Cargo.toml": "aedf2513b2c682882c6062d7d6a725cb99fc797a7cd3a9fffaa7149bf9b62266",
+    "Cargo.lock": "5255f7382f1980181e698ff8a6de690edff42c33ffb9e317ae69b0a6702f01f2",
+    "src/sandbox/windows.rs": "7c23737e522510a488762a9cc5160b2caadfa08000900401180b29f2d1609d4f",
+    "src/sandbox/windows/preflight_witness.rs": "7f72d5f0b351ecda43b05f8020f8c214142828fd4792fbe92e961973e4cc3689"
+  },
+  "validation": [
+    "Matched cargo test --offline --locked before/after PASS1 each; same compiler, same test source, same dependency versions/checksums as baseline, same full immutable132597904-byte image; all six timed plus two warm digests match independent Python hashlib",
+    "cargo fmt --all -- --check PASS",
+    "git diff --check PASS"
+  ],
+  "limits": [
+    "Warm file on aarch64 Mac isolates complete-image hashing CPU cost, not cold Windows filesystem/setup performance.",
+    "No application rebuild/install, no Windows candidate execution, no fix/closed cause or generalCIgreen claim. Root may integrate small candidate and use next original owning Windows job with unchanged3 installed probes to validate real budget.",
+    "Initial matched run used newer three transitives; immutable initial logs preserved in experiment root. Final reported run aligns every transitive version/checksum with779."
+  ],
+  "primary_docs": [
+    "https://doc.rust-lang.org/cargo/reference/profiles.html#overrides",
+    "https://doc.rust-lang.org/cargo/reference/pkgid-spec.html"
+  ],
+  "review": {
+    "reviewer": "root",
+    "findings": [],
+    "checks": [
+      "Read exact5-line version-qualified dev override; application opt0 and release profile unchanged",
+      "Matched baseline dependency versions and immutable full-image digests, independently cross-checked with Python hashlib",
+      "No digest cache, proof bypass, timeout change or sandbox policy modification"
+    ],
+    "native_baseline": "779 Windows general job116097558569 SUCCESS, observer2 exact PASS, original installed3 PASS with90/111/110ms remaining in5s run budget",
+    "candidate_native_windows": "pending next owning CI; warm Mac kernel speedup is not a Windows absolute latency claim",
+    "adapter_fix": "Existing image feature-off test now supplies cfg(hooks) LoopInfo=None; exact owning hooks-on/multimodal-off row passed by Toolspill on779. No production image change."
+  }
+}

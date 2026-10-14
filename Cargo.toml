@@ -229,6 +229,11 @@ overflow-checks = false
 codegen-units = 16
 incremental = true
 
+# Full executable proofs hash the complete installed image at cold startup.
+# Optimize only the existing SHA-256 kernel; application code stays opt-level 0.
+[profile.dev.package."sha2@0.11.0"]
+opt-level = 3
+
 # Exact 100k skill retrieval delegates its contiguous matrix-vector product to
 # this small kernel crate. Keep the kernel representative in debug builds while
 # the rest of mini-agent remains unoptimized and easy to inspect.
