@@ -1141,13 +1141,24 @@ pub(crate) struct SkillSessionServices {
     turn_gate: Arc<tokio::sync::Mutex<()>>,
     search_gate: tokio::sync::Mutex<()>,
     trusted_context: RwLock<Arc<String>>,
+    instruction_turn: RwLock<Option<Arc<crate::extras::skills::session::InstructionTurn>>>,
 }
 
 impl SkillSessionServices {
     #[cfg(test)]
     pub(crate) fn for_test(paths: &crate::paths::AppPaths) -> Arc<Self> {
+        Self::for_test_mode(paths, false)
+    }
+    #[cfg(test)]
+    pub(crate) async fn for_test_with_learned(paths: &crate::paths::AppPaths) -> Arc<Self> {
+        let services = Self::for_test_mode(paths, true);
+        services.runtime.settle_learned_rebuild_for_test().await;
+        services
+    }
+    #[cfg(test)]
+    fn for_test_mode(paths: &crate::paths::AppPaths, learned: bool) -> Arc<Self> {
         let runtime =
-            SkillRuntime::open_with_learned_js(paths, None, false).expect("test skill runtime");
+            SkillRuntime::open_with_learned_js(paths, None, learned).expect("test skill runtime");
         Arc::new(Self {
             runtime: Arc::new(runtime),
             observation: None,
@@ -1156,6 +1167,7 @@ impl SkillSessionServices {
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
             search_gate: tokio::sync::Mutex::new(()),
             trusted_context: RwLock::new(Arc::new(String::new())),
+            instruction_turn: RwLock::new(None),
         })
     }
 
@@ -1233,6 +1245,7 @@ impl SkillSessionServices {
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
             search_gate: tokio::sync::Mutex::new(()),
             trusted_context: RwLock::new(Arc::new(String::new())),
+            instruction_turn: RwLock::new(None),
         }))
     }
 
@@ -1347,16 +1360,106 @@ impl SkillSessionServices {
         self.runtime.learned_index_len_for_test()
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_prompt(&self, prompt: &str) -> String {
         let discovery = self.runtime.prepare_turn(prompt).await;
         self.replace_trusted_context(discovery.trusted_context);
         prompt.to_string()
     }
 
+    pub(crate) async fn prepare_instruction_prompt(
+        &self,
+        prompt: &str,
+        turn: &Arc<crate::extras::skills::session::InstructionTurn>,
+    ) -> Result<String, String> {
+        let selection = turn
+            .prepare_with_embedder(prompt, Some(self.runtime.embedder()))
+            .await?;
+        let discovery = self
+            .runtime
+            .prepare_instruction_turn(prompt, selection, turn.preserve_learned_turn())
+            .await?;
+        *self
+            .instruction_turn
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(turn));
+        self.replace_trusted_context(discovery.trusted_context);
+        Ok(prompt.to_string())
+    }
+
+    pub(crate) fn compose_instructions(
+        &self,
+        selection: &crate::extras::skills::selection::InstructionSelection,
+    ) -> Result<String, String> {
+        self.runtime.compose_instructions(selection)
+    }
     pub(crate) async fn search(
         &self,
         query: &str,
     ) -> Result<super::turn::TurnDiscoveryBundle, &'static str> {
+        // The legacy direct Rust API has no SDK receipt. Its own return
+        // boundary remains the publication boundary; model calls require an
+        // explicitly captured instruction turn instead.
+        if self
+            .instruction_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            let _guard = self.search_gate.try_lock().map_err(
+                |_| "another skills_search call is already running; wait for it to finish",
+            )?;
+            let discovery = self.runtime.refreeze_turn(query).await;
+            self.replace_trusted_context(discovery.trusted_context.clone());
+            return Ok(discovery);
+        }
+        let (discovery, candidate) = self.search_candidate(query).await?;
+        if let Some((turn, candidate)) = candidate {
+            if !self.publish_search_candidate(&turn, &discovery) {
+                return Err("instruction search belongs to a retired turn");
+            }
+            turn.publish_candidate(candidate).await;
+        }
+        self.replace_trusted_context(discovery.trusted_context.clone());
+        Ok(discovery)
+    }
+
+    pub(crate) fn publish_search_candidate(
+        &self,
+        turn: &Arc<crate::extras::skills::session::InstructionTurn>,
+        discovery: &super::turn::TurnDiscoveryBundle,
+    ) -> bool {
+        if crate::agent::runner::current_work_scope_is_cancelled() {
+            return false;
+        }
+        let current = self
+            .instruction_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if !current
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, turn))
+            || !self.runtime.publish_instruction_candidate(discovery)
+        {
+            return false;
+        }
+        self.replace_trusted_context(discovery.trusted_context.clone());
+        true
+    }
+
+    pub(crate) async fn search_candidate(
+        &self,
+        query: &str,
+    ) -> Result<
+        (
+            super::turn::TurnDiscoveryBundle,
+            Option<(
+                Arc<crate::extras::skills::session::InstructionTurn>,
+                crate::extras::skills::session::PreparedSelection,
+            )>,
+        ),
+        &'static str,
+    > {
         let _guard = self
             .search_gate
             .try_lock()
@@ -1364,9 +1467,26 @@ impl SkillSessionServices {
         // A mid-turn search re-freezes the bundle inside the SAME user turn:
         // starting a new turn here would re-draw the canary route and orphan
         // the invocations already made in this turn from its outcome evidence.
-        let discovery = self.runtime.refreeze_turn(query).await;
-        self.replace_trusted_context(discovery.trusted_context.clone());
-        Ok(discovery)
+        let instruction = self
+            .instruction_turn
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let (discovery, candidate) = if let Some(turn) = instruction {
+            let candidate = turn
+                .candidate(query, Some(self.runtime.embedder()))
+                .await
+                .map_err(|_| "current instruction source or pin unavailable")?;
+            let discovery = self
+                .runtime
+                .prepare_instruction_candidate(query, Arc::clone(&candidate.selection))
+                .await
+                .map_err(|_| "pinned skill cannot fit the composed context budget")?;
+            (discovery, Some((turn, candidate)))
+        } else {
+            return Err("skills_search has no captured instruction turn");
+        };
+        Ok((discovery, candidate))
     }
 
     #[cfg(any(feature = "subagents", test))]
@@ -1381,6 +1501,7 @@ impl SkillSessionServices {
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
             search_gate: tokio::sync::Mutex::new(()),
             trusted_context: RwLock::new(Arc::new(String::new())),
+            instruction_turn: RwLock::new(None),
         })
     }
 
@@ -1391,6 +1512,7 @@ impl SkillSessionServices {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn trusted_context(&self) -> Arc<String> {
         self.trusted_context
             .read()
@@ -1417,11 +1539,13 @@ impl SkillSessionServices {
 
 /// Injects the current trusted skill block as a per-request system patch.
 /// The patch is rebuilt for every model call and never enters run history.
+#[cfg(test)]
 pub(crate) struct SkillContextHook {
     base_preamble: String,
     services: Arc<SkillSessionServices>,
 }
 
+#[cfg(test)]
 impl SkillContextHook {
     pub(crate) fn new(base_preamble: String, services: Arc<SkillSessionServices>) -> Self {
         Self {
@@ -1431,6 +1555,7 @@ impl SkillContextHook {
     }
 }
 
+#[cfg(test)]
 impl<M> rig::agent::AgentHook<M> for SkillContextHook
 where
     M: rig::completion::CompletionModel,

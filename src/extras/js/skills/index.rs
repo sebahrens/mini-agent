@@ -16,13 +16,7 @@ use super::store::{SkillRecordMetadata, StoredEmbedding};
 use super::{CapabilityTier, SkillArtifact};
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
-const MAX_QUERY_TERMS: usize = 64;
 const MAX_FTS_QUERY_TERMS: usize = 16;
-const LEXICAL_STOP_WORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from", "get", "give",
-    "how", "i", "in", "into", "is", "it", "me", "my", "of", "on", "or", "please", "print", "show",
-    "that", "the", "this", "to", "use", "want", "with", "you",
-];
 #[cfg(not(test))]
 const ANN_MIN_ROWS: usize = 10_000;
 // Keep the normal CI smoke small while exercising the same HNSW construction/search path.
@@ -835,32 +829,7 @@ pub(crate) fn manifest_size(artifact: &SkillArtifact) -> usize {
         + 128
 }
 
-pub(crate) fn lexical_tokens(text: &str) -> Vec<String> {
-    text.split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .map(str::to_lowercase)
-        .filter(|term| !term.is_empty() && !LEXICAL_STOP_WORDS.contains(&term.as_str()))
-        .take(MAX_QUERY_TERMS)
-        .collect()
-}
-
-pub(crate) fn lexical_query_terms(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut terms = Vec::new();
-    for term in query
-        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .map(str::to_lowercase)
-        .filter(|term| !term.is_empty() && !LEXICAL_STOP_WORDS.contains(&term.as_str()))
-    {
-        if seen.insert(term.clone()) {
-            terms.push(term);
-            if terms.len() == MAX_QUERY_TERMS {
-                break;
-            }
-        }
-    }
-    terms.sort();
-    terms
-}
+pub(crate) use crate::extras::skills::retrieval::lexical_query_terms;
 
 fn fts_query(connection: &Connection, query: &str) -> Result<Option<String>, rusqlite::Error> {
     let total_documents = connection.query_row("SELECT count(*) FROM skill_search", [], |row| {

@@ -323,6 +323,9 @@ pub struct InputEditor {
     custom_commands: Vec<(String, String)>,
     #[cfg(feature = "mcp")]
     mcp_resources: Vec<String>,
+
+    #[cfg(feature = "agent-skills")]
+    skill_commands: Vec<(String, String)>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
     current_model: Option<String>,
@@ -353,6 +356,9 @@ impl InputEditor {
             custom_commands: Vec::new(),
             #[cfg(feature = "mcp")]
             mcp_resources: Vec::new(),
+
+            #[cfg(feature = "agent-skills")]
+            skill_commands: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
             current_model: None,
@@ -435,6 +441,28 @@ impl InputEditor {
 
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
         self.quick_model_names = names;
+    }
+
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn set_skill_commands(&mut self, skills: Vec<(String, String)>) {
+        self.skill_commands = skills
+            .into_iter()
+            .filter(|(name, _)| {
+                !self
+                    .custom_commands
+                    .iter()
+                    .any(|(custom, _)| custom == name)
+            })
+            .collect();
+    }
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn start_skills_picker(&mut self) {
+        let mut picker = ListPicker::new();
+        #[cfg(feature = "agent-skills")]
+        picker.append_described_items(self.skill_commands.clone());
+        picker.set_monochrome(self.monochrome);
+        picker.activate();
+        self.picker = Some(Picker::Command(picker));
     }
 
     pub fn set_live_model_names(&mut self, names: Vec<String>) {
@@ -526,6 +554,8 @@ impl InputEditor {
     pub fn start_command_picker(&mut self) {
         let mut picker = ListPicker::with_static_commands();
         picker.append_described_items(self.custom_commands.clone());
+        #[cfg(feature = "agent-skills")]
+        picker.append_described_items(self.skill_commands.clone());
         picker.set_monochrome(self.monochrome);
         picker.activate();
         self.picker = Some(Picker::Command(picker));
@@ -1587,5 +1617,33 @@ mod editor_temp_tests {
             assert_eq!(foreign_contents.unwrap(), b"foreign draft");
             assert_eq!(owned_contents.unwrap(), b"owned draft");
         }
+    }
+}
+
+#[cfg(all(test, feature = "agent-skills"))]
+mod skill_completion_tests {
+    use super::*;
+    #[test]
+    fn skill_names_reach_command_picker_and_templates_keep_precedence() {
+        let mut editor = InputEditor::new();
+        editor.set_custom_commands(vec![("/shared".into(), "template".into())]);
+        editor.set_skill_commands(vec![
+            ("/reviewer".into(), "project .claude — review code".into()),
+            ("/shared".into(), "skill shadow".into()),
+        ]);
+        editor.start_skills_picker();
+        let Some(Picker::Command(picker)) = &editor.picker else {
+            panic!("skill command picker required");
+        };
+        assert_eq!(picker.selected_name(), Some("/reviewer"));
+        assert_eq!(editor.skill_commands.len(), 1);
+        editor.start_command_picker();
+        let Some(Picker::Command(picker)) = &mut editor.picker else {
+            panic!("ordinary command picker required");
+        };
+        for c in "reviewer".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.selected_name(), Some("/reviewer"));
     }
 }

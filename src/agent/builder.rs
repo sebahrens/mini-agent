@@ -377,6 +377,11 @@ fn compose_preamble(
         preamble.push_str(appended);
     }
     record_part(&mut parts, &preamble, "Appended system prompt");
+    #[cfg(feature = "agent-skills")]
+    {
+        preamble.push_str(crate::extras::skills::selection::POLICY);
+        record_part(&mut parts, &preamble, "Instruction skill policy");
+    }
     #[cfg(feature = "memory")]
     {
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
@@ -551,9 +556,9 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
         names.push("js");
-        #[cfg(feature = "skills")]
-        names.push("skills_search");
     }
+    #[cfg(feature = "agent-skills")]
+    names.push("skills_search");
     #[cfg(feature = "subagents")]
     if cfg.task_enabled.unwrap_or(true) {
         names.push("task");
@@ -1056,6 +1061,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             .with_workspace_binding(workspace.clone())
             .with_workspace_instructions(instructions.clone())
             .with_response_max_tokens(cli.resolve_max_tokens(cfg));
+            #[cfg(feature = "agent-skills")]
+            let task_tool =
+                task_tool.with_instruction_discovery_disabled(cli.resolve_no_context_files(cfg));
             #[cfg(feature = "js")]
             let task_tool = if js_tool_enabled {
                 task_tool.with_read_only_js(sandbox.clone(), js_worker_containment_status.clone())
@@ -1187,11 +1195,31 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             )));
         }
 
-        #[cfg(feature = "skills")]
-        if let Some(services) = &skill_services {
-            all_tools.push(Box::new(
-                crate::extras::js::skills::search_tool::SkillsSearchTool::new(Arc::clone(services)),
-            ));
+        #[cfg(feature = "agent-skills")]
+        {
+            #[cfg(feature = "skills")]
+            let learned_search = skill_services.as_ref().map(|services| {
+                Box::new(
+                    crate::extras::js::skills::search_tool::SkillsSearchTool::new(Arc::clone(
+                        services,
+                    )),
+                ) as Box<dyn rig::tool::ToolDyn>
+            });
+            #[cfg(not(feature = "skills"))]
+            let learned_search: Option<Box<dyn rig::tool::ToolDyn>> = None;
+            if let Some(tool) = learned_search {
+                all_tools.push(tool);
+            } else if let Ok(paths) = crate::paths::process_paths() {
+                let services = crate::extras::skills::session::InstructionOwner::default().resolve(
+                    paths,
+                    workspace.clone(),
+                    permission.clone(),
+                    cli.resolve_no_context_files(cfg),
+                );
+                all_tools.push(Box::new(
+                    crate::extras::skills::search_tool::SkillsSearchTool::new(services),
+                ));
+            }
         }
 
         #[cfg(feature = "js")]
@@ -1360,13 +1388,6 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         goal_store.clone(),
     ));
     let mut builder = builder;
-    #[cfg(feature = "skills")]
-    if let Some(services) = skill_services {
-        builder = builder.add_hook(crate::extras::js::skills::session::SkillContextHook::new(
-            preamble.clone(),
-            services,
-        ));
-    }
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         tool_output_session_id,
         tool_result_spills,
@@ -1484,6 +1505,8 @@ pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
 
     let mut preamble = String::new();
     preamble.push_str(BTW_SYSTEM_PROMPT);
+    #[cfg(feature = "agent-skills")]
+    preamble.push_str(crate::extras::skills::selection::POLICY);
 
     // Project context, for reference only — NOT instructions to act on.
     let has_ctx = context.agents.as_deref().is_some_and(|s| !s.is_empty()) || !cwd.is_empty();
@@ -2312,6 +2335,13 @@ mod js_tests {
         assert_eq!(
             first_preamble
                 .matches(crate::context::instructions::POLICY)
+                .count(),
+            1
+        );
+        #[cfg(feature = "agent-skills")]
+        assert_eq!(
+            first_preamble
+                .matches(crate::extras::skills::selection::POLICY)
                 .count(),
             1
         );

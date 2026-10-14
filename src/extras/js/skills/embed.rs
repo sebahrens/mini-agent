@@ -671,14 +671,7 @@ pub mod fastembed_backend {
     }
 }
 
-/// Immutable metadata about an embedding model.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ModelMetadata {
-    pub model_id: String,
-    pub model_revision: String,
-    pub dimensions: usize,
-    pub normalized: bool,
-}
+pub use crate::extras::skills::retrieval::ModelMetadata;
 
 /// Bounded query cache with O(1)-hit monotonic counter LRU eviction.
 struct QueryCache {
@@ -1203,6 +1196,18 @@ mod tests {
     #[test]
     fn deterministic_embedder_disables_semantic_retrieval() {
         assert!(!Embedder::new().unwrap().supports_semantic_retrieval());
+    }
+
+    #[tokio::test]
+    async fn instruction_and_learned_query_normalization_share_one_cached_embedding() {
+        let backend = Arc::new(QueryTestBackend::default());
+        let embedder = Embedder::with_backend(backend.clone()).unwrap();
+        let first = crate::extras::skills::retrieval::normalize_query("code\nreview 雪");
+        let second = crate::extras::skills::retrieval::normalize_query(" code\t review\u{2003}雪 ");
+        let one = embedder.embed_query_cached(&first).await.unwrap();
+        let two = embedder.embed_query_cached(&second).await.unwrap();
+        assert!(Arc::ptr_eq(&one, &two));
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

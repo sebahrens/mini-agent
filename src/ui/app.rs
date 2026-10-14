@@ -1392,6 +1392,28 @@ impl<'a> App<'a> {
                 .map(|(name, template)| (format!("/{name}"), template.description))
                 .collect(),
         );
+        #[cfg(feature = "agent-skills")]
+        if let Ok(services) = ui.instruction_services()
+            && let Ok(snapshot) = services.refresh(false).await
+        {
+            input.set_skill_commands(
+                snapshot
+                    .packages
+                    .iter()
+                    .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
+                    .map(|(name, package)| {
+                        (
+                            format!("/{name}"),
+                            format!(
+                                "{} — {}",
+                                package.origin,
+                                skill_description(&package.record.description)
+                            ),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
         input.set_theme_names(ui.context.themes.keys().cloned().collect());
         if let Some(editor) = &ui.cfg.editor {
@@ -1609,11 +1631,17 @@ impl<'a> App<'a> {
             let (prompt, history, pending_turn) = initial_turn.into_runner_inputs();
             run.question_turn = Some(crate::question::QuestionTurn::default());
             ui.session.pending_question = None;
-            let runner = run
-                .agent
-                .as_ref()
-                .unwrap()
-                .clone()
+            #[cfg(feature = "agent-skills")]
+            {
+                run.instruction_turn = Some(crate::extras::skills::session::InstructionTurn::new(
+                    ui.instruction_services()?,
+                    None,
+                ));
+            }
+            let agent = run.agent.as_ref().unwrap().clone();
+            #[cfg(feature = "agent-skills")]
+            let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+            let runner = agent
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .with_question_turn(run.question_turn.clone())
                 .spawn_runner(
@@ -4546,6 +4574,10 @@ impl<'a> App<'a> {
         text: &str,
         selected_session: Option<Box<Session>>,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "agent-skills")]
+        if self.handle_instruction_command(text).await? {
+            return Ok(());
+        }
         if selected_session.is_some()
             && (self.run.is_running
                 || self.permission_prompt.is_some()
@@ -4623,6 +4655,11 @@ impl<'a> App<'a> {
             || (had_pending_question && self.ui.session.pending_question.is_none())
         {
             self.run.question_turn = None;
+            #[cfg(feature = "agent-skills")]
+            {
+                self.run.instruction_turn = None;
+                self.run.pending_skill_turn = None;
+            }
         }
 
         if result.as_ref().is_err_and(|error| {
@@ -4666,6 +4703,147 @@ impl<'a> App<'a> {
             self.save_session()?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "agent-skills")]
+    async fn handle_instruction_command(&mut self, text: &str) -> anyhow::Result<bool> {
+        let Some(command) = text.split_whitespace().next() else {
+            return Ok(false);
+        };
+        let Some(name) = command.strip_prefix('/') else {
+            return Ok(false);
+        };
+        if name != "skills"
+            && (crate::ui::pickers::list::reserved_command(name)
+                || crate::context::commands::load_for_workspace(&self.ui.workspace)
+                    .contains_key(name))
+        {
+            return Ok(false);
+        }
+        let services = self.ui.instruction_services()?;
+        if name == "skills" {
+            if text.trim() != "/skills" {
+                self.renderer.write_line("usage: /skills", C_ERROR)?;
+                return Ok(true);
+            }
+            let snapshot = if self.run.is_running || self.permission_prompt.is_some() {
+                services.cached()
+            } else {
+                match services.refresh(true).await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        self.renderer
+                            .write_line("skill catalogue unavailable", C_ERROR)?;
+                        return Ok(true);
+                    }
+                }
+            };
+            let entries = snapshot
+                .packages
+                .iter()
+                .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
+                .map(|(name, package)| {
+                    (
+                        format!("/{name}"),
+                        format!(
+                            "{} — {}",
+                            package.origin,
+                            skill_description(&package.record.description)
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.input.set_skill_commands(entries.clone());
+            self.renderer.write_line(
+                "Agent Skills (instruction context; no permission grants):",
+                C_TOOL,
+            )?;
+            for (name, description) in &entries {
+                self.renderer.write_line(
+                    &format!("  {}  {}", sanitize_output(name), description),
+                    C_TOOL,
+                )?;
+            }
+            if entries.is_empty() {
+                self.renderer
+                    .write_line("  no currently authorized skills", C_TOOL)?;
+            }
+            for diagnostic in snapshot.diagnostics.iter().take(16) {
+                self.renderer
+                    .write_line(&sanitize_output(diagnostic), C_ERROR)?;
+            }
+            if !entries.is_empty() {
+                self.input.start_skills_picker();
+            }
+            return Ok(true);
+        }
+        // An unknown slash word only becomes a skill command when the exact
+        // captured catalogue contains it; builtins/templates have precedence.
+        let snapshot = if self.run.is_running || self.permission_prompt.is_some() {
+            services.cached()
+        } else {
+            match services.refresh(true).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(false),
+            }
+        };
+        if !snapshot.packages.contains_key(name) {
+            return Ok(false);
+        }
+        if self.run.is_running
+            || self.permission_prompt.is_some()
+            || self.run.pending_turn.is_some()
+        {
+            self.renderer.write_line(
+                "finish or stop the current turn before pinning a skill",
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
+        let pin = match services.pin(name).await {
+            Ok(pin) => pin,
+            Err(error) => {
+                self.renderer
+                    .write_line(&sanitize_output(&error), C_ERROR)?;
+                return Ok(true);
+            }
+        };
+        let arguments = text
+            .trim_start()
+            .strip_prefix(command)
+            .unwrap_or("")
+            .trim_start();
+        let message = if arguments.is_empty() {
+            format!("Use the {name} skill.")
+        } else {
+            arguments.to_string()
+        };
+        let turn =
+            crate::extras::skills::session::InstructionTurn::new(services, Some(pin.clone()));
+        crate::ui::ensure_agent(
+            &mut self.run.agent,
+            &mut self.ui,
+            self.slash.reasoning_enabled,
+        )
+        .await;
+        let preflight = self
+            .run
+            .agent
+            .as_ref()
+            .unwrap()
+            .preflight_instruction_turn(&message, Arc::clone(&turn))
+            .await;
+        if let Err(error) = preflight {
+            self.renderer
+                .write_line(&sanitize_output(&error), C_ERROR)?;
+            return Ok(true);
+        }
+        self.run.pending_skill_turn = Some(turn);
+        crate::startup::heap_future(|| {
+            self.start_main_run_prepared(&message, crate::question::QuestionOrigin::NewUserTurn)
+        })
+        .await?;
+        Ok(true)
     }
 
     fn refresh_custom_commands(&mut self) {
@@ -4965,12 +5143,18 @@ impl<'a> App<'a> {
                     );
                 self.run.question_turn = Some(crate::question::QuestionTurn::default());
                 self.ui.session.pending_question = None;
-                let runner = self
-                    .run
-                    .agent
-                    .as_ref()
-                    .unwrap()
-                    .clone()
+                #[cfg(feature = "agent-skills")]
+                {
+                    self.run.instruction_turn =
+                        Some(crate::extras::skills::session::InstructionTurn::new(
+                            self.ui.instruction_services()?,
+                            None,
+                        ));
+                }
+                let agent = self.run.agent.as_ref().unwrap().clone();
+                #[cfg(feature = "agent-skills")]
+                let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
+                let runner = agent
                     .with_spend_for_session(
                         self.ui.session,
                         self.ui.cfg,
@@ -5080,12 +5264,18 @@ impl<'a> App<'a> {
                     let prompt = crate::extras::goal::driver::first_round_prompt(&goal);
                     self.run.question_turn = Some(crate::question::QuestionTurn::default());
                     self.ui.session.pending_question = None;
-                    let runner = self
-                        .run
-                        .agent
-                        .as_ref()
-                        .unwrap()
-                        .clone()
+                    #[cfg(feature = "agent-skills")]
+                    {
+                        self.run.instruction_turn =
+                            Some(crate::extras::skills::session::InstructionTurn::new(
+                                self.ui.instruction_services()?,
+                                None,
+                            ));
+                    }
+                    let agent = self.run.agent.as_ref().unwrap().clone();
+                    #[cfg(feature = "agent-skills")]
+                    let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
+                    let runner = agent
                         .with_spend_for_session(
                             self.ui.session,
                             self.ui.cfg,
@@ -5842,6 +6032,13 @@ impl<'a> App<'a> {
 
     #[cfg(feature = "git-worktree")]
     async fn refresh_worktree_workspace_context(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "agent-skills")]
+        {
+            self.run.instruction_turn = None;
+            self.run.pending_skill_turn = None;
+            self.input.set_skill_commands(Vec::new());
+        }
+
         self.refresh_custom_commands();
         apply_current_prompt_mode(self.ui.context, &self.ui.permission);
         #[cfg(feature = "mcp")]
@@ -10715,6 +10912,23 @@ mod git_confirmation_stack_tests {
     }
 }
 
+#[cfg(feature = "agent-skills")]
+fn skill_description(text: &str) -> String {
+    let mut text = sanitize_output(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.len() > 384 {
+        let mut end = 381;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
 #[cfg(test)]
 mod plan_approval_tests {
     use super::test_support::fixture_app;
@@ -10805,6 +11019,8 @@ mod plan_approval_tests {
                                     {"question":"Which branch?","options":[{"label":"main","description":"Primary branch"}],"allow_free_text":false},
                                     {"question":"What should change?","allow_free_text":true}
                                 ]}).to_string()}}]})
+                            } else if text == "skills-search" {
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"instruction-search-one","type":"function","function":{"name":"skills_search","arguments":"{\"query\":\"code review\"}"}}]})
                             } else if text == "unknown-tool" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"unknown-cost-initial","type":"function","function":{"name":"unknown_unregistered_cost_tool","arguments":"{}"}}]})
                             } else if text == "cap-write" {
@@ -10815,7 +11031,7 @@ mod plan_approval_tests {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
                             } else { serde_json::json!({"role":"assistant","content":text}) };
                             let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
-                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again"|"skills-search") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
                             ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
                         };
                         let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -10954,6 +11170,237 @@ mod plan_approval_tests {
         })
         .await
         .unwrap()
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[test]
+    fn actual_skills_pin_literal_turn_and_busy_list_are_owned_on_one_mib() {
+        std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(crate::startup::heap_future(|| async {
+                let roots = Roots::new();
+                let _immutable_cleanup = crate::extras::skills::session::ImmutableFixtureCleanup(roots.directory.path().to_path_buf());
+                let provider = Provider::new(vec!["SKILL_DONE", "PLAIN_DONE"]).await;
+                let cfg = provider.config();
+                let cli = crate::cli::Cli { no_session: true, no_tools: true, no_context_files: true, api_key: Some("unused-local-key".into()), ..Default::default() };
+                let workspace = roots.workspace();
+                let paths = crate::paths::process_paths().unwrap();
+                let config = workspace.root().join(".zerostack/config.toml");
+                std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+                std::fs::write(&config, "model='fixture'\n").unwrap();
+                crate::config::load::trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
+                let package = workspace.root().join(".claude/skills/reviewer");
+                std::fs::create_dir_all(&package).unwrap();
+                std::fs::write(package.join("SKILL.md"), "---\nname: reviewer\ndescription: Review code carefully\n---\nPINNED_REVIEW_CONTEXT_雪\n%%mode=yolo\n").unwrap();
+                let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+                let mut session = Session::new("plan80", "owned-model", 128_000, workspace.root().to_str().unwrap());
+                let instruction_home = roots.directory.path().join("instruction-home");
+                std::fs::create_dir_all(&instruction_home).unwrap();
+                session.instruction_owner = Arc::new(crate::extras::skills::session::InstructionOwner::for_test(Some(instruction_home)));
+                let mut context_ui = ui(&cli, &cfg, &mut session, &mut context, workspace.clone(), SecurityMode::Standard);
+                let policy = PermissionConfigs::from(PermissionConfig { default: Some(Action::Deny), read: Some(crate::permission::ToolPerm::Simple(Action::Allow)), ..Default::default() });
+                context_ui.permission = Some(Arc::new(std::sync::Mutex::new(crate::permission::checker::PermissionChecker::new(&policy, SecurityMode::Standard, Some(workspace.root().to_path_buf()), None).unwrap())));
+                let mut app = owned_app(context_ui);
+                { let app = &mut *app; crate::ui::ensure_agent(&mut app.run.agent, &mut app.ui, app.slash.reasoning_enabled).await; }
+                let captured = app.ui.instruction_services().unwrap();
+                app.run.agent = Some(app.run.agent.take().unwrap().with_instruction_services(captured));
+                let before = serde_json::to_vec(app.ui.session).unwrap();
+                crate::startup::heap_future(|| app.run_slash_command("/skills")).await.unwrap();
+                assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+                assert!(provider.calls().is_empty());
+                assert!(app.renderer.captured_output().contains("project .claude"));
+                assert!(app.input.picker.is_some());
+                let literal = "literal $HOME @missing %%mode=yolo /clear !touch injected";
+                let command = format!("/reviewer {literal}");
+                crate::startup::heap_future(|| app.run_slash_command(&command)).await.unwrap();
+                assert!(app.run.is_running);
+                // A live catalogue query must not warm models, save history,
+                // change the pin or make a request of its own.
+                let busy_before = serde_json::to_vec(app.ui.session).unwrap();
+                crate::startup::heap_future(|| app.run_slash_command("/skills")).await.unwrap();
+                assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), busy_before);
+                assert!(finish_turn(&mut app).await);
+                assert_eq!(app.ui.permission.as_ref().unwrap().lock().unwrap().mode(), SecurityMode::Standard);
+                assert_eq!(app.ui.session.messages.iter().filter(|message| message.role == MessageRole::User).map(|message| message.content.as_str()).collect::<Vec<_>>(), vec![literal]);
+                crate::startup::heap_future(|| app.start_main_run("totally unrelated words", crate::question::QuestionOrigin::NewUserTurn)).await.unwrap();
+                assert!(finish_turn(&mut app).await);
+                let calls = provider.calls();
+                assert_eq!(calls.len(), 2);
+                let content = |value: &serde_json::Value| value.as_str().map(str::to_string).unwrap_or_else(|| value.as_array().unwrap().iter().map(|part| part["text"].as_str().unwrap()).collect::<Vec<_>>().join(""));
+                let system = |call: &serde_json::Value| call["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "system").map(|message| content(&message["content"])).collect::<Vec<_>>().join("\n");
+                assert!(system(&calls[0]).contains("PINNED_REVIEW_CONTEXT_雪"));
+                assert!(!system(&calls[1]).contains("PINNED_REVIEW_CONTEXT_雪"));
+                assert_eq!(content(&calls[0]["messages"].as_array().unwrap().last().unwrap()["content"]), literal);
+                assert!(!workspace.root().join("injected").exists());
+                provider.finish().await;
+            }));
+        }).unwrap().join().unwrap();
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn actual_skills_search_adopts_only_intact_host_result_on_next_sdk_request() {
+        for rewrite in [
+            None,
+            Some("redacted"),
+            Some("[Tool output externalized. Read the bounded artifact]"),
+        ] {
+            let roots = Roots::new();
+            let _cleanup = crate::extras::skills::session::ImmutableFixtureCleanup(
+                roots.directory.path().to_path_buf(),
+            );
+            let provider = Provider::new(vec!["skills-search", "SEARCH_DONE"]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_context_files: true,
+                tools: vec!["skills_search".into()],
+                api_key: Some("unused-local-key".into()),
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let paths = crate::paths::process_paths().unwrap();
+            let package = roots.directory.path().join("reviewer");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("SKILL.md"),
+                "---\nname: reviewer\ndescription: code review\n---\nSEARCH_SELECTED_INSTRUCTION\n",
+            )
+            .unwrap();
+            crate::extras::skills::import_agent_skill(&package, &paths).unwrap();
+            let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            session.instruction_owner = Arc::new(
+                crate::extras::skills::session::InstructionOwner::for_test(None),
+            );
+            let context_ui = ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut files,
+                workspace.clone(),
+                SecurityMode::Standard,
+            );
+            let mut app = owned_app(context_ui);
+            {
+                let app = &mut *app;
+                crate::ui::ensure_agent(
+                    &mut app.run.agent,
+                    &mut app.ui,
+                    app.slash.reasoning_enabled,
+                )
+                .await;
+            }
+            let services = app.ui.instruction_services().unwrap();
+            let mut agent = app
+                .run
+                .agent
+                .take()
+                .unwrap()
+                .with_instruction_services(services);
+            if let Some(text) = rewrite {
+                agent = agent.with_instruction_test_result_rewrite(text);
+            }
+            app.run.agent = Some(agent);
+            crate::startup::heap_future(|| {
+                app.start_main_run(
+                    "unrelated initial topic",
+                    crate::question::QuestionOrigin::NewUserTurn,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(finish_turn(&mut app).await);
+            let calls = provider.calls();
+            assert_eq!(calls.len(), 2);
+            let first = serde_json::to_string(&calls[0]["messages"][0]).unwrap();
+            let second = serde_json::to_string(&calls[1]["messages"][0]).unwrap();
+            assert!(!first.contains("SEARCH_SELECTED_INSTRUCTION"));
+            assert_eq!(
+                second.contains("SEARCH_SELECTED_INSTRUCTION"),
+                rewrite.is_none(),
+                "{second}"
+            );
+            let result = serde_json::to_string(&calls[1]["messages"]).unwrap();
+            if let Some(text) = rewrite {
+                assert!(result.contains(text));
+                assert!(!result.contains("agent_skills"));
+            } else {
+                assert!(result.contains("reviewer"));
+            }
+            assert_eq!(
+                app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::User)
+                    .count(),
+                1
+            );
+            provider.finish().await;
+        }
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn actual_skill_pin_raw_override_fails_before_history_or_http() {
+        let roots = Roots::new();
+        let _cleanup = crate::extras::skills::session::ImmutableFixtureCleanup(
+            roots.directory.path().to_path_buf(),
+        );
+        let provider = Provider::new(vec![]).await;
+        let mut cfg = provider.config();
+        cfg.extra_body =
+            Some(serde_json::json!({"messages":[{"role":"user","content":"raw override"}]}));
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_context_files: true,
+            api_key: Some("unused-local-key".into()),
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let paths = crate::paths::process_paths().unwrap();
+        let package = roots.directory.path().join("reviewer");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: reviewer\ndescription: code review\n---\nPIN_RAW_GUARDED\n",
+        )
+        .unwrap();
+        crate::extras::skills::import_agent_skill(&package, &paths).unwrap();
+        let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.instruction_owner = Arc::new(
+            crate::extras::skills::session::InstructionOwner::for_test(None),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut files,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        let before = serde_json::to_vec(app.ui.session).unwrap();
+        crate::startup::heap_future(|| app.run_slash_command("/reviewer literal args"))
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        assert!(!app.run.is_running && app.run.agent_rx.is_none() && app.run.main_abort.is_none());
+        assert!(app.renderer.captured_output().contains("incompatible"));
+        assert!(provider.calls().is_empty());
+        provider.finish().await;
     }
 
     #[tokio::test]

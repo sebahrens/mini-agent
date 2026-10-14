@@ -989,6 +989,8 @@ async fn finish_goal_round(
                 Some(max_turns) => rebuilt.with_max_agent_turns(max_turns),
                 None => rebuilt.clone(),
             };
+            #[cfg(feature = "agent-skills")]
+            let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
             let runner = round_agent
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .with_question_turn(run.question_turn.clone())

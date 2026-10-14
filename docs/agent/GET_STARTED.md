@@ -625,3 +625,8 @@ I hope that you enjoy mini-agent. You can discover more about its configuration 
 
 Cheers,
 Giuseppe Della Vedova
+
+Use `/skills` to inspect authorized instruction skills or choose one in the command picker.
+`/reviewer inspect the error handling` pins a discovered `reviewer` skill for that user turn;
+automatic retrieval can still select other relevant skills within the same budget. The skill is
+instruction context, and its bundled scripts and permission metadata do not grant effects.

@@ -1,9 +1,14 @@
 # Skills
 
-With the `skills` feature, mini-agent discovers two authority-separated skill types before the
-first model request of each user turn:
+The default `agent-skills` feature discovers instruction packages without JavaScript, SQLite or
+learned retrieval dependencies. The opt-in `skills` feature additionally enables learned JavaScript
+skills. The two types keep their existing authority boundaries:
 
-- Agent Skills are content-addressed instruction packages under the portable data root. Only
+- Agent Skills are content-addressed instruction packages. Explicit imports take precedence,
+  followed by captured project `.zerostack/skills`, `.mini-agent/skills`, `.claude/skills`, and
+  the captured user's `~/.claude/skills`. Project roots require the existing project-config trust
+  fingerprint; original files require current read authority. Ask/Deny sources are omitted without
+  prompting. Links, hard links, special files and escaping resources are refused. Only
   bounded metadata is indexed; a selected `SKILL.md` is loaded progressively, and resource content
   is included only for exact Markdown/code-path references within its independent budget.
   `allowed-tools` and bundled scripts are inert metadata/resources and never grant permissions.
@@ -16,13 +21,25 @@ first model request of each user turn:
   JavaScript worker. Identity-v1 rows are quarantined and cannot execute; current artifacts use
   identity v2 with ABI-bound structured target grants.
 
-One cached query embedding feeds both typed indexes. The initial query is the bounded user prompt.
+With an available learned-skills semantic embedder, one cached, whitespace-normalized query embedding
+feeds both typed indexes. Instruction-only and deterministic-backend matching stays lexical. The initial
+query is the bounded user prompt.
 While working, the model can call the read-only `skills_search` tool with a more specific query;
 the result exposes only Agent Skill name/description/digest and learned-JS
 ID/description/export-signature metadata. That call re-freezes the learned-JS bundle at the tool
 result boundary, so newly selected exports are available to later `js` calls in the same turn.
 It does not reveal stored source or tests and cannot install, approve, activate, or widen a skill.
-Queries are non-empty and limited to 8 KiB.
+Queries are non-empty and limited to 8 KiB. Instruction selection is adopted only from the intact final
+successful host tool result; a redacted or spilled result cannot silently install an instruction candidate.
+
+`/skills` lists names, origins and bounded one-line descriptions and opens the command picker.
+`/<skill-name> [arguments]` pins the exact captured skill for the next ordinary turn and its automatic
+continuations. Arguments remain literal user text. Builtins and custom command templates take precedence;
+a later explicit user prompt clears the pin. Source changes, lost trust/read authority or an oversized
+pin fail visibly before user history or HTTP. `--no-context-files` suppresses automatic directory scans;
+explicit list/pin actions still apply the same source policy. All roots share the bounded discovery caps
+listed in [CONFIG.md](CONFIG.md#importing-portable-agent-skills); scripts and `allowed-tools` never grant
+permissions or execute themselves.
 
 Selected instructions and manifests are appended to the system preamble through a per-completion,
 non-sticky request patch. The user prompt remains a separate, byte-identical user message, so a
@@ -47,7 +64,7 @@ independent prompt retrieval and are reachable only through routing.
 Within a logical agent session, discovery storage and telemetry are initialized lazily once for
 the canonical workspace and reused across model switches, compaction, and other full-agent
 rebuilds. `--no-tools`, an ineligible JS tool, or unavailable worker containment starts none of
-the discovery services. When
+these learned-JS services; independent instruction discovery remains available. When
 `enable_skill_proposals = true` is set in trusted configuration, one bounded proposal-store worker
 and one contained-verification admission worker join the session bundle; otherwise the
 `propose_skill` global remains absent. ACP
@@ -701,3 +718,17 @@ candidates rejoin the RRF fusion described above.
 See [the Phase 3 specification](../specs/phase-3-skill-library.md),
 [the Phase 6 brokered-runtime specification](../specs/phase-6-brokered-js-runtime.md), and
 [the 100k benchmark](../benchmarks/skill-retrieval.md) for invariants and measured limits.
+
+For the actual native Anthropic adapter, the initial selected instruction/learned block stays fixed
+for the captured turn. Later successful `skills_search` calls carry new bounded guidance in their
+actual canonical tool result, under the static instruction policy; system and tool definitions stay
+unchanged before retained signed thinking. This is not opaque replay across frontend turns (that
+separate lifecycle is still governed by native history compatibility). Redaction, spill rewriting,
+or removal of an expected native result stops locally before another model request and never
+restores removed bytes. The initial block is at most 64 KiB, search metadata 8 KiB, a complete native
+search result 80 KiB, and the exact runner retains at most 16 delivery receipts. These are consistency
+checks, never permission grants or cryptographic signature verification. Combined learned/instruction
+search stages its callable and instruction selections until the exact captured turn's intact final
+host result commits them once. A rewritten or spilled result leaves live callable lookup, routing
+and attribution unchanged; cancellation or a later user turn rejects stale candidates. Existing
+learned ABI, lease, scope and admission checks remain in force.

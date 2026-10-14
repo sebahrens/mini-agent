@@ -65,6 +65,58 @@ impl Tool for SkillsSearchTool {
         })
     }
 
+    async fn call_structured(
+        &self,
+        args: SkillsSearchArgs,
+        _extensions: &rig::tool::ToolCallExtensions,
+    ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
+        let query = validate_query(&args.query)?;
+        let (discovery, candidate) = self
+            .services
+            .search_candidate(query)
+            .await
+            .map_err(|error| ToolError::Msg(format!("skills_search: {error}")))?;
+        let learned_js = discovery
+            .learned_js
+            .skills
+            .iter()
+            .map(|skill| LearnedSkillSummary {
+                id: &skill.id,
+                description: &skill.description,
+                exports: &skill.exports,
+            })
+            .collect();
+        let output = serde_json::to_string(&SearchResult {
+            agent_skills: &discovery.agent_skills,
+            learned_js,
+        })
+        .map_err(|_| ToolError::Msg("skills_search encoding failed".into()))?;
+        if output.len() > 8192 {
+            return Err(ToolError::Msg(
+                "skills_search encoded metadata budget exceeded".into(),
+            ));
+        }
+        Ok(if let Some((turn, prepared)) = candidate {
+            let output = turn
+                .native_result(output, discovery.trusted_context.clone())
+                .map_err(ToolError::Msg)?;
+            rig::tool::ToolReturn::success(output.clone()).with_extension(
+                crate::extras::skills::session::SearchCandidate {
+                    turn,
+                    prepared,
+                    output,
+                    learned: Some(Arc::new(crate::extras::skills::session::PendingLearned {
+                        services: Arc::clone(&self.services),
+                        discovery,
+                        committed: std::sync::Mutex::new(false),
+                    })),
+                },
+            )
+        } else {
+            rig::tool::ToolReturn::success(output)
+        })
+    }
+
     async fn call(&self, args: SkillsSearchArgs) -> Result<String, ToolError> {
         let query = validate_query(&args.query)?;
 

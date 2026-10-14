@@ -875,3 +875,43 @@ captured Question/Run/work scope. Form answers never mint grants or a persisted
 main question. Headless declines forms and ACP cancels unsupported forms; URL elicitation and sampling are
 unsupported. Both transports keep bounded raw schema observations. See
 [MCP prompts, resources and forms](MCP_INTERACTION.md) for limits and UI controls.
+
+### Instruction package discovery
+
+`extras/skills/retrieval.rs` owns pure metadata and the shared bounded lexical
+normalization; it has no learned-JS database, embedding backend, or worker
+dependency. `extras/skills/discovery.rs` reads explicitly captured source roots
+through retained no-follow directory/file capabilities, within one aggregate
+entry/content budget. Project sources reuse the existing captured project config
+trust and ordinary read authority. Discovered content-addressed snapshots use
+private source-specific cache namespaces and cannot repoint the explicit imported
+Agent Skills catalogue's `ACTIVE` pointers. Neither frontmatter `allowed-tools`
+nor bundled resources grants authority or executes code.
+
+`extras/skills/session.rs` owns captured instruction services and one captured pin/generation per ordinary
+turn, including source revalidation. An intact successful host `skills_search` result can refreeze
+that turn’s selection; redaction or spill rewriting does not install the candidate. Its single `InstructionContextHook` composes
+plain instructions or the existing learned-JS manifest as an ephemeral system patch. The
+instruction-only `extras/skills/search_tool.rs` exposes bounded metadata through the ordinary
+mandatory tool wrappers; learned builds retain their existing same-turn search and lifecycle.
+
+`extras/skills/selection.rs` owns the shared instruction/resource composition and post-escape budget;
+`extras/skills/retrieval.rs` owns the same bounded whitespace-normalized query key used by the learned
+embedder. Unknown or unavailable learned embedding services keep instruction discovery lexical.
+The prepared-request observer rejects transcript/system overrides that would erase selected context;
+it does not claim that a typed request attests arbitrary provider wire overrides.
+
+For the actual native Anthropic adapter, the initial selected instruction/learned block stays fixed
+for the captured turn. Later successful `skills_search` calls carry new bounded guidance in their
+actual canonical tool result, under the static instruction policy; system and tool definitions stay
+unchanged before retained signed thinking. This is not opaque replay across frontend turns (that
+separate lifecycle is still governed by native history compatibility). Redaction, spill rewriting,
+or removal of an expected native result stops locally before another model request and never
+restores removed bytes. The initial block is at most 64 KiB, search metadata 8 KiB, a complete native
+search result 80 KiB, and the exact runner retains at most 16 delivery receipts. These are consistency
+checks, never permission grants or cryptographic signature verification. Combined learned/instruction
+search builds a staged bundle without changing callable lookup, canary routing or attribution. Only
+that captured turn's intact successful final host result commits both selections, once; redacted or
+spilled results leave the previous live bundle unchanged. A cancelled or retired-turn candidate cannot
+replace a later turn. Existing learned ABI, lease, scope and admission checks still apply; publication
+is not a new script approval path.

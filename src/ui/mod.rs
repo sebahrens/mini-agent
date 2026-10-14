@@ -1044,7 +1044,26 @@ pub(crate) async fn start_main_run(
     }
     run.question_turn = question_origin.capture(run.question_turn.take());
     let question_turn = run.question_turn.clone();
+    #[cfg(feature = "agent-skills")]
+    {
+        if run.instruction_turn.is_none()
+            || matches!(
+                question_origin,
+                crate::question::QuestionOrigin::NewUserTurn
+            )
+        {
+            run.instruction_turn = Some(match run.pending_skill_turn.take() {
+                Some(prepared) => prepared,
+                None => crate::extras::skills::session::InstructionTurn::new(
+                    ui.instruction_services()?,
+                    None,
+                ),
+            });
+        }
+    }
     let agent = run.agent.as_ref().unwrap().clone();
+    #[cfg(feature = "agent-skills")]
+    let agent = agent.with_instruction_turn(run.instruction_turn.clone());
     // Construct this measured large child in the short factory frame. The
     // exact request/profile scope and its owned await remain on this turn.
     let runner = crate::startup::heap_future(|| {
@@ -1293,11 +1312,10 @@ pub(crate) async fn mid_turn_compact_and_respawn(
         ui.session,
         ui.cfg.resolve_keep_recent_tool_results(),
     );
-    let runner = run
-        .agent
-        .as_ref()
-        .unwrap()
-        .clone()
+    let agent = run.agent.as_ref().unwrap().clone();
+    #[cfg(feature = "agent-skills")]
+    let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+    let runner = agent
         .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
         .with_question_turn(run.question_turn.clone())
         .spawn_runner(

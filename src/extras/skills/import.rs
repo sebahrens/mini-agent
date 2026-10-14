@@ -11,6 +11,7 @@ use crate::{fs as secure_fs, paths::portable};
 use super::catalog::{AgentSkillCatalog, CatalogError};
 use super::manifest::{AgentSkillManifest, ManifestError, parse_skill_markdown};
 
+#[cfg(feature = "skills")]
 use crate::extras::js::skills::store::SkillStore;
 
 const TREE_IDENTITY_VERSION: &[u8] = b"mini-agent-agent-skill-tree-v1";
@@ -90,17 +91,21 @@ struct TreeEntry {
 }
 
 #[derive(Default)]
-struct SourceTree {
+pub(super) struct SourceTree {
     entries: BTreeMap<String, TreeEntry>,
     collision_paths: BTreeMap<String, String>,
 }
 
 impl SourceTree {
-    fn insert_directory(&mut self, path: &str, explicit: bool) -> Result<(), ImportError> {
+    pub(super) fn insert_directory(
+        &mut self,
+        path: &str,
+        explicit: bool,
+    ) -> Result<(), ImportError> {
         self.insert(path, None, explicit)
     }
 
-    fn insert_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), ImportError> {
+    pub(super) fn insert_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), ImportError> {
         self.insert(path, Some(bytes), false)
     }
 
@@ -235,7 +240,18 @@ pub fn import_agent_skill(
         return Err(ImportError::InvalidSource);
     };
 
-    let (tree, manifest) = normalize_skill_tree(tree, expected_directory.as_deref())?;
+    publish_tree(tree, expected_directory.as_deref(), app_paths)
+}
+
+/// Shared validated publication. Discovery supplies bytes read through retained
+/// source capabilities and a source-specific destination, never the global
+/// explicit-import namespace.
+pub(super) fn publish_tree(
+    tree: SourceTree,
+    expected_directory: Option<&str>,
+    app_paths: &AppPaths,
+) -> Result<ImportedSkill, ImportError> {
+    let (tree, manifest) = normalize_skill_tree(tree, expected_directory)?;
     validate_instruction_budget(&tree)?;
     validate_learned_js_references(&manifest, app_paths)?;
     let identity = identity(&tree);
@@ -407,6 +423,7 @@ fn validate_instruction_budget(tree: &SourceTree) -> Result<(), ImportError> {
     Ok(())
 }
 
+#[cfg(feature = "skills")]
 fn validate_learned_js_references(
     manifest: &AgentSkillManifest,
     app_paths: &AppPaths,
@@ -448,6 +465,20 @@ fn validate_learned_js_references(
         }
     }
     Ok(())
+}
+
+#[cfg(not(feature = "skills"))]
+fn validate_learned_js_references(
+    manifest: &AgentSkillManifest,
+    _app_paths: &AppPaths,
+) -> Result<(), ImportError> {
+    match manifest.learned_js.first() {
+        None => Ok(()),
+        Some(id) => Err(ImportError::LearnedJsUnavailable {
+            id: id.clone(),
+            reason: "this build lacks the learned-JS skills feature".to_string(),
+        }),
+    }
 }
 
 fn collect_directory(root: &Path) -> Result<SourceTree, ImportError> {
@@ -1211,7 +1242,6 @@ mod tests {
 
     #[test]
     fn selected_content_read_rejects_growth_and_replacement_between_check_and_open() {
-        use crate::extras::js::skills::embed::Embedder;
         use crate::extras::skills::{index::AgentSkillSearchPolicy, loader};
 
         for markdown in [true, false] {
@@ -1220,10 +1250,9 @@ mod tests {
                 let source =
                     write_directory_skill(&temp.0, "bounded-skill", &temp.0.join("never-run"));
                 import_agent_skill(&source, &temp.paths()).unwrap();
-                let embedder = Embedder::new().unwrap();
                 let mut catalog = AgentSkillCatalog::new(&temp.paths());
                 let record = catalog
-                    .refresh(&embedder)
+                    .refresh_lexical()
                     .unwrap()
                     .search_lexical("bounded", &AgentSkillSearchPolicy::default())
                     .unwrap()

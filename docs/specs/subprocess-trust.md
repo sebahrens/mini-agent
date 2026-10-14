@@ -11,6 +11,15 @@ controls how mini-agent selects a subprocess boundary and records the authority 
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
 
+## Instruction-skill regression inventory
+
+The actual instruction list/pin App regression creates one owned1MiB Rust thread
+and joins it before fixture cleanup. Its exact `std::thread::Builder` spawn is
+non-process data in the checked inventory. The shared instruction compositor moves
+inert `String` formatting macros from learned `turn.rs` to `extras/skills/selection.rs`;
+these exact output identifiers are non-process sites. No process dispatcher or
+scanner exemption is added, and existing process negative controls stay unchanged.
+
 ## Windows journal-publication regression inventory
 
 The source-gated publication matrix launches the current libtest image through

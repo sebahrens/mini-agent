@@ -790,6 +790,12 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/ui/app.rs",
+        r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
+        1,
+        "NON-PROCESS",
+    ),
     // reqwest response status is HTTP metadata, never a process terminal.
     (
         "src/update.rs",
@@ -2653,24 +2659,30 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/skills/turn.rs",
+        "src/extras/skills/selection.rs",
         "let _ = writeln!(output, \"BEGIN_{resource_delimiter} path={path}\");",
         1,
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/skills/turn.rs",
+        "src/extras/skills/selection.rs",
         "let _ = writeln!(output, \"END_{delimiter}\");",
         1,
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/skills/turn.rs",
+        "src/extras/skills/selection.rs",
         "let _ = writeln!(output, \"END_{resource_delimiter}\");",
         1,
         "NON-PROCESS",
     ),
-    ("src/extras/js/skills/turn.rs", "output,", 4, "NON-PROCESS"),
+    ("src/extras/js/skills/turn.rs", "output,", 3, "NON-PROCESS"),
+    (
+        "src/extras/skills/selection.rs",
+        "output,",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/js/supervisor.rs",
         "output = future => Ok(output),",
@@ -4199,6 +4211,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/ui/app.rs",
+        r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/context/commands.rs",
         "let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());",

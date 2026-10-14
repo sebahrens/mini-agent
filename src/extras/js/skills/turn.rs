@@ -16,7 +16,7 @@ use crate::extras::skills::index::{AgentSkillIndex, AgentSkillSearchPolicy};
 use crate::extras::skills::loader::{load_resource, load_skill_markdown};
 use crate::paths::AppPaths;
 
-const MAX_QUERY_BYTES: usize = 8 * 1024;
+use crate::extras::skills::retrieval::normalize_query;
 /// Routing policy identity frozen onto every route. Recorded on the canary
 /// audit record so a route can be replayed against the policy that produced it.
 const ROUTE_POLICY_VERSION: &str = "phase5-v1";
@@ -24,7 +24,6 @@ const ROUTE_POLICY_VERSION: &str = "phase5-v1";
 const CANARY_SHARE_BASIS_POINTS: u16 = 1_000;
 const MAX_TRUSTED_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_RESOURCE_CONTEXT_BYTES: usize = 32 * 1024;
-const MAX_AGENT_RESOURCE_INVENTORY_BYTES: usize = 8 * 1024;
 // Share live session services without making this process-wide lookup their owner.
 type CoordinatorKey = (std::path::PathBuf, ModelMetadata);
 type CoordinatorRegistry = Mutex<HashMap<CoordinatorKey, Weak<IndexCoordinator>>>;
@@ -73,21 +72,10 @@ impl AgentSkillState {
     }
 }
 
-struct AgentSection {
-    digest: String,
-    markdown: String,
-    resources: Vec<(String, u64, String, Option<String>)>,
-    learned_js: Vec<String>,
-    score: f32,
-    rank: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ResolvedAgentSkill {
-    pub name: String,
-    pub description: String,
-    pub digest: String,
-}
+pub use crate::extras::skills::selection::ResolvedAgentSkill;
+use crate::extras::skills::selection::{
+    AgentSection, markdown_references_resource, render_agent_section,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSkill {
@@ -214,30 +202,36 @@ impl SkillTurnContext {
     }
 
     pub fn replace(&self, bundle: TurnSkillBundle) {
-        {
-            let mut attribution = self
-                .attribution
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            if attribution.turn_id != bundle.turn_id {
-                // A new user turn: attribution and completeness start fresh.
-                attribution.turn_id = bundle.turn_id.clone();
-                attribution.selected.clear();
-                attribution.evidence_complete = true;
+        self.replace_checked(bundle, false);
+    }
+
+    /// Commit a search only while its captured ordinary turn is still current.
+    pub(crate) fn replace_same_turn(&self, bundle: TurnSkillBundle) -> bool {
+        self.replace_checked(bundle, true)
+    }
+
+    fn replace_checked(&self, bundle: TurnSkillBundle, same_turn: bool) -> bool {
+        let mut attribution = self.attribution.write().unwrap_or_else(|e| e.into_inner());
+        if same_turn && attribution.turn_id != bundle.turn_id {
+            return false;
+        }
+        if attribution.turn_id != bundle.turn_id {
+            attribution.turn_id = bundle.turn_id.clone();
+            attribution.selected.clear();
+            attribution.evidence_complete = true;
+        }
+        for skill in &bundle.skills {
+            if attribution.selected.len() >= MAX_TURN_ATTRIBUTION_SKILLS {
+                break;
             }
-            for skill in &bundle.skills {
-                if attribution.selected.len() >= MAX_TURN_ATTRIBUTION_SKILLS {
-                    break;
-                }
-                if !attribution.selected.iter().any(|id| id == &skill.id) {
-                    attribution.selected.push(skill.id.clone());
-                }
+            if !attribution.selected.iter().any(|id| id == &skill.id) {
+                attribution.selected.push(skill.id.clone());
             }
         }
-        match self.current.write() {
-            Ok(mut current) => *current = Arc::new(bundle),
-            Err(error) => *error.into_inner() = Arc::new(bundle),
-        }
+        // Hold attribution through publication: a stale result cannot race a
+        // new turn's attribution update and then overwrite its live bundle.
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(bundle);
+        true
     }
 }
 
@@ -247,6 +241,18 @@ pub struct TurnDiscoveryBundle {
     pub agent_skills: Vec<ResolvedAgentSkill>,
     pub diagnostics: Vec<String>,
     pub trusted_context: String,
+}
+
+fn audit_published_routes(bundle: &TurnSkillBundle) {
+    for skill in &bundle.skills {
+        if let Some(record) = skill
+            .route
+            .as_ref()
+            .and_then(|route| canary_route_audit(&bundle.turn_id, route))
+        {
+            tracing::info!(route = %record, "learned-skill canary route frozen");
+        }
+    }
 }
 
 /// Runtime owner kept outside QuickJS. Query embedding occurs exactly once per call.
@@ -456,9 +462,11 @@ impl SkillRuntime {
     }
 
     /// Freeze discovery for a new user turn.
+    #[cfg(test)]
     pub async fn prepare_turn(&self, prompt: &str) -> TurnDiscoveryBundle {
-        self.discover(prompt, uuid::Uuid::new_v4().to_string())
+        self.discover(prompt, uuid::Uuid::new_v4().to_string(), None, true)
             .await
+            .expect("automatic discovery has no required pin")
     }
 
     /// Re-freeze the bound bundle for a mid-turn `skills_search` without
@@ -477,15 +485,82 @@ impl SkillRuntime {
         } else {
             current
         };
-        self.discover(query, turn_id).await
+        self.discover(query, turn_id, None, true)
+            .await
+            .expect("automatic discovery has no required pin")
     }
 
-    async fn discover(&self, prompt: &str, turn_id: String) -> TurnDiscoveryBundle {
+    pub(crate) fn compose_instructions(
+        &self,
+        selection: &crate::extras::skills::selection::InstructionSelection,
+    ) -> Result<String, String> {
+        render_trusted_context_checked(
+            &self.turn_context.snapshot(),
+            selection.generation,
+            &selection.sections,
+            &mut Vec::new(),
+            selection.pin.as_deref(),
+        )
+    }
+
+    pub(crate) fn embedder(&self) -> Arc<Embedder> {
+        Arc::clone(&self.embedder)
+    }
+
+    pub(crate) async fn prepare_instruction_turn(
+        &self,
+        prompt: &str,
+        selection: Arc<crate::extras::skills::selection::InstructionSelection>,
+        preserve_turn: bool,
+    ) -> Result<TurnDiscoveryBundle, String> {
+        let current = self.turn_context.snapshot().turn_id.clone();
+        let turn_id = if preserve_turn && !current.is_empty() {
+            current
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        self.discover(prompt, turn_id, Some(selection), true).await
+    }
+
+    /// Construct a same-turn search candidate without changing runtime lookup,
+    /// routing or attribution. Only its intact final host receipt may commit it.
+    pub(crate) async fn prepare_instruction_candidate(
+        &self,
+        prompt: &str,
+        selection: Arc<crate::extras::skills::selection::InstructionSelection>,
+    ) -> Result<TurnDiscoveryBundle, String> {
+        let turn_id = self.turn_context.snapshot().turn_id.clone();
+        if turn_id.is_empty() {
+            return Err("instruction search has no captured learned turn".into());
+        }
+        self.discover(prompt, turn_id, Some(selection), false).await
+    }
+
+    pub(crate) fn publish_instruction_candidate(&self, candidate: &TurnDiscoveryBundle) -> bool {
+        if !self
+            .turn_context
+            .replace_same_turn((*candidate.learned_js).clone())
+        {
+            return false;
+        }
+        audit_published_routes(&candidate.learned_js);
+        true
+    }
+
+    async fn discover(
+        &self,
+        prompt: &str,
+        turn_id: String,
+        instruction: Option<Arc<crate::extras::skills::selection::InstructionSelection>>,
+        publish: bool,
+    ) -> Result<TurnDiscoveryBundle, String> {
         let query = normalize_query(prompt);
         let fingerprint = fingerprint(&query);
         let mut diagnostics = self.startup_diagnostics.clone();
         let mut agent_skills = self.agent_skills.as_ref().map(|state| state.snapshot());
-        if let Some(state) = &self.agent_skills {
+        if instruction.is_none()
+            && let Some(state) = &self.agent_skills
+        {
             let state = Arc::clone(state);
             let embedder = Arc::clone(&self.embedder);
             match crate::agent::runner::spawn_blocking_scoped(move || {
@@ -650,19 +725,6 @@ impl SkillRuntime {
                                     )
                                     .ok()
                                 });
-                                // Canary exposure must be auditable outside the
-                                // model-facing block. The durable `skill_events`
-                                // row cannot carry route identity yet, so the
-                                // frozen route is recorded here instead.
-                                if let Some(record) = route
-                                    .as_ref()
-                                    .and_then(|route| canary_route_audit(&turn_id, route))
-                                {
-                                    tracing::info!(
-                                        route = %record,
-                                        "learned-skill canary route frozen"
-                                    );
-                                }
                                 let artifact = match (&route, candidate) {
                                     (Some(route), Some((candidate, _)))
                                         if route.chosen_id == candidate.id =>
@@ -733,7 +795,12 @@ impl SkillRuntime {
         let mut agent_skill_generation = 0;
         let mut selected_agent_skills = Vec::new();
         let mut agent_sections = Vec::new();
-        if let (Some(vector), Some(index)) = (&query_embedding, &agent_skills) {
+        if let Some(instruction) = &instruction {
+            agent_skill_generation = instruction.generation;
+            selected_agent_skills = instruction.selected.clone();
+            agent_sections = instruction.sections.clone();
+            diagnostics.extend(instruction.diagnostics.iter().cloned());
+        } else if let (Some(vector), Some(index)) = (&query_embedding, &agent_skills) {
             agent_skill_generation = index.generation();
             let index = Arc::clone(index);
             let vector = vector.clone();
@@ -825,26 +892,33 @@ impl SkillRuntime {
 
         self.attach_declared_skills(&mut learned_bundle, &agent_sections, &mut diagnostics)
             .await;
-        self.turn_context.replace(learned_bundle);
-        let learned_bundle = self.turn_context.snapshot();
-
-        let trusted_context = render_trusted_context(
+        let trusted_context = render_trusted_context_checked(
             &learned_bundle,
             agent_skill_generation,
             &agent_sections,
             &mut diagnostics,
-        );
+            instruction
+                .as_ref()
+                .and_then(|selection| selection.pin.as_deref()),
+        )?;
+        // Publication follows successful combined-budget validation. A pin
+        // refusal must not replace a previously bound learned bundle.
+        let learned_bundle = Arc::new(learned_bundle);
+        if publish {
+            self.turn_context.replace((*learned_bundle).clone());
+            audit_published_routes(&learned_bundle);
+        }
         // Diagnostics stay on the returned bundle for callers but never enter the
         // model-facing block. Startup diagnostics were logged at construction, so
         // only the diagnostics this turn produced are logged here.
         let startup = self.startup_diagnostics.len().min(diagnostics.len());
         log_skill_diagnostics(&diagnostics[startup..]);
-        TurnDiscoveryBundle {
+        Ok(TurnDiscoveryBundle {
             learned_js: learned_bundle,
             agent_skills: selected_agent_skills,
             diagnostics,
             trusted_context,
-        }
+        })
     }
 
     async fn attach_declared_skills(
@@ -1061,36 +1135,9 @@ fn route_kind_token(kind: RouteKind) -> &'static str {
     }
 }
 
-fn normalize_query(prompt: &str) -> String {
-    let mut query = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if query.len() > MAX_QUERY_BYTES {
-        let mut end = MAX_QUERY_BYTES;
-        while !query.is_char_boundary(end) {
-            end -= 1;
-        }
-        query.truncate(end);
-    }
-    query
-}
-
 fn fingerprint(query: &str) -> String {
     let digest = Sha256::digest(query.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn markdown_references_resource(markdown: &str, relative_path: &str) -> bool {
-    if markdown.contains(&format!("`{relative_path}`"))
-        || markdown.contains(&format!("<{relative_path}>"))
-    {
-        return true;
-    }
-    let prefix = format!("]({relative_path}");
-    markdown.match_indices(&prefix).any(|(start, _)| {
-        markdown[start + prefix.len()..]
-            .chars()
-            .next()
-            .is_some_and(|next| matches!(next, ')' | ' ' | '\t' | '#' | '?'))
-    })
 }
 
 /// Emit discovery diagnostics through `tracing` instead of the model-facing
@@ -1116,14 +1163,26 @@ fn log_skill_diagnostics(diagnostics: &[String]) {
 /// from the rendered bytes: `diagnostics` is an output sink that keeps truncation
 /// facts on `TurnDiscoveryBundle` for callers and for `tracing`, so a turn that
 /// retrieved nothing injects no block at all.
+#[cfg(test)]
 fn render_trusted_context(
     learned: &TurnSkillBundle,
     agent_generation: u64,
     agent_sections: &[AgentSection],
     diagnostics: &mut Vec<String>,
 ) -> String {
+    render_trusted_context_checked(learned, agent_generation, agent_sections, diagnostics, None)
+        .expect("automatic composition has no required pin")
+}
+
+fn render_trusted_context_checked(
+    learned: &TurnSkillBundle,
+    agent_generation: u64,
+    agent_sections: &[AgentSection],
+    diagnostics: &mut Vec<String>,
+    pin: Option<&str>,
+) -> Result<String, String> {
     if learned.skills.is_empty() && agent_sections.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     let mut output = String::new();
     let _ = writeln!(
@@ -1172,6 +1231,10 @@ fn render_trusted_context(
         let rendered = render_agent_section(section);
         if output.len() + rendered.len() + CLOSING.len() <= MAX_TRUSTED_CONTEXT_BYTES {
             output.push_str(&rendered);
+        } else if pin == Some(section.digest.as_str()) {
+            return Err(
+                "pinned skill exceeds the combined instruction/learned manifest budget".into(),
+            );
         } else {
             diagnostics.push(format!(
                 "agent_skill_context_omitted:{}:budget",
@@ -1180,54 +1243,7 @@ fn render_trusted_context(
         }
     }
     output.push_str(CLOSING);
-    output
-}
-
-fn render_agent_section(section: &AgentSection) -> String {
-    let mut output = String::new();
-    let delimiter = format!("AGENT_SKILL_{}", section.digest);
-    let _ = writeln!(
-        output,
-        "BEGIN_{delimiter} rank={} score={:.6}",
-        section.rank, section.score
-    );
-    output.push_str(
-        &section
-            .markdown
-            .replace("</trusted_skill_context>", "&lt;/trusted_skill_context&gt;"),
-    );
-    if !section.markdown.ends_with('\n') {
-        output.push('\n');
-    }
-    if !section.resources.is_empty() {
-        output.push_str(
-            "RESOURCE_INVENTORY (content is included only when referenced by SKILL.md, UTF-8, and within the turn budget):\n",
-        );
-        let mut inventory_bytes = 0usize;
-        for (path, bytes, sha256, text) in &section.resources {
-            let inventory_line = format!("- {path} bytes={bytes} sha256={sha256}\n");
-            if inventory_bytes + inventory_line.len() > MAX_AGENT_RESOURCE_INVENTORY_BYTES {
-                output.push_str("- [additional resource metadata omitted: inventory budget]\n");
-                break;
-            }
-            inventory_bytes += inventory_line.len();
-            output.push_str(&inventory_line);
-            if let Some(text) = text {
-                let resource_delimiter =
-                    format!("AGENT_SKILL_RESOURCE_{}_{}", section.digest, sha256);
-                let _ = writeln!(output, "BEGIN_{resource_delimiter} path={path}");
-                output.push_str(
-                    &text.replace("</trusted_skill_context>", "&lt;/trusted_skill_context&gt;"),
-                );
-                if !text.ends_with('\n') {
-                    output.push('\n');
-                }
-                let _ = writeln!(output, "END_{resource_delimiter}");
-            }
-        }
-    }
-    let _ = writeln!(output, "END_{delimiter}");
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1434,6 +1450,17 @@ mod tests {
             index_generation: 1,
             skills: skill_ids.iter().map(|id| attribution_skill(id)).collect(),
         }
+    }
+
+    #[test]
+    fn a_staged_search_cannot_replace_a_new_turn_or_its_attribution() {
+        let context = SkillTurnContext::new(attribution_bundle("old-turn", &["old-skill"]));
+        let staged = attribution_bundle("old-turn", &["staged-skill"]);
+        context.replace(attribution_bundle("new-turn", &["new-skill"]));
+        let before = context.snapshot();
+        assert!(!context.replace_same_turn(staged));
+        assert_eq!(context.snapshot(), before);
+        assert_eq!(context.turn_selected_skill_ids(), vec!["new-skill"]);
     }
 
     #[test]

@@ -264,6 +264,9 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         suffix.as_deref(),
     );
 
+    #[cfg(feature = "agent-skills")]
+    preamble.push_str(crate::extras::skills::selection::POLICY);
+
     let mut captured = authorization.clone();
     captured.instructions = authorization
         .instructions
@@ -353,13 +356,6 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         .max_tokens(max_tokens)
         .tools(tools)
         .add_hook(crate::agent::runner::ToolLoopGuard);
-    #[cfg(feature = "skills")]
-    if let Some(services) = skill_services {
-        builder = builder.add_hook(crate::extras::js::skills::session::SkillContextHook::new(
-            preamble.clone(),
-            std::sync::Arc::clone(services),
-        ));
-    }
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         uuid::Uuid::new_v4().to_string(),
         None,
@@ -435,6 +431,17 @@ pub(crate) async fn build_explore_agent(
         persona.provider_extra_body.clone(),
         &uuid::Uuid::new_v4().to_string(),
     );
+    #[cfg(feature = "agent-skills")]
+    let instructions = authorization.workspace.as_ref().and_then(|workspace| {
+        crate::paths::process_paths().ok().map(|paths| {
+            crate::extras::skills::session::InstructionOwner::default().resolve(
+                paths,
+                workspace.clone(),
+                authorization.permission.clone(),
+                cfg.no_context_files.unwrap_or(false),
+            )
+        })
+    });
     let inner = match model {
         AnyModel::OpenRouter(m, _) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
             m,
@@ -553,11 +560,17 @@ pub(crate) async fn build_explore_agent(
             skill_services.as_ref(),
         )),
     };
-    AnyAgent::with_runtime(
+    let agent = AnyAgent::with_runtime(
         inner,
         #[cfg(feature = "skills")]
         skill_services,
-    )
+    );
+    #[cfg(feature = "agent-skills")]
+    let agent = match instructions {
+        Some(services) => agent.with_instruction_services(services),
+        None => agent,
+    };
+    agent
 }
 
 #[cfg(all(test, feature = "js"))]

@@ -590,7 +590,6 @@ mod tests {
 
     #[test]
     fn a_session_catalog_leases_what_it_published_until_dropped() {
-        use crate::extras::js::skills::embed::Embedder;
         use crate::extras::skills::catalog::AgentSkillCatalog;
         use crate::paths::AppPaths;
 
@@ -624,9 +623,8 @@ mod tests {
         let name_root = install_root.join("kept-skill");
 
         let first = import_version(1);
-        let embedder = Embedder::new().unwrap();
         let mut catalog = AgentSkillCatalog::new(&paths);
-        let index = catalog.refresh(&embedder).unwrap();
+        let index = catalog.refresh_lexical().unwrap();
         assert_eq!(index.generation(), 1);
         for version in 2..=4 {
             import_version(version);

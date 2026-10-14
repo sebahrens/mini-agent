@@ -479,6 +479,8 @@ pub struct TaskTool {
     #[cfg(feature = "archmd")]
     architecture: Option<String>,
     deny_repeated_reads: bool,
+    #[cfg(feature = "agent-skills")]
+    instruction_discovery_disabled: bool,
     #[cfg(feature = "skills")]
     skill_services: Option<Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "js")]
@@ -503,6 +505,8 @@ impl TaskTool {
             #[cfg(feature = "archmd")]
             architecture: None,
             deny_repeated_reads,
+            #[cfg(feature = "agent-skills")]
+            instruction_discovery_disabled: false,
             #[cfg(feature = "skills")]
             skill_services: None,
             #[cfg(feature = "js")]
@@ -526,6 +530,13 @@ impl TaskTool {
         instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
     ) -> Self {
         self.instructions = instructions;
+
+        self
+    }
+
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn with_instruction_discovery_disabled(mut self, disabled: bool) -> Self {
+        self.instruction_discovery_disabled = disabled;
         self
     }
 
@@ -676,6 +687,15 @@ editing in a known location, grepping for a literal you will act on immediately.
             .map_err(|err| ToolError::Msg(err.to_string()))?;
         let mut config = config;
         config.max_tokens = Some(self.effective_response_max_tokens(&config));
+        #[cfg(feature = "agent-skills")]
+        let config = {
+            let mut config = config;
+            config.no_context_files = Some(
+                self.instruction_discovery_disabled || config.no_context_files.unwrap_or(false),
+            );
+            config
+        };
+
         let limits = limits.validate()?;
         let prompts = prepare_task_prompts(&args, limits)?;
 
@@ -894,6 +914,17 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
                 .await
                 .with_spend(spend_profile);
+                #[cfg(feature = "agent-skills")]
+                let agent = if let Some(services) = agent.instruction_services() {
+                    agent.clone().with_instruction_turn(Some(
+                        crate::extras::skills::session::InstructionTurn::new(
+                            Arc::clone(services),
+                            None,
+                        ),
+                    ))
+                } else {
+                    agent
+                };
                 let result = agent
                     .run_subagent(
                         &execution_prompt,
@@ -937,7 +968,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 if let Ok(response) = run.response.as_ref() {
                     let violations = report_contract_violations(response);
                     if !violations.is_empty() {
-                        let repair = agent
+                        #[cfg(feature = "agent-skills")]
+                        let repair_agent = agent.clone().without_instruction_context();
+                        #[cfg(not(feature = "agent-skills"))]
+                        let repair_agent = agent.clone();
+                        let repair = repair_agent
                             .run_subagent(
                                 &report_repair_prompt(response, &violations),
                                 REPORT_REPAIR_MAX_TURNS,

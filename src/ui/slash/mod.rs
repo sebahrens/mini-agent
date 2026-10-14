@@ -691,7 +691,7 @@ where
 pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {
     matches!(
         split_command(text).first().copied(),
-        Some("/context" | "/cost" | "/doctor")
+        Some("/context" | "/cost" | "/doctor" | "/skills")
     )
 }
 

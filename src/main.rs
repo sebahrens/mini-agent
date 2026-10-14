@@ -238,9 +238,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     }
 
     // Gated with the flag in `cli.rs`: the catalog, index and loader that read an
-    // installed tree only exist in a `skills` build, so importing anywhere else
+    // installed tree only exist in a `agent-skills` build, so importing anywhere else
     // would validate and install a tree nothing ever reads.
-    #[cfg(feature = "skills")]
+    #[cfg(feature = "agent-skills")]
     if let Some(source) = cli.import_agent_skill.as_deref() {
         let imported = extras::skills::import_agent_skill(source, &app_paths)?;
         println!(

@@ -2613,6 +2613,10 @@ async fn run_headless_goal_rounds(
     #[cfg(feature = "hooks")] loop_mode: bool,
 ) -> HeadlessRounds {
     let question_turn = crate::question::QuestionTurn::default();
+    #[cfg(feature = "agent-skills")]
+    let instruction_turn = agent.instruction_services().map(|services| {
+        crate::extras::skills::session::InstructionTurn::new(services.clone(), None)
+    });
     session.pending_question = None;
     let output = if cli.is_loop_mode() && !cli.print {
         crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)
@@ -2637,8 +2641,10 @@ async fn run_headless_goal_rounds(
     let mut turn = heap_future(|| {
         // The chained setters move a large AnyAgent. Construct it in this
         // short factory frame before the owned request starts polling HTTP.
+        let agent = agent.clone();
+        #[cfg(feature = "agent-skills")]
+        let agent = agent.with_instruction_turn(instruction_turn.clone());
         let agent = agent
-            .clone()
             .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
             .with_question_turn(Some(question_turn.clone()));
         #[cfg(feature = "hooks")]
@@ -2997,8 +3003,10 @@ async fn run_headless_goal_rounds(
             let next = heap_future(|| {
                 // Automatic rounds retain the same clarification identity;
                 // only this round's owned financial/request profile is fresh.
+                let round_agent = round_agent.clone();
+                #[cfg(feature = "agent-skills")]
+                let round_agent = round_agent.with_instruction_turn(instruction_turn.clone());
                 let round_agent = round_agent
-                    .clone()
                     .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                     .with_question_turn(Some(question_turn.clone()));
                 #[cfg(feature = "hooks")]

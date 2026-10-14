@@ -76,6 +76,8 @@ pub(crate) fn is_command_alias(name: &str) -> bool {
 pub(crate) fn available_commands() -> Vec<&'static str> {
     let mut cmds: Vec<&'static str> = BASE_COMMANDS.to_vec();
 
+    #[cfg(feature = "agent-skills")]
+    cmds.push("/skills");
     #[cfg(feature = "advisor")]
     cmds.push("/advisor");
 
@@ -125,6 +127,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
     BASE_COMMANDS.contains(&slash.as_str())
         || COMMAND_ALIASES.iter().any(|(alias, _)| *alias == slash)
         || [
+            "/skills",
             "/advisor",
             "/export",
             "/import",

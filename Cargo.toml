@@ -33,7 +33,7 @@ harness = false
 required-features = ["git-worktree", "sandbox"]
 
 [features]
-default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory']
+default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory', 'agent-skills']
 status-signals = []
 # `--loop` is a goal preset: it sets a goal and the goal driver runs its
 # rounds, so the loop feature cannot be built without it.
@@ -64,7 +64,8 @@ hooks = ["dep:which"]
 lsp = ["dep:lsp-types", "dep:process-wrap", "dep:url", "dep:which"]
 js = ["dep:rquickjs"]
 sandbox = []
-skills = ["js", "dep:rusqlite", "dep:matrixmultiply", "dep:hnsw_rs"]
+agent-skills = []
+skills = ["agent-skills", "js", "dep:rusqlite", "dep:matrixmultiply", "dep:hnsw_rs"]
 # Real ONNX/BGE embedding backend. Opt-in because `ort-sys` ships no prebuilt
 # binaries for some hosts (notably x86_64-apple-darwin); `skills` alone must build
 # everywhere and uses the deterministic backend.

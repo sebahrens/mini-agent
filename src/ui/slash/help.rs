@@ -63,6 +63,11 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /cost                 session by model and UTC daily/all-time usage estimates",
     );
+    #[cfg(feature = "agent-skills")]
+    emit(
+        false,
+        "  /skills               list/pick authorized instruction skills for one turn",
+    );
     emit(false, "  /add [path...]         add file(s) to context");
     emit(
         false,

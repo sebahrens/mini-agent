@@ -41,6 +41,9 @@ pub(crate) enum InstructionProtocol {
 }
 impl InstructionProtocol {
     fn transcript_overridden(self, request: &CompletionRequest) -> bool {
+        self.extra_body_overrides(request.additional_params.as_ref())
+    }
+    pub(crate) fn extra_body_overrides(self, params: Option<&serde_json::Value>) -> bool {
         let keys: &[&str] = match self {
             Self::Chat => &["messages"],
             Self::Anthropic => &["messages", "system"],
@@ -53,9 +56,7 @@ impl InstructionProtocol {
             #[cfg(test)]
             Self::Unverified => return true,
         };
-        request
-            .additional_params
-            .as_ref()
+        params
             .and_then(serde_json::Value::as_object)
             .is_some_and(|map| keys.iter().any(|key| map.contains_key(*key)))
     }
@@ -1020,6 +1021,29 @@ fn incompatible(request: &CompletionRequest, protocol: InstructionProtocol) -> b
         .any(|message| matches!(message,Message::System{content} if content.contains(POLICY)))
         || protocol.transcript_overridden(request)
 }
+/// Consistency-only reuse of the private native delivery matcher. This boolean
+/// creates no reviewed source, permission grant or tool invocation authority.
+#[cfg(feature = "agent-skills")]
+pub(crate) fn effective_context_result_visible(
+    request: &CompletionRequest,
+    name: &str,
+    id: &str,
+    internal_id: &str,
+    call_id: Option<&str>,
+    output: &str,
+) -> bool {
+    const SENTINEL: &str = "effective-skill-context-result";
+    let receipt = Receipt {
+        name: name.into(),
+        id: id.into(),
+        internal_id: internal_id.into(),
+        call_id: call_id.map(str::to_owned),
+        output: output.into(),
+        sources: BTreeSet::from([SENTINEL.into()]),
+    };
+    visible_sources(request, &[receipt]).contains(SENTINEL)
+}
+
 /// One bounded pass over the actual prepared history, with preceding assistant
 /// calls retained by their exact canonical/optional IDs. No copied transcript or
 /// tool-name/argument inference can establish delivery.

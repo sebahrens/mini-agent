@@ -4,8 +4,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::extras::js::skills::embed::ModelMetadata;
-use crate::extras::js::skills::index::{lexical_query_terms, lexical_tokens};
+use super::retrieval::{ModelMetadata, lexical_query_terms, lexical_tokens};
 
 use super::catalog::ResourceMetadata;
 
@@ -115,6 +114,10 @@ impl AgentSkillIndex {
             model,
             records: records.into(),
         })
+    }
+
+    pub(crate) fn records(&self) -> &[Arc<AgentSkillRecord>] {
+        &self.records
     }
 
     pub fn generation(&self) -> u64 {

@@ -591,9 +591,8 @@ pub struct Cli {
     pub learned_skill_json: bool,
 
     // Agent Skills are only ever read by the catalog, index and loader, which
-    // exist only in a `skills` build. Without this gate the default release
-    // binary accepted the flag and installed a tree nothing would ever read.
-    #[cfg(feature = "skills")]
+    // belong to the default instruction-only agent-skills feature.
+    #[cfg(feature = "agent-skills")]
     #[arg(
         long = "import-agent-skill",
         value_name = "PATH",
@@ -1662,6 +1661,17 @@ output_token_cost = 0.0
             cli.resolve_provider(&cfg).to_string(),
             cli.resolve_model_with_env(&cfg, env).to_string(),
         )
+    }
+
+    #[test]
+    fn instruction_import_flag_tracks_agent_skills_not_learned_js_feature() {
+        let parsed = Cli::try_parse_from(["mini-agent", "--import-agent-skill", "owned-package"]);
+        assert_eq!(parsed.is_ok(), cfg!(feature = "agent-skills"));
+        #[cfg(feature = "agent-skills")]
+        assert_eq!(
+            parsed.unwrap().import_agent_skill,
+            Some(std::path::PathBuf::from("owned-package"))
+        );
     }
 
     // mini-agent-jm8cf: `--provider X` must not keep another provider's model.

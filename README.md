@@ -403,7 +403,7 @@ task-level regression coverage without a live provider.
 ## Feature flags
 
 The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,
-`status-signals`, `multithread`, `export`, `js`, `sandbox`, and `memory`. Learned-skill storage is
+`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, and `agent-skills`. Learned-skill storage is
 opt-in because it adds SQLite and retrieval dependencies.
 
 Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
@@ -417,6 +417,7 @@ cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.9.
 |---|---|
 | `js` | Brokered QuickJS worker and parent-owned effect globals |
 | `sandbox` | Linux/macOS/Windows process isolation and brokered `spawn`/`fetch` where supported |
+| `agent-skills` | Default-on bounded instruction catalogue, `/skills`, one-turn pinning and lexical retrieval; no JS/store dependency |
 | `skills` | Immutable learned-skill store, deterministic embeddings, retrieval, verification, and lifecycle; implies `js` |
 | `skills-embed` | Local BGE embedding inference through ONNX Runtime |
 | `skills-embed-dynamic` | Runtime ONNX linkage for hosts without a prebuilt `ort-sys` binary |

@@ -2041,6 +2041,10 @@ pub struct AnyAgent {
     context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "lsp")]
     diagnostic_lsp: Option<crate::extras::lsp::LspManager>,
+    #[cfg(feature = "agent-skills")]
+    instructions: Option<std::sync::Arc<crate::extras::skills::session::InstructionServices>>,
+    #[cfg(feature = "agent-skills")]
+    instruction_turn: Option<std::sync::Arc<crate::extras::skills::session::InstructionTurn>>,
     #[cfg(feature = "skills")]
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
@@ -2057,6 +2061,10 @@ impl AnyAgent {
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
+            #[cfg(feature = "agent-skills")]
+            instructions: None,
+            #[cfg(feature = "agent-skills")]
+            instruction_turn: None,
             #[cfg(feature = "lsp")]
             diagnostic_lsp: None,
             #[cfg(feature = "skills")]
@@ -2136,6 +2144,236 @@ impl AnyAgent {
         .unwrap_or("")
     }
 
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn instruction_services(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::extras::skills::session::InstructionServices>> {
+        self.instructions.as_ref()
+    }
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn with_instruction_turn(
+        mut self,
+        turn: Option<std::sync::Arc<crate::extras::skills::session::InstructionTurn>>,
+    ) -> Self {
+        self.instruction_turn = turn;
+        self
+    }
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn with_instruction_services(
+        mut self,
+        services: std::sync::Arc<crate::extras::skills::session::InstructionServices>,
+    ) -> Self {
+        self.instructions = Some(services);
+        self
+    }
+    #[cfg(all(feature = "agent-skills", feature = "subagents"))]
+    pub(crate) fn without_instruction_context(mut self) -> Self {
+        self.instructions = None;
+        self.instruction_turn = None;
+        #[cfg(feature = "skills")]
+        {
+            self.skills = None;
+        }
+        self
+    }
+
+    #[cfg(feature = "agent-skills")]
+    fn deferred_instruction_hook(mut self, query: &str) -> Self {
+        let Some(services) = &self.instructions else {
+            return self;
+        };
+        let turn = crate::extras::skills::session::InstructionTurn::new(services.clone(), None);
+        let protocol = self.instruction_protocol();
+        fn add<M: rig::completion::CompletionModel>(
+            agent: &mut Agent<M>,
+            turn: std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+            query: &str,
+            protocol: crate::context::instructions::InstructionProtocol,
+        ) {
+            agent
+                .hooks
+                .push(crate::extras::skills::session::InstructionContextHook::new(
+                    agent.preamble.clone().unwrap_or_default(),
+                    turn,
+                    query.to_string(),
+                    protocol,
+                    #[cfg(feature = "skills")]
+                    None,
+                ));
+        }
+        match &mut self.inner {
+            AnyAgentInner::OpenRouter(a) => add(a, turn, query, protocol),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => add(a, turn, query, protocol),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => add(a, turn, query, protocol),
+            AnyAgentInner::Anthropic(a) => add(a, turn, query, protocol),
+            AnyAgentInner::Gemini(a) => add(a, turn, query, protocol),
+            AnyAgentInner::Ollama(a) => add(a, turn, query, protocol),
+        }
+        self
+    }
+
+    #[cfg(all(test, feature = "agent-skills"))]
+    pub(crate) fn with_instruction_test_result_rewrite(mut self, text: &'static str) -> Self {
+        #[derive(Clone)]
+        struct Rewrite(&'static str);
+        impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Rewrite {
+            async fn on_event(
+                &self,
+                _: &rig::agent::HookContext,
+                event: rig::agent::StepEvent<'_, M>,
+            ) -> rig::agent::Flow {
+                if matches!(
+                    event,
+                    rig::agent::StepEvent::ToolResult {
+                        tool_name: "skills_search",
+                        ..
+                    }
+                ) {
+                    rig::agent::Flow::rewrite_result(self.0)
+                } else {
+                    rig::agent::Flow::cont()
+                }
+            }
+            fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+                kind == rig::agent::StepEventKind::ToolResult
+            }
+        }
+        match &mut self.inner {
+            AnyAgentInner::OpenRouter(a) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::Anthropic(a) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::Gemini(a) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::Ollama(a) => a.hooks.push(Rewrite(text)),
+        }
+        self
+    }
+
+    #[cfg(feature = "agent-skills")]
+    fn instruction_protocol(&self) -> crate::context::instructions::InstructionProtocol {
+        use crate::context::instructions::InstructionProtocol as P;
+        match &self.inner {
+            AnyAgentInner::OpenRouter(_) | AnyAgentInner::OpenAI(OpenAiAgent::Completions(_)) => {
+                P::Chat
+            }
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(_)) => P::Responses,
+            AnyAgentInner::Anthropic(_) => P::Anthropic,
+            AnyAgentInner::Gemini(_) => P::Gemini,
+            AnyAgentInner::Ollama(_) => P::Ollama,
+        }
+    }
+    #[cfg(feature = "agent-skills")]
+    fn instruction_transcript_overridden(&self) -> bool {
+        let params = match &self.inner {
+            AnyAgentInner::OpenRouter(a) => &a.additional_params,
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &a.additional_params,
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &a.additional_params,
+            AnyAgentInner::Anthropic(a) => &a.additional_params,
+            AnyAgentInner::Gemini(a) => &a.additional_params,
+            AnyAgentInner::Ollama(a) => &a.additional_params,
+        };
+        self.instruction_protocol()
+            .extra_body_overrides(params.as_ref())
+    }
+    #[cfg(feature = "agent-skills")]
+    pub(crate) async fn preflight_instruction_turn(
+        &self,
+        prompt: &str,
+        turn: std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+    ) -> Result<(), String> {
+        if self
+            .instructions
+            .as_ref()
+            .is_none_or(|services| !services.same_authority(&turn.services))
+        {
+            return Err("Skill turn belongs to another captured workspace/source authority".into());
+        }
+        if self.instruction_transcript_overridden()
+            && !turn.prepare(prompt).await?.selected.is_empty()
+        {
+            return Err(
+                "Skill context is incompatible with the configured transcript/system override"
+                    .into(),
+            );
+        }
+        #[cfg(feature = "skills")]
+        if let Some(learned) = &self.skills {
+            learned.prepare_instruction_prompt(prompt, &turn).await?;
+        } else {
+            turn.prepare(prompt).await?;
+        }
+        #[cfg(not(feature = "skills"))]
+        turn.prepare(prompt).await?;
+        Ok(())
+    }
+    #[cfg(feature = "agent-skills")]
+    async fn prepared_instruction_inner(&self, prompt: &str) -> Result<AnyAgentInner, String> {
+        let Some(services) = &self.instructions else {
+            return Ok(self.inner.clone());
+        };
+        let turn = self.instruction_turn.clone().unwrap_or_else(|| {
+            crate::extras::skills::session::InstructionTurn::new(
+                std::sync::Arc::clone(services),
+                None,
+            )
+        });
+        if !services.same_authority(&turn.services) {
+            return Err("Skill turn belongs to another captured workspace/source authority".into());
+        }
+        #[cfg(feature = "skills")]
+        if let Some(learned) = &self.skills {
+            learned.prepare_instruction_prompt(prompt, &turn).await?;
+        } else {
+            turn.prepare(prompt).await?;
+        }
+        #[cfg(not(feature = "skills"))]
+        turn.prepare(prompt).await?;
+        fn add<M: rig::completion::CompletionModel>(
+            agent: &Agent<M>,
+            turn: std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+            protocol: crate::context::instructions::InstructionProtocol,
+            #[cfg(feature = "skills")] learned: Option<
+                std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+            >,
+        ) -> Agent<M> {
+            let mut agent = agent.clone();
+            agent
+                .hooks
+                .push(crate::extras::skills::session::InstructionContextHook::new(
+                    agent.preamble.clone().unwrap_or_default(),
+                    turn,
+                    String::new(),
+                    protocol,
+                    #[cfg(feature = "skills")]
+                    learned,
+                ));
+            agent
+        }
+        macro_rules! prepared {
+            ($agent:expr) => {
+                add(
+                    $agent,
+                    turn,
+                    self.instruction_protocol(),
+                    #[cfg(feature = "skills")]
+                    self.skills.clone(),
+                )
+            };
+        }
+        Ok(match &self.inner {
+            AnyAgentInner::OpenRouter(a) => AnyAgentInner::OpenRouter(prepared!(a)),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Responses(prepared!(a)))
+            }
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Completions(prepared!(a)))
+            }
+            AnyAgentInner::Anthropic(a) => AnyAgentInner::Anthropic(prepared!(a)),
+            AnyAgentInner::Gemini(a) => AnyAgentInner::Gemini(prepared!(a)),
+            AnyAgentInner::Ollama(a) => AnyAgentInner::Ollama(prepared!(a)),
+        })
+    }
+
     /// Metadata already registered in this agent. `None` never selects
     /// dynamic/vector tools and cannot connect an MCP server or call a tool.
     pub(crate) async fn context_tool_definitions(
@@ -2184,6 +2422,10 @@ impl AnyAgent {
             question_turn: None,
             completion_verification: None,
             context_snapshot: None,
+            #[cfg(feature = "agent-skills")]
+            instructions: None,
+            #[cfg(feature = "agent-skills")]
+            instruction_turn: None,
             #[cfg(feature = "lsp")]
             diagnostic_lsp: None,
             #[cfg(feature = "skills")]
@@ -2321,18 +2563,24 @@ impl AnyAgent {
                 } else {
                     None
                 };
-                #[cfg(feature = "skills")]
-                let prompt = if let Some(skills) = &self.skills {
-                    match runner::await_headless_work(skills.prepare_prompt(prompt)).await {
-                        Ok(prompt) => prompt,
-                        Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                #[cfg(feature = "agent-skills")]
+                let inner = match runner::await_headless_work(crate::startup::heap_future(|| {
+                    self.prepared_instruction_inner(prompt)
+                }))
+                .await
+                {
+                    Ok(Ok(inner)) => inner,
+                    Ok(Err(error)) => {
+                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                     }
-                } else {
-                    prompt.to_string()
+                    Err(error) => {
+                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
+                    }
                 };
-                #[cfg(not(feature = "skills"))]
                 let prompt = prompt.to_string();
-                match &self.inner {
+                #[cfg(not(feature = "agent-skills"))]
+                let inner = &self.inner;
+                match &inner {
                     AnyAgentInner::OpenRouter(a) => {
                         crate::startup::heap_future(|| {
                             runner::run_print_with_output_and_verification(
@@ -2485,15 +2733,23 @@ impl AnyAgent {
                 } else {
                     None
                 };
-                #[cfg(feature = "skills")]
-                let prompt = if let Some(skills) = &self.skills {
-                    skills.prepare_prompt(prompt).await
-                } else {
-                    prompt.to_string()
-                };
-                #[cfg(not(feature = "skills"))]
+                #[cfg(feature = "agent-skills")]
+                let inner =
+                    match crate::startup::heap_future(|| self.prepared_instruction_inner(prompt))
+                        .await
+                    {
+                        Ok(inner) => inner,
+                        Err(error) => {
+                            return runner::SubagentRunOutput {
+                                response: Err(error),
+                                usage: Default::default(),
+                            };
+                        }
+                    };
                 let prompt = prompt.to_string();
-                match &self.inner {
+                #[cfg(not(feature = "agent-skills"))]
+                let inner = &self.inner;
+                match &inner {
                     AnyAgentInner::OpenRouter(a) => {
                         runner::run_subagent(
                             a,
@@ -2657,16 +2913,22 @@ impl AnyAgent {
                 } else {
                     None
                 };
-                #[cfg(feature = "skills")]
-                let prompt = if let Some(skills) = &self.skills {
-                    work_scope.run(skills.prepare_prompt(&prompt)).await
-                } else {
-                    prompt
+                #[cfg(feature = "agent-skills")]
+                let inner = match work_scope
+                    .run(crate::startup::heap_future(|| {
+                        self.prepared_instruction_inner(&prompt)
+                    }))
+                    .await
+                {
+                    Ok(inner) => inner,
+                    Err(error) => return spawn_blocked_runner(error, work_scope),
                 };
                 let turn_token_budget = self.turn_token_budget;
                 let completion_verification = self.completion_verification;
                 let native_capture = self.native_capture;
-                match self.inner {
+                #[cfg(not(feature = "agent-skills"))]
+                let inner = self.inner;
+                match inner {
                     AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
                         a,
                         prompt,
@@ -2768,8 +3030,12 @@ impl AnyAgent {
         id: u32,
         retry_config: RetryConfig,
     ) -> crate::agent::runner::BtwRunner {
+        #[cfg(feature = "agent-skills")]
+        let self_ = self.deferred_instruction_hook(&prompt);
+        #[cfg(not(feature = "agent-skills"))]
+        let self_ = self;
         crate::question::scope_sync(None, || {
-            crate::spend::run::scope_sync(self.spend.clone(), || match self.inner {
+            crate::spend::run::scope_sync(self_.spend.clone(), || match self_.inner {
                 AnyAgentInner::OpenRouter(a) => {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
@@ -3329,6 +3595,13 @@ pub async fn build_agent_in_workspace(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
+    #[cfg(feature = "agent-skills")]
+    let instruction_services = crate::extras::skills::session::InstructionOwner::default().resolve(
+        crate::paths::process_paths().expect("startup installed validated application paths"),
+        workspace.clone(),
+        permission.clone(),
+        cli.resolve_no_context_files(cfg),
+    );
     #[cfg(feature = "js")]
     let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "js")]
@@ -3559,6 +3832,8 @@ pub async fn build_agent_in_workspace(
     .with_completion_verification(completion_verification);
     #[cfg(feature = "lsp")]
     let agent = agent.with_lsp_manager(diagnostic_lsp);
+    #[cfg(feature = "agent-skills")]
+    let agent = agent.with_instruction_services(instruction_services);
     agent
 }
 
@@ -3860,6 +4135,15 @@ pub async fn build_btw_agent(
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
 ) -> AnyAgent {
+    #[cfg(feature = "agent-skills")]
+    let instructions = crate::paths::process_paths().ok().map(|paths| {
+        crate::extras::skills::session::InstructionOwner::default().resolve(
+            paths,
+            workspace.clone(),
+            permission.clone(),
+            cli.resolve_no_context_files(cfg),
+        )
+    });
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             crate::startup::heap_future(|| {
@@ -3994,7 +4278,13 @@ pub async fn build_btw_agent(
             .await,
         ),
     };
-    AnyAgent::without_skills(inner)
+    let agent = AnyAgent::without_skills(inner);
+    #[cfg(feature = "agent-skills")]
+    let agent = match instructions {
+        Some(services) => agent.with_instruction_services(services),
+        None => agent,
+    };
+    agent
 }
 
 #[cfg(all(test, feature = "goal"))]

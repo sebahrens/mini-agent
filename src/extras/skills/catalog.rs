@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "skills")]
 use crate::extras::js::skills::embed::Embedder;
 use crate::paths::{AppPaths, portable};
 
@@ -37,6 +38,7 @@ pub enum CatalogError {
     Manifest(#[from] super::ManifestError),
     #[error(transparent)]
     Portable(#[from] portable::PortablePathError),
+    #[cfg(feature = "skills")]
     #[error(transparent)]
     Embedding(#[from] crate::extras::js::skills::embed::EmbeddingError),
     #[error(transparent)]
@@ -135,27 +137,12 @@ impl AgentSkillCatalog {
     }
 
     /// Scan installed immutable trees, batch metadata embeddings, and construct one generation.
+    #[cfg(feature = "skills")]
     pub fn refresh(&mut self, embedder: &Embedder) -> Result<AgentSkillIndex, CatalogError> {
         // Capture the tree before scanning. An import racing this build changes
         // the next turn's signature and therefore forces another refresh.
         let signature = catalog_signature(&self.root)?;
-        let mut records = Vec::new();
-        if self.root.is_dir() {
-            let mut names = fs::read_dir(&self.root)?.collect::<Result<Vec<_>, _>>()?;
-            names.sort_by_key(|entry| entry.file_name());
-            for name_entry in names {
-                if signature.unavailable_packages.contains(&name_entry.path())
-                    || !name_entry.file_type().is_ok_and(|kind| kind.is_dir())
-                {
-                    continue;
-                }
-                // Installed packages are independent trust domains. A corrupt package is
-                // omitted from this generation without making valid siblings unavailable.
-                if let Ok(Some(record)) = scan_record(&self.root, &name_entry) {
-                    records.push(record);
-                }
-            }
-        }
+        let mut records = self.scan_records(&signature, u64::MAX)?;
         self.record_lease(&records);
         let documents = records
             .iter()
@@ -174,6 +161,52 @@ impl AgentSkillCatalog {
             AgentSkillIndex::build(self.generation, embedder.model_metadata().clone(), records)?;
         self.signature = Some(signature);
         Ok(index)
+    }
+
+    /// Instruction-only refresh: stable lexical ranking without inference,
+    /// learned-store access, or a JavaScript worker.
+    pub(crate) fn refresh_lexical(&mut self) -> Result<AgentSkillIndex, CatalogError> {
+        let signature = catalog_signature(&self.root)?;
+        let records = self.scan_records(&signature, 8 * 1024 * 1024)?;
+        self.record_lease(&records);
+        self.generation = self.generation.saturating_add(1);
+        let index = AgentSkillIndex::build(
+            self.generation,
+            super::retrieval::ModelMetadata {
+                model_id: "lexical-only".into(),
+                model_revision: "agent-skills-lexical-v1".into(),
+                dimensions: 0,
+                normalized: false,
+            },
+            records,
+        )?;
+        self.signature = Some(signature);
+        Ok(index)
+    }
+
+    fn scan_records(
+        &self,
+        signature: &CatalogSignature,
+        mut bytes_left: u64,
+    ) -> Result<Vec<AgentSkillRecord>, CatalogError> {
+        let mut records = Vec::new();
+        if self.root.is_dir() {
+            let names = bounded_directory_entries(&self.root)?;
+            for name_entry in names {
+                if signature.unavailable_packages.contains(&name_entry.path())
+                    || !name_entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
+                    continue;
+                }
+                if bytes_left == 0 {
+                    break;
+                }
+                if let Ok(Some(record)) = scan_record(&self.root, &name_entry, &mut bytes_left) {
+                    records.push(record);
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// Lease the digests of a generation before any reader can load from it.
@@ -203,6 +236,7 @@ impl AgentSkillCatalog {
     }
 
     /// Rebuild only after an import or ACTIVE-pointer change is visible.
+    #[cfg(feature = "skills")]
     pub fn refresh_if_changed(
         &mut self,
         embedder: &Embedder,
@@ -240,6 +274,18 @@ fn signature_entry(path: PathBuf) -> Result<CatalogSignatureEntry, CatalogError>
     })
 }
 
+fn bounded_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, CatalogError> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        if entries.len() == 1024 {
+            return Err(CatalogError::ResourceLimit);
+        }
+        entries.push(entry?);
+    }
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
+}
+
 fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
     let root_entry = match signature_entry(root.to_path_buf()) {
         Ok(entry) => entry,
@@ -253,14 +299,12 @@ fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
     };
     let mut entries = vec![root_entry];
     let mut unavailable_packages = Vec::new();
-    let mut names = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    names.sort_by_key(|entry| entry.file_name());
+    let names = bounded_directory_entries(root)?;
     for name in names {
         let package_entries = (|| -> Result<Vec<CatalogSignatureEntry>, CatalogError> {
             let mut entries = vec![signature_entry(name.path())?];
             if name.file_type()?.is_dir() {
-                let mut children = fs::read_dir(name.path())?.collect::<Result<Vec<_>, _>>()?;
-                children.sort_by_key(|entry| entry.file_name());
+                let children = bounded_directory_entries(&name.path())?;
                 for child in children {
                     entries.push(signature_entry(child.path())?);
                 }
@@ -268,7 +312,12 @@ fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
             Ok(entries)
         })();
         match package_entries {
-            Ok(package_entries) => entries.extend(package_entries),
+            Ok(package_entries) => {
+                if entries.len().saturating_add(package_entries.len()) > 4096 {
+                    return Err(CatalogError::ResourceLimit);
+                }
+                entries.extend(package_entries);
+            }
             // Retry the package signature on every refresh check. Recording its unavailable
             // state prevents unnecessary index rebuilds while still detecting repairs.
             Err(_) => unavailable_packages.push(name.path()),
@@ -283,6 +332,7 @@ fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
 fn scan_record(
     root: &Path,
     name_entry: &fs::DirEntry,
+    bytes_left: &mut u64,
 ) -> Result<Option<AgentSkillRecord>, CatalogError> {
     let name_root = name_entry.path();
     portable::ensure_no_link_traversal(root, &name_root)?;
@@ -293,15 +343,16 @@ fn scan_record(
     portable::ensure_no_link_traversal(root, &digest_root)?;
     let markdown_path = digest_root.join("SKILL.md");
     let metadata = fs::symlink_metadata(&markdown_path)?;
-    if !metadata.is_file() || metadata.len() > MAX_SKILL_MD_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_SKILL_MD_BYTES || metadata.len() > *bytes_left {
         return Ok(None);
     }
+    *bytes_left = bytes_left.saturating_sub(metadata.len());
     let markdown = super::import::read_stable_file(&markdown_path, MAX_SKILL_MD_BYTES, false)?;
     let manifest = parse_skill_markdown(&markdown)?;
     if name_entry.file_name().to_string_lossy() != manifest.name {
         return Ok(None);
     }
-    let resources = resources(&digest_root, markdown.len() as u64)?;
+    let resources = resources(&digest_root, markdown.len() as u64, bytes_left)?;
     let mut tags = manifest
         .metadata
         .get("tags")
@@ -349,8 +400,8 @@ fn select_active_digest(name_root: &Path) -> Result<Option<String>, CatalogError
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut digests = fs::read_dir(name_root)?
-        .filter_map(Result::ok)
+    let mut digests = bounded_directory_entries(name_root)?
+        .into_iter()
         .filter_map(|entry| {
             entry
                 .file_type()
@@ -390,13 +441,18 @@ fn validate_digest(digest: &str) -> Result<(), CatalogError> {
     }
 }
 
-fn resources(root: &Path, instruction_bytes: u64) -> Result<Vec<ResourceMetadata>, CatalogError> {
+fn resources(
+    root: &Path,
+    instruction_bytes: u64,
+    remaining: &mut u64,
+) -> Result<Vec<ResourceMetadata>, CatalogError> {
     fn visit(
         root: &Path,
         current: &Path,
         depth: usize,
         entries: &mut usize,
         bytes_left: &mut u64,
+        remaining: &mut u64,
         output: &mut BTreeMap<String, ResourceMetadata>,
     ) -> Result<(), CatalogError> {
         for entry in fs::read_dir(current)? {
@@ -409,7 +465,15 @@ fn resources(root: &Path, instruction_bytes: u64) -> Result<Vec<ResourceMetadata
             portable::ensure_no_link_traversal(root, &path)?;
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
-                visit(root, &path, depth + 1, entries, bytes_left, output)?;
+                visit(
+                    root,
+                    &path,
+                    depth + 1,
+                    entries,
+                    bytes_left,
+                    remaining,
+                    output,
+                )?;
             } else if metadata.is_file() {
                 let relative = path
                     .strip_prefix(root)
@@ -417,9 +481,10 @@ fn resources(root: &Path, instruction_bytes: u64) -> Result<Vec<ResourceMetadata
                     .to_string_lossy()
                     .replace('\\', "/");
                 if relative != "SKILL.md" {
-                    if metadata.len() > *bytes_left {
+                    if metadata.len() > *bytes_left || metadata.len() > *remaining {
                         return Err(CatalogError::ResourceLimit);
                     }
+                    *remaining = remaining.saturating_sub(metadata.len());
                     let bytes = super::import::read_stable_file(
                         &path,
                         super::import::MAX_FILE_BYTES.min(*bytes_left),
@@ -445,7 +510,15 @@ fn resources(root: &Path, instruction_bytes: u64) -> Result<Vec<ResourceMetadata
         .ok_or(CatalogError::ResourceLimit)?;
     let mut entries = 0;
     let mut output = BTreeMap::new();
-    visit(root, root, 0, &mut entries, &mut bytes_left, &mut output)?;
+    visit(
+        root,
+        root,
+        0,
+        &mut entries,
+        &mut bytes_left,
+        remaining,
+        &mut output,
+    )?;
     Ok(output.into_values().collect())
 }
 
@@ -454,4 +527,28 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod bounded_signature_tests {
+    #[test]
+    fn aggregate_signature_entries_are_capped_across_package_directories() {
+        let root = crate::tests::OwnedTestDirectory::new("skill-signature-cap");
+        for package in 0..5 {
+            let dir = root.path().join(format!("package{package}"));
+            std::fs::create_dir(&dir).unwrap();
+            for version in 0..820 {
+                std::fs::write(dir.join(format!("version{version}")), b"").unwrap();
+            }
+        }
+        assert!(matches!(
+            super::catalog_signature(root.path()),
+            Err(super::CatalogError::ResourceLimit)
+        ));
+        std::fs::remove_dir_all(root.path().join("package4")).unwrap();
+        assert_eq!(
+            super::catalog_signature(root.path()).unwrap().entries.len(),
+            3285
+        );
+    }
 }

@@ -638,6 +638,9 @@ pub struct Session {
     /// Artifact handoff shared by every rebuild of this logical session.
     #[serde(skip)]
     pub(crate) tool_result_spills: ToolResultSpillStore,
+    #[cfg(feature = "agent-skills")]
+    #[serde(skip)]
+    pub(crate) instruction_owner: std::sync::Arc<crate::extras::skills::session::InstructionOwner>,
     /// Process-local JSON scratch state shared by JavaScript tools across agent rebuilds.
     #[cfg(feature = "js")]
     #[serde(skip)]
@@ -847,6 +850,8 @@ impl Session {
             goal_store: crate::extras::goal::GoalStore::default(),
             read_tracker: crate::agent::tools::ReadTracker::default(),
             tool_result_spills: ToolResultSpillStore::default(),
+            #[cfg(feature = "agent-skills")]
+            instruction_owner: Default::default(),
             #[cfg(feature = "js")]
             js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
             #[cfg(feature = "multimodal")]

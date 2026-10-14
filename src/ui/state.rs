@@ -49,6 +49,18 @@ impl<'a> UiContext<'a> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn instruction_services(
+        &self,
+    ) -> anyhow::Result<Arc<crate::extras::skills::session::InstructionServices>> {
+        Ok(self.session.instruction_owner.resolve(
+            crate::paths::process_paths()?,
+            self.workspace.clone(),
+            self.permission.clone(),
+            self.cli.resolve_no_context_files(self.cfg),
+        ))
+    }
+
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     pub(crate) fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
@@ -395,6 +407,10 @@ pub(crate) struct AgentRunState {
     /// Clarification identity of the logical main user turn. Automatic
     /// phases, retries and context relief preserve this exact slot.
     pub question_turn: Option<crate::question::QuestionTurn>,
+    #[cfg(feature = "agent-skills")]
+    pub instruction_turn: Option<Arc<crate::extras::skills::session::InstructionTurn>>,
+    #[cfg(feature = "agent-skills")]
+    pub pending_skill_turn: Option<Arc<crate::extras::skills::session::InstructionTurn>>,
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,

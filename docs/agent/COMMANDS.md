@@ -719,3 +719,40 @@ accounting and the current provider anchor so the total exactly matches the
 context count in the status line. The pruning projection uses the same retained
 history policy as the next request. The displayed compaction thresholds do not
 trigger compaction.
+
+## Agent Skills
+
+`/skills` lists currently authorized instruction skills with their names, origins and descriptions,
+and opens the command picker. `/<skill-name> [arguments]` pins that exact skill for the next ordinary
+user turn, including its automatic continuations. The arguments are literal user text: they do not
+expand shell variables, file includes or permission directives. A later explicit user prompt removes
+the pin. Built-in commands and custom command templates take precedence over skill names.
+
+Discovery checks explicitly imported packages first, then captured project `.zerostack/skills`,
+`.mini-agent/skills` and `.claude/skills`, then the captured user's `~/.claude/skills`. First valid name
+wins. Project sources use the existing project-config trust fingerprint; each original source also
+requires current read authority. An Ask or Deny source is omitted without prompting or granting.
+Links, special files, hard links and escaping resources are refused. Scripts and `allowed-tools`
+remain inert. A pin that has changed, lost authority or cannot fit the shared context budget fails
+visibly before adding the prompt to history or making a model request.
+
+The default `agent-skills` feature enables instruction discovery without the learned-JS store.
+`skills` additionally enables the existing learned-JS verification, ABI and capability lifecycle.
+Automatic matching remains lexical on the deterministic backend; semantic ranking uses the
+explicitly configured semantic embedder in learned-skills builds. `--no-context-files` suppresses
+automatic directory discovery; explicit `/skills` and skill commands still apply normal trust and
+read checks. While a turn is busy `/skills` displays only its already captured catalogue.
+
+For the actual native Anthropic adapter, the initial selected instruction/learned block stays fixed
+for the captured turn. Later successful `skills_search` calls carry new bounded guidance in their
+actual canonical tool result, under the static instruction policy; system and tool definitions stay
+unchanged before retained signed thinking. This is not opaque replay across frontend turns (that
+separate lifecycle is still governed by native history compatibility). Redaction, spill rewriting,
+or removal of an expected native result stops locally before another model request and never
+restores removed bytes. The initial block is at most 64 KiB, search metadata 8 KiB, a complete native
+search result 80 KiB, and the exact runner retains at most 16 delivery receipts. These are consistency
+checks, never permission grants or cryptographic signature verification. Combined learned/instruction
+search stages its callable and instruction selections until the exact captured turn's intact final
+host result commits them once. A rewritten or spilled result leaves live callable lookup, routing
+and attribution unchanged; cancellation or a later user turn rejects stale candidates. Existing
+learned ABI, lease, scope and admission checks remain in force.

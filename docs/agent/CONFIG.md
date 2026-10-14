@@ -3387,3 +3387,15 @@ read access to its stored source, outputs or metadata.
 raw JSON, raw edit hashes or whole-file overwrite authorization. The cell view
 is not a full raw-file read. See [Notebook cells](TOOL_RUNTIME.md#notebook-cells)
 for the bounded format and output limits.
+
+Instruction-only Agent Skills are available with the default `agent-skills` Cargo feature. Their
+captured project sources share the existing `.zerostack/config.toml` trust approval; no new trust
+file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a 64-package ceiling. Directory roots share a scan
+budget of 1,024 entries, depth 8, 48 KiB per `SKILL.md`, 1 MiB per resource and 8 MiB of
+content. Selected instruction bodies share a 48 KiB budget, referenced resources 32 KiB, and the
+post-escape instruction/learned manifest block 64 KiB. Discovered packages are copied into isolated
+content-addressed cache namespaces and never repoint explicitly imported packages' `ACTIVE` files.
+
+Imported catalogue metadata is bounded separately to 1,024 names and 4,096 aggregate signature entries,
+with 8 MiB of lexical-load content. List descriptions are sanitized to one line and 384 UTF-8 bytes;
+model search metadata has a separate final encoded 8 KiB limit.
