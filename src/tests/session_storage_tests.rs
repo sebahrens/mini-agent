@@ -40,6 +40,13 @@ fn setup_test_env() -> TestEnv {
         ("ZS_CONFIG_DIR", Some(data_dir.clone().into())),
         ("ZS_STATE_DIR", Some(data_dir.clone().into())),
     ]);
+    // Elevated Windows tokens can give generic CreateDirectory an
+    // Administrators owner. Create this missing private fixture through the
+    // same explicit current-user descriptor as production; existing roots
+    // remain subject to the unchanged strict owner check.
+    #[cfg(windows)]
+    crate::paths::ensure_private_directory(&dir.join("sessions")).unwrap();
+    #[cfg(not(windows))]
     std::fs::create_dir_all(dir.join("sessions")).unwrap();
     TestEnv {
         dir,
