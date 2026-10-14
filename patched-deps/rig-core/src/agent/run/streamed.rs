@@ -282,6 +282,7 @@ pub enum StreamedTurnEvent {
         /// Whether the ingested final item should be forwarded to the
         /// consumer (set when the turn streamed text).
         emit_final: bool,
+        native_end_turn: bool,
     },
 }
 
@@ -471,7 +472,11 @@ impl StreamedTurnAssembler {
                 let usage = final_response.token_usage();
                 let emit_final = self.saw_text;
                 self.saw_text = false;
-                Ok(vec![StreamedTurnEvent::Completed { usage, emit_final }])
+                Ok(vec![StreamedTurnEvent::Completed {
+                    usage,
+                    emit_final,
+                    native_end_turn: final_response.native_anthropic_end_turn(),
+                }])
             }
             StreamedAssistantContent::Unknown(_) => {
                 // Unmodeled provider item (e.g. a hosted-tool result): forward it

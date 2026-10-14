@@ -723,3 +723,9 @@ these two inert `String::contains` contexts, each with a count of one.
 No scanner, process
 creation classification, or negative validator is changed. Formatter execution
 uses the existing sandbox command owner and creation boundary.
+
+The shared native binding control in `src/provider_effort_replay_probe.rs` adds
+one named `std::thread::Builder` thread with an explicit 1 MiB stack. Like the
+existing capture control, it joins before its owned fake HTTP fixture teardown.
+Both exact `.spawn(|| {` sites are `NON-PROCESS`; neither creates a command,
+worker, security grant, or independent accounting owner.

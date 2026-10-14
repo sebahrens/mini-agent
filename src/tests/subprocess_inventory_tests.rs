@@ -911,7 +911,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/provider_effort_replay_probe.rs",
         ".spawn(|| {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // Exact owned/joined context63 1MiB Rust thread, never an OS process.
@@ -4633,7 +4633,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/provider_effort_replay_probe.rs",
         ".spawn(|| {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // Exact owned/joined context63 1MiB Rust thread, never an OS process.

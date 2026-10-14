@@ -1016,6 +1016,7 @@ where
                 prepared.allowed_tool_names.clone(),
             );
             let mut completion_call_emitted = false;
+            let mut native_end_turn = false;
             let mut turn_abandoned = false;
             // Mirrors the blocking driver's `response_hook_suppressed`: a turn
             // whose invalid tool call was repaired is a recovered turn, so its
@@ -1129,7 +1130,8 @@ where
                                 },
                             ));
                         }
-                        StreamedTurnEvent::Completed { usage, emit_final } => {
+                        StreamedTurnEvent::Completed { usage, emit_final, native_end_turn: reported_native_end_turn } => {
+                            native_end_turn = reported_native_end_turn;
                             match emit_completion_call!(usage) {
                                 Ok(Some(item)) => yield Ok(item),
                                 Ok(None) => {}
@@ -1316,6 +1318,7 @@ where
                             turn: hook_ctx.turn(),
                             content: &canonical_choice,
                             usage: last_usage,
+                            native_end_turn,
                         })
                         .await,
                 )

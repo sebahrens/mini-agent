@@ -21,6 +21,9 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
         session.messages.len() <= MAX_SESSION_MESSAGES,
         "persisted session exceeds the message limit"
     );
+    session
+        .validate_native_persistence()
+        .map_err(anyhow::Error::from)?;
     Ok(session)
 }
 
@@ -200,6 +203,9 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     if disabled("sessions") {
         return Ok(());
     }
+    session
+        .validate_native_persistence()
+        .map_err(anyhow::Error::from)?;
     let json = serialize_bounded_session(session)?;
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;

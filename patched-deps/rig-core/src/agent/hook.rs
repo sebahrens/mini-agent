@@ -509,6 +509,9 @@ pub enum StepEvent<'a, M: CompletionModel> {
         content: &'a OneOrMany<AssistantContent>,
         /// Token usage for this turn (zeroed if the provider reported none).
         usage: Usage,
+        /// Runtime-only native streaming end_turn report; absent/default false
+        /// for other protocols, recovered turns and unreported reasons.
+        native_end_turn: bool,
     },
     /// The model emitted a tool call that is unknown or disallowed for this
     /// turn. Honors [`Flow::Fail`] (the default), [`Flow::Retry`],

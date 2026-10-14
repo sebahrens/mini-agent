@@ -2413,3 +2413,73 @@ async fn model_listing48_actual_redirect_keeps_captured_origin_auth_policy() {
             .is_err()
     );
 }
+
+#[test]
+fn native_replay_protocol_classifier_uses_actual_custom_adapter_and_api_style() {
+    use crate::provider::{AnyAgent, AnyAgentInner, OpenAiAgent, OpenAiModel};
+    use crate::session::native_replay::HistoryProtocol;
+    let agent_from_model = |model| {
+        let inner = match model {
+            AnyModel::Anthropic(model) => {
+                AnyAgentInner::Anthropic(rig::agent::AgentBuilder::new(model).build())
+            }
+            AnyModel::OpenRouter(model, _) => {
+                AnyAgentInner::OpenRouter(rig::agent::AgentBuilder::new(model).build())
+            }
+            AnyModel::OpenAI(OpenAiModel::Responses(model)) => AnyAgentInner::OpenAI(
+                OpenAiAgent::Responses(rig::agent::AgentBuilder::new(model).build()),
+            ),
+            AnyModel::OpenAI(OpenAiModel::Completions(model)) => AnyAgentInner::OpenAI(
+                OpenAiAgent::Completions(rig::agent::AgentBuilder::new(model).build()),
+            ),
+            AnyModel::Gemini(model) => {
+                AnyAgentInner::Gemini(rig::agent::AgentBuilder::new(model).build())
+            }
+            AnyModel::Ollama(model) => {
+                AnyAgentInner::Ollama(rig::agent::AgentBuilder::new(model).build())
+            }
+        };
+        AnyAgent::without_skills(inner)
+    };
+    for (kind, api_style, expected) in [
+        ("anthropic", None, HistoryProtocol::AnthropicMessages),
+        (
+            "openrouter",
+            None,
+            HistoryProtocol::OpenRouterChatCompletions,
+        ),
+        (
+            "openai",
+            Some(ApiStyle::Responses),
+            HistoryProtocol::OpenAIResponses,
+        ),
+        (
+            "openai",
+            Some(ApiStyle::Completions),
+            HistoryProtocol::OpenAIChatCompletions,
+        ),
+        ("gemini", None, HistoryProtocol::GeminiGenerateContent),
+        ("ollama", None, HistoryProtocol::OllamaChat),
+    ] {
+        let mut custom = HashMap::new();
+        let mut definition = cfg(api_style);
+        definition.provider_type = kind.into();
+        definition.base_url = "https://native-classifier.example.test/route".into();
+        custom.insert("misleading-openai-anthropic-name".into(), definition);
+        let client = crate::provider::create_client_with_env(
+            "misleading-openai-anthropic-name",
+            Some("unused-fake-key"),
+            &custom,
+            None,
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .unwrap();
+        assert_eq!(client.history_protocol(), expected);
+        // Deliberately misleading model label: adapter classification wins.
+        let agent = agent_from_model(client.completion_model("claude-fable-5-1"));
+        assert_eq!(agent.history_protocol(), expected);
+        let restored: HistoryProtocol =
+            serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
+        assert_eq!(restored, expected);
+    }
+}

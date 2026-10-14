@@ -73,6 +73,53 @@ pub(crate) struct WorkspaceBinding {
 }
 
 impl WorkspaceBinding {
+    /// Bounded compatibility data, never a persisted workspace capability.
+    /// Check the path size before canonicalization or any owned encoding, and
+    /// validate both sides of reading the already-retained physical identity.
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn compatibility_fingerprint(&self) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+        const MAX_ROOT_ENCODING_BYTES: usize = 4 * 1024 * 1024;
+        let mut hash = Sha256::new();
+        hash.update(b"mini-agent.workspace-compatibility.v1\0");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = self.root.as_os_str().as_bytes();
+            if bytes.len() > MAX_ROOT_ENCODING_BYTES {
+                return Err("workspace path exceeds compatibility limits".into());
+            }
+            hash.update(b"unix-path\0");
+            hash.update(bytes);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            // Iterating the borrowed encoding does not allocate a Vec/String.
+            if self
+                .root
+                .as_os_str()
+                .encode_wide()
+                .take(MAX_ROOT_ENCODING_BYTES / 2 + 1)
+                .count()
+                > MAX_ROOT_ENCODING_BYTES / 2
+            {
+                return Err("workspace path exceeds compatibility limits".into());
+            }
+            hash.update(b"windows-path\0");
+            for unit in self.root.as_os_str().encode_wide() {
+                hash.update(unit.to_le_bytes());
+            }
+        }
+        self.validate()?;
+        hash.update(self.identity.identity_fingerprint());
+        self.validate()?;
+        Ok(hash.finalize().into())
+    }
+
     pub(crate) fn capture(path: &Path) -> io::Result<Self> {
         let root = std::fs::canonicalize(path)?;
         let capability = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
@@ -4048,5 +4095,43 @@ mod config69_clone_tests {
         std::fs::write(directory.join("control"), "replacement").unwrap();
         assert!(clone.validate().is_err());
         assert!(clone.try_clone().is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_workspace_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn native_host_workspace_fingerprint_is_retained_bounded_data() {
+        let root = crate::tests::OwnedTestDirectory::new("native-workspace-fingerprint");
+        let binding = WorkspaceBinding::capture(root.path()).unwrap();
+        let same = WorkspaceBinding::capture(root.path()).unwrap();
+        assert_eq!(
+            binding.compatibility_fingerprint().unwrap(),
+            same.compatibility_fingerprint().unwrap()
+        );
+        let mut oversized = WorkspaceBinding::capture(root.path()).unwrap();
+        oversized.root = PathBuf::from("x".repeat(4 * 1024 * 1024 + 1));
+        assert_eq!(
+            oversized.compatibility_fingerprint().unwrap_err(),
+            "workspace path exceeds compatibility limits"
+        );
+        assert!(binding.validate().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_same_path_workspace_replacement_refuses_old_binding() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-workspace-replacement");
+        let path = roots.path().join("workspace");
+        std::fs::create_dir(&path).unwrap();
+        let binding = WorkspaceBinding::capture(&path).unwrap();
+        let old = binding.compatibility_fingerprint().unwrap();
+        std::fs::rename(&path, roots.path().join("old-workspace")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(binding.compatibility_fingerprint().is_err());
+        let replacement = WorkspaceBinding::capture(&path).unwrap();
+        assert_ne!(replacement.compatibility_fingerprint().unwrap(), old);
     }
 }

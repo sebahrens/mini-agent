@@ -1094,6 +1094,38 @@ original committed bytes are not rolled back and its scoped process owner retain
 the existing retirement/forced-exit contract. An empty map preserves legacy tool
 output exactly.
 
+Native replay compatibility is recorded separately from the display feed in a
+bounded, protocol-specific envelope. The shared canonical commit binds the actual
+adapter, Session ID, preappend feed, cutoff, and compactions; after exact actor
+retirement it projects observed usage at captured prices without creating another
+receipt. Accepted native content that cannot attach advances a shared cutoff and
+persists a closed static refusal. Same-session clones retain denial; forks inherit
+an independent denied cell. Healthy legacy numeric cutoffs remain compatible.
+These helpers confer no permissions, instruction receipts, or runtime ownership.
+Frontend enablement and explicit durable fresh-context recovery are separate work.
+
+The lower native replay checkpoint fingerprints the exact preappend Session rows and compactions. Same-cutoff accepted progress that cannot attach persists a closed local refusal; a stale foreign-session or newer-cutoff binding cannot fence its successor. Retirement and refusal share one coherent in-memory checkpoint, and dropping an old retirement guard cannot clear an accepted refusal. Native completed acceptance is recorded before finite capture limits, so an oversized completed frame remains progress even when its opaque payload cannot be retained. Imported frames require exhaustive ordered opaque-block witnesses; untracked opaque base/input history is refused before native HTTP. These are lower-core attachment checks. Actor-backed terminal/reply-boundary adoption and recovery after a failed on-disk replacement remain separate controller requirements; live-clone refusal is not evidence of cross-process failed-save fencing.
+
+
+Native saved boundaries are attached only from the exact retired actor outcome:
+`Done` permits a completed boundary after its zero-tool structural check;
+`AwaitingUser` or an actual compaction pressure boundary permits a live reply
+only with the complete correlated typed tool-result tail. Cancellation and
+errors remain incomplete. Legacy wrapper calls default to incomplete, and an
+imported missing or unknown boundary cannot attest retirement. A signed or
+redacted-only native `end_turn` can truthfully produce `Done` with an empty
+visible answer; truncated, paused, unsigned, interrupted or unbound responses
+retain existing failure/continuation behavior. These lower shared helpers do
+not enable ordinary frontend replay or provide cross-process fencing after a
+failed disk replacement.
+
+Canonical Session usage projection belongs to the exact first retired owner
+claim. It preserves observed usage at captured prices even if a same-epoch
+edited feed refuses attachment. Foreign sessions, newer cutoffs, and duplicate
+retirement calls return before projection; lifecycle settlement uses the usage
+already recorded by its event consumer. Neither path creates another ledger
+receipt.
+
 
 ### Configuration layer ownership
 

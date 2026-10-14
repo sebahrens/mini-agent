@@ -506,6 +506,13 @@ pub trait GetTokenUsage {
     /// [`Usage`]'s documented sentinel for missing provider usage metrics;
     /// response types that carry no usage return [`Usage::new`].
     fn token_usage(&self) -> crate::completion::Usage;
+
+    /// Actual native Anthropic streaming terminal metadata. False for other
+    /// responses and missing/unknown reasons. This is not permission or billing
+    /// authority; consumers must also prove their actual native invocation.
+    fn native_anthropic_end_turn(&self) -> bool {
+        false
+    }
 }
 
 impl GetTokenUsage for () {

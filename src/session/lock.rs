@@ -129,6 +129,7 @@ pub(crate) fn held_elsewhere_error(session_id: &str) -> anyhow::Error {
 /// stores (todos, goal, read tracker) are not shared with the source.
 pub fn fork_session(source: &Session) -> anyhow::Result<Session> {
     let mut fork: Session = serde_json::from_value(serde_json::to_value(source)?)?;
+    fork.native_frontier = source.native_frontier.fork();
     fork.id = CompactString::new(Uuid::new_v4().to_string());
     if !fork.name.is_empty() {
         fork.name = CompactString::new(format!("{} (fork)", fork.name));

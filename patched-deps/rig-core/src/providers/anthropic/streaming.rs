@@ -252,9 +252,16 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    // Runtime-only producer metadata. Deserializing a saved/raw object cannot
+    // mint a terminal witness, and no untrusted stop string is retained.
+    #[serde(skip)]
+    native_end_turn: bool,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
+    fn native_anthropic_end_turn(&self) -> bool {
+        self.native_end_turn
+    }
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
         usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64;
@@ -282,9 +289,55 @@ where
     T: HttpClientExt + Clone + Default + 'static,
     Ext: AnthropicCompatibleProvider + Clone + WasmCompatSend + WasmCompatSync + 'static,
 {
-    pub(crate) async fn stream(
+    /// Compose the exact native streaming request without sending it. This
+    /// native-only view includes deferred definitions, raw overrides and cache
+    /// placement; callers must impose their own observation/persistence bounds.
+    /// It is consistency data, not a signature or account-identity verifier.
+    pub fn replay_request_body(
         &self,
         mut completion_request: CompletionRequest,
+    ) -> Result<Value, CompletionError> {
+        let request_model = completion_request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model.clone());
+        let max_tokens = completion_request
+            .max_tokens
+            .or(self.default_max_tokens)
+            .ok_or_else(|| {
+                CompletionError::RequestError("`max_tokens` must be set for Anthropic".into())
+            })?;
+        self.prepare_deferred_request(&mut completion_request)?;
+        create_streaming_request_body(
+            request_model,
+            completion_request,
+            max_tokens,
+            self.prompt_caching,
+            self.automatic_caching,
+            self.automatic_caching_ttl.clone(),
+        )
+    }
+
+    /// True only when this actual model applies the SDK's manual marker
+    /// placement. Hosts may exclude its generated last-block marker from a
+    /// local replay commitment; explicit markers in all other positions stay data.
+    pub fn replay_manual_cache_markers(&self) -> bool {
+        self.prompt_caching
+    }
+
+    /// Request URI without headers. A host retaining public route metadata
+    /// must first reject credential-bearing URI forms.
+    pub fn replay_endpoint(&self) -> Result<http::Uri, CompletionError> {
+        self.client
+            .post("/v1/messages")?
+            .uri_ref()
+            .cloned()
+            .ok_or_else(|| CompletionError::RequestError("invalid native request endpoint".into()))
+    }
+
+    pub(crate) async fn stream(
+        &self,
+        completion_request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse<StreamingCompletionResponse>, CompletionError>
     {
         let request_model = completion_request
@@ -311,25 +364,7 @@ where
         } else {
             tracing::Span::current()
         };
-        let max_tokens = if let Some(tokens) = completion_request.max_tokens {
-            tokens
-        } else if let Some(tokens) = self.default_max_tokens {
-            tokens
-        } else {
-            return Err(CompletionError::RequestError(
-                "`max_tokens` must be set for Anthropic".into(),
-            ));
-        };
-
-        self.prepare_deferred_request(&mut completion_request)?;
-        let body = create_streaming_request_body(
-            request_model,
-            completion_request,
-            max_tokens,
-            self.prompt_caching,
-            self.automatic_caching,
-            self.automatic_caching_ttl.clone(),
-        )?;
+        let body = self.replay_request_body(completion_request)?;
 
         if enabled!(Level::TRACE) {
             tracing::trace!(
@@ -357,6 +392,7 @@ where
             let mut sse_stream = Box::pin(stream);
             let mut accumulated_usage = PartialUsage::default();
             let mut final_usage = None;
+            let mut native_end_turn = false;
 
             let mut text_content = String::new();
 
@@ -384,6 +420,7 @@ where
                                             break;
                                         }
                                         if delta.stop_reason.is_some() {
+                                            native_end_turn = delta.stop_reason.as_deref() == Some("end_turn");
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&accumulated_usage);
                                             final_usage = Some(accumulated_usage.clone());
@@ -428,7 +465,8 @@ where
             sse_stream.close();
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
+                usage: final_usage.unwrap_or_default(),
+                native_end_turn,
             }))
         }.instrument(span));
 

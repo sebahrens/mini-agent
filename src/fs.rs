@@ -524,6 +524,44 @@ impl std::ops::Deref for CheckedMetadata {
 }
 
 impl CheckedMetadata {
+    /// Fixed-size compatibility data from the retained physical identity.
+    /// This digest is not a file capability and cannot reopen or authorize it.
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn identity_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"mini-agent.physical-file-identity.v1\0");
+        match self.identity {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            FileIdentity::Unix { device, inode } => {
+                hash.update(b"unix\0");
+                hash.update(device.to_le_bytes());
+                hash.update(inode.to_le_bytes());
+            }
+            #[cfg(target_os = "macos")]
+            FileIdentity::MacOs { filesystem, inode } => {
+                hash.update(b"macos\0");
+                for component in filesystem {
+                    hash.update(component.to_le_bytes());
+                }
+                hash.update(inode.to_le_bytes());
+            }
+            #[cfg(windows)]
+            FileIdentity::Windows {
+                volume_serial_number,
+                file_id,
+            } => {
+                hash.update(b"windows\0");
+                hash.update(volume_serial_number.to_le_bytes());
+                hash.update(file_id);
+            }
+        }
+        hash.finalize().into()
+    }
+
     /// The retained descriptor for the approved object. Only callers that know
     /// the handle was opened readable may read through it; `checked_path_metadata`
     /// uses `O_PATH` on Linux.

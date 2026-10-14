@@ -233,3 +233,34 @@ captured request endpoint/auth/version headers and configured HTTP backend for
 bounded listing GETs. It adds no client state and leaves completion request,
 streaming, native projection and cache-control semantics unchanged. The host's
 listing adapter owns pagination/body/deadline limits and redacted errors.
+
+## Lower native replay inspection (application delivery still separate)
+
+The native Anthropic model exposes its actual endpoint, manual-marker policy,
+and the existing streaming request-body factory through `replay_endpoint`,
+`replay_manual_cache_markers`, and `replay_request_body`. These helpers perform
+no network work and preserve deferred declarations and cache normalization.
+The application compares fully prepared bodies against bounded completed native
+content; imported compatibility data creates no runtime owner or permission.
+Generic provider order, Responses identity, tool dispatch and usage remain unchanged.
+
+### Native zero-visible terminal metadata (mini-agent-i7ro6.46.3)
+
+The native Anthropic streaming response retains a private, nonserialized flag
+only when the actual parsed `message_delta.stop_reason` equals `end_turn`.
+`GetTokenUsage` defaults this accessor to false for every other provider. The
+stream assembler carries it to the existing canonical `ModelTurnFinished`
+event even when no display-text final item is forwarded. Blocking completion
+conservatively reports false. Usage, tool dispatch and generic empty-answer
+continuation remain unchanged.
+
+The application uses this metadata only in an actual native invocation whose
+bounded capture has a valid prepared body/domain, completed signed or redacted
+content, no tool calls or visible answer, and a current healthy frontier. A new
+prepared request resets eligibility. Capture failure, truncation, paused or
+missing stop reasons, incomplete signatures, and unbound/other protocols do not
+become completion. The actual headless and interactive actor tests retain the
+opaque blocks without inventing answer text; a private reload receives an
+actor-backed saved boundary separately. The official [stop-reason contract](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
+distinguishes natural `end_turn` from token limits and paused tool work.
+This carrier is not saved runtime ownership, permissions, or billing metadata.

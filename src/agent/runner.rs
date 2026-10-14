@@ -1623,13 +1623,23 @@ fn usage_nonnegative_difference(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "shared API is intentionally dormant before its frontend consumer lands"
+)]
 fn completed_stream_delta(
     messages: Option<Vec<Message>>,
     current_prompt: &str,
 ) -> Result<Vec<Message>, &'static str> {
+    completed_stream_delta_message(messages, &Message::user(current_prompt.to_owned()))
+}
+
+fn completed_stream_delta_message(
+    messages: Option<Vec<Message>>,
+    expected_prompt: &Message,
+) -> Result<Vec<Message>, &'static str> {
     let mut messages = messages.ok_or("Rig final response omitted completed messages")?;
-    let expected_prompt = Message::user(current_prompt.to_owned());
-    if messages.first() != Some(&expected_prompt) {
+    if messages.first() != Some(expected_prompt) {
         return Err("Rig final response did not begin with the current prompt");
     }
     messages.remove(0);
@@ -2023,7 +2033,7 @@ pub fn convert_history_shared_with_tool_result_retention(
         return history;
     }
     let history: Arc<[Message]> =
-        convert_history_uncached(session, keep_recent_tool_results).into();
+        convert_history_uncached(session, keep_recent_tool_results, false).into();
     session.cache_converted_history(keep_recent_tool_results, Arc::clone(&history));
     history
 }
@@ -2092,13 +2102,32 @@ fn replay_call_identity(
     )
 }
 
-fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) -> Vec<Message> {
+/// Canonical ACP projection retains actual empty assistant boundaries and
+/// optional non-Responses IDs; legacy/Responses identity safety stays intact.
+#[cfg(feature = "acp")]
+#[allow(
+    dead_code,
+    reason = "shared canonical adapter precedes its ACP session consumer"
+)]
+pub(crate) fn convert_canonical_history_with_tool_result_retention(
+    session: &Session,
+    keep_recent_tool_results: usize,
+) -> Vec<Message> {
+    convert_history_uncached(session, keep_recent_tool_results, true)
+}
+
+fn convert_history_uncached(
+    session: &Session,
+    keep_recent_tool_results: usize,
+    canonical: bool,
+) -> Vec<Message> {
     let (summary, first_kept) = session.compacted_context();
     let replay_messages =
         session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
     let remaining = replay_messages.len().saturating_sub(first_kept);
     let extra = if summary.is_some() { 1 } else { 0 };
     let mut messages = Vec::with_capacity(remaining + extra);
+    let mut canonical_none_call_ids = std::collections::HashSet::new();
 
     // The compaction summary is emitted as an Assistant message rather
     // than a System message: the agent already has a System preamble
@@ -2195,13 +2224,16 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
         }
         match msg.role {
             MessageRole::User => {
-                messages.push(Message::user(msg.content.to_string()));
+                messages.push(msg.user.as_ref().map_or_else(
+                    || Message::user(msg.content.to_string()),
+                    crate::session::user::PersistedUserMessage::to_message,
+                ));
                 replay_kind = ReplayKind::Other;
             }
             // An empty assistant record (a round that ended in its accepted
             // `goal_report` with no closing text) carries nothing to replay,
             // and providers reject an empty text block.
-            MessageRole::Assistant if msg.content.is_empty() => {}
+            MessageRole::Assistant if msg.content.is_empty() && !canonical => {}
             MessageRole::Assistant => {
                 messages.push(Message::assistant(msg.content.to_string()));
                 replay_kind = ReplayKind::Assistant;
@@ -2226,12 +2258,27 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                         // Reasoning first: the Responses API requires the
                         // `reasoning` item to precede the `function_call` it
                         // was emitted with, in the same assistant turn.
-                        items.push(AssistantContent::tool_call_with_call_id(
+                        let preserve_none = canonical
+                            && !identity.item_id.starts_with("fc_")
+                            && session.provenance_for_tool_call(id.as_str()).is_some_and(
+                                |provenance| {
+                                    provenance.provider_call_id.is_none()
+                                        && provenance.provider_item_id.as_deref()
+                                            == Some(id.as_str())
+                                },
+                            );
+                        if preserve_none {
+                            canonical_none_call_ids.insert(id.to_string());
+                        }
+                        let mut call = rig::message::ToolCall::new(
                             identity.item_id.clone(),
-                            identity.call_id.clone(),
-                            name.to_string(),
-                            arguments.clone(),
-                        ));
+                            rig::message::ToolFunction {
+                                name: name.to_string(),
+                                arguments: arguments.clone(),
+                            },
+                        );
+                        call.call_id = (!preserve_none).then(|| identity.call_id.clone());
+                        items.push(AssistantContent::ToolCall(call));
                         replay_identities.insert(id.to_string(), identity);
                         Some(items)
                     }
@@ -2275,7 +2322,8 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                                 });
                         Some(UserContent::ToolResult(ToolResult {
                             id: identity.item_id,
-                            call_id: Some(identity.call_id),
+                            call_id: (!canonical_none_call_ids.contains(id.as_str()))
+                                .then_some(identity.call_id),
                             content: OneOrMany::one(ToolResultContent::text(output.to_string())),
                         }))
                     }
@@ -2477,12 +2525,38 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let message = Message::user(original_prompt.to_owned());
+    crate::startup::heap_future(|| {
+        continue_prompt_message_injector(
+            agent,
+            &message,
+            retry_history,
+            continuation_bridge,
+            max_turns,
+            native_capture,
+        )
+    })
+    .await
+}
+
+async fn continue_prompt_message_injector<M>(
+    agent: &Agent<M>,
+    original_prompt: &Message,
+    retry_history: &[Message],
+    continuation_bridge: &[Message],
+    max_turns: usize,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
+) -> StreamingResult<M::StreamingResponse>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
     let (current_prompt, bridge_history) = continuation_bridge
         .split_last()
         .expect("continuation bridge always ends with the continuation prompt");
     debug_assert!(matches!(current_prompt, Message::User { .. }));
     let mut new_history = retry_history.to_vec();
-    new_history.push(Message::user(original_prompt.to_string()));
+    new_history.push(original_prompt.clone());
     new_history.extend_from_slice(bridge_history);
     agent
         .stream_chat(current_prompt.clone(), new_history)
@@ -2583,7 +2657,7 @@ where
     let work_scope = AgentWorkScope::new();
     spawn_agent_with_start_mode(
         agent,
-        prompt,
+        crate::agent::input::PromptInput::text(prompt),
         history.into(),
         retry_config,
         turn_token_budget,
@@ -2630,6 +2704,10 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "shared API is intentionally dormant before its frontend consumer lands"
+)]
 pub(crate) fn spawn_agent_paused_in_scope<M>(
     agent: Agent<M>,
     prompt: String,
@@ -2662,9 +2740,46 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "shared API is intentionally dormant before its frontend consumer lands"
+)]
 pub(crate) fn spawn_agent_paused_in_scope_with_native_capture<M>(
     agent: Agent<M>,
     prompt: String,
+    history: Arc<[Message]>,
+    retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    completion_verification: Option<CompletionVerification>,
+    work_scope: Arc<AgentWorkScope>,
+    native_capture: crate::agent::native_capture::NativeCaptureHook,
+) -> PausedAgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    spawn_agent_paused_input_in_scope_with_native_capture(
+        agent,
+        crate::agent::input::PromptInput::text(prompt),
+        history,
+        retry_config,
+        turn_token_budget,
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        completion_verification,
+        work_scope,
+        native_capture,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_agent_paused_input_in_scope_with_native_capture<M>(
+    agent: Agent<M>,
+    prompt: crate::agent::input::PromptInput,
     history: Arc<[Message]>,
     retry_config: RetryConfig,
     turn_token_budget: Option<u64>,
@@ -2721,7 +2836,7 @@ where
     let work_scope = AgentWorkScope::new();
     spawn_agent_with_start_mode(
         agent,
-        prompt,
+        crate::agent::input::PromptInput::text(prompt),
         history.into(),
         retry_config,
         turn_token_budget,
@@ -2741,7 +2856,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_with_start_mode<M>(
     agent: Agent<M>,
-    prompt: String,
+    prompt: crate::agent::input::PromptInput,
     history: Arc<[Message]>,
     retry_config: RetryConfig,
     turn_token_budget: Option<u64>,
@@ -2792,7 +2907,7 @@ where
         let _turn_guard = turn_guard;
         tracing::debug!(
             "spawn_agent: prompt_len={}, history_len={}, max_attempts={}",
-            prompt.len(),
+            prompt.literal_text().len(),
             history.len(),
             retry_config.max_attempts,
         );
@@ -2800,7 +2915,7 @@ where
         // Rig requires an owned prompt/history for each API attempt, so the
         // attempt below clones exactly once; avoid making additional full
         // copies before any request has even started.
-        let retry_prompt = prompt;
+        let retry_message = prompt.to_message();
         let retry_history = history;
         let mut first_attempt_history = Some(retry_history.to_vec());
         let mut interactions: Vec<Message> = Vec::new();
@@ -2882,7 +2997,7 @@ where
             let result = retry::retry_stream_chat_with(
                 &retry_config,
                 || {
-                    let prompt = retry_prompt.clone();
+                    let prompt = retry_message.clone();
                     let history = first_attempt_history
                         .take()
                         .unwrap_or_else(|| retry_history.to_vec());
@@ -3092,6 +3207,7 @@ where
                         ) else {
                             continue;
                         };
+                        native_capture.tool_result(&internal_call_id, &tool_result);
                         tracing::debug!(
                             "agent tool result: name={}, output_len={}",
                             tool_name,
@@ -3134,9 +3250,13 @@ where
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
-                        let completed_delta = match completed_stream_delta(
+                        let expected_prompt = stream_prompt.as_ref().map_or_else(
+                            || retry_message.clone(),
+                            |prompt| Message::user(prompt.clone()),
+                        );
+                        let completed_delta = match completed_stream_delta_message(
                             res.messages.clone(),
-                            stream_prompt.as_deref().unwrap_or(&retry_prompt),
+                            &expected_prompt,
                         ) {
                             Ok(messages) => messages,
                             Err(error) => {
@@ -3208,6 +3328,7 @@ where
                         if terminal_was_streamed
                             || !response_text.is_empty()
                             || goal_report_accepted
+                            || native_capture.completes_without_visible_text()
                         {
                             let verification_ran = workspace_may_have_changed
                                 && completion_verification
@@ -3502,9 +3623,9 @@ where
             completed_interactions = continuation_bridge.clone();
             stream_prompt = Some(continuation_instruction.clone());
             stream = stream_policy.apply(
-                continue_prompt_injector(
+                continue_prompt_message_injector(
                     &agent,
-                    &retry_prompt,
+                    &retry_message,
                     &retry_history,
                     &continuation_bridge,
                     remaining_turns,
@@ -3991,6 +4112,7 @@ where
                     ) else {
                         continue;
                     };
+                    native_capture.tool_result(&internal_call_id, &tool_result);
                     #[cfg(feature = "acp")]
                     crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                     goal_report_accepted |= is_accepted_goal_report(&name, &output);
@@ -4071,7 +4193,9 @@ where
                     // A round whose work ended in an accepted `goal_report` has
                     // said what it had to say; it is complete, not empty
                     // (mini-agent-64qyf).
-                    if full_response.len() == response_len_at_stream_start && !goal_report_accepted
+                    if full_response.len() == response_len_at_stream_start
+                        && !goal_report_accepted
+                        && !native_capture.completes_without_visible_text()
                     {
                         empty_response_count += 1;
                         if empty_response_count >= MAX_EMPTY_RESPONSES {
@@ -4960,6 +5084,75 @@ mod tests {
         assert_eq!(
             model.requests()[2].chat_history.last_ref(),
             &Message::user(TRANSIENT_PROVIDER_CONTINUATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_user53_runner_retains_exact_images_on_interrupted_retry() {
+        let user = crate::session::user::PersistedUserMessage::new(vec![
+            crate::session::user::UserBlock::Text {
+                text: "before 雪".into(),
+            },
+            crate::session::user::UserBlock::Image {
+                data: "aW5lcnQ=".into(),
+                mime_type: crate::session::user::ImageMime::Png,
+            },
+            crate::session::user::UserBlock::Text {
+                text: "after $HOME @file".into(),
+            },
+        ])
+        .unwrap();
+        let expected = user.to_message();
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::error("socket connection reset")],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_paused_input_in_scope_with_native_capture(
+            agent,
+            crate::agent::input::PromptInput::user(user),
+            Vec::new().into(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            None,
+            super::AgentWorkScope::new(),
+            crate::agent::native_capture::NativeCaptureHook::default(),
+        )
+        .start();
+        let mut retries = 0;
+        loop {
+            match runner.event_rx.recv().await.expect("owned runner terminal") {
+                crate::event::AgentEvent::Retrying { .. } => retries += 1,
+                crate::event::AgentEvent::Done { interactions, .. } => {
+                    assert_eq!(interactions.last(), Some(&Message::assistant("recovered")));
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        while runner.event_rx.recv().await.is_some() {}
+        assert_eq!(retries, 1);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].chat_history.last_ref(), &expected);
+        assert_eq!(requests[1].chat_history.first_ref(), &expected);
+        assert_eq!(
+            requests[1]
+                .chat_history
+                .iter()
+                .filter(|row| *row == &expected)
+                .count(),
+            1
         );
     }
 
@@ -5915,7 +6108,7 @@ mod tests {
             .build();
         let mut runner = super::spawn_agent_with_start_mode(
             agent,
-            "change the workspace".to_string(),
+            crate::agent::input::PromptInput::text("change the workspace".to_string()),
             Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,
@@ -6000,7 +6193,7 @@ mod tests {
             .build();
         let mut runner = super::spawn_agent_with_start_mode(
             agent,
-            "change the workspace".to_string(),
+            crate::agent::input::PromptInput::text("change the workspace".to_string()),
             Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,

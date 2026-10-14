@@ -1,0 +1,200 @@
+{
+  "scope": [
+    "mini-agent-i7ro6.53.1 bounded readonly storage",
+    "mini-agent-i7ro6.46.2 exact attachment and refusal settlement",
+    "mini-agent-i7ro6.46.3 native terminal reason through invocation-owned actor"
+  ],
+  "prerequisites": [
+    "config69 integrated in6e92b7e2",
+    "typed storage integrated in6a67abcc"
+  ],
+  "reviewed_source_patch_sha256": "22444c10c4e3bd7aeff3b630945f3c141cb54b9b4844911e118a4e9575716cf2",
+  "reused_evidence": {
+    "/private/tmp/mini-agent-effort46-shared-core-checkpoint-manifest.json": "161313a7e9f1231a28f09e410aa0b90554a1e7c3c9da5a1185f3860f985038aa",
+    "/private/tmp/mini-agent-effort46-2-attachment-audit-manifest.json": "dceba4e236a8e8817ae344e6a6bf5dab2947af395e28d8ff7b030210fb1dd199",
+    "/private/tmp/mini-agent-effort46-2-retirement-once-manifest.json": "24ad3229b028c0bf1d03bc1b4293f4e7ffb956ac0884c1f9c40c34936a9fc10d",
+    "/private/tmp/mini-agent-effort46-2-canonical-accounting-manifest.json": "a4620ca644a959bba616ca2d04722f7d04109fe8746998d3eb0d33e3e0e22d26",
+    "/private/tmp/mini-agent-effort46-3-native-terminal-metadata-manifest.json": "a34311aba22e2423b460d4dfa838cf54884caf3db8da15a62c7c332e2383e51c",
+    "/private/tmp/mini-agent-effort46-retired-outcome-api-manifest.json": "70af94a796db098b22563fea519424f1c8c20a52cdd0dbe5ce41f72bcd349335",
+    "/private/tmp/mini-agent-native46-host-workspace-getter-checkpoint.manifest.json": "cca4c2c29fd0e0ffedf10945df6b4e392f54b3191ead89bb5b4dadd9ce08cfe8",
+    "/private/tmp/mini-agent-session53-readonly-storage-273-manifest.json": "099283d520974c32d2db361c46ed57f46ed7cb68f22bf27fc5867c61ebf7e55c",
+    "/private/tmp/mini-agent-acp53-typed-save-validation-followup-manifest.json": "7cb01e7fec054b6eea207ac7cc184e1671817726d95f302ea164083ef276dcea",
+    "/private/tmp/mini-agent-storage-readonly-wave39b-frozen-manifest.json": "abcdbb6a702c7bb39ededb623a5753bc15a9bd33780a6350266d05ac38236264",
+    "/private/tmp/mini-agent-acp53-ordinary-media-adapter-review-manifest.json": "22c0def3849c891fc40ffc6f5243da466a0a42254b1c60a26846b7b034602afa"
+  },
+  "acceptance": {
+    "53.1": [
+      {
+        "requirement": "Exact/noncreating/nonrepairing bounded import, ID/cwd/private identity/link checks, cleared grants/redo",
+        "proof": "native exact importer complete execution after test-only observer retirement",
+        "run": 38553324781,
+        "job": 115816291915,
+        "result": "1 passed0failed0ignored0.11s",
+        "artifact": "/private/tmp/mini-agent-storage-readonly39b-hosted-final-proof.json",
+        "log": "/private/tmp/mini-agent-storage-readonly39b-hosted-job.log"
+      },
+      {
+        "requirement": "Actual Windows broader file/root DACL refusal without repair and healthy restored positives",
+        "proof": "actual native owning ACL test, not discovery",
+        "run": 38551277994,
+        "job": 115809554555,
+        "result": "PASS file+directory refusal/unchanged ACL+restored positive",
+        "artifact": "/private/tmp/mini-agent-storage-rights-wave39-hosted-acceptance-limits.json",
+        "log": "/private/tmp/mini-agent-storage-rights-wave39-hosted-job.log"
+      },
+      {
+        "requirement": "Actual8MiB bounded single-pass save before create/claim/replace, prior artifact unchanged; typed row projection validated",
+        "proof": "same native source run storage global bound PASS; typed6cc proof and Root wave38 scoped9+headless2+debug install33.16s reused",
+        "run": 38551277994,
+        "job": 115809554555,
+        "result": "session_storage_global_limit_refuses_before_creating_and_keeps_errors_static PASS",
+        "artifact": "/private/tmp/mini-agent-acp53-typed-save-validation-followup-manifest.json"
+      }
+    ],
+    "46.2": [
+      {
+        "requirement": "Same-count edited preappend bytes and compaction/frame drift refuse; clone/fork/save/reload retain denial; foreign/newcutoff not poisoned",
+        "filters": [
+          "effort46_shared_binding_and_denial_on_one_mib",
+          "native_accepted_refusal_survives_an_active_retirement_and_its_drop",
+          "native_refusal_cutoff_is_shared_persisted_and_forked_without_runtime_owners",
+          "stale_refusal_cannot_poison_a_newer_cutoff_and_counter_exhaustion_stays_denied"
+        ],
+        "artifact": "/private/tmp/mini-agent-effort46-2-attachment-audit-manifest.json",
+        "logs": [
+          "/private/tmp/mini-agent-effort46-2-preappend-red.log",
+          "/private/tmp/mini-agent-effort46-2-preappend-green.log",
+          "/private/tmp/mini-agent-effort46-2-checkpoint-final.log",
+          "/private/tmp/mini-agent-native46-landing-d2-one-mib-integration-final.log"
+        ]
+      },
+      {
+        "requirement": "Unchanged canonical/missing-row controls and duplicate commit/settle preserve healthy chain",
+        "filters": [
+          "effort46_native_canonical_commit_once_does_not_refuse_attached_chain",
+          "effort46_canonical_commit_generic_once_stale_and_captured_prices_without_receipts"
+        ],
+        "artifact": "/private/tmp/mini-agent-effort46-2-retirement-once-manifest.json",
+        "logs": [
+          "/private/tmp/mini-agent-effort46-2-native-once-green.log",
+          "/private/tmp/mini-agent-effort46-2-native-settle-once-green.log",
+          "/private/tmp/mini-agent-native46-landing-d2-one-mib-integration-final.log"
+        ]
+      },
+      {
+        "requirement": "Accepted same-owner stale-prefix usage retained once at captured prices; wrongID/newcutoff/duplicate no wrong charge",
+        "artifact": "/private/tmp/mini-agent-effort46-2-canonical-accounting-manifest.json",
+        "logs": [
+          "/private/tmp/mini-agent-effort46-2-canonical-accounting-native-final.log",
+          "/private/tmp/mini-agent-effort46-2-canonical-accounting-generic-final.log"
+        ]
+      }
+    ],
+    "landing": {
+      "prerequisite_commit": "7ccdca0404a595ce1d029865f16a8c71fbe4ea92",
+      "lower_commit": "3f26f3aada7bb00a84a3ebd7ebacffcff087f328",
+      "manifest": "/private/tmp/mini-agent-native46-reviewed-shared-landing-d2-manifest.json",
+      "integration": "currentd2 physical1MiB1PASS/default strictPASS18.24s; Parent combined required debug install/commit/push pending"
+    },
+    "limits": "Native readonly acceptance is combined executed evidence across39 and39b, not one all-green run or discovery-only claim. Normal frontend/native publication and full53/full46/71/i4 remain open.",
+    "evidence_sha256": {
+      "/private/tmp/mini-agent-acp53-typed-save-validation-followup-manifest.json": "7cb01e7fec054b6eea207ac7cc184e1671817726d95f302ea164083ef276dcea",
+      "/private/tmp/mini-agent-effort46-2-attachment-audit-manifest.json": "dceba4e236a8e8817ae344e6a6bf5dab2947af395e28d8ff7b030210fb1dd199",
+      "/private/tmp/mini-agent-effort46-2-canonical-accounting-generic-final.log": "04e0fe56f7bd248ed2aa34cdc01a1fcf49bb20c86d28060b6c1531e1616a4c89",
+      "/private/tmp/mini-agent-effort46-2-canonical-accounting-manifest.json": "a4620ca644a959bba616ca2d04722f7d04109fe8746998d3eb0d33e3e0e22d26",
+      "/private/tmp/mini-agent-effort46-2-canonical-accounting-native-final.log": "bc63612837d17d993cc9e196c41677540d8b9eae1a52322a1a690e0dbcb8bcd4",
+      "/private/tmp/mini-agent-effort46-2-checkpoint-final.log": "841dbe27af7f409267cfb0ddec6c8cd2c00a5e1f2003b5cbb90e9315a5333e3b",
+      "/private/tmp/mini-agent-effort46-2-native-once-green.log": "baa610fc46a6e2c5616112df33d1d1ec4a106048fafae48cc7443190165e5de9",
+      "/private/tmp/mini-agent-effort46-2-native-settle-once-green.log": "5a0dcd2cad44a9b31de954cf81663fe5b31cf6663d93cdfbc3ed3662115e2137",
+      "/private/tmp/mini-agent-effort46-2-preappend-green.log": "3a2c5c2e2c5063d0ac764d67b40927fafcfce9359b8a9c86fafb0cabf4f7176a",
+      "/private/tmp/mini-agent-effort46-2-preappend-red.log": "ab86c3615202f81c45e8739d95ef9258058eb5198808a458d1827b2d01f6a897",
+      "/private/tmp/mini-agent-effort46-2-retirement-once-manifest.json": "24ad3229b028c0bf1d03bc1b4293f4e7ffb956ac0884c1f9c40c34936a9fc10d",
+      "/private/tmp/mini-agent-native46-landing-d2-one-mib-integration-final.log": "e9f9b52ea381e72f32db2df4f37f04164c6c6f8e5e296701a0b099d53d5cfc26",
+      "/private/tmp/mini-agent-storage-readonly39b-hosted-final-proof.json": "dc014b6d026cb5ac05d3ab2f07f6cf0205184d8234a8b0ef82a8f9608bf07627",
+      "/private/tmp/mini-agent-storage-readonly39b-hosted-job.log": "788252c19fdddec52c0ca476f11a1c60d510eda832e99665f763b7a2c110557c",
+      "/private/tmp/mini-agent-storage-rights-wave39-hosted-acceptance-limits.json": "c1598e8c916af8a69103f1c02ef6a3353a98dbb4589ee34f9e05f29727c6edb4",
+      "/private/tmp/mini-agent-storage-rights-wave39-hosted-job.log": "4ab1139bf5cb113e3c6a120aff3ce219ccd3b013ca101e4c9bb4806533be5611"
+    }
+  },
+  "integration": {
+    "changes": "Preserved config69 print consumer changes, both workspace test modules and both documentation additions; no production conflict beyond composing independent existing changes.31/34 final source files match immutable owner hashes exactly.",
+    "tests": "8 selected tests PASS1.08s after changed SDK rebuilt: exact native actor1MiB, App/session-picker1MiB, bounded save, keyboard CLI merge and retained clone/workspace identity controls.",
+    "log": "/private/tmp/mini-agent-wave45-combined-integration-recompiled-sdk.log",
+    "strict": "default+advisor all targets -D warnings PASS;84s wall time includes waiting for the install Cargo lock.",
+    "install": "required cargo install --path . --debug --features advisor --locked --offline --root /private/tmp/mini-agent-wave45-install PASS36.32s",
+    "native": {
+      "root": "/private/tmp/mini-agent-keys73-native-5qetn8jm",
+      "binary": "/private/tmp/mini-agent-wave45-install/bin/mini-agent",
+      "binary_sha256": "5d564184602b66c10a799fdd65dd4a2723e3f9a9ac6b461b24273ae6071334e9",
+      "assertions": {
+        "configured_startup_insert": true,
+        "configured_show_keys": true,
+        "removed_default_does_not_move_cursor": true,
+        "remapped_motion_keeps_unicode_draft": true,
+        "normal_delete_and_undo": true,
+        "literal_search_query_visible": true,
+        "picker_does_not_apply_remapped_motion": true,
+        "picker_close_retains_raw_caret_key": true,
+        "full_command_picker_retains_raw_enter": true,
+        "actual_vim_command": true,
+        "normal_quit_exit_zero": true,
+        "native_process_retired": true,
+        "completion_posts_zero": true
+      },
+      "calls": [
+        [
+          "GET",
+          "/v1/models"
+        ]
+      ],
+      "errors": [],
+      "stack_bytes": 1048576,
+      "native_pid": 25263,
+      "listener_joined": true,
+      "passed": true
+    }
+  },
+  "source_hashes": {
+    "Cargo.lock": "5255f7382f1980181e698ff8a6de690edff42c33ffb9e317ae69b0a6702f01f2",
+    "Cargo.toml": "130437cea17a940b8d0adb1a006fedd2761f900c32050018b79392754003c6c6",
+    "docs/agent/TOOL_RUNTIME.md": "b6ef68363b58f401bc6b395e5f79386aa2494d4b59fa5f703799312d19dafefb",
+    "docs/agent/native-compatibility.md": "b2b71b82c44983f4a96fecddc1b3d7e5ddfdef1cf95925f3219e35f083f76aa8",
+    "docs/specs/subprocess-trust.md": "445eaddc8dbf30d0d6a5a4e00397ccd01fd79ee23b8d0ed5107e683c4f32c81e",
+    "patched-deps/rig-core/PATCH.md": "a2d380ff7221f1c1fc1107a65afefeef505e52e0823ea5b73ce32a69c40aa88b",
+    "patched-deps/rig-core/src/agent/hook.rs": "8c14d18cafa122c15e05c2a078cc380b9f458c92b2f3dfa3e31cb5e74c0b7774",
+    "patched-deps/rig-core/src/agent/prompt_request/streaming.rs": "affe40a39b95ac9ea639286f60cd2e6ed6720cfa471422aefdad0e61d2f494e4",
+    "patched-deps/rig-core/src/agent/run/streamed.rs": "29fac89c25789306d074a3593b49523fdef8f18b2dc6439d2767d1c6966fa7a0",
+    "patched-deps/rig-core/src/agent/runner.rs": "9ef3335bf791fe13d5a2209c7cfb9a3a92df813428bd2b71873ae74b0a09d150",
+    "patched-deps/rig-core/src/completion/request.rs": "d83251c316bb9388006a86ca40a51d9516feef3f286af0f1e6ecb055721592bc",
+    "patched-deps/rig-core/src/providers/anthropic/streaming.rs": "79ea779ee7905594fefe1cdc79ed2050dba9c6826161f2290e9e2a9284f99467",
+    "src/agent/input.rs": "57756cdc3019f87833fb80ddad54ac42299663e51f09986bd6cf8cd9fcf8dec2",
+    "src/agent/mod.rs": "61042de7afc300878aeb1ec601b4932c5a1bc43e963f7af2aa46e2ffad9f7985",
+    "src/agent/native_capture.rs": "ff3d695ffdc9a725b7fef75601202736c7907f040aedf5fe292cd9eb2a439f83",
+    "src/agent/runner.rs": "dc3ef89af93a310f9d9c4f4767f585c7e9be85e5ef4ac325e67caa9fabd827cd",
+    "src/extras/acp/mod.rs": "4a329fd1e5bdc0f9534bfdc52c255cb2f5816255e41a71d043f563ead51e854a",
+    "src/extras/advisor/mod.rs": "4b68f1b5c415b56cfd0007738ee8ebff2f1c7d21bc93199a97b9f8d8a2adf769",
+    "src/extras/export.rs": "4f769e0d2589faa738e45f1b52de945f5aef0d0796110b535123214c2192056b",
+    "src/extras/js/skills/distill.rs": "b45971b0406ade40385644f84473d0f6810c510de9c93b35003c64ca05ef19b5",
+    "src/fs.rs": "7d27a614390ce822577b8da4f3a7ab9b5650671b93049eeef6d9c6b7bf22276c",
+    "src/paths.rs": "be7863cfd6bd5ad88f7bf70cb2acfb563708a979962644bc9826bad2de7d7b46",
+    "src/print.rs": "9d5c7596392b9ad0582566906ec60f05cffd038322f85964f32e79298cbed946",
+    "src/provider.rs": "66fc61e13d478492dc59774e06f3a4b62720409f8af8fa55ab68f0c3b3d85505",
+    "src/provider_effort_replay_probe.rs": "76259da121becd0461973568165151bc003d925b72b76b1e29e36ff852d53aac",
+    "src/session/lock.rs": "e01b3772cc8a3589b1e56955e29a3c21f00cdbeed56016dca25e8b19ca0553f0",
+    "src/session/mod.rs": "e30c3cd110cea7cc99a1d728b419ecf9f6d314324aafadf1c2469424bffa7e57",
+    "src/session/native_replay.rs": "56f66c999feee457889d28a124763f3f39967818c6828573bc084d2ff846d4ea",
+    "src/session/storage.rs": "0b067738aec46f21c742d25b34f3c29e0db4e6faf910194d76b84778d580cf25",
+    "src/session/user.rs": "c51f8cde99846b4848e8b5dc6bed27c5eb7e68614442e93f7eae8f9ba8d8c5a0",
+    "src/spend/request_tests.rs": "50f505f96abbffa7599b57da06692bc2723df71673da5f059807f2eb8a3d6462",
+    "src/tests/advisor_tests.rs": "2efbd2c1c071dbaa95d2000cbb999562938c92c513a88ceeb6c8e7aecc3b7847",
+    "src/tests/provider_tests.rs": "058dc4903d1a94512f9d1f0af577ebd3d68d59424135d14939e3bac01046bc5e",
+    "src/tests/subprocess_inventory_tests.rs": "4097a504fbd3a28dfc56033bc8d5163257ce8e8fa18364f229dc900c1b63e07f"
+  },
+  "limits": [
+    "Original Windows storage evidence combines unchanged3 passes with corrected exact importer1 pass; not one fresh4-test pass.",
+    "Shared native APIs remain dormant in ordinary frontends; full46/46.4/53/71/instruction prefix issue remain open.",
+    "Current-host same-owner refused actor/canonical usage/zero-visible metadata are proved by owned actual HTTP controls; this does not prove full controller/publication adoption.",
+    "First combined compile reused a stale local SDK artifact; package-only rig-core cleanup and identical selected controls passed without a source change. No broad test run.",
+    "Fresh combined-main hostedCI must be observed after push."
+  ]
+}

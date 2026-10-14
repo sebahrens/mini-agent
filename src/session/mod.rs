@@ -2,6 +2,7 @@ pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
 pub mod lock;
+pub(crate) mod native_replay;
 pub mod storage;
 pub mod title;
 pub(crate) mod user;
@@ -597,6 +598,17 @@ pub struct Session {
     /// waiter or approval. A new ordinary user turn supplies the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_question: Option<crate::question::QuestionRequired>,
+    /// Native compatibility data only; imports never install captures or grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_history: Option<native_replay::NativeHistory>,
+    /// Retired opaque history is bounded audit data; never selected for replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) retired_native_history: Vec<native_replay::NativeHistory>,
+    #[serde(
+        default,
+        skip_serializing_if = "native_replay::NativeFrontier::is_initial"
+    )]
+    pub(crate) native_frontier: native_replay::NativeFrontier,
     pub messages: Vec<SessionMessage>,
     /// Provider-native identity and reasoning for persisted tool calls, keyed
     /// by the call record's `tool_call_id`. A session file written before this
@@ -762,6 +774,83 @@ impl GitStatus {
 }
 
 impl Session {
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn native_history_snapshot(&self) -> Option<&native_replay::NativeHistory> {
+        self.native_history.as_ref()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn native_restore_history(
+        &self,
+        target: native_replay::HistoryProtocol,
+        boundary: native_replay::ReplayBoundary,
+    ) -> Result<Vec<rig::completion::Message>, native_replay::RestartReason> {
+        if let Some(reason) = self.native_frontier.refusal() {
+            return Err(reason);
+        }
+        let history = self
+            .native_history
+            .as_ref()
+            .ok_or(native_replay::RestartReason::UnavailableSource)?;
+        history.validate_feed(&self.messages, &self.compactions)?;
+        history.restore_history(target, &self.native_frontier, boundary)
+    }
+
+    /// The caller owns exact retired-turn settlement. Validate a candidate
+    /// snapshot before mutation; importing this data cannot recreate runtime
+    /// authority or establish a ready native request on its own.
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn store_native_history(
+        &mut self,
+        mut history: native_replay::NativeHistory,
+    ) -> Result<(), native_replay::RestartReason> {
+        native_replay::bounded_serialized(self, storage::MAX_SESSION_BYTES)?;
+        history.bind_feed(&self.messages, &self.compactions)?;
+        history.validate_saved()?;
+        let mut candidate = self.clone();
+        candidate.native_history = Some(history);
+        candidate.validate_native_persistence()?;
+        native_replay::bounded_serialized(&candidate, storage::MAX_SESSION_BYTES)?;
+        self.native_history = candidate.native_history;
+        Ok(())
+    }
+
+    pub(crate) fn validate_native_persistence(&self) -> Result<(), native_replay::RestartReason> {
+        if let Some(history) = &self.native_history {
+            history.validate_saved()?;
+        }
+        let mut frames = self
+            .native_history
+            .as_ref()
+            .map_or(0, |history| history.frames().len());
+        let mut epochs = std::collections::HashSet::new();
+        for history in &self.retired_native_history {
+            history.validate_saved()?;
+            if history.epoch() >= self.native_frontier.current() || !epochs.insert(history.epoch())
+            {
+                return Err(native_replay::RestartReason::UnavailableSource);
+            }
+            frames = frames.saturating_add(history.frames().len());
+        }
+        if frames > native_replay::MAX_NATIVE_FRAMES {
+            return Err(native_replay::RestartReason::Limit);
+        }
+        native_replay::bounded_serialized(
+            &(&self.native_history, &self.retired_native_history),
+            native_replay::MAX_NATIVE_PAYLOAD,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn set_cache_prices(&mut self, prices: crate::pricing::CachePrices) {
         self.cache_read_token_cost = prices.read;
         self.cache_write_token_cost = prices.write;
@@ -865,6 +954,9 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             generated_title: None,
+            native_history: None,
+            retired_native_history: Vec::new(),
+            native_frontier: native_replay::NativeFrontier::default(),
             messages: Vec::new(),
             tool_call_provenance: BTreeMap::new(),
             compactions: Vec::new(),

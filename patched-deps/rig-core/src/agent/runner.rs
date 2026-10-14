@@ -34,7 +34,7 @@ use futures::StreamExt;
 use tracing::{Instrument, info_span, span::Id};
 
 use super::{
-    completion::{Agent, DynamicContextStore, BuiltCompletionRequest},
+    completion::{Agent, BuiltCompletionRequest, DynamicContextStore},
     hook::{
         AgentHook, Flow, HookContext, HookStack, InvalidToolCallHookAction, RequestPatch, StepEvent,
     },
@@ -990,6 +990,7 @@ where
                                         turn: hook_ctx.turn(),
                                         content: &resp.choice,
                                         usage: resp.usage,
+                                        native_end_turn: false,
                                     })
                                     .await,
                             ) {
