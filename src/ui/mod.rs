@@ -1195,7 +1195,7 @@ pub(crate) async fn start_main_run(
                 .as_ref()
                 .unwrap()
                 .clone()
-                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
+                .with_main_session(ui.cfg, ui.session),
         )
     })
     .await;
@@ -1263,9 +1263,9 @@ pub(crate) async fn start_main_run(
             )
         })
         .await;
-        #[cfg(feature = "hooks")]
+        #[cfg(any(feature = "hooks", feature = "memory"))]
         let mut paused = paused;
-        #[cfg(feature = "hooks")]
+        #[cfg(any(feature = "hooks", feature = "memory"))]
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         let pending = pending_turn.take().unwrap();
         if record_chat_history {
@@ -1292,9 +1292,9 @@ pub(crate) async fn start_main_run(
                 )
         })
         .await;
-        #[cfg(feature = "hooks")]
+        #[cfg(any(feature = "hooks", feature = "memory"))]
         let mut paused = paused;
-        #[cfg(feature = "hooks")]
+        #[cfg(any(feature = "hooks", feature = "memory"))]
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         paused.start_interactive()
     };
@@ -1382,7 +1382,7 @@ pub(crate) fn record_goal_round_boundary(
     Ok(settled)
 }
 
-#[cfg(feature = "hooks")]
+#[cfg(any(feature = "hooks", feature = "memory"))]
 pub(crate) fn adopt_runner_hook_context(
     paused: &mut crate::agent::runner::PausedAgentRunner,
     pending: Option<&mut PendingMainTurn>,
@@ -1392,7 +1392,9 @@ pub(crate) fn adopt_runner_hook_context(
     if let Some(pending) = pending {
         pending.record_hook_context(session, notices);
     } else {
-        crate::extras::hooks::append_context_session(session, &notices);
+        for notice in notices {
+            session.add_message(MessageRole::System, &notice);
+        }
     }
 }
 
@@ -1591,7 +1593,7 @@ pub(crate) async fn mid_turn_compact_and_respawn(
                 .as_ref()
                 .unwrap()
                 .clone()
-                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
+                .with_main_session(ui.cfg, ui.session),
         )
     })
     .await;
@@ -1613,9 +1615,9 @@ pub(crate) async fn mid_turn_compact_and_respawn(
             None,
         )
         .await;
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     let mut paused = paused;
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
     if let Some(text) = previous_steering
         .as_ref()

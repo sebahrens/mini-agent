@@ -857,6 +857,35 @@ deadline and a 128 KiB body cap. Headless, loop, and ACP modes neither check nor
 create update-cache state. Unset or `update_check = false` disables the feature;
 project-local opt-in requires the ordinary content-bound project trust approval.
 
+## Prompt-cache prefix and memory snapshots
+
+New sessions keep the tools and static system preamble before mutable memory.
+Before an ordinary main request, the captured memory block is appended as
+conversation context, followed by the unchanged literal or ordered-media User
+message. Changing memory adds a new snapshot; it never edits earlier messages
+or signed thinking. Identical snapshots are not appended again, and clearing
+memory records an empty replacement snapshot. The original memory read and
+32 KiB injection bound are retained.
+
+For Anthropic the [cache hierarchy](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+is tools → system → messages. The existing
+system breakpoint therefore ends before mutable memory; the last-user marker
+can also cache earlier, now immutable memory/conversation snapshots. A memory
+change preserves the static cached prefix and all prior signed input.
+`cache_ttl = "1h"` selects one-hour native markers; the default remains `"5m"`.
+`/cost` reports the last recorded request's uncached/cached input and cache-write
+TTL tiers. Reported 5-minute and 1-hour writes use their independently captured
+rates (default native multipliers 1.25× and 2×); unreported required TTL splits
+remain unpriced rather than guessed.
+
+Older saved sessions without a placement version retain their original system
+memory layout, including existing native signatures. Their memory changes keep
+the previous compatibility rules; a new session uses the new cache-friendly
+layout. Placement is serialized data and cannot restore replay or permission
+owners. `PreambleSnapshot::detach_memory` extracts only the fresh builder-owned
+Memory range before dispatch; host context uses the existing canonical System
+row / Assistant-prose representation, outside the provider's top-level system.
+
 ## Ad hoc system instructions
 
 `--system-prompt <text|@file>` replaces the opening built-in persona paragraph
@@ -866,7 +895,8 @@ guidance, repository context, active named prompts, goals and permissions also
 remain in effect.
 
 `--append-system-prompt <text|@file>` adds instructions after the main context
-and `/add` files, before the memory block. Both flags work in the TUI and
+and `/add` files. New sessions carry memory later as conversation context;
+legacy sessions keep it in its original system position. Both flags work in the TUI and
 headless runs and can be combined. They affect the main agent; specialized
 subagent, advisor, summarizer, judge and `/btw` prompts keep their own contracts.
 

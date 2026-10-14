@@ -3103,6 +3103,8 @@ async fn execute_prompt(
         return Ok(PromptOutcome::cancelled(None));
     };
 
+    #[cfg(feature = "memory")]
+    let agent = agent.with_memory_placement(crate::session::MemoryPlacement::Messages);
     let agent = agent
         .with_spend(crate::spend::run::Run::current())
         .with_question_turn(Some(crate::question::QuestionTurn::default()));
@@ -3198,9 +3200,9 @@ async fn relay_paused_runner(
     paused_runner: crate::agent::runner::PausedAgentRunner,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     let mut paused_runner = paused_runner;
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     let notices = paused_runner.take_hook_context();
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
@@ -3216,7 +3218,7 @@ async fn relay_paused_runner(
         usage_provider,
     )
     .await;
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     let outcome = {
         let mut outcome = outcome;
         if !notices.is_empty() {

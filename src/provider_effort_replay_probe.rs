@@ -4427,3 +4427,400 @@ async fn effort46_live_gateway_uses_gateway_reasoning_and_native_unsupported_has
     assert!(failed.interactions.is_empty());
     assert!(negative.finish().is_empty());
 }
+
+#[cfg(feature = "memory")]
+async fn cache71_memory_native_roundtrip(legacy: bool) {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = crate::tests::OwnedTestDirectory::new("cache71-memory-native");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "ZS_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "ZS_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "ZS_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "ZS_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let mut responses = vec![
+        (
+            true,
+            start()
+                + &thinking(0, "", "cache71-memory-signature-one")
+                + &text(1, "first effort answer")
+                + &finish(),
+        ),
+        (
+            true,
+            start()
+                + &thinking(0, "", "cache71-memory-signature-two")
+                + &text(1, "second effort answer")
+                + &finish(),
+        ),
+    ];
+    if !legacy {
+        responses.push((
+            true,
+            start() + &text(0, "third unchanged memory answer") + &finish(),
+        ));
+    }
+    let wire = Wire::new(responses);
+    let cfg:crate::config::Config=serde_json::from_value(json!({
+        "session_title_model":"off","compact_enabled":false,
+        "cache_ttl":"1h",
+        "custom_providers":{"cache71-memory":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"cache71-model":{"provider":"cache71-memory","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    let paths = crate::paths::process_paths().unwrap();
+    let mut seed = crate::session::Session::new("cache71-memory", "claude-opus-5-5", 128_000, "");
+    seed.working_dir = workspace.root().to_string_lossy().into_owned().into();
+    if legacy {
+        seed.memory_placement = crate::session::MemoryPlacement::LegacySystem;
+    }
+    seed.set_input_output_prices(Some((2.0, 4.0)));
+    let sid = seed.id.to_string();
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+    let _release = Release(sid.clone());
+    crate::session::storage::save_session(&seed).unwrap();
+    crate::session::lock::release_session(&sid);
+    let prompts = if legacy {
+        vec![
+            "first literal memory prompt",
+            "second literal memory prompt",
+        ]
+    } else {
+        vec![
+            "first literal memory prompt",
+            "second literal memory prompt",
+            "third literal memory prompt",
+        ]
+    };
+    let memory_file = crate::extras::memory::Mem::open().memory_md();
+    crate::fs::ensure_private_directory(memory_file.parent().unwrap()).unwrap();
+    for (index, prompt) in prompts.iter().enumerate() {
+        std::fs::write(
+            &memory_file,
+            if legacy || index == 0 {
+                "CACHE_MEMORY_A_SENTINEL"
+            } else {
+                "CACHE_MEMORY_B_SENTINEL"
+            },
+        )
+        .unwrap();
+        let cli = crate::cli::Cli {
+            api_key: Some("owned-effort-key".into()),
+            quick_model: Some("cache71-model".into()),
+            session: Some(sid.clone()),
+            print: true,
+            quiet: true,
+            no_context_files: true,
+            no_tools: true,
+            no_sandbox: true,
+            message: vec![(*prompt).into()],
+            ..Default::default()
+        };
+        let mut startup = crate::startup::heap_future(|| async {
+            Box::new(
+                crate::startup::Startup::init(
+                    cli,
+                    cfg.clone(),
+                    paths.clone(),
+                    workspace.clone(),
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap(),
+            )
+        })
+        .await;
+        crate::startup::heap_future(|| startup.init_features())
+            .await
+            .unwrap();
+        crate::startup::heap_future(|| startup.resolve_prompts())
+            .await
+            .unwrap();
+        crate::startup::heap_future(|| startup.dispatch())
+            .await
+            .unwrap();
+        let sessions = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+        let restored =
+            crate::session::storage::load_session_exact_read_only(&sessions, &sid, &workspace)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            restored.memory_placement,
+            if legacy {
+                crate::session::MemoryPlacement::LegacySystem
+            } else {
+                crate::session::MemoryPlacement::Messages
+            }
+        );
+        let notices: Vec<_> = restored
+            .messages
+            .iter()
+            .filter(|row| {
+                row.role == crate::session::MessageRole::System
+                    && row.content.starts_with("Persistent memory snapshot")
+            })
+            .collect();
+        assert_eq!(notices.len(), if legacy { 0 } else { (index + 1).min(2) });
+        if !legacy {
+            assert!(notices[0].content.contains("CACHE_MEMORY_A_SENTINEL"));
+            if index > 0 {
+                assert!(notices[1].content.contains("CACHE_MEMORY_B_SENTINEL"));
+            }
+        }
+        assert_eq!(restored.native_frontier.refusal(), None);
+        assert_eq!(
+            (restored.total_input_tokens, restored.total_output_tokens),
+            ((index as u64 + 1) * 10, (index as u64 + 1) * 2)
+        );
+        assert_eq!(
+            crate::spend::Ledger::new(&paths.state_dir)
+                .summary_for_session(&sid)
+                .unwrap()
+                .session
+                .records,
+            index + 1
+        );
+        crate::session::lock::release_session(&sid);
+    }
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), if legacy { 2 } else { 3 });
+    for body in &bodies {
+        assert_eq!(body["system"], bodies[0]["system"]);
+        assert_eq!(body["tools"], bodies[0]["tools"]);
+        let system = body["system"].to_string();
+        assert_eq!(system.contains("CACHE_MEMORY_A_SENTINEL"), legacy);
+        assert!(!system.contains("CACHE_MEMORY_B_SENTINEL"));
+        assert_eq!(
+            body["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        assert_eq!(
+            body["system"].as_array().unwrap().last().unwrap()["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"}),
+            "the static prefix has its own breakpoint before memory messages"
+        );
+    }
+    assert_eq!(
+        bodies[1]["messages"]
+            .to_string()
+            .matches("cache71-memory-signature-one")
+            .count(),
+        1
+    );
+    if !legacy {
+        for body in &bodies[1..] {
+            let messages = body["messages"].to_string();
+            assert_eq!(messages.matches("CACHE_MEMORY_A_SENTINEL").count(), 1);
+            assert_eq!(messages.matches("CACHE_MEMORY_B_SENTINEL").count(), 1);
+        }
+    }
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn cache71_memory_native_updates_keep_cached_prefix_and_saved_signed_history() {
+    cache71_memory_native_roundtrip(false).await;
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn cache71_memory_legacy_native_resume_retains_its_signed_system_layout() {
+    cache71_memory_native_roundtrip(true).await;
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn cache71_memory_actual_paused_write_checkpoint_tracks_the_literal_user_after_context() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("cache71-memory-write-anchor");
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    std::fs::write(root.path().join("file.txt"), "ORIGINAL_MEMORY_PREIMAGE").unwrap();
+    let first = start()
+        + &thinking(0, "", "memory-write-signature")
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"memory-write","name":"write","input":{}}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"file.txt\",\"content\":\"AFTER_MEMORY_WRITE\",\"overwrite\":true}"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        + &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}),
+        )
+        + &event("message_stop", json!({"type":"message_stop"}));
+    let wire = Wire::new(vec![
+        (true, first),
+        (true, start() + &text(0, "memory write done") + &finish()),
+    ]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let preamble = "STATIC\n\n---\n\nMEMORY_ANCHOR_SENTINEL".to_string();
+    let snapshot = crate::agent::builder::PreambleSnapshot {
+        tokens: crate::session::Session::estimate_tokens(&preamble),
+        bytes: preamble.len(),
+        parts: Vec::new(),
+        ranges: vec![("Static", 0..6), ("Memory", 6..preamble.len())],
+        instruction_sources: None,
+    };
+    use rig::tool::Tool;
+    let tracker = crate::agent::tools::ReadTracker::new(true);
+    crate::agent::tools::read::ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+        .with_workspace_binding(workspace.clone())
+        .call(crate::agent::tools::ReadArgs {
+            raw_notebook: false,
+            path: "file.txt".into(),
+            offset: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble(&preamble)
+            .max_tokens(128)
+            .default_max_turns(2)
+            .tool(
+                crate::agent::tools::write::WriteTool::new_with_tracker(None, None, None, tracker)
+                    .with_workspace_binding(workspace.clone()),
+            )
+            .build(),
+    ))
+    .with_context_snapshot(Some(snapshot));
+    let mut session = crate::session::Session::new("native-memory", "claude-opus-5-5", 128_000, "");
+    let agent = agent
+        .with_main_session(&crate::config::Config::default(), &session)
+        .with_file_checkpoints(session.file_checkpoints.recorder(&session.id, 0, true));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let mut paused = crate::startup::heap_future(|| {
+        agent.spawn_runner_paused_in_scope(
+            "literal memory write".into(),
+            Vec::<Message>::new(),
+            RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+            scope.clone(),
+        )
+    })
+    .await;
+    let mut pending = crate::ui::state::PendingMainTurn::capture(&session, "literal memory write");
+    crate::ui::adopt_runner_hook_context(&mut paused, Some(&mut pending), &mut session);
+    let mut run = crate::ui::state::AgentRunState::default();
+    crate::ui::mark_main_turn_started(&mut session, &mut run, pending);
+    assert!(
+        !run.pending_turn
+            .as_ref()
+            .unwrap()
+            .has_progress(&session, "", &[]),
+        "context alone is not accepted model/file progress"
+    );
+    let user = session
+        .messages
+        .iter()
+        .position(|row| row.role == crate::session::MessageRole::User)
+        .unwrap();
+    assert_eq!(user, 1);
+    let mut runner = paused.start_interactive();
+    let mut done = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { .. } => {
+                    done = true;
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => {
+                    runner
+                        .compaction_decision_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cleanup.settle().await;
+    assert!(done);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("file.txt")).unwrap(),
+        "AFTER_MEMORY_WRITE"
+    );
+    let records = serde_json::to_value(&session.file_checkpoints).unwrap();
+    assert_eq!(records["records"].as_array().unwrap().len(), 1);
+    assert_eq!(records["records"][0]["turn"], user);
+    assert!(
+        run.pending_turn
+            .as_ref()
+            .unwrap()
+            .has_progress(&session, "", &[])
+    );
+    assert_eq!(
+        session
+            .file_checkpoints
+            .restore(&session.id, user + 1, &workspace)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session
+            .file_checkpoints
+            .restore(&session.id, user, &workspace)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("file.txt")).unwrap(),
+        "ORIGINAL_MEMORY_PREIMAGE"
+    );
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        !bodies[0]["system"]
+            .to_string()
+            .contains("MEMORY_ANCHOR_SENTINEL")
+    );
+    assert!(
+        bodies[0]["messages"]
+            .to_string()
+            .contains("MEMORY_ANCHOR_SENTINEL")
+    );
+}

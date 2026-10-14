@@ -383,7 +383,7 @@ pub(crate) fn steering_handoff() -> (
     )
 }
 
-#[cfg(feature = "hooks")]
+#[cfg(any(feature = "hooks", feature = "memory"))]
 pub(crate) fn inserted_context(rows: usize) {
     if let Some(recorder) = current() {
         let _ = recorder.turn.fetch_update(

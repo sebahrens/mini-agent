@@ -504,17 +504,7 @@ pub(crate) fn append_context_history(
     history: std::sync::Arc<[rig::completion::Message]>,
     notices: &[String],
 ) -> std::sync::Arc<[rig::completion::Message]> {
-    if notices.is_empty() {
-        return history;
-    }
-    let mut history = history.to_vec();
-    history.extend(
-        notices
-            .iter()
-            .cloned()
-            .map(rig::completion::Message::assistant),
-    );
-    history.into()
+    crate::agent::input::append_context_history(history, notices)
 }
 
 pub(crate) fn append_context_session(session: &mut crate::session::Session, notices: &[String]) {

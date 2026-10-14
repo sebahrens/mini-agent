@@ -26,7 +26,17 @@ pub async fn ensure_agent(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) {
-    if agent.is_some() {
+    if let Some(captured) = agent.take() {
+        *agent = Some(
+            crate::startup::heap_future(|| {
+                std::future::ready(captured.with_main_session(ui.cfg, ui.session))
+            })
+            .await,
+        );
+        if let Some(snapshot) = agent.as_ref().and_then(AnyAgent::context_snapshot) {
+            ui.session.overhead_tokens = snapshot.tokens;
+            ui.session.overhead_parts = snapshot.parts.clone();
+        }
         return;
     }
     #[cfg(feature = "mcp")]
@@ -37,7 +47,7 @@ pub async fn ensure_agent(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
             .await
-            .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls),
+            .with_main_session(ui.cfg, ui.session),
     );
     // The builder captured these counts from the actual preamble and actual
     // registered tools. Never reread added/suffix files after building it.
@@ -564,10 +574,11 @@ async fn handle_agent_done(
     let qm = crate::config::quick_models_map(ui.cfg);
 
     #[cfg(feature = "memory")]
-    let reserve = crate::extras::memory::effective_reserve(
+    let reserve = crate::extras::memory::effective_session_reserve(
         ui.cfg
             .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
         ui.context.memory.as_deref(),
+        ui.session,
     );
     #[cfg(not(feature = "memory"))]
     let reserve = ui
@@ -1047,7 +1058,7 @@ async fn finish_goal_round(
             #[cfg(feature = "agent-skills")]
             let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
             let paused = round_agent
-                .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls)
+                .with_main_session(ui.cfg, ui.session)
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .with_file_checkpoints(ui.session.file_checkpoints.recorder(
                     &ui.session.id,
@@ -1063,9 +1074,9 @@ async fn finish_goal_round(
                     None,
                 )
                 .await;
-            #[cfg(feature = "hooks")]
+            #[cfg(any(feature = "hooks", feature = "memory"))]
             let mut paused = paused;
-            #[cfg(feature = "hooks")]
+            #[cfg(any(feature = "hooks", feature = "memory"))]
             super::adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
             let runner = paused.start_interactive();
             run.compaction_decision_tx = runner.compaction_decision_tx;

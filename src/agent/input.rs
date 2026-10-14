@@ -95,3 +95,23 @@ mod tests {
         assert_eq!(text.to_message(), rig::message::Message::user("rewritten"));
     }
 }
+
+/// Append host context as transcript prose, matching canonical System rows.
+/// This never changes the provider's top-level system prefix.
+#[cfg(any(feature = "hooks", feature = "memory"))]
+pub(crate) fn append_context_history(
+    history: std::sync::Arc<[rig::completion::Message]>,
+    notices: &[String],
+) -> std::sync::Arc<[rig::completion::Message]> {
+    if notices.is_empty() {
+        return history;
+    }
+    let mut history = history.to_vec();
+    history.extend(
+        notices
+            .iter()
+            .cloned()
+            .map(rig::completion::Message::assistant),
+    );
+    history.into()
+}

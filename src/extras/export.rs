@@ -46,6 +46,7 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         "total_cost": session.total_cost,
         "generated_title": replay.generated_title,
         "reasoning_controls": replay.reasoning_controls,
+        "memory_placement": replay.memory_placement,
         "compactions": replay.compactions,
         "tool_call_provenance": replay.tool_call_provenance,
     });
@@ -178,6 +179,8 @@ pub struct ImportedReplayMetadata {
     #[serde(default)]
     pub(crate) reasoning_controls: crate::provider::effort::SessionReasoning,
     #[serde(default)]
+    pub(crate) memory_placement: crate::session::MemoryPlacement,
+    #[serde(default)]
     pub generated_title: Option<CompactString>,
     #[serde(default)]
     pub compactions: Vec<crate::session::Compaction>,
@@ -202,6 +205,7 @@ impl ImportedReplayMetadata {
             .collect();
         Self {
             reasoning_controls: session.reasoning_controls,
+            memory_placement: session.memory_placement,
             generated_title: session.generated_title.clone(),
             compactions: if session.compacted_context().0.is_some() {
                 session.compactions.clone()
@@ -226,6 +230,7 @@ impl ImportedReplayMetadata {
     pub fn apply(&self, session: &mut Session) {
         session.file_checkpoints = Default::default();
         session.reasoning_controls = self.reasoning_controls;
+        session.memory_placement = self.memory_placement;
         session.generated_title = self.generated_title.clone();
         session.compactions = self.compactions.clone();
         for compaction in &mut session.compactions {

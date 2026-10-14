@@ -573,7 +573,8 @@ fn headless_compaction_plan(
     let configured_reserve =
         cfg.resolve_reserve_tokens(&session.model, &quick_models, session.context_window);
     #[cfg(feature = "memory")]
-    let reserve = crate::extras::memory::effective_reserve(configured_reserve, memory);
+    let reserve =
+        crate::extras::memory::effective_session_reserve(configured_reserve, memory, session);
     #[cfg(not(feature = "memory"))]
     let reserve = configured_reserve;
     if !session.needs_compaction_with_pending_after_tool_result_pruning(
@@ -2890,7 +2891,7 @@ async fn run_bound_headless_round(
             #[cfg(feature = "agent-skills")]
             let agent = agent.with_instruction_turn(instruction_turn);
             let agent = agent
-                .with_reasoning_controls(cfg, session.reasoning_controls)
+                .with_main_session(cfg, session)
                 .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                 .with_file_checkpoints(session.file_checkpoints.recorder(
                     &session.id,
@@ -2961,7 +2962,7 @@ async fn run_bound_headless_round(
         #[cfg(feature = "agent-skills")]
         let agent = agent.with_instruction_turn(instruction_turn);
         let agent = agent
-            .with_reasoning_controls(cfg, session.reasoning_controls)
+            .with_main_session(cfg, session)
             .with_spend(Some(spend))
             .with_file_checkpoints(file_checkpoints.clone())
             .with_question_turn(Some(question_turn));
@@ -3131,7 +3132,7 @@ async fn run_headless_goal_rounds(
                 #[cfg(feature = "agent-skills")]
                 let agent = agent.with_instruction_turn(instruction_turn);
                 let agent = agent
-                    .with_reasoning_controls(cfg, session.reasoning_controls)
+                    .with_main_session(cfg, session)
                     .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                     .with_file_checkpoints(session.file_checkpoints.recorder(
                         &session.id,
@@ -3272,7 +3273,7 @@ async fn run_headless_goal_rounds_inner(
             #[cfg(feature = "agent-skills")]
             let agent = agent.with_instruction_turn(instruction_turn.clone());
             let agent = agent
-                .with_reasoning_controls(cfg, session.reasoning_controls)
+                .with_main_session(cfg, session)
                 .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                 .with_file_checkpoints(session.file_checkpoints.recorder(
                     &session.id,
@@ -3663,7 +3664,7 @@ async fn run_headless_goal_rounds_inner(
                 #[cfg(feature = "agent-skills")]
                 let round_agent = round_agent.with_instruction_turn(instruction_turn.clone());
                 let round_agent = round_agent
-                    .with_reasoning_controls(cfg, session.reasoning_controls)
+                    .with_main_session(cfg, session)
                     .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
                     .with_file_checkpoints(session.file_checkpoints.recorder(
                         &session.id,
@@ -3971,12 +3972,19 @@ mod tests {
             (without.input_token_budget, without.response_token_budget),
             (80, 20)
         );
+        let pending_notice = crate::extras::memory::context_notice("abcd", &[]).unwrap();
+        let pending_tokens = Session::estimate_tokens(&pending_notice);
+        assert_eq!(with.input_token_budget, 80 - pending_tokens);
+        assert_eq!(with.response_token_budget, 20 + pending_tokens);
+        let mut legacy = session.clone();
+        legacy.memory_placement = crate::session::MemoryPlacement::LegacySystem;
+        let legacy_plan = headless_compaction_plan(&legacy, &normal, 1, Some("abcd")).unwrap();
         assert_eq!(
-            with.input_token_budget,
+            legacy_plan.input_token_budget,
             80 - Session::estimate_tokens("abcd")
         );
         assert_eq!(
-            with.response_token_budget,
+            legacy_plan.response_token_budget,
             20 + Session::estimate_tokens("abcd")
         );
         assert_eq!(

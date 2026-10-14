@@ -460,10 +460,11 @@ pub async fn handle_compress(
     // gate that decided to call us.
     let qm = crate::config::quick_models_map(ui.cfg);
     #[cfg(feature = "memory")]
-    let reserve = crate::extras::memory::effective_reserve(
+    let reserve = crate::extras::memory::effective_session_reserve(
         ui.cfg
             .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
         ui.context.memory.as_deref(),
+        ui.session,
     );
     #[cfg(not(feature = "memory"))]
     let reserve = ui

@@ -601,6 +601,17 @@ pub struct ProviderOverrideAudit {
     pub context_disclosure_acknowledged: bool,
 }
 
+/// Cache placement is data, not replay authority. Old snapshots keep their
+/// original signed system layout; newly created sessions append memory as
+/// conversation context after the stable tools/system prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryPlacement {
+    #[default]
+    LegacySystem,
+    Messages,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: CompactString,
@@ -616,6 +627,8 @@ pub struct Session {
         skip_serializing_if = "crate::provider::effort::SessionReasoning::is_default"
     )]
     pub(crate) reasoning_controls: crate::provider::effort::SessionReasoning,
+    #[serde(default)]
+    pub(crate) memory_placement: MemoryPlacement,
     /// Bounded clarification data only: imported records never recreate a
     /// waiter or approval. A new ordinary user turn supplies the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -986,6 +999,7 @@ impl Session {
             name: CompactString::new(name),
             generated_title: None,
             reasoning_controls: Default::default(),
+            memory_placement: MemoryPlacement::Messages,
             native_history: None,
             retired_native_history: Vec::new(),
             native_frontier: native_replay::NativeFrontier::default(),
@@ -3138,5 +3152,21 @@ mod goal_persistence_tests {
     fn a_missing_goal_field_defaults_to_an_empty_store() {
         let store: GoalStore = serde_json::from_str("null").expect("null store");
         assert!(store.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod memory_placement_tests {
+    use super::*;
+    #[test]
+    fn cache71_memory_layout_is_versioned_data_and_legacy_defaults_are_preserved() {
+        let session = Session::new("anthropic", "model", 100_000, "");
+        assert_eq!(session.memory_placement, MemoryPlacement::Messages);
+        let mut value = serde_json::to_value(&session).unwrap();
+        value.as_object_mut().unwrap().remove("memory_placement");
+        let legacy: Session = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.memory_placement, MemoryPlacement::LegacySystem);
+        value["memory_placement"] = serde_json::json!("permit");
+        assert!(serde_json::from_value::<Session>(value).is_err());
     }
 }

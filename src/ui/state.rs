@@ -248,7 +248,7 @@ pub(crate) struct PendingMainTurn {
     session_before: SessionRollback,
     started_at: Option<compact_str::CompactString>,
     tool_output_paths: Vec<std::path::PathBuf>,
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     hook_notice_count: usize,
     #[cfg(feature = "memory")]
     memory_summaries: Vec<(String, Option<usize>)>,
@@ -289,7 +289,7 @@ impl PendingMainTurn {
             },
             started_at: None,
             tool_output_paths: Vec::new(),
-            #[cfg(feature = "hooks")]
+            #[cfg(any(feature = "hooks", feature = "memory"))]
             hook_notice_count: 0,
             #[cfg(feature = "memory")]
             memory_summaries: Vec::new(),
@@ -334,7 +334,7 @@ impl PendingMainTurn {
         *self = rebased;
     }
 
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     pub(crate) fn record_hook_context(&mut self, session: &mut Session, notices: Vec<String>) {
         for notice in notices {
             // User rows may already be registered by an automatic phase. Keep
@@ -356,11 +356,11 @@ impl PendingMainTurn {
     }
 
     fn initial_message_count(&self) -> usize {
-        #[cfg(feature = "hooks")]
+        #[cfg(any(feature = "hooks", feature = "memory"))]
         {
             1usize.saturating_add(self.hook_notice_count)
         }
-        #[cfg(not(feature = "hooks"))]
+        #[cfg(not(any(feature = "hooks", feature = "memory")))]
         {
             1
         }

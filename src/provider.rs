@@ -2242,6 +2242,8 @@ pub struct AnyAgent {
     question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
+    #[cfg(feature = "memory")]
+    memory_context: Option<Result<std::sync::Arc<str>, &'static str>>,
     context_snapshot: Option<builder::PreambleSnapshot>,
     #[cfg(feature = "lsp")]
     diagnostic_lsp: Option<crate::extras::lsp::LspManager>,
@@ -2955,6 +2957,8 @@ impl AnyAgent {
             question_turn: None,
             completion_verification: None,
             reasoning_controls: None,
+            #[cfg(feature = "memory")]
+            memory_context: None,
             context_snapshot: None,
             #[cfg(feature = "agent-skills")]
             instructions: None,
@@ -2967,6 +2971,64 @@ impl AnyAgent {
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Capture main-session data before restoring a binding or starting work.
+    /// Independently built auxiliary agents retain their own context policy.
+    pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
+        let agent = self.with_reasoning_controls(cfg, session.reasoning_controls);
+        #[cfg(feature = "memory")]
+        {
+            agent.with_memory_placement(session.memory_placement)
+        }
+        #[cfg(not(feature = "memory"))]
+        {
+            agent
+        }
+    }
+
+    #[cfg(feature = "memory")]
+    pub(crate) fn with_memory_placement(
+        mut self,
+        placement: crate::session::MemoryPlacement,
+    ) -> Self {
+        if placement == crate::session::MemoryPlacement::LegacySystem {
+            if self.memory_context.is_some() {
+                self.memory_context = Some(Err("rebuild the agent for this saved memory layout"));
+            }
+            return self;
+        }
+        if self.memory_context.is_some() {
+            return self;
+        }
+        let Some(snapshot) = &mut self.context_snapshot else {
+            return self;
+        };
+        let preamble = match &mut self.inner {
+            AnyAgentInner::OpenRouter(agent) => &mut agent.preamble,
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => &mut agent.preamble,
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => &mut agent.preamble,
+            AnyAgentInner::Anthropic(agent) => &mut agent.preamble,
+            AnyAgentInner::Gemini(agent) => &mut agent.preamble,
+            AnyAgentInner::Ollama(agent) => &mut agent.preamble,
+        };
+        self.memory_context = Some(match preamble {
+            Some(preamble) => snapshot.detach_memory(preamble).map(std::sync::Arc::from),
+            None => Err("the captured memory preamble is unavailable"),
+        });
+        self
+    }
+
+    #[cfg(any(feature = "hooks", feature = "memory"))]
+    fn context_notices(&self, history: &[Message]) -> Vec<String> {
+        #[cfg(feature = "memory")]
+        if let Some(Ok(memory)) = &self.memory_context {
+            return crate::extras::memory::context_notice(memory, history)
+                .into_iter()
+                .collect();
+        }
+        let _ = history;
+        Vec::new()
     }
 
     fn reasoning_route(&self) -> (effort::Protocol, &str) {
@@ -3061,6 +3123,10 @@ impl AnyAgent {
         }
     }
     fn reasoning_error(&self) -> Option<effort::ControlError> {
+        #[cfg(feature = "memory")]
+        if let Some(Err(error)) = self.memory_context {
+            return Some(effort::ControlError(error));
+        }
         self.reasoning_controls
             .as_ref()
             .and_then(|captured| captured.error)
@@ -3439,6 +3505,8 @@ impl AnyAgent {
             question_turn: None,
             completion_verification: None,
             reasoning_controls: None,
+            #[cfg(feature = "memory")]
+            memory_context: None,
             context_snapshot: None,
             #[cfg(feature = "agent-skills")]
             instructions: None,
@@ -3579,6 +3647,9 @@ impl AnyAgent {
             if let Some(error) = self.reasoning_error() {
                 return runner::HeadlessTurn::failed_before_start(error.into());
             }
+            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+            let mut context_notices = self.context_notices(&history);
             #[cfg(feature = "hooks")]
             let (hook_prompt, hook_context) = {
                 if let Err(error) = crate::spend::run::admit_current_effect().await {
@@ -3605,9 +3676,11 @@ impl AnyAgent {
             #[cfg(feature = "hooks")]
             let prompt = hook_prompt.as_str();
             #[cfg(feature = "hooks")]
-            let history = crate::extras::hooks::append_context_history(history, &hook_context);
-            #[cfg(feature = "hooks")]
-            crate::session::file_checkpoints::inserted_context(hook_context.len());
+            context_notices.extend(hook_context);
+            #[cfg(any(feature = "hooks", feature = "memory"))]
+            let history = crate::agent::input::append_context_history(history, &context_notices);
+            #[cfg(any(feature = "hooks", feature = "memory"))]
+            crate::session::file_checkpoints::inserted_context(context_notices.len());
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
                 Some(
@@ -3747,11 +3820,11 @@ impl AnyAgent {
                     .await
                 }
             };
-            #[cfg(feature = "hooks")]
+            #[cfg(any(feature = "hooks", feature = "memory"))]
             let turn = {
                 let mut turn = turn;
                 turn.interactions
-                    .splice(0..0, hook_context.into_iter().map(Message::system));
+                    .splice(0..0, context_notices.into_iter().map(Message::system));
                 turn
             };
             turn
@@ -4038,6 +4111,9 @@ impl AnyAgent {
                 {
                     return spawn_blocked_runner(error.to_string(), work_scope);
                 }
+                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+                let mut context_notices = self.context_notices(&history);
                 #[cfg(feature = "hooks")]
                 let rewritten = match work_scope
                     .run(crate::startup::heap_future(|| {
@@ -4058,9 +4134,12 @@ impl AnyAgent {
                 #[cfg(feature = "hooks")]
                 let (rewritten, hook_context) = rewritten;
                 #[cfg(feature = "hooks")]
-                let history = crate::extras::hooks::append_context_history(history, &hook_context);
-                #[cfg(feature = "hooks")]
-                crate::session::file_checkpoints::inserted_context(hook_context.len());
+                context_notices.extend(hook_context);
+                #[cfg(any(feature = "hooks", feature = "memory"))]
+                let history =
+                    crate::agent::input::append_context_history(history, &context_notices);
+                #[cfg(any(feature = "hooks", feature = "memory"))]
+                crate::session::file_checkpoints::inserted_context(context_notices.len());
                 #[cfg(feature = "hooks")]
                 if let Err(error) = prompt.apply_hook_text(rewritten) {
                     return spawn_blocked_runner(error.to_owned(), work_scope);
@@ -4190,8 +4269,8 @@ impl AnyAgent {
                         )
                     }
                 };
-                #[cfg(feature = "hooks")]
-                let paused = paused.with_hook_context(hook_context);
+                #[cfg(any(feature = "hooks", feature = "memory"))]
+                let paused = paused.with_hook_context(context_notices);
                 paused
             }),
         );

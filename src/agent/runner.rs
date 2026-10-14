@@ -1155,7 +1155,7 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 pub(crate) struct PausedAgentRunner {
     runner: AgentRunner,
     /// Canonical context is adopted by the frontend before releasing start.
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     hook_context: Vec<String>,
     start_tx: tokio::sync::oneshot::Sender<()>,
     #[cfg(any(test, feature = "acp"))]
@@ -1170,7 +1170,7 @@ impl PausedAgentRunner {
     ) -> Self {
         Self {
             runner,
-            #[cfg(feature = "hooks")]
+            #[cfg(any(feature = "hooks", feature = "memory"))]
             hook_context: Vec::new(),
             start_tx,
             #[cfg(any(test, feature = "acp"))]
@@ -1178,13 +1178,13 @@ impl PausedAgentRunner {
         }
     }
 
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     pub(crate) fn with_hook_context(mut self, notices: Vec<String>) -> Self {
         self.hook_context = notices;
         self
     }
 
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "memory"))]
     pub(crate) fn take_hook_context(&mut self) -> Vec<String> {
         std::mem::take(&mut self.hook_context)
     }

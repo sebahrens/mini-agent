@@ -175,6 +175,57 @@ pub(crate) struct PreambleSnapshot {
         Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
 }
 
+#[cfg(feature = "memory")]
+impl PreambleSnapshot {
+    /// Extract only the builder-owned Memory range before any request is
+    /// prepared. No saved transcript or provider-authored block is rewritten.
+    pub(crate) fn detach_memory(&mut self, preamble: &mut String) -> Result<String, &'static str> {
+        if preamble.len() != self.bytes {
+            return Err("the captured memory preamble changed; rebuild the agent");
+        }
+        let memory = self
+            .ranges
+            .iter()
+            .find(|(label, _)| *label == "Memory")
+            .map(|(_, range)| range.clone());
+        let Some(range) = memory else {
+            return Ok(String::new());
+        };
+        let segment = preamble
+            .get(range.clone())
+            .ok_or("invalid captured memory range")?;
+        let memory = segment
+            .strip_prefix("\n\n---\n\n")
+            .ok_or("invalid captured memory framing")?;
+        if memory.len() > crate::extras::memory::MAX_INJECT_BYTES {
+            return Err("the memory snapshot exceeds its injection bound");
+        }
+        let memory = memory.to_owned();
+        let removed = range.len();
+        preamble.replace_range(range.clone(), "");
+        self.ranges.retain(|(label, _)| *label != "Memory");
+        for (_, part) in &mut self.ranges {
+            if part.start >= range.end {
+                part.start -= removed;
+                part.end -= removed;
+            }
+        }
+        self.bytes = preamble.len();
+        self.tokens = crate::session::Session::estimate_tokens(preamble);
+        self.parts = self
+            .ranges
+            .iter()
+            .map(|(label, range)| {
+                (
+                    *label,
+                    crate::session::Session::estimate_tokens(&preamble[range.clone()]),
+                )
+            })
+            .collect();
+        Ok(memory)
+    }
+}
+
 struct PreambleComposition {
     text: String,
     parts: Vec<(&'static str, std::ops::Range<usize>)>,
@@ -2326,6 +2377,55 @@ mod js_tests {
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["read"]
+        );
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn cache71_memory_changes_leave_static_preamble_and_ranges_unchanged() {
+        let mut context = empty_context();
+        let mut projected = Vec::new();
+        for value in ["MEMORY_A_雪", "MEMORY_B_changed"] {
+            context.memory = Some(value.into());
+            let composition = super::compose_preamble(
+                &context,
+                false,
+                None,
+                false,
+                Some("GOAL_AFTER_MEMORY"),
+                Some("STATIC_PERSONA"),
+                Some("STATIC_APPEND"),
+            );
+            let mut snapshot = composition.snapshot();
+            let mut preamble = composition.text;
+            assert_eq!(snapshot.detach_memory(&mut preamble).unwrap(), value);
+            assert!(!preamble.contains(value));
+            assert!(preamble.contains("GOAL_AFTER_MEMORY") && preamble.contains("STATIC_APPEND"));
+            assert!(snapshot.parts.iter().all(|(label, _)| *label != "Memory"));
+            assert_eq!(snapshot.bytes, preamble.len());
+            assert_eq!(
+                snapshot.tokens,
+                crate::session::Session::estimate_tokens(&preamble)
+            );
+            for ((name, range), (part, tokens)) in snapshot.ranges.iter().zip(&snapshot.parts) {
+                assert_eq!(name, part);
+                assert_eq!(
+                    *tokens,
+                    crate::session::Session::estimate_tokens(&preamble[range.clone()])
+                );
+            }
+            projected.push(preamble);
+        }
+        assert_eq!(projected[0].as_bytes(), projected[1].as_bytes());
+        context.memory = Some("x".repeat(crate::extras::memory::MAX_INJECT_BYTES + 1));
+        let composition = super::compose_preamble(&context, false, None, false, None, None, None);
+        let mut snapshot = composition.snapshot();
+        let mut preamble = composition.text;
+        let before = preamble.clone();
+        assert!(snapshot.detach_memory(&mut preamble).is_err());
+        assert_eq!(
+            preamble, before,
+            "a rejected capture must not edit the prefix"
         );
     }
 

@@ -1701,7 +1701,7 @@ impl<'a> App<'a> {
                 #[cfg(feature = "agent-skills")]
                 let agent = agent.with_instruction_turn(run.instruction_turn.clone());
                 let paused = agent
-                    .with_reasoning_controls(ui.cfg, ui.session.reasoning_controls)
+                    .with_main_session(ui.cfg, ui.session)
                     .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                     .with_file_checkpoints(ui.session.file_checkpoints.recorder(
                         &ui.session.id,
@@ -1717,9 +1717,9 @@ impl<'a> App<'a> {
                         None,
                     )
                     .await;
-                #[cfg(feature = "hooks")]
+                #[cfg(any(feature = "hooks", feature = "memory"))]
                 let mut paused = paused;
-                #[cfg(feature = "hooks")]
+                #[cfg(any(feature = "hooks", feature = "memory"))]
                 super::adopt_runner_hook_context(&mut paused, Some(&mut pending_turn), ui.session);
                 let runner = paused.start_interactive();
                 run.compaction_decision_tx = runner.compaction_decision_tx;
@@ -5890,10 +5890,7 @@ impl<'a> App<'a> {
                         #[cfg(feature = "agent-skills")]
                         let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
                         agent
-                            .with_reasoning_controls(
-                                self.ui.cfg,
-                                self.ui.session.reasoning_controls,
-                            )
+                            .with_main_session(self.ui.cfg, self.ui.session)
                             .with_spend_for_session(
                                 self.ui.session,
                                 self.ui.cfg,
@@ -5914,9 +5911,9 @@ impl<'a> App<'a> {
                             )
                     })
                     .await;
-                    #[cfg(feature = "hooks")]
+                    #[cfg(any(feature = "hooks", feature = "memory"))]
                     let mut paused = paused;
-                    #[cfg(feature = "hooks")]
+                    #[cfg(any(feature = "hooks", feature = "memory"))]
                     super::adopt_runner_hook_context(
                         &mut paused,
                         self.run.pending_turn.as_mut(),
@@ -6032,10 +6029,7 @@ impl<'a> App<'a> {
                         #[cfg(feature = "agent-skills")]
                         let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
                         agent
-                            .with_reasoning_controls(
-                                self.ui.cfg,
-                                self.ui.session.reasoning_controls,
-                            )
+                            .with_main_session(self.ui.cfg, self.ui.session)
                             .with_spend_for_session(
                                 self.ui.session,
                                 self.ui.cfg,
@@ -6056,9 +6050,9 @@ impl<'a> App<'a> {
                             )
                     })
                     .await;
-                    #[cfg(feature = "hooks")]
+                    #[cfg(any(feature = "hooks", feature = "memory"))]
                     let mut paused = paused;
-                    #[cfg(feature = "hooks")]
+                    #[cfg(any(feature = "hooks", feature = "memory"))]
                     super::adopt_runner_hook_context(
                         &mut paused,
                         self.run.pending_turn.as_mut(),

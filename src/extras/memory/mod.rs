@@ -210,6 +210,33 @@ pub fn append_memory_block(preamble: &mut String, memory: Option<&str>) {
     }
 }
 
+/// An append-only data snapshot. The latest one supersedes earlier snapshots;
+/// it does not supply instructions, grants, or a signed top-level system field.
+const CONTEXT_NOTICE: &str = "Persistent memory snapshot (user-maintained context; newer snapshots supersede earlier snapshots):\n";
+
+pub(crate) fn context_notice(memory: &str, history: &[rig::completion::Message]) -> Option<String> {
+    let previous = history.iter().rev().find_map(|message| match message {
+        rig::completion::Message::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|part| {
+                if let rig::completion::AssistantContent::Text(text) = part {
+                    text.text
+                        .starts_with(CONTEXT_NOTICE)
+                        .then_some(text.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .last(),
+        _ => None,
+    });
+    if memory.is_empty() && previous.is_none() {
+        return None;
+    }
+    let notice = format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len());
+    (previous != Some(notice.as_str())).then_some(notice)
+}
+
 /// Opaque, collision-resistant identity for a project path.
 ///
 /// The project basename remains display metadata and never becomes a persistent
@@ -1387,6 +1414,32 @@ pub fn effective_reserve(base: u64, memory_block: Option<&str>) -> u64 {
     )
 }
 
+/// Once a memory snapshot is a canonical message its tokens are already
+/// counted. Reserve only a pending new snapshot; legacy system memory keeps
+/// its original preamble reserve.
+pub(crate) fn effective_session_reserve(
+    base: u64,
+    memory: Option<&str>,
+    session: &crate::session::Session,
+) -> u64 {
+    if session.memory_placement == crate::session::MemoryPlacement::LegacySystem {
+        return effective_reserve(base, memory);
+    }
+    let previous = session.messages.iter().rev().find(|row| {
+        row.role == crate::session::MessageRole::System && row.content.starts_with(CONTEXT_NOTICE)
+    });
+    let current = memory.unwrap_or_default();
+    if current.is_empty() && previous.is_none() {
+        return base;
+    }
+    let notice = format!("{CONTEXT_NOTICE}bytes={}\n{current}", current.len());
+    if previous.is_some_and(|row| row.content.as_str() == notice) {
+        base
+    } else {
+        base.saturating_add(crate::session::Session::estimate_tokens(&notice))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rig tools
 // ---------------------------------------------------------------------------
@@ -1690,5 +1743,46 @@ up with memory_read. Use to recall older context that is not auto-injected. If a
         } else {
             Ok(results.render(MAX_INJECT_BYTES))
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_placement_tests {
+    use super::*;
+    #[test]
+    fn cache71_memory_notices_dedupe_clear_and_preserve_literal_bytes() {
+        use rig::completion::Message;
+        assert!(context_notice("", &[]).is_none());
+        let first = context_notice("raw memory 雪", &[]).unwrap();
+        assert!(first.ends_with("raw memory 雪"));
+        let history = vec![
+            Message::assistant(first),
+            Message::user("literal user"),
+            Message::assistant("answer"),
+        ];
+        assert!(context_notice("raw memory 雪", &history).is_none());
+        let updated = context_notice("new memory", &history).unwrap();
+        assert!(updated.ends_with("new memory"));
+        let cleared = context_notice("", &history).unwrap();
+        assert!(cleared.ends_with("bytes=0\n"));
+        assert!(context_notice("", &[Message::assistant(cleared)]).is_none());
+        let mut session = crate::session::Session::new("test", "test", 128_000, "");
+        let reserve = effective_session_reserve(100, Some("raw memory 雪"), &session);
+        assert!(reserve > 100);
+        session.add_message(
+            crate::session::MessageRole::System,
+            &context_notice("raw memory 雪", &[]).unwrap(),
+        );
+        assert_eq!(
+            effective_session_reserve(100, Some("raw memory 雪"), &session),
+            100
+        );
+        assert!(effective_session_reserve(100, Some("changed"), &session) > 100);
+        assert!(effective_session_reserve(100, None, &session) > 100);
+        session.memory_placement = crate::session::MemoryPlacement::LegacySystem;
+        assert_eq!(
+            effective_session_reserve(100, Some("raw memory 雪"), &session),
+            effective_reserve(100, Some("raw memory 雪"))
+        );
     }
 }

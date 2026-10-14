@@ -159,7 +159,8 @@ impl ContextDiagnostic {
             session.context_window,
         );
         #[cfg(feature = "memory")]
-        let reserve = crate::extras::memory::effective_reserve(reserve, memory_block);
+        let reserve =
+            crate::extras::memory::effective_session_reserve(reserve, memory_block, session);
         #[cfg(not(feature = "memory"))]
         let _ = memory_block;
         let keep = cfg.resolve_keep_recent_tool_results();
@@ -565,7 +566,11 @@ mod tests {
         assert_eq!(
             normal.threshold,
             session.context_window
-                - crate::extras::memory::effective_reserve(100, Some("captured memory"))
+                - crate::extras::memory::effective_session_reserve(
+                    100,
+                    Some("captured memory"),
+                    &session
+                )
         );
     }
 
@@ -776,9 +781,10 @@ mod tests {
             );
             assert_eq!(
                 with_memory.threshold,
-                1000 - crate::extras::memory::effective_reserve(
+                1000 - crate::extras::memory::effective_session_reserve(
                     100,
-                    Some("CAPTURED_PRIVATE_MEMORY")
+                    Some("CAPTURED_PRIVATE_MEMORY"),
+                    &session,
                 )
             );
             assert!(!with_memory.render().contains("CAPTURED_PRIVATE_MEMORY"));
