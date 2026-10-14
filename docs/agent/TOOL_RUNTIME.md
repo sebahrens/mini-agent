@@ -959,6 +959,13 @@ that called guard primitive with an inert command; it does not substitute for
 AppContainer runtime containment proofs, which retain their existing launcher
 and broker contracts.
 
+The native spend-wait test requires two Tokio runtime threads: one can wait on
+actual process creation while the other records the controlled spend change.
+The development Tokio dependency therefore enables `rt-multi-thread` alongside
+`test-util`, including in minimal feature test rows. This supports the test
+fixture only; production Tokio features, defaults and process ownership policy
+remain unchanged. The fourth owner control is required in the exact native row.
+
 The manual CI scope `windows-command-family` runs the existing Windows default
 compilation job, including four physical App stack controls, three suspended Job
 prototypes, four production owner controls and the unchanged five native PR/Shell
