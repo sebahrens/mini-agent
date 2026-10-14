@@ -1093,3 +1093,26 @@ formatter status. Dropping a cancelled tool future cannot promise a reply, but t
 original committed bytes are not rolled back and its scoped process owner retains
 the existing retirement/forced-exit contract. An empty map preserves legacy tool
 output exactly.
+
+
+### Installed Windows preflight helper observation
+
+Only the explicit installed sandbox self-check attaches the unnamed fixed-size
+`windows/preflight_witness.rs` observation cell. Its complete private request
+transfers a noninheritable handle duplicated into the exact spawned helper; the
+contained target retains its unchanged three-stdio handle list. Existing helper
+stage stores mirror into one aligned scalar. The parent samples only after the
+exact helper retires and emits a closed phase label, never handles, paths, SIDs,
+argv, payloads, or credentials. The observation is not readiness, containment,
+or availability authority and does not repair a timeout. Ordinary launches and
+direct verification omit the optional field and retain their existing path.
+
+The observed self-check owns its request writer thread through cancellation,
+actual thread signal and join. Every parent pipe reader is closed after spawn.
+Preparation, duplicate/encode/delivery, helper execution and retirement consume
+the original five-second run plus five-second cleanup deadlines; recovery keeps
+its established separate deadline. If exact helper/writer retirement cannot be
+proved by that cleanup bound, the explicit self-check terminates fatally rather
+than detaching an owner or declaring availability. Recovery state is preserved.
+The scalar and feeder primitives have prior finite native Windows proof; an
+actual observed installed check remains the owning integration witness.

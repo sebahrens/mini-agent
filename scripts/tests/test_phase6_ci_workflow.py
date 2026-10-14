@@ -1486,6 +1486,8 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
             "[int]$match.Groups[3].Value -gt 60000", "[int]$match.Groups[4].Value -gt 60000",
             "if (-not $match.Success", " stage=finished category=available ", " stage=cached category=available ",
             "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular", "breakaway=denied", "network=denied",
+            "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC ", "$helper.Count -ne 1",
+            "phase=cleanup elapsed_ms=([0-9]{1,5})$", "[int]$helperMatch.Groups[1].Value -gt 60000",
         ]:
             if item not in probe:
                 raise AssertionError("missing installed diagnostic guard: " + item)

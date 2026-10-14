@@ -16,6 +16,7 @@ pub(super) mod general_owner;
 #[cfg(test)]
 #[path = "../tests/windows_foreground_job_tests.rs"]
 mod general_process_prototype_tests;
+mod preflight_witness;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, c_void};
@@ -215,6 +216,7 @@ static GENERAL_SANDBOX_AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new()
 
 fn mark_helper_stage(stage: u8) {
     HELPER_STAGE.store(stage, Ordering::Release);
+    preflight_witness::mark(stage);
 }
 
 fn helper_failure_status() -> i32 {
@@ -236,6 +238,8 @@ struct LaunchRequest {
     parent_pid: u32,
     parent_created: u64,
     ready_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preflight_witness: Option<preflight_witness::Attachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
@@ -951,6 +955,7 @@ struct PreflightDiagnostics {
     started: Instant,
     events: std::cell::RefCell<Vec<PreflightDiagnosticEvent>>,
     saturated: std::cell::Cell<bool>,
+    helper_phase: std::cell::Cell<Option<&'static str>>,
 }
 impl PreflightDiagnostics {
     fn new() -> Self {
@@ -958,6 +963,7 @@ impl PreflightDiagnostics {
             started: Instant::now(),
             events: std::cell::RefCell::new(Vec::with_capacity(MAX_PREFLIGHT_DIAGNOSTIC_EVENTS)),
             saturated: std::cell::Cell::new(false),
+            helper_phase: std::cell::Cell::new(None),
         }
     }
     fn record(
@@ -1015,6 +1021,18 @@ impl PreflightDiagnostics {
         let mut text = String::new();
         for event in self.events.borrow().iter() {
             writeln!(text, "WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1 stage={} category={} elapsed_ms={} slack_ms={} capped={}", event.stage.name(), event.category.name(), event.elapsed_ms, event.slack_ms, event.capped).expect("String formatting cannot fail");
+        }
+        if let Some(phase) = self.helper_phase.get() {
+            writeln!(
+                text,
+                "WINDOWS_GENERAL_PREFLIGHT_HELPER_DIAGNOSTIC v=1 phase={} elapsed_ms={}",
+                phase,
+                self.started
+                    .elapsed()
+                    .as_millis()
+                    .min(MAX_PREFLIGHT_DIAGNOSTIC_MS)
+            )
+            .expect("String formatting cannot fail");
         }
         if self.saturated.get() {
             text.push_str("WINDOWS_GENERAL_PREFLIGHT_DIAGNOSTIC v=1 stage=bounded category=retained elapsed_ms=0 slack_ms=0 capped=true\n");
@@ -1089,32 +1107,49 @@ fn run_production_preflight_owned_in(
             "production preflight executable",
         )?;
         let cleanup_ready = workspace.join("cleanup-ready.txt");
-        let mut command = build_helper_with_ready(
-            executable.clone(),
-            vec![
-                TARGET_PROBE_ARG.into(),
-                TARGET_BOUNDARY_ARG.into(),
-                inside_file.to_string_lossy().into_owned(),
-                cache_fixture.to_string_lossy().into_owned(),
-                outside_secret.to_string_lossy().into_owned(),
-                outside_file.to_string_lossy().into_owned(),
-            ],
-            &workspace,
-            &cache,
-            Some(cleanup_ready.clone()),
-        )?;
-        command
-            .as_std_mut()
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        record_preflight(
-            diagnostics,
-            PreflightStage::Prepared,
-            PreflightCategory::Ok,
-            Some(run_deadline),
-        );
-        let status =
-            run_bounded_preflight_helper(&mut command, run_deadline, reap_deadline, diagnostics)?;
+        let arguments = vec![
+            TARGET_PROBE_ARG.into(),
+            TARGET_BOUNDARY_ARG.into(),
+            inside_file.to_string_lossy().into_owned(),
+            cache_fixture.to_string_lossy().into_owned(),
+            outside_secret.to_string_lossy().into_owned(),
+            outside_file.to_string_lossy().into_owned(),
+        ];
+        let status = if let Some(diagnostics) = diagnostics {
+            let pending = preflight_witness::prepare(
+                executable.clone(),
+                arguments,
+                &workspace,
+                &cache,
+                Some(cleanup_ready.clone()),
+            )?;
+            record_preflight(
+                Some(diagnostics),
+                PreflightStage::Prepared,
+                PreflightCategory::Ok,
+                Some(run_deadline),
+            );
+            pending.run(run_deadline, reap_deadline, diagnostics)?
+        } else {
+            let mut command = build_helper_with_ready(
+                executable.clone(),
+                arguments,
+                &workspace,
+                &cache,
+                Some(cleanup_ready.clone()),
+            )?;
+            command
+                .as_std_mut()
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            record_preflight(
+                None,
+                PreflightStage::Prepared,
+                PreflightCategory::Ok,
+                Some(run_deadline),
+            );
+            run_bounded_preflight_helper(&mut command, run_deadline, reap_deadline, None)?
+        };
         if !status.success() || !inside_file.exists() || outside_file.exists() {
             return Err("production AppContainer preflight denied its declared boundary".into());
         }
@@ -1553,13 +1588,22 @@ fn run_bounded_preflight_helper(
     cleanup_deadline: Instant,
     diagnostics: Option<&PreflightDiagnostics>,
 ) -> Result<ExitStatus, String> {
+    let mut child = spawn_preflight_helper(command, run_deadline, diagnostics)?;
+    wait_bounded_preflight_child(&mut child, run_deadline, cleanup_deadline, diagnostics)
+}
+
+fn spawn_preflight_helper(
+    command: &mut tokio::process::Command,
+    run_deadline: Instant,
+    diagnostics: Option<&PreflightDiagnostics>,
+) -> Result<Child, String> {
     record_preflight(
         diagnostics,
         PreflightStage::Spawn,
         PreflightCategory::Begin,
         Some(run_deadline),
     );
-    let mut child = command
+    let child = command
         .as_std_mut()
         .spawn_guarded_until(run_deadline)
         .map_err(|error| {
@@ -1577,6 +1621,15 @@ fn run_bounded_preflight_helper(
         PreflightCategory::Ok,
         Some(run_deadline),
     );
+    Ok(child)
+}
+
+fn wait_bounded_preflight_child(
+    child: &mut Child,
+    run_deadline: Instant,
+    cleanup_deadline: Instant,
+    diagnostics: Option<&PreflightDiagnostics>,
+) -> Result<ExitStatus, String> {
     loop {
         if Instant::now() >= run_deadline {
             record_preflight(
@@ -1585,7 +1638,7 @@ fn run_bounded_preflight_helper(
                 PreflightCategory::Deadline,
                 Some(run_deadline),
             );
-            terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)?;
+            terminate_and_reap_owned_helper(child, cleanup_deadline, diagnostics)?;
             return Err("sandbox: Windows general AppContainer preflight timed out".into());
         }
         match child.try_wait() {
@@ -1614,8 +1667,7 @@ fn run_bounded_preflight_helper(
                 let poll_error =
                     format!("sandbox: poll production AppContainer preflight: {error}");
                 return Err(
-                    match terminate_and_reap_owned_helper(&mut child, cleanup_deadline, diagnostics)
-                    {
+                    match terminate_and_reap_owned_helper(child, cleanup_deadline, diagnostics) {
                         Ok(()) => poll_error,
                         Err(cleanup) => format!("{poll_error}; {cleanup}"),
                     },
@@ -1841,7 +1893,7 @@ fn build_helper_with_ready(
     build_helper_with_ready_and_roots(program, arguments, cwd, cache, ready_path, &[], &[])
 }
 
-fn build_helper_with_ready_and_roots(
+fn prepare_launch_request(
     program: PathBuf,
     arguments: Vec<String>,
     cwd: &Path,
@@ -1849,7 +1901,7 @@ fn build_helper_with_ready_and_roots(
     ready_path: Option<PathBuf>,
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
-) -> Result<tokio::process::Command, String> {
+) -> Result<LaunchRequest, String> {
     let cwd = canonical_root(cwd, "workspace")?;
     let cache = canonical_root(cache, "application cache")?;
     let program = canonical_file(&program, "sandbox executable")?;
@@ -1872,7 +1924,7 @@ fn build_helper_with_ready_and_roots(
         &read_roots,
         &write_roots,
     )?;
-    let request = LaunchRequest {
+    Ok(LaunchRequest {
         version: REQUEST_VERSION,
         program,
         program_proof,
@@ -1886,7 +1938,28 @@ fn build_helper_with_ready_and_roots(
         parent_pid: unsafe { GetCurrentProcessId() },
         parent_created: process_creation_time(unsafe { GetCurrentProcess() })?,
         ready_path,
-    };
+        preflight_witness: None,
+    })
+}
+
+fn build_helper_with_ready_and_roots(
+    program: PathBuf,
+    arguments: Vec<String>,
+    cwd: &Path,
+    cache: &Path,
+    ready_path: Option<PathBuf>,
+    configured_read_roots: &[PathBuf],
+    configured_write_roots: &[PathBuf],
+) -> Result<tokio::process::Command, String> {
+    let request = prepare_launch_request(
+        program,
+        arguments,
+        cwd,
+        cache,
+        ready_path,
+        configured_read_roots,
+        configured_write_roots,
+    )?;
     let payload = serde_json::to_vec(&request)
         .map_err(|error| format!("sandbox: encode Windows launch request: {error}"))?;
     if payload.len() > REQUEST_MAX_BYTES {
@@ -2740,6 +2813,10 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
 fn run_helper() -> Result<i32, String> {
     mark_helper_stage(HELPER_STAGE_REQUEST);
     let request = read_request()?;
+    if let Some(attachment) = &request.preflight_witness {
+        preflight_witness::attach(attachment)?;
+        mark_helper_stage(HELPER_STAGE_REQUEST);
+    }
     if request.version != REQUEST_VERSION {
         return Err("unsupported Windows sandbox request version".into());
     }

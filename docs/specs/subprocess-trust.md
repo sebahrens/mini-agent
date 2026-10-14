@@ -723,3 +723,14 @@ these two inert `String::contains` contexts, each with a count of one.
 No scanner, process
 creation classification, or negative validator is changed. Formatter execution
 uses the existing sandbox command owner and creation boundary.
+
+
+## Installed preflight helper observation inventory
+
+The explicit Windows self-check's `windows/preflight_witness.rs` retains the
+same current-executable AppContainer helper constructor under `TC-MODEL-ACTION`
+and the existing guarded creation boundary. The `tokio::process::Command` field
+is inert type data. Its one `std::thread::Builder` request writer is non-process
+and is retained until exact native thread signal and join, within the original
+cleanup deadline. This observer does not select a new target, backend, grant, or
+worker boundary. Existing source scanner rules and negative controls are unchanged.

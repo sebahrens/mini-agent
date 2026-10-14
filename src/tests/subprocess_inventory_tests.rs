@@ -1550,6 +1550,32 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    // Explicit installed self-check observer: one joined Rust writer, same
+    // fixed production helper constructor/creation boundary; no new target.
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "command: tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows/preflight_witness.rs",
+        "let mut command = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
@@ -1584,7 +1610,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         "command: &mut tokio::process::Command,",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
