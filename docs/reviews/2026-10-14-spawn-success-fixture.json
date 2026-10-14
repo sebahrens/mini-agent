@@ -1,0 +1,40 @@
+{
+  "bead": "mini-agent-i7ro6.114",
+  "base": "8e003f13c0fec06a84b7e5d503bb40821728f44f",
+  "failure": {
+    "run": 38566797613,
+    "job": 115862418622,
+    "test": "extras::js::tests::worker_effect_services::worker_effect_services_spawn_target_failure_then_success",
+    "observed": "EffectServiceError::TimedOut before bounded output result",
+    "log": "/private/tmp/mini-agent-ci8e-job-115862418622.log"
+  },
+  "change": "Only the target/recovery/output-limit success fixture service budget changes1s->10s. Permission-timeout owner20ms and Ask service1s, output truncation, recovered printf and cancellation assertions stay unchanged. No production budget, containment, permission or output limit changes.",
+  "source_reason": "SpawnEffectService::execute creates a preparation deadline from the configured fixture timeout and authorize can return TimedOut; execute_prepared returns actual execution timeouts inside SpawnResult rather than this error. The failure therefore precedes bounded output execution. The fixture proves successful target/output/recovery, not a1s preparation SLA.",
+  "test_selection": {
+    "method": "Code-indexer exact failed test, SpawnEffectService and execute/prepared source traces; focused physical reads disambiguate execute homonyms.",
+    "filters": [
+      "worker_effect_services_spawn_target_failure_then_success"
+    ],
+    "rows": [
+      "default",
+      "--no-default-features --features skills"
+    ],
+    "reason": "Default and the actual failed skills-only cfg differ in Sandbox/host launch compilation. Only the one changed fixture is rerun on each; no whole worker, JS, runtime or local feature matrix suite.",
+    "phase6": "Canonical security checklist read; no runtime/broker/protocol/sandbox production edits.",
+    "install_reuse": "Root113 required debug install on identical production source is reused for this test-only repair; isolated64 required install concerns its separate draft checkout.",
+    "limits": "Local owning tests are macOS evidence, not native Linux acceptance. Fresh hosted source CI remains required."
+  },
+  "logs": {
+    "default": {
+      "path": "/private/tmp/mini-agent-ci114-default-owning.log",
+      "sha256": "2070c49acf70048608f1a2e9ba0fe2f38a826fda59c8289de5cafae985c5d400",
+      "result": "1 passed, 0 failed"
+    },
+    "skills": {
+      "path": "/private/tmp/mini-agent-ci114-skills-owning.log",
+      "sha256": "7808f87443ca772720e13542c1343f786c9e4fb311e2c90af93d4679bf46a6d8",
+      "result": "1 passed, 0 failed"
+    }
+  },
+  "fresh_ci": "pending push; Windows installed preflight and LSP parallel failures remain separate unresolved beads108.2/44.2"
+}

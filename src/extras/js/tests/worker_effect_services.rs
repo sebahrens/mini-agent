@@ -509,10 +509,14 @@ async fn worker_effect_services_permission_deny_timeout_and_cancellation_are_clo
 #[tokio::test]
 async fn worker_effect_services_spawn_target_failure_then_success() {
     let owner = PermissionBridgeOwner::new(None, None, Duration::from_millis(100));
+    // This control proves target recovery and output limits, not a short
+    // executable-preparation deadline. Preparation may contend with other
+    // native fixtures on hosted runners; keep it bounded without conflating
+    // that scheduling delay with the output-limit contract below.
     let service = SpawnEffectService::new(
         Sandbox::new(false, "bwrap"),
         owner.bridge(),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
     );
 
     assert!(matches!(
