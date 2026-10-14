@@ -1,0 +1,36 @@
+{
+  "bead": "mini-agent-4ccbc",
+  "status": "Diagnostic only; actual existing-session Windows failure remains open until native cause and repair are proven.",
+  "owner_manifest": {
+    "bead": "mini-agent-4ccbc",
+    "base": "2c93906e210762241cfebc56f85ab39874e98801",
+    "patch": "/private/tmp/mini-agent-windows-session-save-stage-owned.patch",
+    "patch_sha256": "9d8d8c550f536e50a189ebc000987d7878bb629cd0006b1a63ffb41150cd2828",
+    "file": "src/fs.rs",
+    "file_sha256": "e5ab5fdaadf559ae74d5b1ce72bafcfca21a417023c91289c3ab9ed170ab1351",
+    "bytes": 6954,
+    "scope": "Test-only closed stage and numeric original OS/NT failure observation. Non-test macro branch evaluates original operation. Existing publication, exact captured authority, full bytes, ACLs, sharing, cleanup, retry and deadlines unchanged.",
+    "validation": [
+      "cargo fmt --all PASS",
+      "git diff --check PASS",
+      "No Cargo/tests/install run: changes are Windows-only test observation; existing actual native second-save control is the owning test."
+    ],
+    "required_hosted": {
+      "test": "tests::session_storage_tests::session_storage_permissions_windows_dacls_exclude_broad_principals",
+      "command": "cargo test --locked --no-default-features --features mcp --bin mini-agent -- tests::session_storage_tests::session_storage_permissions_windows_dacls_exclude_broad_principals --exact --nocapture --test-threads=1",
+      "discovery": "same exact fullname --exact --list; require exactly one discovered",
+      "acceptance": "Observe original failing stage/OS code and raw NTSTATUS if create/rename. A green attempt is not established intermittent cause or fixed production behavior."
+    }
+  },
+  "root_review": {
+    "findings": [],
+    "checks": [
+      "Each instrumented operation executes once; non-test expansion is original operation",
+      "Original io::Error and cleanup/retry branches preserved",
+      "Only fixed source-free stage literals, numeric OS code and numeric NTSTATUS printed under cfg(test)",
+      "No new environment controls, access masks, sharing flags, authority, deadlines or retries",
+      "No Mac runtime gate repeated for Windows-only test observation; next actual hosted second-save fixture owns acceptance"
+    ],
+    "limits": "Some uninstrumented validation errors may still return between observation points; existing target may fail before rename. No guessed sharing fix."
+  }
+}

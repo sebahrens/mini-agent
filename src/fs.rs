@@ -2206,6 +2206,31 @@ fn atomic_write_platform(
     Ok(())
 }
 
+// Test-only closed stages identify the original failing subcall without
+// printing paths, payloads or error messages. Non-test expansion is exactly
+// the original expression; authority, error values and retries are unchanged.
+#[cfg(windows)]
+macro_rules! observe_windows_atomic {
+    ($stage:literal, $operation:expr) => {{
+        #[cfg(test)]
+        {
+            let result = $operation;
+            if let Err(error) = &result {
+                eprintln!(
+                    "WINDOWS_ATOMIC_WRITE_FAILURE stage={} os_code={:?}",
+                    $stage,
+                    error.raw_os_error()
+                );
+            }
+            result
+        }
+        #[cfg(not(test))]
+        {
+            $operation
+        }
+    }};
+}
+
 /// One native, handle-relative rename attempt. Callers retain their own retry/cancellation
 /// policy and directory identity authority. `replace=false` never overwrites an existing leaf.
 #[cfg(windows)]
@@ -2287,6 +2312,11 @@ pub(crate) fn windows_rename_open_file_relative(
     if status >= 0 {
         Ok(())
     } else {
+        #[cfg(test)]
+        eprintln!(
+            "WINDOWS_ATOMIC_WRITE_NATIVE_FAILURE stage=rename ntstatus=0x{:08x}",
+            status as u32
+        );
         // SAFETY: accepts the NTSTATUS returned by the native operation.
         Err(std::io::Error::from_raw_os_error(
             unsafe { RtlNtStatusToDosError(status) } as i32,
@@ -2452,6 +2482,11 @@ fn atomic_write_platform(
             )
         };
         if status < 0 {
+            #[cfg(test)]
+            eprintln!(
+                "WINDOWS_ATOMIC_WRITE_NATIVE_FAILURE stage=temp_create ntstatus=0x{:08x}",
+                status as u32
+            );
             // SAFETY: the conversion accepts any NTSTATUS returned by NtCreateFile.
             let code = unsafe { RtlNtStatusToDosError(status) };
             return Err(std::io::Error::from_raw_os_error(code as i32));
@@ -2469,17 +2504,21 @@ fn atomic_write_platform(
     ensure_same_file(
         canonical_root,
         approved_root,
-        &checked_path_metadata(canonical_root)?,
+        &observe_windows_atomic!("root_metadata", checked_path_metadata(canonical_root))?,
     )?;
     let parent = canonical_root.join(relative_parent);
-    let parent_metadata = checked_path_metadata(&parent)?;
+    let parent_metadata =
+        observe_windows_atomic!("parent_metadata", checked_path_metadata(&parent))?;
     if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
         return Err(path_changed_error(&parent));
     }
     if let Some(approved) = approved_parent {
         ensure_same_file(&parent, approved, &parent_metadata)?;
     }
-    let directory = open_verified_directory(&parent, &parent_metadata)?;
+    let directory = observe_windows_atomic!(
+        "open_verified_directory",
+        open_verified_directory(&parent, &parent_metadata)
+    )?;
     if let Some(approved) = approved_parent {
         ensure_same_file(&parent, approved, &checked_file_metadata(&directory)?)?;
     }
@@ -2497,9 +2536,12 @@ fn atomic_write_platform(
         }
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+        Err(error) => return observe_windows_atomic!("initial_target_metadata", Err(error)),
     };
-    ensure_same_file(&parent, &parent_metadata, &checked_path_metadata(&parent)?)?;
+    observe_windows_atomic!(
+        "parent_identity_before_create",
+        ensure_same_file(&parent, &parent_metadata, &checked_path_metadata(&parent)?)
+    )?;
 
     #[cfg(test)]
     cancellation.probe_before_temp_creation();
@@ -2510,7 +2552,10 @@ fn atomic_write_platform(
     let mut bound_file = None;
     for _ in 0..128 {
         let temp_name = format!(".zswrite.{}.tmp", uuid::Uuid::new_v4().simple());
-        let file = match create_relative_temp(&directory, std::ffi::OsStr::new(&temp_name)) {
+        let file = match observe_windows_atomic!(
+            "temp_create",
+            create_relative_temp(&directory, std::ffi::OsStr::new(&temp_name))
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -2529,7 +2574,10 @@ fn atomic_write_platform(
         // Initialize only this exclusive empty image, before private bytes.
         // The central helper installs the explicit current-user owner and
         // protected DACL on the retained object, including elevated tokens.
-        if let Err(error) = private::prepare_new_private_file(&file) {
+        if let Err(error) = observe_windows_atomic!(
+            "temp_private_setup",
+            private::prepare_new_private_file(&file)
+        ) {
             delete_open_file(&file);
             return Err(error);
         }
@@ -2542,12 +2590,12 @@ fn atomic_write_platform(
     }
     // NTFS journals the rename itself; syncing the contents first makes the
     // published file durable (FlushFileBuffers).
-    let write_result = file
-        .write_all(contents)
-        .and_then(|()| file.flush())
+    let write_result = observe_windows_atomic!("temp_write", file.write_all(contents))
+        .and_then(|()| observe_windows_atomic!("temp_flush", file.flush()))
         .and_then(|()| {
             if durability == AtomicWriteDurability::Sync {
-                file.sync_all().inspect(|_| record_durable_sync())
+                observe_windows_atomic!("temp_sync", file.sync_all())
+                    .inspect(|_| record_durable_sync())
             } else {
                 Ok(())
             }
@@ -2577,7 +2625,7 @@ fn atomic_write_platform(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 delete_open_file(&file);
-                return Err(error);
+                return observe_windows_atomic!("current_target_metadata", Err(error));
             }
         };
         let same_target = match (initial_target.as_ref(), current_target.as_ref()) {
@@ -2611,8 +2659,15 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation
-        .publish(|| rename_open_file(&directory, &file, leaf, !mode.create_only(), cancellation));
+    let publish_result = observe_windows_atomic!(
+        "publication",
+        cancellation.publish(|| {
+            observe_windows_atomic!(
+                "rename",
+                rename_open_file(&directory, &file, leaf, !mode.create_only(), cancellation)
+            )
+        })
+    );
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);
