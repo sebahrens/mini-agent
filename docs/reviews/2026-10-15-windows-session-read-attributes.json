@@ -9,6 +9,13 @@
   "fix": "Add FILE_READ_ATTRIBUTES to that one retained temporary handle. Share mode, root binding, exclusive creation, ACL/owner validation, rename/CAS, timeout and cleanup remain unchanged.",
   "source_patch": "f487e1628aeb3e21a1da9dbb43aa07bc6850abb8e56623c0a6ba07c7f6036763",
   "diagnostic_branch_commit": "7683d2a0ae4e530d01f19395791c8e2a05fb1735",
-  "validation": "Exact two existing minimal-MCP native storage controls are running at https://github.com/sebahrens/mini-agent/actions/runs/38649629222. No native pass or bead closure claimed yet. Unchanged macOS cfg is covered by the combined tests/lint/install; no redundant local feature matrix.",
+  "validation": {
+    "native_run": "https://github.com/sebahrens/mini-agent/actions/runs/38649629222",
+    "job": 116144994538,
+    "source": "7683d2a0ae4e530d01f19395791c8e2a05fb1735",
+    "result": "Exact two discovered and executed:2 passed,0 failed,0 ignored in0.17s. First/second saves, protected private ACLs, tool-output/lock paths, actual junction rejection and no-residue assertions retained.",
+    "log_sha256": "7d22a75d48d6ad59ee71b79878115f30f9843f5c57c78c1741ef884f948040d7",
+    "scope": "One-bit production difference versus the corrected-fixture native red at846da19d. Full combined Main CI remains separate."
+  },
   "separation": "This is session temporary-handle validation. It does not deliver blocked Windows MCP configuration replacement mini-agent-i7ro6.57.1."
 }
