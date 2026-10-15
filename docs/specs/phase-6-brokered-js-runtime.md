@@ -783,9 +783,16 @@ atomically creates a distinct single-link image from the pinned trusted source w
 `fclonefileat(..., CLONE_NOOWNERCOPY)`. The APFS copy-on-write path avoids rewriting and durably
 flushing the complete executable for every worker generation. If the pinned executable is on a
 different or non-cloning volume, only `EXDEV` or `ENOTSUP` selects the descriptor-relative,
-exclusive private-copy path; every other clone error fails closed. Mutable-source publication independently
-hashes both pinned descriptors; a previously admitted anonymous source follows the retained selection
-contract below. The publisher verifies source and destination metadata and distinct inodes,
+exclusive private-copy path; every other clone error fails closed. Mutable-source publication
+independently reads the pinned source digest on a cache miss. A bounded persistent record may
+supply only an **expected digest**, selected by the exact path hash and live descriptor's device,
+inode, size, mtime and ctime (including nanoseconds). Those metadata are lookup/rejection checks,
+not content proof. On every hit the newly sealed private image is still independently hashed and
+must equal that expectation **before any guardian executes**. A forged/stale expectation mismatch
+cleans up and fails closed; it cannot reach trusted launch or turn into admitted bytes. The
+source-evidence type distinguishes an independent source read, persistent expectation, and
+previously admitted anonymous source. The last follows the retained selection contract below.
+The publisher verifies source and destination metadata and distinct inodes,
 changes the image to `0500`, and retains close-on-exec descriptors so cleanup and unlink remain
 bound to the proven directory and inode. The destination must not exist, and a clone, reopen, ACL,
 metadata, permission, synchronization, or hash failure cleans up or fails closed. Under the
@@ -812,6 +819,23 @@ the child and protocol pipes to the supervisor, so no bootstrap challenge, authe
 request, or brokered effect can precede proof completion. Ready-time descriptor revalidation,
 rehashing and unlink remain unchanged.
 
+**Persistent source-digest expectation (`mini-agent-i7ro6.5`; amendment 2026-10-15).**
+The single versioned digest record is at most 4 KiB in the existing private application-data
+publication root. All reads and writes use that retained directory descriptor and its existing
+publication lock. The record must be current-user owned, private 0600, regular, singly linked,
+close-on-exec and free of extended ACLs; no-follow/nonblocking opens reject aliases and special
+files. Malformed, oversized, unknown-version or insecure records are skipped unchanged. Only a
+fresh independent source read that matches the newly hashed image may update a valid record or
+create an absent one. The bounded descriptor update is synced under the same lock; interruption
+can leave an ignored hint, never availability or a worker handle. No record deserializes a
+`RetainedWorkerSource`, invocation grant or `Available` status. Every new parent still performs the
+complete live containment matrix, and authenticated Ready still independently rehashes/unlinks
+that generation. The source cache saves one source read across process starts; it never caches
+containment attestation or replaces either generation image proof.
+Opted-in containment evidence reports only the closed source-evidence token
+`MACOS_SOURCE_DIGEST_EXPECTATION_V1=source_read` or `matched_image`; it exposes no path,
+lookup key, digest or executable bytes. Normal operation keeps this in debug tracing.
+
 **Retained executable selection (`mini-agent-i7ro6.86`; amendment 2026-10-15).**
 A process retains the first generation's already-proven image only after its authenticated Ready
 rehash, identity-bound unlink, and complete successful native containment preflight, including
@@ -820,13 +844,13 @@ same full content digest; the trusted parent-death helper's bounded, exactly par
 its own post-Ready image digest. A source change between matrix cases refuses cache commitment
 even if its size or timestamps match or it is later restored. Failed or incomplete preflight drops
 the pending candidate. Mutable pathname sources and executables above the retention cap continue
-through independent source and destination hashing.
+through the fresh path publisher and its expected-digest rule above.
 
 Such selection fixes the executable bytes for the parent lifetime; executable updates require a
 parent restart. It is not transparent pathname refresh. The retained object must be an opaque,
 nonserializable, parent-owned read-only close-on-exec descriptor with no pathname, writable alias,
 extended ACL or remaining link. At most one object, capped at 512 MiB, may be retained; larger
-executables continue through the uncached publisher. Descriptor identity and flags can reject a
+executables continue through the non-retained publisher. Descriptor identity and flags can reject a
 changed object, but metadata never authorizes replacement bytes. The approved scoped threat model
 still trusts the parent and OS and excludes hostile same-UID peers; this ownership guarantee is
 not a Darwin kernel write seal or a Security.framework identity claim.

@@ -691,7 +691,7 @@ fn launch_executable_with_source(
         Some(source) => one_time_image::OneTimeWorkerImage::prepare_from_retained_and_start(
             source, &root, start,
         ),
-        None => one_time_image::OneTimeWorkerImage::prepare_from_and_start_retaining(
+        None => one_time_image::OneTimeWorkerImage::prepare_from_cached_and_start_retaining(
             &executable,
             &root,
             retain_candidate,
@@ -2407,7 +2407,8 @@ mod one_time_image {
     #[cfg(test)]
     const MAX_CODE_IDENTITY_ARCHITECTURES: usize = 4;
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct FileIdentity {
         device: u64,
         inode: u64,
@@ -2873,9 +2874,18 @@ mod one_time_image {
         Retained(&'a RetainedWorkerSource),
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SourceDigestEvidence {
+        IndependentRead,
+        PersistentExpectation,
+        RetainedSnapshot,
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct WorkerImageProof {
         source: FileIdentity,
+        #[cfg_attr(not(test), allow(dead_code))]
+        source_digest_evidence: SourceDigestEvidence,
         image: FileIdentity,
     }
 
@@ -3170,11 +3180,13 @@ mod one_time_image {
                 ImageSource::Path(source),
                 private_root,
                 false,
+                false,
                 fault,
                 start,
             )
         }
 
+        #[cfg(test)]
         pub(super) fn prepare_from_and_start_retaining<T>(
             source: &Path,
             private_root: &Path,
@@ -3185,6 +3197,7 @@ mod one_time_image {
                 ImageSource::Path(source),
                 private_root,
                 retain_candidate,
+                false,
                 |_, _| Ok(()),
                 start,
             )
@@ -3199,6 +3212,23 @@ mod one_time_image {
                 ImageSource::Retained(source),
                 private_root,
                 false,
+                false,
+                |_, _| Ok(()),
+                start,
+            )
+        }
+
+        pub(super) fn prepare_from_cached_and_start_retaining<T>(
+            source: &Path,
+            private_root: &Path,
+            retain_candidate: bool,
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
+            Self::prepare_source_with_fault_and_start(
+                ImageSource::Path(source),
+                private_root,
+                retain_candidate,
+                true,
                 |_, _| Ok(()),
                 start,
             )
@@ -3208,6 +3238,7 @@ mod one_time_image {
             source: ImageSource<'_>,
             private_root: &Path,
             retain_candidate: bool,
+            use_digest_cache: bool,
             mut fault: impl FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
             start: impl FnOnce(&Path) -> io::Result<T>,
         ) -> io::Result<(Self, T)> {
@@ -3253,6 +3284,17 @@ mod one_time_image {
                         None,
                     )
                 }
+            };
+
+            let persistent_digest = selected_path
+                .filter(|_| use_digest_cache)
+                .and_then(|path| read_source_digest_expectation(&root, path, &source_opened));
+            let source_digest_evidence = if cached_digest.is_some() {
+                SourceDigestEvidence::RetainedSnapshot
+            } else if persistent_digest.is_some() {
+                SourceDigestEvidence::PersistentExpectation
+            } else {
+                SourceDigestEvidence::IndependentRead
             };
 
             if !descriptor_has_close_on_exec(source_file.as_raw_fd())?
@@ -3307,10 +3349,10 @@ mod one_time_image {
                 publication.adopt_created_image(image)?;
                 fault(PreparationFaultStage::Created, &image_path)?;
                 ensure_no_extended_acl(publication.image()?, "writable one-time worker image")?;
-                // Mutable sources are independently hashed on every publication. The sole
-                // exception is an already-proven privately constructed anonymous snapshot;
-                // its metadata is only a rejection check, never a content-cache key.
-                let source_sha256 = if let Some(digest) = cached_digest {
+                // A persistent value is only an expectation: fresh sealed-image
+                // equality below must succeed before any guardian executes.
+                // It is not an independent mutable-source read or attestation.
+                let source_sha256 = if let Some(digest) = cached_digest.or(persistent_digest) {
                     digest
                 } else {
                     let started = std::time::Instant::now();
@@ -3377,6 +3419,34 @@ mod one_time_image {
                         "one-time worker image did not match its source",
                     ));
                 }
+                if use_digest_cache {
+                    let token = match source_digest_evidence {
+                        SourceDigestEvidence::IndependentRead => {
+                            "MACOS_SOURCE_DIGEST_EXPECTATION_V1=source_read"
+                        }
+                        SourceDigestEvidence::PersistentExpectation => {
+                            "MACOS_SOURCE_DIGEST_EXPECTATION_V1=matched_image"
+                        }
+                        SourceDigestEvidence::RetainedSnapshot => {
+                            "MACOS_SOURCE_DIGEST_EXPECTATION_V1=retained_snapshot"
+                        }
+                    };
+                    match super::preflight_token_stderr_line(
+                        token,
+                        super::containment_evidence_requested(),
+                    ) {
+                        Some(line) => eprintln!("{line}"),
+                        None => tracing::debug!(token, "worker source digest expectation"),
+                    }
+                }
+                if use_digest_cache
+                    && source_digest_evidence == SourceDigestEvidence::IndependentRead
+                    && let Some(path) = selected_path
+                {
+                    // Optional content expectation only, never availability.
+                    let _ =
+                        write_source_digest_expectation(&root, path, &source_opened, source_sha256);
+                }
                 let before_start = publication.image()?.metadata()?;
                 validate_published_image(&before_start)?;
                 ensure_stable_metadata(
@@ -3421,6 +3491,7 @@ mod one_time_image {
                 let directory = directory.try_clone()?;
                 let proof = WorkerImageProof {
                     source: FileIdentity::from_metadata_and_digest(&source_opened, source_sha256),
+                    source_digest_evidence,
                     image: FileIdentity::from_metadata_and_digest(&image_opened, image_sha256),
                 };
                 let (image, lease) = publication.commit()?;
@@ -4305,6 +4376,122 @@ mod one_time_image {
         Ok(flags & libc::O_ACCMODE == libc::O_RDONLY)
     }
 
+    const SOURCE_DIGEST_CACHE_NAME: &str = "source-digest-v1.json";
+    const MAX_SOURCE_DIGEST_RECORD_BYTES: usize = 4096;
+    const MAX_SOURCE_DIGEST_PATH_BYTES: usize = 16 * 1024;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SourceDigestRecord {
+        version: u8,
+        path_hash: [u8; 32],
+        source: FileIdentity,
+    }
+
+    fn source_path_hash(path: &Path) -> Option<[u8; 32]> {
+        let bytes = path.as_os_str().as_bytes();
+        (bytes.len() <= MAX_SOURCE_DIGEST_PATH_BYTES).then(|| Sha256::digest(bytes).into())
+    }
+
+    fn read_source_digest_record(file: &mut std::fs::File) -> io::Result<SourceDigestRecord> {
+        validate_publication_lease(file)?;
+        let before = file.metadata()?;
+        if before.len() > MAX_SOURCE_DIGEST_RECORD_BYTES as u64 {
+            return Err(io::Error::other("digest cache exceeds bound"));
+        }
+        let mut bytes = Vec::new();
+        (&mut *file)
+            .take(MAX_SOURCE_DIGEST_RECORD_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_SOURCE_DIGEST_RECORD_BYTES {
+            return Err(io::Error::other("digest cache exceeds bound"));
+        }
+        validate_publication_lease(file)?;
+        ensure_stable_metadata(&before, &file.metadata()?, "digest cache changed")?;
+        let record: SourceDigestRecord =
+            serde_json::from_slice(&bytes).map_err(|_| io::Error::other("invalid digest cache"))?;
+        if record.version != 1 {
+            return Err(io::Error::other("unsupported digest cache"));
+        }
+        Ok(record)
+    }
+
+    /// Caller holds RootPublicationLock on this exact validated private root.
+    /// All failures are misses; no permissions are repaired or authority minted.
+    fn read_source_digest_expectation(
+        root: &std::fs::File,
+        path: &Path,
+        source: &std::fs::Metadata,
+    ) -> Option<[u8; 32]> {
+        let path_hash = source_path_hash(path)?;
+        let mut file = open_at(
+            root,
+            OsStr::new(SOURCE_DIGEST_CACHE_NAME),
+            OPEN_READ_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .ok()?;
+        let record = read_source_digest_record(&mut file).ok()?;
+        (record.path_hash == path_hash && record.source.matches_metadata(source))
+            .then_some(record.source.sha256)
+    }
+
+    fn write_source_digest_expectation(
+        root: &std::fs::File,
+        path: &Path,
+        source: &std::fs::Metadata,
+        digest: [u8; 32],
+    ) -> io::Result<()> {
+        let Some(path_hash) = source_path_hash(path) else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&SourceDigestRecord {
+            version: 1,
+            path_hash,
+            source: FileIdentity::from_metadata_and_digest(source, digest),
+        })
+        .map_err(|_| io::Error::other("digest cache encoding failed"))?;
+        if bytes.len() > MAX_SOURCE_DIGEST_RECORD_BYTES {
+            return Err(io::Error::other("digest cache exceeds bound"));
+        }
+        let name = OsStr::new(SOURCE_DIGEST_CACHE_NAME);
+        let flags = OPEN_READ_WRITE | OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK;
+        let (mut file, created) = match open_at(root, name, flags, 0) {
+            Ok(file) => (file, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                open_at(root, name, flags | OPEN_CREATE | OPEN_EXCLUSIVE, 0o600)?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
+        validate_publication_lease(&file)?;
+        if !created {
+            // Malformed, oversized and future records stay untouched, as do
+            // insecure files. A cache miss must never become permission repair.
+            read_source_digest_record(&mut file)?;
+        }
+        let current = open_at(
+            root,
+            name,
+            OPEN_READ_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )?;
+        validate_publication_lease(&current)?;
+        ensure_same_identity(
+            &file.metadata()?,
+            &current.metadata()?,
+            "digest cache path changed",
+        )?;
+        // The existing root lock serializes readers and writers. A crash during
+        // this bounded update leaves an ignored hint, never admitted state.
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        validate_publication_lease(&file)?;
+        root.sync_all()
+    }
+
     fn hash_file(file: &mut std::fs::File) -> io::Result<[u8; 32]> {
         file.seek(std::io::SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
@@ -4386,6 +4573,199 @@ mod one_time_image {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.path);
             }
+        }
+
+        fn cached_image(source: &Path, root: &TestRoot) -> OneTimeWorkerImage {
+            OneTimeWorkerImage::prepare_from_cached_and_start_retaining(
+                source,
+                &root.path,
+                false,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .0
+        }
+
+        #[test]
+        fn source_digest_cache_survives_independent_open_with_fresh_image_and_ready_proof() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"cacheable worker bytes");
+            let mut first = cached_image(&source, &root);
+            assert_eq!(
+                first.proof.source_digest_evidence,
+                SourceDigestEvidence::IndependentRead
+            );
+            let digest = first.proof.image.sha256;
+            let inode = first.proof.image.inode;
+            first.unlink_after_exec().unwrap();
+            first.retire_after_reap().unwrap();
+            drop(first);
+            let record_path = root.path.join(SOURCE_DIGEST_CACHE_NAME);
+            let record_bytes = std::fs::read(&record_path).unwrap();
+            // No cache object or descriptor survives into this separate open.
+            let mut second = cached_image(&source, &root);
+            assert_eq!(
+                second.proof.source_digest_evidence,
+                SourceDigestEvidence::PersistentExpectation
+            );
+            assert_eq!(second.proof.image.sha256, digest);
+            assert_ne!(second.proof.image.inode, inode);
+            assert_ne!(second.proof.image.inode, second.proof.source.inode);
+            second.unlink_after_exec().unwrap();
+            second.retire_after_reap().unwrap();
+            assert_eq!(std::fs::read(&record_path).unwrap(), record_bytes);
+            assert_eq!(
+                std::fs::metadata(record_path).unwrap().mode() & 0o7777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn source_digest_cache_malformed_records_miss_without_repair() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"current bytes");
+            let key = source_path_hash(&source).unwrap();
+            let record = SourceDigestRecord {
+                version: 1,
+                path_hash: key,
+                source: FileIdentity::from_metadata_and_digest(
+                    &std::fs::metadata(&source).unwrap(),
+                    Sha256::digest(b"current bytes").into(),
+                ),
+            };
+            let value = serde_json::to_value(&record).unwrap();
+            let mut future = value.clone();
+            future["version"] = serde_json::json!(2);
+            let mut wrong = value.clone();
+            wrong["source"]["sha256"] = serde_json::json!("not-a-digest");
+            let mut extra = value;
+            extra["available"] = serde_json::json!(true);
+            let invalid = [
+                b"{".to_vec(),
+                vec![b' '; MAX_SOURCE_DIGEST_RECORD_BYTES + 1],
+                serde_json::to_vec(&future).unwrap(),
+                serde_json::to_vec(&wrong).unwrap(),
+                serde_json::to_vec(&extra).unwrap(),
+            ];
+            let path = root.path.join(SOURCE_DIGEST_CACHE_NAME);
+            for bytes in invalid {
+                std::fs::write(&path, &bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let image = cached_image(&source, &root);
+                assert_eq!(
+                    image.proof.source_digest_evidence,
+                    SourceDigestEvidence::IndependentRead
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+            }
+            let too_long = PathBuf::from("x".repeat(MAX_SOURCE_DIGEST_PATH_BYTES + 1));
+            assert!(source_path_hash(&too_long).is_none());
+        }
+
+        #[test]
+        fn source_digest_cache_insecure_entries_miss_without_mutation() {
+            use std::os::unix::fs::symlink;
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"trusted bytes");
+            let initial = cached_image(&source, &root);
+            drop(initial);
+            let cache = root.path.join(SOURCE_DIGEST_CACHE_NAME);
+            let bytes = std::fs::read(&cache).unwrap();
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o666)).unwrap();
+            let image = cached_image(&source, &root);
+            assert_eq!(
+                image.proof.source_digest_evidence,
+                SourceDigestEvidence::IndependentRead
+            );
+            assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o7777, 0o666);
+            assert_eq!(std::fs::read(&cache).unwrap(), bytes);
+            drop(image);
+            std::fs::remove_file(&cache).unwrap();
+            let external = root.path.join("other-private-record");
+            std::fs::write(&external, &bytes).unwrap();
+            std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600)).unwrap();
+            symlink(&external, &cache).unwrap();
+            let image = cached_image(&source, &root);
+            assert_eq!(
+                image.proof.source_digest_evidence,
+                SourceDigestEvidence::IndependentRead
+            );
+            assert!(
+                std::fs::symlink_metadata(&cache)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&external).unwrap(), bytes);
+            drop(image);
+            std::fs::remove_file(&cache).unwrap();
+            std::fs::hard_link(&external, &cache).unwrap();
+            let image = cached_image(&source, &root);
+            assert_eq!(
+                image.proof.source_digest_evidence,
+                SourceDigestEvidence::IndependentRead
+            );
+            assert_eq!(std::fs::read(&external).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&external).unwrap().nlink(), 2);
+        }
+
+        #[test]
+        fn source_digest_cache_forged_metadata_rejects_before_guardian_and_updates_miss() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"original bytes");
+            let image = cached_image(&source, &root);
+            let old_digest = image.proof.image.sha256;
+            drop(image);
+            std::fs::write(&source, b"modified bytes").unwrap();
+            let cache = root.path.join(SOURCE_DIGEST_CACHE_NAME);
+            let current = std::fs::metadata(&source).unwrap();
+            assert_eq!(current.len(), b"original bytes".len() as u64);
+            // Make the complete key match the changed file, but retain the old
+            // digest. Metadata must not authorize this newly cloned image.
+            let forged = serde_json::to_vec(&SourceDigestRecord {
+                version: 1,
+                path_hash: source_path_hash(&source).unwrap(),
+                source: FileIdentity::from_metadata_and_digest(&current, old_digest),
+            })
+            .unwrap();
+            std::fs::write(&cache, &forged).unwrap();
+            let called = std::cell::Cell::new(false);
+            let error = OneTimeWorkerImage::prepare_from_cached_and_start_retaining(
+                &source,
+                &root.path,
+                false,
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("did not match its source"));
+            assert!(!called.get());
+            assert_eq!(std::fs::read(&cache).unwrap(), forged);
+            assert!(
+                directory_entry_names(&open_directory(&root.path).unwrap())
+                    .unwrap()
+                    .iter()
+                    .all(|name| !name.starts_with(ONE_TIME_DIRECTORY_PREFIX.as_bytes()))
+            );
+            // A valid old key is an ordinary miss, so source reading refreshes
+            // it instead of trusting a stale executable path/identity.
+            let mut stale: SourceDigestRecord = serde_json::from_slice(&forged).unwrap();
+            stale.source.inode ^= 1;
+            std::fs::write(&cache, serde_json::to_vec(&stale).unwrap()).unwrap();
+            let image = cached_image(&source, &root);
+            assert_eq!(
+                image.proof.source_digest_evidence,
+                SourceDigestEvidence::IndependentRead
+            );
+            assert_ne!(image.proof.image.sha256, old_digest);
+            drop(image);
+            assert_eq!(
+                cached_image(&source, &root).proof.source_digest_evidence,
+                SourceDigestEvidence::PersistentExpectation
+            );
         }
 
         fn retained_fixture(root: &TestRoot, source: &Path) -> RetainedWorkerSource {
