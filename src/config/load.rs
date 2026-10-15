@@ -12,6 +12,8 @@ use crate::config::{
     Config, ConfigLayer, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine,
     StatusLineSegment,
 };
+#[cfg(feature = "subagents")]
+use crate::config::{TaskCostWeighting, TaskCostWeights};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
@@ -361,6 +363,8 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
 }
 
 pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<String> {
+    #[cfg(feature = "subagents")]
+    cfg.validate_subagent_settings().map_err(io::Error::other)?;
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => toml::to_string(cfg).map_err(io::Error::other),
         _ => serde_yaml_ng::to_string(cfg).map_err(io::Error::other),
@@ -589,6 +593,12 @@ pub(super) fn rich_default_config() -> Config {
         task_max_output_bytes: Some(128 * 1024),
         #[cfg(feature = "subagents")]
         task_max_cost_units: Some(4_000_000),
+        #[cfg(feature = "subagents")]
+        task_cost_weighting: Some(TaskCostWeighting::Auto),
+        #[cfg(feature = "subagents")]
+        task_cost_weights: Some(TaskCostWeights::default()),
+        #[cfg(feature = "subagents")]
+        task_cost_overrides: None,
         #[cfg(feature = "subagents")]
         task_timeout_secs: Some(300),
         #[cfg(feature = "advisor")]
@@ -2883,7 +2893,13 @@ fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> 
     let after = toml::Value::try_from(after).map_err(io::Error::other)?;
     apply_toml_delta(&mut global, &before, &after);
 
-    let _: Config = global.clone().try_into().map_err(io::Error::other)?;
+    let candidate: Config = global.clone().try_into().map_err(io::Error::other)?;
+    #[cfg(feature = "subagents")]
+    candidate
+        .validate_subagent_settings()
+        .map_err(io::Error::other)?;
+    #[cfg(not(feature = "subagents"))]
+    let _ = candidate;
     atomic_config_write(path, &toml::to_string(&global).map_err(io::Error::other)?)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
@@ -5081,5 +5097,100 @@ mod config691_tests {
                     .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod task_cost_persistence_tests {
+    use super::{parse_config_content, save_config_changes_at};
+    use crate::config::Config;
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn task_cost_edits_roundtrip_and_invalid_edits_leave_prior_bytes() {
+        use crate::config::{TaskCostOverride, TaskCostWeighting, TaskCostWeights};
+        let root = crate::tests::OwnedTestDirectory::new("task-cost-config-edit");
+        for extension in ["toml", "yaml"] {
+            let path = root.path().join(format!("config.{extension}"));
+            let original = if extension == "toml" {
+                "model='global'\nfuture_key='keep'\n"
+            } else {
+                "model: global\nfuture_key: keep\n"
+            };
+            std::fs::write(&path, original).unwrap();
+            let mut before = parse_config_content(&path, original).unwrap();
+            before.chat_left_margin = Some(7); // Effective project value, not an edit.
+            let mut after = before.clone();
+            after.task_cost_weighting = Some(TaskCostWeighting::Fixed);
+            after.task_cost_weights = Some(TaskCostWeights {
+                output: 7.0,
+                cache_read: 0.0,
+                ..Default::default()
+            });
+            after.task_cost_overrides = Some(
+                [(
+                    "child".into(),
+                    TaskCostOverride {
+                        weighting: Some(TaskCostWeighting::Auto),
+                        weights: Some(TaskCostWeights {
+                            cache_write_1h: 3.0,
+                            ..Default::default()
+                        }),
+                    },
+                )]
+                .into(),
+            );
+            save_config_changes_at(&path, &before, &after).unwrap();
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            let saved = parse_config_content(&path, &bytes).unwrap();
+            assert_eq!(saved.task_cost_weighting, after.task_cost_weighting);
+            assert_eq!(saved.task_cost_weights, after.task_cost_weights);
+            assert_eq!(saved.task_cost_overrides, after.task_cost_overrides);
+            assert_eq!(saved.model.as_deref(), Some("global"));
+            assert_eq!(saved.chat_left_margin, None);
+            assert!(saved.preserved.keys().any(|key| key == "future_key"));
+            for invalid in [
+                Config {
+                    task_cost_weights: Some(TaskCostWeights {
+                        input: 0.0,
+                        ..Default::default()
+                    }),
+                    ..after.clone()
+                },
+                Config {
+                    task_cost_overrides: Some([(" ".into(), TaskCostOverride::default())].into()),
+                    ..after.clone()
+                },
+            ] {
+                assert!(save_config_changes_at(&path, &after, &invalid).is_err());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "subagents"))]
+    #[test]
+    fn task_cost_feature_disabled_edit_preserves_all_policy_objects() {
+        let root = crate::tests::OwnedTestDirectory::new("task-cost-disabled-preserve");
+        let path = root.path().join("config.toml");
+        let source = "model='before'\ntask_cost_weighting='fixed'\n[task_cost_weights]\noutput=7.0\n[task_cost_overrides.child]\nweighting='auto'\n[task_cost_overrides.child.weights]\ncache_read=0.0\n";
+        std::fs::write(&path, source).unwrap();
+        let before = parse_config_content(&path, source).unwrap();
+        let after = Config {
+            model: Some("after".into()),
+            ..before.clone()
+        };
+        save_config_changes_at(&path, &before, &after).unwrap();
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original: toml::Value = toml::from_str(source).unwrap();
+        for key in [
+            "task_cost_weighting",
+            "task_cost_weights",
+            "task_cost_overrides",
+        ] {
+            assert_eq!(saved.get(key), original.get(key));
+            assert!(before.preserved.keys().any(|preserved| preserved == key));
+        }
+        assert_eq!(saved["model"].as_str(), Some("after"));
     }
 }

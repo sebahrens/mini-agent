@@ -170,6 +170,7 @@ mod tests {
             total_tokens: 15,
             cached_input_tokens: 3,
             cache_creation_input_tokens: 4,
+            cache_creation: None,
             tool_use_prompt_tokens: 12,
             reasoning_tokens: 5,
         });

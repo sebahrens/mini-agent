@@ -618,6 +618,15 @@ pub struct Config {
     pub task_max_cost_units: Option<u64>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_cost_weighting: Option<TaskCostWeighting>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_cost_weights: Option<TaskCostWeights>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_cost_overrides: Option<HashMap<String, TaskCostOverride>>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub task_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_repeated_reads: Option<bool>,
@@ -1126,6 +1135,23 @@ impl Config {
 
     #[cfg(feature = "subagents")]
     pub(crate) fn validate_subagent_settings(&self) -> Result<(), String> {
+        if let Some(weights) = self.task_cost_weights {
+            weights
+                .validate()
+                .map_err(|field| format!("Invalid task_cost_weights.{field} (value omitted)"))?;
+        }
+        if let Some(overrides) = &self.task_cost_overrides {
+            for (alias, policy) in overrides {
+                if alias.trim().is_empty() {
+                    return Err("Invalid task_cost_overrides alias (value omitted)".into());
+                }
+                if let Some(weights) = policy.weights {
+                    weights.validate().map_err(|field| {
+                        format!("Invalid task_cost_overrides.weights.{field} (value omitted)")
+                    })?;
+                }
+            }
+        }
         for (name, invalid) in [
             (
                 "subagent_context_window",
@@ -1179,6 +1205,16 @@ impl Config {
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_output_bytes(&self) -> usize {
         self.task_max_output_bytes.unwrap_or(128 * 1024)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_cost_weighting(&self) -> TaskCostWeighting {
+        self.task_cost_weighting.unwrap_or_default()
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_cost_weights(&self) -> TaskCostWeights {
+        self.task_cost_weights.unwrap_or_default()
     }
 
     #[cfg(feature = "subagents")]
@@ -1918,5 +1954,161 @@ mod subagent_settings127_tests {
         };
         assert_eq!(cfg.resolve_task_max_report_bytes(), 1024);
         assert_eq!(cfg.resolve_task_report_repair_max_tokens(), 1024);
+    }
+}
+
+#[cfg(all(test, feature = "subagents"))]
+mod task_cost_config_tests {
+    use super::{Config, TaskCostOverride, TaskCostWeighting, TaskCostWeights};
+
+    #[test]
+    fn task_cost_defaults_partial_objects_and_roundtrip_are_explicit() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.resolve_task_cost_weighting(),
+            TaskCostWeighting::Auto
+        );
+        assert_eq!(
+            defaults.resolve_task_cost_weights(),
+            TaskCostWeights {
+                input: 1.0,
+                output: 5.0,
+                cache_read: 1.0,
+                cache_write_5m: 2.0,
+                cache_write_1h: 2.0,
+            }
+        );
+        let partial: Config = toml::from_str("task_cost_weighting='fixed'\n[task_cost_weights]\noutput=7.0\n[task_cost_overrides.child.weights]\ncache_read=0.0\n").unwrap();
+        assert_eq!(
+            partial.resolve_task_cost_weighting(),
+            TaskCostWeighting::Fixed
+        );
+        assert_eq!(partial.resolve_task_cost_weights().input, 1.0);
+        assert_eq!(partial.resolve_task_cost_weights().output, 7.0);
+        let child = partial.task_cost_overrides.as_ref().unwrap()["child"];
+        assert_eq!(child.weighting, None);
+        assert_eq!(
+            child.weights.unwrap(),
+            TaskCostWeights {
+                cache_read: 0.0,
+                ..Default::default()
+            }
+        );
+        let again: Config = toml::from_str(&toml::to_string(&partial).unwrap()).unwrap();
+        assert_eq!(again.task_cost_weighting, partial.task_cost_weighting);
+        assert_eq!(again.task_cost_weights, partial.task_cost_weights);
+        assert_eq!(again.task_cost_overrides, partial.task_cost_overrides);
+        let generated = super::load::rich_default_config();
+        let again: Config = toml::from_str(&toml::to_string(&generated).unwrap()).unwrap();
+        assert_eq!(again.task_cost_weighting, Some(TaskCostWeighting::Auto));
+        assert_eq!(again.task_cost_weights, Some(TaskCostWeights::default()));
+    }
+
+    #[test]
+    fn task_cost_rejects_unknown_fields_modes_and_blank_override_aliases() {
+        for source in [
+            "task_cost_weighting='automatic'",
+            "task_cost_weights=[]",
+            "task_cost_weights=[1.0, 5.0, 1.0, 2.0, 2.0]",
+            "task_cost_overrides={child=[]}",
+            "task_cost_overrides={child={weights=[]}}",
+            "task_cost_weighting='Auto'",
+            "[task_cost_weights]\noutput_typo=5.0",
+            "[task_cost_overrides.child]\nunknown=true",
+            "[task_cost_overrides.child]\nweighting='unknown'",
+            "[task_cost_overrides.child.weights]\ncache_write=2.0",
+        ] {
+            assert!(toml::from_str::<Config>(source).is_err());
+        }
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([1, 5, 1, 2, 2]),
+            serde_json::json!(3),
+            serde_json::json!("weights"),
+        ] {
+            assert!(serde_json::from_value::<TaskCostWeights>(value.clone()).is_err());
+            assert!(serde_json::from_value::<TaskCostOverride>(value).is_err());
+        }
+        let invalid = Config {
+            task_cost_overrides: Some([(" ".into(), TaskCostOverride::default())].into()),
+            ..Default::default()
+        };
+        assert!(
+            invalid
+                .validate_subagent_settings()
+                .unwrap_err()
+                .contains("task_cost_overrides")
+        );
+        // A staged alias is legal data; only the runtime's exact selected-route
+        // check may decide whether an override applies.
+        let staged: Config =
+            toml::from_str("[task_cost_overrides.future]\nweighting='fixed'").unwrap();
+        staged.validate_subagent_settings().unwrap();
+    }
+
+    #[test]
+    fn task_cost_numeric_validation_covers_parsed_and_programmatic_values() {
+        for field in [
+            "input",
+            "output",
+            "cache_read",
+            "cache_write_5m",
+            "cache_write_1h",
+        ] {
+            for value in ["nan", "inf", "-inf", "-1.0"] {
+                for prefix in ["task_cost_weights", "task_cost_overrides.child.weights"] {
+                    let source = format!("[{prefix}]\n{field}={value}\n");
+                    assert!(
+                        toml::from_str::<Config>(&source).is_err(),
+                        "{prefix}.{field}"
+                    );
+                }
+            }
+            let zero = format!("[task_cost_weights]\n{field}=0.0\n");
+            assert_eq!(
+                toml::from_str::<Config>(&zero).is_ok(),
+                field.starts_with("cache_")
+            );
+        }
+        for field in 0..5 {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+                let mut weights = TaskCostWeights::default();
+                match field {
+                    0 => weights.input = value,
+                    1 => weights.output = value,
+                    2 => weights.cache_read = value,
+                    3 => weights.cache_write_5m = value,
+                    _ => weights.cache_write_1h = value,
+                }
+                for cfg in [
+                    Config {
+                        task_cost_weights: Some(weights),
+                        ..Default::default()
+                    },
+                    Config {
+                        task_cost_overrides: Some(
+                            [(
+                                "child".into(),
+                                TaskCostOverride {
+                                    weights: Some(weights),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                ] {
+                    assert!(cfg.validate_subagent_settings().is_err());
+                    assert!(
+                        super::load::serialize_config_content(
+                            std::path::Path::new("config.toml"),
+                            &cfg
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
     }
 }

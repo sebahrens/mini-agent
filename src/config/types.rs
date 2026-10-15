@@ -11,6 +11,175 @@ pub struct SubagentPolicy {
     pub allow_write: bool,
 }
 
+/// Proxy-unit strategy for task budgets; independent of monetary accounting.
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCostWeighting {
+    #[default]
+    Auto,
+    Fixed,
+}
+
+/// Explicit token weights used by fixed mode and as automatic-mode fallbacks.
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TaskCostWeights {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+#[cfg(feature = "subagents")]
+impl<'de> Deserialize<'de> for TaskCostWeights {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Fields {
+            #[serde(deserialize_with = "positive_task_cost_weight")]
+            input: f64,
+            #[serde(deserialize_with = "positive_task_cost_weight")]
+            output: f64,
+            #[serde(deserialize_with = "nonnegative_task_cost_weight")]
+            cache_read: f64,
+            #[serde(deserialize_with = "nonnegative_task_cost_weight")]
+            cache_write_5m: f64,
+            #[serde(deserialize_with = "nonnegative_task_cost_weight")]
+            cache_write_1h: f64,
+        }
+        impl Default for Fields {
+            fn default() -> Self {
+                let value = TaskCostWeights::default();
+                Self {
+                    input: value.input,
+                    output: value.output,
+                    cache_read: value.cache_read,
+                    cache_write_5m: value.cache_write_5m,
+                    cache_write_1h: value.cache_write_1h,
+                }
+            }
+        }
+        let fields: Fields = task_cost_object(deserializer)?;
+        Ok(Self {
+            input: fields.input,
+            output: fields.output,
+            cache_read: fields.cache_read,
+            cache_write_5m: fields.cache_write_5m,
+            cache_write_1h: fields.cache_write_1h,
+        })
+    }
+}
+
+#[cfg(feature = "subagents")]
+impl Default for TaskCostWeights {
+    fn default() -> Self {
+        Self {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 1.0,
+            cache_write_5m: 2.0,
+            cache_write_1h: 2.0,
+        }
+    }
+}
+
+#[cfg(feature = "subagents")]
+impl TaskCostWeights {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        for (name, value, positive) in [
+            ("input", self.input, true),
+            ("output", self.output, true),
+            ("cache_read", self.cache_read, false),
+            ("cache_write_5m", self.cache_write_5m, false),
+            ("cache_write_1h", self.cache_write_1h, false),
+        ] {
+            if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
+                return Err(name);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "subagents")]
+fn positive_task_cost_weight<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "task input/output weight must be finite and greater than zero",
+        ))
+    }
+}
+
+#[cfg(feature = "subagents")]
+fn nonnegative_task_cost_weight<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "task cache weight must be finite and nonnegative",
+        ))
+    }
+}
+
+/// Alias-specific policy; only a matching selected quick-model route may use it.
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TaskCostOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weighting: Option<TaskCostWeighting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weights: Option<TaskCostWeights>,
+}
+
+#[cfg(feature = "subagents")]
+impl<'de> Deserialize<'de> for TaskCostOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Fields {
+            weighting: Option<TaskCostWeighting>,
+            weights: Option<TaskCostWeights>,
+        }
+        let fields: Fields = task_cost_object(deserializer)?;
+        Ok(Self {
+            weighting: fields.weighting,
+            weights: fields.weights,
+        })
+    }
+}
+
+/// Serde's ordinary struct visitor also accepts sequences. Policy objects must
+/// enter through a map; the delegated field visitor retains defaults and rejects
+/// unknown keys, duplicates and invalid numeric values.
+#[cfg(feature = "subagents")]
+fn task_cost_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Object<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Object<T> {
+        type Value = T;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a task cost policy object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(Object(std::marker::PhantomData))
+}
+
 /// Host-owned TTL for native Anthropic prompt caching.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromptCacheTtl {

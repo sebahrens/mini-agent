@@ -948,7 +948,11 @@ impl GetTokenUsage for ResponsesUsage {
                 .as_ref()
                 .map(|details| details.cached_tokens)
                 .unwrap_or(0),
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: self
+                .input_tokens_details
+                .as_ref()
+                .map(|details| details.cache_write_tokens)
+                .unwrap_or(0),
             cache_creation: None,
             tool_use_prompt_tokens: 0,
             reasoning_tokens: self
@@ -994,11 +998,17 @@ impl Add for ResponsesUsage {
 pub struct InputTokensDetails {
     /// Cached tokens from OpenAI
     pub cached_tokens: u64,
+    /// Tokens written to the prompt cache by OpenAI-compatible providers.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 impl InputTokensDetails {
     pub(crate) fn new() -> Self {
-        Self { cached_tokens: 0 }
+        Self {
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        }
     }
 }
 
@@ -1006,7 +1016,8 @@ impl Add for InputTokensDetails {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         Self {
-            cached_tokens: self.cached_tokens + rhs.cached_tokens,
+            cached_tokens: self.cached_tokens.saturating_add(rhs.cached_tokens),
+            cache_write_tokens: self.cache_write_tokens.saturating_add(rhs.cache_write_tokens),
         }
     }
 }
@@ -3223,7 +3234,10 @@ mod tests {
     fn responses_usage_token_usage_preserves_reasoning_tokens() {
         let usage = ResponsesUsage {
             input_tokens: 100,
-            input_tokens_details: Some(InputTokensDetails { cached_tokens: 25 }),
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 25,
+                cache_write_tokens: 10,
+            }),
             output_tokens: 50,
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 15,
@@ -3235,9 +3249,47 @@ mod tests {
 
         assert_eq!(token_usage.input_tokens, 100);
         assert_eq!(token_usage.cached_input_tokens, 25);
+        assert_eq!(token_usage.cache_creation_input_tokens, 10);
         assert_eq!(token_usage.output_tokens, 50);
         assert_eq!(token_usage.reasoning_tokens, 15);
         assert_eq!(token_usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn responses_usage_cache_writes_survive_wire_conversion_and_addition() {
+        let usage: ResponsesUsage = serde_json::from_value(json!({
+            "input_tokens": 100,
+            "input_tokens_details": { "cached_tokens": 25, "cache_write_tokens": 10 },
+            "output_tokens": 50,
+            "output_tokens_details": { "reasoning_tokens": 15 },
+            "total_tokens": 150
+        }))
+        .expect("compatible Responses usage should deserialize");
+        let token_usage = usage.token_usage();
+        assert_eq!(token_usage.input_tokens, 100);
+        assert_eq!(token_usage.cached_input_tokens, 25);
+        assert_eq!(token_usage.cache_creation_input_tokens, 10);
+        assert_eq!(token_usage.output_tokens, 50);
+        assert_eq!(token_usage.reasoning_tokens, 15);
+        assert_eq!(token_usage.total_tokens, 150);
+
+        let combined = (usage.clone() + usage).token_usage();
+        assert_eq!(combined.input_tokens, 200);
+        assert_eq!(combined.cached_input_tokens, 50);
+        assert_eq!(combined.cache_creation_input_tokens, 20);
+        assert_eq!(combined.output_tokens, 100);
+        assert_eq!(combined.reasoning_tokens, 30);
+        assert_eq!(combined.total_tokens, 300);
+
+        let saturated = InputTokensDetails {
+            cached_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
+        } + InputTokensDetails {
+            cached_tokens: 1,
+            cache_write_tokens: 1,
+        };
+        assert_eq!(saturated.cached_tokens, u64::MAX);
+        assert_eq!(saturated.cache_write_tokens, u64::MAX);
     }
 
     #[test]
@@ -3258,6 +3310,7 @@ mod tests {
 
         assert_eq!(token_usage.input_tokens, 100);
         assert_eq!(token_usage.cached_input_tokens, 25);
+        assert_eq!(token_usage.cache_creation_input_tokens, 0);
         assert_eq!(token_usage.output_tokens, 50);
         assert_eq!(token_usage.reasoning_tokens, 0);
         assert_eq!(token_usage.total_tokens, 150);
@@ -3804,7 +3857,10 @@ mod tests {
         };
         let rhs = ResponsesUsage {
             input_tokens: 3,
-            input_tokens_details: Some(InputTokensDetails { cached_tokens: 2 }),
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 2,
+                cache_write_tokens: 1,
+            }),
             output_tokens: 5,
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 4,
@@ -3817,6 +3873,7 @@ mod tests {
 
         assert_eq!(token_usage.input_tokens, 13);
         assert_eq!(token_usage.cached_input_tokens, 2);
+        assert_eq!(token_usage.cache_creation_input_tokens, 1);
         assert_eq!(token_usage.output_tokens, 25);
         assert_eq!(token_usage.reasoning_tokens, 4);
         assert_eq!(token_usage.total_tokens, 38);

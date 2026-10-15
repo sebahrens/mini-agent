@@ -73,8 +73,10 @@ live session/job scope. Closing the session or process frontend cancels and join
 owned jobs before releasing services and workspace owners. Rewind/clear/undo stop
 old jobs before changing their launch history. A saved entry is **data only**:
 there is no deserialized task, grant or resumable handle, and entries last saved
-as active are shown as `interrupted` after restart. Reports are capped at 256 KiB
-in memory and 16 KiB per saved entry; no report path is dereferenced on import.
+as active are shown as `interrupted` after restart. The background result store
+has a 256 KiB memory ceiling and a 16 KiB saved-entry ceiling; ordinary report
+defaults remain 32 KiB per child and 128 KiB per batch. No report path is
+dereferenced on import.
 
 `subagents::background` owns the pool, and `session::background_observation`
 tracks private runtime provenance for the shared account, file checkpoints and
@@ -475,25 +477,100 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_max_prompts`          | `usize`  | `8`                      | Max child prompts in one tool call |
 | `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
 | `task_max_output_bytes`     | `usize`  | `131072` (128 KiB)       | Hard cap on the complete returned tool output |
-| `task_max_cost_units`       | `u64`    | `4000000`                 | Aggregate provider token/cost-unit budget |
+| `task_max_cost_units`       | `u64`    | `4000000`                 | Aggregate normalized work budget, independent of USD |
+| `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
+| `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
+| `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
 | `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
 
-All numeric task limits must be greater than zero.
+All integer task limits must be greater than zero.
 `task_max_output_bytes` must be at least 256, leaving room for an explicit
 partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
-Cost units are a token-based budget proxy, not dollar charges. Itemized usage
-is preferred: Anthropic-native input uses the selected model's cache-read and
-cache-write ratios expressed as base-input-equivalent tokens, rounded to the
-nearest token. Published ratios come from the catalog; explicit selected
-quick-model cache prices override them. Missing rates retain the 0.10x read and
-1.25x write fallback. Output and separately reported reasoning/tool-prompt
-tokens are added without a dollar-price multiplier. Reported free cache usage
-consumes zero units; a positive cache cost below one rounded unit consumes one.
-Without itemized usage, the reported aggregate total is used; absent usage
-falls back to a text-size estimate so unknown usage is not treated as free.
+### Model-aware task work accounting
+
+`task_max_cost_units` remains **4,000,000** per task call. These are normalized
+work units, not USD, provider credits, or measured GPU time. The captured policy
+is implemented in `src/extras/subagents/cost.rs`; the session's existing monetary
+account, prices, and dollar ceiling remain independent. A free model, missing
+price, or an on-prem deployment does not disable its work budget.
+
+`task_cost_weighting = "auto"` uses the selected quick-model's explicit pricing
+and otherwise known catalogue metadata. With a finite positive input price,
+output/cache prices are normalized against that input price and scaled by the
+configured input weight. Missing components keep their fallbacks. Anthropic-native
+cache-tier fallbacks are 0.1× input for reads, 1.25× for 5-minute writes, and 2×
+for 1-hour writes when model metadata does not identify the tier. Without usable
+positive input pricing, the configured weights apply; a zero price is never a
+division-by-zero or a reason to make all work free.
+
+`task_cost_weighting = "fixed"` uses the configured numbers directly, without
+model-price ratios. Defaults, also used as general automatic-mode fallbacks, are:
+
+| Token category | Weight |
+|---|---:|
+| Uncached input | `1.0` |
+| Output, including separately reported reasoning where appropriate | `5.0` |
+| Cache read | `1.0` |
+| 5-minute cache write | `2.0` |
+| 1-hour cache write | `2.0` |
+
+All weights must be finite. Input/output weights must be positive; cache weights
+may be zero. Partial weight objects fill omitted fields with these built-in
+defaults. For example:
+
+```toml
+task_cost_weighting = "auto"
+task_max_cost_units = 4000000
+
+[task_cost_weights]
+input = 1.0
+output = 5.0
+cache_read = 1.0
+cache_write_5m = 2.0
+cache_write_1h = 2.0
+
+[task_cost_overrides.corporate_child]
+weighting = "fixed"
+weights = { input = 1.0, output = 6.0, cache_read = 1.0, cache_write_5m = 2.0, cache_write_1h = 2.0 }
+```
+
+An override is used only when `corporate_child` is the actual selected
+quick-model alias and that entry matches the child's provider and model. It is
+not inferred from a raw model id or another alias for the same model. An omitted
+override `weighting` or `weights` inherits that global setting; an override's
+partial **weights object** uses built-in field defaults, rather than merging
+individual fields with the global object. Opaque corporate, LiteLLM and vLLM
+aliases do not identify an upstream model or prove its prices. Configure exact
+quick-model pricing, or select fixed weights explicitly.
+
+The counter separates uncached input, cache reads, 5m/1h writes, output and
+exclusive reasoning. Inclusive gateway input counters have cache tokens
+subtracted only when consistent; reasoning already included in output is not
+added again. Ambiguous write tiers use the greater applicable weight. A combined
+usage total without categories uses the largest weight. When usage is missing,
+the fallback weights the **complete prepared request estimate** and its reserved
+output, without assuming a cache discount. Repair requests consume both their
+separate allocation and the same aggregate work budget. Metadata and weights
+are captured at the next delegation; refreshes and live edits do not reprice
+already running children.
+
+This applies to direct OpenAI, Anthropic and Gemini routes and OpenRouter, plus
+OpenAI-compatible LiteLLM/vLLM deployments when their usage fields are available.
+Provider documentation describes distinct input/output/cache categories:
+[Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing), and
+[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing).
+[OpenRouter usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+exposes usage and billing details; those dollar amounts do not replace this
+local work counter. [LiteLLM custom pricing](https://docs.litellm.ai/docs/proxy/custom_pricing)
+requires deployment-specific pricing metadata.
+[vLLM's OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/)
+provides protocol compatibility, which alone does not establish billing rates.
+These sources inform the local policy; configured ratios are not a promise of
+an exact provider invoice or hardware cost.
 
 ### Model resolution (in order of precedence)
 
@@ -668,7 +745,7 @@ Partial returns begin with a summary containing the stop reason and aggregate
 started/completed/cost accounting. Cost includes usage already observed from
 started siblings before they were cancelled, so partial work cannot bypass the
 aggregate budget. The editable `task_max_report_bytes` per-child report cap
-defaults to 256 KiB and is bounded by the aggregate limit, while
+defaults to 32 KiB and is bounded by the aggregate limit, while
 `task_max_output_bytes` is a final hard cap over the
 entire rendered tool result, including headings and status markers.
 Scheduling charges completed responses with their quotation prefixes and host
@@ -698,7 +775,12 @@ call deadline 300 seconds. These are editable as `task_max_concurrency`,
 `task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Concurrency is
 editable without recompilation but requires restart: the session owns a fixed
 semaphore shared by foreground and background children. The other listed sizing
-limits apply to the next delegation. Reports are capped at 32 KiB per child and 128 KiB per batch, roughly 8K
+limits apply to the next delegation. The cost policy keys `task_cost_weighting`,
+`task_cost_weights`, and `task_cost_overrides` also apply at that boundary;
+`/config task_cost_weighting "fixed"` and
+`/config task_cost_weights { input = 1.0, output = 5.0 }` persist validated
+settings. Use object forms in JSON configuration files and inline tables in
+`/config` or `--config` TOML literals. Reports are capped at 32 KiB per child and 128 KiB per batch, roughly 8K
 and 32K tokens respectively (actual token counts vary). This keeps batch reports
 near 3% of a 1M-token parent context by default; a large child context
 is not permission to return an equally large report. Read/write authorization,

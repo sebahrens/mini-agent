@@ -8,6 +8,7 @@ use crate::provider::AnyClient;
 
 pub(crate) mod background;
 pub(crate) mod builder;
+pub(crate) mod cost;
 pub(crate) mod prompt;
 pub(crate) mod task_tool;
 
@@ -182,6 +183,9 @@ pub(crate) const LIVE_SETTING_KEYS: &[&str] = &[
     "task_max_prompts",
     "task_max_output_bytes",
     "task_max_cost_units",
+    "task_cost_weighting",
+    "task_cost_weights",
+    "task_cost_overrides",
     "task_timeout_secs",
 ];
 
@@ -190,35 +194,55 @@ fn apply_limit_setting(
     key: &str,
     literal: &str,
 ) -> Result<(), &'static str> {
-    let value: toml::Table = toml::from_str(&format!("value={literal}"))
-        .map_err(|_| "Invalid subagent setting (value omitted)")?;
-    let value = value
-        .get("value")
-        .and_then(toml::Value::as_integer)
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or("Subagent setting must be a nonnegative integer")?;
+    // TOML inline tables and JSON objects share the same typed validation.
+    // Parse into a candidate first: malformed or non-finite weights cannot
+    // change installed limits, provenance, or an admitted child's snapshot.
+    let invalid = "Invalid subagent setting (value omitted)";
+    let value = match toml::from_str::<toml::Table>(&format!("value={literal}")) {
+        Ok(mut table) if table.len() == 1 && table.contains_key("value") => {
+            table.remove("value").ok_or(invalid)?
+        }
+        _ => {
+            let json: serde_json::Value = serde_json::from_str(literal).map_err(|_| invalid)?;
+            toml::Value::try_from(json).map_err(|_| invalid)?
+        }
+    };
     let mut next = config.config.clone();
-    macro_rules! assign {
-        ($($name:ident),* $(,)?) => {
+    macro_rules! assign_integer {
+        ($($name:ident),* $(,)?) => {{
+            let number = value.as_integer()
+                .and_then(|number| u64::try_from(number).ok())
+                .ok_or("Subagent setting must be a nonnegative integer")?;
             match key {
-                $(stringify!($name) => next.$name = Some(value.try_into()
+                $(stringify!($name) => next.$name = Some(number.try_into()
                     .map_err(|_| "Subagent setting exceeds this platform's limit")?),)*
                 _ => return Err("Setting requires restart"),
             }
-        };
+        }};
     }
-    assign!(
-        subagent_context_window,
-        subagent_max_tokens,
-        task_max_report_bytes,
-        task_report_repair_max_tokens,
-        task_report_repair_max_cost_units,
-        task_max_turns,
-        task_max_prompts,
-        task_max_output_bytes,
-        task_max_cost_units,
-        task_timeout_secs
-    );
+    match key {
+        "task_cost_weighting" => {
+            next.task_cost_weighting = Some(value.try_into().map_err(|_| invalid)?)
+        }
+        "task_cost_weights" => {
+            next.task_cost_weights = Some(value.try_into().map_err(|_| invalid)?)
+        }
+        "task_cost_overrides" => {
+            next.task_cost_overrides = Some(value.try_into().map_err(|_| invalid)?)
+        }
+        _ => assign_integer!(
+            subagent_context_window,
+            subagent_max_tokens,
+            task_max_report_bytes,
+            task_report_repair_max_tokens,
+            task_report_repair_max_cost_units,
+            task_max_turns,
+            task_max_prompts,
+            task_max_output_bytes,
+            task_max_cost_units,
+            task_timeout_secs
+        ),
+    }
     next.validate_subagent_settings()
         .map_err(|_| "Invalid subagent limit (value omitted)")?;
     config.max_turns = next.task_max_turns.unwrap_or(20);
@@ -337,6 +361,26 @@ fn live_limit_values_for(
     ] {
         values.insert(key.into(), value.into());
     }
+    values.insert(
+        "task_cost_weighting".into(),
+        serde_json::to_value(config.config.resolve_task_cost_weighting()).ok()?,
+    );
+    values.insert(
+        "task_cost_weights".into(),
+        serde_json::to_value(config.config.resolve_task_cost_weights()).ok()?,
+    );
+    values.insert(
+        "task_cost_overrides".into(),
+        serde_json::to_value(
+            config
+                .config
+                .task_cost_overrides
+                .as_ref()
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .ok()?,
+    );
     Some(values)
 }
 
@@ -408,6 +452,140 @@ mod tests {
 #[cfg(test)]
 mod settings127_tests {
     use super::*;
+    fn cost_setting_fixture() -> SubagentConfig {
+        let cfg = crate::config::Config::default();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        resolve_config(&cfg, None, "openrouter", "fixture-child", &client)
+    }
+
+    #[test]
+    fn subagent1301_cost_settings_update_next_delegation_with_layer_precedence() {
+        use crate::config::{ConfigLayer, TaskCostWeighting};
+        let mut installed = cost_setting_fixture();
+        let active_child = installed.clone();
+        assert!(
+            apply_limit_setting_at(
+                &mut installed,
+                "task_cost_weighting",
+                "\"fixed\"",
+                ConfigLayer::Project
+            )
+            .unwrap()
+        );
+        assert!(
+            apply_limit_setting_at(
+                &mut installed,
+                "task_cost_weights",
+                "{input=2.5, output=7.0}",
+                ConfigLayer::Project
+            )
+            .unwrap()
+        );
+        // JSON objects and nested TOML tables both pass the same typed checks.
+        assert!(
+            apply_limit_setting_at(
+                &mut installed,
+                "task_cost_overrides",
+                r#"{"exact-child":{"weighting":"fixed","weights":{"output":9.0}}}"#,
+                ConfigLayer::Project
+            )
+            .unwrap()
+        );
+        assert!(
+            !apply_limit_setting_at(
+                &mut installed,
+                "task_cost_weighting",
+                "\"auto\"",
+                ConfigLayer::Global
+            )
+            .unwrap()
+        );
+        assert!(
+            !apply_limit_setting_at(
+                &mut installed,
+                "task_cost_weights",
+                "{input=1.0}",
+                ConfigLayer::Global
+            )
+            .unwrap()
+        );
+        assert!(
+            !apply_limit_setting_at(
+                &mut installed,
+                "task_cost_overrides",
+                "{}",
+                ConfigLayer::Global
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            installed.config.resolve_task_cost_weighting(),
+            TaskCostWeighting::Fixed
+        );
+        assert_eq!(installed.config.resolve_task_cost_weights().input, 2.5);
+        assert_eq!(installed.config.resolve_task_cost_weights().output, 7.0);
+        let displayed = live_limit_values_for(&installed).unwrap();
+        assert_eq!(displayed["task_cost_weighting"], "fixed");
+        assert_eq!(displayed["task_cost_weights"]["input"], 2.5);
+        assert_eq!(
+            displayed["task_cost_overrides"]["exact-child"]["weights"]["output"],
+            9.0
+        );
+        assert!(!displayed.contains_key("api_keys"));
+        assert_eq!(
+            active_child.config.resolve_task_cost_weighting(),
+            TaskCostWeighting::Auto
+        );
+        assert_eq!(active_child.config.resolve_task_cost_weights().input, 1.0);
+        assert!(
+            active_child
+                .config
+                .task_cost_overrides
+                .as_ref()
+                .is_none_or(|map| map.is_empty())
+        );
+        assert_eq!(active_child.config.resolve_task_max_cost_units(), 4_000_000);
+    }
+
+    #[test]
+    fn subagent1301_invalid_cost_settings_leave_installed_snapshot_and_provenance_unchanged() {
+        use crate::config::ConfigLayer;
+        let mut installed = cost_setting_fixture();
+        apply_limit_setting_at(
+            &mut installed,
+            "task_cost_overrides",
+            "{ child={weighting=\"fixed\", weights={input=2.0}} }",
+            ConfigLayer::Project,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&installed.config).unwrap();
+        let sources = installed.config.provenance.sources.clone();
+        for (key, literal) in [
+            ("task_cost_weighting", "\"unknown\""),
+            ("task_cost_weights", "[]"),
+            ("task_cost_weights", "{input=nan}"),
+            ("task_cost_weights", "{output=inf}"),
+            ("task_cost_weights", "{input=-1.0}"),
+            ("task_cost_weights", "{unexpected=1.0}"),
+            ("task_cost_overrides", "{ child={weights={input=nan}} }"),
+            ("task_cost_overrides", "{ child={unknown=1} }"),
+            ("task_cost_weights", "{input=2.0}\nother=3"),
+        ] {
+            assert!(
+                apply_limit_setting_at(&mut installed, key, literal, ConfigLayer::Local).is_err(),
+                "{key}"
+            );
+            assert_eq!(serde_json::to_value(&installed.config).unwrap(), before);
+            assert_eq!(installed.config.provenance.sources, sources);
+        }
+    }
+
     #[test]
     fn subagent130_live_limit_overlay_uses_selected_child_capacity() {
         let mut cfg = crate::config::Config {

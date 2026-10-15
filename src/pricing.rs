@@ -393,46 +393,6 @@ pub(crate) fn billable_input_tokens_with_multipliers(
     }
 }
 
-/// Task proxy units use reported write tiers. Missing required breakdowns use
-/// the larger captured write ratio conservatively; this is not a dollar quote.
-#[cfg(feature = "subagents")]
-pub(crate) fn billable_input_tokens_with_cache_tiers(
-    anthropic_native: bool,
-    usage: crate::event::UsageDelta,
-    mut multipliers: CacheMultipliers,
-    split_required: bool,
-) -> u64 {
-    if !anthropic_native {
-        return usage.input_tokens;
-    }
-    if [multipliers.read, multipliers.write, multipliers.write_1h]
-        .into_iter()
-        .any(|rate| !rate.is_finite() || rate < 0.0)
-    {
-        return u64::MAX;
-    }
-    if let Some(split) = usage
-        .cache_creation
-        .filter(|split| split.total() == Some(usage.cache_creation_input_tokens))
-    {
-        return (usage.input_tokens as f64
-            + usage.cached_input_tokens as f64 * multipliers.read
-            + split.ephemeral_5m_input_tokens as f64 * multipliers.write
-            + split.ephemeral_1h_input_tokens as f64 * multipliers.write_1h)
-            .round() as u64;
-    }
-    if split_required || usage.cache_creation.is_some() {
-        multipliers.write = multipliers.write.max(multipliers.write_1h);
-    }
-    billable_input_tokens_with_multipliers(
-        true,
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_input_tokens,
-        multipliers,
-    )
-}
-
 /// Estimate cost for given token counts and per-million-token prices.
 /// Returns 0.0 if either price is 0.0.
 ///

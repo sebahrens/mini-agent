@@ -792,7 +792,10 @@ Accepted top-level keys:
 | `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
 | `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
 | `task_max_output_bytes`   | integer | Aggregate rendered output cap for a `task` call. Default: `131072`; requires `subagents`. |
-| `task_max_cost_units`     | integer | Aggregate reported token/cost-unit cap for a `task` call. Default: `4000000`; requires `subagents`. |
+| `task_max_cost_units`     | integer | Aggregate normalized work-unit cap for a `task` call, independent of USD. Default: `4000000`; requires `subagents`. |
+| `task_cost_weighting`     | string | `"auto"` (default) derives model-aware normalized ratios; `"fixed"` uses configured weights. Applies to the next delegation; requires `subagents`. |
+| `task_cost_weights`       | object | Finite token weights: `input=1.0`, `output=5.0`, `cache_read=1.0`, `cache_write_5m=2.0`, `cache_write_1h=2.0`. Input/output must be positive; cache weights nonnegative. Partial objects use built-in defaults. Applies to the next delegation. |
+| `task_cost_overrides`     | object | Map of exact quick-model aliases to `{ weighting?, weights? }`. Only the actual selected alias matching the child provider/model can override the globals. Default: `{}`; applies to the next delegation. |
 | `task_timeout_secs`       | integer | Whole-call subagent deadline. Default: `300`, maximum `86400`; requires `subagents`. |
 | `task_enabled`            | boolean | Register the `task` tool when subagents are compiled in. Default: `true`. |
 | `subagent_model`          | string  | Raw model id or quick-model alias used by subagents; absent inherits the main model. |
@@ -3800,6 +3803,27 @@ and applies effective changes to the next delegation, preserving current child
 snapshots and higher layer/CLI precedence. `--config key=value` provides the same
 startup overrides. See [Editable child sizing](SUBAGENTS.md#editable-child-sizing)
 for provider/parent ceilings, estimated context admission and repair behavior.
+
+`task_cost_weighting`, `task_cost_weights`, and `task_cost_overrides` are also
+live next-delegation settings. `/config task_cost_weighting "fixed"` selects
+fixed weights, while `/config task_cost_weights { input = 1.0, output = 5.0 }`
+sets a typed inline table. JSON configuration files use the corresponding
+object form; `/config` and `--config` values remain literal TOML. Values are parsed and validated as a complete candidate: invalid modes, unknown fields,
+non-finite/negative weights and blank aliases are rejected without partially
+updating installed settings. Higher configuration layers retain precedence;
+active children keep their captured metadata and policy. The settings view
+shows resolved global mode/weight defaults and configured alias overrides,
+without provider credentials. Automatic mode may derive different effective
+weights from the selected model's metadata at admission.
+
+Work accounting is separate from actual USD accounting. Direct OpenAI,
+Anthropic, Gemini and OpenRouter routes use known selected-model metadata;
+opaque LiteLLM/vLLM/corporate aliases require explicit matching quick-model
+pricing or fixed weights. A zero/free dollar price still consumes work using
+the fallback policy. Missing usage reserves weighted full prepared input and
+output; cache/reasoning categories are counted once. See
+[Model-aware task work accounting](SUBAGENTS.md#model-aware-task-work-accounting)
+for default ratios, exact alias overrides, usage fallbacks and official sources.
 
 `task_max_concurrency` remains editable but restart-required because the session's
 foreground/background child pool retains a fixed semaphore. Changing its saved

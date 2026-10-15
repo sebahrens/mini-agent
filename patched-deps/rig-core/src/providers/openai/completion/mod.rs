@@ -1276,6 +1276,9 @@ pub struct PromptTokensDetails {
     /// Cached tokens from prompt caching
     #[serde(default)]
     pub cached_tokens: usize,
+    /// Input tokens written to the provider-managed prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -1354,6 +1357,11 @@ impl GetTokenUsage for Usage {
                 .map(|d| d.cached_tokens as u64)
                 .unwrap_or(0),
         );
+        usage.cache_creation_input_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cache_write_tokens as u64)
+            .unwrap_or(0);
         usage.reasoning_tokens = self
             .completion_tokens_details
             .as_ref()
@@ -2059,6 +2067,55 @@ mod tests {
             id: id.to_string(),
             text: text.to_string(),
             additional_props: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn openai_compatible_cache_write_usage_reaches_rig_usage() {
+        for details in [
+            serde_json::json!({"cached_tokens": 50, "cache_write_tokens": 30}),
+            serde_json::json!({"cached_tokens": 50}),
+        ] {
+            let expected_write = details
+                .get("cache_write_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let usage_wire = serde_json::json!({
+                "prompt_tokens": 200,
+                "completion_tokens": 20,
+                "total_tokens": 220,
+                "prompt_tokens_details": details,
+                "completion_tokens_details": {"reasoning_tokens": 7}
+            });
+            let response: CompletionResponse = serde_json::from_value(serde_json::json!({
+                "id": "gateway-cache-usage",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "fixture",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                    "logprobs": null
+                }],
+                "usage": usage_wire.clone()
+            }))
+            .unwrap();
+            assert_eq!(
+                response.usage.as_ref().unwrap().prompt_tokens_details.as_ref().unwrap().cache_write_tokens as u64,
+                expected_write,
+            );
+            let converted: completion::CompletionResponse<CompletionResponse> =
+                response.try_into().unwrap();
+            assert_eq!(converted.usage.input_tokens, 200);
+            assert_eq!(converted.usage.output_tokens, 20);
+            assert_eq!(converted.usage.total_tokens, 220);
+            assert_eq!(converted.usage.cached_input_tokens, 50);
+            assert_eq!(converted.usage.cache_creation_input_tokens, expected_write);
+            assert_eq!(converted.usage.reasoning_tokens, 7);
+            let streamed: super::streaming::StreamingCompletionResponse =
+                serde_json::from_value(serde_json::json!({"usage": usage_wire})).unwrap();
+            assert_eq!(streamed.token_usage(), converted.usage);
         }
     }
 

@@ -1718,6 +1718,7 @@ mod tests {
             .expect("citation delta should produce a raw choice");
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+                native_end_turn: false,
                 usage: PartialUsage::default(),
             }));
         };
@@ -1863,6 +1864,7 @@ mod tests {
             .expect("citation delta should produce a raw choice");
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+                native_end_turn: false,
                 usage: PartialUsage::default(),
             }));
         };

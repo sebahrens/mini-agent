@@ -1639,15 +1639,15 @@ pub(crate) struct SharedUsageLedger {
 #[derive(Clone)]
 pub(crate) struct SubagentAdmission {
     pub(crate) allowed: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-    pub(crate) observe: std::sync::Arc<dyn Fn(Usage, u64) + Send + Sync>,
-    fallback: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) observe: std::sync::Arc<dyn Fn(Usage, Usage) + Send + Sync>,
+    fallback: std::sync::Arc<std::sync::Mutex<Usage>>,
 }
 
 #[cfg(feature = "subagents")]
 impl SubagentAdmission {
     pub(crate) fn new(
         allowed: impl Fn() -> bool + Send + Sync + 'static,
-        observe: impl Fn(Usage, u64) + Send + Sync + 'static,
+        observe: impl Fn(Usage, Usage) + Send + Sync + 'static,
     ) -> Self {
         Self {
             allowed: std::sync::Arc::new(allowed),
@@ -1675,23 +1675,21 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for SharedUsageLedger {
                 Flow::terminate("task cost-unit budget exhausted")
             }
             StepEvent::CompletionRequestPrepared { request, .. } => {
-                let estimate = serde_json::to_string(request)
+                let input_tokens = serde_json::to_string(request)
                     .ok()
                     .map(|text| crate::session::Session::estimate_tokens(&text))
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(request.max_tokens.unwrap_or(0));
-                admission
+                    .unwrap_or(u64::MAX);
+                let output_tokens = request.max_tokens.unwrap_or(0);
+                let fallback = Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens.saturating_add(output_tokens),
+                    ..Default::default()
+                };
+                *admission
                     .fallback
-                    .store(estimate, std::sync::atomic::Ordering::Relaxed);
-                Flow::cont()
-            }
-            StepEvent::ModelTurnFinished { usage, .. } => {
-                (admission.observe)(
-                    usage,
-                    admission
-                        .fallback
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fallback;
                 Flow::cont()
             }
             StepEvent::ToolCall { .. } if !(admission.allowed)() => Flow::Skip {
@@ -1706,7 +1704,6 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for SharedUsageLedger {
             kind,
             StepEventKind::CompletionCall
                 | StepEventKind::CompletionRequestPrepared
-                | StepEventKind::ModelTurnFinished
                 | StepEventKind::ToolCall
         )
     }
@@ -1725,6 +1722,21 @@ impl SharedUsageLedger {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(usage);
         crate::spend::run::observe_current(delta);
+        // CompletionCall is emitted once for every billable streamed call,
+        // including recovered turns and turns ending in a stream error.
+        // ModelTurnFinished intentionally omits recovered turns, so it cannot
+        // own admission accounting. Charge before polling any following tool.
+        self.observe_admission(usage);
+    }
+
+    fn observe_admission(&self, usage: Usage) {
+        if let Some(admission) = &self.admission {
+            let fallback = *admission
+                .fallback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (admission.observe)(usage, fallback);
+        }
     }
 
     fn reconcile_terminal(&self, usage: Usage) {
@@ -1735,6 +1747,7 @@ impl SharedUsageLedger {
             .reconcile_terminal(usage);
         if delta.has_values() {
             crate::spend::run::observe_current(delta);
+            self.observe_admission(delta.into());
         }
     }
 
@@ -6662,7 +6675,7 @@ mod tests {
                 move |usage, fallback| {
                     charge.fetch_add(
                         if usage == Usage::default() {
-                            fallback
+                            fallback.total_tokens
                         } else {
                             usage.total_tokens
                         },
@@ -6721,6 +6734,228 @@ mod tests {
                 assert_eq!(run.usage.total_tokens, 60);
             }
         }
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn task130_recovered_turn_charges_usage_before_effects() {
+        #[derive(Clone)]
+        struct RepairCounterName(Arc<AtomicUsize>);
+        impl AgentHook<MockCompletionModel> for RepairCounterName {
+            async fn on_event(
+                &self,
+                _: &HookContext,
+                event: StepEvent<'_, MockCompletionModel>,
+            ) -> Flow {
+                if let StepEvent::InvalidToolCall(context) = event {
+                    assert_eq!(context.tool_name, "broken-counter-name");
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Flow::repair(CountingTool::NAME)
+                } else {
+                    Flow::cont()
+                }
+            }
+        }
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+            ..Usage::new()
+        };
+        let cfg = crate::config::Config {
+            task_cost_weighting: Some(crate::config::TaskCostWeighting::Fixed),
+            ..Default::default()
+        };
+        let policy =
+            crate::extras::subagents::cost::CostPolicy::resolve(&cfg, "openai", "fixture", None);
+        let used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let check = used.clone();
+        let charge = used.clone();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = observed.clone();
+        let admission = super::SubagentAdmission::new(
+            move || check.load(Ordering::SeqCst) < 100,
+            move |reported, fallback| {
+                recorded.lock().unwrap().push(reported);
+                charge.fetch_add(
+                    policy.units(if reported.has_values() {
+                        &reported
+                    } else {
+                        &fallback
+                    }),
+                    Ordering::SeqCst,
+                );
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repairs = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("known finding"),
+                MockStreamEvent::tool_call(
+                    "recover-paid-call",
+                    "broken-counter-name",
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(usage),
+            ],
+            vec![
+                MockStreamEvent::text("NEVER_CONTINUE"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .max_tokens(100)
+            .tool(CountingTool(calls.clone()))
+            .add_hook(RepairCounterName(repairs.clone()))
+            .build();
+        let run = super::run_subagent(
+            &agent,
+            "investigate",
+            20,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default().with_admission(admission),
+        )
+        .await;
+        assert_eq!(
+            repairs.load(Ordering::SeqCst),
+            1,
+            "exercise actual SDK invalid-tool recovery"
+        );
+        assert_eq!(
+            model.requests().len(),
+            1,
+            "no next request after weighted exhaustion"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "repaired tool still obeys admission"
+        );
+        assert_eq!(
+            used.load(Ordering::SeqCst),
+            110,
+            "charge known billable usage exactly once even when ModelTurnFinished is suppressed"
+        );
+        assert_eq!(*observed.lock().unwrap(), vec![usage]);
+        assert_eq!(run.usage, usage);
+        let response = run.response.unwrap();
+        assert!(response.contains("known finding"), "{response}");
+        assert!(
+            response.contains("task cost-unit budget exhausted"),
+            "{response}"
+        );
+        assert!(!response.contains("NEVER_CONTINUE"));
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn task_weighted_missing_usage_preserves_prepared_input_and_output_reserve() {
+        const OUTPUT_RESERVE: u64 = 32_000;
+        const BUDGET: u64 = 64_000;
+        let used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let check = used.clone();
+        let charge = used.clone();
+        let recorded = observations.clone();
+        let admission = super::SubagentAdmission::new(
+            move || check.load(Ordering::SeqCst) < BUDGET,
+            move |reported, fallback| {
+                recorded.lock().unwrap().push((reported, fallback));
+                let usage = if reported == Usage::default() {
+                    fallback
+                } else {
+                    reported
+                };
+                let units = usage
+                    .input_tokens
+                    .saturating_add(usage.output_tokens.saturating_mul(5));
+                charge.fetch_add(units, Ordering::SeqCst);
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("known finding"),
+                MockStreamEvent::tool_call(
+                    "blocked-weighted-effect",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(Usage::default()),
+            ],
+            vec![
+                MockStreamEvent::text("NEVER_CONTINUE"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let preamble = "trusted persona instructions and tool context ".repeat(1_000);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble(&preamble)
+            .max_tokens(OUTPUT_RESERVE)
+            .tool(CountingTool(calls.clone()))
+            .build();
+        let run = super::run_subagent(
+            &agent,
+            "investigate",
+            20,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default().with_admission(admission),
+        )
+        .await;
+
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "weighted reserve must stop the next request"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no effect after exhaustion"
+        );
+        let request = &requests[0];
+        assert_eq!(request.max_tokens, Some(OUTPUT_RESERVE));
+        assert!(
+            serde_json::to_string(request)
+                .unwrap()
+                .contains(preamble.as_str()),
+            "full prepared request retains the persona in its system messages"
+        );
+        assert!(
+            !request.tools.is_empty(),
+            "estimate includes prepared tool definitions"
+        );
+        let input_tokens =
+            crate::session::Session::estimate_tokens(&serde_json::to_string(request).unwrap());
+        assert!(input_tokens > crate::session::Session::estimate_tokens("investigate") + 1_000);
+        let fallback = Usage {
+            input_tokens,
+            output_tokens: OUTPUT_RESERVE,
+            total_tokens: input_tokens.saturating_add(OUTPUT_RESERVE),
+            ..Default::default()
+        };
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![(Usage::default(), fallback)]
+        );
+        assert!(
+            fallback.total_tokens < BUDGET,
+            "an unweighted reserve would wrongly allow the effect"
+        );
+        let weighted = input_tokens.saturating_add(OUTPUT_RESERVE.saturating_mul(5));
+        assert!(weighted >= BUDGET);
+        assert_eq!(used.load(Ordering::SeqCst), weighted);
+        let response = run.response.unwrap();
+        assert!(response.contains("known finding"), "{response}");
+        assert!(
+            response.contains("task cost-unit budget exhausted"),
+            "{response}"
+        );
+        assert!(!response.contains("NEVER_CONTINUE"), "{response}");
     }
 
     #[tokio::test]

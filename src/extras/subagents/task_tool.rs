@@ -864,43 +864,14 @@ editing in a known location, grepping for a literal you will act on immediately.
             &runtime.model_name,
             selected_alias,
         ));
-        let quick = crate::config::quick_models_map(&config);
-        let matches = |entry: &&crate::config::QuickModelConfig| {
-            entry.provider == runtime.provider_name && entry.model == runtime.model_name
-        };
-        let selected = selected_alias
-            .and_then(|alias| quick.get(alias))
-            .filter(|entry| matches(entry));
-        let catalog_provider = if config.is_anthropic_native(&runtime.provider_name) {
-            "anthropic"
-        } else {
-            &runtime.provider_name
-        };
-        let input_price = selected
-            .and_then(|entry| entry.resolved_prices().map(|price| price.0))
-            .or_else(|| {
-                crate::config::Config::catalog_input_output_cost(
-                    catalog_provider,
-                    &runtime.model_name,
-                )
-                .map(|price| price.0)
-            })
-            .or_else(|| {
-                quick
-                    .iter()
-                    .filter(|(_, entry)| matches(entry))
-                    .min_by(|(a, _), (b, _)| a.cmp(b))
-                    .and_then(|(_, entry)| entry.resolved_prices().map(|price| price.0))
-            })
-            .unwrap_or(0.0);
-        let cache_multipliers = crate::pricing::cache_prices_for_model(
+        let cost_policy = super::cost::CostPolicy::resolve(
+            &config,
             &runtime.provider_name,
             &runtime.model_name,
-            &config,
             selected_alias,
-            input_price,
-        )
-        .multipliers(input_price);
+        );
+        tracing::debug!(weights = ?cost_policy.weights, source = cost_policy.source,
+            "captured subagent task work-unit policy");
         let parent_run = crate::spend::run::Run::current();
         let task_pool = parent_run
             .as_ref()
@@ -951,10 +922,6 @@ editing in a known location, grepping for a literal you will act on immediately.
             None => run,
         });
         let specialization = specialization.map(|resolved| resolved.prompt);
-        let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
-        let cache_split_required = config.native_cache_split_required(&runtime.model_name);
-        let reasoning_exclusive =
-            config.reasoning_tokens_are_exclusive_of_output(&runtime.provider_name);
 
         // A session job must not retain the foreground event channel: that
         // channel's closure is part of parent-turn retirement.
@@ -1015,28 +982,23 @@ editing in a known location, grepping for a literal you will act on immediately.
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let task_budget = executor_budget.clone();
             let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
+            let child_budget = LiveTaskBudget::new(u64::MAX);
             let admission = |repair: bool| {
                 let check_task = task_budget.clone();
                 let check_repair = repair_budget.clone();
                 let charge_task = task_budget.clone();
                 let charge_repair = repair_budget.clone();
+                let charge_child = child_budget.clone();
                 SubagentAdmission::new(
                     move || !check_task.exhausted() && (!repair || !check_repair.exhausted()),
                     move |usage, fallback| {
-                        let units = if usage == Usage::default() {
-                            fallback
+                        let units = cost_policy.units(if usage == Usage::default() {
+                            &fallback
                         } else {
-                            usage_cost_units_with_cache_policy(
-                                &usage,
-                                anthropic_native,
-                                reasoning_exclusive,
-                                "",
-                                &Ok(String::new()),
-                                cache_multipliers,
-                                cache_split_required,
-                            )
-                        };
+                            &usage
+                        });
                         charge_task.charge(units);
+                        charge_child.charge(units);
                         if repair {
                             charge_repair.charge(units);
                         }
@@ -1070,28 +1032,25 @@ editing in a known location, grepping for a literal you will act on immediately.
             let initial_usage = SharedUsageLedger::default().with_admission(admission(false));
             let retry_usage = SharedUsageLedger::default().with_admission(admission(false));
             let repair_usage = SharedUsageLedger::default().with_admission(admission(true));
-            let cancellation_prompt = prompt_text.clone();
+            let cancellation_units = child_budget.clone();
             let cancellation_initial_usage = initial_usage.clone();
             let cancellation_retry_usage = retry_usage.clone();
             let cancellation_repair_usage = repair_usage.clone();
             let cancellation_cost = Arc::new(move || {
-                let usage = usage_saturating_add(
+                // Streaming usage may be known before ModelTurnFinished. Keep
+                // it when cancellation retires an in-flight request, without
+                // charging completed turns twice or losing no-usage estimates.
+                let observed = usage_saturating_add(
                     usage_saturating_add(
                         cancellation_initial_usage.total(),
                         cancellation_retry_usage.total(),
                     ),
                     cancellation_repair_usage.total(),
                 );
-                let output = Err("subagent cancelled before completion".to_string());
-                usage_cost_units_with_cache_policy(
-                    &usage,
-                    anthropic_native,
-                    reasoning_exclusive,
-                    &cancellation_prompt,
-                    &output,
-                    cache_multipliers,
-                    cache_split_required,
-                )
+                cancellation_units
+                    .used
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .max(cost_policy.units(&observed))
             });
             let future = crate::startup::heap_future(|| async move {
                 if let Some(spend) = &spend_profile
@@ -1102,7 +1061,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                         cost_units: 0,
                     };
                 }
-                let display_prompt = prompt_text.clone();
                 #[cfg(feature = "hooks")]
                 let execution_prompt = match crate::extras::hooks::dispatch_subagent_start(
                     &hook_agent_type,
@@ -1210,15 +1168,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let output = run
                     .response
                     .map(|response| enforce_bounded_report_contract(&response, max_report_bytes));
-                let cost_units = usage_cost_units_with_cache_policy(
-                    &run.usage,
-                    anthropic_native,
-                    reasoning_exclusive,
-                    &display_prompt,
-                    &output,
-                    cache_multipliers,
-                    cache_split_required,
-                );
+                let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
                 ChildExecution { output, cost_units }
             });
             let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
@@ -2164,63 +2114,29 @@ fn usage_cost_units_with_cache_policy(
     multipliers: crate::pricing::CacheMultipliers,
     split_required: bool,
 ) -> u64 {
-    let itemized = crate::pricing::billable_input_tokens_with_cache_tiers(
-        anthropic_native,
-        (*usage).into(),
-        multipliers,
+    let policy = super::cost::CostPolicy {
+        weights: crate::config::TaskCostWeights {
+            cache_read: multipliers.read,
+            cache_write_5m: multipliers.write,
+            cache_write_1h: multipliers.write_1h,
+            ..Default::default()
+        },
+        source: "explicit cache policy",
+        native_input: anthropic_native,
+        exclusive_reasoning: reasoning_exclusive,
         split_required,
-    )
-    .saturating_add(usage.output_tokens)
-    .saturating_add(usage.tool_use_prompt_tokens)
-    .saturating_add(if reasoning_exclusive {
-        usage.reasoning_tokens
-    } else {
-        0
-    });
-    if itemized > 0 {
-        return itemized;
+    };
+    if usage.has_values() {
+        return policy.units(usage);
     }
-    if anthropic_native && (usage.cached_input_tokens > 0 || usage.cache_creation_input_tokens > 0)
-    {
-        // Reported cache usage can legitimately be free. A positive rate that
-        // rounds below one proxy unit still consumes one; neither case is an
-        // absent usage report that warrants a total/text fallback.
-        let positive_write = match usage
-            .cache_creation
-            .filter(|split| split.total() == Some(usage.cache_creation_input_tokens))
-        {
-            Some(split) => {
-                (split.ephemeral_5m_input_tokens > 0 && multipliers.write > 0.0)
-                    || (split.ephemeral_1h_input_tokens > 0 && multipliers.write_1h > 0.0)
-            }
-            None => {
-                usage.cache_creation_input_tokens > 0
-                    && if split_required || usage.cache_creation.is_some() {
-                        multipliers.write.max(multipliers.write_1h) > 0.0
-                    } else {
-                        multipliers.write > 0.0
-                    }
-            }
-        };
-        let positive_cache_cost =
-            (usage.cached_input_tokens > 0 && multipliers.read > 0.0) || positive_write;
-        return u64::from(positive_cache_cost);
-    }
-    if usage.total_tokens > 0 {
-        return usage.total_tokens;
-    }
-
-    // Some providers do not report usage. Keep the budget enforceable with a
-    // conservative text estimate instead of treating unknown cost as free.
     let response_len = response
         .as_ref()
         .map_or_else(|error| error.len(), |text| text.len());
-    prompt
-        .len()
-        .saturating_add(response_len)
-        .div_ceil(4)
-        .try_into()
-        .unwrap_or(u64::MAX)
+    policy.units(&Usage {
+        input_tokens: prompt.len().div_ceil(4).try_into().unwrap_or(u64::MAX),
+        output_tokens: response_len.div_ceil(4).try_into().unwrap_or(u64::MAX),
+        ..Usage::new()
+    })
 }
 
 fn truncate_total_bytes(value: &str, max_bytes: usize, marker: &str) -> String {
@@ -2623,9 +2539,14 @@ mod tests {
         let valid = "## Findings\n- [confidence: high] Source contains this literal Markdown:\n\
             ````text\n## Findings\n- a code bullet, not an unlabelled finding\n```\n````\n\
             ## Unverified\n- None.\n## Coverage\n- Covered: fixture.rs:1.\n- Skipped: None.";
-        for (answers, expected_count) in
-            [(vec![valid], 1), (vec!["unstructured finding", valid], 2)]
-        {
+        for (answers, expected_count, budget, partial) in [
+            (vec![valid], 1, 4_000_000, false),
+            // Each observed call costs 7 input + 5*5 output = 32 units.
+            // Both the initial call and its repair fit only if charged once.
+            (vec!["unstructured finding", valid], 2, 65, false),
+            // The old 1x output accounting would incorrectly fit this limit.
+            (vec![valid], 1, 31, true),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -2676,6 +2597,7 @@ mod tests {
                 "no_context_files": true, "session_title_model": "off",
                 "max_tokens": 1024, "subagent_max_tokens": 1024,
                 "task_report_repair_max_tokens": 37,
+                "task_max_cost_units": budget,
                 "retry": {"max_attempts": 1},
                 "custom_providers": {"report-wire": {"provider_type": "openai",
                     "base_url": format!("http://{address}/v1"), "api_style": "completions"}}
@@ -2727,7 +2649,10 @@ mod tests {
                 !report.contains("response contract repaired by host"),
                 "{report}"
             );
-            assert!(!report.contains("[partial:"), "{report}");
+            assert_eq!(report.contains("[partial:"), partial, "{report}");
+            if partial {
+                assert!(report.contains("cost_units=32/31"), "{report}");
+            }
             assert_eq!(requests[0]["max_tokens"], 1024);
             if expected_count == 2 {
                 assert_eq!(
@@ -4235,12 +4160,12 @@ mod tests {
             ..Usage::new()
         };
         let standard_units = usage_cost_units(&standard, false, false, "", &Ok(String::new()));
-        assert_eq!(standard_units, 232_000);
+        assert_eq!(standard_units, 360_000);
         let budget = LiveTaskBudget::new(TaskLimits::default().max_cost_units);
         for _ in 0..8 {
             budget.clone().charge(standard_units);
         }
-        assert_eq!(budget.used.load(Ordering::Acquire), 1_856_000);
+        assert_eq!(budget.used.load(Ordering::Acquire), 2_880_000);
         assert!(!budget.exhausted());
 
         // Reserve the full 32k response inside a 1,048,576-token window.
@@ -4265,7 +4190,7 @@ mod tests {
             crate::pricing::CacheMultipliers::default(),
             true,
         );
-        assert_eq!(native_units, 2_065_152);
+        assert_eq!(native_units, 2_193_152);
         let budget = LiveTaskBudget::new(TaskLimits::default().max_cost_units);
         budget.clone().charge(native_units);
         assert_eq!(budget.used.load(Ordering::Acquire), native_units);
@@ -4289,11 +4214,11 @@ mod tests {
         };
         assert_eq!(
             usage_cost_units(&usage, false, false, "prompt", &Ok("response".into())),
-            13
+            33
         );
         assert_eq!(
             usage_cost_units(&usage, true, false, "prompt", &Ok("response".into())),
-            16
+            36
         );
         let cache_only = Usage {
             total_tokens: 100,
@@ -4313,11 +4238,11 @@ mod tests {
         };
         assert_eq!(
             usage_cost_units(&unreported_total, true, false, "", &Ok(String::new())),
-            11
+            23
         );
         assert_eq!(
             usage_cost_units(&Usage::new(), false, false, "1234", &Ok("5678".into())),
-            2
+            6
         );
     }
 
@@ -4476,8 +4401,8 @@ mod tests {
                 ratios,
                 true
             ),
-            20,
-            "routed totals remain provider-normalized, without adding native tiers"
+            16,
+            "gateway cache categories are subsets of inclusive prompt counts"
         );
     }
 
@@ -4557,8 +4482,8 @@ mod tests {
                 &Ok("response".into()),
                 free
             ),
-            6,
-            "missing usage still uses the conservative text estimate"
+            14,
+            "missing usage still weights the conservative input/output estimate"
         );
         assert_eq!(
             usage_cost_units_with_multipliers(
@@ -4572,8 +4497,8 @@ mod tests {
                 &Ok("response".into()),
                 free
             ),
-            42,
-            "total-only usage remains an available budget estimate"
+            210,
+            "total-only usage uses the larger input/output weight"
         );
     }
 
@@ -4591,7 +4516,7 @@ mod tests {
         };
         assert_eq!(
             usage_cost_units(&usage, false, false, "prompt", &Ok("response".into())),
-            150
+            350
         );
     }
 
@@ -4608,7 +4533,7 @@ mod tests {
         };
         assert_eq!(
             usage_cost_units(&usage, false, true, "prompt", &Ok("response".into())),
-            190
+            550
         );
     }
 
