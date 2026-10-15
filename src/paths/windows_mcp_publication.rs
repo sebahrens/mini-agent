@@ -313,6 +313,43 @@ fn replace_with_hook(
     expected_security: &[u8; 32],
     before_commit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    replace_with_hooks(
+        workspace,
+        path,
+        content,
+        expected,
+        base,
+        expected_security,
+        || {},
+        before_commit,
+    )
+}
+
+fn check_parent_namespace(
+    workspace: &WorkspaceBinding,
+    relative: &Path,
+    parent_identity: &CheckedMetadata,
+    parent_security: &[u8; 32],
+) -> io::Result<()> {
+    workspace.validate().map_err(io::Error::other)?;
+    let (current, _) = workspace.open_parent(relative, false)?;
+    // A retained directory handle alone does not bind the original relative
+    // namespace: it can survive a rename and report a new held_path. Rewalk
+    // from the retained workspace and compare the exact approved parent.
+    check_directory(&current.into_std_file(), parent_identity, parent_security)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_with_hooks(
+    workspace: &WorkspaceBinding,
+    path: &Path,
+    content: &[u8],
+    expected: &CheckedMetadata,
+    base: &ContentDigest,
+    expected_security: &[u8; 32],
+    after_parent_capture: impl FnOnce(),
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     if content.len() > crate::extras::mcp::project::MAX_PROJECT_MCP_BYTES {
         return Err(io::Error::other("MCP configuration exceeds 1 MiB"));
     }
@@ -322,6 +359,7 @@ fn replace_with_hook(
     let parent = parent.into_std_file();
     let parent_identity = crate::fs::checked_file_metadata(&parent)?;
     let parent_security = security_fingerprint(&parent)?;
+    after_parent_capture();
     let root_security = security_fingerprint(&workspace.directory)?;
     let root_path = held_path(&workspace.directory)?;
     let parent_path = held_path(&parent)?;
@@ -335,7 +373,7 @@ fn replace_with_hook(
         check_directory(&root, &workspace.identity, &root_security)?;
         let parent = transaction.open(&parent_path, false, true)?;
         check_directory(&parent, &parent_identity, &parent_security)?;
-        workspace.validate().map_err(io::Error::other)?;
+        check_parent_namespace(workspace, &relative, &parent_identity, &parent_security)?;
         let mut target = transaction.open(&target_path, false, false)?;
         check_shape(&target, false)?;
         crate::fs::ensure_same_file(
@@ -357,7 +395,7 @@ fn replace_with_hook(
         crate::fs::validate_private_file(&candidate)?;
         check_directory(&root, &workspace.identity, &root_security)?;
         check_directory(&parent, &parent_identity, &parent_security)?;
-        workspace.validate().map_err(io::Error::other)?;
+        check_parent_namespace(workspace, &relative, &parent_identity, &parent_security)?;
         // All transacted File and temporary CheckedMetadata clones drop HERE.
     }
     transaction.replace(&candidate_path, &target_path)?;
@@ -482,6 +520,45 @@ mod tests {
             std::fs::read_to_string(retained.join(fixture.relative())).unwrap(),
             snapshot.content
         );
+    }
+
+    #[test]
+    fn windows_mcp_txf_parent_reparent_after_capture_preserves_both_namespaces() {
+        let fixture = Fixture::new("mcp-txf-parent-reparent");
+        let original = std::fs::read(&fixture.target).unwrap();
+        let file = fixture
+            .workspace
+            .open_regular_relative(fixture.relative())
+            .unwrap();
+        let expected = crate::fs::checked_file_metadata(&file).unwrap();
+        let security = security_fingerprint(&file).unwrap();
+        let parent = fixture.target.parent().unwrap().to_owned();
+        let moved = fixture.workspace.root().join("moved-parent");
+        let error = replace_with_hooks(
+            &fixture.workspace,
+            fixture.relative(),
+            b"{}",
+            &expected,
+            &ContentDigest::of(&original),
+            &security,
+            || {
+                std::fs::rename(&parent, &moved).unwrap();
+                crate::fs::ensure_private_directory(&parent).unwrap();
+                crate::fs::private_atomic_write_sync(&fixture.target, b"NEW_NAMESPACE_UNCHANGED")
+                    .unwrap();
+                fixture.workspace.validate().unwrap(); // Root itself never changed.
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&fixture.target).unwrap(),
+            b"NEW_NAMESPACE_UNCHANGED"
+        );
+        assert_eq!(std::fs::read(moved.join(".mcp.json")).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
     }
 
     #[test]
