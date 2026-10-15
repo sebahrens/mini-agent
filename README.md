@@ -326,6 +326,12 @@ cd mini-agent
 cargo install --path . --locked
 ```
 
+Source builds also need Python 3 and the native C, curl and zlib development
+toolchain for the embedded Git runtime. Windows and cross-target builds supply an
+explicit prepared payload. See [Git runtime build prerequisites](docs/development/git-runtime-bootstrap.md)
+and [static Linux builds](docs/development/git-runtime-musl.md). Prebuilt release
+archives already include this payload.
+
 `--locked` builds with the dependency versions in the checked-in `Cargo.lock`. Contributors use a
 separate debug build; see [CONTRIBUTING.md](CONTRIBUTING.md).
 

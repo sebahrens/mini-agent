@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -29,6 +31,79 @@ oleaut32.dll psapi.dll rpcrt4.dll secur32.dll setupapi.dll shell32.dll shlwapi.d
 ucrtbase.dll user32.dll userenv.dll version.dll winhttp.dll wininet.dll winmm.dll
 wintrust.dll wldap32.dll ws2_32.dll
 """.split())
+
+# MSYS2 noacl mounts synthesize POSIX permission bits. Establish and inspect the
+# native protected DACL instead; never infer cache privacy from chmod/stat.
+PRIVATE_CACHE_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:MINI_AGENT_GIT_BUILD_DIRECTORY
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($user)
+$acl.SetAccessRuleProtection($true, $false)
+$inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor `
+    [Security.AccessControl.InheritanceFlags]::ObjectInherit
+foreach ($sidValue in @($user.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object Security.Principal.SecurityIdentifier($sidValue)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+        $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+        $inherit, [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow)
+    [void]$acl.AddAccessRule($rule)
+}
+# This overload applies security at creation, and leaves an existing directory
+# unchanged. Existing unsafe caches are rejected by the readback below.
+[void][IO.Directory]::CreateDirectory($path, $acl)
+if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
+    throw 'Git bootstrap cache cannot be a reparse point'
+}
+$actual = [IO.Directory]::GetAccessControl($path)
+$rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+    @{ sid = $_.IdentityReference.Value; rights = [int]$_.FileSystemRights;
+       type = [int]$_.AccessControlType; inherited = $_.IsInherited;
+       inheritance = [int]$_.InheritanceFlags; propagation = [int]$_.PropagationFlags }
+})
+@{ owner = $actual.GetOwner([Security.Principal.SecurityIdentifier]).Value;
+   user = $user.Value; protected = $actual.AreAccessRulesProtected; rules = $rules } |
+    ConvertTo-Json -Compress -Depth 4
+"""
+
+
+def validate_cache_acl(record: dict) -> None:
+    if not isinstance(record, dict) or set(record) != {"owner", "user", "protected", "rules"}:
+        raise ValueError("Invalid native Git bootstrap cache security record")
+    user = record["user"]
+    if not isinstance(user, str) or not re.fullmatch(r"S-1-[0-9-]{1,180}", user):
+        raise ValueError("Invalid native Git bootstrap cache owner")
+    expected = {user, "S-1-5-18", "S-1-5-32-544"}
+    rules = record["rules"]
+    if record["owner"] != user or record["protected"] is not True or not isinstance(rules, list) or len(rules) != len(expected):
+        raise ValueError("Git bootstrap cache must have an owned protected native DACL")
+    seen = set()
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"sid", "rights", "type", "inherited", "inheritance", "propagation"} or rule["sid"] not in expected or rule["sid"] in seen or rule["rights"] != 0x1F01FF or rule["type"] != 0 or rule["inherited"] is not False or rule["inheritance"] != 3 or rule["propagation"] != 0:
+            raise ValueError("Git bootstrap cache has an unexpected native access rule")
+        seen.add(rule["sid"])
+
+
+def private_directory(path: Path, env: dict[str, str]) -> None:
+    # Reject MSYS symlinks before invoking native APIs; native reparse points
+    # are independently rejected after opening the actual Windows path.
+    if path.is_symlink() or (path.exists() and not stat.S_ISDIR(path.lstat().st_mode)):
+        raise ValueError("Git bootstrap cache must be a real directory")
+    system_root = next((value for key, value in env.items() if key.upper() == "SYSTEMROOT"), None)
+    if not system_root:
+        raise ValueError("Windows SystemRoot is required for native cache security")
+    windows_path = subprocess.check_output(["/usr/bin/cygpath", "-aw", str(path)], text=True, timeout=30).strip()
+    powershell = subprocess.check_output(["/usr/bin/cygpath", "-u", system_root + "/System32/WindowsPowerShell/v1.0/powershell.exe"], text=True, timeout=30).strip()
+    if not windows_path or not powershell:
+        raise ValueError("Windows cache security paths are unavailable")
+    security_env = env.copy()
+    security_env["MINI_AGENT_GIT_BUILD_DIRECTORY"] = windows_path
+    response = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PRIVATE_CACHE_SCRIPT], env=security_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True)
+    if len(response.stdout) > 16384:
+        raise ValueError("Native cache security record exceeds bound")
+    validate_cache_acl(json.loads(response.stdout))
 
 
 def common_module():
@@ -205,38 +280,39 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
     env = toolchain_environment(toolchain_prefix)
     cache_root = cache_root.absolute()
     cache_root.parent.mkdir(parents=True, exist_ok=True)
-    common.private_directory(cache_root)
+    private_directory(cache_root, env)
     native_cache = cache_root / TARGET
-    common.private_directory(native_cache)
+    private_directory(native_cache, env)
     # Fresh build only: CI provisions the compiler and DLLs explicitly. No cache
     # can retain an obsolete dependency package across a toolchain update.
-    with common.cache_lock(native_cache / ".build.lock"):
-        staging = Path(tempfile.mkdtemp(prefix=".windows-building-", dir=native_cache))
+    # Every build owns fresh staging; no shared cached artifact is consumed,
+    # so a POSIX flock/mode-based lock is unnecessary on MSYS2 noacl mounts.
+    staging = Path(tempfile.mkdtemp(prefix=".windows-building-", dir=native_cache))
+    try:
+        source = common.extract_source(archive, staging)
+        patch_file = staging / "policy.patch"
+        patch_file.write_bytes(patch)
+        common.run(["/usr/bin/patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], source, env)
+        common.run(["/usr/bin/make", f"-j{jobs}", "NO_RUST=YesPlease", "NO_GETTEXT=YesPlease", "NO_TCLTK=YesPlease", "NO_PERL=YesPlease", "NO_PYTHON=YesPlease", "NO_OPENSSL=YesPlease", "NO_INSTALL_HARDLINKS=YesPlease", "NO_GITWEB=YesPlease", f"CC={toolchain_prefix}/bin/gcc", f"CURL_CONFIG={toolchain_prefix}/bin/curl-config", "CFLAGS=-O2", f"prefix={toolchain_prefix}", "git.exe", "git-remote-http.exe"], source, env)
+        programs = [source / "git.exe", source / "git-remote-http.exe"]
+        libraries = dependency_closure(programs, toolchain_prefix / "bin", common.read_regular)
+        producer = common.prepare_module()
+        producer.prepare(root=ROOT, target=TARGET, source_archive=source_archive, git=programs[0], http_helper=programs[1], https_helper=None, libraries=libraries, output=output)
+        # Version check uses ONLY the captured payload DLLs and Windows OS
+        # directories. UCRT64/bin is deliberately absent from this PATH.
         try:
-            source = common.extract_source(archive, staging)
-            patch_file = staging / "policy.patch"
-            patch_file.write_bytes(patch)
-            common.run(["/usr/bin/patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], source, env)
-            common.run(["/usr/bin/make", f"-j{jobs}", "NO_RUST=YesPlease", "NO_GETTEXT=YesPlease", "NO_TCLTK=YesPlease", "NO_PERL=YesPlease", "NO_PYTHON=YesPlease", "NO_OPENSSL=YesPlease", "NO_INSTALL_HARDLINKS=YesPlease", "NO_GITWEB=YesPlease", f"CC={toolchain_prefix}/bin/gcc", f"CURL_CONFIG={toolchain_prefix}/bin/curl-config", "CFLAGS=-O2", f"prefix={toolchain_prefix}", "git.exe", "git-remote-http.exe"], source, env)
-            programs = [source / "git.exe", source / "git-remote-http.exe"]
-            libraries = dependency_closure(programs, toolchain_prefix / "bin", common.read_regular)
-            producer = common.prepare_module()
-            producer.prepare(root=ROOT, target=TARGET, source_archive=source_archive, git=programs[0], http_helper=programs[1], https_helper=None, libraries=libraries, output=output)
-            # Version check uses ONLY the captured payload DLLs and Windows OS
-            # directories. UCRT64/bin is deliberately absent from this PATH.
-            try:
-                runtime_env = env.copy()
-                system_root = next((value for key, value in env.items() if key.upper() == "SYSTEMROOT"), None)
-                if not system_root:
-                    raise ValueError("Windows SystemRoot is required for explicit system DLL resolution")
-                windows = Path(subprocess.check_output(["/usr/bin/cygpath", "-u", system_root], text=True, timeout=30).strip())
-                runtime_env["PATH"] = str(output) + ":" + str(windows / "System32") + ":" + str(windows)
-                common.run([str(output / "git.exe"), "--version"], output, runtime_env)
-            except BaseException:
-                shutil.rmtree(output)
-                raise
-        finally:
-            shutil.rmtree(staging)
+            runtime_env = env.copy()
+            system_root = next((value for key, value in env.items() if key.upper() == "SYSTEMROOT"), None)
+            if not system_root:
+                raise ValueError("Windows SystemRoot is required for explicit system DLL resolution")
+            windows = Path(subprocess.check_output(["/usr/bin/cygpath", "-u", system_root], text=True, timeout=30).strip())
+            runtime_env["PATH"] = str(output) + ":" + str(windows / "System32") + ":" + str(windows)
+            common.run([str(output / "git.exe"), "--version"], output, runtime_env)
+        except BaseException:
+            shutil.rmtree(output)
+            raise
+    finally:
+        shutil.rmtree(staging)
     return output
 
 

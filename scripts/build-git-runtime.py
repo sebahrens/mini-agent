@@ -267,7 +267,7 @@ def toolchain_identity(env: dict[str, str], target: str, inputs: list[Path] | No
     for program in ["cc", "curl-config"] + (["pkg-config"] if "musl" in target else []):
         executable = shutil.which(program, path=env.get("PATH"))
         if executable is None:
-            raise ValueError("Git build toolchain program is unavailable")
+            raise ValueError(f"Git build toolchain program is unavailable: {program}")
         path = Path(executable).absolute()
         resolved = path.resolve(strict=True)
         identity.update(hashlib.sha256(read_regular(resolved, 256 * 1024 * 1024)).digest())

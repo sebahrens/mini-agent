@@ -354,6 +354,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `GITHUB_COPILOT_API_TOKEN`, `COPILOT_GITHUB_TOKEN` | Copilot model API token or explicitly supplied GitHub bootstrap token, respectively. CLI API key wins, then these designated sources, then `api_keys.copilot`, then a saved Copilot login. No ambient GitHub CLI/Actions tokens or editor caches are read. Isolated custom providers need their own token or explicit inheritance. |
 | `COPILOT_CLIENT_ID`, `COPILOT_GITHUB_HOST`, `COPILOT_API_URL` | Your device-flow-enabled GitHub OAuth app ID (required for `/login copilot` or `--login copilot`), authorization host (`github.com` or `SUBDOMAIN.ghe.com`), and optional model API origin. A configured endpoint wins the origin fallback; GitHub-issued endpoint selection stays within the captured host's approved Copilot service origins. See [Copilot credentials](PROVIDERS.md#github-copilot-credential-ownership). |
 | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub Gist sharing credentials. `GITHUB_TOKEN` is tried first; `GH_TOKEN` is used if the former cannot be read. Sharing is an explicit action and can disclose the shared session. |
+| `GIT_CONFIG_GLOBAL` | Explicit operator Git configuration source. Its bounded include graph is captured before project/model effects; the exact platform null device disables that source. Repository-owned sources cannot grant executable authority. |
 | `EDITOR` | Editor command fallback after config `editor`; otherwise the command is `editor`. |
 | `RUST_LOG` | Standard tracing filter for stderr; explicit `--log-level` wins. File logging remains controlled by `--verbose`/`--log-file`. |
 | `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the configured `acp_api_key`. |
@@ -397,6 +398,7 @@ so fixture names remain visible without advertising them as product configuratio
 
 | Internal family | Names and purpose |
 |---|---|
+| Guarded Git snapshot | `MINI_AGENT_GIT_GLOBAL_SNAPSHOT`: bounded parent-owned selection of the captured operator Git configuration, supplied only to the guarded Git child. An inherited value is replaced and does not authorize repository executable configuration. |
 | Private worker dispatch | `MINI_AGENT_INTERNAL_JS_WORKER`, `MINI_AGENT_INTERNAL_JS_GUARDIAN`: parent-owned broker/guardian dispatch. |
 | macOS containment fixtures | `MINI_AGENT_INTERNAL_MACOS_CONTAINMENT_PROBE`, `MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`, `MINI_AGENT_INTERNAL_MACOS_PARENT_DEATH_CANARY`, `MINI_AGENT_CONTAINMENT_EVIDENCE`, `MINI_AGENT_MACOS_CREDENTIAL_SENTINEL`, `MINI_AGENT_MACOS_DESCRIPTOR_BOUND`, `MINI_AGENT_MACOS_GUARDIAN_PGID`, `MINI_AGENT_MACOS_ONE_TIME_IMAGE`, `MINI_AGENT_MACOS_ORIGINAL_EXECUTABLE`, `MINI_AGENT_MACOS_SKILL_SENTINEL`, `MINI_AGENT_MACOS_WORKSPACE_SENTINEL`: hosted containment evidence and canaries. |
 | Retained worker image fixture | `MINI_AGENT_SNAPSHOT86_BINARY`: installed debug executable selected by the explicitly invoked macOS retained-image regression test; test-only input, never a production worker-selection override. |

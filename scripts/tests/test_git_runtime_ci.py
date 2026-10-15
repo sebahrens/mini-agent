@@ -1,5 +1,6 @@
-"""Owning policy tests for pinned Windows Git preparation before Cargo."""
+"""Owning policy tests for native Git prerequisites and preparation before Cargo."""
 from pathlib import Path
+import copy
 import re
 import unittest
 
@@ -41,11 +42,53 @@ def validate_preparation(body):
     step = body[:body.index(PREP)].rsplit("      - name:", 1)[1]
     if "continue-on-error" in step:
         raise AssertionError("Git preparation cannot fail open")
-    if "runs-on: ${{ matrix.os }}" in body:
-        if "if: matrix.os == 'windows-latest'" not in step:
-            raise AssertionError("Unix matrix jobs must retain their native default bootstrap")
-    elif "if:" in step:
-        raise AssertionError("native Windows preparation must not be optional")
+    if "if:" in step:
+        raise AssertionError("preparation must cover every compiling row; the action selects the host OS")
+
+
+EXPECTED_LINUX_JOBS = {
+    "harness-regression", "vscode", "clippy", "test", "all-features",
+    "parallel-test-smoke", "linux-sandbox-policy", "phase6-cross-platform-gate",
+    "platform-paths", "platform-path-negative-controls", "platform-path-install-smoke",
+    "mcp-stdio", "lsp-lifecycle", "install", "package",
+}
+
+
+def compiles_our_crate(step):
+    command = step.get("run", "").replace("\\\n", " ")
+    if re.search(r"\bcargo\s+(?:test|clippy|check|build|run)\b", command):
+        return True
+    return any(re.search(r"--path(?:=|\s+)\.(?:\s|$)", line)
+               for line in re.findall(r"\bcargo\s+install\b[^\n]*", command))
+
+
+def linux_compiling_jobs(workflow):
+    document = CHECK_PACKAGE_METADATA.parse_yaml_document(workflow)
+    result = {}
+    for name, job in document["jobs"].items():
+        runner = job.get("runs-on", "")
+        matrix = job.get("strategy", {}).get("matrix", {})
+        platforms = matrix.get("os", []) + [row.get("os", "") for row in matrix.get("include", [])]
+        linux = "ubuntu" in runner or "linux" in runner
+        if "matrix.os" in runner:
+            linux = any("ubuntu" in platform or "linux" in platform for platform in platforms)
+        if linux and any(compiles_our_crate(step) for step in job.get("steps", [])):
+            result[name] = job
+    return result
+
+
+def validate_linux_preparation(job):
+    steps = job["steps"]
+    preparation = [index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/prepare-git-runtime"]
+    if len(preparation) != 1:
+        raise AssertionError("each Linux crate-compiling job requires exactly one preparation")
+    index = preparation[0]
+    if not any(step.get("uses", "").startswith("actions/checkout@") for step in steps[:index]):
+        raise AssertionError("local action must follow checkout")
+    if index >= next(i for i, step in enumerate(steps) if compiles_our_crate(step)):
+        raise AssertionError("Linux prerequisites must precede the first crate compilation")
+    if steps[index].get("if") or steps[index].get("continue-on-error"):
+        raise AssertionError("Linux prerequisites must not be skipped or fail open")
 
 
 WINDOWS_SERVICE_TESTS = {
@@ -98,6 +141,47 @@ class GitRuntimeCiTests(unittest.TestCase):
         self.assertNotIn(PREP, job_body(self.ci, "windows-msi"))
         self.assertIn("python3 -m unittest scripts.tests.test_git_runtime_ci", job_body(self.ci, "fmt"))
 
+    def test_every_linux_crate_compilation_prepares_once_before_cargo(self):
+        jobs = linux_compiling_jobs(self.ci)
+        self.assertEqual(set(jobs), EXPECTED_LINUX_JOBS)
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                validate_linux_preparation(job)
+        # Tool installation and resolution alone do not compile this crate.
+        for name in ("fmt", "changes", "corresponding-source", "dependency-policy", "package-compliance-smoke"):
+            self.assertNotIn(PREP, job_body(self.ci, name))
+        original = jobs["mcp-stdio"]
+        prep_index = next(i for i, step in enumerate(original["steps"]) if step.get("uses") == "./.github/actions/prepare-git-runtime")
+        for mode in ("missing", "late", "duplicate", "windows-only", "fail-open"):
+            job = copy.deepcopy(original)
+            step = job["steps"][prep_index]
+            if mode == "missing":
+                del job["steps"][prep_index]
+            elif mode == "late":
+                job["steps"].append(job["steps"].pop(prep_index))
+            elif mode == "duplicate":
+                job["steps"].append(copy.deepcopy(step))
+            elif mode == "windows-only":
+                step["if"] = "runner.os == 'Windows'"
+            else:
+                step["continue-on-error"] = True
+            with self.subTest(mode=mode), self.assertRaises(AssertionError):
+                validate_linux_preparation(job)
+
+    def test_linux_action_installs_only_explicit_build_prerequisites(self):
+        document = CHECK_PACKAGE_METADATA.parse_yaml_document(self.action)
+        linux = [step for step in document["runs"]["steps"] if step.get("if") == "runner.os == 'Linux'"]
+        self.assertEqual(len(linux), 1)
+        step = linux[0]
+        self.assertEqual(step["shell"], "bash")
+        command = step["run"].replace("\\\n", " ")
+        self.assertIn("set -euo pipefail", command)
+        self.assertIn("sudo apt-get update", command)
+        installed = command.split("sudo apt-get install --yes --no-install-recommends", 1)[1].split()
+        self.assertEqual(set(installed), {"build-essential", "patch", "pkg-config", "libcurl4-openssl-dev", "zlib1g-dev", "libexpat1-dev", "libssl-dev"})
+        for forbidden in ("cargo ", "build-git-runtime.py", "HOME=", "continue-on-error"):
+            self.assertNotIn(forbidden, command)
+
     def test_changed_yaml_parses_and_release_pins_remain_accepted(self):
         for document in (self.ci, self.release, self.action):
             self.assertIsInstance(CHECK_PACKAGE_METADATA.parse_yaml_document(document), dict)
@@ -112,7 +196,7 @@ class GitRuntimeCiTests(unittest.TestCase):
             body.replace(step, "", 1),
             body.replace(step, "", 1) + "\n" + step,
             body + "\n" + step,
-            body.replace("if: matrix.os == 'windows-latest'", "if: always()", 1),
+            body.replace(PREP, "if: always()\n        " + PREP, 1),
         ]
         for candidate in bad:
             with self.subTest(candidate=candidate[-50:]), self.assertRaises(AssertionError):
@@ -149,8 +233,9 @@ class GitRuntimeCiTests(unittest.TestCase):
         self.assertIn('export HOME="$MINI_AGENT_BUILD_HOST_HOME"', self.action)
         self.assertIn("unset HOME", self.action)
         self.assertIn('/usr/bin/pacman -Q > "$owned/toolchain-packages.txt"', self.action)
+        windows = self.action.split("    - name: Capture the existing host HOME", 1)[1]
         for forbidden in ["continue-on-error", "cargo ", "git clone", "curl https", "wget ", "sudo "]:
-            self.assertNotIn(forbidden, self.action)
+            self.assertNotIn(forbidden, windows)
 
     def test_release_native_records_are_required_before_notices_and_source_assembly(self):
         windows = job_body(self.release, "build-windows")

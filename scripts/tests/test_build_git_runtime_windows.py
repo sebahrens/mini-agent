@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import struct
@@ -74,6 +75,61 @@ class WindowsGitBootstrapTests(unittest.TestCase):
         path = self.bin / name
         path.write_bytes(pe_image(imports, delayed, forwarded))
         return path
+
+    def native_acl(self):
+        user = "S-1-5-21-100-200-300-1001"
+        return {"owner": user, "user": user, "protected": True, "rules": [
+            {"sid": sid, "rights": 0x1F01FF, "type": 0, "inherited": False, "inheritance": 3, "propagation": 0}
+            for sid in (user, "S-1-5-18", "S-1-5-32-544")
+        ]}
+
+    def test_native_private_cache_accepts_noacl_stat_bits_without_relaxing_dacl(self):
+        directory = self.root / "native cache with spaces"
+        directory.mkdir(mode=0o777)
+        directory.chmod(0o777)
+        # Reproduce the observed decision boundary: an owned native-private
+        # directory can expose broad synthetic MSYS noacl permission bits.
+        with self.assertRaisesRegex(ValueError, "owned private"):
+            MODULE.common_module().private_directory(directory)
+        environment = {"SystemRoot": "C:/Windows", "HOME": os.environ.get("HOME", "")}
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.native_acl()).encode(), b"")
+        with patch.object(MODULE.subprocess, "check_output", side_effect=["C:\\private cache\\directory\n", "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe\n"]), patch.object(MODULE.subprocess, "run", return_value=response) as native:
+            MODULE.private_directory(directory, environment)
+        command = native.call_args.args[0]
+        self.assertEqual(command[0], "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        self.assertEqual(command[1:5], ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertIn("CreateDirectory($path, $acl)", command[5])
+        self.assertIn("GetAccessControl($path)", command[5])
+        self.assertIn("ReparsePoint", command[5])
+        self.assertTrue(native.call_args.kwargs["check"])
+        self.assertEqual(native.call_args.kwargs["timeout"], 30)
+        child = native.call_args.kwargs["env"]
+        self.assertEqual(child["MINI_AGENT_GIT_BUILD_DIRECTORY"], "C:\\private cache\\directory")
+        self.assertEqual(child["HOME"], environment["HOME"])
+        self.assertNotIn("MINI_AGENT_GIT_BUILD_DIRECTORY", environment)
+
+    def test_native_cache_rejects_wrong_owner_broad_or_inherited_rules_and_symlinks(self):
+        mutations = [
+            lambda value: value.update(owner="S-1-5-32-544"),
+            lambda value: value.update(protected=False),
+            lambda value: value["rules"][0].update(sid="S-1-1-0"),
+            lambda value: value["rules"][0].update(inherited=True),
+            lambda value: value["rules"][0].update(rights=0x120089),
+            lambda value: value["rules"][0].update(type=1),
+            lambda value: value["rules"].append(value["rules"][0].copy()),
+        ]
+        for mutate in mutations:
+            record = self.native_acl()
+            mutate(record)
+            with self.assertRaises(ValueError):
+                MODULE.validate_cache_acl(record)
+        directory = self.root / "cache"
+        directory.mkdir()
+        link = self.root / "cache-link"
+        link.symlink_to(directory, target_is_directory=True)
+        with patch.object(MODULE.subprocess, "run") as native, self.assertRaisesRegex(ValueError, "real directory"):
+            MODULE.private_directory(link, {"SystemRoot": "C:/Windows"})
+        native.assert_not_called()
 
     def test_pe_imports_include_delay_and_export_forwarding(self):
         data = pe_image(["KERNEL32.dll", "libcurl-4.dll"], ["optional.dll"], ["forwarded.target", "other.dll.#1"])
@@ -174,7 +230,7 @@ class WindowsGitBootstrapTests(unittest.TestCase):
                 if cwd.name == "failed":
                     raise subprocess.CalledProcessError(1, command)
 
-        with patch.object(MODULE, "ROOT", self.root), patch.object(common, "ROOT", self.root), patch.object(MODULE, "common_module", return_value=common), patch.object(common, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "PATCH_SHA256", common.digest(policy.read_bytes())), patch.object(producer, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "prepare_module", return_value=producer), patch.object(MODULE, "toolchain_environment", return_value={"HOME": os.environ.get("HOME", ""), "SYSTEMROOT": "C:/Windows"}), patch.object(common, "run", side_effect=fake_run), patch.object(MODULE.subprocess, "check_output", return_value="/c/Windows\n"):
+        with patch.object(MODULE, "ROOT", self.root), patch.object(common, "ROOT", self.root), patch.object(MODULE, "common_module", return_value=common), patch.object(common, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "PATCH_SHA256", common.digest(policy.read_bytes())), patch.object(producer, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "prepare_module", return_value=producer), patch.object(MODULE, "toolchain_environment", return_value={"HOME": os.environ.get("HOME", ""), "SYSTEMROOT": "C:/Windows"}), patch.object(common, "run", side_effect=fake_run), patch.object(MODULE.subprocess, "check_output", return_value="/c/Windows\n"), patch.object(MODULE, "private_directory", side_effect=lambda path, env: path.mkdir(mode=0o700, exist_ok=True)), patch.object(common, "cache_lock", side_effect=AssertionError("fresh Windows builds must not use a POSIX-mode cache lock")):
             output = MODULE.bootstrap(output=self.root / "success", **arguments)
             self.assertEqual({p.name for p in output.iterdir()}, {"git.exe", "git-remote-http.exe", "git-remote-https.exe", "libcurl-4.dll", "libiconv-2.dll", "bundle.manifest"})
             self.assertEqual((output / "libcurl-4.dll").read_bytes(), (self.bin / "libcurl-4.dll").read_bytes())

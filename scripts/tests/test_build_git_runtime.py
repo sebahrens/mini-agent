@@ -216,6 +216,18 @@ class GitBootstrapTests(unittest.TestCase):
             (self.root / "libcurl.a").write_bytes(b"security patch under unchanged version")
             self.assertNotEqual(first, MODULE.toolchain_identity({}, "aarch64-unknown-linux-musl"))
 
+    def test_missing_native_toolchain_program_is_named_before_build(self):
+        for missing in ("cc", "curl-config"):
+            with self.subTest(program=missing), patch.object(
+                MODULE.shutil, "which",
+                side_effect=lambda program, **_kwargs: None if program == missing else sys.executable,
+            ), patch.object(MODULE, "read_regular", return_value=b"compiler"), patch.object(
+                MODULE.subprocess, "check_output"
+            ) as command:
+                with self.assertRaisesRegex(ValueError, "unavailable: " + missing + "$"):
+                    MODULE.toolchain_identity({}, "x86_64-unknown-linux-gnu")
+                command.assert_not_called()
+
     def test_changed_tls_toolchain_cannot_reuse_previous_payload(self):
         args = self.configure_build()
         with patch.object(MODULE, "toolchain_identity", side_effect=["openssl", "mbedtls"]), patch.object(MODULE, "run", side_effect=self.fixture_build) as run:

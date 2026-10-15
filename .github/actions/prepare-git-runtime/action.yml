@@ -1,5 +1,5 @@
 name: Prepare guarded Git runtime
-description: Build the pinned native Windows Git payload once before this job's Cargo commands
+description: Provision native Git build prerequisites and prepare the pinned Windows payload before Cargo
 inputs:
   collect-sources:
     description: Capture verified sources/notices for the actual redistributed DLL closure
@@ -8,6 +8,16 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install Linux native Git build prerequisites
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          build-essential patch pkg-config libcurl4-openssl-dev \
+          zlib1g-dev libexpat1-dev libssl-dev
+
     - name: Capture the existing host HOME
       if: runner.os == 'Windows'
       id: home

@@ -368,6 +368,11 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
         self.assertIn("non-ignored", errors[0])
 
     def test_dependabot_collective_ignore_patterns_are_rejected(self) -> None:
+        publishers = sorted({
+            action.split("/", 1)[0]
+            for action, _version in CHECK_PACKAGE_METADATA.APPROVED_RELEASE_ACTIONS
+        })
+        self.assertGreater(len(publishers), 1)
         errors = CHECK_PACKAGE_METADATA.validate_github_actions_updates(
             "version: 2\n"
             "updates:\n"
@@ -376,9 +381,7 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
             "    schedule:\n"
             "      interval: weekly\n"
             "    ignore:\n"
-            "      - dependency-name: 'actions/*'\n"
-            "      - dependency-name: 'actions-rust-lang/*'\n"
-            "      - dependency-name: 'taiki-e/*'\n"
+            + "".join(f"      - dependency-name: '{publisher}/*'\n" for publisher in publishers)
         )
 
         self.assertEqual(1, len(errors))
