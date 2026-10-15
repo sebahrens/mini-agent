@@ -210,6 +210,7 @@ struct State {
 /// The logical Session owns this Arc. Tools and workers receive Weak handles.
 /// The root scope tracks producers; each producer joins its own effect scope
 /// before its root registration drops or a terminal status becomes visible.
+#[cfg(feature = "acp")]
 pub(crate) struct PreparedAsk {
     pub(crate) sender: crate::permission::ask::AskSender,
     pub(crate) future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -569,6 +570,7 @@ impl Pool {
             scope: Arc::downgrade(&scope),
         })
     }
+    #[cfg(any(feature = "acp", test))]
     pub(crate) fn active_count(&self) -> usize {
         self.state
             .lock()

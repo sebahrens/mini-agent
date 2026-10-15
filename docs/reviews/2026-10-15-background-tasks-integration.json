@@ -70,7 +70,7 @@
       {
         "path": "src/extras/subagents/background.rs",
         "sha256": "c4daf034ef865066a207c4a7bebe15d37f1aa2a1d3ab97da24c8b0aa9ed79553",
-        "integrated_sha256": "c4daf034ef865066a207c4a7bebe15d37f1aa2a1d3ab97da24c8b0aa9ed79553"
+        "integrated_sha256": "cde09169aa34f09e66594eab07187b1ee533d832654cb8bb6f93bc3940487090"
       },
       {
         "path": "src/extras/subagents/mod.rs",
@@ -175,7 +175,7 @@
       {
         "path": "src/ui/pickers/list.rs",
         "sha256": "7d5367d63f17bd5c7d9c726c7fe7f5d280efd1b15157d246c88a49650ad5ae92",
-        "integrated_sha256": "7d5367d63f17bd5c7d9c726c7fe7f5d280efd1b15157d246c88a49650ad5ae92"
+        "integrated_sha256": "f2158146e1650113f02335a07e4125908f91cc5abd729e5d88b69a43ef0195a0"
       },
       {
         "path": "src/ui/slash/help.rs",
@@ -225,7 +225,28 @@
     },
     "final_native_publication_correction": "seal_progress snapshot remains mutable on every cfg because final publication assignment is unconditional; refused-value snapshot retains cfg shadow.",
     "final_helper_cfg": "any(feature=\"mcp\",all(test,feature=\"goal\",feature=\"js\"))",
-    "final_cumulative_patch_sha256": "cc12b6104e953ce60540e6d535a7823ca931630badf5b107d6947f689985718a"
+    "validated_pre_reservation_cumulative_patch_sha256": "cc12b6104e953ce60540e6d535a7823ca931630badf5b107d6947f689985718a",
+    "ci_followup": {
+      "base": "c860e56b45b601e6051e952130f7a42a2bf6c486",
+      "files": [
+        {
+          "path": "src/context/commands.rs",
+          "sha256": "a503560b52dddea67075843491dd2271fdf58ab09923ec063b48f3b56ac53e00"
+        },
+        {
+          "path": "src/extras/subagents/background.rs",
+          "sha256": "cde09169aa34f09e66594eab07187b1ee533d832654cb8bb6f93bc3940487090"
+        },
+        {
+          "path": "src/ui/pickers/list.rs",
+          "sha256": "f2158146e1650113f02335a07e4125908f91cc5abd729e5d88b69a43ef0195a0"
+        }
+      ],
+      "changes": [
+        "Reserve /tasks regardless of enabled features; reject tasks.md custom-command shadowing.",
+        "Compile PreparedAsk only with ACP, and active_count with ACP or tests, matching actual callers."
+      ]
+    }
   },
   "review": {
     "initial": {
@@ -621,9 +642,182 @@
       "stderr": "",
       "passed": true
     },
-    "final_exact_identity_debug_install_seconds": 6.81
+    "final_exact_identity_debug_install_seconds": 6.81,
+    "tasks_reservation_followup": {
+      "controlled_ci_failure": {
+        "run": 38666339563,
+        "job": 116199594073,
+        "passed": 4175,
+        "failed": 1,
+        "only_failure": "context::commands::tests::actual_input_command_picker_draws_description_and_inserts_only_the_name"
+      },
+      "filters": [
+        "actual_input_command_picker_draws_description_and_inserts_only_the_name",
+        "actual_project_trust_controls_layer_precedence_without_overriding_builtins"
+      ],
+      "default": {
+        "passed": 2,
+        "seconds": 0.05,
+        "compile_seconds": 60.0
+      },
+      "no_default_features": {
+        "passed": 2,
+        "seconds": 0.04,
+        "compile_seconds": 34.85
+      },
+      "namespace_audit": {
+        "scope": [
+          "/tasks",
+          "task_result",
+          "task_list",
+          "task_cancel"
+        ],
+        "mode": "Bounded read-only must-reserve namespace audit; no Cargo, source edits, policy changes or whole-patch review.",
+        "finding": "No additional mandatory namespace reservation registry found.",
+        "confirmed_reservations": [
+          {
+            "registry": "src/ui/pickers/list.rs::reserved_command",
+            "state": "Root current correction includes /tasks",
+            "consumers": [
+              "src/context/commands.rs:343 custom-command loader",
+              "src/extras/skills/session.rs:236 instruction-skill pin",
+              "src/ui/app.rs:1435 initial skill completion",
+              "src/ui/app.rs:5543 skill dispatch precedence",
+              "src/ui/app.rs:5570 refreshed skill completion"
+            ]
+          },
+          {
+            "registry": "src/agent/builder.rs::is_reserved_builtin_tool_name",
+            "state": "All3new modeltool names present; existing owning reservation test includes them",
+            "consumers": [
+              "src/agent/builder.rs:84 collect_mcp_tools"
+            ]
+          },
+          {
+            "registry": "src/cli.rs::mcp_is_eligible::BUILTIN_TOOLS",
+            "state": "All3new modeltool names present under subagents cfg",
+            "purpose": "Exact CLI builtin-name eligibility classification"
+          }
+        ],
+        "other_surfaces_checked": [
+          {
+            "surface": "JS learned skill export/global collisions",
+            "reason_no_change": "Separate JS realm namespace; these names are not added as JS host globals or promoted to rig model-tool definitions."
+          },
+          {
+            "surface": "Instruction skill and custom command names",
+            "reason_no_change": "Both share reserved_command, so adding /tasks there covers dispatch/pinning/completion and file loader."
+          },
+          {
+            "surface": "Tool allowlist normalization and hook normalization",
+            "reason_no_change": "These are eligibility/normalization paths, not independent namespace reservation authorities. New exact underscore names remain distinct."
+          },
+          {
+            "surface": "Permission configurability/read-tool classification",
+            "reason_no_change": "Separate deliberate policy control surface, outside must-reserve scope. No claim arbitrary permission-tool strings are configurable; no addition proposed."
+          },
+          {
+            "surface": "estimated_registered_tools",
+            "reason_no_change": "Preamble-composition hint list, not a namespace reservation registry; no new tool-specific prompt branch requires these control names."
+          }
+        ],
+        "evidence": {
+          "qualified_index": "/private/tmp/mini-agent-background56-namespace-qualified-index.json",
+          "physical_registry_search": "/private/tmp/mini-agent-background56-namespace-physical.txt",
+          "index_session": "774ae18e-a72e-4edf-98a9-e64f84963414",
+          "index_limit": "Old saved index session expired; refreshed session exact symbol lookups returned404, so used narrow indexed grep plus physical qualified reads. No failed symbol query is claimed successful."
+        },
+        "remaining_required_change": "Only Root already-owned /tasks reserved_command row + its existing picker/real custom-command loader controls.",
+        "findings": []
+      },
+      "tasks_only_debug_install_seconds": 28.52,
+      "tasks_only_installed_native_js": {
+        "binary": "/private/tmp/mini-agent-background56-tasks-reserved-install/bin/mini-agent",
+        "sha256": "a1734a63eccdab3671fc59e0f9af9e6d6e51bcf40b85bd221c083efb39b5ebef",
+        "bytes": 161556064,
+        "stack_bytes": 1048576,
+        "pid": 40788,
+        "pgid": 40788,
+        "forced_cleanup": false,
+        "exit": 0,
+        "elapsed_ms": 1937.2698749648407,
+        "stdout": "JS runtime check: PASS (2)\n",
+        "stderr": "",
+        "passed": true
+      },
+      "no_acp_strict": {
+        "command": "cargo clippy --locked --offline --all-targets --no-default-features --features hooks,js,subagents,skills,sandbox -- -D warnings",
+        "passed": true,
+        "seconds": 39.47,
+        "failure_before_fix": "PreparedAsk never constructed; active_count unused without ACP",
+        "log": "/private/tmp/mini-agent-background56-no-acp-strict.log"
+      },
+      "reuse": "Default ACP=true and feature-off subagents=false compile the same helper bodies as before these two cfg attrs. Reuse passing default/feature-off picker+loader2, TUI7POST, accounting/native replay and cancellation controls. Fresh final default install/native JS validates its exact source identity separately.",
+      "final_source_manifest": {
+        "base": "c860e56b45b601e6051e952130f7a42a2bf6c486",
+        "patch": "/private/tmp/mini-agent-background56-no-acp-followup.patch",
+        "sha256": "e29d0d29f537f8890bb70978edd74d8030d08468adf4a34ff9b93aae4962b86a",
+        "bytes": 2504,
+        "files": [
+          {
+            "path": "src/context/commands.rs",
+            "sha256": "a503560b52dddea67075843491dd2271fdf58ab09923ec063b48f3b56ac53e00"
+          },
+          {
+            "path": "src/extras/subagents/background.rs",
+            "sha256": "cde09169aa34f09e66594eab07187b1ee533d832654cb8bb6f93bc3940487090"
+          },
+          {
+            "path": "src/ui/pickers/list.rs",
+            "sha256": "f2158146e1650113f02335a07e4125908f91cc5abd729e5d88b69a43ef0195a0"
+          }
+        ],
+        "Root_source_equality": true,
+        "source_changes": [
+          "Reserve new /tasks name in existing optional-command namespace; strengthen existing actual picker/loader test diagnostics and feature-off reservation coverage.",
+          "PreparedAsk cfgacp; active_count cfg(any(acp,test)) matches actual production/test consumers, no allow/dead_code suppression."
+        ],
+        "selection": {
+          "actual_failed_row": "cargo clippy --locked --offline --all-targets --no-default-features --features hooks,js,subagents,skills,sandbox -- -D warnings",
+          "result": "PASS39.47s",
+          "log": "/private/tmp/mini-agent-background56-no-acp-strict.log",
+          "Root_reuse": [
+            "actual picker+loader2 default PASS",
+            "same feature-off2 PASS",
+            "all default behavior/native7POST proof unchanged; ACP true keeps same compiled helpers"
+          ]
+        },
+        "install": {
+          "log": "/private/tmp/mini-agent-background56-no-acp-fix-install.log",
+          "result": "PASS8.61s",
+          "command": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-background56-install"
+        },
+        "new_binary_JS": "Root-owned after refreshed install",
+        "no_new_unit_TUI_namespace_or_matrix_run": true,
+        "binary": {
+          "path": "/private/tmp/mini-agent-background56-install/bin/mini-agent",
+          "sha256": "821a2536ccc07597c141de8aa195046da9bb7ee631f3d3291cc05971d3b24c0c"
+        }
+      },
+      "final_debug_install_seconds": 8.61,
+      "final_installed_native_js": {
+        "binary": "/private/tmp/mini-agent-background56-install/bin/mini-agent",
+        "sha256": "821a2536ccc07597c141de8aa195046da9bb7ee631f3d3291cc05971d3b24c0c",
+        "bytes": 161556064,
+        "stack_bytes": 1048576,
+        "pid": 42976,
+        "pgid": 42976,
+        "forced_cleanup": false,
+        "exit": 0,
+        "elapsed_ms": 1407.7862910926342,
+        "stdout": "JS runtime check: PASS (2)\n",
+        "stderr": "",
+        "passed": true
+      },
+      "final_installed_native_js_report": "/private/tmp/mini-agent-bg56-final-followup-js-native-report.json"
+    }
   },
-  "status": "Delivered scope passed. Final goal-only strict cfg check and refreshed exact-build native JS2 passed; original real TUI7POST proof is explicitly reused for unchanged default compiled behavior. Hosted CI remains a separate pending gate.",
+  "status": "Scoped /tasks reservation and NoACP helper cfg corrections passed default and feature-off affected tests, exact failed strict row, refreshed debug install and actual physical 1MiB native JS check. Hosted successor CI remains required; no all-green claim.",
   "limits": [
     "Native signed-wire fixtures preserve opaque block/system/tools bytes; they do not claim validity of a remote provider signature.",
     "No paid provider or real-account calls.",

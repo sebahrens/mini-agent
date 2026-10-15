@@ -151,6 +151,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
             "/mcp",
             "/subagent-model",
             "/subagent-models",
+            "/tasks",
             "/diff",
             "/commit",
             "/pr",

@@ -415,10 +415,12 @@ mod tests {
         }
         assert_eq!(picker.selected_name(), Some("/fix-issue"));
         assert!(picker.display_rows()[0].contains("Fix a reported issue"));
+        assert!(crate::ui::pickers::list::reserved_command("tasks"));
         for command in crate::ui::pickers::list::available_commands() {
-            assert!(crate::ui::pickers::list::reserved_command(
-                command.trim_start_matches('/')
-            ));
+            assert!(
+                crate::ui::pickers::list::reserved_command(command.trim_start_matches('/')),
+                "advertised builtin command must be reserved: {command}"
+            );
         }
     }
 
@@ -510,7 +512,7 @@ mod tests {
         )
         .unwrap();
         for name in [
-            "help", "compact", "exit", "diff", "commit", "pr", "export", "goal",
+            "help", "compact", "exit", "diff", "commit", "pr", "export", "goal", "tasks",
         ] {
             std::fs::write(
                 paths.config_dir.join(format!("commands/{name}.md")),
