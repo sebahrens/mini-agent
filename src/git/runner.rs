@@ -23,6 +23,10 @@ use crate::sandbox::{
     CommandLimits, CommandOutput, CommandStatus, Sandbox, configure_child_lifetime,
 };
 
+// Git's pinned MinGW access/fopen adapters explicitly recognize this spelling.
+// Uppercase DOS `NUL` does not take its null-file access-check shortcut.
+const NULL_GLOBAL_CONFIG: &str = "/dev/null";
+
 pub(crate) const QUERY_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(10),
     stdout_bytes: 256 * 1024,
@@ -379,10 +383,7 @@ impl GitRunner {
                     .find(|(key, _)| key == name)
                     .map(|(_, value)| value.clone())
             }));
-            command.env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            );
+            command.env("GIT_CONFIG_GLOBAL", NULL_GLOBAL_CONFIG);
             command.env(
                 "GIT_EXEC_PATH",
                 self.guarded_runtime().expect("checked runtime").directory(),
@@ -517,10 +518,7 @@ impl GitRunner {
         if let Some(global) = global {
             command.env("GIT_CONFIG_GLOBAL", global);
         } else {
-            command.env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            );
+            command.env("GIT_CONFIG_GLOBAL", NULL_GLOBAL_CONFIG);
         }
         let sandbox = Sandbox::new(false, "git");
         let output = match input {

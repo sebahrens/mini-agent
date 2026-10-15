@@ -19,6 +19,13 @@ operator after startup require a restart. This ordering also prevents a later
 model-held descriptor to an unlinked alias from changing trusted source bytes.
 Hostile independent same-UID processes are outside this boundary.
 
+When a Git command needs an empty global source, it explicitly selects
+`GIT_CONFIG_GLOBAL=/dev/null`, including on Windows. The pinned MinGW Git
+recognizes that spelling in both its access and file-open adapters. Uppercase
+`NUL` is not interchangeable during those checks. The selector remains set so
+HOME and XDG cannot become fallback global sources; a selected private mirror
+still replaces it when evaluating captured conditional includes.
+
 For each host operation, a private short-lived mirror contains only those
 captured sources. Git evaluates its native `gitdir`, branch, and remote URL
 conditions against the current repository. Relative include paths retain their

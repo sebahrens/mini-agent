@@ -1,0 +1,83 @@
+{
+  "run": 38719475996,
+  "url": "https://github.com/sebahrens/mini-agent/actions/runs/38719475996",
+  "conclusion": "success",
+  "workflow_head": "5deb4232d8f3e03f408bcd8e951cbc446ea22d45",
+  "source": "81519c9724a4c00e4a5da9fbebf64ae283551b77",
+  "watcher": "24935 retired exit0",
+  "jobs": [
+    {
+      "os": "macos-15",
+      "job": "116370200413",
+      "host": [
+        "ProductName:\t\tmacOS",
+        "ProductVersion:\t\t15.7.9",
+        "BuildVersion:\t\t24G830",
+        "SelectedDeveloper=/Applications/Xcode_16.4.app/Contents/Developer",
+        "Xcode 16.4",
+        "Build version 16F6"
+      ],
+      "source": "81519c9724a4c00e4a5da9fbebf64ae283551b77",
+      "source_hashes": [
+        "5a5e72846d5e2c8e89d4036ce950ac4e20ad1d342bfe49582371b8293923cdce  src/sandbox.rs",
+        "56ccba2fbe1b7fc8b8b86edb9fbce26e0aea1454d3dc932e6a668b6e17b299aa  docs/agent/TOOL_RUNTIME.md"
+      ],
+      "tests": [
+        "sandbox::sandbox_tests::profile100_seatbelt_ladder_keeps_private_git_network_and_namespace_denies_last",
+        "sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases"
+      ],
+      "summary": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3039 filtered out; finished in 2.55s",
+      "strict_postguards": "PASS: per-name count1, pass2/fail0/ignored0, no skips",
+      "native_log": "/private/tmp/mini-agent-xcode100-frameworks-artifacts/temporary-xcode-runtime-macos-15/native-tests.log",
+      "native_log_sha256": "db6f67ab6a505fddbed220f65123d6ae579dc572ed3eb9f6b89adf4e005de24d"
+    },
+    {
+      "os": "macos-26",
+      "job": "116370200573",
+      "host": [
+        "ProductName:\t\tmacOS",
+        "ProductVersion:\t\t26.6.2",
+        "BuildVersion:\t\t25G83",
+        "SelectedDeveloper=/Applications/Xcode_26.6.app/Contents/Developer",
+        "Xcode 26.6",
+        "Build version 17F113"
+      ],
+      "source": "81519c9724a4c00e4a5da9fbebf64ae283551b77",
+      "source_hashes": [
+        "5a5e72846d5e2c8e89d4036ce950ac4e20ad1d342bfe49582371b8293923cdce  src/sandbox.rs",
+        "56ccba2fbe1b7fc8b8b86edb9fbce26e0aea1454d3dc932e6a668b6e17b299aa  docs/agent/TOOL_RUNTIME.md"
+      ],
+      "tests": [
+        "sandbox::sandbox_tests::profile100_seatbelt_ladder_keeps_private_git_network_and_namespace_denies_last",
+        "sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases"
+      ],
+      "summary": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3039 filtered out; finished in 5.24s",
+      "strict_postguards": "PASS: per-name count1, pass2/fail0/ignored0, no skips",
+      "native_log": "/private/tmp/mini-agent-xcode100-frameworks-artifacts/temporary-xcode-runtime-macos-26/native-tests.log",
+      "native_log_sha256": "f1537221e42138e8f7ae6a5b5a63d72fc6eb93a93e2a3b7931c5ce28eb5ecda5"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 11964477913,
+      "name": "temporary-xcode-runtime-macos-15",
+      "size_in_bytes": 1729,
+      "digest": "sha256:3ea1b70326f80acb8fce710bfe5188a9e0137a03aefc37c0d877dc6c0d498f2b"
+    },
+    {
+      "id": 11963484196,
+      "name": "temporary-xcode-runtime-macos-26",
+      "size_in_bytes": 1728,
+      "digest": "sha256:680ceb5856cf95846676ad31a6019f4d1d8e1cf53288d8f51a6d100c5426083f"
+    }
+  ],
+  "scope": "Actual full Xcode15/26 general Workspace native Git/cached-alias and profile ladder acceptance. Worker policy unchanged. No SDK widening. No aggregate Main CI claim.",
+  "diagnostic": "Temporary CI replacement only, never merge; normal single push, no manual dispatch.",
+  "cleanup": {
+    "branch": "diag/xcode-runtime-2fbc-20261015",
+    "verified_tip_before_delete": "5deb4232d8f3e03f408bcd8e951cbc446ea22d45",
+    "method": "exact-tip compare-and-swap lease deletion",
+    "remote_absent_after": "verified git ls-remote exact ref returned empty",
+    "local_workflow_commit": "retained in private diagnostic worktree; never merge to Main"
+  }
+}

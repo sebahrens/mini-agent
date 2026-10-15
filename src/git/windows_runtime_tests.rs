@@ -238,9 +238,19 @@ async fn windows_missing_shell_refuses_only_selected_shell_services() {
     let mut runner = GitRunner::from_runtime(Arc::new(runtime)).unwrap();
     let windows = PathBuf::from(std::env::var_os("SYSTEMROOT").unwrap());
     let path = std::env::join_paths([windows.join("System32"), windows]).unwrap();
+    let home = root.join("inert ambient home");
+    let xdg = root.join("inert ambient xdg");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&xdg).unwrap();
+    // Any ambient-global fallback must fail before helper admission. Both the
+    // startup parser and later local/network commands must use explicit globals.
+    std::fs::write(home.join(".gitconfig"), "[invalid ambient global\n").unwrap();
+    std::fs::write(xdg.join("config"), "[invalid ambient xdg\n").unwrap();
     let mut environment = runner.captured_environment.as_ref().clone();
-    environment.retain(|(name, _)| name != "PATH");
+    environment.retain(|(name, _)| name != "PATH" && name != "HOME" && name != "XDG_CONFIG_HOME");
     environment.push(("PATH".into(), path));
+    environment.push(("HOME".into(), home.into_os_string()));
+    environment.push(("XDG_CONFIG_HOME".into(), xdg.into_os_string()));
     runner.captured_environment = Arc::new(environment);
     let global = root.join("global");
     std::fs::write(&global, "[credential]\nhelper = !printf should-not-run\n").unwrap();
