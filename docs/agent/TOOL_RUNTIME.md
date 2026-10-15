@@ -1490,3 +1490,32 @@ retained as CI artifacts. The identical Rust toolchain is staged under the exist
 readonly `/usr` allowance only for fixture use; no sandbox mount is widened.
 Owned fixture directories are retired after settlement. These controls do not
 resolve the separately recorded whole-filesystem-root `/` refusal.
+
+## Windows MCP exact-snapshot publication
+
+The Windows adapter in `src/paths/windows_mcp_publication.rs` is specific to
+MCP configuration edits. Ordinary workspace compare-and-exchange remains
+unsupported on Windows. An existing `.mcp.json` or global MCP config is opened
+as a transaction writer and compared against its retained file identity, bounded
+original bytes, and captured owner/group/DACL fingerprint. Root and immediate
+parent directories are acquired as transaction writers and compared against the
+retained directory identities and current security observations. These data
+fingerprints confer no filesystem or runtime authority.
+
+The replacement uses the existing private-file initializer and validator. All
+transacted file handles and metadata clones are closed before replacement; the
+same owned KTM transaction performs replacement and commit. The normal snapshot
+read handle remains retained throughout. A failure before commit rolls back the
+transaction, without a nontransactional pathname replacement or restoration over
+a newer file. Unsupported filesystems, conflicting writers, changed roots,
+reparse points, extra hardlinks, and failed private initialization refuse the edit.
+An absent destination still uses the existing create-only operation.
+
+Publication remains inside the existing MCP scoped blocking job; dropping its
+awaiter does not retire that job or release its transaction early. The owning
+Windows controls cover the actual retained reader/private candidate, parent and
+root metadata conflicts, root replacement, rollback, and cancellation with a
+held blocking writer. The separate native TxF diagnostic establishes commit,
+rollback, stale-data refusal and transaction-lock survival on the recorded
+Windows host; it is not a replacement for these consumer controls or evidence
+for every filesystem or account privilege level.

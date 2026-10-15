@@ -824,6 +824,8 @@ pub(crate) struct FileSnapshot {
     relative: std::path::PathBuf,
     identity: Option<crate::fs::CheckedMetadata>,
     base: Option<crate::fs::ContentDigest>,
+    #[cfg(windows)]
+    security: Option<[u8; 32]>,
     pub content: String,
 }
 impl FileSnapshot {
@@ -839,6 +841,8 @@ impl FileSnapshot {
                     relative: relative.into(),
                     identity: None,
                     base: None,
+                    #[cfg(windows)]
+                    security: None,
                     content: String::new(),
                 });
             }
@@ -860,6 +864,8 @@ impl FileSnapshot {
             ));
         }
         let identity = crate::fs::checked_file_metadata(&file)?;
+        #[cfg(windows)]
+        let security = crate::paths::windows_mcp_publication::security_fingerprint(&file)?;
         let content = match crate::paths::read_utf8_bounded_status(file, MAX_PROJECT_MCP_BYTES)? {
             crate::paths::BoundedUtf8Read::Content(content) => content,
             _ => {
@@ -878,11 +884,17 @@ impl FileSnapshot {
         if !base.matches_file(&current)? {
             return Err(crate::fs::stale_content_error(relative));
         }
+        #[cfg(windows)]
+        if crate::paths::windows_mcp_publication::security_fingerprint(&current)? != security {
+            return Err(crate::fs::stale_content_error(relative));
+        }
         workspace.validate().map_err(std::io::Error::other)?;
         Ok(Self {
             relative: relative.into(),
             identity: Some(identity),
             base: Some(base),
+            #[cfg(windows)]
+            security: Some(security),
             content,
         })
     }
@@ -920,6 +932,18 @@ impl FileSnapshot {
             return Err(std::io::Error::other("MCP configuration exceeds 1 MiB"));
         }
         if let (Some(identity), Some(base)) = (&self.identity, &self.base) {
+            #[cfg(windows)]
+            crate::paths::windows_mcp_publication::replace(
+                workspace,
+                &self.relative,
+                content.as_bytes(),
+                identity,
+                base,
+                self.security.as_ref().ok_or_else(|| {
+                    std::io::Error::other("MCP snapshot has no security identity")
+                })?,
+            )?;
+            #[cfg(not(windows))]
             workspace.replace_relative_private_atomic_expecting(
                 &self.relative,
                 content.as_bytes(),

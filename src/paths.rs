@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+#[cfg(all(windows, feature = "mcp"))]
+pub(crate) mod windows_mcp_publication;
 #[cfg(target_os = "linux")]
 mod workspace_spelling;
 
