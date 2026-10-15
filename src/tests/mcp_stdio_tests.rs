@@ -439,27 +439,6 @@ impl FixtureBuild {
         if !self.root.exists() {
             return;
         }
-        // Windows can hold a just-built fixture executable open for a moment
-        // after its process exits (for example while it is scanned), which
-        // surfaces as a sharing violation. Callers have already asserted the
-        // child was reaped, so retry that one error for a bounded time.
-        #[cfg(windows)]
-        {
-            const ERROR_SHARING_VIOLATION: i32 = 32;
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match fs::remove_dir_all(&self.root) {
-                    Ok(()) => return,
-                    Err(error)
-                        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
         fs::remove_dir_all(&self.root).unwrap_or_else(|error| {
             panic!(
                 "fixture directory could not be removed; a child may still be running ({}): {error}",
@@ -2374,8 +2353,10 @@ async fn mcp_manager_connect_fills_the_auxiliary_catalogue_off_the_connect_path(
     assert_eq!((commands.len(), resources.len()), (1, 1));
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
-    // Windows refuses to remove the fixture while the server image is open.
     assert_process_reaped(pid).await;
+    // The binding holds an open handle on the fixture root, which Windows
+    // refuses to delete while it is open.
+    drop(workspace);
     fixture.cleanup();
 }
 
