@@ -647,7 +647,8 @@ fn headless_and_tui_paths_delegate_to_the_shared_explicit_shell_runner() {
     let app = include_str!("../ui/app.rs");
 
     assert!(startup.contains(".run_explicit_shell("));
-    assert!(app.contains(".run_explicit_shell("));
+    // The TUI uses the progress-publishing entry point of the same runner.
+    assert!(app.contains(".run_explicit_shell_with_progress("));
     assert!(app.contains(".output_support_command("));
     assert!(app.contains(".status_support_command("));
     assert!(!startup.contains("std::process::Command::new(\"bash\")"));

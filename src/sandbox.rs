@@ -7184,6 +7184,48 @@ mod sandbox_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_progress_publishes_output_before_the_command_finishes() {
+        let sandbox = disabled();
+        let progress = CommandProgress::new();
+        let mut changes = progress.subscribe();
+        let run = sandbox.run_explicit_shell_with_progress(
+            "!printf 'a\\n'; sleep 1; printf 'b\\n'",
+            DEFAULT_COMMAND_LIMITS,
+            None,
+            Some(progress.clone()),
+        );
+        tokio::pin!(run);
+        let finished_first = tokio::select! {
+            _ = &mut run => true,
+            changed = changes.changed() => {
+                changed.unwrap();
+                false
+            }
+        };
+        assert!(
+            !finished_first,
+            "progress must arrive before the command finishes"
+        );
+        assert_eq!(progress.tail_lines(5), "a");
+        let run = run.await.unwrap();
+        assert_eq!(run.output.status, CommandStatus::Completed);
+        assert_eq!(run.output.stdout, b"a\nb\n");
+        assert_eq!(progress.tail_lines(5), "a\nb");
+        assert_eq!(progress.tail_lines(1), "b");
+    }
+
+    #[test]
+    fn command_progress_tail_keeps_recent_whole_lines() {
+        let progress = CommandProgress::new();
+        let long = "x".repeat(COMMAND_PROGRESS_TAIL_BYTES);
+        progress.record(format!("{long}\nlast one\n").as_bytes());
+        assert_eq!(progress.tail_lines(5), "last one");
+        progress.record(b"partial");
+        assert_eq!(progress.tail_lines(1), "partial");
+    }
+
     #[tokio::test]
     async fn explicit_shell_cancelled_before_preparation_never_wraps_on_the_caller() {
         // An unavailable backend fails inside `wrap_command`. A Cancelled
@@ -7206,15 +7248,13 @@ mod sandbox_tests {
             run.output.stderr.is_empty(),
             "wrap_command must not have run"
         );
-        assert_eq!(
-            receipts
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, status)| *status)
-                .collect::<Vec<_>>(),
-            vec![CommandStatus::Cancelled]
-        );
+        let receipt_statuses: Vec<CommandStatus> = receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|receipt| receipt.1)
+            .collect();
+        assert_eq!(receipt_statuses, vec![CommandStatus::Cancelled]);
 
         // Without cancellation the worker wraps, fails closed before any
         // spawn, and still emits exactly one audit receipt.

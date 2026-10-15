@@ -6812,6 +6812,10 @@ impl<'a> App<'a> {
     }
 
     async fn run_bang_command(&mut self, text: &str) -> anyhow::Result<()> {
+        /// Live output of a `!` command is repainted at most this often.
+        const BANG_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        /// Trailing output lines shown while a `!` command runs.
+        const BANG_PROGRESS_LINES: usize = 12;
         let command_is_empty = text
             .strip_prefix('!')
             .is_none_or(|command| command.trim().is_empty());
@@ -6825,16 +6829,53 @@ impl<'a> App<'a> {
             self.renderer
                 .write_line(&format!("> {}", safe_line), Color::Green)?;
         }
-        self.renderer.write_line("", Color::White)?;
+        // The blank separator anchors the live output tail shown while the
+        // command runs; the final output replaces it after the save.
+        let progress_anchor = format!("bang-shell:{}", uuid::Uuid::new_v4());
+        self.renderer
+            .write_line_anchored(&progress_anchor, "", Color::White)?;
 
         let cancellation = CommandCancellation::new();
         let sandbox = self.ui.sandbox.clone();
-        let operation =
-            sandbox.run_explicit_shell(text, DEFAULT_COMMAND_LIMITS, Some(&cancellation));
+        let progress = crate::sandbox::CommandProgress::new();
+        let mut progress_changes = progress.subscribe();
+        let operation = sandbox.run_explicit_shell_with_progress(
+            text,
+            DEFAULT_COMMAND_LIMITS,
+            Some(&cancellation),
+            Some(progress.clone()),
+        );
         tokio::pin!(operation);
+        let mut progress_pending = false;
+        let mut progress_painted: Option<tokio::time::Instant> = None;
         let run = loop {
+            let progress_due = progress_painted.map(|painted| painted + BANG_PROGRESS_INTERVAL);
             tokio::select! {
                 result = &mut operation => break result?,
+                changed = progress_changes.changed(), if !progress_pending => {
+                    if changed.is_ok() {
+                        progress_pending = true;
+                    }
+                }
+                _ = async {
+                    if let Some(due) = progress_due {
+                        tokio::time::sleep_until(due).await;
+                    }
+                }, if progress_pending => {
+                    progress_pending = false;
+                    progress_painted = Some(tokio::time::Instant::now());
+                    let tail = progress.tail_lines(BANG_PROGRESS_LINES);
+                    if !tail.is_empty()
+                        && self.renderer.feed_mut().set_anchor_progress(
+                            &progress_anchor,
+                            crate::ui::feed::BlockStyle::ToolResult,
+                            sanitize_output(&tail),
+                        )
+                    {
+                        self.renderer.invalidate();
+                        self.renderer.render_viewport()?;
+                    }
+                }
                 event = self.user_rx.recv() => {
                     let Some(event) = event else {
                         cancellation.cancel();
@@ -6857,6 +6898,13 @@ impl<'a> App<'a> {
                 }
             }
         };
+        if self
+            .renderer
+            .feed_mut()
+            .clear_anchor_progress(&progress_anchor)
+        {
+            self.renderer.invalidate();
+        }
         let result = run.rendered_output();
 
         self.ui.session.add_shell_interaction(text, &result);
@@ -9039,6 +9087,74 @@ mod explicit_shell_persistence_tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_shell_live_tail_is_replaced_by_the_final_output() {
+        let root = crate::tests::OwnedTestDirectory::new("explicit-shell-live-tail");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "ZS_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let _session_release = SessionRelease(session.id.to_string());
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        let blocks_before = app.renderer.feed().block_count();
+        app.run_bang_command("!printf 'EARLY_LINE\\n'; sleep 0.5; printf 'LATE_LINE\\n'")
+            .await
+            .unwrap();
+        let lines = app.renderer.feed().line_count(4096);
+        let shown = app
+            .renderer
+            .feed()
+            .selected_text(4096, 0, lines - 1)
+            .unwrap();
+        assert_eq!(shown.matches("EARLY_LINE").count(), 2, "{shown}");
+        assert_eq!(shown.matches("LATE_LINE").count(), 2, "{shown}");
+        // Echoed command, anchored separator, two output lines, trailing blank.
+        let texts: Vec<_> = (blocks_before..app.renderer.feed().block_count())
+            .map(|index| app.renderer.feed().block_text(index).unwrap().to_owned())
+            .collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("EARLY_LINE\nLATE_LINE")),
+            "the live tail block is removed after the run: {texts:?}"
+        );
+        assert_eq!(texts.iter().filter(|text| *text == "EARLY_LINE").count(), 1);
     }
 
     #[tokio::test]
