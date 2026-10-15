@@ -99,7 +99,11 @@ async fn windows_embedded_http_global_helpers_with_cmd_only_path_and_spaces() {
                 format!("http://probe:fixture-only@127.0.0.1:{port}\n"),
             )
             .unwrap();
-            format!("store --file={}", shell_path(&credentials))
+            // This option is consumed by native C Git, not MSYS sh. Keep
+            // the same owned file using its checked ordinary Win32 spelling.
+            let c_credentials = super::super::global_snapshot::c_git_path(&credentials)
+                .expect("owned credential file must have an equivalent C Git spelling");
+            format!("store --file={}", shell_path(&c_credentials))
         };
         let global = operator.join("approved global config");
         std::fs::write(
