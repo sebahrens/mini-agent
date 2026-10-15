@@ -1215,7 +1215,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/hooks/subprocess.rs",
-        ".with_validated_root(&project_dir, || cmd.spawn())",
+        ".with_validated_root(project_dir, || cmd.spawn())",
         1,
         "TC-PROJECT-AUTOMATION",
     ),

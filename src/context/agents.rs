@@ -433,7 +433,7 @@ pub(crate) fn parse_for_test(name: &str, content: &str) -> AgentDefinition {
 }
 
 /// Tool narrowings declared by the compiled-in personas.
-#[cfg(test)]
+#[cfg(all(test, feature = "subagents"))]
 pub(crate) fn embedded_tool_narrowings_for_test() -> Vec<Option<Vec<AgentTool>>> {
     normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md"))
         .into_iter()

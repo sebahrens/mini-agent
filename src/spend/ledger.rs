@@ -1021,7 +1021,7 @@ fn load_checkpoint(
         anyhow::ensure!(
             header.version == CHECKPOINT_VERSION
                 && id_count == header.records
-                && ids.len() == id_count.checked_mul(16).unwrap_or(usize::MAX)
+                && ids.len() == id_count.saturating_mul(16)
                 && header.records > 0
                 && header.records <= MAX_LEDGER_RECORDS
                 && header.sessions.len() <= MAX_CHECKPOINT_SESSIONS,
