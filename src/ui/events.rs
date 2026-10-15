@@ -188,6 +188,30 @@ pub(crate) fn push_session_messages(
     push_session_records(feed, messages, cfg, None);
 }
 
+/// Replay one stored message as a single block whose every line carries
+/// `prefix`. The feed wraps each line on its own, so the rows are those of one
+/// block per line, without spending a block (and its caches and retention
+/// slot) on each line of a long prompt. An empty message adds nothing.
+fn push_prefixed_message(
+    feed: &mut crate::ui::feed::Feed,
+    style: BlockStyle,
+    prefix: &str,
+    content: &str,
+) {
+    let safe = sanitize_output(content);
+    let mut text = String::with_capacity(safe.len() + prefix.len() * 4);
+    for (index, line) in safe.lines().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        text.push_str(prefix);
+        text.push_str(line);
+    }
+    if !text.is_empty() {
+        feed.push_block(style, text);
+    }
+}
+
 fn push_session_records(
     feed: &mut crate::ui::feed::Feed,
     messages: &[crate::session::SessionMessage],
@@ -202,17 +226,13 @@ fn push_session_records(
             // Stored text is raw (the live view sanitised only what it
             // painted), so every role is sanitised again on replay.
             MessageRole::User => {
-                for line in sanitize_output(&msg.content).lines() {
-                    feed.push_line(BlockStyle::User, format!("> {}", line));
-                }
+                push_prefixed_message(feed, BlockStyle::User, "> ", &msg.content);
             }
             MessageRole::Assistant => {
                 feed.push_block(BlockStyle::Agent, sanitize_output(&msg.content).to_string());
             }
             MessageRole::System => {
-                for line in sanitize_output(&msg.content).lines() {
-                    feed.push_line(BlockStyle::System, format!("# {}", line));
-                }
+                push_prefixed_message(feed, BlockStyle::System, "# ", &msg.content);
             }
             MessageRole::ToolCall => {
                 if let Some(recorded) = msg.tool_call_id.as_ref().and_then(|id| provenance?.get(id))
@@ -953,6 +973,52 @@ mod replay_tests {
         (0..feed.block_count())
             .map(|index| feed.block_text(index).unwrap().to_string())
             .collect()
+    }
+
+    /// cttyn.15: each user/system message replays as one block whose rows are
+    /// exactly those of the former one-block-per-line replay.
+    #[test]
+    fn replay_pushes_one_block_per_message_with_identical_rows() {
+        use crate::session::MessageRole;
+        use crate::ui::feed::BlockStyle;
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let long = "a long pasted prompt line that wraps across a narrow terminal width ".repeat(3);
+        let prompt = format!("first line\n\n{long}\r\n  indented\u{1b}[31m red\ntrailing\n");
+        session.add_message(MessageRole::User, &prompt);
+        session.add_message(MessageRole::System, "notice one\nnotice two");
+        session.add_message(MessageRole::User, "");
+        session.add_message(MessageRole::Assistant, "answer");
+        let mut feed = Feed::new();
+        push_session_messages(&mut feed, &session.messages, &Config::default());
+        // Three non-empty messages plus one spacer per message.
+        assert_eq!(feed.block_count(), 3 + 4, "{:?}", texts(&feed));
+
+        // The former replay: one block per sanitised line, then a spacer.
+        let mut per_line = Feed::new();
+        for line in super::sanitize_output(&prompt).lines() {
+            per_line.push_line(BlockStyle::User, format!("> {line}"));
+        }
+        per_line.push_line(BlockStyle::Plain, "");
+        per_line.push_line(BlockStyle::System, "# notice one");
+        per_line.push_line(BlockStyle::System, "# notice two");
+        per_line.push_line(BlockStyle::Plain, "");
+        per_line.push_line(BlockStyle::Plain, "");
+        per_line.push_block(BlockStyle::Agent, "answer");
+        per_line.push_line(BlockStyle::Plain, "");
+        for width in [12, 40, 120] {
+            let (actual, expected) = (feed.lines(width), per_line.lines(width));
+            assert_eq!(actual.len(), expected.len(), "width {width}");
+            for row in 0..expected.len() {
+                assert_eq!(
+                    actual[row].text, expected[row].text,
+                    "width {width} row {row}"
+                );
+                assert_eq!(
+                    actual[row].color, expected[row].color,
+                    "width {width} row {row}"
+                );
+            }
+        }
     }
 
     /// mini-agent-mfebw: a replayed session shows each result under its own
