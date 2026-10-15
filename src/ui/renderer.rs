@@ -698,6 +698,9 @@ pub struct Renderer {
     frame: std::cell::RefCell<Vec<u8>>,
     /// Nesting depth of `frame` calls; the frame is flushed at depth zero.
     frame_depth: u32,
+    /// A line was written inside an open frame; the frame's close paints
+    /// the chat once for all of them.
+    deferred_line_paint: bool,
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
@@ -849,6 +852,7 @@ impl Renderer {
             test_counters: Arc::new(OutputCounters::default()),
             frame: std::cell::RefCell::new(Vec::with_capacity(16 * 1024)),
             frame_depth: 0,
+            deferred_line_paint: false,
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -956,21 +960,45 @@ impl Renderer {
         &mut self,
         paint: impl FnOnce(&mut Self) -> io::Result<R>,
     ) -> io::Result<R> {
+        self.begin_frame();
+        let result = paint(self);
+        let flushed = self.end_frame();
+        let value = result?;
+        flushed?;
+        Ok(value)
+    }
+
+    /// Open a frame (see [`Renderer::frame`]) that a later
+    /// [`Renderer::end_frame`] closes. Lines written while it is open are
+    /// painted once, when the outermost frame closes, instead of one chat
+    /// repaint per line. Callers that cannot wrap their work in a closure
+    /// use this pair; every `begin_frame` must be matched.
+    pub(crate) fn begin_frame(&mut self) {
         if self.frame_depth == 0 {
             let mut frame = self.frame.borrow_mut();
             frame.clear();
             frame.extend_from_slice(SYNC_BEGIN.as_bytes());
         }
         self.frame_depth += 1;
-        let result = paint(self);
-        self.frame_depth -= 1;
-        if self.frame_depth > 0 {
-            return result;
+    }
+
+    /// Close a frame opened by [`Renderer::begin_frame`]; the outermost
+    /// close paints lines written meanwhile and writes the frame.
+    pub(crate) fn end_frame(&mut self) -> io::Result<()> {
+        debug_assert!(self.frame_depth > 0, "end_frame without begin_frame");
+        if self.frame_depth > 1 {
+            self.frame_depth -= 1;
+            return Ok(());
         }
+        let painted = if std::mem::take(&mut self.deferred_line_paint) {
+            self.render_viewport_in_frame()
+        } else {
+            Ok(())
+        };
+        self.frame_depth = 0;
         let flushed = self.flush_frame();
-        let value = result?;
-        flushed?;
-        Ok(value)
+        painted?;
+        flushed
     }
 
     fn flush_frame(&mut self) -> io::Result<()> {
@@ -1853,14 +1881,26 @@ impl Renderer {
         }
     }
 
+    /// Show a line just written: paint the chat now when following the
+    /// tail, or once when the enclosing frame closes. Painting immediately
+    /// outside a frame keeps a line visible across an await that follows it
+    /// (a prompt waiting for the user, a slow network call).
+    fn paint_written_line(&mut self) -> io::Result<()> {
+        if self.scroll_offset != 0 {
+            return Ok(());
+        }
+        if self.frame_depth > 0 {
+            self.deferred_line_paint = true;
+            return Ok(());
+        }
+        self.render_viewport()
+    }
+
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
         let style = style_from_color(color);
         self.feed.push_block(style, text);
         self.chat_dirty = true;
-        if self.scroll_offset == 0 {
-            self.render_viewport()?;
-        }
-        Ok(())
+        self.paint_written_line()
     }
 
     /// Like [`Renderer::write_line`], and later lines can be placed under
@@ -1874,10 +1914,7 @@ impl Renderer {
         self.feed
             .push_anchored_block(anchor, style_from_color(color), text);
         self.chat_dirty = true;
-        if self.scroll_offset == 0 {
-            self.render_viewport()?;
-        }
-        Ok(())
+        self.paint_written_line()
     }
 
     /// Place a line directly under the line written with `anchor` (a tool
@@ -1886,10 +1923,7 @@ impl Renderer {
         let style = style_from_color(color);
         self.feed.place_after_anchor(anchor, style, text);
         self.chat_dirty = true;
-        if self.scroll_offset == 0 {
-            self.render_viewport()?;
-        }
-        Ok(())
+        self.paint_written_line()
     }
 
     pub fn clear_content(&mut self) -> io::Result<()> {
@@ -3939,6 +3973,36 @@ mod frame_buffer_tests {
         renderer.tick_spinner().unwrap();
         let tick = renderer.frame_stats().since(before);
         assert_eq!((tick.writes, tick.flushes), (2, 2));
+    }
+
+    #[test]
+    fn lines_written_inside_a_frame_paint_once_and_lines_outside_paint_at_once() {
+        let mut renderer = filled_renderer();
+        renderer.render_viewport().unwrap();
+        let before = renderer.frame_stats();
+        renderer.begin_frame();
+        for line in 0..50 {
+            renderer
+                .write_line(&format!("listed {line}"), Color::White)
+                .unwrap();
+        }
+        assert_eq!(renderer.frame_stats().since(before).flushes, 0);
+        renderer.end_frame().unwrap();
+        renderer.render_viewport().unwrap();
+        let batched = renderer.frame_stats().since(before);
+        assert_eq!(batched.viewport_paints, 1);
+        assert_eq!((batched.writes, batched.flushes), (1, 1));
+        assert!(renderer.captured_output().contains("listed 49"));
+        assert!(!renderer.chat_needs_redraw());
+
+        // Outside a frame a line is on screen before the call returns, so
+        // it stays visible across whatever the caller awaits next.
+        let before = renderer.frame_stats();
+        renderer
+            .write_line("waiting for you", Color::White)
+            .unwrap();
+        let single = renderer.frame_stats().since(before);
+        assert_eq!((single.viewport_paints, single.flushes), (1, 1));
     }
 
     #[test]
