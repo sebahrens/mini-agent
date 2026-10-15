@@ -2181,6 +2181,7 @@ impl<'a> App<'a> {
         Ok(app)
     }
 
+    #[cfg_attr(not(feature = "agent-skills"), allow(dead_code))]
     fn mark_startup_skill_commands_stale(&mut self) {
         if let Some(pending) = self.skill_commands.as_mut() {
             pending.stale = true;
@@ -13768,6 +13769,7 @@ fn skill_command_entries(
         .collect()
 }
 
+#[cfg_attr(not(feature = "agent-skills"), allow(dead_code))]
 fn skill_description(text: &str) -> String {
     let mut text = sanitize_output(text)
         .split_whitespace()

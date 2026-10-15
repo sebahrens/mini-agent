@@ -902,26 +902,19 @@ impl Session {
     /// remaining work is left to process exit and `false` is returned; jobs
     /// not yet retired keep their non-terminal saved status. Session switches
     /// keep using the unbounded [`Self::close_background_tasks`].
+    #[cfg(feature = "subagents")]
     pub(crate) async fn close_background_tasks_within(&self, timeout: std::time::Duration) -> bool {
-        #[cfg(feature = "subagents")]
+        if tokio::time::timeout(timeout, self.close_background_tasks())
+            .await
+            .is_ok()
         {
-            if tokio::time::timeout(timeout, self.close_background_tasks())
-                .await
-                .is_ok()
-            {
-                return true;
-            }
-            tracing::warn!(
-                timeout_ms = timeout.as_millis() as u64,
-                "background task cleanup did not retire before the exit deadline"
-            );
-            false
+            return true;
         }
-        #[cfg(not(feature = "subagents"))]
-        {
-            let _ = timeout;
-            true
-        }
+        tracing::warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "background task cleanup did not retire before the exit deadline"
+        );
+        false
     }
 
     #[allow(
