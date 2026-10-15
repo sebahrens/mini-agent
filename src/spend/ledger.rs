@@ -94,7 +94,8 @@ pub(crate) struct LedgerSummary {
     pub last_session_request: Option<CacheRequestSummary>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CacheRequestSummary {
     pub provider: String,
     pub model: String,
@@ -167,6 +168,8 @@ impl Drop for LockedLedgerFile {
 
 /// One ledger's directory authority, not a global registry. Read-only summaries
 /// never create a file/directory or repair permissions. Missing storage is empty.
+/// The startup session summary's only write is the private `usage.checkpoint`
+/// sidecar, replaced atomically beside an existing ledger.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     path: PathBuf,
@@ -393,12 +396,76 @@ impl Ledger {
         self.summary_with_session(Some(session_id))
     }
     /// Startup reconciliation needs only `session`, `session_by_model` and
-    /// `last_session_request`. Every row is still bounded, parsed, validated
-    /// and checked for duplicate receipts, but the all-time/today/by-model
-    /// accumulators and the per-row re-serialization + SHA-256 fingerprint
-    /// (needed only to detect conflicting appends in `flush`) are skipped.
-    /// The session fields are identical to [`Self::summary_for_session`]'s.
+    /// `last_session_request` (plus `all_time`, which carries the ledger-wide
+    /// overflow bounds). Rows covered by a verified checkpoint
+    /// (`usage.checkpoint`) are not reread: only the tail past its offset is
+    /// bounded, parsed, validated and checked for duplicate receipts against
+    /// the checkpoint's receipt IDs. Without a checkpoint that still matches
+    /// the ledger's identity, length and boundary rows, the whole file is
+    /// scanned exactly as before. The result is identical to a full
+    /// session-only scan's; a refreshed checkpoint is then written under the
+    /// shared ledger lock.
     pub(crate) fn session_summary(&self, session_id: &str) -> anyhow::Result<LedgerSummary> {
+        let _io = self
+            .io
+            .lock()
+            .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
+        let Some((file, binding)) = self.open(false)? else {
+            return Ok(LedgerSummary::default());
+        };
+        file.try_lock_shared()
+            .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+        let mut file = LockedLedgerFile::new(file);
+        #[cfg(all(test, unix))]
+        self.pause_lock_for_test(&file);
+        Self::revalidate(&binding, &file)?;
+        let length = file.metadata()?.len();
+        anyhow::ensure!(
+            length <= MAX_LEDGER_BYTES as u64,
+            "usage ledger exceeds byte limit"
+        );
+        let checkpoint = load_checkpoint(&binding, &mut file, length);
+        let resumed = checkpoint.is_some();
+        let mut state = checkpoint.unwrap_or_default();
+        file.seek(SeekFrom::Start(state.offset))?;
+        let mut tail = Vec::new();
+        (&mut *file)
+            .take(MAX_LEDGER_BYTES as u64 - state.offset + 1)
+            .read_to_end(&mut tail)?;
+        anyhow::ensure!(
+            state.offset as usize + tail.len() <= MAX_LEDGER_BYTES,
+            "usage ledger exceeds byte limit"
+        );
+        anyhow::ensure!(
+            tail.is_empty() || tail.last() == Some(&b'\n'),
+            "usage ledger has an incomplete tail"
+        );
+        state.scan(&tail, session_id)?;
+        Self::revalidate(&binding, &file)?;
+        if state.checkpointable && state.records > 0 && (!resumed || !tail.is_empty()) {
+            // Best effort: a failed write only means the next startup scans
+            // more. Written while the shared lock excludes appenders.
+            if let Err(error) = store_checkpoint(&binding, &mut file, &state) {
+                tracing::debug!(%error, "usage ledger checkpoint not written");
+            }
+            Self::revalidate(&binding, &file)?;
+        }
+        file.release()?;
+        #[cfg(test)]
+        if let Some(gate) = &self.summary_scanned {
+            drop(file);
+            gate.scanned.try_send(()).unwrap();
+            gate.released
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("bounded summary test gate release");
+        }
+        Ok(state.into_summary(session_id))
+    }
+    /// The full session-only scan the checkpointed path must equal.
+    #[cfg(test)]
+    fn full_session_summary(&self, session_id: &str) -> anyhow::Result<LedgerSummary> {
         self.summary_with_mode(Some(session_id), ScanMode::SessionOnly)
     }
     fn summary_with_session(&self, session_id: Option<&str>) -> anyhow::Result<LedgerSummary> {
@@ -546,6 +613,9 @@ enum ScanMode {
     /// Every accumulator, for `/cost` style summaries.
     Summary,
     /// Only the requested session's accumulators; duplicate IDs still fail.
+    /// Production startup uses the checkpointed [`TailScan`] instead; this
+    /// full scan is its test reference.
+    #[cfg_attr(not(test), allow(dead_code))]
     SessionOnly,
 }
 
@@ -645,6 +715,462 @@ fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyho
         }
     }
     Ok(scanned)
+}
+
+const CHECKPOINT_FILE: &str = "usage.checkpoint";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"MAUSGCK1";
+const CHECKPOINT_VERSION: u32 = 1;
+const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+/// Sessions tracked for a checkpoint. A ledger with more distinct sessions is
+/// still scanned exactly; it is simply not checkpointed.
+const MAX_CHECKPOINT_SESSIONS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static TAIL_ROWS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `Totals` with the cost stored as exact IEEE-754 bits, so a checkpoint
+/// round trip never perturbs the running sum.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TotalsRecord {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_creation: Option<rig::completion::CacheCreationUsage>,
+    known_cost_bits: u64,
+    unpriced_records: usize,
+    unreported_records: usize,
+    unpriced_tokens: u64,
+    missing_usage: bool,
+    records: usize,
+}
+
+impl From<&Totals> for TotalsRecord {
+    fn from(totals: &Totals) -> Self {
+        Self {
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+            cached_input_tokens: totals.cached_input_tokens,
+            cache_creation_input_tokens: totals.cache_creation_input_tokens,
+            cache_creation: totals.cache_creation,
+            known_cost_bits: totals.known_cost.to_bits(),
+            unpriced_records: totals.unpriced_records,
+            unreported_records: totals.unreported_records,
+            unpriced_tokens: totals.unpriced_tokens,
+            missing_usage: totals.missing_usage,
+            records: totals.records,
+        }
+    }
+}
+
+impl TotalsRecord {
+    fn into_totals(self) -> Option<Totals> {
+        let known_cost = f64::from_bits(self.known_cost_bits);
+        (known_cost.is_finite() && (0.0..=MAX_RECEIPT_USD).contains(&known_cost)).then_some(
+            Totals {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cached_input_tokens: self.cached_input_tokens,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_creation: self.cache_creation,
+                known_cost,
+                unpriced_records: self.unpriced_records,
+                unreported_records: self.unreported_records,
+                unpriced_tokens: self.unpriced_tokens,
+                missing_usage: self.missing_usage,
+                records: self.records,
+            },
+        )
+    }
+}
+
+/// One session's accumulators, updated exactly as `scan_with` updates the
+/// requested session's.
+#[derive(Debug, Clone, Default)]
+struct SessionTotals {
+    totals: Totals,
+    by_model: BTreeMap<(String, String), Totals>,
+    capped: bool,
+    last: Option<CacheRequestSummary>,
+}
+
+impl SessionTotals {
+    fn add(&mut self, row: &Row) -> anyhow::Result<()> {
+        self.totals.add(row)?;
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|previous| (row.ts, row.id) > (previous.timestamp, previous.id))
+        {
+            self.last = Some(CacheRequestSummary::from_row(row));
+        }
+        let key = (row.provider.clone(), row.model.clone());
+        if self.by_model.contains_key(&key) || self.by_model.len() < MAX_MODEL_DETAILS {
+            self.by_model.entry(key).or_default().add(row)?;
+        } else {
+            self.capped = true;
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRecord {
+    session_id: String,
+    totals: TotalsRecord,
+    by_model: Vec<(String, String, TotalsRecord)>,
+    capped: bool,
+    last: Option<CacheRequestSummary>,
+}
+
+/// Identity of the ledger file a checkpoint covers. Replacement (rotation)
+/// changes it; truncation is caught by the length and boundary-row checks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerIdentity {
+    device: u64,
+    inode: u64,
+    created_secs: i64,
+    created_nanos: u32,
+}
+
+impl LedgerIdentity {
+    fn of(file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (device, inode) = (0, 0);
+        let (created_secs, created_nanos) = metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| (elapsed.as_secs() as i64, elapsed.subsec_nanos()))
+            .unwrap_or((-1, 0));
+        Ok(Self {
+            device,
+            inode,
+            created_secs,
+            created_nanos,
+        })
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointHeader {
+    version: u32,
+    identity: LedgerIdentity,
+    offset: u64,
+    records: usize,
+    /// SHA-256 of the ledger bytes `[0, offset)`.
+    prefix_sha256: [u8; 32],
+    all_time: TotalsRecord,
+    sessions: Vec<SessionRecord>,
+}
+
+/// Running state of a session-only scan: what a checkpoint persists, plus
+/// the per-row checks of `scan_with` applied to each newly read row.
+struct TailScan {
+    offset: u64,
+    records: usize,
+    ids: std::collections::HashSet<Uuid>,
+    all_time: Totals,
+    sessions: BTreeMap<String, SessionTotals>,
+    /// Running SHA-256 of the bytes `[0, offset)`.
+    prefix: Sha256,
+    /// False once other sessions' totals are no longer tracked exactly.
+    checkpointable: bool,
+}
+
+impl Default for TailScan {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            records: 0,
+            ids: Default::default(),
+            all_time: Totals::default(),
+            sessions: BTreeMap::new(),
+            prefix: Sha256::new(),
+            checkpointable: true,
+        }
+    }
+}
+
+impl TailScan {
+    /// Apply `bytes` (complete rows starting at `self.offset`) in order with
+    /// exactly `scan_with`'s session-only checks: record/row bounds, parse,
+    /// validate, duplicate receipt, all-time overflow, then the requested
+    /// session's accumulators. Other sessions are tracked only for the
+    /// checkpoint and can never fail the scan.
+    fn scan(&mut self, bytes: &[u8], requested: &str) -> anyhow::Result<()> {
+        self.prefix.update(bytes);
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            #[cfg(test)]
+            TAIL_ROWS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+            self.records += 1;
+            anyhow::ensure!(
+                self.records <= MAX_LEDGER_RECORDS && line.len() <= MAX_ROW_BYTES && line.len() > 1,
+                "usage ledger record exceeds limits"
+            );
+            let row: Row = serde_json::from_slice(&line[..line.len() - 1])
+                .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+            row.validate()
+                .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+            anyhow::ensure!(
+                self.ids.insert(row.id),
+                "usage ledger contains duplicate receipts"
+            );
+            self.all_time.add(&row)?;
+            if row.session_id == requested {
+                self.sessions
+                    .entry(row.session_id.clone())
+                    .or_default()
+                    .add(&row)?;
+            } else if self.checkpointable {
+                let tracked = self.sessions.contains_key(&row.session_id)
+                    || self.sessions.len() < MAX_CHECKPOINT_SESSIONS;
+                if !tracked
+                    || self
+                        .sessions
+                        .entry(row.session_id.clone())
+                        .or_default()
+                        .add(&row)
+                        .is_err()
+                {
+                    self.checkpointable = false;
+                    self.sessions.retain(|session, _| session == requested);
+                }
+            }
+        }
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn into_summary(mut self, requested: &str) -> LedgerSummary {
+        let session = self.sessions.remove(requested).unwrap_or_default();
+        LedgerSummary {
+            all_time: self.all_time,
+            session: session.totals,
+            session_by_model: session.by_model,
+            session_model_details_capped: session.capped,
+            last_session_request: session.last,
+            ..Default::default()
+        }
+    }
+}
+
+/// Stream `[0, length)` of the ledger into a fresh SHA-256 state.
+fn hash_prefix(file: &mut File, length: u64) -> std::io::Result<Sha256> {
+    let mut hasher = Sha256::new();
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = length;
+    let mut buffer = vec![0; 1024 * 1024];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..chunk])?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+    }
+    Ok(hasher)
+}
+
+/// Read and verify the checkpoint against the locked ledger. Any problem
+/// (missing, unreadable, oversized, corrupt, another version, or a ledger
+/// that was replaced, truncated or rewritten anywhere in the covered prefix)
+/// yields `None`, which scans the whole ledger.
+fn load_checkpoint(
+    binding: &crate::paths::WorkspaceBinding,
+    ledger: &mut File,
+    ledger_length: u64,
+) -> Option<TailScan> {
+    let result = (|| -> anyhow::Result<TailScan> {
+        let path = binding.root().join(CHECKPOINT_FILE);
+        let file = crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Read)?;
+        crate::fs::validate_private_file(&file)?;
+        let length = file.metadata()?.len();
+        anyhow::ensure!(length <= MAX_CHECKPOINT_BYTES, "checkpoint is oversized");
+        let mut bytes = Vec::new();
+        file.take(MAX_CHECKPOINT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_CHECKPOINT_BYTES && bytes.len() >= 8 + 8 + 8 + 32,
+            "checkpoint size is invalid"
+        );
+        let (body, digest) = bytes.split_at(bytes.len() - 32);
+        anyhow::ensure!(
+            Sha256::digest(body).as_slice() == digest,
+            "checkpoint digest mismatch"
+        );
+        anyhow::ensure!(&body[..8] == CHECKPOINT_MAGIC, "checkpoint magic mismatch");
+        let header_length = u64::from_le_bytes(body[8..16].try_into()?) as usize;
+        let header_end = 16usize
+            .checked_add(header_length)
+            .filter(|end| *end + 8 <= body.len())
+            .ok_or_else(|| anyhow::anyhow!("checkpoint header is truncated"))?;
+        let header: CheckpointHeader = serde_json::from_slice(&body[16..header_end])?;
+        let id_count = u64::from_le_bytes(body[header_end..header_end + 8].try_into()?) as usize;
+        let ids = &body[header_end + 8..];
+        anyhow::ensure!(
+            header.version == CHECKPOINT_VERSION
+                && id_count == header.records
+                && ids.len() == id_count.checked_mul(16).unwrap_or(usize::MAX)
+                && header.records > 0
+                && header.records <= MAX_LEDGER_RECORDS
+                && header.sessions.len() <= MAX_CHECKPOINT_SESSIONS,
+            "checkpoint header is inconsistent"
+        );
+        anyhow::ensure!(
+            header.identity == LedgerIdentity::of(ledger)?,
+            "ledger identity changed"
+        );
+        anyhow::ensure!(
+            header.offset <= ledger_length && header.offset <= MAX_LEDGER_BYTES as u64,
+            "ledger was truncated"
+        );
+        // One streamed SHA-256 pass replaces parsing, validating and
+        // re-accumulating the covered rows; any byte change fails closed.
+        let prefix = hash_prefix(ledger, header.offset)?;
+        anyhow::ensure!(
+            prefix.clone().finalize().as_slice() == header.prefix_sha256,
+            "ledger prefix changed"
+        );
+        let mut unique = std::collections::HashSet::with_capacity(id_count);
+        for id in ids.chunks_exact(16) {
+            anyhow::ensure!(
+                unique.insert(Uuid::from_slice(id)?),
+                "checkpoint receipt IDs repeat"
+            );
+        }
+        let mut sessions = BTreeMap::new();
+        for record in header.sessions {
+            let mut by_model = BTreeMap::new();
+            for (provider, model, totals) in record.by_model {
+                let totals = totals
+                    .into_totals()
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint totals are invalid"))?;
+                by_model.insert((provider, model), totals);
+            }
+            anyhow::ensure!(
+                by_model.len() <= MAX_MODEL_DETAILS,
+                "checkpoint model details exceed limits"
+            );
+            let totals = record
+                .totals
+                .into_totals()
+                .ok_or_else(|| anyhow::anyhow!("checkpoint totals are invalid"))?;
+            anyhow::ensure!(
+                sessions
+                    .insert(
+                        record.session_id,
+                        SessionTotals {
+                            totals,
+                            by_model,
+                            capped: record.capped,
+                            last: record.last,
+                        },
+                    )
+                    .is_none(),
+                "checkpoint sessions repeat"
+            );
+        }
+        let all_time = header
+            .all_time
+            .into_totals()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint totals are invalid"))?;
+        anyhow::ensure!(
+            all_time.records == header.records,
+            "checkpoint totals are inconsistent"
+        );
+        Ok(TailScan {
+            offset: header.offset,
+            records: header.records,
+            ids: unique,
+            all_time,
+            sessions,
+            prefix,
+            checkpointable: true,
+        })
+    })();
+    match result {
+        Ok(state) => Some(state),
+        Err(error) => {
+            tracing::debug!(%error, "usage ledger checkpoint unavailable; scanning the full ledger");
+            None
+        }
+    }
+}
+
+fn encode_checkpoint(ledger: &mut File, state: &TailScan) -> anyhow::Result<Vec<u8>> {
+    let header = CheckpointHeader {
+        version: CHECKPOINT_VERSION,
+        identity: LedgerIdentity::of(ledger)?,
+        offset: state.offset,
+        records: state.records,
+        prefix_sha256: state.prefix.clone().finalize().into(),
+        all_time: TotalsRecord::from(&state.all_time),
+        sessions: state
+            .sessions
+            .iter()
+            .map(|(session_id, totals)| SessionRecord {
+                session_id: session_id.clone(),
+                totals: TotalsRecord::from(&totals.totals),
+                by_model: totals
+                    .by_model
+                    .iter()
+                    .map(|((provider, model), totals)| {
+                        (provider.clone(), model.clone(), TotalsRecord::from(totals))
+                    })
+                    .collect(),
+                capped: totals.capped,
+                last: totals.last.clone(),
+            })
+            .collect(),
+    };
+    let header = serde_json::to_vec(&header)?;
+    let mut ids = state
+        .ids
+        .iter()
+        .map(|id| *id.as_bytes())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut bytes = Vec::with_capacity(16 + header.len() + 8 + ids.len() * 16 + 32);
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+    for id in ids {
+        bytes.extend_from_slice(&id);
+    }
+    let digest = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_CHECKPOINT_BYTES,
+        "checkpoint exceeds its size limit"
+    );
+    Ok(bytes)
+}
+
+/// Atomically replace the private checkpoint sidecar. The caller holds the
+/// ledger's shared lock, so no append can interleave with the covered prefix.
+fn store_checkpoint(
+    binding: &crate::paths::WorkspaceBinding,
+    ledger: &mut File,
+    state: &TailScan,
+) -> anyhow::Result<()> {
+    let bytes = encode_checkpoint(ledger, state)?;
+    binding
+        .validate()
+        .map_err(|_| anyhow::anyhow!("usage ledger directory changed"))?;
+    crate::fs::private_atomic_write_sync(&binding.root().join(CHECKPOINT_FILE), &bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -747,6 +1273,247 @@ mod tests {
         assert!(ledger.summary_for_session("a").is_err());
         assert!(ledger.session_summary("a").is_err());
     }
+    fn tail_rows_parsed() -> usize {
+        TAIL_ROWS_PARSED.with(std::cell::Cell::get)
+    }
+
+    /// The checkpointed startup summary must equal the full session-only scan
+    /// in every field, or fail with the same error.
+    fn assert_equals_full_scan(ledger: &Ledger, session: &str) -> Option<LedgerSummary> {
+        let full = ledger.full_session_summary(session);
+        let quick = ledger.session_summary(session);
+        match (full, quick) {
+            (Ok(full), Ok(quick)) => {
+                for (left, right) in [
+                    (
+                        format!("{:?}", quick.session),
+                        format!("{:?}", full.session),
+                    ),
+                    (
+                        format!("{:?}", quick.session_by_model),
+                        format!("{:?}", full.session_by_model),
+                    ),
+                    (
+                        format!("{:?}", quick.last_session_request),
+                        format!("{:?}", full.last_session_request),
+                    ),
+                    (
+                        format!("{:?}", quick.all_time),
+                        format!("{:?}", full.all_time),
+                    ),
+                    (
+                        quick.session_model_details_capped.to_string(),
+                        full.session_model_details_capped.to_string(),
+                    ),
+                ] {
+                    assert_eq!(left, right, "session {session}");
+                }
+                Some(quick)
+            }
+            (Err(full), Err(quick)) => {
+                assert_eq!(quick.to_string(), full.to_string(), "session {session}");
+                None
+            }
+            (full, quick) => panic!(
+                "checkpointed scan diverged for {session}: full {:?}, quick {:?}",
+                full.map(|summary| summary.session.records),
+                quick.map(|summary| summary.session.records)
+            ),
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    fn append_random_rows(ledger: &Ledger, rng: &mut Rng, rows: u64) {
+        for _ in 0..rows {
+            let session = ["a", "b", "c", "d"][rng.below(4) as usize];
+            let account = Account::new(session, None, 0.0).unwrap();
+            let model = format!("m{}", rng.below(5));
+            let prices = if rng.below(4) == 0 {
+                PriceSnapshot::capture(None, Default::default(), false)
+            } else {
+                PriceSnapshot::capture(Some((0.3, 1.7)), Default::default(), false)
+            };
+            let usage = if rng.below(6) == 0 {
+                UsageDelta::default()
+            } else {
+                UsageDelta {
+                    input_tokens: 1 + rng.below(50_000),
+                    output_tokens: rng.below(9_000),
+                    cached_input_tokens: rng.below(1_000),
+                    ..Default::default()
+                }
+            };
+            let kind = [RequestKind::Turn, RequestKind::Title, RequestKind::Subagent]
+                [rng.below(3) as usize];
+            account
+                .observe(&Receipt::new(
+                    session, "provider", &model, kind, usage, prices,
+                ))
+                .unwrap();
+            ledger.flush(&account).unwrap();
+        }
+    }
+
+    fn line_count(ledger: &Ledger) -> usize {
+        std::fs::read(&ledger.path)
+            .unwrap()
+            .split_inclusive(|byte| *byte == b'\n')
+            .count()
+    }
+
+    #[test]
+    fn startup_checkpoint_scans_only_the_tail_and_equals_a_full_scan() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-checkpoint");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        let checkpoint = state.join(CHECKPOINT_FILE);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+
+        // Randomized appends: after the first scan, each startup parses only
+        // the rows appended since the previous one.
+        append_random_rows(&ledger, &mut rng, 40);
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "a");
+        assert_eq!(
+            tail_rows_parsed() - before,
+            40,
+            "first scan reads every row"
+        );
+        assert!(checkpoint.exists(), "a checkpoint is written");
+        for round in 0..12 {
+            let appended = rng.below(9);
+            append_random_rows(&ledger, &mut rng, appended);
+            for (index, session) in ["a", "b", "c", "d", "absent"].into_iter().enumerate() {
+                let before = tail_rows_parsed();
+                assert_equals_full_scan(&ledger, session);
+                let expected = if index == 0 { appended as usize } else { 0 };
+                assert_eq!(
+                    tail_rows_parsed() - before,
+                    expected,
+                    "round {round}, session {session}: only the tail is parsed"
+                );
+            }
+        }
+        let total = line_count(&ledger);
+
+        // A corrupt checkpoint fails closed to a full scan, then is replaced.
+        let mut corrupt = std::fs::read(&checkpoint).unwrap();
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 0x55;
+        crate::fs::private_atomic_write_sync(&checkpoint, &corrupt).unwrap();
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "b");
+        assert_eq!(tail_rows_parsed() - before, total);
+        crate::fs::private_atomic_write_sync(&checkpoint, b"not a checkpoint").unwrap();
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "b");
+        assert_eq!(tail_rows_parsed() - before, total);
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "c");
+        assert_eq!(
+            tail_rows_parsed() - before,
+            0,
+            "the rewritten checkpoint is valid"
+        );
+
+        // Truncation below the checkpoint offset fails closed.
+        let bytes = std::fs::read(&ledger.path).unwrap();
+        let rows = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let keep: usize = rows[..rows.len() / 2].iter().map(|row| row.len()).sum();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ledger.path)
+            .unwrap()
+            .set_len(keep as u64)
+            .unwrap();
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "a");
+        assert_eq!(tail_rows_parsed() - before, rows.len() / 2);
+
+        // Truncated and regrown past the old offset in place (same inode):
+        // the prefix digest no longer matches, so the whole file is rescanned.
+        let covered = std::fs::metadata(&ledger.path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ledger.path)
+            .unwrap()
+            .set_len(rows[0].len() as u64)
+            .unwrap();
+        while std::fs::metadata(&ledger.path).unwrap().len() <= covered {
+            append_random_rows(&ledger, &mut rng, 1);
+        }
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "d");
+        assert_eq!(tail_rows_parsed() - before, line_count(&ledger));
+
+        // A replaced ledger (a middle row removed) has a new identity and is
+        // rescanned in full.
+        append_random_rows(&ledger, &mut rng, 4);
+        assert_equals_full_scan(&ledger, "a");
+        let bytes = std::fs::read(&ledger.path).unwrap();
+        let rows = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let replaced = rows
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != rows.len() / 2)
+            .flat_map(|(_, row)| row.iter().copied())
+            .collect::<Vec<_>>();
+        crate::fs::private_atomic_write_sync(&ledger.path, &replaced).unwrap();
+        let before = tail_rows_parsed();
+        let summary = assert_equals_full_scan(&ledger, "a").unwrap();
+        assert_eq!(tail_rows_parsed() - before, rows.len() - 1);
+        assert_eq!(summary.all_time.records, rows.len() - 1);
+
+        // An in-place rewrite of one byte inside the covered prefix (same
+        // inode and length) changes the prefix digest: full rescan, which
+        // fails exactly as the full scan does.
+        assert_equals_full_scan(&ledger, "a");
+        let mut bytes = std::fs::read(&ledger.path).unwrap();
+        let middle = bytes.len() / 2;
+        let original = bytes[middle];
+        bytes[middle] = if original == b'1' { b'2' } else { b'1' };
+        std::fs::write(&ledger.path, &bytes).unwrap();
+        let before = tail_rows_parsed();
+        assert_equals_full_scan(&ledger, "a");
+        assert!(tail_rows_parsed() - before > 0);
+        bytes[middle] = original;
+        std::fs::write(&ledger.path, &bytes).unwrap();
+        assert_equals_full_scan(&ledger, "a");
+
+        // A duplicate receipt in the tail fails exactly as the full scan does.
+        assert_equals_full_scan(&ledger, "a");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger.path)
+            .unwrap();
+        file.write_all(rows[0]).unwrap();
+        drop(file);
+        assert!(assert_equals_full_scan(&ledger, "a").is_none());
+        // An incomplete tail fails the same way too.
+        let mut bytes = std::fs::read(&ledger.path).unwrap();
+        bytes.truncate(bytes.len() - rows[0].len());
+        bytes.extend_from_slice(b"{\"crash\":");
+        std::fs::write(&ledger.path, &bytes).unwrap();
+        assert!(assert_equals_full_scan(&ledger, "a").is_none());
+    }
+
     #[test]
     fn spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent() {
         let root = crate::tests::OwnedTestDirectory::new("spend-ledger");

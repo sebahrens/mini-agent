@@ -126,6 +126,26 @@ other I/O/identity failure leaves the charge and pending receipt intact and
 tracking incomplete. Summaries retain their one-shot nonblocking shared lock.
 Read-only queries never create, repair, quarantine or rewrite storage.
 
+Startup reconciliation of a resumed or cost-capped session reads a private
+checkpoint sidecar, `<state_dir>/usage.checkpoint`, so it scans only the rows
+appended since the previous startup. The checkpoint holds the covered byte
+offset and record count, the ledger file's identity (device, inode, creation
+time), the SHA-256 of the covered prefix, every covered receipt ID (for
+duplicate detection), the all-time totals (overflow bounds) and each session's
+accumulators, with costs stored as exact IEEE-754 bits, all sealed by a trailing
+SHA-256. It is used only when the ledger's identity matches, its length is at
+least the offset and the streamed SHA-256 of the prefix still equals the recorded
+digest (one hashing pass instead of parsing and validating every row); a missing,
+oversized, corrupt or mismatching checkpoint (rotation, replacement, truncation,
+any in-place rewrite of the prefix) falls back to the full scan. The tail is then checked exactly as a full scan checks
+every row, so the session totals, duplicate detection and overflow bounds equal
+a full scan's. After a successful scan that read new rows, startup atomically
+replaces the checkpoint while it still holds the shared ledger lock; this is the
+only write a summary performs, it never touches `usage.jsonl`, and a failed write
+only means the next startup scans more. Ledgers with more than 4096 sessions are
+scanned exactly but not checkpointed. `/cost` summaries and appends still scan
+the full file.
+
 Acquired ledger locks are explicitly released before returning a summary or
 acknowledging persisted receipts. Descriptor close alone can leave a Unix lock
 held by an already-forked child until exec, even with CLOEXEC. Error and unwind
