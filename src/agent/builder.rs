@@ -34,7 +34,7 @@ fn registered_shell_capability<'a>(
     sandbox.shell_capability()
 }
 
-#[cfg(any(feature = "mcp", all(test, feature = "goal")))]
+#[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
 fn is_reserved_builtin_tool_name(name: &str) -> bool {
     matches!(
         name,
