@@ -25,7 +25,10 @@ pub(crate) struct SubagentConfig {
     /// provider with the same explicit credential semantics as startup.
     pub api_key: Option<String>,
     pub max_turns: usize,
-    pub config: crate::config::Config,
+    /// Shared so each delegation snapshots it by reference count instead of
+    /// cloning the whole configuration under the global lock; updates swap in
+    /// a fresh `Arc` and leave admitted snapshots untouched.
+    pub config: std::sync::Arc<crate::config::Config>,
 }
 
 impl SubagentConfig {
@@ -177,7 +180,7 @@ pub(crate) fn resolve_config(
         fallback_notice,
         api_key: api_key.map(str::to_owned),
         max_turns: task_max_turns,
-        config: cfg.clone(),
+        config: std::sync::Arc::new(cfg.clone()),
     }
 }
 
@@ -217,7 +220,7 @@ fn apply_limit_setting(
             toml::Value::try_from(json).map_err(|_| invalid)?
         }
     };
-    let mut next = config.config.clone();
+    let mut next = crate::config::Config::clone(&config.config);
     macro_rules! assign_integer {
         ($($name:ident),* $(,)?) => {{
             let number = value.as_integer()
@@ -256,7 +259,7 @@ fn apply_limit_setting(
     next.validate_subagent_settings()
         .map_err(|_| "Invalid subagent limit (value omitted)")?;
     config.max_turns = next.task_max_turns.unwrap_or(20);
-    config.config = next;
+    config.config = std::sync::Arc::new(next);
     Ok(())
 }
 
@@ -289,8 +292,7 @@ fn apply_limit_setting_at(
         .find(|known| *known == key)
         .ok_or("Setting requires restart")?;
     apply_limit_setting(config, key, literal)?;
-    config
-        .config
+    std::sync::Arc::make_mut(&mut config.config)
         .provenance
         .sources
         .entry(key)
@@ -321,7 +323,7 @@ pub(crate) fn live_limit_values() -> Option<serde_json::Map<String, serde_json::
 fn live_limit_values_for(
     config: &SubagentConfig,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let mut values = serde_json::to_value(&config.config)
+    let mut values = serde_json::to_value(&*config.config)
         .ok()?
         .as_object()?
         .clone();

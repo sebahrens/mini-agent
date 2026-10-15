@@ -7467,7 +7467,7 @@ mod tests {
             fallback_notice: None,
             api_key: None,
             max_turns: 2,
-            config: cfg,
+            config: cfg.into(),
         };
         crate::extras::subagents::scope_test_config(configured, async {
             let capacity = super::run_event_capacity();

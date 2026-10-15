@@ -776,7 +776,8 @@ editing in a known location, grepping for a literal you will act on immediately.
         let max_report_bytes = config.resolve_task_max_report_bytes();
         let repair_max_tokens = config.resolve_task_report_repair_max_tokens();
         let repair_max_cost_units = config.resolve_task_report_repair_max_cost_units();
-        let mut config = config;
+        // One owned copy per call (outside the global lock); children share it.
+        let mut config = crate::config::Config::clone(&config);
         config.max_tokens = Some(self.effective_response_max_tokens(&config));
         #[cfg(feature = "agent-skills")]
         let mut config = {
@@ -917,6 +918,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 crate::spend::RequestKind::Subagent,
             )
         });
+        let config = Arc::new(config);
         let spend_profile = spend_profile.map(|run| match &observation {
             Some(observation) => run.with_background_observation(observation.clone()),
             None => run,
@@ -975,6 +977,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             authorization
         };
         let lane_workspace = self.workspace.clone();
+        // The user's prompt suffix is read once per call, not once per child.
+        let suffix: Option<Arc<str>> = crate::session::storage::load_suffix().map(Arc::from);
         let pool_weak = task_pool.as_ref().map(Arc::downgrade);
         let lane = if admission.is_some() {
             ChildLane::Shared
@@ -1022,6 +1026,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             #[cfg(feature = "archmd")]
             let architecture = architecture.clone();
             let config = config.clone();
+            let suffix = suffix.clone();
             let authorization = authorization.clone();
             let lane_workspace = lane_workspace.clone();
             #[cfg(feature = "skills")]
@@ -1083,7 +1088,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     model_name,
                     config.cache_ttl.unwrap_or_default(),
                 );
-                let agent = builder::build_explore_agent(
+                let agent = builder::build_explore_agent_with_suffix(
                     model,
                     max_turns,
                     &config,
@@ -1091,6 +1096,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     #[cfg(feature = "archmd")]
                     architecture,
                     specialization,
+                    suffix.as_deref(),
                     persona,
                     #[cfg(feature = "skills")]
                     skill_services,
@@ -2947,7 +2953,7 @@ mod tests {
                 fallback_notice: None,
                 api_key: None,
                 max_turns: 2,
-                config,
+                config: config.into(),
             };
             let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
             let args = serde_json::from_value(
@@ -3312,7 +3318,7 @@ mod tests {
                 fallback_notice: None,
                 api_key: None,
                 max_turns: 2,
-                config: crate::config::Config::default(),
+                config: crate::config::Config::default().into(),
             };
             let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
             let args = serde_json::from_value(serde_json::json!({
@@ -3386,7 +3392,7 @@ mod tests {
                 fallback_notice: None,
                 api_key: None,
                 max_turns: 2,
-                config,
+                config: config.into(),
             };
             let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
             let args = serde_json::from_value(serde_json::json!({"prompts":["edit the selected file"],"agent_type":"implementer"})).unwrap();

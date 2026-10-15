@@ -963,7 +963,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
         fallback_notice: None,
         api_key: Some("unused-fixture-key".into()),
         max_turns: 2,
-        config: cfg,
+        config: cfg.into(),
     };
     let tool = crate::extras::subagents::task_tool::TaskTool::new(None, None, false)
         .with_workspace_binding(Arc::new(
@@ -1722,7 +1722,7 @@ async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_noti
         fallback_notice: None,
         api_key: Some("inert-child-key".into()),
         max_turns: 2,
-        config: child_cfg,
+        config: child_cfg.into(),
     };
     fn native(answer: &str, signature: &str) -> String {
         let events = [

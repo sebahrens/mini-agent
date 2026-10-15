@@ -441,8 +441,55 @@ pub(crate) fn persona_tools(
     tools
 }
 
+/// Test entry point with the pre-hoisting signature: loads the suffix itself.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_explore_agent_inner<M: CompletionModel + 'static>(
+    model: M,
+    protocol: crate::context::instructions::InstructionProtocol,
+    max_turns: usize,
+    max_tokens: u64,
+    context_window: u64,
+    max_text_file_size: u64,
+    max_read_lines: u64,
+    max_grep_results: u64,
+    max_find_results: u64,
+    max_list_dir_entries: Option<u64>,
+    authorization: &SubagentAuthorization,
+    additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "archmd")] architecture: Option<&str>,
+    specialization: Option<&str>,
+    persona: &PersonaExecution,
+    #[cfg(feature = "skills")] skill_services: Option<
+        &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
+) -> Agent<M> {
+    let suffix = crate::session::storage::load_suffix();
+    build_explore_agent_inner_with_suffix(
+        model,
+        protocol,
+        max_turns,
+        max_tokens,
+        context_window,
+        max_text_file_size,
+        max_read_lines,
+        max_grep_results,
+        max_find_results,
+        max_list_dir_entries,
+        authorization,
+        additional_params,
+        #[cfg(feature = "archmd")]
+        architecture,
+        specialization,
+        suffix.as_deref(),
+        persona,
+        #[cfg(feature = "skills")]
+        skill_services,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     model: M,
     protocol: crate::context::instructions::InstructionProtocol,
     max_turns: usize,
@@ -460,17 +507,18 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     #[cfg(feature = "archmd")] architecture: Option<&str>,
     // Optional specialization prompt prepended before the base explore prompt.
     specialization: Option<&str>,
+    // The user's prompt suffix, loaded once per task call by the caller.
+    suffix: Option<&str>,
     persona: &PersonaExecution,
     #[cfg(feature = "skills")] skill_services: Option<
         &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> Agent<M> {
-    let suffix = crate::session::storage::load_suffix();
     let mut preamble = build_explore_preamble(
         #[cfg(feature = "archmd")]
         architecture,
         specialization,
-        suffix.as_deref(),
+        suffix,
     );
     if persona.write_mode {
         // Only the host's own read-only rules are replaced; authored persona
@@ -611,6 +659,39 @@ pub(crate) async fn build_explore_agent(
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> AnyAgent {
+    let suffix = crate::session::storage::load_suffix();
+    build_explore_agent_with_suffix(
+        model,
+        max_turns,
+        cfg,
+        authorization,
+        #[cfg(feature = "archmd")]
+        architecture,
+        specialization,
+        suffix.as_deref(),
+        persona,
+        #[cfg(feature = "skills")]
+        skill_services,
+    )
+    .await
+}
+
+/// [`build_explore_agent`] with the user's prompt suffix already loaded, so a
+/// task call reads the suffix file once rather than once per child.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_explore_agent_with_suffix(
+    model: AnyModel,
+    max_turns: usize,
+    cfg: &crate::config::Config,
+    authorization: SubagentAuthorization,
+    #[cfg(feature = "archmd")] architecture: Option<String>,
+    specialization: Option<String>,
+    suffix: Option<&str>,
+    persona: PersonaExecution,
+    #[cfg(feature = "skills")] skill_services: Option<
+        std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
+) -> AnyAgent {
     let max_tokens = cfg
         .max_tokens
         .into_iter()
@@ -653,48 +734,8 @@ pub(crate) async fn build_explore_agent(
         })
     });
     let inner = match model {
-        AnyModel::OpenRouter(m, _) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
-            m,
-            crate::context::instructions::InstructionProtocol::Chat,
-            max_turns,
-            max_tokens,
-            context_window,
-            max_text_file_size,
-            max_read_lines,
-            max_grep_results,
-            max_find_results,
-            max_list_dir_entries,
-            &authorization,
-            provider_params.clone(),
-            #[cfg(feature = "archmd")]
-            arch_ref,
-            spec_ref,
-            &persona,
-            #[cfg(feature = "skills")]
-            skill_services.as_ref(),
-        )),
-        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
-            OpenAiModel::Responses(m) => OpenAiAgent::Responses(build_explore_agent_inner(
-                m,
-                crate::context::instructions::InstructionProtocol::Responses,
-                max_turns,
-                max_tokens,
-                context_window,
-                max_text_file_size,
-                max_read_lines,
-                max_grep_results,
-                max_find_results,
-                max_list_dir_entries,
-                &authorization,
-                provider_params.clone(),
-                #[cfg(feature = "archmd")]
-                arch_ref,
-                spec_ref,
-                &persona,
-                #[cfg(feature = "skills")]
-                skill_services.as_ref(),
-            )),
-            OpenAiModel::Completions(m) => OpenAiAgent::Completions(build_explore_agent_inner(
+        AnyModel::OpenRouter(m, _) => {
+            AnyAgentInner::OpenRouter(build_explore_agent_inner_with_suffix(
                 m,
                 crate::context::instructions::InstructionProtocol::Chat,
                 max_turns,
@@ -710,12 +751,61 @@ pub(crate) async fn build_explore_agent(
                 #[cfg(feature = "archmd")]
                 arch_ref,
                 spec_ref,
+                suffix,
                 &persona,
                 #[cfg(feature = "skills")]
                 skill_services.as_ref(),
-            )),
+            ))
+        }
+        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
+            OpenAiModel::Responses(m) => {
+                OpenAiAgent::Responses(build_explore_agent_inner_with_suffix(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Responses,
+                    max_turns,
+                    max_tokens,
+                    context_window,
+                    max_text_file_size,
+                    max_read_lines,
+                    max_grep_results,
+                    max_find_results,
+                    max_list_dir_entries,
+                    &authorization,
+                    provider_params.clone(),
+                    #[cfg(feature = "archmd")]
+                    arch_ref,
+                    spec_ref,
+                    suffix,
+                    &persona,
+                    #[cfg(feature = "skills")]
+                    skill_services.as_ref(),
+                ))
+            }
+            OpenAiModel::Completions(m) => {
+                OpenAiAgent::Completions(build_explore_agent_inner_with_suffix(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Chat,
+                    max_turns,
+                    max_tokens,
+                    context_window,
+                    max_text_file_size,
+                    max_read_lines,
+                    max_grep_results,
+                    max_find_results,
+                    max_list_dir_entries,
+                    &authorization,
+                    provider_params.clone(),
+                    #[cfg(feature = "archmd")]
+                    arch_ref,
+                    spec_ref,
+                    suffix,
+                    &persona,
+                    #[cfg(feature = "skills")]
+                    skill_services.as_ref(),
+                ))
+            }
         }),
-        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner(
+        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner_with_suffix(
             m,
             crate::context::instructions::InstructionProtocol::Anthropic,
             max_turns,
@@ -731,11 +821,12 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            suffix,
             &persona,
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
-        AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner(
+        AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner_with_suffix(
             m,
             crate::context::instructions::InstructionProtocol::Gemini,
             max_turns,
@@ -751,11 +842,12 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            suffix,
             &persona,
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
-        AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner(
+        AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner_with_suffix(
             m,
             crate::context::instructions::InstructionProtocol::Ollama,
             max_turns,
@@ -771,11 +863,12 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            suffix,
             &persona,
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
-        AnyModel::Copilot(m) => AnyAgentInner::Copilot(build_explore_agent_inner(
+        AnyModel::Copilot(m) => AnyAgentInner::Copilot(build_explore_agent_inner_with_suffix(
             m.clone(),
             crate::provider::copilot::instruction_protocol(&m),
             max_turns,
@@ -791,6 +884,7 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            suffix,
             &persona,
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
@@ -828,6 +922,42 @@ mod js_isolation_tests {
                 },
                 &crate::config::Config::default(),
             )
+    }
+
+    #[test]
+    fn caller_loaded_suffix_reaches_the_child_preamble_before_host_rules() {
+        let model = rig::test_utils::MockCompletionModel::from_stream_turns(vec![vec![
+            rig::test_utils::MockStreamEvent::text("unused"),
+        ]]);
+        let agent = super::build_explore_agent_inner_with_suffix(
+            model,
+            crate::context::instructions::InstructionProtocol::Unverified,
+            2,
+            16_384,
+            262_144,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &SubagentAuthorization::new(None, None, true),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            Some("HOISTED_SUFFIX_MARKER"),
+            &PersonaExecution::default(),
+            #[cfg(feature = "skills")]
+            None,
+        );
+        let preamble = agent.preamble.expect("child preamble");
+        let suffix = preamble.find("HOISTED_SUFFIX_MARKER").unwrap();
+        assert!(
+            suffix
+                < preamble
+                    .find(super::prompt::NON_OVERRIDABLE_EXPLORE_RULES)
+                    .unwrap()
+        );
     }
 
     #[tokio::test]
