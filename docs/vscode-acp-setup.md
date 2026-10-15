@@ -267,3 +267,28 @@ exit. A finite owner cleans up its process group and server on failure; native
 acceptance also records process and listener retirement. This proves the tested
 platform's UI flow; it does not supply Linux/Windows evidence or strengthen that
 platform's sandbox claims.
+
+The temporary Linux/Windows diagnostic uses the same provider and production
+participant. For `--app`, Linux supplies the extracted directory containing
+`code` and `bin/code`; Windows supplies the archive directory containing
+`Code.exe` and `bin/code.cmd`. Linux runs under Xvfb. The adapter preserves
+Darwin's Cmd shortcuts and uses Ctrl on Linux/Windows. Normal close of the final
+window is the Linux/Windows quit action. Windows installation uses explicit
+`cmd /d /s /c` quoting, and runtime environment filtering preserves SystemRoot,
+ComSpec, and temporary-directory variables while excluding provider secrets.
+A native kill-on-close Job owns Windows processes: creation is suspended until
+Job assignment, including the installation command and its descendants.
+Retirement requires the Job's actual active process count to reach zero; forced
+retirement is recorded as a failed acceptance. Unix process groups and both
+loopback listener closures are recorded separately from parent exit.
+
+Cheap adapter checks (not native UI evidence):
+
+```sh
+python3 test/chat-ui-platform.test.py
+node --test test/chat-ui-keys.test.mjs
+```
+
+Only the separately recorded native run can establish success on an additional
+platform. Source identity, binary/VSIX hashes, screenshots, provider requests,
+normal exit, and descendant/listener retirement must all be retained together.

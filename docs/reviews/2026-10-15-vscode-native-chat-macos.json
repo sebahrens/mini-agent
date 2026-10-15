@@ -261,5 +261,11 @@
     "sha256": "7fcd3e049b2749c20b96ed2c1047bbb33931a8c7bec03ab40452d7e813ec6e16",
     "apply_check": "PASS against current Main, read-only git apply --check"
   },
-  "integration_note": "Executed fixture hashes describe the frozen macOS acceptance cohort; integration removes one whitespace-only blank line. Linux and Windows actual Chat evidence is pending. No production extension or Rust changes in this fixture commit."
+  "integration_note": "Native macOS acceptance describes the original frozen fixture cohort and2fb production extension/debug binary. Later portable process/key adapters preserve Darwin command/key behavior through owning tests; their Linux/Windows actual host evidence remains pending. No production extension or Rust changes in the fixture commits.",
+  "portable_adapter": {
+    "manifest_sha256": "b4edc1ed56f8bef89b4900b01248b5a4b772b16d4e4c912d82180a680fb1766a",
+    "platform_module_sha256": "1dc5bf0cb41c1a8c6307c363b9e27b37c88d54f76dd7ade6d09b770de487ebe2",
+    "scoped_checks": "9 platform lifecycle/command/environment controls +3 wire/acceptance controls +2 keyboard controls PASS; no Rust suite or native platform claim",
+    "native_linux_windows": "pending scoped CI"
+  }
 }

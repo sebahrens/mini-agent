@@ -3,6 +3,7 @@
 import argparse, hashlib, http.server, json, os, signal, socket, subprocess, threading, time, shutil
 import urllib.request
 from pathlib import Path
+from chat_ui_platform import NativeProcesses, fixture_environment, install_command, launch_command
 
 def scripted_response(payload, fixture):
  messages = payload.get('messages', [])
@@ -66,25 +67,25 @@ base_url = "http://127.0.0.1:{port}/v1"
 api_key_env = "MINI_AGENT_IDE_FIXTURE_KEY"
 api_style = "completions"
 ''');(root/'config/config.toml').chmod(0o600)
- env={k:os.environ[k] for k in ['HOME','USER','LOGNAME','PATH','TMPDIR','SHELL','LANG'] if k in os.environ}
+ env=fixture_environment(os.environ)
  env['MINI_AGENT_CHAT_FIXTURE_EVENTS']=str(root/'fixture-model-events.jsonl')
  env.update({'ZS_CONFIG_DIR':str(root/'config'),'ZS_DATA_DIR':str(root/'data'),'ZS_LOCAL_DATA_DIR':str(root/'local-data'),'ZS_STATE_DIR':str(root/'state'),'ZS_CACHE_DIR':str(root/'cache'),'ZS_CREDENTIALS_DIR':str(root/'credentials'),'MINI_AGENT_IDE_FIXTURE_KEY':'unused-local-fixture-key'})
  common=['--user-data-dir',str(root/'profile'),'--extensions-dir',str(root/'extensions')]
+ processes=NativeProcesses()
  children=[];forced=[];status={'root':str(root),'provider_port':port,'home_preserved':env.get('HOME')==os.environ.get('HOME'),'errors':[]}
  def run_owned(args,log,timeout):
   with log.open('wb') as output:
-   c=subprocess.Popen(args,env=env,stdout=output,stderr=subprocess.STDOUT,start_new_session=True);children.append(c)
+   c=processes.start(args,env,output);children.append(c)
    try:return c.wait(timeout=timeout)
    finally:
-    if c.poll() is None:os.killpg(c.pid,signal.SIGKILL);c.wait();forced.append(c.pid)
+    if c.poll() is None:processes.stop(c,force=True);c.wait();forced.append(c.pid)
  try:
   thread.start()
-  cli=a.app/'Contents/Resources/app/bin/code'
-  code=run_owned([str(cli),*common,'--install-extension',str(a.vsix),'--force'],root/'install.log',90)
+  code=run_owned(install_command(a.app,[*common,'--install-extension',str(a.vsix),'--force'],env),root/'install.log',90)
   if code:raise RuntimeError(f'VSIX installation failed {code}')
   with socket.socket() as s:s.bind(('127.0.0.1',0));debug_port=s.getsockname()[1]
   log=(root/'host.log').open('wb')
-  c=subprocess.Popen([str(a.app/'Contents/MacOS/Code'),*common,'--new-window','--skip-welcome','--skip-release-notes',f'--remote-debugging-port={debug_port}',str(root/'workspace')],env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True);children.append(c)
+  c=processes.start([*launch_command(a.app),*common,'--new-window','--skip-welcome','--skip-release-notes',f'--remote-debugging-port={debug_port}',str(root/'workspace')],env,log);children.append(c)
   status.update({'pid':c.pid,'debug_port':debug_port,'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'vsix_sha256':hashlib.sha256(a.vsix.read_bytes()).hexdigest()});(root/'host.json').write_text(json.dumps(status,indent=2));print(json.dumps(status),flush=True)
   if a.exercise_ui:
    deadline=time.monotonic()+30
@@ -110,7 +111,7 @@ api_style = "completions"
    submit('Reply to this offline Chat UI fixture.');ui('waitText','OFFLINE_IDE_CHAT_RENDERED');ui('waitIdle');capture('real-chat-rendered')
    submit('PERMISSION_ALLOW');ui('waitText','Allow once');capture('permission-allow-picker');ui('clickText','Allow once');ui('waitText','OFFLINE_AFTER_TOOL');ui('waitIdle');capture('permission-allow-rendered')
    submit('PERMISSION_DENY');ui('waitText','Allow once');capture('permission-deny-picker');ui('clickText','Deny (reject once)');ui('waitIdle');capture('permission-deny-rendered')
-   submit('PERMISSION_CANCEL');ui('waitText','Allow once');capture('permission-cancel-pending');ui('click','[aria-label="Cancel (⌘Escape)"]');ui('waitIdle');capture('permission-cancel-idle')
+   submit('PERMISSION_CANCEL');ui('waitText','Allow once');capture('permission-cancel-pending');ui('click','[aria-label^="Cancel ("]');ui('waitIdle');capture('permission-cancel-idle')
    status['posts']=verify_provider_results(events)
    provider_events=[json.loads(line) for line in (root/'fixture-model-events.jsonl').read_text().splitlines()]
    assert not any(event['stage']=='fixture-model-response' for event in provider_events)
@@ -127,13 +128,26 @@ api_style = "completions"
   raise
  finally:
   for c in reversed(children):
-   if c.poll() is None:
-    os.killpg(c.pid,signal.SIGTERM)
-    try:c.wait(timeout=8)
-    except subprocess.TimeoutExpired:os.killpg(c.pid,signal.SIGKILL);c.wait();forced.append(c.pid)
-
-  if thread.is_alive():server.shutdown()
-  server.server_close()
-  if thread.ident is not None:thread.join()
-  status['forced_cleanup']=forced;status['child_exit_codes']=[c.returncode for c in children];(root/'retirement.json').write_text(json.dumps(status,indent=2))
+   try:
+    if c.poll() is None:
+     processes.stop(c)
+     try:c.wait(timeout=8)
+     except subprocess.TimeoutExpired:processes.stop(c,force=True);c.wait();forced.append(c.pid)
+   except BaseException as error:status['errors'].append('child cleanup: '+str(error))
+  try:
+   if thread.is_alive():server.shutdown()
+   server.server_close()
+   if thread.ident is not None:thread.join()
+  finally:
+   try:status['descendant_retirement']=processes.close()
+   except BaseException as error:status['errors'].append('descendant cleanup: '+str(error))
+  status['listeners_closed']={}
+  for label,listener_port in [('provider',port),('cdp',status.get('debug_port'))]:
+   if listener_port is not None:
+    with socket.socket() as listener:status['listeners_closed'][label]=listener.connect_ex(('127.0.0.1',listener_port))!=0
+  status['forced_cleanup']=forced
+  status['child_exit_codes']=[c.returncode for c in children]
+  (root/'retirement.json').write_text(json.dumps(status,indent=2))
+  if status['errors'] or status.get('descendant_retirement',{}).get('forced_descendants',True) or not all(status['listeners_closed'].values()):
+   raise RuntimeError('UI descendant/listener retirement was not clean; see retirement.json')
 if __name__=='__main__':main()
