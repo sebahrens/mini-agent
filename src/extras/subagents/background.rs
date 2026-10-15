@@ -1185,6 +1185,60 @@ mod tests {
         pool.close().await;
         assert_eq!(pool.result(&id).unwrap().status, Status::Cancelled);
     }
+
+    #[tokio::test]
+    async fn exit_close_is_bounded_while_a_cancelled_job_holds_blocking_work() {
+        let root = crate::tests::OwnedTestDirectory::new("background-exit-close");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        // Released on drop too, so a failed assertion cannot strand the
+        // blocking thread and hang runtime shutdown.
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.0.1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let id = admission
+            .start(
+                async move {
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        started_tx.send(()).unwrap();
+                        let mut open = gate.0.lock().unwrap();
+                        while !*open {
+                            open = gate.1.wait(open).unwrap();
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    Ok("should be cancelled".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        started_rx.await.unwrap();
+        assert!(
+            !session
+                .close_background_tasks_within(std::time::Duration::from_millis(20))
+                .await,
+            "exit must not wait on the held blocking child"
+        );
+        // Close already refuses new admissions; the cancelled job is not
+        // terminal until its blocking child retires.
+        assert!(pool.result(&id).unwrap().status.is_active());
+        assert!(pool.reserve(&workspace, &run, &recorder).is_err());
+        drop(release);
+        assert!(
+            session
+                .close_background_tasks_within(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(pool.result(&id).unwrap().status, Status::Cancelled);
+    }
 }
 
 /// Closed task-control operations use the captured Run's pool, never an ID

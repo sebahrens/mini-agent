@@ -284,11 +284,13 @@ fn search_bound_directory(
     re: Regex,
     include_re: Option<(Regex, bool)>,
     options: GrepSearchOptions,
+    cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
 ) -> Result<GrepSearchResult, ToolError> {
     let include_root = bound_directory.approved_root().to_path_buf();
     let mut walker = bound_directory
         .walker()?
-        .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH);
+        .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+        .with_cancellation(cancellation);
     let mut file_count = 0;
     let mut files_with_matches = 0;
     let mut results = Vec::with_capacity(options.max_results.min(64));
@@ -444,6 +446,9 @@ fn search_bound_directory(
         }
     }
 
+    if walker.cancelled() {
+        return Err(ToolError::Msg("grep cancelled".into()));
+    }
     Ok(GrepSearchResult {
         file_count,
         files_with_matches,
@@ -600,6 +605,7 @@ impl Tool for GrepTool {
         let multiline = args.multiline;
         let files_only = args.files_only;
         let count = args.count;
+        let cancellation = crate::agent::runner::current_work_cancellation();
         let search = crate::agent::runner::spawn_blocking_scoped(move || {
             search_bound_directory(
                 bound_directory,
@@ -612,6 +618,7 @@ impl Tool for GrepTool {
                     count,
                     multiline,
                 },
+                cancellation,
             )
         })
         .await

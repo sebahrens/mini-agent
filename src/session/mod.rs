@@ -896,6 +896,26 @@ impl Session {
         }
     }
 
+    /// Process-exit close: admission is closed and every job is cancelled at
+    /// once, but waiting for a cancelled job's in-flight blocking work (a
+    /// spill write, a directory walk) is bounded by `timeout`. On expiry the
+    /// remaining work is left to process exit and `false` is returned; jobs
+    /// not yet retired keep their non-terminal saved status. Session switches
+    /// keep using the unbounded [`Self::close_background_tasks`].
+    pub(crate) async fn close_background_tasks_within(&self, timeout: std::time::Duration) -> bool {
+        if tokio::time::timeout(timeout, self.close_background_tasks())
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        tracing::warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "background task cleanup did not retire before the exit deadline"
+        );
+        false
+    }
+
     #[allow(
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"

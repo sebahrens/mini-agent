@@ -873,6 +873,10 @@ pub(crate) struct BoundWalker {
     remaining_entries: Option<usize>,
     max_depth: usize,
     work_limit_hit: bool,
+    /// The owning work scope; a cancelled owner stops the walk so cancelled
+    /// turns and subagent children do not keep blocking threads busy.
+    cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
+    cancelled: bool,
 }
 
 impl BoundWalker {
@@ -904,6 +908,8 @@ impl BoundWalker {
             remaining_entries: None,
             max_depth: usize::MAX,
             work_limit_hit: false,
+            cancellation: None,
+            cancelled: false,
         })
     }
 }
@@ -918,6 +924,22 @@ impl BoundWalker {
     pub(super) fn work_limit_hit(&self) -> bool {
         self.work_limit_hit
     }
+
+    /// Stop the walk once `cancellation` (captured from the calling task's
+    /// work scope before entering the blocking pool) is cancelled.
+    pub(super) fn with_cancellation(
+        mut self,
+        cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
+    ) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Whether the walk ended because its owner was cancelled; its results
+    /// are then incomplete and must not be reported as a finished search.
+    pub(super) fn cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl Iterator for BoundWalker {
@@ -925,6 +947,15 @@ impl Iterator for BoundWalker {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::agent::runner::AgentWorkCancellation::is_cancelled)
+            {
+                self.cancelled = true;
+                self.stack.clear();
+                return None;
+            }
             let depth = self.stack.len();
             let frame = self.stack.last_mut()?;
             let Some(name) = frame.names.next() else {
@@ -1336,12 +1367,14 @@ impl Tool for FindFilesTool {
 
         let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
         let sort = args.sort;
+        let cancellation = crate::agent::runner::current_work_cancellation();
         let (first_results, total_matches, work_limit_hit) =
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
                 let traversal_root = bound_directory.approved_root().to_path_buf();
                 let mut walker = bound_directory
                     .walker()?
-                    .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH);
+                    .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+                    .with_cancellation(cancellation);
                 let mut first_results = BinaryHeap::with_capacity(max_results.min(64));
                 let mut total_matches = 0_usize;
 
@@ -1364,6 +1397,9 @@ impl Tool for FindFilesTool {
                             first_results.push(ranked);
                         }
                     }
+                }
+                if walker.cancelled() {
+                    return Err(ToolError::Msg("find_files cancelled".into()));
                 }
                 Ok((first_results, total_matches, walker.work_limit_hit()))
             })
@@ -2246,6 +2282,34 @@ mod tests {
             find_file_rank(FindFilesSort::Name, Some(older), "a".into())
                 < find_file_rank(FindFilesSort::Name, Some(newer), "b".into())
         );
+    }
+
+    #[test]
+    fn bound_walker_stops_once_its_owner_is_cancelled() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-cancelled-walk");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(directory.path().join(name), "").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cancellation = scope.cancellation_handle();
+
+        let mut live = bound
+            .walker()
+            .unwrap()
+            .with_cancellation(Some(scope.cancellation_handle()));
+        assert!(live.next().is_some());
+        cancellation.cancel();
+        assert!(live.next().is_none());
+        assert!(live.cancelled());
+        assert!(live.stack.is_empty());
+
+        // A fresh binding: walkers of one binding share its directory handle.
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let mut uncancellable = bound.walker().unwrap().with_cancellation(None);
+        assert_eq!(uncancellable.by_ref().count(), 3);
+        assert!(!uncancellable.cancelled());
     }
 
     #[test]
