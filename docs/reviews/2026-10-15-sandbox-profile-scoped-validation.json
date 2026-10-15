@@ -1,0 +1,69 @@
+{
+  "source_commit": "b244b74c3fadcc55c319209ffe45472f749d8901",
+  "scope": "Sandbox profile100 and unchanged Windows-MCP callers on native macOS; actual Windows and Linux acceptance are separate pending jobs.",
+  "selection": "code-indexer exact defining-file callers, then physical definitions for newly added modules; default and minimal feature boundaries only",
+  "results": {
+    "default_initial": "24 passed; two environment refusals; one native test initially ignored",
+    "owning_retry": "4 passed, 0 ignored: corrected host-full lease, actual macOS profile operations, original root retirement and actual MCP App consumer; two original refusals were sandbox filesystem/listener restrictions",
+    "display_addendum": "2 passed",
+    "host_argv": "1 passed in each default/minimal configuration",
+    "minimal": "13 passed; one native test intentionally excluded and independently executed on macOS with default features",
+    "clippy": "strict default and minimal all-target checks passed",
+    "debug_install": "cargo install --path . --debug --locked --offline passed; actual installed --sandbox-profile host-full --print-config reports host-full"
+  },
+  "reused": "Unchanged passing tests were not repeated after test-only additions, mechanical formatting or Windows-only source changes; no full local suite or release build.",
+  "native_macos": "Actual host-read/full read/write/private-read refusal, protected ancestor rename refusal, explicit write grant and admitted carrier lifetime all passed.",
+  "linux_pending": [
+    "real-path seven unit native controls plus one headless contract",
+    "host profile masks/operations",
+    "HOME rustup cargo test"
+  ],
+  "windows_pending": "Nine exact MCP consumer controls on corrected source8658ab63; first native run failed all nine and drove the directory access correction.",
+  "review": {
+    "r1_remedy_sha256": "59b816c67ceb26df9a09741124c4910eb1fe9e1bf09ec80ef7e5de0dae029ddd",
+    "finding": "Custom/host-full actual write domains must share retained Git authority and command lifetime; narrow remedy accepted. No repeated whole review."
+  },
+  "worker_contract": "Canonical Phase6 checklist reread; broker-only worker launcher/protocol/runtime unchanged.",
+  "logs": {
+    "default_initial": {
+      "path": "/private/tmp/mini-agent-profile100-mcp571-default.log",
+      "sha256": "daaff0f396c1e4aef2e0d92ed6e00f8792c56312a8eba095c9584b8d0ddc03be"
+    },
+    "native_macos_and_owning_retry": {
+      "path": "/private/tmp/mini-agent-profile100-mcp571-native-owning.log",
+      "sha256": "0c212c0b2867a39ea0c77e5d40298d04a93c2f441f1ecccc376adb5c1e80bfaf"
+    },
+    "minimal": {
+      "path": "/private/tmp/mini-agent-profile100-minimal.log",
+      "sha256": "4bb053e7776a943f8a7416568a7e9ad1aec0783ee7127966d41964106aeb4874"
+    },
+    "default_display_addendum": {
+      "path": "/private/tmp/mini-agent-profile100-default-addendum.log",
+      "sha256": "b914e6d95b956dca2029e6ca335a31a82546928a7c05a204a8035973cab2906f"
+    },
+    "default_host_argv": {
+      "path": "/private/tmp/mini-agent-profile100-host-argv.log",
+      "sha256": "25b1c93417a2f0e414ddce7a9ebcffc9fcff4605f32169dd7a1289b916a87c0b"
+    },
+    "minimal_host_argv": {
+      "path": "/private/tmp/mini-agent-profile100-host-argv-minimal.log",
+      "sha256": "c04669a43d90bebd2534a37c4b2b8d728442be37ea4882b5071c567c8402e6d3"
+    },
+    "default_clippy": {
+      "path": "/private/tmp/mini-agent-profile100-mcp571-clippy.log",
+      "sha256": "cccb13713242333cdb1f3452a6ff8246bcd1114c204daa111da502695710e1b5"
+    },
+    "minimal_clippy": {
+      "path": "/private/tmp/mini-agent-profile100-minimal-clippy.log",
+      "sha256": "9bc74ccebd2ab22b20753fa501977d569b2b695c85b6a760ec67080f688186bb"
+    },
+    "debug_install": {
+      "path": "/private/tmp/mini-agent-profile100-mcp571-install.log",
+      "sha256": "6830cfd08bb173323f506017d68b8150c70d3b24328a8f1d483f4d573bb4418d"
+    }
+  },
+  "binary": {
+    "path": "/private/tmp/mini-agent-profile100-mcp571-install/bin/mini-agent",
+    "sha256": "61dbc98ffc6d313bcde096d18da54ff9ff1892e0d2423655203a6059e9ed9068"
+  }
+}
