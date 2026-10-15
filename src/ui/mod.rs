@@ -226,12 +226,10 @@ pub(crate) fn refresh_display(
         crate::ui::terminal::AgentActivity::Idle
     })?;
     renderer.render_viewport()?;
-    let perm_mode = ui.permission.as_ref().map(|p| {
-        p.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mode()
-            .to_string()
-    });
+    let perm_mode = ui
+        .permission
+        .as_ref()
+        .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).mode().as_str());
     // `round/max`, plus the status word whenever the goal is not simply
     // running, so a parked or budget-stopped goal is visible at a glance.
     #[cfg(feature = "goal")]
@@ -270,7 +268,7 @@ pub(crate) fn refresh_display(
                     .and_then(|reasoning| reasoning.effort)
             })
             .map(|effort| effort.as_wire_str()),
-        perm_mode: perm_mode.as_deref(),
+        perm_mode,
         chain_label: chain.label_msg.as_deref(),
         background_jobs: ui.sandbox.running_background_job_count(),
         todos: ui.session.todos.progress(),
