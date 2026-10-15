@@ -1,0 +1,42 @@
+{
+  "run": 38687088722,
+  "head": "2b52f928995051a3884878872041cc80b56e0312",
+  "job": 116264757492,
+  "job_result": "success",
+  "job_duration": "18m41s",
+  "native_fullname": "git::runner::guarded_runtime_tests::native_sandbox_late_absent_and_nested_config_cannot_reach_host_git",
+  "native_discovery": {
+    "count": 1,
+    "line": 1028
+  },
+  "native_execution": {
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 0.12,
+    "line": 1049,
+    "summary_line": 1051
+  },
+  "log": "/private/tmp/mini-agent-2b52-linux-sandbox-job.log",
+  "log_sha256": "aa3fe6175508951ce6afa00dadae0e1d9b5ca41f8de2d7ed89a7c0d8be3fc111",
+  "runner_source_sha256": "0c23f20de6a4dc2a15bb46c7ddcdd481eec9d68d92b6bb1bf2e7fdc9c4442868",
+  "source_file": "/private/tmp/mini-agent-2b52-linux-native-runner-source.rs",
+  "assertions_read": [
+    "actual sandbox creates absent and nested repository config AFTER captured actual host-Git command",
+    "host guarded add fails; exact operator marker absent; index absent",
+    "ordinary sandbox filewrite then authorized guarded init/add/commit/update-ref succeeds"
+  ],
+  "scope_limit": "Original Linux ala40.8 criteria only. Windows payload/service/source archive remains ew67q.4. Whole old run failed/cancellation requested; not aggregategreen.",
+  "old_observer": {
+    "session": 87847,
+    "pid": 34697,
+    "retired": 143
+  },
+  "old_remote_cancel": "accepted0",
+  "new_observer": {
+    "run": 38687989313,
+    "head": "17e89841b5f9981d96e23f59678b72471844da49",
+    "session": 59098,
+    "log": "/private/tmp/mini-agent-17e-ci-watch.log"
+  }
+}
