@@ -43,3 +43,22 @@ remapped shortcuts, Vim deletion/undo/search, picker boundaries, runtime Vim
 control, normal quit and no completion requests. Strict Clippy and the required
 debug install pass. Independent review's picker finding was corrected. See
 `docs/reviews/2026-10-14-input-keybindings.json`; no local full suite was run.
+
+## Terminal hangup and reader ownership
+
+On Unix, terminal EOF and fatal read errors return from the local Crossterm
+reader to the existing bounded input-error policy. The application still joins
+its input thread when pausing or shutting down. The dependency patch and upstream
+attribution are in `patched-deps/crossterm/UPSTREAM.md`.
+
+The owned macOS regression first verifies raw mode and actual typed-input echo
+before closing the PTY. It uses an isolated local metadata endpoint and sends no
+model request. Against an installed debug binary:
+
+```sh
+python3 scripts/native-terminal-hangup118.py --binary /path/to/mini-agent --label normal --mode quit
+python3 scripts/native-terminal-hangup118.py --binary /path/to/mini-agent --label hangup
+```
+
+The normal control checks multiline bracketed paste and `/quit`; the hangup
+control requires the process to exit and be reaped without forced cleanup.

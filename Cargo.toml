@@ -2,7 +2,7 @@
 # Root package is an implicit member; explicit "." overrides nested exclusions.
 members = []
 # The licensed SDK snapshot is a dependency, not another production target.
-exclude = ["spike", "patched-deps/rig-core", "patched-deps/google-cloud-auth"]
+exclude = ["spike", "patched-deps/rig-core", "patched-deps/google-cloud-auth", "patched-deps/crossterm"]
 resolver = "2"
 
 [workspace.metadata.dependency-policy]
@@ -96,7 +96,7 @@ process-wrap = { version = "9", optional = true, default-features = true, featur
 which = { version = "8", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-crossterm = "0.29"
+crossterm = { version = "=0.29.0", path = "patched-deps/crossterm" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_path_to_error = "0.1"
