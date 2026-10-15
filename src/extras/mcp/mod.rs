@@ -319,9 +319,6 @@ impl McpClientManager {
                         })
                         .await
                     };
-                    if let Ok(handle) = &result {
-                        handle.discover_auxiliary().await;
-                    }
                     attempt.finish(if result.is_ok() {
                         health::AttemptOutcome::Succeeded
                     } else {
@@ -340,6 +337,9 @@ impl McpClientManager {
             match result {
                 Ok(handle) => {
                     tracing::info!("Connected to MCP server '{}'", name);
+                    // Prompt/resource discovery only feeds `/mcp` status and
+                    // the pickers; it no longer holds a connect slot.
+                    handle.spawn_auxiliary_discovery();
                     handles.push(handle);
                 }
                 Err(_) => {

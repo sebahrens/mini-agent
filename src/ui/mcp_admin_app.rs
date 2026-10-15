@@ -387,7 +387,7 @@ impl App<'_> {
                     false,
                 ),
             );
-            handle.discover_auxiliary().await;
+            handle.spawn_auxiliary_discovery();
             Ok(Completion::Connected(handle))
         })?;
         self.mcp_state().work.as_mut().unwrap().attempt = Some(attempt);

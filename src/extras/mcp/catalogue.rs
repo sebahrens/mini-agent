@@ -267,6 +267,16 @@ pub(crate) async fn discover(client: &McpClientHandle, timeout: Duration) -> Cat
         .peer()
         .peer_info()
         .map(|info| info.capabilities.clone());
+    discover_captured(&RpcClient::capture(client), capabilities, timeout).await
+}
+
+/// `discover` over an owned capture, for a detached task that must not
+/// borrow (or prolong) the connection handle.
+pub(crate) async fn discover_captured(
+    client: &RpcClient,
+    capabilities: Option<rmcp::model::ServerCapabilities>,
+    timeout: Duration,
+) -> Catalogue {
     let mut catalogue = Catalogue::default();
     if capabilities
         .as_ref()
@@ -298,11 +308,10 @@ pub(crate) async fn discover(client: &McpClientHandle, timeout: Duration) -> Cat
 }
 
 async fn list(
-    client: &McpClientHandle,
+    client: &RpcClient,
     prompts: bool,
     timeout: Duration,
 ) -> Result<(Vec<Prompt>, Vec<Resource>, bool), ServiceError> {
-    let client = RpcClient::capture(client);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
@@ -321,7 +330,7 @@ async fn list(
         } else {
             ClientRequest::ListResourcesRequest(ListResourcesRequest::with_param(page))
         };
-        let response = request(&client, query, remaining).await?;
+        let response = request(client, query, remaining).await?;
         let next = match response {
             ServerResult::ListPromptsResult(page) if prompts => {
                 for entry in page.prompts {

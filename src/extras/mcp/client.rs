@@ -650,10 +650,34 @@ impl McpClientHandle {
 
     /// Called by the owned connection actor after its immutable source proof
     /// is attached. Diagnostic and picker consumers only read the cached cell.
+    #[cfg(test)]
     pub(crate) async fn discover_auxiliary(&self) {
         self.auxiliary
             .get_or_init(|| super::catalogue::discover(self, Duration::from_secs(3)))
             .await;
+    }
+
+    /// Fill the auxiliary catalogue in a detached task so prompt/resource
+    /// discovery never sits on the connect critical path. Status and the
+    /// pickers already treat a pending cell as empty. The task owns only an
+    /// [`RpcClient`](super::catalogue::RpcClient) capture with a weak liveness
+    /// witness, so retirement ends it at the next request boundary.
+    pub(crate) fn spawn_auxiliary_discovery(&self) {
+        if self.auxiliary.initialized() {
+            return;
+        }
+        let cell = Arc::clone(&self.auxiliary);
+        let client = super::catalogue::RpcClient::capture(self);
+        let capabilities = self
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone());
+        tokio::spawn(async move {
+            cell.get_or_init(|| {
+                super::catalogue::discover_captured(&client, capabilities, Duration::from_secs(3))
+            })
+            .await;
+        });
     }
 
     /// Enumerate every tool the server exposes, bounded by

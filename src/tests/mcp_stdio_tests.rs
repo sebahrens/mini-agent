@@ -2292,6 +2292,42 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
 }
 
 #[tokio::test]
+async fn mcp_manager_connect_fills_the_auxiliary_catalogue_off_the_connect_path() {
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &fixture.lease("auxiliary-detached"),
+    );
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
+    let manager = McpClientManager::connect_all_in_binding(
+        &HashMap::from([("owned".to_string(), cfg)]),
+        &workspace,
+    )
+    .await;
+    assert_eq!(manager.handles.len(), 1);
+    let handle = &manager.handles[0];
+    // Connect returns without awaiting prompts/resources; the detached task
+    // fills the same once-only cell that status and the pickers read.
+    let catalogue = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(catalogue) = handle.auxiliary.get() {
+                return catalogue;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached auxiliary discovery completes");
+    assert_eq!((catalogue.prompts.len(), catalogue.resources.len()), (1, 1));
+    let (commands, resources) = crate::extras::mcp::catalogue::cached_choices(handle);
+    assert_eq!((commands.len(), resources.len()), (1, 1));
+    manager.shutdown().await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_auxiliary_stdio_elicitation_exact_rpc_headless_and_raw_constraint_negatives() {
     use crate::permission::ask::UserRequest;
     use crate::question::{Answer, QuestionAnswer, QuestionTurn};
