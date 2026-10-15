@@ -694,12 +694,16 @@ through ordinary `--config key=value` overrides; changing them needs no recompil
 
 Concurrency remains 4, prompt count 8, model turns 20 per child, and the whole
 call deadline 300 seconds. These are editable as `task_max_concurrency`,
-`task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Reports occupy a
+`task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Concurrency is
+editable without recompilation but requires restart: the session owns a fixed
+semaphore shared by foreground and background children. The other listed sizing
+limits apply to the next delegation. Reports occupy a
 bounded fraction of a 1M-token parent context by default; a large child context
 is not permission to return an equally large report. Read/write authorization,
 write serialization, cancellation, and the session spend ceiling are unchanged.
 
-A successfully saved resource setting applies to the **next delegation**.
+Except for the restart-required concurrency setting, a successfully saved
+resource setting applies to the **next delegation**.
 Running and background children retain their admission snapshots. Saved project
 settings still require ordinary project trust, and higher local/CLI layers still
 win. The settings picker shows captured next-delegation values. Model/provider,

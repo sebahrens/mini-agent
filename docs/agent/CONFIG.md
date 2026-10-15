@@ -3791,8 +3791,12 @@ permission source. Optional fetch `prompt` does not invoke a summarizing model.
 (262144 bytes), `task_report_repair_max_tokens` (4096 response tokens), and
 `task_report_repair_max_cost_units` (65536 weighted usage units) are separate
 from the main session's context pin and dollar budget. `/config` persists these
-and the existing task turn/prompt/concurrency/aggregate/cost/deadline settings
+and the existing task turn/prompt/aggregate/cost/deadline settings
 and applies effective changes to the next delegation, preserving current child
 snapshots and higher layer/CLI precedence. `--set key=value` provides the same
 startup overrides. See [Editable child sizing](SUBAGENTS.md#editable-child-sizing)
 for provider/parent ceilings, estimated context admission and repair behavior.
+
+`task_max_concurrency` remains editable but restart-required because the session's
+foreground/background child pool retains a fixed semaphore. Changing its saved
+value does not resize live concurrency or interrupt admitted children.

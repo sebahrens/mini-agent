@@ -180,7 +180,6 @@ pub(crate) const LIVE_SETTING_KEYS: &[&str] = &[
     "task_report_repair_max_cost_units",
     "task_max_turns",
     "task_max_prompts",
-    "task_max_concurrency",
     "task_max_output_bytes",
     "task_max_cost_units",
     "task_timeout_secs",
@@ -216,7 +215,6 @@ fn apply_limit_setting(
         task_report_repair_max_cost_units,
         task_max_turns,
         task_max_prompts,
-        task_max_concurrency,
         task_max_output_bytes,
         task_max_cost_units,
         task_timeout_secs
@@ -318,10 +316,6 @@ pub(crate) fn live_limit_values() -> Option<serde_json::Map<String, serde_json::
         (
             "task_max_prompts",
             config.config.resolve_task_max_prompts() as u64,
-        ),
-        (
-            "task_max_concurrency",
-            config.config.resolve_task_max_concurrency() as u64,
         ),
         (
             "task_max_cost_units",

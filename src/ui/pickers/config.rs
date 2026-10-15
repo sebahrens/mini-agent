@@ -282,7 +282,6 @@ mod tests {
                     | "task_report_repair_max_cost_units"
                     | "task_max_turns"
                     | "task_max_prompts"
-                    | "task_max_concurrency"
                     | "task_max_output_bytes"
                     | "task_max_cost_units"
                     | "task_timeout_secs"

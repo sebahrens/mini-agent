@@ -268,7 +268,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "task_report_repair_max_cost_units").described("Separate report-repair weighted token budget (default 65536); still charged to task total and the same USD account. Applies to the next delegation.").live().shaped(ConfigShape::Integer),
     gated("subagents", "task_max_turns").described("Model turns per child (default 20). Applies to the next delegation.").live().shaped(ConfigShape::Integer),
     gated("subagents", "task_max_prompts").described("Children per task call (default 8). Applies to the next delegation.").live().shaped(ConfigShape::Integer),
-    gated("subagents", "task_max_concurrency").described("Concurrent children (default 4); write children remain serialized. Applies to the next delegation.").live().shaped(ConfigShape::Integer),
+    gated("subagents", "task_max_concurrency").described("Concurrent children (default 4); write children remain serialized. Restart to rebuild the retained session pool.").shaped(ConfigShape::Integer),
     gated("subagents", "task_max_output_bytes").described("Aggregate returned report bytes (default 1048576). Applies to the next delegation.").live().shaped(ConfigShape::Integer),
     gated("subagents", "task_max_cost_units").described("Task weighted token budget (default 2000000), not US dollars. Applies to the next delegation.").live().shaped(ConfigShape::Integer),
     gated("subagents", "task_timeout_secs").described("Whole task deadline (default 300 seconds, maximum 86400), including repair and cleanup. Applies to the next delegation.").live().shaped(ConfigShape::Integer),

@@ -1,0 +1,31 @@
+{
+  "bead": "mini-agent-i7ro6.100",
+  "partial_acceptance": "Actual native Linux HostRead+HostFull operations, masks, retainedcommandlease and descriptorclosurePASS; Rustup originalcriterion remainsopen until itsfixture correction is measured.",
+  "run": 38701896949,
+  "job": 116311838878,
+  "workflow_head": "cbab218062520570b1193bf5f6e8747df10f9999",
+  "checked_out_source": "1c3a99d691ad6c41041819b2a9f71e6e3a4182f6",
+  "name": "sandbox::general_profile::tests::profile100_native_host_profiles_preserve_masks_and_real_operations",
+  "passed": 1,
+  "failed": 0,
+  "seconds": 0.08,
+  "log": "/private/tmp/mini-agent-profile100-native-scratch-job.log",
+  "log_sha256": "3112ec05dd9f377aa2259651d8dfa933af778b08e3134a73ff5efe33d84efa7e",
+  "log_lines": [
+    908,
+    910
+  ],
+  "boundaries": [
+    "Thiscase executedbothHostRead andHostFull inone actualLinuxkernel control",
+    "Actualexistinghomefilewrite refused forHostRead; privateTMPscratchallowed, originalhostoutsidepathabsent",
+    "ActualHostFulloutsidehostfilewrite observed",
+    "PrivateSecret bytesunchanged, privateReadsblocked, Homeancestorrenamefails, workspace+explicitwritesobserved",
+    "Retainedadmittedcommandlease afterSandboxdrop; nohighFDleak"
+  ],
+  "not_claimed": [
+    "Fulljobgreen",
+    "RustupcasePASS",
+    "PrecisepriorHostReadscriptfailurecheckpoint",
+    "Single fresh8case99proof"
+  ]
+}
