@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use compact_str::CompactString;
-use crossterm::ExecutableCommand;
+use crossterm::QueueableCommand;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::{
     Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use regex::Regex;
 
 use super::events::sanitize_output;
@@ -617,6 +617,47 @@ struct FrameTrace {
     started: Option<std::time::Instant>,
 }
 
+/// Escape bytes that open and close one terminal frame (DEC 2026
+/// synchronized update); terminals that do not know the mode ignore them.
+static SYNC_BEGIN: LazyLock<String> = LazyLock::new(|| ansi(BeginSynchronizedUpdate));
+static SYNC_END: LazyLock<String> = LazyLock::new(|| ansi(EndSynchronizedUpdate));
+
+fn ansi(command: impl crossterm::Command) -> String {
+    let mut text = String::new();
+    command
+        .write_ansi(&mut text)
+        .expect("writing an escape sequence to a String cannot fail");
+    text
+}
+
+/// Writer into the renderer's frame buffer. Paint paths queue their escape
+/// sequences and text here; the frame is written and flushed once, at the
+/// outermost frame boundary (see `Renderer::frame`). Its `flush` is a no-op.
+struct FrameOut<'a>(&'a std::cell::RefCell<Vec<u8>>);
+
+impl Write for FrameOut<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A writer into `$renderer`'s frame buffer, borrowing only that field so
+/// paint code can keep updating other renderer state while it writes.
+macro_rules! frame_out {
+    ($renderer:expr) => {{
+        debug_assert!($renderer.frame_depth > 0, "painted outside a frame");
+        FrameOut(&$renderer.frame)
+    }};
+}
+
 impl FrameTrace {
     fn start(region: &'static str) -> Self {
         let started = tracing::enabled!(target: "ui::frame", tracing::Level::TRACE)
@@ -649,6 +690,11 @@ pub struct Renderer {
     native_size_queries: std::cell::Cell<usize>,
     #[cfg(test)]
     test_counters: Arc<OutputCounters>,
+    /// The frame being painted: every paint path appends here and the
+    /// outermost `frame` call writes it with one `write_all` + flush.
+    frame: std::cell::RefCell<Vec<u8>>,
+    /// Nesting depth of `frame` calls; the frame is flushed at depth zero.
+    frame_depth: u32,
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
@@ -797,6 +843,8 @@ impl Renderer {
             native_size_queries: std::cell::Cell::new(0),
             #[cfg(test)]
             test_counters: Arc::new(OutputCounters::default()),
+            frame: std::cell::RefCell::new(Vec::with_capacity(16 * 1024)),
+            frame_depth: 0,
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -870,9 +918,71 @@ impl Renderer {
             .clone()
     }
 
+    /// Write one finished frame to the terminal: a single `write_all` and
+    /// flush on the locked stdout handle.
     #[cfg(not(test))]
-    fn writer(&self) -> io::Stdout {
-        io::stdout()
+    fn write_frame(&self, bytes: &[u8]) -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(bytes)?;
+        out.flush()
+    }
+
+    #[cfg(test)]
+    fn write_frame(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut out = self.writer();
+        out.write_all(bytes)?;
+        out.flush()
+    }
+
+    /// Run `paint` inside one terminal frame. Nested calls join the
+    /// enclosing frame; the outermost call wraps everything painted in a
+    /// synchronized update and writes it with one `write_all` + flush. A
+    /// frame that painted nothing writes nothing. When that write fails, the
+    /// regions are marked dirty so the next frame repaints them in full.
+    pub(crate) fn frame<R>(
+        &mut self,
+        paint: impl FnOnce(&mut Self) -> io::Result<R>,
+    ) -> io::Result<R> {
+        if self.frame_depth == 0 {
+            let mut frame = self.frame.borrow_mut();
+            frame.clear();
+            frame.extend_from_slice(SYNC_BEGIN.as_bytes());
+        }
+        self.frame_depth += 1;
+        let result = paint(self);
+        self.frame_depth -= 1;
+        if self.frame_depth > 0 {
+            return result;
+        }
+        let flushed = self.flush_frame();
+        let value = result?;
+        flushed?;
+        Ok(value)
+    }
+
+    fn flush_frame(&mut self) -> io::Result<()> {
+        let mut frame = std::mem::take(&mut *self.frame.borrow_mut());
+        let result = if frame.len() > SYNC_BEGIN.len() {
+            frame.extend_from_slice(SYNC_END.as_bytes());
+            self.write_frame(&frame)
+        } else {
+            Ok(())
+        };
+        frame.clear();
+        *self.frame.borrow_mut() = frame;
+        if result.is_err() {
+            // Recorded snapshots describe a frame the terminal never got.
+            self.chat_dirty = true;
+            self.bottom_dirty = true;
+            self.title_activity = None;
+        }
+        result
+    }
+
+    /// Bytes painted into the open frame so far (zero outside a frame).
+    fn frame_len(&self) -> usize {
+        self.frame.borrow().len()
     }
 
     #[cfg(test)]
@@ -989,9 +1099,7 @@ impl Renderer {
         if out.is_empty() {
             return Ok(());
         }
-        let mut stdout = self.writer();
-        stdout.write_all(out.as_bytes())?;
-        stdout.flush()?;
+        self.frame(|this| frame_out!(this).write_all(out.as_bytes()))?;
         if title_changed {
             self.title_activity = Some(activity);
         }
@@ -1148,8 +1256,7 @@ impl Renderer {
         let (cols, _) = self.checked_draw_size()?;
         let floor = self.picker_floor_row();
         let bg = self.chat_bg;
-        let mut writer = self.writer();
-        paint(&mut writer, cols, floor, bg)
+        self.frame(|this| paint(&mut frame_out!(this), cols, floor, bg))
     }
 
     fn max_line_width(&self) -> usize {
@@ -1334,8 +1441,11 @@ impl Renderer {
     pub fn sync_input_height(&mut self, input_line: &str) -> io::Result<()> {
         let (_, rows) = self.terminal_size();
         let new_height = self.input_visible_height(input_line, rows);
-        self.clear_shrunk_rows(self.prev_input_height, new_height)?;
+        let old_height = self.prev_input_height;
         self.prev_input_height = new_height;
+        if new_height < old_height {
+            self.frame(|this| this.clear_shrunk_rows(old_height, new_height))?;
+        }
         Ok(())
     }
 
@@ -1585,12 +1695,18 @@ impl Renderer {
         self.render_viewport()
     }
 
+    /// Repaint the chat viewport when it changed since the last draw.
     pub fn render_viewport(&mut self) -> io::Result<()> {
+        self.frame(Self::render_viewport_in_frame)
+    }
+
+    fn render_viewport_in_frame(&mut self) -> io::Result<()> {
         self.reconcile_feed_retention();
         if !self.chat_needs_redraw() {
             return Ok(());
         }
         let trace = FrameTrace::start("viewport");
+        let frame_start = self.frame_len();
         let (cols, _rows) = self.terminal_size();
         let max_width = cols.saturating_sub(1 + self.chat_margin) as usize;
         let visible = self.visible_lines();
@@ -1600,7 +1716,7 @@ impl Renderer {
         // shrank, the terminal was resized); keep the offset inside the
         // scrollable range so the arithmetic below never underflows.
         self.scroll_offset = clamp_scroll_offset(self.scroll_offset, total, visible);
-        let mut stdout = self.writer();
+        let mut stdout = frame_out!(self);
         write!(stdout, "{}", Hide)?;
 
         let auto_scroll = self.scroll_offset == 0;
@@ -1619,7 +1735,7 @@ impl Renderer {
         if auto_scroll && total < visible {
             let pad = visible - total;
             for _ in 0..pad {
-                stdout.execute(MoveTo(0, visual_row))?;
+                stdout.queue(MoveTo(0, visual_row))?;
                 if let Some(bg) = self.chat_bg {
                     write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
                 }
@@ -1637,7 +1753,7 @@ impl Renderer {
                 break;
             }
 
-            stdout.execute(MoveTo(0, visual_row))?;
+            stdout.queue(MoveTo(0, visual_row))?;
 
             let selected = match (
                 self.selection_active,
@@ -1662,7 +1778,7 @@ impl Renderer {
         }
 
         while (visual_row as usize) < visible {
-            stdout.execute(MoveTo(0, visual_row))?;
+            stdout.queue(MoveTo(0, visual_row))?;
             if let Some(bg) = self.chat_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
@@ -1677,7 +1793,7 @@ impl Renderer {
                 HistoryIndicator::Above(text) => (text, Color::DarkGrey),
             };
             let x = cols.saturating_sub(display_width(text) as u16);
-            stdout.execute(MoveTo(x, 0))?;
+            stdout.queue(MoveTo(x, 0))?;
             if let Some(bg) = self.chat_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
@@ -1686,13 +1802,12 @@ impl Renderer {
             write!(stdout, "{}", ResetColor)?;
         }
 
-        stdout.flush()?;
         #[cfg(test)]
         {
             OutputCounters::bump(&self.test_counters.viewport_paints, 1);
             OutputCounters::bump(&self.test_counters.viewport_rows, visible);
         }
-        trace.finish(0);
+        trace.finish(self.frame_len() - frame_start);
         self.record_chat_drawn();
         Ok(())
     }
@@ -1754,19 +1869,22 @@ impl Renderer {
     }
 
     pub fn clear_content(&mut self) -> io::Result<()> {
+        self.frame(Self::clear_content_in_frame)
+    }
+
+    fn clear_content_in_frame(&mut self) -> io::Result<()> {
         self.chat_dirty = true;
         self.feed.clear();
         self.partial.clear();
         self.scroll_offset = 0;
         self.clear_selection();
-        let mut stdout = self.writer();
+        let mut stdout = frame_out!(self);
         if let Some(bg) = self.chat_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
-        stdout.execute(Clear(ClearType::All))?;
+        stdout.queue(Clear(ClearType::All))?;
         write!(stdout, "{}", ResetColor)?;
-        stdout.execute(MoveTo(0, 0))?;
-        stdout.flush()?;
+        stdout.queue(MoveTo(0, 0))?;
         Ok(())
     }
 
@@ -1788,9 +1906,9 @@ impl Renderer {
         let avail = rows.saturating_sub(reserve);
         let old_start = avail.saturating_sub(old_height as u16).saturating_add(1);
         let new_start = avail.saturating_sub(new_height as u16).saturating_add(1);
-        let mut stdout = self.writer();
+        let mut stdout = frame_out!(self);
         for row in old_start..new_start {
-            stdout.execute(MoveTo(0, row))?;
+            stdout.queue(MoveTo(0, row))?;
             if let Some(bg) = self.input_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
@@ -1801,8 +1919,8 @@ impl Renderer {
     }
 
     fn draw_separator(&self, row: u16, cols: u16) -> io::Result<()> {
-        let mut stdout = self.writer();
-        stdout.execute(MoveTo(0, row))?;
+        let mut stdout = frame_out!(self);
+        stdout.queue(MoveTo(0, row))?;
         if let Some(bg) = self.input_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
@@ -1859,13 +1977,13 @@ impl Renderer {
         prefix: Option<(&str, Color)>,
         cols: u16,
     ) -> io::Result<()> {
-        let mut stdout = self.writer();
-        stdout.execute(MoveTo(0, screen_row))?;
+        let mut stdout = frame_out!(self);
+        stdout.queue(MoveTo(0, screen_row))?;
         if let Some(bg) = self.status_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
         write!(stdout, "{}", Clear(ClearType::CurrentLine))?;
-        stdout.execute(MoveTo(0, screen_row))?;
+        stdout.queue(MoveTo(0, screen_row))?;
         if let Some(bg) = self.status_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
@@ -1946,6 +2064,18 @@ impl Renderer {
         write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
         write!(stdout, "{}", ResetColor)?;
         Ok(())
+    }
+
+    /// Paint one statusline row as its own frame.
+    #[cfg(test)]
+    fn statusline_row_frame_for_test(
+        &mut self,
+        screen_row: u16,
+        spans: &[StatusSpan],
+        prefix: Option<(&str, Color)>,
+        cols: u16,
+    ) -> io::Result<()> {
+        self.frame(|this| this.draw_statusline_row(screen_row, spans, prefix, cols))
     }
 
     fn status_foreground(
@@ -2064,21 +2194,44 @@ impl Renderer {
     /// Re-place the terminal caret where the last full bottom draw left it.
     /// Needed after a statusline-only redraw or a picker overlay, both of
     /// which move the cursor.
-    pub(crate) fn restore_bottom_cursor(&self) -> io::Result<()> {
-        let mut stdout = self.writer();
+    pub(crate) fn restore_bottom_cursor(&mut self) -> io::Result<()> {
+        self.frame(|this| this.write_bottom_cursor())
+    }
+
+    fn write_bottom_cursor(&self) -> io::Result<()> {
+        let mut stdout = frame_out!(self);
         match self.bottom_cursor {
             Some((x, row)) => {
-                stdout.execute(MoveTo(x, row))?;
+                stdout.queue(MoveTo(x, row))?;
                 write!(stdout, "{}", Show)?;
             }
             None => {
                 write!(stdout, "{}", Hide)?;
             }
         }
-        stdout.flush()
+        Ok(())
     }
 
     pub fn draw_bottom(
+        &mut self,
+        input_line: &str,
+        cursor_pos: usize,
+        statusline: &[Vec<StatusSpan>],
+        statusline_key: u64,
+        is_running: bool,
+    ) -> io::Result<()> {
+        self.frame(|this| {
+            this.draw_bottom_in_frame(
+                input_line,
+                cursor_pos,
+                statusline,
+                statusline_key,
+                is_running,
+            )
+        })
+    }
+
+    fn draw_bottom_in_frame(
         &mut self,
         input_line: &str,
         cursor_pos: usize,
@@ -2117,8 +2270,9 @@ impl Renderer {
         #[cfg(test)]
         OutputCounters::bump(&self.test_counters.bottom_full_paints, 1);
         let trace = FrameTrace::start("bottom");
+        let frame_start = self.frame_len();
         let reserve = self.statusline_reserve();
-        let mut stdout = self.writer();
+        let mut stdout = frame_out!(self);
 
         if let Some(prompt_rows) = self.overlay_prompt_rows(cols, rows) {
             let line_count = prompt_rows.len();
@@ -2135,7 +2289,7 @@ impl Renderer {
             let prompt_color = self.color(self.palette.permission);
             for (i, line) in prompt_rows.iter().enumerate() {
                 let render_row = input_top.saturating_add(i as u16);
-                stdout.execute(MoveTo(0, render_row))?;
+                stdout.queue(MoveTo(0, render_row))?;
                 if let Some(bg) = self.input_bg {
                     write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
                 }
@@ -2152,8 +2306,7 @@ impl Renderer {
 
             self.draw_statusline(statusline, cols, false)?;
             write!(stdout, "{}", Hide)?;
-            stdout.flush()?;
-            trace.finish(0);
+            trace.finish(self.frame_len() - frame_start);
             self.bottom_cursor = None;
             self.record_bottom_drawn(snapshot);
             return Ok(());
@@ -2239,7 +2392,7 @@ impl Renderer {
             .take(visible_line_count)
         {
             let render_row = input_top.saturating_add((i - first_visible) as u16);
-            stdout.execute(MoveTo(0, render_row))?;
+            stdout.queue(MoveTo(0, render_row))?;
 
             if let Some(bg) = self.input_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -2288,10 +2441,9 @@ impl Renderer {
         let cursor_row = input_top.saturating_add(cursor_render_idx as u16);
         let cursor_x =
             (prompt_width + cursor_display_col).min(cols.saturating_sub(1) as usize) as u16;
-        stdout.execute(MoveTo(cursor_x, cursor_row))?;
+        stdout.queue(MoveTo(cursor_x, cursor_row))?;
         write!(stdout, "{}", Show)?;
-        stdout.flush()?;
-        trace.finish(0);
+        trace.finish(self.frame_len() - frame_start);
         self.bottom_cursor = Some((cursor_x, cursor_row));
         // The draw itself settles `input_vscroll_offset` (cursor follow /
         // clamping); record the settled value so the next identical frame is
@@ -2311,14 +2463,20 @@ impl Renderer {
         if !self.chat_needs_redraw() {
             return Ok(false);
         }
-        self.render_viewport()?;
-        self.restore_bottom_cursor()?;
+        self.frame(|this| {
+            this.render_viewport()?;
+            this.restore_bottom_cursor()
+        })?;
         Ok(true)
     }
 
     /// Advance only the running prompt's spinner cell. The 100 ms UI tick uses
     /// this after an ordinary full draw has established the input geometry.
     pub(crate) fn tick_spinner(&mut self) -> io::Result<()> {
+        self.frame(Self::tick_spinner_in_frame)
+    }
+
+    fn tick_spinner_in_frame(&mut self) -> io::Result<()> {
         let Some(snapshot) = self.last_bottom_snapshot.as_ref() else {
             return Ok(());
         };
@@ -2330,8 +2488,8 @@ impl Renderer {
         }
 
         let drawn_frame = self.spinner_frame;
-        let mut stdout = self.writer();
-        stdout.execute(MoveTo(0, self.input_base_row))?;
+        let mut stdout = frame_out!(self);
+        stdout.queue(MoveTo(0, self.input_base_row))?;
         if let Some(bg) = self.input_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
         }
@@ -2342,7 +2500,6 @@ impl Renderer {
             SPINNER[drawn_frame as usize],
             ResetColor
         )?;
-        stdout.flush()?;
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
         if let Some(snapshot) = self.last_bottom_snapshot.as_mut() {
             snapshot.spinner_frame = drawn_frame;
@@ -3235,7 +3392,9 @@ mod statusline_layout_tests {
             }],
         };
         let rows = statusline::build_lines(&spec, &session, &context);
-        renderer.draw_statusline_row(5, &rows[0], None, 80).unwrap();
+        renderer
+            .statusline_row_frame_for_test(5, &rows[0], None, 80)
+            .unwrap();
         let captured = renderer.captured_output();
         let StatusSpan::Text { layout, fg, .. } = &rows[0][0] else {
             panic!("context item")
@@ -3261,7 +3420,9 @@ mod statusline_layout_tests {
         renderer.capture_bytes().lock().unwrap().clear();
         session.overhead_tokens = 1100;
         let rows = statusline::build_lines(&spec, &session, &context);
-        renderer.draw_statusline_row(5, &rows[0], None, 80).unwrap();
+        renderer
+            .statusline_row_frame_for_test(5, &rows[0], None, 80)
+            .unwrap();
         let StatusSpan::Text { layout, fg, .. } = &rows[0][0] else {
             panic!("context item")
         };
@@ -3283,7 +3444,7 @@ mod statusline_layout_tests {
 
     #[test]
     fn actual_statusline_draw_reserves_last_cell_and_marks_unicode_clipping() {
-        let renderer = Renderer::for_app_test().unwrap();
+        let mut renderer = Renderer::for_app_test().unwrap();
         let session = Session::new("p", "m", 1000, "/workspace");
         let context = StatusContext {
             workspace: std::path::Path::new("/workspace"),
@@ -3311,14 +3472,14 @@ mod statusline_layout_tests {
         };
         let spans = statusline::build_lines(&spec, &session, &context);
         renderer
-            .draw_statusline_row(5, &spans[0], None, 12)
+            .statusline_row_frame_for_test(5, &spans[0], None, 12)
             .unwrap();
         let text = crate::ui::events::sanitize_output(&renderer.captured_output());
         assert_eq!(text, "prompt:界…");
         assert!(display_width(&text) <= 11);
         renderer.capture_bytes().lock().unwrap().clear();
         renderer
-            .draw_statusline_row(5, &spans[0], None, 30)
+            .statusline_row_frame_for_test(5, &spans[0], None, 30)
             .unwrap();
         let wide = crate::ui::events::sanitize_output(&renderer.captured_output());
         assert_eq!(wide, "prompt:界界界界界界界界");
@@ -3327,7 +3488,7 @@ mod statusline_layout_tests {
 
     #[test]
     fn actual_statusline_draw_splits_flex_and_relayouts_on_resize_without_rebuild() {
-        let renderer = Renderer::for_app_test().unwrap();
+        let mut renderer = Renderer::for_app_test().unwrap();
         let item = |text: &str| StatusSpan::Text {
             text: text.into(),
             fg: None,
@@ -3346,12 +3507,16 @@ mod statusline_layout_tests {
             StatusSpan::Flex,
             item("c"),
         ];
-        renderer.draw_statusline_row(5, &spans, None, 12).unwrap();
+        renderer
+            .statusline_row_frame_for_test(5, &spans, None, 12)
+            .unwrap();
         let text = crate::ui::events::sanitize_output(&renderer.captured_output());
         assert_eq!(text, "a    b    c");
         assert_eq!(display_width(&text), 11);
         renderer.capture_bytes().lock().unwrap().clear();
-        renderer.draw_statusline_row(5, &spans, None, 6).unwrap();
+        renderer
+            .statusline_row_frame_for_test(5, &spans, None, 6)
+            .unwrap();
         assert_eq!(
             crate::ui::events::sanitize_output(&renderer.captured_output()),
             "a b c"
@@ -3630,5 +3795,104 @@ mod frame_cost_tests {
         );
         assert_eq!(stats.viewport_paints, 0, "typing must not repaint the chat");
         assert_eq!(stats.bottom_full_paints, keys);
+    }
+}
+
+#[cfg(test)]
+mod frame_buffer_tests {
+    use super::*;
+    use crate::ui::feed::BlockStyle;
+
+    fn filled_renderer() -> Renderer {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..100 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("row {line}"));
+        }
+        renderer
+    }
+
+    #[test]
+    fn each_paint_entry_point_writes_one_synchronized_frame() {
+        let mut renderer = filled_renderer();
+        let before = renderer.frame_stats();
+        renderer.render_viewport().unwrap();
+        let viewport = renderer.frame_stats().since(before);
+        assert_eq!((viewport.writes, viewport.flushes), (1, 1));
+        assert_eq!(viewport.viewport_paints, 1);
+
+        let before = renderer.frame_stats();
+        renderer.draw_bottom("draft", 5, &[], 0, false).unwrap();
+        let bottom = renderer.frame_stats().since(before);
+        assert_eq!((bottom.writes, bottom.flushes), (1, 1));
+
+        let captured = renderer.captured_output();
+        assert!(captured.starts_with("\x1b[?2026h"));
+        assert!(captured.ends_with("\x1b[?2026l"));
+        assert_eq!(captured.matches("\x1b[?2026h").count(), 2);
+        assert_eq!(captured.matches("\x1b[?2026l").count(), 2);
+    }
+
+    #[test]
+    fn a_whole_refresh_is_one_frame_and_an_unchanged_one_writes_nothing() {
+        let mut renderer = filled_renderer();
+        let before = renderer.frame_stats();
+        renderer
+            .frame(|r| {
+                r.sync_input_height("draft")?;
+                r.render_viewport()?;
+                r.draw_bottom("draft", 5, &[], 0, false)
+            })
+            .unwrap();
+        let first = renderer.frame_stats().since(before);
+        assert_eq!((first.writes, first.flushes), (1, 1));
+        assert_eq!(first.viewport_paints, 1);
+        assert_eq!(first.bottom_full_paints, 1);
+
+        let before = renderer.frame_stats();
+        renderer
+            .frame(|r| {
+                r.sync_input_height("draft")?;
+                r.render_viewport()?;
+                r.draw_bottom("draft", 5, &[], 0, false)
+            })
+            .unwrap();
+        let idle = renderer.frame_stats().since(before);
+        assert_eq!((idle.writes, idle.flushes, idle.bytes), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_ui_tick_paints_chat_spinner_and_caret_in_one_frame_each() {
+        let mut renderer = filled_renderer();
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 0, true).unwrap();
+        renderer
+            .feed_mut()
+            .push_block(BlockStyle::Agent, "streamed");
+        let before = renderer.frame_stats();
+        assert!(renderer.paint_pending_chat().unwrap());
+        renderer.tick_spinner().unwrap();
+        let tick = renderer.frame_stats().since(before);
+        assert_eq!((tick.writes, tick.flushes), (2, 2));
+    }
+
+    #[test]
+    fn a_failed_frame_write_propagates_and_forces_a_full_repaint() {
+        let mut renderer = filled_renderer();
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("draft", 5, &[], 0, false).unwrap();
+        renderer.feed_mut().push_block(BlockStyle::Agent, "lost");
+        renderer.fail_next_write_for_test();
+        let error = renderer.render_viewport().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(renderer.chat_needs_redraw());
+        let before = renderer.frame_stats();
+        renderer.draw_bottom("draft", 5, &[], 0, false).unwrap();
+        renderer.render_viewport().unwrap();
+        let retry = renderer.frame_stats().since(before);
+        assert_eq!(retry.bottom_full_paints, 1, "bottom repainted in full");
+        assert_eq!(retry.viewport_paints, 1);
+        assert!(renderer.captured_output().contains("lost"));
     }
 }

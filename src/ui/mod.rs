@@ -214,6 +214,36 @@ pub(crate) fn refresh_display(
     chain: &ChainState,
     btw: BtwStats,
 ) -> io::Result<()> {
+    // The chat and bottom regions go out as one synchronized frame: one
+    // write and flush per refresh instead of one per painted row. The frame
+    // closes before a picker draws, because pickers write their overlay
+    // directly and must land on top of it.
+    renderer.frame(|renderer| draw_main_frame(renderer, input, ui, run, chain, btw))?;
+    if let Some(ref mut picker) = input.picker {
+        let was_active = picker.active();
+        picker.draw_with_renderer(renderer)?;
+        if was_active {
+            // Drawing the list moved the caret; put it back in the input.
+            renderer.restore_bottom_cursor()?;
+            // The picker painted over the chat and bottom regions, which the
+            // dirty-region tracking cannot see; force a full repaint next
+            // frame so a closing picker never leaves remnants behind.
+            renderer.invalidate();
+        }
+    }
+    Ok(())
+}
+
+/// Paint the chat viewport and the bottom region (input and statusline) of one
+/// refresh into the renderer's open frame.
+fn draw_main_frame(
+    renderer: &mut Renderer,
+    input: &mut InputEditor,
+    ui: &UiContext,
+    run: &AgentRunState,
+    chain: &ChainState,
+    btw: BtwStats,
+) -> io::Result<()> {
     // Reconcile the input height first so the chat viewport is drawn against
     // the size the input is about to occupy (avoids a stale separator when the
     // input shrinks, or chat text hidden under it when the input grows).
@@ -344,18 +374,6 @@ pub(crate) fn refresh_display(
         statusline_key,
         run.is_running,
     )?;
-    if let Some(ref mut picker) = input.picker {
-        let was_active = picker.active();
-        picker.draw_with_renderer(renderer)?;
-        if was_active {
-            // Drawing the list moved the caret; put it back in the input.
-            renderer.restore_bottom_cursor()?;
-            // The picker painted over the chat and bottom regions, which the
-            // dirty-region tracking cannot see; force a full repaint next
-            // frame so a closing picker never leaves remnants behind.
-            renderer.invalidate();
-        }
-    }
     Ok(())
 }
 

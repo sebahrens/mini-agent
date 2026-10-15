@@ -31,3 +31,5 @@ At runtime the same frames can be traced with `RUST_LOG=ui::frame=trace`
 | --- | --- | --- | --- | --- | --- | --- |
 | streaming 200 KB (4286 tokens) | 2996 viewport | 145732 | 1980534 | 11425321 | 3813 | 348 ms |
 | 17 keystrokes | 0 viewport, 17 bottom | 119 (7/key) | 986 | 20462 (1203/key) | - | - |
+| after cttyn.2 frame buffer: streaming | 2996 viewport | 3425 | 3425 | 11480121 | 3831 | 280 ms |
+| after cttyn.2 frame buffer: 17 keystrokes | 0 viewport, 17 bottom | 17 (1/key) | 17 | 20734 (1219/key) | - | - |
