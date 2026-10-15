@@ -19,11 +19,13 @@ def fixture_environment(inherited, platform=sys.platform):
 
 _WINDOWS_PRIVATE_FIXTURE_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::Error.WriteLine('fixture-private-init:transport')
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $allowed = @($user.Value, 'S-1-5-18')
 $rows = @()
 foreach ($relative in @('', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml')) {
     $path = if ($relative) { Join-Path $env:MINI_AGENT_CHAT_PRIVATE_ROOT $relative } else { $env:MINI_AGENT_CHAT_PRIVATE_ROOT }
+    [Console]::Error.WriteLine('fixture-private-init:inspect:' + $relative)
     $item = Get-Item -LiteralPath $path -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Fixture private path is a reparse point' }
     $acl = if ($item.PSIsContainer) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
@@ -35,7 +37,9 @@ foreach ($relative in @('', 'config', 'data', 'local-data', 'state', 'cache', 'c
         $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
         [void]$acl.AddAccessRule($rule)
     }
+    [Console]::Error.WriteLine('fixture-private-init:set-acl:' + $relative)
     Set-Acl -LiteralPath $path -AclObject $acl
+    [Console]::Error.WriteLine('fixture-private-init:verify:' + $relative)
     $actual = Get-Acl -LiteralPath $path
     $owner = $actual.GetOwner([Security.Principal.SecurityIdentifier]).Value
     $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
@@ -45,6 +49,7 @@ foreach ($relative in @('', 'config', 'data', 'local-data', 'state', 'cache', 'c
     }
     $rows += @{relative=$relative;owner=$owner;protected=$true}
 }
+[Console]::Error.WriteLine('fixture-private-init:complete')
 ConvertTo-Json -Compress -InputObject $rows
 """
 
@@ -70,7 +75,18 @@ def prepare_private_fixture(root, inherited, platform=sys.platform):
     powershell = str(Path(system_root) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
     env = fixture_environment(inherited, 'win32')
     env['MINI_AGENT_CHAT_PRIVATE_ROOT'] = str(root)
-    completed = subprocess.run([powershell, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', _WINDOWS_PRIVATE_FIXTURE_SCRIPT], env=env, capture_output=True, text=True, timeout=30, check=True)
+    import base64
+    encoded = base64.b64encode(_WINDOWS_PRIVATE_FIXTURE_SCRIPT.encode('utf-16le')).decode('ascii')
+    def retain_diagnostic(outcome, result):
+        def decoded(value):
+            return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else (value or '')
+        (root / 'private-fixture-init.log').write_text(outcome + '\nstdout:\n' + decoded(result.stdout) + '\nstderr:\n' + decoded(result.stderr), encoding='utf-8')
+    try:
+        completed = subprocess.run([powershell, '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=True)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+        retain_diagnostic(type(error).__name__, error)
+        raise
+    retain_diagnostic('completed', completed)
     rows = json.loads(completed.stdout)
     if len(rows) != 8 or any(not row['protected'] for row in rows):
         raise ValueError('incomplete private fixture initialization')

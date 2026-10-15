@@ -2,6 +2,7 @@
 from pathlib import Path, PurePosixPath
 import subprocess
 import json
+import base64
 import stat
 from types import SimpleNamespace
 import unittest
@@ -97,15 +98,32 @@ class PlatformTests(unittest.TestCase):
             isfile=path.name=='config.toml'
             return SimpleNamespace(st_mode=stat.S_IFREG if isfile else stat.S_IFDIR,st_file_attributes=0,st_nlink=1)
         rows=[{'relative':name,'owner':'S-1-5-21-fixture','protected':True} for name in ['', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml']]
-        with patch('chat_ui_platform.Path.lstat',metadata), patch('chat_ui_platform.subprocess.run',return_value=SimpleNamespace(stdout=json.dumps(rows))) as run:
+        with patch('chat_ui_platform.Path.lstat',metadata), patch('chat_ui_platform.subprocess.run',return_value=SimpleNamespace(stdout=json.dumps(rows),stderr='fixture-private-init:complete')) as run, patch('chat_ui_platform.Path.write_text') as diagnostic:
             self.assertEqual(prepare_private_fixture(root,{'SystemRoot':'C:/Windows','HOME':'original','OPENAI_API_KEY':'secret'},'win32'),rows)
         self.assertEqual(observed,['.', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml'])
         command=run.call_args.args[0]
         self.assertTrue(command[0].endswith('WindowsPowerShell/v1.0/powershell.exe'))
-        self.assertEqual(command[1:5],['-NoLogo','-NoProfile','-NonInteractive','-Command'])
+        self.assertEqual(command[1:5],['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand'])
+        decoded=base64.b64decode(command[5]).decode('utf-16le')
+        self.assertIn("fixture-private-init:transport",decoded)
+        self.assertLess(decoded.index('fixture-private-init:transport'),decoded.index('Set-Acl'))
+        self.assertEqual(run.call_args.kwargs['stdin'],subprocess.DEVNULL)
+        self.assertIn('completed',diagnostic.call_args.args[0])
         self.assertEqual(run.call_args.kwargs['env'],{'HOME':'original','SystemRoot':'C:/Windows','MINI_AGENT_CHAT_PRIVATE_ROOT':str(root)})
         self.assertTrue(run.call_args.kwargs['check'])
         self.assertEqual(run.call_args.kwargs['timeout'],30)
+
+    def test_windows_private_initialization_retains_timeout_and_failure_stage(self):
+        def describe(path):
+            return SimpleNamespace(st_mode=stat.S_IFREG if path.name=='config.toml' else stat.S_IFDIR,st_file_attributes=0,st_nlink=1)
+        failures=[subprocess.TimeoutExpired(['powershell'],30,output=b'',stderr=b'fixture-private-init:transport\nfixture-private-init:inspect:config'),subprocess.CalledProcessError(1,['powershell'],output='',stderr='fixture-private-init:set-acl:config')]
+        for error in failures:
+            with self.subTest(error=type(error).__name__), patch('chat_ui_platform.Path.lstat',describe), patch('chat_ui_platform.subprocess.run',side_effect=error) as run, patch('chat_ui_platform.Path.write_text') as diagnostic:
+                with self.assertRaises(type(error)):
+                    prepare_private_fixture(Path('C:/owned'),{'SystemRoot':'C:/Windows'},'win32')
+                self.assertEqual(run.call_count,1)
+                self.assertIn(type(error).__name__,diagnostic.call_args.args[0])
+                self.assertIn('fixture-private-init:',diagnostic.call_args.args[0])
 
     def test_windows_private_initialization_rejects_link_before_mutation(self):
         metadata=SimpleNamespace(st_mode=stat.S_IFDIR,st_file_attributes=0x400,st_nlink=1)
