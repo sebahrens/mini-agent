@@ -416,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn a_name_rebound_to_loopback_after_validation_is_refused() {
         let Some((port, accepted)) =
-            loopback_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            loopback_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         else {
             return;
         };
@@ -453,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn a_pinned_host_is_never_resolved_again() {
         let Some((port, accepted)) =
-            loopback_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            loopback_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         else {
             return;
         };
