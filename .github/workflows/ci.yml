@@ -879,6 +879,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           rustflags: ''
+          # Native proc-macro libraries must not restore from Ubuntu 24 caches.
+          cache-key: ubuntu-22.04
 
       - name: Install bubblewrap
         run: bash scripts/install-ci-bubblewrap.sh --pinned-native

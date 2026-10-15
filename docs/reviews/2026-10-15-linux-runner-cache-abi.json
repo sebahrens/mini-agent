@@ -1,0 +1,79 @@
+{
+  "scope": "Read-only diagnosis of native Linux CI compile failure; no source edits, Cargo, cache deletion, dispatch, or rerun.",
+  "heads": {
+    "passing": "2b52f928995051a3884878872041cc80b56e0312",
+    "failing": "05982587469572b418d61d4f12ca2a3aac41e7e7"
+  },
+  "passing": {
+    "job": 116264757492,
+    "os": "Ubuntu24.04",
+    "image": "20261012.334.1",
+    "log": "/private/tmp/mini-agent-2b52-linux-sandbox-job.log",
+    "sha256": "aa3fe6175508951ce6afa00dadae0e1d9b5ca41f8de2d7ed89a7c0d8be3fc111",
+    "references": {
+      "os_image": [
+        12,
+        17,
+        18
+      ],
+      "compiler": 442,
+      "cache_key": 526,
+      "cache_hit": 547,
+      "cache_bytes": 553,
+      "path_crates_only_compile": [
+        686,
+        689
+      ]
+    }
+  },
+  "failing": {
+    "job": 116270850756,
+    "os": "Ubuntu22.04",
+    "image": "20261012.322.1",
+    "log": "/private/tmp/mini-agent-059-failure-116270850756.log",
+    "sha256": "a129bdb1b4499bbfb005b2f0f3cd95bde01c21d17bc6a4a0eac18ae9d7627f30",
+    "references": {
+      "os_image": [
+        12,
+        17,
+        18
+      ],
+      "compiler": 484,
+      "cache_key": 568,
+      "cache_hit": 589,
+      "cache_bytes": 594,
+      "path_crates_only_compile": [
+        858,
+        861
+      ],
+      "error": [
+        875,
+        880
+      ]
+    }
+  },
+  "shared": {
+    "compiler": "rustc1.96.0 ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96 x86_64-unknown-linux-gnu",
+    "cache_key": "v0-rust-linux-sandbox-policy-Linux-x64-63c37486-c1dadcaf",
+    "cache_archive_bytes": 668506185,
+    "Cargo.toml_Cargo.lock_rig_core_diff": "empty between exact two heads",
+    "derive_feature": "default -> derive -> dep:rig-derive0.40.0; lib.rs187-189 cfgderive export; registry proc-macro=true"
+  },
+  "confirmed_defect": "Runner changed ubuntu-latest(24.04) to22.04 while preserving cache namespace; native compiled proc-macro target artifacts from newer distribution are restored verbatim and reused. Cache key covers kernel OS class/arch/toolchains/manifests, not distribution ABI.",
+  "causal_inference": "Strong evidence that cross-distribution native cached artifact is the failing boundary: exact same artifact set passed the old job, only path crates recompile, no rig-derive compilation occurs, and new job fails locating its proc-macro. This is not a missing dependency/feature/source change.",
+  "limits": "Raw nonverbose E0463 gives no dlopen errno/required GLIBC symbol or artifact pathname; actual cached ELF was not inspected. A particular GLIBC version cannot be asserted as proven. Fresh Ubuntu22-partitioned owning job is required for final confirmation.",
+  "minimal_fix": {
+    "file": ".github/workflows/ci.yml",
+    "job": "linux-sandbox-policy",
+    "step": "Install Rust",
+    "with_addition": {
+      "cache-key": "ubuntu-22.04"
+    },
+    "effect": "Pinned setup action forwards to rust-cache key; pinned config.ts constructs both primary and restore prefixes with this input before OS/arch/environment. Thus incompatible old cache cannot match, while future Ubuntu22 cache remains reusable. No blanket cache deletion or dependency change."
+  },
+  "primary_sources": [
+    "https://github.com/actions-rust-lang/setup-rust-toolchain/blob/166cdcfd11aee3cb47222f9ddb555ce30ddb9659/action.yml",
+    "https://github.com/Swatinem/rust-cache/blob/c19371144df3bb44fab255c43d04cbc2ab54d1c4/src/config.ts"
+  ],
+  "optional_precise_loader_diagnostic": "If retaining old artifact evidence before isolation is useful on an authorized runner: file/ldd -v target/debug/deps/librig_derive-*.so; no library execution or cargo rebuild needed. Not performed here."
+}

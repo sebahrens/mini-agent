@@ -128,6 +128,19 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("linux_js_worker_containment -- --ignored --nocapture", linux)
         self.assertIn("Run Phase 6 adversarial suites under js and skills", linux)
 
+    def test_native_linux_compiled_cache_is_partitioned_by_pinned_runner_abi(self) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        runner = re.search(r"(?m)^    runs-on: (\S+)$", linux).group(1)
+        self.assertEqual(runner, "ubuntu-22.04")
+        rust = linux.split("- name: Install Rust\n", 1)[1].split("- name:", 1)[0]
+        self.assertIn("uses: actions-rust-lang/setup-rust-toolchain@", rust)
+        cache_key = re.search(r"(?m)^          cache-key: (\S+)$", rust)
+        self.assertIsNotNone(cache_key, "compiled cache must not reuse Ubuntu 24 artifacts")
+        # The pinned action puts cache-key into BOTH primary and restore prefixes.
+        # cache-shared-key would override it and revive cross-image restoration.
+        self.assertEqual(cache_key.group(1), runner)
+        self.assertNotIn("cache-shared-key:", rust)
+
     def test_native_workspace_names_match_the_actual_defining_sources(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         step = linux.split("- name: Test native Linux workspace real paths and snapshot authority", 1)[1].split("- name:", 1)[0]

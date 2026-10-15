@@ -284,7 +284,7 @@ async fn linux_native_workspace_cargo_artifacts_are_reused_at_host_real_paths() 
     std::fs::write(
         root.join("build.rs"),
         r#"fn main() {
-        let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let counter = root.join("build-count");
         let n: u32 = std::fs::read_to_string(&counter).unwrap_or_default().parse().unwrap_or(0);
         std::fs::write(counter, (n + 1).to_string()).unwrap();

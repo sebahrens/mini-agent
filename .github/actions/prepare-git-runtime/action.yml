@@ -35,6 +35,9 @@ runs:
         msystem: UCRT64
         path-type: minimal
         update: true
+        # The action clears pacman's cache after saving it. Source collection
+        # needs those exact signed installed archives through the next step.
+        cache: ${{ inputs.collect-sources != 'true' }}
         install: >-
           make patch python zstd diffutils
           mingw-w64-ucrt-x86_64-gcc

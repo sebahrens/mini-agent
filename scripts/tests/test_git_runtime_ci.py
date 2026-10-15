@@ -245,6 +245,13 @@ class GitRuntimeCiTests(unittest.TestCase):
         provision = next(step for step in steps if step.get("uses", "").startswith("msys2/setup-msys2@"))
         self.assertIn("diffutils", provision["with"]["install"].split())  # Git GIT-VERSION-GEN requires /usr/bin/cmp.
         self.assertIn("mingw-w64-ucrt-x86_64-pcre2", provision["with"]["install"].split())
+        # setup-msys2's cache=true path ends with pacman -Scc, deleting the
+        # signed installed archives required by the source collector. Disable
+        # that cache only when collecting, retaining the ordinary CI cache.
+        self.assertEqual(
+            provision["with"].get("cache"),
+            "${{ inputs.collect-sources != 'true' }}",
+        )
         for package in ["make patch python", "gcc", "curl-winssl", "zlib", "expat", "libiconv"]:
             self.assertIn(package, self.action)
         self.assertIn("shell: msys2 {0}", self.action)
