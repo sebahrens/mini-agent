@@ -2945,7 +2945,11 @@ impl<'a> App<'a> {
                 // The measured key-handler future makes this generic event
                 // poll too large for the native 1 MiB stack. Construct it in
                 // the existing short factory, retaining the same owned await.
-                if let Err(e) = crate::startup::heap_future(|| self.handle_key_event(key)).await {
+                // `action` was computed for this key above and nothing since
+                // changed the modal state it depends on.
+                if let Err(e) =
+                    crate::startup::heap_future(|| self.handle_key_event_with(key, action)).await
+                {
                     if e.downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
                     {
@@ -3091,6 +3095,16 @@ impl<'a> App<'a> {
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         let action = self.keyboard_action(key);
+        self.handle_key_event_with(key, action).await
+    }
+
+    /// [`Self::handle_key_event`] with the key's already-resolved
+    /// [`Self::keyboard_action`], so one keystroke resolves bindings once.
+    async fn handle_key_event_with(
+        &mut self,
+        key: KeyEvent,
+        action: Option<KeyAction>,
+    ) -> anyhow::Result<()> {
         let eligible_escape = key.code == KeyCode::Esc
             && key.modifiers.is_empty()
             && key.kind == crossterm::event::KeyEventKind::Press
@@ -3174,12 +3188,7 @@ impl<'a> App<'a> {
             Some(KeyAction::TranscriptTop | KeyAction::TranscriptBottom) => {
                 KeyBindings::canonical(action.unwrap())
             }
-            _ if !self.input.keybindings.removed_default(key, false)
-                && !self.input.keybindings.removed_default(key, true)
-                && !self.input.keybindings.is_explicit_binding(key) =>
-            {
-                Some(key)
-            }
+            _ if !self.input.keybindings.is_reconfigured(key) => Some(key),
             _ => None,
         };
         match scroll_key.and_then(|key| {

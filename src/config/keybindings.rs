@@ -1,6 +1,7 @@
 //! Bounded keyboard settings shared by the input editor and app shortcuts.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Deserializer};
@@ -118,6 +119,28 @@ const SPECS: &[ActionSpec] = &[
     app!(ToggleVim, "toggle_vim",),
     app!(ShowKeys, "show_keys",),
 ];
+
+/// The parsed default chords of each entry of [`SPECS`] (same order), parsed
+/// once per process instead of on every key lookup.
+fn default_chords() -> &'static [Vec<KeyChord>] {
+    static DEFAULTS: OnceLock<Vec<Vec<KeyChord>>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        SPECS
+            .iter()
+            .map(|spec| {
+                spec.defaults
+                    .iter()
+                    .map(|text| KeyChord::parse(text).expect("static key chord"))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+/// Every spec paired with its parsed default chords.
+fn specs_with_defaults() -> impl Iterator<Item = (&'static ActionSpec, &'static [KeyChord])> {
+    SPECS.iter().zip(default_chords().iter().map(Vec::as_slice))
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct KeyChord {
@@ -265,44 +288,45 @@ impl KeyBindings {
             }
         }
         let key = legacy_default_event(key, editor, self.native_clipboard)?;
-        SPECS
-            .iter()
-            .filter(|spec| spec.editor == editor)
-            .filter(|spec| self.default_available(spec))
-            .filter(|spec| {
+        specs_with_defaults()
+            .filter(|(spec, _)| spec.editor == editor)
+            .filter(|(spec, _)| self.default_available(spec))
+            .filter(|(spec, _)| {
                 !self
                     .overrides
                     .iter()
                     .any(|(action, _)| *action == spec.action)
             })
-            .find(|spec| {
-                spec.defaults.iter().any(|text| {
-                    KeyChord::parse(text)
-                        .expect("static key chord")
-                        .matches(key)
-                })
-            })
-            .map(|spec| spec.action)
+            .find(|(_, chords)| chords.iter().any(|chord| chord.matches(key)))
+            .map(|(spec, _)| spec.action)
     }
 
     pub(crate) fn removed_default(&self, key: KeyEvent, editor: bool) -> bool {
+        if self.overrides.is_empty() {
+            return false;
+        }
         let Some(key) = legacy_default_event(key, editor, self.native_clipboard) else {
             return false;
         };
-        SPECS
-            .iter()
-            .filter(|spec| spec.editor == editor)
-            .filter(|spec| self.default_available(spec))
-            .any(|spec| {
+        specs_with_defaults()
+            .filter(|(spec, _)| spec.editor == editor)
+            .filter(|(spec, _)| self.default_available(spec))
+            .any(|(spec, chords)| {
                 self.overrides
                     .iter()
                     .any(|(action, _)| *action == spec.action)
-                    && spec.defaults.iter().any(|text| {
-                        KeyChord::parse(text)
-                            .expect("static key chord")
-                            .matches(key)
-                    })
+                    && chords.iter().any(|chord| chord.matches(key))
             })
+    }
+
+    /// Whether configuration changed what `key` does: it is an explicit
+    /// binding, or a default (global or editor) chord whose action was
+    /// rebound. Such keys must not fall back to their raw meaning.
+    pub(crate) fn is_reconfigured(&self, key: KeyEvent) -> bool {
+        !self.overrides.is_empty()
+            && (self.is_explicit_binding(key)
+                || self.removed_default(key, false)
+                || self.removed_default(key, true))
     }
 
     pub(crate) fn effective_editor_event(&self, key: KeyEvent) -> Option<KeyEvent> {
@@ -331,12 +355,11 @@ impl KeyBindings {
     }
 
     pub(crate) fn canonical(action: KeyAction) -> Option<KeyEvent> {
-        SPECS
-            .iter()
-            .find(|spec| spec.action == action)?
-            .defaults
+        specs_with_defaults()
+            .find(|(spec, _)| spec.action == action)?
+            .1
             .first()
-            .map(|text| KeyChord::parse(text).expect("static key chord").event())
+            .map(|chord| chord.event())
     }
 
     pub(crate) fn describe(&self) -> Vec<String> {
@@ -355,16 +378,20 @@ impl KeyBindings {
                 } else if !self.default_available(spec) {
                     Vec::new()
                 } else {
+                    let index = SPECS
+                        .iter()
+                        .position(|candidate| candidate.action == spec.action)
+                        .expect("spec from SPECS");
                     spec.defaults
                         .iter()
-                        .filter(|text| {
-                            let chord = KeyChord::parse(text).expect("static key chord");
+                        .zip(&default_chords()[index])
+                        .filter(|(_, chord)| {
                             !self
                                 .overrides
                                 .iter()
-                                .any(|(_, chords)| chords.contains(&chord))
+                                .any(|(_, chords)| chords.contains(chord))
                         })
-                        .map(|text| (*text).to_owned())
+                        .map(|(text, _)| (*text).to_owned())
                         .collect()
                 };
                 format!(
@@ -509,6 +536,60 @@ pub(crate) fn deserialize_keys<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparsed_default_chords_match_the_spec_table() {
+        let parsed = default_chords();
+        assert_eq!(parsed.len(), SPECS.len());
+        for (spec, chords) in SPECS.iter().zip(parsed) {
+            let expected: Vec<KeyChord> = spec
+                .defaults
+                .iter()
+                .map(|text| KeyChord::parse(text).unwrap())
+                .collect();
+            assert_eq!(chords, &expected, "{}", spec.name);
+        }
+        assert!(std::ptr::eq(default_chords(), parsed), "parsed once");
+    }
+
+    #[test]
+    fn reconfigured_keys_cover_explicit_and_removed_defaults_only() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let defaults = KeyBindings::default();
+        assert!(!defaults.is_reconfigured(ctrl('a')));
+        assert!(!defaults.is_reconfigured(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        let mut settings = KeyOverrides::new();
+        // Editor action moved: its old default is removed, the new chord is
+        // explicit, and unrelated keys keep their raw meaning.
+        settings.insert("line_start".into(), vec!["ctrl+t".into()]);
+        // Global action moved.
+        settings.insert("page_up".into(), vec!["ctrl+shift+u".into()]);
+        let bindings = KeyBindings::from_overrides(Some(&settings)).unwrap();
+        for key in [
+            ctrl('a'),
+            ctrl('t'),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert_eq!(
+                bindings.is_reconfigured(key),
+                bindings.is_explicit_binding(key)
+                    || bindings.removed_default(key, false)
+                    || bindings.removed_default(key, true),
+                "{key:?}"
+            );
+            assert!(bindings.is_reconfigured(key), "{key:?}");
+        }
+        assert!(!bindings.is_reconfigured(ctrl('e')));
+        assert_eq!(bindings.action(ctrl('e'), true), Some(KeyAction::LineEnd));
+        assert_eq!(
+            KeyBindings::canonical(KeyAction::LineStart),
+            Some(ctrl('a'))
+        );
+    }
 
     #[test]
     fn keys73_literal_chords_are_bounded_and_normalized() {
