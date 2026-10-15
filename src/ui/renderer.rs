@@ -808,6 +808,12 @@ pub struct Renderer {
     /// the state recorded after the last successful draw of each region.
     chat_dirty: bool,
     last_chat_snapshot: Option<ChatSnapshot>,
+    /// Key of what each chat row on screen shows (see `render_viewport`),
+    /// valid for `painted_geometry`; `None` forces a full chat repaint.
+    painted_rows: Vec<u64>,
+    painted_geometry: Option<u64>,
+    /// Reused allocation for the next frame's row keys.
+    row_keys_scratch: Vec<u64>,
     bottom_dirty: bool,
     last_bottom_snapshot: Option<BottomSnapshot>,
     statusline_cache: Option<StatuslineCache>,
@@ -952,6 +958,9 @@ impl Renderer {
             chain_but_mode: false,
             chat_dirty: true,
             last_chat_snapshot: None,
+            painted_rows: Vec::new(),
+            painted_geometry: None,
+            row_keys_scratch: Vec::new(),
             bottom_dirty: true,
             last_bottom_snapshot: None,
             statusline_cache: None,
@@ -983,6 +992,17 @@ impl Renderer {
         renderer.test_native_geometry = true;
         renderer.test_native_size_query = Some(query);
         Ok(renderer)
+    }
+
+    /// Every laid-out transcript row, joined by newlines: what the user can
+    /// see or scroll to, independent of which rows a frame repainted.
+    #[cfg(test)]
+    pub(crate) fn transcript_text(&self) -> String {
+        let lines = self.chat_lines(self.max_line_width());
+        (0..lines.len())
+            .map(|row| lines[row].text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[cfg(test)]
@@ -1085,6 +1105,7 @@ impl Renderer {
             // Recorded snapshots describe a frame the terminal never got.
             self.chat_dirty = true;
             self.bottom_dirty = true;
+            self.painted_geometry = None;
             self.title_activity = None;
         }
         result
@@ -1487,6 +1508,21 @@ impl Renderer {
     pub fn invalidate(&mut self) {
         self.chat_dirty = true;
         self.bottom_dirty = true;
+        self.painted_geometry = None;
+    }
+
+    /// A picker overlay was painted over the chat rows just above the picker
+    /// floor. Only that band is repainted on the next frame (the overlay
+    /// never reaches the separator, the input or the statusline), so an open
+    /// picker costs a few rows per keystroke instead of the whole screen.
+    pub(crate) fn overlay_painted_above_picker_floor(&mut self) {
+        let floor = usize::from(self.picker_floor_row());
+        let top = floor.saturating_sub(usize::from(PICKER_OVERLAY_MAX_ROWS));
+        let end = floor.min(self.painted_rows.len());
+        if top < end {
+            self.painted_rows[top..end].fill(UNKNOWN_ROW);
+        }
+        self.chat_dirty = true;
     }
 
     /// Forget the announced title activity: a suspended and resumed terminal
@@ -1871,8 +1907,6 @@ impl Renderer {
         // shrank, the terminal was resized); keep the offset inside the
         // scrollable range so the arithmetic below never underflows.
         self.scroll_offset = clamp_scroll_offset(self.scroll_offset, total, visible);
-        let mut stdout = frame_out!(self);
-        write!(stdout, "{}", Hide)?;
 
         let auto_scroll = self.scroll_offset == 0;
         let start = if auto_scroll {
@@ -1881,86 +1915,139 @@ impl Renderer {
             total.saturating_sub(self.scroll_offset + visible)
         };
         let start = start.min(total.saturating_sub(visible));
+        // Bottom-align: when auto-scrolling and content is shorter than the
+        // viewport, empty rows come first so content hugs the input area.
+        let pad = if auto_scroll && total < visible {
+            visible - total
+        } else {
+            0
+        };
+        let row_line = |row: usize| {
+            (row >= pad)
+                .then(|| start + row - pad)
+                .filter(|&i| i < total)
+        };
+        let selection = match (
+            self.selection_active,
+            self.selection_start,
+            self.selection_end,
+        ) {
+            (true, Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+        let selected_range = |line: usize| {
+            selection.and_then(|(a, b)| selection_byte_range(&buffer[line].text, line, a, b))
+        };
+        let indicator =
+            history_indicator(self.scroll_offset, total, visible).map(
+                |indicator| match indicator {
+                    HistoryIndicator::Scrolled(text) => (text, Color::DarkYellow),
+                    HistoryIndicator::Above(text) => (text, Color::DarkGrey),
+                },
+            );
 
-        let mut visual_row: u16 = 0;
-        let mut buf_idx = start;
+        // What each screen row shows, as a key: rows whose key matches the
+        // last painted frame are already on screen and are skipped.
+        let mut keys = std::mem::take(&mut self.row_keys_scratch);
+        keys.clear();
+        for row in 0..visible {
+            let mut state = std::collections::hash_map::DefaultHasher::new();
+            match row_line(row) {
+                Some(line) => {
+                    let entry = &buffer[line];
+                    2u8.hash(&mut state);
+                    entry.text.as_str().hash(&mut state);
+                    entry.color.hash(&mut state);
+                    if let Some(spans) = &entry.syntax_spans {
+                        for span in spans.iter() {
+                            (span.range.start, span.range.end, span.color).hash(&mut state);
+                        }
+                    }
+                    selected_range(line).hash(&mut state);
+                }
+                None => 1u8.hash(&mut state),
+            }
+            if row == 0 {
+                indicator.hash(&mut state);
+            }
+            keys.push(state.finish().max(1));
+        }
+        let geometry = hash_value((
+            cols,
+            visible,
+            self.chat_margin,
+            self.chat_bg,
+            self.monochrome,
+        ));
+        let mut painted = std::mem::take(&mut self.painted_rows);
+        if self.painted_geometry != Some(geometry) || painted.len() != visible {
+            painted.clear();
+            painted.resize(visible, UNKNOWN_ROW);
+        }
+        let shift = best_row_shift(&painted, &keys);
+        shift_rows(&mut painted, shift);
+        let dirty = (0..visible)
+            .filter(|&row| painted[row] != keys[row])
+            .count();
 
-        // Bottom-align: when auto-scrolling and content is shorter than viewport,
-        // render empty rows first so content hugs the input area.
-        if auto_scroll && total < visible {
-            let pad = visible - total;
-            for _ in 0..pad {
+        if shift != 0 || dirty > 0 {
+            let mut stdout = frame_out!(self);
+            write!(stdout, "{}", Hide)?;
+            if shift != 0 {
+                // Move the rows already on screen with the terminal's own
+                // scroll, confined to the chat rows, instead of repainting
+                // them; only the rows scrolled in are painted below.
+                write!(stdout, "{}", ResetColor)?;
+                write!(stdout, "\x1b[1;{visible}r")?;
+                let by = shift.unsigned_abs() as u16;
+                if shift > 0 {
+                    stdout.queue(crossterm::terminal::ScrollUp(by))?;
+                } else {
+                    stdout.queue(crossterm::terminal::ScrollDown(by))?;
+                }
+                write!(stdout, "\x1b[r")?;
+            }
+            for row in 0..visible {
+                if painted[row] == keys[row] {
+                    continue;
+                }
+                let visual_row = row as u16;
                 stdout.queue(MoveTo(0, visual_row))?;
                 if let Some(bg) = self.chat_bg {
                     write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
                 }
+                if let Some(line) = row_line(row) {
+                    let entry = &buffer[line];
+                    self.write_chat_margin(&mut stdout)?;
+                    write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
+                    paint_styled_row(&mut stdout, entry, selected_range(line), self.monochrome)?;
+                }
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
                 write!(stdout, "{}", ResetColor)?;
-                visual_row += 1;
+                if row == 0
+                    && let Some((text, color)) = &indicator
+                {
+                    let x = cols.saturating_sub(display_width(text) as u16);
+                    stdout.queue(MoveTo(x, 0))?;
+                    if let Some(bg) = self.chat_bg {
+                        write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                    }
+                    write!(stdout, "{}", SetForegroundColor(self.color(*color)))?;
+                    write!(stdout, "{}", text)?;
+                    write!(stdout, "{}", ResetColor)?;
+                }
             }
         }
-
-        while (visual_row as usize) < visible && buf_idx < total {
-            let entry = &buffer[buf_idx];
-            let chunk = &entry.text;
-
-            if (visual_row as usize) >= visible {
-                break;
-            }
-
-            stdout.queue(MoveTo(0, visual_row))?;
-
-            let selected = match (
-                self.selection_active,
-                self.selection_start,
-                self.selection_end,
-            ) {
-                (true, Some(a), Some(b)) => selection_byte_range(chunk, buf_idx, a, b),
-                _ => None,
-            };
-
-            if let Some(bg) = self.chat_bg {
-                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
-            }
-            self.write_chat_margin(&mut stdout)?;
-            write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-            paint_styled_row(&mut stdout, entry, selected, self.monochrome)?;
-            write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", ResetColor)?;
-
-            visual_row += 1;
-            buf_idx += 1;
-        }
-
-        while (visual_row as usize) < visible {
-            stdout.queue(MoveTo(0, visual_row))?;
-            if let Some(bg) = self.chat_bg {
-                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
-            }
-            write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", ResetColor)?;
-            visual_row += 1;
-        }
-
-        if let Some(indicator) = history_indicator(self.scroll_offset, total, visible) {
-            let (text, color) = match &indicator {
-                HistoryIndicator::Scrolled(text) => (text, Color::DarkYellow),
-                HistoryIndicator::Above(text) => (text, Color::DarkGrey),
-            };
-            let x = cols.saturating_sub(display_width(text) as u16);
-            stdout.queue(MoveTo(x, 0))?;
-            if let Some(bg) = self.chat_bg {
-                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
-            }
-            write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
-            write!(stdout, "{}", text)?;
-            write!(stdout, "{}", ResetColor)?;
-        }
+        painted.clear();
+        painted.extend_from_slice(&keys);
+        self.painted_rows = painted;
+        self.row_keys_scratch = keys;
+        self.painted_geometry = Some(geometry);
 
         #[cfg(test)]
         {
             OutputCounters::bump(&self.test_counters.viewport_paints, 1);
-            OutputCounters::bump(&self.test_counters.viewport_rows, visible);
+            OutputCounters::bump(&self.test_counters.viewport_rows, dirty);
         }
         trace.finish(self.frame_len() - frame_start);
         self.record_chat_drawn();
@@ -2032,6 +2119,7 @@ impl Renderer {
 
     fn clear_content_in_frame(&mut self) -> io::Result<()> {
         self.chat_dirty = true;
+        self.painted_geometry = None;
         self.feed.clear();
         self.scroll_offset = 0;
         self.clear_selection();
@@ -2048,8 +2136,9 @@ impl Renderer {
     pub fn resize(&mut self) {
         self.chat_dirty = true;
         // The terminal changed size: forget the cached geometry so this
-        // frame's layout queries it once.
+        // frame's layout queries it once, and repaint every chat row.
         self.cached_size.set(None);
+        self.painted_geometry = None;
         let visible = self.visible_lines();
         let max_offset = self.buffer_len().saturating_sub(visible);
         if self.scroll_offset > max_offset {
@@ -2685,6 +2774,89 @@ impl Renderer {
             snapshot.spinner_frame = drawn_frame;
         }
         self.restore_bottom_cursor()
+    }
+}
+
+/// Key of a chat row whose screen content is unknown (never painted, or
+/// overwritten by something outside the row tracking); row keys are never 0.
+const UNKNOWN_ROW: u64 = 0;
+
+/// Chat rows, counting up from the picker floor, that a picker overlay may
+/// cover: at most ten entries plus a header (the sessions picker's three
+/// header rows are the tallest), with margin. `picker_overlays_stay_in_band`
+/// pins the picker layouts to it.
+pub(crate) const PICKER_OVERLAY_MAX_ROWS: u16 = 16;
+
+/// The longest scroll `render_viewport` looks for between two frames.
+const MAX_ROW_SHIFT: usize = 64;
+
+/// The terminal scroll that best turns the `painted` rows into `next`:
+/// positive scrolls content up (rows appended at the bottom), negative down.
+/// A scroll is chosen only when it saves repainting at least two rows.
+/// Candidate shifts come from where a few anchor rows of one frame reappear
+/// in the other, so the search stays linear in the row count.
+fn best_row_shift(painted: &[u64], next: &[u64]) -> isize {
+    let rows = next.len();
+    let differing = |shift: isize| {
+        (0..rows)
+            .filter(|&row| {
+                let from = row as isize + shift;
+                let old = if (0..rows as isize).contains(&from) {
+                    painted[from as usize]
+                } else {
+                    UNKNOWN_ROW
+                };
+                old == UNKNOWN_ROW || old != next[row]
+            })
+            .count()
+    };
+    let mut best = (differing(0), 0isize);
+    if best.0 <= 1 || rows < 2 || painted.iter().all(|&key| key == UNKNOWN_ROW) {
+        return 0;
+    }
+    let mut candidates: Vec<isize> = Vec::new();
+    for anchor in [0, rows / 2, rows - 1] {
+        // Content scrolled up by k: next[anchor] was painted at anchor + k.
+        let up = painted
+            .iter()
+            .enumerate()
+            .filter(|&(row, &key)| row > anchor && key != UNKNOWN_ROW && key == next[anchor])
+            .map(|(row, _)| (row - anchor) as isize);
+        // Content scrolled down by k: painted[anchor] is now at anchor + k.
+        let down = next
+            .iter()
+            .enumerate()
+            .filter(|&(row, &key)| {
+                row > anchor && painted[anchor] != UNKNOWN_ROW && key == painted[anchor]
+            })
+            .map(|(row, _)| -((row - anchor) as isize));
+        candidates.extend(up.take(8));
+        candidates.extend(down.take(8));
+    }
+    for shift in candidates {
+        if shift.unsigned_abs() > MAX_ROW_SHIFT {
+            continue;
+        }
+        // The scroll itself costs about as much as one row.
+        let cost = differing(shift) + 1;
+        if cost < best.0 || (cost == best.0 && best.1 != 0 && shift.abs() < best.1.abs()) {
+            best = (cost, shift);
+        }
+    }
+    best.1
+}
+
+/// Apply a terminal scroll of `shift` rows (see [`best_row_shift`]) to the
+/// tracked screen rows; rows scrolled in are unknown.
+fn shift_rows(rows: &mut [u64], shift: isize) {
+    let by = shift.unsigned_abs().min(rows.len());
+    if shift > 0 {
+        rows.rotate_left(by);
+        let len = rows.len();
+        rows[len - by..].fill(UNKNOWN_ROW);
+    } else if shift < 0 {
+        rows.rotate_right(by);
+        rows[..by].fill(UNKNOWN_ROW);
     }
 }
 
@@ -4310,5 +4482,371 @@ mod paint_fast_path_tests {
                 .captured_output()
                 .contains("\x1b]8;;https://example.com/linked\x1b\\")
         );
+    }
+}
+
+#[cfg(test)]
+mod row_diff_tests {
+    use super::*;
+    use crate::ui::feed::BlockStyle;
+
+    /// A minimal terminal model for the sequences the renderer emits:
+    /// cursor moves, erase in line/display, scroll regions and scrolls.
+    /// Colors, cursor visibility, synchronized updates and OSC 8 are
+    /// ignored; cells hold one char each (tests use ASCII).
+    struct Screen {
+        rows: Vec<Vec<char>>,
+        cols: usize,
+        cursor: (usize, usize),
+        region: (usize, usize),
+    }
+
+    impl Screen {
+        fn new(cols: usize, rows: usize) -> Self {
+            Self {
+                rows: vec![vec![' '; cols]; rows],
+                cols,
+                cursor: (0, 0),
+                region: (0, rows - 1),
+            }
+        }
+
+        fn scroll(&mut self, up: bool, by: usize) {
+            let (top, bottom) = self.region;
+            for _ in 0..by {
+                if up {
+                    self.rows.remove(top);
+                    self.rows.insert(bottom, vec![' '; self.cols]);
+                } else {
+                    self.rows.remove(bottom);
+                    self.rows.insert(top, vec![' '; self.cols]);
+                }
+            }
+        }
+
+        fn feed(&mut self, bytes: &[u8]) {
+            let text = String::from_utf8_lossy(bytes);
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\x1b' {
+                    let (row, col) = self.cursor;
+                    if row < self.rows.len() && col < self.cols {
+                        self.rows[row][col] = c;
+                    }
+                    self.cursor.1 += 1;
+                    continue;
+                }
+                match chars.next() {
+                    Some('[') => {
+                        let mut params = String::new();
+                        let mut end = ' ';
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() {
+                                end = c;
+                                break;
+                            }
+                            params.push(c);
+                        }
+                        let nums: Vec<usize> = params
+                            .trim_start_matches('?')
+                            .split(';')
+                            .filter_map(|n| n.parse().ok())
+                            .collect();
+                        let n = |i: usize, default: usize| nums.get(i).copied().unwrap_or(default);
+                        match end {
+                            'H' => self.cursor = (n(0, 1) - 1, n(1, 1) - 1),
+                            'K' => {
+                                let (row, col) = self.cursor;
+                                let from = if n(0, 0) == 2 { 0 } else { col };
+                                for cell in self.rows[row].iter_mut().skip(from) {
+                                    *cell = ' ';
+                                }
+                            }
+                            'J' if n(0, 0) == 2 => {
+                                for row in &mut self.rows {
+                                    row.fill(' ');
+                                }
+                            }
+                            'r' if !params.starts_with('?') => {
+                                let rows = self.rows.len();
+                                self.region = (n(0, 1) - 1, n(1, rows) - 1);
+                                self.cursor = (0, 0);
+                            }
+                            'S' => self.scroll(true, n(0, 1)),
+                            'T' => self.scroll(false, n(0, 1)),
+                            _ => {}
+                        }
+                    }
+                    Some(']') => {
+                        // OSC: skip to ST (ESC \) or BEL.
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' {
+                                break;
+                            }
+                            if c == '\x1b' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn text(&self, rows: std::ops::Range<usize>) -> Vec<String> {
+            self.rows[rows]
+                .iter()
+                .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                .collect()
+        }
+    }
+
+    /// Bytes captured since `from`, appended to `screen`.
+    fn replay(renderer: &Renderer, screen: &mut Screen, from: &mut usize) {
+        let bytes = renderer.capture_bytes();
+        let bytes = bytes.lock().unwrap();
+        screen.feed(&bytes[*from..]);
+        *from = bytes.len();
+    }
+
+    /// What a fresh full repaint of the same state puts in the chat rows.
+    fn full_paint_text(renderer: &mut Renderer) -> Vec<String> {
+        let visible = renderer.visible_lines();
+        renderer.invalidate();
+        let start = renderer.capture_bytes().lock().unwrap().len();
+        renderer.render_viewport().unwrap();
+        let mut screen = Screen::new(180, 50);
+        let mut from = start;
+        replay(renderer, &mut screen, &mut from);
+        screen.text(0..visible)
+    }
+
+    fn rows_of(renderer: &mut Renderer, screen: &mut Screen, from: &mut usize) -> Vec<String> {
+        replay(renderer, screen, from);
+        screen.text(0..renderer.visible_lines())
+    }
+
+    #[test]
+    fn streaming_paints_bytes_proportional_to_the_changed_rows() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..100 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("history {line}"));
+        }
+        let mut screen = Screen::new(180, 50);
+        let mut from = 0;
+        renderer.render_viewport().unwrap();
+        replay(&renderer, &mut screen, &mut from);
+        renderer.feed_mut().push_streaming_block(BlockStyle::Agent);
+        let block = renderer.feed().block_count() - 1;
+        let mut worst = 0;
+        for token in 0..200 {
+            let text = if token % 7 == 6 {
+                format!("word{token}\n")
+            } else {
+                format!("word{token} ")
+            };
+            renderer.feed_mut().append_to(block, text);
+            let before = renderer.frame_stats();
+            renderer.render_viewport().unwrap();
+            let paint = renderer.frame_stats().since(before);
+            assert!(paint.viewport_rows <= 3, "token {token}: {paint:?}");
+            worst = worst.max(paint.bytes);
+        }
+        assert!(worst < 600, "a streamed paint wrote {worst} bytes");
+        let incremental = rows_of(&mut renderer, &mut screen, &mut from);
+        assert_eq!(incremental, full_paint_text(&mut renderer));
+    }
+
+    #[test]
+    fn scrolling_by_one_line_paints_only_the_rows_scrolled_in() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..200 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("line {line}"));
+        }
+        let mut screen = Screen::new(180, 50);
+        let mut from = 0;
+        renderer.render_viewport().unwrap();
+        for step in 0..5 {
+            renderer.scroll_line_up();
+            let before = renderer.frame_stats();
+            renderer.render_viewport().unwrap();
+            let paint = renderer.frame_stats().since(before);
+            // The row scrolled in, plus the top row that carries the
+            // scroll-position indicator.
+            assert!(paint.viewport_rows <= 2, "step {step}: {paint:?}");
+        }
+        for _ in 0..3 {
+            renderer.scroll_line_down();
+            let before = renderer.frame_stats();
+            renderer.render_viewport().unwrap();
+            assert!(renderer.frame_stats().since(before).viewport_rows <= 2);
+        }
+        let incremental = rows_of(&mut renderer, &mut screen, &mut from);
+        assert_eq!(incremental, full_paint_text(&mut renderer));
+    }
+
+    #[test]
+    fn a_selection_drag_paints_only_rows_whose_selection_changed() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..100 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("selectable line {line}"));
+        }
+        renderer.render_viewport().unwrap();
+        let first = renderer.buffer_line_at_row(10).unwrap();
+        renderer.selection_active = true;
+        renderer.selection_start = Some(SelectionPoint::new(first, 2));
+        renderer.selection_end = Some(SelectionPoint::new(first, 6));
+        let before = renderer.frame_stats();
+        renderer.render_viewport().unwrap();
+        assert_eq!(renderer.frame_stats().since(before).viewport_rows, 1);
+        // Extending the drag two rows down repaints those rows and the row
+        // whose selected columns grew.
+        renderer.selection_end = Some(SelectionPoint::new(first + 2, 4));
+        let before = renderer.frame_stats();
+        renderer.render_viewport().unwrap();
+        assert_eq!(renderer.frame_stats().since(before).viewport_rows, 3);
+        renderer.clear_selection();
+        let before = renderer.frame_stats();
+        renderer.render_viewport().unwrap();
+        assert_eq!(renderer.frame_stats().since(before).viewport_rows, 3);
+    }
+
+    #[test]
+    fn geometry_theme_and_invalidate_fall_back_to_a_full_repaint() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..100 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("row {line}"));
+        }
+        renderer.render_viewport().unwrap();
+        let visible = renderer.visible_lines();
+        let full = |renderer: &mut Renderer| {
+            let before = renderer.frame_stats();
+            renderer.render_viewport().unwrap();
+            renderer.frame_stats().since(before).viewport_rows
+        };
+        renderer.invalidate();
+        assert_eq!(full(&mut renderer), visible);
+        renderer.set_background_colors(Some(Color::Black), None, None);
+        assert_eq!(full(&mut renderer), visible);
+        renderer.set_monochrome(true);
+        assert_eq!(full(&mut renderer), visible);
+        renderer.resize();
+        assert_eq!(full(&mut renderer), visible);
+        // A taller input shrinks the viewport: a new geometry.
+        renderer.sync_input_height("one\ntwo\nthree").unwrap();
+        assert_eq!(full(&mut renderer), renderer.visible_lines());
+        // A frame whose write failed is repainted in full.
+        renderer.feed_mut().push_block(BlockStyle::Agent, "lost");
+        renderer.fail_next_write_for_test();
+        assert!(renderer.render_viewport().is_err());
+        assert_eq!(full(&mut renderer), renderer.visible_lines());
+    }
+
+    #[test]
+    fn best_row_shift_finds_scrolls_and_ignores_unknown_rows() {
+        let old = [10, 11, 12, 13, 14, 15];
+        assert_eq!(best_row_shift(&old, &[11, 12, 13, 14, 15, 16]), 1);
+        assert_eq!(best_row_shift(&old, &[12, 13, 14, 15, 16, 17]), 2);
+        assert_eq!(best_row_shift(&old, &[9, 10, 11, 12, 13, 14]), -1);
+        assert_eq!(best_row_shift(&old, &[10, 11, 12, 13, 14, 99]), 0);
+        assert_eq!(
+            best_row_shift(&[UNKNOWN_ROW; 6], &[11, 12, 13, 14, 15, 16]),
+            0
+        );
+        let mut rows = old;
+        shift_rows(&mut rows, 2);
+        assert_eq!(rows, [12, 13, 14, 15, UNKNOWN_ROW, UNKNOWN_ROW]);
+        let mut rows = old;
+        shift_rows(&mut rows, -1);
+        assert_eq!(rows, [UNKNOWN_ROW, 10, 11, 12, 13, 14]);
+    }
+}
+
+#[cfg(test)]
+mod picker_overlay_tests {
+    use super::*;
+    use crate::ui::feed::BlockStyle;
+
+    #[test]
+    fn picker_overlays_stay_in_band() {
+        for floor in [3u16, 12, 40] {
+            for reserved in [0u16, 1] {
+                for len in [1usize, 5, 50] {
+                    let window = crate::ui::pickers::picker_window(floor, reserved, len, len / 2);
+                    let top = window.top_row.saturating_sub(reserved);
+                    assert!(
+                        floor - top <= PICKER_OVERLAY_MAX_ROWS,
+                        "{floor} {reserved} {len}"
+                    );
+                }
+            }
+        }
+        // The sessions picker draws ten entries under a three-row header.
+        assert!(10 + 3 <= PICKER_OVERLAY_MAX_ROWS);
+    }
+
+    /// Rows a frame moved to column 0 of, from its `MoveTo(0, row)` sequences.
+    fn painted_rows(bytes: &[u8]) -> Vec<u16> {
+        let text = String::from_utf8_lossy(bytes);
+        text.split("\x1b[")
+            .filter_map(|part| {
+                let (position, _) = part.split_once('H')?;
+                let (row, col) = position.split_once(';')?;
+                (col == "1").then_some(())?;
+                row.parse::<u16>().ok().map(|row| row - 1)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_keystroke_under_an_open_picker_repaints_only_the_overlay_band() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..200 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("transcript line {line}"));
+        }
+        let refresh = |renderer: &mut Renderer, input: &str| {
+            renderer
+                .frame(|r| {
+                    r.sync_input_height(input)?;
+                    r.render_viewport()?;
+                    r.draw_bottom(input, input.len(), &[], 0, false)
+                })
+                .unwrap();
+        };
+        refresh(&mut renderer, "/");
+        let floor = renderer.picker_floor_row();
+        // Each keystroke: the picker draws its overlay, then the next frame.
+        for input in ["/h", "/he", "/hel"] {
+            renderer.overlay_painted_above_picker_floor();
+            renderer.restore_bottom_cursor().unwrap();
+            let start = renderer.capture_bytes().lock().unwrap().len();
+            let before = renderer.frame_stats();
+            refresh(&mut renderer, input);
+            let frame = renderer.frame_stats().since(before);
+            assert!(
+                frame.viewport_rows <= usize::from(PICKER_OVERLAY_MAX_ROWS),
+                "{frame:?}"
+            );
+            assert!(frame.bytes < 4096, "{frame:?}");
+            let bytes = renderer.capture_bytes().lock().unwrap()[start..].to_vec();
+            let band_top = floor - PICKER_OVERLAY_MAX_ROWS;
+            for row in painted_rows(&bytes) {
+                assert!(
+                    row >= band_top,
+                    "row {row} above the overlay band was rewritten"
+                );
+            }
+        }
     }
 }

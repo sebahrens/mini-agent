@@ -225,10 +225,10 @@ pub(crate) fn refresh_display(
         if was_active {
             // Drawing the list moved the caret; put it back in the input.
             renderer.restore_bottom_cursor()?;
-            // The picker painted over the chat and bottom regions, which the
-            // dirty-region tracking cannot see; force a full repaint next
-            // frame so a closing picker never leaves remnants behind.
-            renderer.invalidate();
+            // The picker painted over chat rows just above its floor, which
+            // the row tracking cannot see; repaint that band next frame so a
+            // closing picker never leaves remnants behind.
+            renderer.overlay_painted_above_picker_floor();
         }
     }
     Ok(())
