@@ -28,6 +28,11 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
 }
 
 pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+    #[cfg(feature = "subagents")]
+    let snapshot = super::background_observation::SharedObservations::capture(session)
+        .map(|observations| observations.frozen_session(session));
+    #[cfg(feature = "subagents")]
+    let session = snapshot.as_ref().unwrap_or(session);
     session.validate_user_messages()?;
     anyhow::ensure!(
         session.messages.len() <= MAX_SESSION_MESSAGES,

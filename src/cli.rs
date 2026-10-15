@@ -1316,6 +1316,12 @@ impl Cli {
             "js",
             #[cfg(feature = "subagents")]
             "task",
+            #[cfg(feature = "subagents")]
+            "task_result",
+            #[cfg(feature = "subagents")]
+            "task_list",
+            #[cfg(feature = "subagents")]
+            "task_cancel",
             #[cfg(feature = "memory")]
             "memory_write",
             #[cfg(feature = "memory")]

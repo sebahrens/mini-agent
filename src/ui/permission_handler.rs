@@ -221,6 +221,20 @@ impl PermissionState {
         Ok(state)
     }
 
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_for(&self, session: &crate::session::Session) -> bool {
+        self.request
+            .as_ref()
+            .and_then(|r| r.background.as_ref())
+            .is_some_and(|origin| origin.valid(session))
+    }
+    #[cfg(feature = "subagents")]
+    pub(crate) fn stale_background(&self, session: &crate::session::Session) -> bool {
+        self.request
+            .as_ref()
+            .and_then(|r| r.background.as_ref())
+            .is_some_and(|origin| !origin.valid(session))
+    }
     pub(crate) fn abandoned(&self) -> bool {
         self.origin_valid.as_ref().is_some_and(|valid| !valid())
             || self

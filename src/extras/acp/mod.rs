@@ -176,6 +176,15 @@ impl SessionHistory {
         F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
         Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
     {
+        #[cfg(feature = "subagents")]
+        let _background_pause = if self.needs_compaction() {
+            match &self.session.background_pool {
+                Some(pool) => Some(pool.pause_for_history().await.ok()?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut usage = crate::event::UsageDelta::default();
         #[cfg(feature = "goal")]
         if let Some(goal) = goal_store {
@@ -1278,6 +1287,19 @@ async fn connect_agent(
     } else {
         builder.connect_to(transport).await
     };
+    #[cfg(feature = "subagents")]
+    {
+        let pools = state
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter_map(|session| session.spend.background_pool())
+            .collect::<Vec<_>>();
+        for pool in pools {
+            pool.close().await;
+        }
+    }
     state.idle.wait_settled().await;
     result
 }
@@ -1362,6 +1384,8 @@ async fn handle_new_session(
         workspace,
         canonical,
         lease,
+        #[cfg(feature = "subagents")]
+        BackgroundSessionClient::Protocol(cx.clone()),
         #[cfg(feature = "mcp")]
         client_mcp_servers,
     )
@@ -1372,6 +1396,63 @@ async fn handle_new_session(
     responder.respond(resp)
 }
 
+#[cfg(feature = "subagents")]
+fn install_background_ask_factory(
+    pool: &Arc<crate::extras::subagents::background::Pool>,
+    state: &AcpState,
+    cx: ConnectionTo<Client>,
+    session_id: &SessionId,
+    policy: &policy::SessionPolicy,
+) -> Result<(), agent_client_protocol::Error> {
+    {
+        let cx = cx.clone();
+        let idle = state.idle.clone();
+        let policy = policy.clone();
+        let id = session_id.clone();
+        pool.install_ask_factory(Arc::new(move |permission, scope| {
+            let activity = idle
+                .admit()
+                .map_err(|_| "ACP client is retiring".to_string())?;
+            let (sender, receiver) = tokio::sync::mpsc::channel(32);
+            let control = Arc::new(TurnControl::new());
+            let cancel = control.clone();
+            let bridge = drive_permission_bridge(
+                cx.clone(),
+                idle::Activity::default(),
+                id.clone(),
+                receiver,
+                control,
+                Some(BridgePolicy {
+                    policy: policy.clone(),
+                    permission,
+                }),
+                #[cfg(feature = "goal")]
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            );
+            let future = activity.track(async move {
+                tokio::pin!(bridge);
+                tokio::select! {
+                    _ = scope.cancelled() => { cancel.cancel(); bridge.await; }
+                    () = &mut bridge => {}
+                }
+            });
+            Ok(crate::extras::subagents::background::PreparedAsk {
+                sender,
+                future: Box::pin(future),
+            })
+        }))
+        .map_err(|error| agent_client_protocol::Error::new(-32603, error))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "subagents")]
+enum BackgroundSessionClient {
+    Protocol(ConnectionTo<Client>),
+    #[cfg(all(test, feature = "goal"))]
+    Unconnected,
+}
+
 /// Install one canonical data owner with entirely fresh runtime authority.
 async fn install_session(
     state: &AcpState,
@@ -1379,6 +1460,7 @@ async fn install_session(
     workspace: Arc<crate::paths::WorkspaceBinding>,
     mut canonical: crate::session::Session,
     lease: Arc<SessionLease>,
+    #[cfg(feature = "subagents")] client: BackgroundSessionClient,
     #[cfg(feature = "mcp")] client_mcp_servers: ClientMcpServers,
 ) -> Result<Option<SessionModeState>, agent_client_protocol::Error> {
     let sandbox = acp_session_sandbox(state, workspace.clone())?;
@@ -1462,6 +1544,16 @@ async fn install_session(
         authority.mode,
         authority.tools_enabled && authority.permission_checks_enabled,
     );
+    #[cfg(feature = "subagents")]
+    match client {
+        BackgroundSessionClient::Protocol(cx) => {
+            if let Some(pool) = spend.background_pool() {
+                install_background_ask_factory(&pool, state, cx, &session_id, &policy)?;
+            }
+        }
+        #[cfg(all(test, feature = "goal"))]
+        BackgroundSessionClient::Unconnected => {}
+    }
     let modes = policy.modes();
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
     let pending_question = canonical.pending_question.clone();
@@ -1742,6 +1834,17 @@ async fn handle_set_session_mode(
         .workspace
         .validate()
         .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    #[cfg(feature = "subagents")]
+    if session
+        .spend
+        .background_pool()
+        .is_some_and(|pool| pool.active_count() > 0)
+    {
+        return Err(agent_client_protocol::Error::new(
+            -32000,
+            "cancel or finish background tasks before changing permission mode",
+        ));
+    }
     let history = session
         .history
         .try_lock()
@@ -1781,11 +1884,21 @@ async fn handle_close_session(
         }
     }
 
-    {
+    let removed = {
         let mut sessions = state.sessions.lock().await;
-        sessions.remove(session_id);
+        let removed = sessions.remove(session_id);
         state.idle.sessions_changed(sessions.len());
+        removed
+    };
+    #[cfg(feature = "subagents")]
+    if let Some(pool) = removed
+        .as_ref()
+        .and_then(|session| session.spend.background_pool())
+    {
+        pool.close().await;
     }
+    #[cfg(not(feature = "subagents"))]
+    drop(removed);
 
     responder.respond(CloseSessionResponse::new())
 }
@@ -3898,9 +4011,9 @@ async fn relay_paused_runner(
     plan_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let mut paused_runner = paused_runner;
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let notices = paused_runner.take_hook_context();
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
@@ -3925,7 +4038,7 @@ async fn relay_paused_runner(
         usage_provider,
     )
     .await;
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let outcome = {
         let mut outcome = outcome;
         if !notices.is_empty() {
@@ -5416,6 +5529,8 @@ mod protocol_tests {
             binding,
             saved,
             lease,
+            #[cfg(feature = "subagents")]
+            BackgroundSessionClient::Unconnected,
             #[cfg(feature = "mcp")]
             Default::default(),
         )
@@ -5819,6 +5934,160 @@ mod protocol_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn background56_actual_acp_permission_after_parent_done_and_close_joins_child() {
+        use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode};
+        let root = crate::tests::OwnedTestDirectory::new("background56-acp-permission");
+        let bindings = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
+        for selected in ["allow_once", "deny_once", "cancelled"] {
+            let state = fixture_state(Arc::new(|_, _| {
+                Box::pin(async { Ok(vec![done("parent complete", Vec::new())]) })
+            }));
+            let retained = state.clone();
+            let captured = state.clone();
+            let cwd = root.path().to_path_buf();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_calls = calls.clone();
+            let work = Client
+                .builder()
+                .on_receive_notification(
+                    async |_: SessionNotification, _cx| Ok(()),
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_request(
+                    move |request: RequestPermissionRequest,
+                          responder: Responder<RequestPermissionResponse>,
+                          _cx| {
+                        observed_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        async move {
+                            assert!(
+                                request
+                                    .options
+                                    .iter()
+                                    .any(|o| o.option_id == PermissionOptionId::new("allow_once"))
+                            );
+                            let outcome = if selected == "cancelled" {
+                                RequestPermissionOutcome::Cancelled
+                            } else {
+                                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                    selected,
+                                ))
+                            };
+                            responder.respond(RequestPermissionResponse::new(outcome))
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(InMemoryAgent(state), async move |cx| {
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let sid = cx
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?
+                        .session_id;
+                    let response = cx
+                        .send_request(prompt(sid.clone(), "parent boundary"))
+                        .block_task()
+                        .await?;
+                    assert_eq!(response.stop_reason, StopReason::EndTurn);
+                    let (run, pool, workspace, recorder) = {
+                        let sessions = captured.sessions.lock().await;
+                        let session = &sessions[&sid];
+                        let history = session.history.lock().await;
+                        assert!(lock_unpoisoned(&session.turns).queue.is_empty());
+                        (
+                            session.spend.clone(),
+                            session.spend.background_pool().unwrap(),
+                            session.workspace.clone(),
+                            history
+                                .session
+                                .file_checkpoints
+                                .recorder(&history.session.id, 0, true),
+                        )
+                    };
+                    let permission = Some(Arc::new(StdMutex::new(
+                        crate::permission::checker::PermissionChecker::new(
+                            &PermissionConfigs::from(PermissionConfig {
+                                default: Some(Action::Ask),
+                                ..Default::default()
+                            }),
+                            SecurityMode::Standard,
+                            Some(workspace.root().into()),
+                            None,
+                        )
+                        .unwrap(),
+                    )));
+                    let mut admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+                    let ask = admission.prepare_ask(permission.clone(), None).unwrap();
+                    let (observed, decision) = tokio::sync::oneshot::channel();
+                    let id = admission
+                        .start(
+                            async move {
+                                let result = crate::agent::tools::check_perm(
+                                    &permission,
+                                    &ask,
+                                    "read",
+                                    "owned.txt",
+                                )
+                                .await;
+                                observed.send(result.is_ok()).unwrap();
+                                // This is real session lifetime work, not a turn waiter.
+                                std::future::pending::<Result<String, String>>().await
+                            },
+                            run,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(3), decision)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        selected == "allow_once"
+                    );
+                    assert_eq!(pool.active_count(), 1);
+                    cx.send_request(CloseSessionRequest::new(sid.clone()))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pool.active_count(), 0);
+                    assert_eq!(
+                        pool.result(&id).unwrap().status,
+                        crate::extras::subagents::background::Status::Cancelled
+                    );
+                    assert!(!captured.sessions.lock().await.contains_key(&sid));
+                    Ok(())
+                });
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work)).await;
+            let pools = retained
+                .sessions
+                .lock()
+                .await
+                .values()
+                .filter_map(|s| s.spend.background_pool())
+                .collect::<Vec<_>>();
+            for pool in pools {
+                pool.close().await;
+            }
+            retained_wait_for_fixture_cleanup(&retained).await;
+            match result {
+                Ok(result) => result.unwrap(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        }
+    }
+
     #[tokio::test]
     async fn acp53_actual_permission_selections_rebuild_only_the_selected_session_choice() {
         use crate::permission::{
@@ -5883,6 +6152,8 @@ mod protocol_tests {
                     ask_tx
                         .send(
                             AskRequest {
+                                #[cfg(feature = "subagents")]
+                                background: None,
                                 tool: "write".into(),
                                 input,
                                 tool_call_id: Some("current".into()),
@@ -5992,6 +6263,8 @@ mod protocol_tests {
                 ask_tx
                     .send(
                         AskRequest {
+                            #[cfg(feature = "subagents")]
+                            background: None,
                             agent_name: None,
                             tool: "write".into(),
                             input: requested.to_owned(),
@@ -6051,6 +6324,8 @@ mod protocol_tests {
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let (descendants, exact) = crate::permission::pattern::search_root_allow_scope("/repo");
         let ask = crate::permission::ask::AskRequest {
+            #[cfg(feature = "subagents")]
+            background: None,
             agent_name: None,
             tool: "grep".into(),
             input: "/repo".to_owned(),
@@ -6072,6 +6347,8 @@ mod protocol_tests {
 
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let shell = crate::permission::ask::AskRequest {
+            #[cfg(feature = "subagents")]
+            background: None,
             agent_name: None,
             tool: "shell".into(),
             input: "rm -rf *".to_owned(),
@@ -6150,6 +6427,8 @@ mod protocol_tests {
                         let send_ask = |name: &str| {
                             let (reply, receiver) = tokio::sync::oneshot::channel();
                             let ask = AskRequest {
+                                #[cfg(feature = "subagents")]
+                                background: None,
                                 agent_name: None,
                                 tool: "shell".into(),
                                 input: name.to_owned(),

@@ -797,3 +797,14 @@ inventories. The Copilot protocol fixtures' eight `JoinSet` actors are likewise
 and is joined on completion or explicitly aborted and drained for cancellation
 controls. The retained `JoinSet` aborts remaining actors on unwinding. No process
 constructor, macro exemption, shell, or credential executable is introduced.
+
+Background Task status notices and the saved-status fixture in
+`src/extras/subagents/background.rs` are application data, bound to two exact
+macro-token digests. The second `Ok("first")` Task fixture output is likewise
+NON-PROCESS. These entries do not change the subprocess scanner or its negative
+controls. Background jobs use existing scoped async actors, not new subprocess
+constructors.
+
+The cancellation/lane fixture's two `old retired` / `next retired` output fields
+are exact NON-PROCESS data entries. Its registered blocking operations mutate
+only the owned fixture file and join before root cleanup. No scanner changes.

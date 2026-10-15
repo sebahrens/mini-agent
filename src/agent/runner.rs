@@ -782,6 +782,13 @@ impl AgentWorkScope {
         AGENT_WORK_SCOPE.scope(Arc::clone(self), future).await
     }
 
+    /// Synchronous registration under an existing owner. Background admission
+    /// holds its closing lock through registration without an async gap.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn run_sync<T>(self: &Arc<Self>, operation: impl FnOnce() -> T) -> T {
+        AGENT_WORK_SCOPE.sync_scope(Arc::clone(self), operation)
+    }
+
     pub(crate) fn cancellation_handle(self: &Arc<Self>) -> AgentWorkCancellation {
         AgentWorkCancellation {
             scope: Arc::clone(self),
@@ -900,6 +907,24 @@ impl AgentRunCleanupGuard {
             armed: true,
             retained: None,
         }
+    }
+
+    /// A child effect scope retains its permits and an exact parent work
+    /// registration through settlement, including cancellation/unwinding.
+    /// The existing cleanup waiter owns this tuple; no new detached owner is
+    /// introduced and the parent cannot report idle before the child retires.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn auxiliary_child<T: Send + 'static>(
+        scope: Arc<AgentWorkScope>,
+        retained: T,
+    ) -> Result<Self, &'static str> {
+        let parent = AGENT_WORK_SCOPE
+            .try_with(|parent| parent.register())
+            .map_err(|_| "subagent child has no parent work owner")?;
+        let mut cleanup = Self::auxiliary(scope);
+        // Release the permits before the final parent-idle notification.
+        cleanup.retain_until_settled((retained, parent));
+        Ok(cleanup)
     }
 
     /// Keep an existing lease or ticket in this guard's existing settlement
@@ -1111,7 +1136,7 @@ pub(crate) fn current_headless_diagnostics() -> Option<(
 
 /// Parent-local ownership for hook work crossing the JS permission receiver.
 /// This reference is never serialized or passed into a worker.
-#[cfg(all(feature = "hooks", feature = "js"))]
+#[cfg(any(all(feature = "hooks", feature = "js"), feature = "subagents"))]
 pub(crate) fn current_hook_work_scope() -> Option<Arc<AgentWorkScope>> {
     AGENT_WORK_SCOPE.try_with(Arc::clone).ok()
 }
@@ -1155,8 +1180,12 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 pub(crate) struct PausedAgentRunner {
     runner: AgentRunner,
     /// Canonical context is adopted by the frontend before releasing start.
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     hook_context: Vec<String>,
+    #[cfg(feature = "subagents")]
+    background_notice: Option<crate::extras::subagents::background::NoticeLease>,
+    #[cfg(feature = "subagents")]
+    context_taken: bool,
     start_tx: tokio::sync::oneshot::Sender<()>,
     #[cfg(any(test, feature = "acp"))]
     work_scope: Arc<AgentWorkScope>,
@@ -1170,22 +1199,30 @@ impl PausedAgentRunner {
     ) -> Self {
         Self {
             runner,
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             hook_context: Vec::new(),
+            #[cfg(feature = "subagents")]
+            background_notice: None,
+            #[cfg(feature = "subagents")]
+            context_taken: false,
             start_tx,
             #[cfg(any(test, feature = "acp"))]
             work_scope,
         }
     }
 
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     pub(crate) fn with_hook_context(mut self, notices: Vec<String>) -> Self {
         self.hook_context = notices;
         self
     }
 
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     pub(crate) fn take_hook_context(&mut self) -> Vec<String> {
+        #[cfg(feature = "subagents")]
+        {
+            self.context_taken = true;
+        }
         std::mem::take(&mut self.hook_context)
     }
 
@@ -1195,8 +1232,26 @@ impl PausedAgentRunner {
         self.work_scope.cancellation_handle()
     }
 
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_background_notice(
+        mut self,
+        notice: Option<crate::extras::subagents::background::NoticeLease>,
+    ) -> Self {
+        self.background_notice = notice;
+        self
+    }
+
     pub(crate) fn start(self) -> AgentRunner {
-        let _ = self.start_tx.send(());
+        let started = self.start_tx.send(()).is_ok();
+        #[cfg(not(feature = "subagents"))]
+        let _ = started;
+        #[cfg(feature = "subagents")]
+        if started
+            && self.context_taken
+            && let Some(notice) = self.background_notice
+        {
+            notice.acknowledge();
+        }
         self.runner
     }
 

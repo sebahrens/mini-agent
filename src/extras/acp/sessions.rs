@@ -236,6 +236,8 @@ pub(super) async fn handle_load(
         workspace,
         session,
         lease,
+        #[cfg(feature = "subagents")]
+        super::BackgroundSessionClient::Protocol(cx.clone()),
         #[cfg(feature = "mcp")]
         client_mcp_servers,
     )

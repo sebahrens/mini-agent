@@ -613,6 +613,8 @@ async fn handle_ask_inner(
     crate::permission::ask::send_permission_request(
         ask_tx,
         AskRequest {
+            #[cfg(feature = "subagents")]
+            background: None,
             agent_name: crate::permission::ask::subagent_name(),
             tool: CompactString::new(tool),
             input: input.to_string(),

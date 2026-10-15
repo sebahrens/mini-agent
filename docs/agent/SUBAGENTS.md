@@ -47,6 +47,46 @@ Task-specific schema/provenance adapters and reasoning-budget accounting follow
 the `subagents` feature; portable metadata and provider tests retain their helpers.
 Main-agent definition loading remains available when subagents are disabled.
 
+## Background tasks
+
+Set `run_in_background: true` on an ordinary `task` call to return a task ID
+immediately. The same persona, tools, permission checks, deadlines, captured
+prices and session cost cap apply. The session keeps at most 32 tasks, including
+finished reports; start a new session when that bounded history is full.
+Foreground and background children share the configured concurrency ceiling,
+and write-enabled children across batches share one write lane. Both permits stay
+owned through actual child-effect retirement, including cancellation, so a queued
+child cannot overlap a still-retiring write. Admission checks
+captured spend and workspace identity again after waiting for that lane.
+
+Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
+agent, or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
+Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
+`cancelling` until the actual model, approvals and effects settle. The default
+`background_tasks` footer item shows active tasks and reports awaiting delivery.
+The next admitted main turn receives one literal completion notice; an abandoned
+preparation keeps it pending. Notices contain status/ID only and grant no authority.
+
+Jobs outlive the foreground turn, including while a new native Anthropic prompt
+runs. Their approvals remain ordinary TUI/ACP requests belonging to the exact
+live session/job scope. Closing the session or process frontend cancels and joins
+owned jobs before releasing services and workspace owners. Rewind/clear/undo stop
+old jobs before changing their launch history. A saved entry is **data only**:
+there is no deserialized task, grant or resumable handle, and entries last saved
+as active are shown as `interrupted` after restart. Reports are capped at 256 KiB
+in memory and 16 KiB per saved entry; no report path is dereferenced on import.
+
+`subagents::background` owns the pool, and `session::background_observation`
+tracks private runtime provenance for the shared account, file checkpoints and
+status history. Native publication retains its full Session digest plus exact old
+snapshots. Only same-store, same-pool, monotonic observations from admitted jobs
+may enter the next ordinary publication. Transcript/pricing edits, replaced or
+imported owners, expired jobs, and unattributed changes still refuse. Paid receipt
+ACKs are attributed to their originating job; numerical cost growth alone is
+never authority. One fixed Account → checkpoints → task-history lock order makes
+saved shared snapshots coherent. Background checkpoint recorders keep their launch
+row when foreground steering advances.
+
 ## The `task` Tool
 
 The main agent has a new tool called `task`. It accepts:

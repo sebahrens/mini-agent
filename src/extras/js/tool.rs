@@ -638,6 +638,8 @@ async fn resolve_permission(
             if crate::permission::ask::send_permission_request(
                 &ask_tx,
                 AskRequest {
+                    #[cfg(feature = "subagents")]
+                    background: None,
             agent_name: crate::permission::ask::subagent_name(),
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),

@@ -51,6 +51,8 @@ pub struct TaskArgs {
     /// Recognized names correspond to the resolved embedded, user-global, and
     /// project agent definitions. Unknown names are rejected.
     pub agent_type: Option<String>,
+    /// Return a session-owned job ID instead of waiting for the child batch.
+    pub run_in_background: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -77,6 +79,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
             briefs: Option<Vec<TaskBrief>>,
             #[serde(default)]
             agent_type: Option<String>,
+            #[serde(default)]
+            run_in_background: bool,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
@@ -99,11 +103,13 @@ impl<'de> Deserialize<'de> for TaskArgs {
                 prompts: raw.prompts.unwrap_or_default(),
                 briefs: None,
                 agent_type: raw.agent_type,
+                run_in_background: raw.run_in_background,
             }),
             (false, true) => Ok(Self {
                 prompts: Vec::new(),
                 briefs: raw.briefs,
                 agent_type: raw.agent_type,
+                run_in_background: raw.run_in_background,
             }),
             // Neither form is populated. Keep a present-but-empty field so
             // `TaskTool::call` reports the specific validation failure.
@@ -112,11 +118,13 @@ impl<'de> Deserialize<'de> for TaskArgs {
                     prompts,
                     briefs: None,
                     agent_type: raw.agent_type,
+                    run_in_background: raw.run_in_background,
                 }),
                 (None, Some(briefs)) => Ok(Self {
                     prompts: Vec::new(),
                     briefs: Some(briefs),
                     agent_type: raw.agent_type,
+                    run_in_background: raw.run_in_background,
                 }),
                 _ => Err(serde::de::Error::custom(TASK_MISSING_HANDOFF_ERROR)),
             },
@@ -663,6 +671,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                     },
                     "description": "Structured handoffs for independent subagents. Each gives an objective plus optional file scope hints, constraints, and expected content. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
                 },
+                "run_in_background": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Return a job id immediately. The job belongs to this session, shares its budget and permissions, and can be inspected with task_result or /tasks."
+                },
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
@@ -814,6 +827,37 @@ editing in a known location, grepping for a literal you will act on immediately.
             input_price,
         )
         .multipliers(input_price);
+        let parent_run = crate::spend::run::Run::current();
+        let task_pool = parent_run
+            .as_ref()
+            .and_then(crate::spend::run::Run::background_pool);
+        let mut admission = if args.run_in_background {
+            let pool = task_pool.as_ref().ok_or_else(|| {
+                ToolError::Msg("task: background work requires the owning session runtime".into())
+            })?;
+            let recorder = crate::session::file_checkpoints::current().ok_or_else(|| {
+                ToolError::Msg(
+                    "task: background work requires the captured turn checkpoint owner".into(),
+                )
+            })?;
+            Some(
+                pool.reserve(
+                    self.workspace.as_ref().ok_or_else(|| {
+                        ToolError::Msg(
+                            "task: background work requires the parent's captured workspace".into(),
+                        )
+                    })?,
+                    parent_run.as_ref().expect("owning pool has Run"),
+                    &recorder,
+                )
+                .map_err(|error| ToolError::Msg(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let observation = admission
+            .as_ref()
+            .map(super::background::Admission::observation);
         let spend_profile = crate::spend::run::Run::current().map(|run| {
             run.for_model(
                 &runtime.provider_name,
@@ -828,13 +872,23 @@ editing in a known location, grepping for a literal you will act on immediately.
                 crate::spend::RequestKind::Subagent,
             )
         });
+        let spend_profile = spend_profile.map(|run| match &observation {
+            Some(observation) => run.with_background_observation(observation.clone()),
+            None => run,
+        });
         let specialization = specialization.map(|resolved| resolved.prompt);
         let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
         let cache_split_required = config.native_cache_split_required(&runtime.model_name);
         let reasoning_exclusive =
             config.reasoning_tokens_are_exclusive_of_output(&runtime.provider_name);
 
-        let subagent_event_tx = clone_subagent_event_tx();
+        // A session job must not retain the foreground event channel: that
+        // channel's closure is part of parent-turn retirement.
+        let subagent_event_tx = if args.run_in_background {
+            None
+        } else {
+            clone_subagent_event_tx()
+        };
         if let Some(event_tx) = &subagent_event_tx {
             let source = permission_source
                 .as_deref()
@@ -854,9 +908,15 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(feature = "js")]
         let read_only_js = self.read_only_js.clone();
 
+        let child_ask = match admission.as_mut() {
+            Some(admission) => admission
+                .prepare_ask(self.permission.clone(), self.ask_tx.clone())
+                .map_err(ToolError::Msg)?,
+            None => self.ask_tx.clone(),
+        };
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),
-            self.ask_tx.clone(),
+            child_ask,
             self.deny_repeated_reads,
         )
         .with_workspace_binding(self.workspace.clone())
@@ -873,10 +933,14 @@ editing in a known location, grepping for a literal you will act on immediately.
         } else {
             authorization
         };
+        let lane_workspace = self.workspace.clone();
+        let pool_weak = task_pool.as_ref().map(Arc::downgrade);
+        let background_run = parent_run.clone();
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let spend_profile = spend_profile
                 .as_ref()
                 .map(crate::spend::run::Run::for_invocation);
+            let admission_run = spend_profile.clone();
             let client = runtime.client.clone();
             let model_name = runtime.model_name.clone();
             let max_turns = runtime.max_turns;
@@ -886,6 +950,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let architecture = architecture.clone();
             let config = config.clone();
             let authorization = authorization.clone();
+            let lane_workspace = lane_workspace.clone();
             #[cfg(feature = "skills")]
             let skill_services = skill_services
                 .as_ref()
@@ -1046,15 +1111,38 @@ editing in a known location, grepping for a literal you will act on immediately.
                 );
                 ChildExecution { output, cost_units }
             });
-            let future = Box::pin(crate::permission::ask::scope_subagent(
+            let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
                 child_name, write_mode, future,
             ));
+            let future = shared_child_lane(
+                future,
+                pool_weak.clone(),
+                write_mode,
+                lane_workspace,
+                admission_run,
+            );
             ScheduledChild {
                 future,
                 cancellation_cost,
             }
         });
 
+        if let Some(admission) = admission {
+            let id = admission
+                .start(
+                    async move {
+                        let report = execute_tasks(prompts, limits, executor, result_notice).await;
+                        let failed = report.stop_reason.is_some();
+                        let text = report.render();
+                        if failed { Err(text) } else { Ok(text) }
+                    },
+                    background_run.expect("admitted owning Run"),
+                )
+                .map_err(|error| ToolError::Msg(error.to_string()))?;
+            return Ok(format!(
+                "Background task started: {id}. Use task_result with this id, or /tasks to list or cancel it."
+            ));
+        }
         let report = execute_tasks(prompts, limits, executor, result_notice).await;
         Ok(report.render())
     }
@@ -1076,6 +1164,67 @@ fn merge_forced_continuation_run(
 }
 
 type ChildFuture = Pin<Box<dyn Future<Output = ChildExecution> + Send>>;
+fn shared_child_lane(
+    child: ChildFuture,
+    pool: Option<std::sync::Weak<super::background::Pool>>,
+    write_mode: bool,
+    workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    admission_run: Option<crate::spend::run::Run>,
+) -> ChildFuture {
+    let Some(pool) = pool else {
+        return child;
+    };
+    Box::pin(async move {
+        let result = async {
+            let (concurrency, write_lane) = {
+                let pool = pool
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("background session closed"))?;
+                (pool.concurrency.clone(), pool.write_lane.clone())
+            };
+            let concurrency = concurrency.acquire_owned().await?;
+            let write = if write_mode {
+                Some(write_lane.acquire_owned().await?)
+            } else {
+                None
+            };
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary_child(
+                scope.clone(),
+                (concurrency, write),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let result = scope
+                .run(async {
+                    {
+                        let pool = pool
+                            .upgrade()
+                            .ok_or_else(|| anyhow::anyhow!("background session closed"))?;
+                        pool.ensure_open()?;
+                        if let Some(workspace) = &workspace {
+                            pool.validate_workspace(workspace)?;
+                        }
+                    }
+                    if let Some(run) = admission_run {
+                        run.prepare().await?;
+                    }
+                    Ok::<_, anyhow::Error>(child.await)
+                })
+                .await;
+            cleanup.settle().await;
+            result
+        }
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(error) => ChildExecution {
+                output: Err(format!("subagent admission refused: {error}")),
+                cost_units: 0,
+            },
+        }
+    })
+}
+
 type IndexedChildFuture = Pin<Box<dyn Future<Output = (usize, ChildExecution)> + Send>>;
 type CancellationCost = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -2070,6 +2219,7 @@ mod tests {
                 expected_sections: vec!["attack path".into()],
             }]),
             agent_type: None,
+            run_in_background: false,
         };
 
         let prompts = prepare_task_prompts(&args, limits()).unwrap();
@@ -2089,6 +2239,7 @@ mod tests {
             prompts: Vec::new(),
             briefs: Some(Vec::new()),
             agent_type: None,
+            run_in_background: false,
         };
         assert!(prepare_task_prompts(&empty, limits()).is_err());
 
@@ -2101,6 +2252,7 @@ mod tests {
                 expected_sections: Vec::new(),
             }]),
             agent_type: None,
+            run_in_background: false,
         };
         let error = prepare_task_prompts(&oversized, limits()).unwrap_err();
         assert!(error.to_string().contains("files item 1"));
@@ -2123,6 +2275,7 @@ mod tests {
                 expected_sections: vec!["attack path".into()],
             }]),
             agent_type: None,
+            run_in_background: false,
         };
         let response = "## Findings\n- [confidence: high] No finding.\n\n## Unverified\n- Runtime behavior.\n\n## Coverage\n- Covered: src/auth.rs.\n- Skipped: None.";
 
@@ -2862,6 +3015,226 @@ mod tests {
         assert!(rendered.contains("[not started: aggregate cost limit"));
         assert_eq!(counters.started.load(Ordering::SeqCst), 2);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn background56_shared_write_lane_serializes_batches_and_rechecks_spend_after_wait() {
+        let root = crate::tests::OwnedTestDirectory::new("background56-write-lane");
+        let mut session = crate::session::Session::new("openai", "fixture", 32000, "");
+        session.working_dir = root.path().to_string_lossy().into();
+        session.initialize_spend_account(Some(0.00001)).unwrap();
+        let pool = super::super::background::Pool::for_session(&mut session, 2).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let run = crate::spend::run::Run::fixture(
+            session.spend_account.clone(),
+            Arc::new(crate::spend::Ledger::new(&root.path().join("state"))),
+            &session.id,
+            crate::spend::PriceSnapshot::capture(Some((2.0, 4.0)), Default::default(), false),
+        );
+        let lane = pool.write_lane.clone().acquire_owned().await.unwrap();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let called = effects.clone();
+        let work = shared_child_lane(
+            Box::pin(async move {
+                called.fetch_add(1, Ordering::AcqRel);
+                ChildExecution {
+                    output: Ok("forbidden".into()),
+                    cost_units: 0,
+                }
+            }),
+            Some(Arc::downgrade(&pool)),
+            true,
+            Some(workspace.clone()),
+            Some(run.clone()),
+        );
+        tokio::pin!(work);
+        assert!(
+            futures::poll!(&mut work).is_pending(),
+            "write-lane contention must actually be reached"
+        );
+        run.observe(crate::event::UsageDelta {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        });
+        drop(lane);
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        let result = scope.run(work).await;
+        cleanup.settle().await;
+        assert!(result.output.unwrap_err().contains("USD budget"));
+        assert_eq!(
+            effects.load(Ordering::Acquire),
+            0,
+            "captured spend is checked after the awaited lane"
+        );
+        // Two independently constructed write batches share one actual lane.
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let (a_live, a_peak) = (live.clone(), peak.clone());
+        let first = shared_child_lane(
+            Box::pin(async move {
+                let n = a_live.fetch_add(1, Ordering::AcqRel) + 1;
+                a_peak.fetch_max(n, Ordering::AcqRel);
+                entered.send(()).unwrap();
+                held.await.unwrap();
+                a_live.fetch_sub(1, Ordering::AcqRel);
+                ChildExecution {
+                    output: Ok("first".into()),
+                    cost_units: 0,
+                }
+            }),
+            Some(Arc::downgrade(&pool)),
+            true,
+            Some(workspace.clone()),
+            None,
+        );
+        let (b_live, b_peak) = (live.clone(), peak.clone());
+        let second = shared_child_lane(
+            Box::pin(async move {
+                let n = b_live.fetch_add(1, Ordering::AcqRel) + 1;
+                b_peak.fetch_max(n, Ordering::AcqRel);
+                b_live.fetch_sub(1, Ordering::AcqRel);
+                ChildExecution {
+                    output: Ok("second".into()),
+                    cost_units: 0,
+                }
+            }),
+            Some(Arc::downgrade(&pool)),
+            true,
+            Some(workspace),
+            None,
+        );
+        let parent = crate::agent::runner::AgentWorkScope::new();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(parent.clone());
+        let both = parent.run(async { tokio::join!(first, second) });
+        tokio::pin!(both);
+        tokio::select! { _=&mut both=>panic!("first batch must remain held"), _=ready=>{} }
+        assert_eq!(live.load(Ordering::Acquire), 1);
+        release.send(()).unwrap();
+        let (first, second) = both.await;
+        cleanup.settle().await;
+        assert_eq!(first.output.unwrap(), "first");
+        assert_eq!(second.output.unwrap(), "second");
+        assert_eq!(peak.load(Ordering::Acquire), 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn background56_cancelled_child_keeps_both_lanes_until_actual_effect_retirement() {
+        for (concurrency, write_mode) in [(1, false), (2, true)] {
+            let root = crate::tests::OwnedTestDirectory::new("background56-cancelled-lane");
+            let mut session = crate::session::Session::new(
+                "openai",
+                "fixture",
+                32000,
+                root.path().to_str().unwrap(),
+            );
+            let pool =
+                super::super::background::Pool::for_session(&mut session, concurrency).unwrap();
+            let parent = crate::agent::runner::AgentWorkScope::new();
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(parent.clone());
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    *self.0.0.lock().unwrap() = true;
+                    self.0.1.notify_all();
+                }
+            }
+            let mut release = Some(Release(gate.clone()));
+            let marker = root.path().join("effect-order");
+            let result = AssertUnwindSafe(parent.run(async {
+                let first_marker = marker.clone();
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let mut first = Some(shared_child_lane(
+                    Box::pin(async move {
+                        crate::agent::runner::spawn_blocking_scoped(move || {
+                            entered.send(()).unwrap();
+                            let mut open = gate.0.lock().unwrap();
+                            while !*open {
+                                open = gate.1.wait(open).unwrap();
+                            }
+                            std::fs::write(first_marker, "old effect retired").unwrap();
+                        })
+                        .await
+                        .unwrap();
+                        ChildExecution {
+                            output: Ok("old retired".into()),
+                            cost_units: 0,
+                        }
+                    }),
+                    Some(Arc::downgrade(&pool)),
+                    write_mode,
+                    None,
+                    None,
+                ));
+                tokio::select! {
+                    _ = first.as_mut().unwrap() => panic!("effect must remain held"),
+                    _ = ready => {}
+                }
+                drop(first.take()); // Same future-drop boundary as a cancelled Task batch.
+                assert_eq!(
+                    pool.concurrency.available_permits(),
+                    concurrency - 1,
+                    "cancellation cannot release shared concurrency before actual effects retire"
+                );
+                assert_eq!(
+                    pool.write_lane.available_permits(),
+                    usize::from(!write_mode)
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), parent.wait_idle())
+                        .await
+                        .is_err(),
+                    "the parent must retain the cancelled child's actual cleanup"
+                );
+                let next_marker = marker.clone();
+                let second = shared_child_lane(
+                    Box::pin(async move {
+                        assert_eq!(
+                            std::fs::read_to_string(&next_marker).unwrap(),
+                            "old effect retired"
+                        );
+                        std::fs::write(next_marker, "next effect after retirement").unwrap();
+                        ChildExecution {
+                            output: Ok("next retired".into()),
+                            cost_units: 0,
+                        }
+                    }),
+                    Some(Arc::downgrade(&pool)),
+                    write_mode,
+                    None,
+                    None,
+                );
+                tokio::pin!(second);
+                assert!(
+                    futures::poll!(&mut second).is_pending(),
+                    "next child must contend the retained lane"
+                );
+                assert!(!marker.exists());
+                drop(release.take());
+                assert!(second.await.output.is_ok());
+                parent.wait_idle().await;
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap(),
+                    "next effect after retirement"
+                );
+                assert_eq!(pool.concurrency.available_permits(), concurrency);
+                assert_eq!(pool.write_lane.available_permits(), 1);
+            }))
+            .catch_unwind()
+            .await;
+            drop(release.take());
+            cleanup.settle().await;
+            pool.close().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

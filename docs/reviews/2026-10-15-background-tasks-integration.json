@@ -1,0 +1,606 @@
+{
+  "beads": [
+    "mini-agent-i7ro6.56",
+    "mini-agent-i7ro6.122"
+  ],
+  "base": "3bcadc7e3f6c94bc8431579c267f927a68f2b1a7",
+  "source": {
+    "frozen_patch_sha256": "36e7e524b81c131d0e62d0c7f716bb3b29699d6712c2962c94a65950ec73205d",
+    "files": [
+      {
+        "path": "docs/agent/CONFIG.md",
+        "sha256": "7db9b275c7d430a11e15439373f1d53064f6a14fcfdd10281f210c3bf048cb3f",
+        "integrated_sha256": "7db9b275c7d430a11e15439373f1d53064f6a14fcfdd10281f210c3bf048cb3f"
+      },
+      {
+        "path": "docs/agent/SUBAGENTS.md",
+        "sha256": "fb2e114695798ee9594e046d3c3e1673301762bc5b8a273cdb79381080292db8",
+        "integrated_sha256": "fb2e114695798ee9594e046d3c3e1673301762bc5b8a273cdb79381080292db8"
+      },
+      {
+        "path": "docs/specs/subprocess-trust.md",
+        "sha256": "33652c21e40187a2e5a9d95273f81d4dfe43b1a9c29f4d1ed5b62b6e52d16fff",
+        "integrated_sha256": "33652c21e40187a2e5a9d95273f81d4dfe43b1a9c29f4d1ed5b62b6e52d16fff"
+      },
+      {
+        "path": "src/agent/builder.rs",
+        "sha256": "51c0fe0ec7caf82b1e48873b89848bf90fed1c2493a83ae6dcda0e61e2ca7950",
+        "integrated_sha256": "8bb9dad9364c2370437b9a18eb8a2c969e68231b644cfb1dbe5a7553e2317a26"
+      },
+      {
+        "path": "src/agent/input.rs",
+        "sha256": "05e59226284510962d864580afa4850790c4fe984c8be6712c587733ad13c123",
+        "integrated_sha256": "05e59226284510962d864580afa4850790c4fe984c8be6712c587733ad13c123"
+      },
+      {
+        "path": "src/agent/runner.rs",
+        "sha256": "97129f09b16bba21286f5bf9d9826553771e8dbf6b9448b16d1ba0ba00e77ed7",
+        "integrated_sha256": "97129f09b16bba21286f5bf9d9826553771e8dbf6b9448b16d1ba0ba00e77ed7"
+      },
+      {
+        "path": "src/agent/tools/mod.rs",
+        "sha256": "1501444f32574b920dbdd795496b739a7a64fc752e56d1dca73ffe8769c28cca",
+        "integrated_sha256": "1501444f32574b920dbdd795496b739a7a64fc752e56d1dca73ffe8769c28cca"
+      },
+      {
+        "path": "src/cli.rs",
+        "sha256": "9c9492798897b5cf46184806b5267b53412d66dc93a62ef31d55ffb515af1b3d",
+        "integrated_sha256": "9c9492798897b5cf46184806b5267b53412d66dc93a62ef31d55ffb515af1b3d"
+      },
+      {
+        "path": "src/extras/acp/mod.rs",
+        "sha256": "da712a9fec637c4b9a4ea02d2984b755fb6f0ea327d421823346e2662c260d94",
+        "integrated_sha256": "da712a9fec637c4b9a4ea02d2984b755fb6f0ea327d421823346e2662c260d94"
+      },
+      {
+        "path": "src/extras/acp/sessions.rs",
+        "sha256": "43b79865bc8a9181ba31968142df3d040f28ce6dd3e448a59b3a4de663be900f",
+        "integrated_sha256": "43b79865bc8a9181ba31968142df3d040f28ce6dd3e448a59b3a4de663be900f"
+      },
+      {
+        "path": "src/extras/hooks/mod.rs",
+        "sha256": "2efc5b3d6928dbbaf97c1559bec0c732f45c77b6944be39e155415c02117fba3",
+        "integrated_sha256": "2efc5b3d6928dbbaf97c1559bec0c732f45c77b6944be39e155415c02117fba3"
+      },
+      {
+        "path": "src/extras/js/tool.rs",
+        "sha256": "b5c0132e78dc81afcb6c55eaa957a9c9316759fc1b1afcaa92425e474a77217f",
+        "integrated_sha256": "b5c0132e78dc81afcb6c55eaa957a9c9316759fc1b1afcaa92425e474a77217f"
+      },
+      {
+        "path": "src/extras/subagents/background.rs",
+        "sha256": "c4daf034ef865066a207c4a7bebe15d37f1aa2a1d3ab97da24c8b0aa9ed79553",
+        "integrated_sha256": "c4daf034ef865066a207c4a7bebe15d37f1aa2a1d3ab97da24c8b0aa9ed79553"
+      },
+      {
+        "path": "src/extras/subagents/mod.rs",
+        "sha256": "432d162f5782469063867096da69a8c40466599936af6a5e03c5475a6593c4e4",
+        "integrated_sha256": "432d162f5782469063867096da69a8c40466599936af6a5e03c5475a6593c4e4"
+      },
+      {
+        "path": "src/extras/subagents/task_tool.rs",
+        "sha256": "c1b103388dc44dbd937f29cad9231a0e4fa18fbea5876242fa52686a9ac4f1a4",
+        "integrated_sha256": "c1b103388dc44dbd937f29cad9231a0e4fa18fbea5876242fa52686a9ac4f1a4"
+      },
+      {
+        "path": "src/permission/ask.rs",
+        "sha256": "88aa4ba45c8f93bd16bfe890781a2388e7de0bcff6d7d83432f0f538b93918e2",
+        "integrated_sha256": "88aa4ba45c8f93bd16bfe890781a2388e7de0bcff6d7d83432f0f538b93918e2"
+      },
+      {
+        "path": "src/provider.rs",
+        "sha256": "10bd84ac7b6c515b3fc40b7e2f8d0d1dbd0a75a497b063d0e8f6c5e651d12810",
+        "integrated_sha256": "10bd84ac7b6c515b3fc40b7e2f8d0d1dbd0a75a497b063d0e8f6c5e651d12810"
+      },
+      {
+        "path": "src/session/background_observation.rs",
+        "sha256": "44b60da969c20fe845637c8b9ea7f65cd961502f1f928107fbb91f2b8cdd85a5",
+        "integrated_sha256": "44b60da969c20fe845637c8b9ea7f65cd961502f1f928107fbb91f2b8cdd85a5"
+      },
+      {
+        "path": "src/session/file_checkpoints.rs",
+        "sha256": "a901492d7acaba37df488e0a537e50ec4d7fdd54bff898f8905628f3003de467",
+        "integrated_sha256": "a901492d7acaba37df488e0a537e50ec4d7fdd54bff898f8905628f3003de467"
+      },
+      {
+        "path": "src/session/mod.rs",
+        "sha256": "389c4fdc2d49a2d667322237ee4ff7f973d76f1d94bffbc9856a7a859d307386",
+        "integrated_sha256": "389c4fdc2d49a2d667322237ee4ff7f973d76f1d94bffbc9856a7a859d307386"
+      },
+      {
+        "path": "src/session/native_publication.rs",
+        "sha256": "f87d0a41cb1fb91bfdbdc5d5d70b521309dd3fb05f47c9ff7d3175e7bf264c98",
+        "integrated_sha256": "01da6b4f5e6863a9c9b0e6f1968b6a320c2bed1667e6c98067231f72e2a0cfa0"
+      },
+      {
+        "path": "src/session/storage.rs",
+        "sha256": "c5c7b71a73fc15cdf62fa07b8af5e0f4899d06c7d6990139edb9b14876193be9",
+        "integrated_sha256": "c5c7b71a73fc15cdf62fa07b8af5e0f4899d06c7d6990139edb9b14876193be9"
+      },
+      {
+        "path": "src/spend.rs",
+        "sha256": "693713ef5b77a65e262b4454c4f124fbed8feda36f2f0693f1b4dfd4510f0a51",
+        "integrated_sha256": "693713ef5b77a65e262b4454c4f124fbed8feda36f2f0693f1b4dfd4510f0a51"
+      },
+      {
+        "path": "src/spend/request_tests.rs",
+        "sha256": "a3dba27c4a6523d5ddd12dee02941b8725907e93fc923c225f21af2a5d0f52e2",
+        "integrated_sha256": "a3dba27c4a6523d5ddd12dee02941b8725907e93fc923c225f21af2a5d0f52e2"
+      },
+      {
+        "path": "src/spend/run.rs",
+        "sha256": "51c8fca70ff6e8e27cfb07364ad6c3dd1f44afeb7476e0e9d082897ad7d9d8a4",
+        "integrated_sha256": "51c8fca70ff6e8e27cfb07364ad6c3dd1f44afeb7476e0e9d082897ad7d9d8a4"
+      },
+      {
+        "path": "src/startup.rs",
+        "sha256": "86edde5f7fd187017713dd479dafb2325abc79d18d307bf478d2f1794769d0dc",
+        "integrated_sha256": "86edde5f7fd187017713dd479dafb2325abc79d18d307bf478d2f1794769d0dc"
+      },
+      {
+        "path": "src/tests/harness_eval_tests.rs",
+        "sha256": "d5ed7ea0057531cdd9bbc383a051033000c8cccd65534d21cb261cb6bec426f4",
+        "integrated_sha256": "d5ed7ea0057531cdd9bbc383a051033000c8cccd65534d21cb261cb6bec426f4"
+      },
+      {
+        "path": "src/tests/subprocess_inventory_tests.rs",
+        "sha256": "28d3f6f7f8af19f1d09189413da6a8b3dbfa8dd390849eac6eafeb342fc2c1e0",
+        "integrated_sha256": "28d3f6f7f8af19f1d09189413da6a8b3dbfa8dd390849eac6eafeb342fc2c1e0"
+      },
+      {
+        "path": "src/ui/app.rs",
+        "sha256": "6e82fa1f1993a682b40aef112469bbccb31fa49e76d326353114e1596a7f5ce9",
+        "integrated_sha256": "6e82fa1f1993a682b40aef112469bbccb31fa49e76d326353114e1596a7f5ce9"
+      },
+      {
+        "path": "src/ui/event_handler.rs",
+        "sha256": "f3c62161387f7d9264f655338462ea2d3f7e66aebd338b258b1d34f54355cba3",
+        "integrated_sha256": "f3c62161387f7d9264f655338462ea2d3f7e66aebd338b258b1d34f54355cba3"
+      },
+      {
+        "path": "src/ui/mcp_admin_app_tests.rs",
+        "sha256": "d16893e8a30af5a06daa60eb6e6f68ca790e192fd297574e32267e09a44ee8ff",
+        "integrated_sha256": "d16893e8a30af5a06daa60eb6e6f68ca790e192fd297574e32267e09a44ee8ff"
+      },
+      {
+        "path": "src/ui/mod.rs",
+        "sha256": "c5b8713bb9b28b8746751b90c5289e4509dfe2d0703c47f26a23557dd5751093",
+        "integrated_sha256": "c5b8713bb9b28b8746751b90c5289e4509dfe2d0703c47f26a23557dd5751093"
+      },
+      {
+        "path": "src/ui/permission_handler.rs",
+        "sha256": "da9ddb1577784de39688db4fb0f7a9b6a52d6bc935302506939b780dafa6c9dc",
+        "integrated_sha256": "da9ddb1577784de39688db4fb0f7a9b6a52d6bc935302506939b780dafa6c9dc"
+      },
+      {
+        "path": "src/ui/pickers/list.rs",
+        "sha256": "7d5367d63f17bd5c7d9c726c7fe7f5d280efd1b15157d246c88a49650ad5ae92",
+        "integrated_sha256": "7d5367d63f17bd5c7d9c726c7fe7f5d280efd1b15157d246c88a49650ad5ae92"
+      },
+      {
+        "path": "src/ui/slash/help.rs",
+        "sha256": "1c355bc941a13a781be901588d89654032484dc731b6057c75615e4059f503cc",
+        "integrated_sha256": "1c355bc941a13a781be901588d89654032484dc731b6057c75615e4059f503cc"
+      },
+      {
+        "path": "src/ui/slash/mod.rs",
+        "sha256": "f833c0b0188a016892ad7bbb4a7e9deb5838093c0811b7f6aeb55fd70bb0eaf5",
+        "integrated_sha256": "f833c0b0188a016892ad7bbb4a7e9deb5838093c0811b7f6aeb55fd70bb0eaf5"
+      },
+      {
+        "path": "src/ui/slash/session.rs",
+        "sha256": "15ae35202925fb3a39fc0cfbfe9d642fefc70aaef4b940ccb9238036f6eb0470",
+        "integrated_sha256": "15ae35202925fb3a39fc0cfbfe9d642fefc70aaef4b940ccb9238036f6eb0470"
+      },
+      {
+        "path": "src/ui/slash/tasks.rs",
+        "sha256": "0d40e9905e2a8ea1a5a456159709e0eb6559b080c48e81d3d4ac6da1522a8281",
+        "integrated_sha256": "0d40e9905e2a8ea1a5a456159709e0eb6559b080c48e81d3d4ac6da1522a8281"
+      },
+      {
+        "path": "src/ui/state.rs",
+        "sha256": "68ebfd814590b00c6457473753734e46ca99afeb6dae62c7a97bf063cfeef132",
+        "integrated_sha256": "68ebfd814590b00c6457473753734e46ca99afeb6dae62c7a97bf063cfeef132"
+      },
+      {
+        "path": "src/ui/statusline.rs",
+        "sha256": "aa364eafe08d1e9580d38910fb912fa03224de27edc22e83bd8a20a90489dd67",
+        "integrated_sha256": "aa364eafe08d1e9580d38910fb912fa03224de27edc22e83bd8a20a90489dd67"
+      }
+    ],
+    "reserved_names_addendum": {
+      "patch": "/private/tmp/mini-agent-background56-reserved-names-addendum.patch",
+      "sha256": "3b620f198ba0f8d98e5d5bab6feecbd3344846718a1cbb1d845d0fb79a9544b9",
+      "source_sha256": "8bb9dad9364c2370437b9a18eb8a2c969e68231b644cfb1dbe5a7553e2317a26",
+      "base_patch": "36e7e524b81c131d0e62d0c7f716bb3b29699d6712c2962c94a65950ec73205d",
+      "contracts": [
+        "task_result/list/cancel always reserved against external MCP shadowing",
+        "actual ControlTool::NAME constants asserted against matcher when subagents enabled",
+        "helper visible for existing goal-only test; goal assertion retained"
+      ],
+      "selection": [
+        "agent::builder::mcp_tests::external_tools_cannot_claim_builtin_prompt_semantics (default; active47822)",
+        "agent::builder::js_tests::goal_report_registration::the_report_tool_name_is_reserved_against_shadowing (--no-default-features --features goal,js; Root can batch warm row)"
+      ]
+    },
+    "final_native_publication_correction": "seal_progress snapshot remains mutable on every cfg because final publication assignment is unconditional; refused-value snapshot retains cfg shadow."
+  },
+  "review": {
+    "initial": {
+      "review_scope": {
+        "patch": "/private/tmp/mini-agent-background56-final-owned.patch",
+        "patch_sha256": "c215af91814730dfb557fabcfd1ed3b71ff679dd00e6f282fd3f4dd8034df058",
+        "manifest": "/private/tmp/mini-agent-background56-final-manifest.json",
+        "frozen_source_files_hash_verified": 40,
+        "hash_mismatches": [],
+        "affected_tests": "/private/tmp/mini-agent-background56-affected-tests-and-mutation-audit.json",
+        "indexed_callers": "/private/tmp/mini-agent-background56-final-affected-index.json",
+        "mode": "Read-only source and supplied test-evidence review; no Cargo or production edits."
+      },
+      "reviews": [
+        {
+          "reviewer": "adversarial",
+          "depth": "deep",
+          "findings": [
+            {
+              "id": "BG56-R1",
+              "priority": "P1",
+              "title": "Cancelling a child releases the shared write lane before its owned effects retire",
+              "confidence": 0.97,
+              "autofix_class": "manual",
+              "owner": "downstream-resolver",
+              "source_refs": [
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/task_tool.rs",
+                  "line": 1185
+                },
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/task_tool.rs",
+                  "line": 1203
+                },
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/background.rs",
+                  "line": 776
+                },
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/background.rs",
+                  "line": 787
+                },
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/task_tool.rs",
+                  "line": 1552
+                }
+              ],
+              "evidence": [
+                "A write-enabled child owns semaphore permits as ordinary locals inside shared_child_lane while awaiting child work.",
+                "The child starts a registered blocking filesystem operation or owned subprocess that is still alive when cancellation or a task deadline occurs. Such production operations exist in fs.rs atomic_write_resolved_inner and atomic_create_resolved_checked_cancellable.",
+                "Background cancellation drops work in the biased select before cleanup.settle waits for those registered effects. A batch deadline also explicitly drops in_flight futures. Dropping the lane future releases both semaphore permits immediately.",
+                "A different foreground or background child can acquire the released write lane and concurrency slot while the first child effect is still live. This violates the documented shared lane and concurrency ceiling even though the first job correctly remains Cancelling."
+              ],
+              "requested_fix": "Retain permits until the exact child effect scope actually settles, including future-drop cancellation and deadlines. The owner proposed reusing a per-child AgentWorkScope plus AgentRunCleanupGuard holding permits and a parent-scope registration; this satisfies the traced lifetime requirement without a separate registry.",
+              "required_regression": "Hold an actual registered first-child blocking effect, cancel/drop the first lane future, queue a second child, assert neither write nor concurrency capacity becomes available until the held effect is released and joined; then assert second child enters."
+            }
+          ],
+          "residual_risks": [
+            "No additional confirmed defect found in exact session/store/pool provenance, imported data, coherent snapshots, or permission/teardown paths reviewed. This is a bounded independent review, not a proof of absence."
+          ],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "reliability",
+          "findings": [],
+          "residual_risks": [
+            "BG56-R1 is the same cancellation-to-effect-retirement lifetime issue; not duplicated here."
+          ],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "testing",
+          "findings": [],
+          "residual_risks": [],
+          "testing_gaps": [
+            {
+              "related_finding": "BG56-R1",
+              "source_refs": [
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/task_tool.rs",
+                  "line": 3009
+                },
+                {
+                  "path": "/private/tmp/mini-agent-background56-final-sources/src/extras/subagents/background.rs",
+                  "line": 1103
+                }
+              ],
+              "gap": "Lane test covers successful await completion and spend recheck. Held-effect cancellation test covers terminal status/close settlement but does not place another child behind the same lane, so neither exercises early permit reuse."
+            }
+          ]
+        }
+      ],
+      "resolution_status": "Owner and Root notified. Per-child existing cleanup/parent registration remedy discussed; successor code/tests not reviewed or claimed accepted. No repeated whole-patch review requested."
+    },
+    "resolved": {
+      "reviewer": "adversarial/reliability/testing",
+      "scope": "Incremental BG56-R1 remedy and regression only; original remaining 40-file review not repeated.",
+      "final_patch_sha256": "36e7e524b81c131d0e62d0c7f716bb3b29699d6712c2962c94a65950ec73205d",
+      "final_sources": "/private/tmp/mini-agent-background56-retirement-final-sources",
+      "verified_files": [
+        {
+          "path": "src/agent/runner.rs",
+          "sha256": "97129f09b16bba21286f5bf9d9826553771e8dbf6b9448b16d1ba0ba00e77ed7"
+        },
+        {
+          "path": "src/extras/subagents/task_tool.rs",
+          "sha256": "c1b103388dc44dbd937f29cad9231a0e4fa18fbea5876242fa52686a9ac4f1a4"
+        }
+      ],
+      "verdict": "accepted",
+      "resolved_findings": [
+        "BG56-R1"
+      ],
+      "findings": [],
+      "evidence": [
+        "auxiliary_child requires synchronous registration under the actual current parent AgentWorkScope; no optional/unowned fallback.",
+        "Per-child scope inherits current hook root and owns effects during validation, spend preparation and child polling.",
+        "Existing cleanup guard retains both lane permits and parent registration until child effects join, including future-drop cancellation and panic.",
+        "Final retained tuple is (retained,parent), releasing semaphore permits before the parent-idle notification.",
+        "Regression covers concurrency1/read and concurrency2/write using a real held registered blocking write, cancellation by future drop, both retained permit counts, parent non-idle, actual queued second-child contention, ordered file writes, and complete permit recovery."
+      ],
+      "owner_test_evidence": {
+        "red": "/private/tmp/mini-agent-background56-cancelled-lanes-red.log",
+        "green_two_lanes": "/private/tmp/mini-agent-background56-cancelled-lanes-green.log (two lane tests pass; wire test socket EPERM in that initial sandbox run)",
+        "native_wire_successor": "/private/tmp/mini-agent-background56-lane-native-wire.log",
+        "final_new_regression_and_static_three": "/private/tmp/mini-agent-background56-final-owners-and-inventory.log (4 passed)"
+      },
+      "limits": [
+        "No production edits or Cargo run by reviewer.",
+        "Acceptance is bounded to traced R1 correction and test; Root retains integration/install/native acceptance."
+      ],
+      "residual_risks": [],
+      "testing_gaps": []
+    },
+    "root_additional_findings_resolved": [
+      "Reserve actual task_result/task_list/task_cancel tool names against external MCP shadowing; owning matcher tests use actual Tool::NAME constants.",
+      "Preserve goal-only reservation assertion by exposing pure helper under test+goal, not hiding the test.",
+      "Correct non-subagents seal_progress snapshot compilation after cfg shadow edit."
+    ]
+  },
+  "selection": {
+    "base": "7a55690b0217063d56c7d2ed0526742256ccef32",
+    "index": {
+      "state": "/private/tmp/mini-agent-background56-current-indexer",
+      "session": "507705a2-24a5-4296-b175-460b6f96bfc6",
+      "qualified_output": "/private/tmp/mini-agent-background56-final-affected-index.json"
+    },
+    "selection": [
+      {
+        "symbol": "Pool::reserve/Admission::start/close",
+        "source": "src/extras/subagents/background.rs:438",
+        "callers": [
+          "TaskTool::call \u2192 Admission::prepare_ask/start; Session::close_background_tasks \u2192 UI teardown/replace/dispatch/headless/ACP close+EOF"
+        ],
+        "exact_filters": [
+          "background56_immediate_id_outlives_parent_and_result_is_session_owned",
+          "background56_closed_owner_refuses_reserved_but_not_registered_work",
+          "background56_cancel_does_not_publish_terminal_until_blocking_child_retires",
+          "background56_capacity_import_and_notification_delivery_are_data_only"
+        ],
+        "cfg": "subagents"
+      },
+      {
+        "symbol": "SharedObservations/native publication",
+        "source": "src/session/background_observation.rs:178",
+        "callers": [
+          "storage::serialize_snapshot; native_publication begin/progress/refuse/actor retirement/SessionEnd/effort"
+        ],
+        "exact_filters": [
+          "background56_held_shared_receipt_allows_next_native_prompt",
+          "background56_actual_task_and_signed_native_next_prompt_overlap_and_notify_once",
+          "native_session_end_permit_is_bound_to_its_acknowledged_retired_value"
+        ],
+        "cfg": "subagents; lower SDK/native publication unchanged"
+      },
+      {
+        "symbol": "Account mutation/receipt/ACK attribution",
+        "source": "src/spend.rs:534",
+        "callers": [
+          "Run::for_session/for_model/for_invocation \u2192 observe receipts; ledger fsync ACK; Account setters/reconcile/tracking failures"
+        ],
+        "exact_filters": [
+          "background56_exact_account_receipt_ack_is_observed_but_replacement_and_setter_are_not",
+          "background56_observation_stamp_rejects_foreign_settled_and_unattributed_changes",
+          "background56_observation_stamp_overflow_and_rebinding_never_authorize"
+        ],
+        "cfg": "subagents; serde unchanged feature-off"
+      },
+      {
+        "symbol": "Recorder launch anchor and exhaustive checkpoint mutation",
+        "source": "src/session/file_checkpoints.rs:104",
+        "callers": [
+          "existing Write/Edit mutation seam: prepare/published/committed/formatted/skipped, background inherits existing Task scope; foreground steering Recorder advance remains separate"
+        ],
+        "exact_filters": [
+          "background56_real_write_keeps_launch_anchor_and_rewind_is_unattributed",
+          "background56_held_shared_receipt_allows_next_native_prompt"
+        ],
+        "cfg": "subagents; ordinary restore/retire/compact stamped unattributed"
+      },
+      {
+        "symbol": "History transition pause",
+        "source": "src/extras/subagents/background.rs:532",
+        "callers": [
+          "ui::slash::compact_session_with \u2192 App between/midturn/manual compact",
+          "startup::compact_headless_session_with",
+          "ACP SessionHistory::compact_with \u2192 emergency_compact (lease remains in scope)"
+        ],
+        "exact_filters": [
+          "background56_actual_compaction_joins_old_effects_before_rebasing_and_reopens_admission"
+        ],
+        "cfg": "subagents; no wait added to ordinary next prompt"
+      },
+      {
+        "symbol": "Permission exact origin and client lifecycle",
+        "source": "src/permission/ask.rs:None",
+        "callers": [
+          "send_permission_request fills only captured Run origin; App retain/idle accept/expire/cancel; ACP install_session New+Load installs runtime Protocol factory before advertisement, close+EOF clear after jobs join"
+        ],
+        "exact_filters": [
+          "background56_actual_app_approval_survives_parent_and_tasks_views_are_inert",
+          "background56_actual_acp_permission_after_parent_done_and_close_joins_child",
+          "actual_app_native_permission_cancel_settles_call_drops_queue_and_cannot_late_grant"
+        ],
+        "cfg": "subagents plus acp owning protocol row; None adapters cfg subagents"
+      },
+      {
+        "symbol": "Task/background controls and shared lane",
+        "source": "src/extras/subagents/task_tool.rs:55",
+        "callers": [
+          "agent::builder::register_subagents; built-in eligibility; TaskExecutor existing authorized persona/readonly/write55 children; controls actual Run pool only"
+        ],
+        "exact_filters": [
+          "background56_shared_write_lane_serializes_batches_and_rechecks_spend_after_wait",
+          "background56_actual_task_and_signed_native_next_prompt_overlap_and_notify_once"
+        ],
+        "cfg": "subagents; foreground Task regression reused default"
+      },
+      {
+        "symbol": "TUI /tasks/footer/notify & literal notices",
+        "source": "src/ui/slash/tasks.rs:5",
+        "callers": [
+          "slash read/control dispatch bypasses generic save/goal/warm; App Notify idle redraw; UiState/cache footer; provider paused runner takes context before start ACK"
+        ],
+        "exact_filters": [
+          "background56_actual_app_approval_survives_parent_and_tasks_views_are_inert",
+          "every_command_in_help_is_offered_by_the_slash_picker"
+        ],
+        "cfg": "subagents; feature-off help check"
+      },
+      {
+        "symbol": "Exact static data classifications",
+        "source": "src/tests/subprocess_inventory_tests.rs:1923",
+        "callers": [
+          "existing inventory and macro context readers; scanner unchanged"
+        ],
+        "exact_filters": [
+          "production_subprocess_sites_have_a_trust_classification",
+          "windows_capable_production_process_terminals_use_creation_boundary"
+        ],
+        "cfg": "test-only tables"
+      }
+    ],
+    "mutation_audit": {
+      "account": [
+        "Every serialized field comes from State::saved. AccountMutation compares before/after under same existing mutex, including early/error returns. Receipt::observe and pending ACK retain originating JobObservation; ordinary setters/failures/reconcile are unattributed.",
+        "Pending receipt token retained until canonical fsync ACK; cleanup token stays live through terminal history stamp. Numerical growth never authorizes."
+      ],
+      "checkpoints": [
+        "FileMutation covers prepare blob/record, publication, commit/postimage, formatting, skipped flags. Recorder uses captured token, separate fixed launch-row Arc. Ordinary restore/retire/compact are unattributed.",
+        "No diff excerpt becomes preimage; same FileCheckpoints store identity and actual Session are checked before admission."
+      ],
+      "task_history": [
+        "reserve/terminal/cancel use exact admitted job token under existing pool state then History lock. notified is skipped serde, never changes full saved digest.",
+        "Imported active rows become Interrupted, no scopes/factory/account/checkpoint handles restored."
+      ],
+      "coherent_cut": [
+        "Account \u2192 FileCheckpoints \u2192 History fixed mutex order. Mutators hold one store only. Native reconstruction uses exact original stores and complete old data, never excluded fields.",
+        "Current complete Session reserialized with those old snapshots must equal previous complete digest. Same exact pool/owner/generation required; all static/transcript/profile/store tampering refuses."
+      ],
+      "lifecycle": [
+        "Session-held pool; tools/workers weak. Same state lock stop/admit synchronous scoped registration; true effect scopes joined before terminal data.",
+        "ACP staged factory retains client only after install, cleared after job join. UI and protocol approvals need exact live job/token/scope; close/cancel cannot mint late approvals.",
+        "History cut pauses admission and joins jobs before removing/rebasing launch rows; ordinary next prompt stays concurrent."
+      ]
+    },
+    "reused": [
+      "Default22 runtime pass current2f2, no default runtime changes on 7a merge; parent provider/Doctor/auth/build changes additive and unchanged by56.",
+      "Minimal subagents,acp13 pass; new compaction actual1 pass default.",
+      "Unchanged reaper/worker containment/SDK signature projection/accounting broad suites not rerun. No subprocess constructor/containment/protocol/worker change."
+    ],
+    "required_remaining": [
+      "current static2 (active)",
+      "feature-off type/help",
+      "default all-target strict",
+      "one default debug install and one real owned offline physical1MiB TUI driver"
+    ],
+    "native_limits": [
+      "Fake native wire proves exact signed-block preservation and immutable tools/system, not remote signature validity.",
+      "No paid provider requests. No imported/background metadata grants. No blanket field exclusions or secondary financial account."
+    ]
+  },
+  "validation": {
+    "root_minimal_original_failed_row": {
+      "command": "cargo test --locked --offline --no-default-features --features skills,goal --bin mini-agent -- the_report_tool_name_is_reserved_against_shadowing --test-threads=1",
+      "passed": 1,
+      "seconds": 0.0,
+      "compile_seconds": 55.21,
+      "supersedes": "Earlier feature-off help result predates cfg shadow correction and is not used to establish final typing."
+    },
+    "owner_final_inventory_and_lane": {
+      "passed": 4,
+      "seconds": 25.21,
+      "log": "/private/tmp/mini-agent-background56-final-owners-and-inventory.log"
+    },
+    "required_debug_install": {
+      "seconds": 33.01,
+      "binary": "/private/tmp/mini-agent-background56-install/bin/mini-agent",
+      "sha256": "cfa2e43efc8a9cc1d7c6f69b6a03da38b949a90a08e3f89de71930446544705a"
+    },
+    "root_real_containment": {
+      "binary": "/private/tmp/mini-agent-background56-install/bin/mini-agent",
+      "sha256": "cfa2e43efc8a9cc1d7c6f69b6a03da38b949a90a08e3f89de71930446544705a",
+      "bytes": 161556064,
+      "stack_bytes": 1048576,
+      "pid": 29077,
+      "pgid": 29077,
+      "forced_cleanup": false,
+      "exit": 0,
+      "elapsed_ms": 1411.724374978803,
+      "stdout": "JS runtime check: PASS (2)\n",
+      "stderr": "",
+      "passed": true
+    },
+    "owner_real_tui": {
+      "binary": "/private/tmp/mini-agent-background56-install/bin/mini-agent",
+      "binary_sha256": "cfa2e43efc8a9cc1d7c6f69b6a03da38b949a90a08e3f89de71930446544705a",
+      "physical_stack_bytes": 1048576,
+      "root": "/private/tmp/mini-agent-background56-native-uvmmv_05",
+      "assertions": {
+        "immediate_id_and_foreground_completion": true,
+        "next_prompt_overlaps_live_child": true,
+        "exact_once_notice_and_registered_result": true,
+        "persisted_data_and_normal_quit": true
+      },
+      "pid": 29780,
+      "exit": 0,
+      "retired_pid": 29780,
+      "final_returncode": 0,
+      "listener_joined": true,
+      "errors": [],
+      "request_count": 7,
+      "post_breakdown": {
+        "parent": 5,
+        "child": 2
+      }
+    },
+    "default_reserved_names": {
+      "passed": 1,
+      "seconds": 0.0,
+      "compile_seconds": 23.12,
+      "log": "/private/tmp/mini-agent-background56-reserved-names.log"
+    },
+    "default_strict": {
+      "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+      "passed": true,
+      "seconds": 52.83,
+      "reuse_limit": "Before pure reservation/helper cfg addendum; added matcher and original failed minimal row then compiled and passed independently."
+    },
+    "tui_driver_source": "import argparse, errno, fcntl, hashlib, http.server, json, os, pathlib, pty, re, select, shlex, signal, struct, subprocess, tempfile, termios, threading, time, uuid\nparser=argparse.ArgumentParser();parser.add_argument('--binary',required=True);args=parser.parse_args()\nbinary=pathlib.Path(args.binary).resolve();root=pathlib.Path(tempfile.mkdtemp(prefix='mini-agent-background56-native-',dir='/private/tmp'))\nworkspace=root/'workspace';workspace.mkdir(mode=0o700);(workspace/'ARCHITECTURE.md').write_text('# Owned background task fixture\\nRead only owned-child.txt.\\n');(workspace/'owned-child.txt').write_text('OWNED_CHILD56_LITERAL')\nenv=dict(os.environ);env['TERM']='xterm-256color';env['NO_PROXY']='127.0.0.1';env['no_proxy']='127.0.0.1'\nfor key in list(env):\n if key.endswith('_API_KEY') or key.endswith('_TOKEN') or key.startswith('OPENAI_') or key.startswith('OPENROUTER_'):env.pop(key,None)\nfor key in ['ZS_CONFIG_DIR','ZS_DATA_DIR','ZS_STATE_DIR','ZS_CACHE_DIR','ZS_LOCAL_DATA_DIR','ZS_CREDENTIALS_DIR']:\n path=root/key;path.mkdir(mode=0o700);env[key]=str(path)\nrequests=[];errors=[];lock=threading.Lock();release=threading.Event();child_seen=threading.Event();child_id=None;child_calls=0;collect_calls=0\nreport_text='## Findings\\n- [confidence: high] OWNED_CHILD56_LITERAL was read.\\n\\n## Unverified\\n- None\\n\\n## Coverage\\n- Covered: owned-child.txt.\\n- Skipped: None.\\n'\ndef sse(text=None,tool=None):\n delta={'role':'assistant','content':text} if tool is None else {'role':'assistant','tool_calls':[{'index':0,'id':tool[0],'type':'function','function':{'name':tool[1],'arguments':json.dumps(tool[2])}}]}\n return ('data: '+json.dumps({'id':'owned56','object':'chat.completion.chunk','created':0,'model':'fixture','choices':[{'index':0,'delta':delta,'finish_reason':None}]})+'\\n\\ndata: '+json.dumps({'id':'owned56','object':'chat.completion.chunk','created':0,'model':'fixture','choices':[{'index':0,'delta':{},'finish_reason':'stop' if tool is None else 'tool_calls'}],'usage':{'prompt_tokens':10,'completion_tokens':2,'total_tokens':12}})+'\\n\\ndata: [DONE]\\n\\n').encode()\nclass Handler(http.server.BaseHTTPRequestHandler):\n def log_message(self,*args):pass\n def do_GET(self):\n  with lock:requests.append({'method':'GET','path':self.path})\n  body=json.dumps({'object':'list','data':[{'id':'fixture','object':'model','context_length':128000}]}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)\n def do_POST(self):\n  global child_id,child_calls,collect_calls\n  try:\n   size=int(self.headers.get('Content-Length','0'));assert 0<size<=1024*1024;body=json.loads(self.rfile.read(size));names=[t['function']['name'] for t in body.get('tools',[])];serialized=json.dumps(body)\n   with lock:requests.append({'method':'POST','path':self.path,'body':body})\n   assert self.path=='/v1/chat/completions',self.path\n   if 'task' not in names:\n    with lock:child_calls+=1;number=child_calls\n    if number==1:reply=sse(tool=('child-read56','read',{'path':'owned-child.txt'}))\n    else:\n     assert number==2 and 'OWNED_CHILD56_LITERAL' in serialized\n     child_seen.set();assert release.wait(25),'child was not released by owned UI driver';reply=sse(report_text)\n   else:\n    users=[m.get('content','') for m in body['messages'] if m.get('role')=='user'];last=json.dumps(users[-1])\n    if 'COLLECT56' in last:\n     with lock:collect_calls+=1;number=collect_calls\n     assert child_id\n     if number==1:\n      assert serialized.count('[Background task ')==1,'missing or duplicate ordinary-turn notice'\n      reply=sse(tool=('task-result56','task_result',{'id':child_id}))\n     else:\n      assert number==2 and 'OWNED_CHILD56_LITERAL' in serialized;reply=sse('PARENT_COLLECTED56')\n    elif 'NEXT56' in last:\n     assert not release.is_set();reply=sse('PARENT_SECOND56')\n    else:\n     found=re.search(r'Background task started: ([0-9a-f-]{36})',serialized)\n     if found:child_id=found.group(1);uuid.UUID(child_id);reply=sse('PARENT_FIRST56')\n     else:reply=sse(tool=('task-start56','task',{'prompts':['Read owned-child.txt and report its literal contents.'],'run_in_background':True}))\n   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(reply)));self.end_headers();self.wfile.write(reply);self.wfile.flush()\n  except Exception as e:\n   with lock:errors.append(type(e).__name__+': '+str(e))\n   try:self.send_error(500,'owned fixture failed')\n   except (BrokenPipeError,ConnectionResetError):pass\nclass Server(http.server.ThreadingHTTPServer):daemon_threads=False;block_on_close=True\nserver=Server(('127.0.0.1',0),Handler);listener=threading.Thread(target=server.serve_forever,name='owned-background56-listener');\nconfig=root/'ZS_CONFIG_DIR/config.toml';config.write_text(f'''provider=\"background56-wire\"\nmodel=\"bg56\"\nsubagent_model=\"bg56\"\nmax_tokens=512\ncompact_enabled=false\nsession_title_model=\"off\"\nauto_update_prompts=false\nauto_update_themes=false\nupdate_check=false\n[custom_providers.background56-wire]\nprovider_type=\"openai\"\napi_style=\"completions\"\nbase_url=\"http://127.0.0.1:{server.server_port}/v1\"\napi_key_env=\"BACKGROUND56_KEY\"\n[quick_models.bg56]\nprovider=\"background56-wire\"\nmodel=\"fixture\"\ncontext_window=128000\ninput_token_cost=2.0\noutput_token_cost=4.0\n[lsp]\nenabled=false\n''');config.chmod(0o600);env['BACKGROUND56_KEY']='owned-loopback-key'\napproved=set()\nreport={'binary':str(binary),'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'physical_stack_bytes':1048576,'root':str(root),'assertions':{}};master=slave=None;child=None;painted=bytearray()\ndef snapshot():\n files=list((root/'ZS_STATE_DIR/sessions').glob('*.json'))\n if len(files)!=1:return None\n try:return json.loads(files[0].read_text())\n except (ValueError,OSError):return None\ntry:\n listener.start()\n master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',44,200,0,0))\n def setup():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)\n cli=[str(binary),'--no-context-files','--no-sandbox','--tools','read,task,task_result,task_list,task_cancel','--allow','read:*','--load-prompt','code']\n child=subprocess.Popen(['/bin/sh','-c','ulimit -S -s 1024 || exit 90; exec \"$@\"','background56',*cli],cwd=workspace,env=env,stdin=slave,stdout=slave,stderr=slave,preexec_fn=setup);os.close(slave);slave=None;report['pid']=child.pid\n def drain():\n  if select.select([master],[],[],.05)[0]:\n   try:painted.extend(os.read(master,65536))\n   except OSError as e:\n    if e.errno!=errno.EIO:raise\n  if b'\\x1b]11;?\\x07' in painted and not getattr(drain,'answered',False):os.write(master,b'\\x1b]11;rgb:0000/0000/0000\\x07');drain.answered=True\n  plain=re.sub(rb'\\x1b\\[[0-?]*[ -/]*[@-~]',b'',bytes(painted))\n  for ask in re.finditer(rb'\\[permission\\] (task(?:_result|_list|_cancel)?): ([^\\r\\n]*)',plain):\n   key=(ask.group(1),ask.group(2))\n   if key not in approved and b'(y) allow once' in plain[ask.end():ask.end()+1000]:\n    assert len(approved)<2,'unexpected additional task approval'\n    approved.add(key);os.write(master,b'y');report['ordinary_approval_tools']=[k[0].decode() for k in approved]\n\n def wait(check,label):\n  deadline=time.monotonic()+25\n  while time.monotonic()<deadline:\n   drain()\n   if check():return\n   assert child.poll() is None,('early-exit',child.returncode,label,bytes(painted)[-3000:])\n  raise AssertionError(('timeout',label,errors,bytes(painted)[-3000:]))\n def command(text):os.write(master,b'\\x1b[200~'+text.encode()+b'\\x1b[201~\\r')\n wait(lambda:b'code' in painted,'initial prompt');command('LAUNCH56 investigate owned-child.txt in the background')\n wait(lambda:b'PARENT_FIRST56' in painted and child_seen.is_set(),'parent completes while actual child followup held')\n assert child_id;report['assertions']['immediate_id_and_foreground_completion']=True\n command('/tasks');wait(lambda:child_id.encode() in painted and b'running' in painted,'tasks list running')\n before=len([r for r in requests if r['method']=='POST']);command('NEXT56 continue while child runs');wait(lambda:b'PARENT_SECOND56' in painted,'next prompt overlaps child');assert not release.is_set();report['assertions']['next_prompt_overlaps_live_child']=True\n release.set();wait(lambda:(snapshot() or {}).get('background_history',[{}])[0].get('status')=='completed' or b'ready:1' in painted,'completed footer')\n command('COLLECT56 inspect the completed background report');wait(lambda:b'PARENT_COLLECTED56' in painted,'registered task_result and completion notice')\n report['assertions']['exact_once_notice_and_registered_result']=True\n wait(lambda:any(m.get('content')=='PARENT_COLLECTED56' for m in (snapshot() or {}).get('messages',[])),'canonical save')\n command('/quit');deadline=time.monotonic()+10\n while child.poll() is None and time.monotonic()<deadline:drain()\n assert child.poll()==0,('quit',child.returncode)\n saved=snapshot();assert saved and len(saved.get('background_history',[]))==1;assert saved['background_history'][0]['status']=='completed';assert 'OWNED_CHILD56_LITERAL' in saved['background_history'][0]['result']\n assert child_calls==2 and collect_calls==2 and not errors,(child_calls,collect_calls,errors)\n assert len([r for r in requests if r['method']=='POST'])==7\n report['assertions']['persisted_data_and_normal_quit']=True;report['exit']=child.returncode\nexcept BaseException as exc:\n report['error']=repr(exc)\nfinally:\n release.set()\n if child is not None:\n  if child.poll() is None:\n   try:os.killpg(child.pid,signal.SIGTERM)\n   except ProcessLookupError:pass\n   try:child.wait(timeout=2)\n   except subprocess.TimeoutExpired:\n    try:os.killpg(child.pid,signal.SIGKILL)\n    except ProcessLookupError:pass\n    child.wait(timeout=3)\n  report['retired_pid']=child.pid;report['final_returncode']=child.returncode\n if slave is not None:os.close(slave)\n if master is not None:os.close(master)\n server.shutdown();server.server_close();listener.join(timeout=3);report['listener_joined']=not listener.is_alive();assert not listener.is_alive()\n (root/'screen.raw').write_bytes(painted);(root/'requests.json').write_text(json.dumps(requests,ensure_ascii=False,indent=2));report['errors']=errors;(root/'report.json').write_text(json.dumps(report,indent=2));print(root/'report.json',flush=True)\nif 'error' in report:raise SystemExit(1)\n",
+    "tui_driver_sha256": "ae13345bb492da77c5bcbc39ac09b04cc7626edc41bacdc406c0b94dd15ccdee",
+    "root_containment_driver_source": "import hashlib,json,os,pathlib,resource,signal,subprocess,sys,tempfile,time\nbinary=pathlib.Path(sys.argv[1]).resolve();report={'binary':str(binary),'sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'bytes':binary.stat().st_size,'stack_bytes':1048576}\nwith tempfile.TemporaryDirectory(prefix='mini-agent-snapshot86-production-',dir=pathlib.Path(tempfile.gettempdir()).resolve()) as name:\n root=pathlib.Path(name);env=os.environ.copy()\n for key in tuple(env):\n  if key.startswith(('ZS_','OPENAI_','ANTHROPIC_','OPENROUTER_','MINI_AGENT_INTERNAL_')) or key.endswith(('_API_KEY','_AUTH_TOKEN')):env.pop(key,None)\n for key in ('ZS_CONFIG_DIR','ZS_DATA_DIR','ZS_LOCAL_DATA_DIR','ZS_STATE_DIR','ZS_CACHE_DIR','ZS_CREDENTIALS_DIR'):\n  path=root/key;path.mkdir(mode=0o700);env[key]=str(path)\n work=root/'workspace';work.mkdir();env['RUST_LOG']='off'\n def setup():\n  os.setsid();resource.setrlimit(resource.RLIMIT_STACK,(1048576,resource.getrlimit(resource.RLIMIT_STACK)[1]))\n started=time.monotonic();child=subprocess.Popen([str(binary),'--js-runtime-check'],cwd=work,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,preexec_fn=setup)\n report.update(pid=child.pid,pgid=os.getpgid(child.pid),forced_cleanup=False);assert report['pgid']==child.pid\n try:stdout,stderr=child.communicate(timeout=45)\n finally:\n  if child.poll() is None:\n   report['forced_cleanup']=True\n   try:os.killpg(child.pid,signal.SIGTERM)\n   except ProcessLookupError:pass\n   try:child.wait(timeout=3)\n   except subprocess.TimeoutExpired:\n    try:os.killpg(child.pid,signal.SIGKILL)\n    except ProcessLookupError:pass\n    child.wait(timeout=5)\n report.update(exit=child.returncode,elapsed_ms=(time.monotonic()-started)*1000,stdout=stdout,stderr=stderr)\n report['passed']=child.returncode==0 and stdout.strip()=='JS runtime check: PASS (2)' and not report['forced_cleanup']\npathlib.Path('/private/tmp/mini-agent-snapshot86-production-report.json').write_text(json.dumps(report,indent=2)+'\\n');print(json.dumps(report,indent=2));assert report['passed']\n"
+  },
+  "status": "Scoped review findings resolved. Required debug install, original failed cfg row, actual TUI background overlap/result/once-notice/persistence/normal quit, and actual native JS execution passed on the same installed binary. Hosted CI for the resulting commit is a separate pending gate.",
+  "limits": [
+    "Native signed-wire fixtures preserve opaque block/system/tools bytes; they do not claim validity of a remote provider signature.",
+    "No paid provider or real-account calls.",
+    "Only exact source changes and affected caller filters are validated; unchanged passing controls are reused."
+  ]
+}

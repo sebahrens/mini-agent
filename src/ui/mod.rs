@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "subagents"))]
+pub(crate) use app::drive_native_background_fixture;
 #[cfg(all(test, feature = "agent-skills"))]
 pub(crate) use app::drive_native_instruction_fixture;
 #[cfg(all(test, feature = "hooks", feature = "agent-skills"))]
@@ -752,6 +754,7 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
     crate::ui::slash::is_readonly_diagnostic(t)
         || crate::ui::slash::is_readonly_view(t)
         || crate::ui::slash::is_jobs_control(t)
+        || crate::ui::slash::is_tasks_control(t)
         || t.trim_end() == "/effort"
         || t == "/queue"
         || crate::ui::slash::is_input_control(t)
@@ -1263,9 +1266,9 @@ pub(crate) async fn start_main_run(
             )
         })
         .await;
-        #[cfg(any(feature = "hooks", feature = "memory"))]
+        #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
         let mut paused = paused;
-        #[cfg(any(feature = "hooks", feature = "memory"))]
+        #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         let pending = pending_turn.take().unwrap();
         if record_chat_history {
@@ -1292,9 +1295,9 @@ pub(crate) async fn start_main_run(
                 )
         })
         .await;
-        #[cfg(any(feature = "hooks", feature = "memory"))]
+        #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
         let mut paused = paused;
-        #[cfg(any(feature = "hooks", feature = "memory"))]
+        #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         paused.start_interactive()
     };
@@ -1382,7 +1385,7 @@ pub(crate) fn record_goal_round_boundary(
     Ok(settled)
 }
 
-#[cfg(any(feature = "hooks", feature = "memory"))]
+#[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
 pub(crate) fn adopt_runner_hook_context(
     paused: &mut crate::agent::runner::PausedAgentRunner,
     pending: Option<&mut PendingMainTurn>,
@@ -1615,9 +1618,9 @@ pub(crate) async fn mid_turn_compact_and_respawn(
             None,
         )
         .await;
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let mut paused = paused;
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
     if let Some(text) = previous_steering
         .as_ref()
@@ -1765,8 +1768,10 @@ pub async fn run_interactive(
     .await?;
     let result = app.run().await;
     app.teardown_owners().await;
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "subagents"))]
     let result = result.and(crate::startup::heap_future(|| app.finish_session_end()).await);
+    #[cfg(feature = "subagents")]
+    let result = result.and(app.persist_background_state());
     result
 }
 

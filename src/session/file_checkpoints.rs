@@ -12,7 +12,7 @@ pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDS: usize = 512;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Record {
     session: String,
     turn: usize,
@@ -23,7 +23,7 @@ struct Record {
     #[serde(default)]
     retired: bool,
 }
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Data {
     records: Vec<Record>,
     blobs: BTreeMap<String, usize>,
@@ -37,6 +37,8 @@ struct State {
     data: Data,
     trusted: bool,
     memory: BTreeMap<String, Vec<u8>>,
+    #[cfg(feature = "subagents")]
+    observation: crate::session::background_observation::ObservationStamp,
 }
 /// Live clones deliberately share actual filesystem observations, like TodoStore.
 #[derive(Clone, Debug)]
@@ -47,6 +49,8 @@ impl Default for FileCheckpoints {
             data: Data::default(),
             trusted: true,
             memory: BTreeMap::new(),
+            #[cfg(feature = "subagents")]
+            observation: Default::default(),
         })))
     }
 }
@@ -90,7 +94,63 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
             data,
             trusted: false,
             memory: BTreeMap::new(),
+            #[cfg(feature = "subagents")]
+            observation: Default::default(),
         }))))
+    }
+}
+// The guard stamps every serialized change, including early failures during
+// preimage preparation. Runtime-only blob bytes/trust flags are not serialized.
+struct FileMutation<'a> {
+    state: std::sync::MutexGuard<'a, State>,
+    #[cfg(feature = "subagents")]
+    before: Data,
+    #[cfg(feature = "subagents")]
+    observation: Option<crate::session::background_observation::JobObservation>,
+}
+impl std::ops::Deref for FileMutation<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for FileMutation<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+}
+impl Drop for FileMutation<'_> {
+    fn drop(&mut self) {
+        #[cfg(feature = "subagents")]
+        if self.before != self.state.data {
+            self.state.observation.changed(self.observation.as_ref());
+        }
+    }
+}
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone)]
+pub(crate) struct FileObservation {
+    original: FileCheckpoints,
+    data: Data,
+    stamp: crate::session::background_observation::ObservationStamp,
+}
+#[cfg(feature = "subagents")]
+impl FileObservation {
+    pub(crate) fn frozen(&self) -> FileCheckpoints {
+        FileCheckpoints(Arc::new(Mutex::new(State {
+            data: self.data.clone(),
+            trusted: false,
+            memory: Default::default(),
+            observation: Default::default(),
+        })))
+    }
+    pub(crate) fn validates_since(
+        &self,
+        previous: &Self,
+        owner: &Arc<crate::session::background_observation::ObservationOwner>,
+    ) -> bool {
+        Arc::ptr_eq(&self.original.0, &previous.original.0)
+            && self.stamp.validates_since(&previous.stamp, owner)
     }
 }
 fn valid_digest(s: &str) -> bool {
@@ -107,6 +167,53 @@ fn relative_path(p: &Path) -> bool {
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 impl FileCheckpoints {
+    #[cfg(feature = "subagents")]
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    fn edit(&self) -> FileMutation<'_> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        FileMutation {
+            #[cfg(feature = "subagents")]
+            before: state.data.clone(),
+            state,
+            #[cfg(feature = "subagents")]
+            observation: None,
+        }
+    }
+    #[cfg(feature = "subagents")]
+    fn edit_observation(
+        &self,
+        observation: Option<&crate::session::background_observation::JobObservation>,
+    ) -> FileMutation<'_> {
+        let mut mutation = self.edit();
+        mutation.observation = observation.cloned();
+        mutation
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_observation_snapshot<T>(
+        &self,
+        capture: impl FnOnce(FileObservation) -> T,
+    ) -> T {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        capture(FileObservation {
+            original: self.clone(),
+            data: state.data.clone(),
+            stamp: state.observation.clone(),
+        })
+    }
+    #[cfg(feature = "subagents")]
+    pub(crate) fn bind_observation_owner(
+        &self,
+        owner: &Arc<crate::session::background_observation::ObservationOwner>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observation
+            .bind(owner)
+    }
     pub(crate) fn revision(&self) -> u64 {
         self.0
             .lock()
@@ -127,6 +234,8 @@ impl FileCheckpoints {
             session: session.into(),
             turn: Arc::new(std::sync::atomic::AtomicUsize::new(turn)),
             ephemeral,
+            #[cfg(feature = "subagents")]
+            observation: None,
             #[cfg(test)]
             blob_root: None,
         }
@@ -158,7 +267,7 @@ impl FileCheckpoints {
         )
     }
     pub(crate) fn retire_from(&self, index: usize) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.edit();
         for r in &mut state.data.records {
             if r.turn >= index {
                 r.retired = true;
@@ -172,7 +281,7 @@ impl FileCheckpoints {
     /// The summary replaces a prefix, so surviving user rows move together
     /// with their exact checkpoints. Pruned turns cannot become later turns.
     pub(crate) fn compact_prefix(&self, removed: usize) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.edit();
         for record in &mut state.data.records {
             if record.turn < removed {
                 record.retired = true;
@@ -294,13 +403,7 @@ impl FileCheckpoints {
                 anyhow::bail!("restored {restored} files; stopped at {path}: {error}");
             }
             restored += 1;
-            for record in &mut self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .data
-                .records
-            {
+            for record in &mut self.edit().data.records {
                 if record.session == session && record.turn >= index && record.path == path {
                     record.retired = true;
                 }
@@ -316,10 +419,39 @@ pub(crate) struct Recorder {
     session: String,
     turn: Arc<std::sync::atomic::AtomicUsize>,
     ephemeral: bool,
+    #[cfg(feature = "subagents")]
+    observation: Option<crate::session::background_observation::JobObservation>,
     #[cfg(test)]
     blob_root: Option<PathBuf>,
 }
 impl Recorder {
+    #[cfg(feature = "subagents")]
+    pub(crate) fn belongs_to_store(&self, session: &str, store: &FileCheckpoints) -> bool {
+        self.session == session && self.store.same_owner(store)
+    }
+    #[cfg(feature = "subagents")]
+    pub(crate) fn for_background(
+        &self,
+        observation: crate::session::background_observation::JobObservation,
+    ) -> Self {
+        Self {
+            // This launch row stays fixed even when foreground steering rebases
+            // the original recorder before subsequent foreground effects.
+            turn: Arc::new(std::sync::atomic::AtomicUsize::new(self.turn())),
+            observation: Some(observation),
+            ..self.clone()
+        }
+    }
+    fn edit_store(&self) -> FileMutation<'_> {
+        #[cfg(feature = "subagents")]
+        {
+            self.store.edit_observation(self.observation.as_ref())
+        }
+        #[cfg(not(feature = "subagents"))]
+        {
+            self.store.edit()
+        }
+    }
     fn turn(&self) -> usize {
         self.turn.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -383,7 +515,7 @@ pub(crate) fn steering_handoff() -> (
     )
 }
 
-#[cfg(any(feature = "hooks", feature = "memory"))]
+#[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
 pub(crate) fn inserted_context(rows: usize) {
     if let Some(recorder) = current() {
         let _ = recorder.turn.fetch_update(
@@ -406,15 +538,12 @@ pub(crate) fn scope<F: std::future::Future>(
 }
 pub(crate) fn skipped() {
     if let Some(recorder) = current() {
-        skip(
-            &mut recorder.store.0.lock().unwrap_or_else(|e| e.into_inner()),
-            recorder.turn(),
-        );
+        skip(&mut recorder.edit_store(), recorder.turn());
     }
 }
 pub(crate) fn published() {
     if let Some(recorder) = current() {
-        let mut state = recorder.store.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = recorder.edit_store();
         state.data.mutations = state.data.mutations.wrapping_add(1);
     }
 }
@@ -493,7 +622,7 @@ pub(crate) fn prepare(
     read_allowed: bool,
 ) -> Option<Pending> {
     let recorder = current()?;
-    let mut state = recorder.store.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = recorder.edit_store();
     let make = (|| -> anyhow::Result<Record> {
         anyhow::ensure!(
             read_allowed && state.data.records.len() < MAX_RECORDS,
@@ -594,12 +723,7 @@ pub(crate) fn prepare(
 impl Pending {
     pub(crate) fn committed(&mut self, after: &[u8]) {
         self.record.after = digest(after);
-        let mut state = self
-            .recorder
-            .store
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.recorder.edit_store();
         if state.data.records.len() >= MAX_RECORDS || after.len() > MAX_FILE_BYTES {
             skip(&mut state, self.record.turn);
             return;
@@ -608,12 +732,7 @@ impl Pending {
         state.data.records.push(self.record.clone());
     }
     pub(crate) fn formatted(&self, after: Option<&str>) {
-        let mut state = self
-            .recorder
-            .store
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.recorder.edit_store();
         if let Some(record) = self
             .recorded_index
             .and_then(|index| state.data.records.get_mut(index))

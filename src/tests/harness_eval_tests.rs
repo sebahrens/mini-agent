@@ -1675,6 +1675,7 @@ async fn persona_regression_eval() {
                 prompts: vec![case.prompt],
                 briefs: None,
                 agent_type: Some(case.agent_type.clone()),
+                run_in_background: false,
             },
             workspace.clone(),
             vec![case.response],

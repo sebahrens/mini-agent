@@ -12,6 +12,8 @@ mod hooks;
 pub(crate) mod init;
 mod jobs;
 mod memory;
+#[cfg(feature = "subagents")]
+mod tasks;
 #[cfg(feature = "memory")]
 pub(crate) use memory::edit_memory_file;
 #[cfg(unix)]
@@ -182,6 +184,8 @@ impl SlashCtx<'_> {
                 .replace_session_allowlist(&entries);
         }
 
+        #[cfg(feature = "subagents")]
+        self.session.close_background_tasks().await;
         *self.client = next_client;
         *self.agent = Some(next_agent);
         *self.session = session;
@@ -669,6 +673,11 @@ where
     F: std::future::Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
 {
     let model = session.model.to_string();
+    #[cfg(feature = "subagents")]
+    let _background_pause = match &session.background_pool {
+        Some(pool) => Some(pool.pause_for_history().await?),
+        None => None,
+    };
     let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
     let previous_summary = session
         .compactions
@@ -725,6 +734,10 @@ pub(crate) fn is_readonly_view(text: &str) -> bool {
             | ["/sessions"]
             | ["/sessions", "--all"]
     )
+}
+
+pub(crate) fn is_tasks_control(text: &str) -> bool {
+    cfg!(feature = "subagents") && split_command(text).first().copied() == Some("/tasks")
 }
 
 pub(crate) fn is_jobs_control(text: &str) -> bool {
@@ -938,6 +951,8 @@ pub(crate) async fn handle_slash(
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => doctor::handle(&parts, &mut ctx),
         "/jobs" => jobs::handle(&parts, &mut ctx),
+        #[cfg(feature = "subagents")]
+        "/tasks" => tasks::handle(&parts, &mut ctx),
         "/help" => {
             help::handle(&parts, &mut ctx);
             Ok(())

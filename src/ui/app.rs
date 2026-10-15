@@ -136,6 +136,8 @@ pub(super) mod test_support {
             user_rx,
             tui_log_rx: None,
             deferred_user_events: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_requests: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
             event_handle: None,
             prebuild: None,
@@ -1192,6 +1194,8 @@ pub(crate) struct App<'a> {
     user_rx: mpsc::Receiver<UserEvent>,
     tui_log_rx: Option<mpsc::Receiver<String>>,
     deferred_user_events: std::collections::VecDeque<UserEvent>,
+    #[cfg(feature = "subagents")]
+    background_requests: std::collections::VecDeque<crate::permission::ask::UserRequest>,
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild: Option<super::prebuild::AgentPrebuild>,
@@ -1717,9 +1721,9 @@ impl<'a> App<'a> {
                         None,
                     )
                     .await;
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let mut paused = paused;
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 super::adopt_runner_hook_context(&mut paused, Some(&mut pending_turn), ui.session);
                 let runner = paused.start_interactive();
                 run.compaction_decision_tx = runner.compaction_decision_tx;
@@ -1880,6 +1884,8 @@ impl<'a> App<'a> {
             user_rx,
             tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
+            #[cfg(feature = "subagents")]
+            background_requests: Default::default(),
             running,
             event_handle,
             prebuild,
@@ -1939,6 +1945,27 @@ impl<'a> App<'a> {
         }
     }
 
+    #[cfg(all(feature = "subagents", not(feature = "hooks")))]
+    pub(super) async fn finish_session_end(&mut self) -> anyhow::Result<()> {
+        if let Some(owner) = self.run.native_session_end.take() {
+            owner.run(self.ui.session).await
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(super) fn persist_background_state(&self) -> anyhow::Result<()> {
+        if !self.ui.cli.no_session
+            && !self.ui.session.background_history.is_empty()
+            && !crate::session::native_publication::is_native_bearing(self.ui.session)
+        {
+            crate::session::storage::save_session(self.ui.session)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         let result = crate::startup::heap_future(|| self.run_inner()).await;
         #[cfg(feature = "mcp")]
@@ -1962,6 +1989,14 @@ impl<'a> App<'a> {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             self.expire_abandoned_permission()?;
+            #[cfg(feature = "subagents")]
+            if self.permission_prompt.is_none()
+                && self.question_prompt.is_none()
+                && let Some(request) = self.background_requests.pop_front()
+            {
+                self.begin_user_request(request)?;
+                self.refresh()?;
+            }
             self.drain_tui_diagnostics()?;
             #[cfg(feature = "git-worktree")]
             self.drain_git_observations()?;
@@ -1989,7 +2024,14 @@ impl<'a> App<'a> {
                 self.last_branch_check = std::time::Instant::now();
             }
 
+            #[cfg(feature = "subagents")]
+            let background_pool = self.ui.session.background_pool.clone();
             tokio::select! {
+                _ = async {
+                    #[cfg(feature = "subagents")]
+                    if let Some(pool) = background_pool { pool.wait_changed().await; return; }
+                    std::future::pending::<()>().await;
+                } => { self.refresh()?; }
                 Some(message) = async { self.tui_log_rx.as_mut()?.recv().await } => {
                     for line in message.lines() {
                         self.renderer.write_line(&sanitize_output(line), C_ERROR)?;
@@ -2134,7 +2176,7 @@ impl<'a> App<'a> {
         if let Err(error) = self.retire_session_title().await {
             tracing::warn!(%error,"session title cleanup failed");
         }
-        self.cancel_pending_permissions();
+        self.cancel_all_permissions();
         self.pause_event_thread();
 
         // Retire owned work before closing the services it can still use.
@@ -2162,6 +2204,8 @@ impl<'a> App<'a> {
             tracing::warn!(%error, "TUI prebuild cleanup failed");
         }
 
+        #[cfg(feature = "subagents")]
+        self.ui.session.close_background_tasks().await;
         #[cfg(feature = "lsp")]
         crate::extras::lsp::shutdown_live_managers().await;
         #[cfg(feature = "mcp")]
@@ -2370,7 +2414,23 @@ impl<'a> App<'a> {
     ) -> anyhow::Result<()> {
         // Cancellation settles the owning run before another request can be
         // adopted. A dropped caller or a request left by that run cannot grant.
-        if !self.run.is_running || request.reply.is_closed() {
+        #[cfg(feature = "subagents")]
+        let background = request
+            .background
+            .as_ref()
+            .is_some_and(|origin| origin.valid(self.ui.session));
+        #[cfg(not(feature = "subagents"))]
+        let background = false;
+        if (!self.run.is_running && !background) || request.reply.is_closed() || {
+            #[cfg(feature = "subagents")]
+            {
+                request.background.is_some() && !background
+            }
+            #[cfg(not(feature = "subagents"))]
+            {
+                false
+            }
+        } {
             let _ = request
                 .reply
                 .send(crate::permission::ask::UserDecision::Deny);
@@ -2425,7 +2485,15 @@ impl<'a> App<'a> {
             .is_some_and(|owner| !self.mcp_frontend_owner_current(owner));
         #[cfg(not(feature = "mcp"))]
         let stale_mcp_permission = false;
-        if stale_mcp_permission
+        #[cfg(feature = "subagents")]
+        let stale_background = self
+            .permission_prompt
+            .as_ref()
+            .is_some_and(|p| p.stale_background(self.ui.session));
+        #[cfg(not(feature = "subagents"))]
+        let stale_background = false;
+        if stale_background
+            || stale_mcp_permission
             || self
                 .permission_prompt
                 .as_ref()
@@ -2444,22 +2512,51 @@ impl<'a> App<'a> {
     /// Deny both the displayed request and the sequential channel backlog
     /// before settlement; no waiter from the retired run can become a grant.
     fn cancel_pending_permissions(&mut self) {
+        self.cancel_permissions(false);
+    }
+    fn cancel_all_permissions(&mut self) {
+        self.cancel_permissions(true);
+    }
+    fn cancel_permissions(&mut self, all: bool) {
         if let Some(prompt) = self.question_prompt.take() {
             if let Err(error) = prompt.finish(&mut self.renderer) {
                 tracing::warn!(%error,"question overlay cleanup failed");
             }
             drop(prompt);
         }
-        if let Some(prompt) = self.permission_prompt.take() {
+        #[cfg(feature = "subagents")]
+        let keep_background = !all
+            && self
+                .permission_prompt
+                .as_ref()
+                .is_some_and(|p| p.background_for(self.ui.session));
+        #[cfg(not(feature = "subagents"))]
+        let keep_background = false;
+        if !keep_background && let Some(prompt) = self.permission_prompt.take() {
             prompt.decline_on_cancel(&self.ui);
             if let Err(error) = prompt.finish(&mut self.renderer) {
                 tracing::warn!(%error, "permission overlay cleanup failed");
             }
             drop(prompt);
         }
-        self.renderer.permission_prompt = None;
+        if !keep_background {
+            self.renderer.permission_prompt = None;
+        }
+        #[cfg(not(feature = "subagents"))]
+        let _ = all;
         if let Some(receiver) = self.ask_rx.as_mut() {
             while let Ok(request) = receiver.try_recv() {
+                #[cfg(feature = "subagents")]
+                if !all && request.background_for(self.ui.session) {
+                    self.background_requests.push_back(request);
+                    continue;
+                }
+                request.cancel();
+            }
+        }
+        #[cfg(feature = "subagents")]
+        if all {
+            for request in self.background_requests.drain(..) {
                 request.cancel();
             }
         }
@@ -2726,7 +2823,7 @@ impl<'a> App<'a> {
                 }
             }
             UserEvent::Quit => {
-                self.cancel_pending_permissions();
+                self.cancel_all_permissions();
                 // The terminal may already be gone (SIGHUP): drawing can fail,
                 // but stopping the run and saving must still happen.
                 if self.run.is_running
@@ -3113,6 +3210,8 @@ impl<'a> App<'a> {
                         .write_line("rewind selection is stale; open /rewind again", C_ERROR)?;
                     return Ok(());
                 }
+                #[cfg(feature = "subagents")]
+                self.ui.session.reset_background_tasks().await;
                 if mode != RewindMode::Conversation {
                     // Like session publication, this bounded native operation stays
                     // owned by the foreground key handler through completion.
@@ -5377,6 +5476,7 @@ impl<'a> App<'a> {
         if crate::ui::slash::config::is_command(text)
             || crate::ui::slash::is_readonly_view(text)
             || crate::ui::slash::is_jobs_control(text)
+            || crate::ui::slash::is_tasks_control(text)
             || crate::ui::slash::is_input_control(text)
         {
             if let Err(error) = result {
@@ -5911,9 +6011,9 @@ impl<'a> App<'a> {
                             )
                     })
                     .await;
-                    #[cfg(any(feature = "hooks", feature = "memory"))]
+                    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     let mut paused = paused;
-                    #[cfg(any(feature = "hooks", feature = "memory"))]
+                    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     super::adopt_runner_hook_context(
                         &mut paused,
                         self.run.pending_turn.as_mut(),
@@ -6050,9 +6150,9 @@ impl<'a> App<'a> {
                             )
                     })
                     .await;
-                    #[cfg(any(feature = "hooks", feature = "memory"))]
+                    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     let mut paused = paused;
-                    #[cfg(any(feature = "hooks", feature = "memory"))]
+                    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     super::adopt_runner_hook_context(
                         &mut paused,
                         self.run.pending_turn.as_mut(),
@@ -8450,6 +8550,8 @@ mod permission_loop_tests {
         let (reply, receiver) = oneshot::channel();
         (
             AskRequest {
+                #[cfg(feature = "subagents")]
+                background: None,
                 agent_name: None,
                 tool: "shell".into(),
                 input: input.into(),
@@ -10803,6 +10905,8 @@ mod workspace_session_picker_tests {
                         let mut decision = if pending_permission {
                             let (reply, decision) = tokio::sync::oneshot::channel();
                             app.begin_permission_request(crate::permission::ask::AskRequest {
+                                #[cfg(feature = "subagents")]
+                                background: None,
                                 agent_name: None,
                                 tool: "bash".into(),
                                 input: "owned unanswered command".into(),
@@ -12478,6 +12582,16 @@ pub(crate) async fn drive_native_steer_fixture(
     plan_approval_tests::drive_native_steer_fixture(ui, stop_at_boundary).await
 }
 
+#[cfg(all(test, feature = "subagents"))]
+pub(crate) async fn drive_native_background_fixture(
+    ui: UiContext<'_>,
+    child: crate::extras::subagents::SubagentConfig,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+) -> Vec<Session> {
+    plan_approval_tests::drive_native_background_fixture(ui, child, calls, release).await
+}
+
 #[cfg(test)]
 pub(crate) async fn drive_native_fixture_turn(ui: UiContext<'_>, prompt: &str) {
     plan_approval_tests::drive_native_fixture_turns(ui, &[prompt], false).await;
@@ -13941,6 +14055,286 @@ mod plan_approval_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn background56_actual_app_approval_survives_parent_and_tasks_views_are_inert() {
+        let roots = Roots::new();
+        let provider = Provider::new(vec![]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_context_files: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("plan80", "owned-model", 32000, "background");
+        session.working_dir = workspace.root().to_string_lossy().into();
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace.clone(),
+            SecurityMode::Standard,
+        ));
+        let (sender, receiver) = mpsc::channel(32);
+        app.ask_rx = Some(receiver);
+        let policy = PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Ask),
+            ..Default::default()
+        });
+        let permission = Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &policy,
+                SecurityMode::Standard,
+                Some(workspace.root().into()),
+                None,
+            )
+            .unwrap(),
+        ));
+        app.ui.permission = Some(permission.clone());
+        let run = crate::spend::run::Run::for_session(
+            app.ui.session,
+            &cfg,
+            crate::spend::RequestKind::Turn,
+        );
+        let pool = run.background_pool().unwrap();
+        let recorder = app
+            .ui
+            .session
+            .file_checkpoints
+            .recorder(&app.ui.session.id, 0, true);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            for (key_code, permitted) in [(KeyCode::Char('y'), true), (KeyCode::Char('n'), false)] {
+                let permission = Some(permission.clone());
+                let sender = Some(sender.clone());
+                let id = pool
+                    .reserve(&workspace, &run, &recorder)
+                    .unwrap()
+                    .start(
+                        async move {
+                            crate::agent::tools::check_perm(
+                                &permission,
+                                &sender,
+                                "read",
+                                "owned.txt",
+                            )
+                            .await
+                            .map(|_| "approved exact child read".to_string())
+                            .map_err(|e| e.to_string())
+                        },
+                        run.clone(),
+                    )
+                    .unwrap();
+                let request = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.ask_rx.as_mut().unwrap().recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(request.background_for(app.ui.session));
+                app.background_requests.push_back(request);
+                app.cancel_pending_permissions();
+                assert_eq!(app.background_requests.len(), 1);
+                let request = app.background_requests.pop_front().unwrap();
+                app.begin_user_request(request).unwrap();
+                assert!(
+                    app.permission_prompt.is_some(),
+                    "idle frontend must adopt a live child's ordinary Ask"
+                );
+                assert!(!app.run.is_running);
+                app.cancel_pending_permissions();
+                assert!(
+                    app.permission_prompt.is_some(),
+                    "foreground retirement cannot deny a different live scope"
+                );
+                key(&mut app, key_code).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while pool.result(&id).unwrap().status.is_active() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    pool.result(&id).unwrap().status,
+                    if permitted {
+                        crate::extras::subagents::background::Status::Completed
+                    } else {
+                        crate::extras::subagents::background::Status::Failed
+                    }
+                );
+            }
+            let before = serde_json::to_vec(app.ui.session).unwrap();
+            for command in ["/tasks", "/tasks invalid"] {
+                crate::startup::heap_future(|| app.run_slash_command(command))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(app.ui.session).unwrap(),
+                    before,
+                    "views must not save, start a goal or add history"
+                );
+            }
+            assert!(provider.calls().is_empty());
+            assert!(app.renderer.captured_output().contains("completed"));
+            assert_eq!(app.ui.session.background_task_counts(), (0, 2));
+        }))
+        .await;
+        app.teardown_owners().await;
+        provider.cancel().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(super) async fn drive_native_background_fixture(
+        ui: UiContext<'_>,
+        child: crate::extras::subagents::SubagentConfig,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Vec<Session> {
+        use rig::tool::Tool;
+        let mut app = owned_app(ui);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            user(
+                &mut app,
+                UserEvent::Paste("first background parent prompt".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(finish_turn(&mut app).await);
+            let first: Session =
+                serde_json::from_value(serde_json::to_value(&*app.ui.session).unwrap()).unwrap();
+            let cfg = app.ui.cfg;
+            let run = crate::spend::run::Run::for_session(
+                app.ui.session,
+                cfg,
+                crate::spend::RequestKind::Turn,
+            );
+            let pool = run.background_pool().unwrap();
+            let tool = crate::extras::subagents::task_tool::TaskTool::new(None, None, false)
+                .with_workspace_binding(app.ui.workspace.clone());
+            let recorder = app
+                .ui
+                .session
+                .file_checkpoints
+                .recorder(&app.ui.session.id, 0, false);
+            let launch = crate::extras::subagents::scope_test_config(
+                child,
+                crate::session::file_checkpoints::scope(
+                    Some(recorder),
+                    crate::spend::run::scope(
+                        Some(run),
+                        tool.call(crate::extras::subagents::task_tool::TaskArgs {
+                            prompts: vec![
+                                "Read owned-child.txt and report its literal contents".into(),
+                            ],
+                            briefs: None,
+                            agent_type: None,
+                            run_in_background: true,
+                        }),
+                    ),
+                ),
+            );
+            let launch = tokio::time::timeout(Duration::from_secs(5), launch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(launch.starts_with("Background task started:"));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while calls.load(std::sync::atomic::Ordering::Acquire) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                pool.active_count(),
+                1,
+                "actual child followup must remain held across the next main prompt"
+            );
+            assert!(
+                app.ui.session.recorded_total_cost() > first.recorded_total_cost(),
+                "actual accepted child usage must advance the same account"
+            );
+            app.run_slash_command("/tasks").await.unwrap();
+            assert!(app.renderer.captured_output().contains("running"));
+            user(
+                &mut app,
+                UserEvent::Paste("second background parent prompt".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(
+                finish_turn(&mut app).await,
+                "next native prompt must overlap the live child"
+            );
+            assert!(app.run.native_blocked.is_none());
+            assert_eq!(pool.active_count(), 1);
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.active_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let row = pool.list().pop().unwrap();
+            assert_eq!(
+                row.status,
+                crate::extras::subagents::background::Status::Completed,
+                "{row:?}"
+            );
+            let notices = pool.pending_notices().unwrap();
+            assert_eq!(notices.messages().len(), 1);
+            drop(notices);
+            assert!(
+                pool.pending_notices().is_some(),
+                "preparation failure/drop cannot consume a notice"
+            );
+            let second: Session =
+                serde_json::from_value(serde_json::to_value(&*app.ui.session).unwrap()).unwrap();
+            user(
+                &mut app,
+                UserEvent::Paste("third background parent prompt".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(
+                finish_turn(&mut app).await,
+                "completion notice must enter ordinary native admission"
+            );
+            assert!(
+                pool.pending_notices().is_none(),
+                "accepted next turn delivers the exact completion once"
+            );
+            assert!(
+                app.ui
+                    .session
+                    .messages
+                    .iter()
+                    .any(|row| row.content.contains("[Background task "))
+            );
+            let third: Session =
+                serde_json::from_value(serde_json::to_value(&*app.ui.session).unwrap()).unwrap();
+            vec![first, second, third]
+        }))
+        .await;
+        release.notify_one();
+        app.teardown_owners().await;
+        if outcome.is_ok() {
+            app.finish_session_end().await.unwrap();
+        }
+        match outcome {
+            Ok(sessions) => sessions,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[cfg(unix)]

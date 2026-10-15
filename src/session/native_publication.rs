@@ -55,6 +55,8 @@ pub(crate) struct NativePublication {
     owner: Arc<WriterOwner>,
     revision: u64,
     digest: [u8; 32],
+    #[cfg(feature = "subagents")]
+    observations: Option<Arc<super::background_observation::SharedObservations>>,
 }
 
 /// Not serializable or cloneable. An exact frontend actor retains this until
@@ -422,7 +424,7 @@ fn digest(session: &Session) -> anyhow::Result<[u8; 32]> {
     Ok(Sha256::digest(encoded.as_bytes()).into())
 }
 
-fn checked_publication(session: &Session) -> anyhow::Result<&NativePublication> {
+fn checked_publication_owner(session: &Session) -> anyhow::Result<&NativePublication> {
     let publication = session.native_publication.as_ref().ok_or_else(|| {
         anyhow::anyhow!("unfinished native context requires its saved-session owner")
     })?;
@@ -437,11 +439,84 @@ fn checked_publication(session: &Session) -> anyhow::Result<&NativePublication> 
         ),
         "unfinished native context belongs to another session owner"
     );
+    Ok(publication)
+}
+
+fn checked_publication(session: &Session) -> anyhow::Result<&NativePublication> {
+    let publication = checked_publication_owner(session)?;
     anyhow::ensure!(
         digest(session)? == publication.digest,
         "native context snapshot changed before publication"
     );
     Ok(publication)
+}
+
+// Derived cleanup/control authority still binds the entire published Session.
+// Only genuine same-owner observations may advance behind its retired actor;
+// their new bytes are written only by the existing begin/retire transition.
+fn checked_retired_publication(session: &Session) -> anyhow::Result<&NativePublication> {
+    #[cfg(feature = "subagents")]
+    let publication = checked_publication_owner(session)?;
+    #[cfg(feature = "subagents")]
+    if let Some(previous) = &publication.observations {
+        previous.current_since(session)?;
+        anyhow::ensure!(
+            digest(&previous.frozen_session(session))? == publication.digest,
+            "native context changed beyond background observations"
+        );
+        return Ok(publication);
+    }
+    checked_publication(session)
+}
+
+fn unchanged_retired_body(
+    session: &Session,
+    publication: &NativePublication,
+) -> anyhow::Result<bool> {
+    #[cfg(feature = "subagents")]
+    if let Some(previous) = &publication.observations {
+        previous.current_since(session)?;
+        return Ok(digest(&previous.frozen_session(session))? == publication.digest);
+    }
+    Ok(digest(session)? == publication.digest)
+}
+
+#[cfg(feature = "subagents")]
+fn freeze_shared_observations(
+    session: &mut Session,
+) -> Option<Arc<super::background_observation::SharedObservations>> {
+    let observations =
+        super::background_observation::SharedObservations::capture(session).map(Arc::new);
+    if let Some(observations) = &observations {
+        *session = observations.frozen_session(session);
+    }
+    observations
+}
+
+// This does not publish or issue a completed-actor permit. Only the existing
+// retired->staging begin may use it, under its exact writer/revision checks.
+#[cfg(feature = "subagents")]
+fn observed_begin_snapshot(
+    session: &mut Session,
+) -> anyhow::Result<Option<Arc<super::background_observation::SharedObservations>>> {
+    let publication = checked_publication_owner(session)?;
+    match &publication.observations {
+        Some(previous) => {
+            // Reconstruct the ENTIRE prior Session, not an excluded-field hash.
+            // Even a byte-identical replacement runtime store is forbidden.
+            let next = previous.current_since(session)?;
+            anyhow::ensure!(
+                digest(&previous.frozen_session(session))? == publication.digest,
+                "native context changed beyond background observations"
+            );
+            *session = next.frozen_session(session);
+            Ok(Some(Arc::new(next)))
+        }
+        None => {
+            checked_publication(session)?;
+            Ok(freeze_shared_observations(session))
+        }
+    }
 }
 
 fn validate_revision(
@@ -511,15 +586,22 @@ fn begin_blocking(
     );
     let cell = snapshot.native_frontier.publication_cell();
     let owner = match &snapshot.native_publication {
-        Some(publication) => {
-            checked_publication(&snapshot)?;
-            Arc::clone(&publication.owner)
-        }
+        Some(_) => Arc::clone(&checked_publication_owner(&snapshot)?.owner),
         None => Arc::new(WriterOwner {
             lease: super::lock::claim_native_writer(&snapshot)?,
             cell,
         }),
     };
+    #[cfg(feature = "subagents")]
+    let observations = if snapshot.native_publication.is_some() {
+        observed_begin_snapshot(&mut snapshot)?
+    } else {
+        freeze_shared_observations(&mut snapshot)
+    };
+    #[cfg(not(feature = "subagents"))]
+    if snapshot.native_publication.is_some() {
+        checked_publication(&snapshot)?;
+    }
     snapshot.native_frontier.activate_publication();
     let current_digest = digest(&snapshot)?;
     let publication = {
@@ -548,6 +630,8 @@ fn begin_blocking(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest: current_digest,
+            #[cfg(feature = "subagents")]
+            observations,
         }
     };
     snapshot.native_publication = Some(publication.clone());
@@ -645,7 +729,10 @@ fn seal_progress(
     ticket: &mut NativePublicationTicket,
 ) -> anyhow::Result<(Session, String, NativePublication)> {
     ensure_actor_value(session, ticket)?;
-    let canonical = super::storage::serialize_bounded_session(session)?;
+    let mut snapshot = session.clone();
+    #[cfg(feature = "subagents")]
+    let observations = freeze_shared_observations(&mut snapshot);
+    let canonical = super::storage::serialize_bounded_session(&snapshot)?;
     let digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
     // This detached data projection is never a runtime Session. Decode the
     // exact captured bytes so mutable account/todo/goal owners cannot change
@@ -671,11 +758,14 @@ fn seal_progress(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest,
+            #[cfg(feature = "subagents")]
+            observations,
         }
     };
     session.native_publication = Some(publication.clone());
     ticket.publication = publication.clone();
-    Ok((session.clone(), denied, publication))
+    snapshot.native_publication = Some(publication.clone());
+    Ok((snapshot, denied, publication))
 }
 
 struct ProgressFence {
@@ -885,7 +975,12 @@ pub(crate) async fn publish_refused_owned(
         state.consumed = true;
         refusal
     };
-    let json = super::storage::serialize_bounded_session(session)?;
+    let snapshot = session.clone();
+    #[cfg(feature = "subagents")]
+    let mut snapshot = snapshot;
+    #[cfg(feature = "subagents")]
+    let observations = freeze_shared_observations(&mut snapshot);
+    let json = super::storage::serialize_bounded_session(&snapshot)?;
     let projection: Session = serde_json::from_str(&json)?;
     projection.validate_native_persistence()?;
     let digest: [u8; 32] = Sha256::digest(json.as_bytes()).into();
@@ -908,6 +1003,8 @@ pub(crate) async fn publish_refused_owned(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest,
+            #[cfg(feature = "subagents")]
+            observations,
         }
     };
     session.native_publication = Some(publication.clone());
@@ -1073,6 +1170,8 @@ fn retire_blocking_using(
             "native context does not match its retired actor"
         );
     }
+    #[cfg(feature = "subagents")]
+    let observations = freeze_shared_observations(&mut snapshot);
     let next_digest = digest(&snapshot)?;
     let publication = {
         let mut state = owner
@@ -1092,6 +1191,8 @@ fn retire_blocking_using(
             owner: Arc::clone(owner),
             revision: state.revision,
             digest: next_digest,
+            #[cfg(feature = "subagents")]
+            observations,
         }
     };
     snapshot.native_publication = Some(publication.clone());
@@ -1199,7 +1300,7 @@ impl RetiredSessionEndPermit {
         session: &Session,
         pair: &NativeActorPair,
     ) -> anyhow::Result<Self> {
-        let publication = checked_publication(session)?;
+        let publication = checked_retired_publication(session)?;
         let mut actor = pair.0.state.lock().unwrap_or_else(|e| e.into_inner());
         anyhow::ensure!(
             Arc::ptr_eq(&pair.0.owner, &publication.owner)
@@ -1252,7 +1353,7 @@ impl RetiredSessionEndPermit {
         host: Option<&crate::provider::NativeHostGuard>,
         next: crate::provider::effort::SessionReasoning,
     ) -> anyhow::Result<()> {
-        let publication = checked_publication(session)?;
+        let publication = checked_retired_publication(session)?;
         anyhow::ensure!(
             Arc::ptr_eq(&publication.owner, &self.publication.owner)
                 && publication.revision == self.publication.revision
@@ -1289,7 +1390,7 @@ impl RetiredSessionEndPermit {
             let mut check = session.clone();
             check.reasoning_controls = previous;
             anyhow::ensure!(
-                digest(&check)? == self.publication.digest,
+                unchanged_retired_body(&check, &self.publication)?,
                 "session context changed while updating effort"
             );
             progress_owned(session, &mut ticket, &scope).await?;
@@ -1324,13 +1425,13 @@ impl RetiredSessionEndPermit {
         result
     }
 
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "subagents"))]
     pub(crate) async fn run(
         self,
         session: &mut Session,
         host: Option<&crate::provider::NativeHostGuard>,
     ) -> anyhow::Result<()> {
-        let publication = checked_publication(session)?;
+        let publication = checked_retired_publication(session)?;
         anyhow::ensure!(
             Arc::ptr_eq(&publication.owner, &self.publication.owner)
                 && publication.revision == self.publication.revision
@@ -1365,6 +1466,7 @@ impl RetiredSessionEndPermit {
             let active = begin_owned(session, &scope).await?;
             *ticket.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
         }
+        #[cfg(feature = "hooks")]
         scope
             .run(crate::extras::hooks::dispatch_session_end("exit"))
             .await;
@@ -1372,7 +1474,7 @@ impl RetiredSessionEndPermit {
         // The hook scope is closed. Its exact model boundary is unchanged;
         // all final IO is owned separately, just as in model publication.
         let mut ticket = ticket.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let unchanged = digest(session)? == self.publication.digest;
+        let unchanged = unchanged_retired_body(session, &self.publication)?;
         let valid_host = host.map_or(Ok(()), |host| host.validate());
         if !unchanged || valid_host.is_err() {
             if session.native_frontier.ready() {
@@ -1457,6 +1559,169 @@ mod tests {
         super::super::storage::load_session_exact(&session.id)
             .unwrap()
             .unwrap()
+    }
+
+    // Controlled lower publisher regression. The later real-wire task fixture
+    // must additionally establish signed-prefix compatibility; this test proves
+    // the exact current rejection caused by a genuine shared paid receipt.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn background56_held_shared_receipt_allows_next_native_prompt() {
+        let roots = crate::tests::OwnedTestDirectory::new("background56-observed-native");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "launch background child");
+        session.initialize_spend_account(None).unwrap();
+        let observations =
+            super::super::background_observation::ObservationOwner::bind(&mut session).unwrap();
+        let (observation, observation_lifetime) = observations.admit().unwrap();
+        let ledger = Arc::new(crate::spend::Ledger::new(&roots.path().join("state")));
+        let run = crate::spend::run::Run::fixture(
+            session.spend_account.clone(),
+            ledger,
+            &session.id,
+            crate::spend::PriceSnapshot::capture(Some((2.0, 4.0)), Default::default(), false),
+        )
+        .with_background_observation(observation.clone());
+        let recorder = session
+            .file_checkpoints
+            .recorder(&session.id, 0, true)
+            .for_background(observation);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+        runtime().block_on(async {
+            let foreground = crate::agent::runner::AgentWorkScope::new();
+            let background = crate::agent::runner::AgentWorkScope::new();
+            let mut cleanup =
+                crate::agent::runner::AgentRunCleanupGuard::auxiliary(background.clone());
+            cleanup.retain_until_settled(observation_lifetime);
+            let (observe_tx, observe_rx) = tokio::sync::oneshot::channel();
+            let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let held = std::sync::atomic::AtomicBool::new(true);
+            let child = background.run(async {
+                observe_rx.await.unwrap();
+                run.observe(crate::event::UsageDelta {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    total_tokens: 12,
+                    ..Default::default()
+                });
+                run.flush().await;
+                assert!(!run.account.has_pending());
+                use rig::tool::Tool;
+                super::super::file_checkpoints::scope(Some(recorder), async {
+                    crate::agent::tools::write::WriteTool::new(None, None, None)
+                        .with_workspace_binding(workspace)
+                        .call(crate::agent::tools::WriteArgs {
+                            path: "owned-child.txt".into(),
+                            content: "completed before child returns".into(),
+                            overwrite: false,
+                        })
+                        .await
+                        .unwrap();
+                })
+                .await;
+                observed_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                held.store(false, std::sync::atomic::Ordering::Release);
+            });
+            let parent = async {
+                let mut ticket = begin_owned(&mut session, &foreground).await.unwrap();
+                let pair = NativeActorPair::pair(&session, &mut ticket).unwrap();
+                let actor_scope = crate::agent::runner::AgentWorkScope::new();
+                NativeModelOwner::new(
+                    async {},
+                    pair.clone(),
+                    crate::agent::runner::AgentRunCleanupGuard::auxiliary(actor_scope),
+                )
+                .unwrap()
+                .settle()
+                .await;
+                pair.claim_retired(&session, &ticket).unwrap();
+                retire_owned(
+                    &mut session,
+                    ticket,
+                    RetiredNativeOutcome::Completed,
+                    &foreground,
+                )
+                .await
+                .unwrap();
+                assert_eq!(foreground.active_children(), 0);
+                observe_tx.send(()).unwrap();
+                observed_rx.await.unwrap();
+                assert!(held.load(std::sync::atomic::Ordering::Acquire));
+                assert!((session.recorded_total_cost() - 0.000028).abs() < 1e-12);
+                // Every negative preserves the same valid background receipt
+                // and checkpoint; those cannot authorize unrelated changes.
+                for change in 0..8 {
+                    let mut tampered = session.clone();
+                    match change {
+                        0 => tampered.messages[0].content = "forged transcript".into(),
+                        1 => tampered.name = "forged metadata".into(),
+                        2 => tampered.input_token_cost = 999.0,
+                        3 => {
+                            tampered.spend_account = serde_json::from_value(
+                                serde_json::to_value(&session.spend_account).unwrap(),
+                            )
+                            .unwrap();
+                            tampered
+                                .spend_account
+                                .bind_observation_owner(&observations)
+                                .unwrap();
+                        }
+                        4 => {
+                            tampered.file_checkpoints = serde_json::from_value(
+                                serde_json::to_value(&session.file_checkpoints).unwrap(),
+                            )
+                            .unwrap();
+                            tampered
+                                .file_checkpoints
+                                .bind_observation_owner(&observations)
+                                .unwrap();
+                        }
+                        5 => {
+                            tampered.background_observations =
+                                Some(super::super::background_observation::ObservationOwner::new())
+                        }
+                        6 => {
+                            tampered.background_history = serde_json::from_value(
+                                serde_json::to_value(&session.background_history).unwrap(),
+                            )
+                            .unwrap();
+                            tampered
+                                .background_history
+                                .bind_observation_owner(&observations)
+                                .unwrap();
+                        }
+                        7 => {
+                            let mut foreign = Session::new("anthropic", "fixture", 32000, "");
+                            tampered.background_pool = Some(
+                                crate::extras::subagents::background::Pool::for_session(
+                                    &mut foreign,
+                                    1,
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        begin_owned(&mut tampered, &foreground).await.is_err(),
+                        "substitution case {change}"
+                    );
+                }
+                // The prior whole-digest implementation rejected here. The
+                // typed observation proof permits the next prompt while the
+                // exact paid/writing child is still held, without new grants.
+                let next = begin_owned(&mut session, &foreground).await.unwrap();
+                assert!(held.load(std::sync::atomic::Ordering::Acquire));
+                finish_tx.send(()).unwrap();
+                drop(next);
+            };
+            tokio::join!(child, parent);
+            cleanup.settle().await;
+        });
     }
 
     #[test]

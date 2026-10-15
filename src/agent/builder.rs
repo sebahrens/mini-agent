@@ -34,7 +34,7 @@ fn registered_shell_capability<'a>(
     sandbox.shell_capability()
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(any(feature = "mcp", all(test, feature = "goal")))]
 fn is_reserved_builtin_tool_name(name: &str) -> bool {
     matches!(
         name,
@@ -54,6 +54,9 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "git"
             | "js"
             | "task"
+            | "task_result"
+            | "task_list"
+            | "task_cancel"
             | "memory_write"
             | "memory_edit"
             | "memory_read"
@@ -1149,6 +1152,27 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             #[cfg(feature = "archmd")]
             let task_tool = task_tool.with_architecture(context.architecture.clone());
             all_tools.push(Box::new(task_tool));
+            all_tools.push(Box::new(
+                crate::extras::subagents::background::ResultTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
+            all_tools.push(Box::new(
+                crate::extras::subagents::background::ListTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
+            all_tools.push(Box::new(
+                crate::extras::subagents::background::CancelTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
         }
 
         #[cfg(feature = "memory")]
@@ -2115,6 +2139,9 @@ mod mcp_tests {
             "job_status",
             "js",
             "task",
+            "task_result",
+            "task_list",
+            "task_cancel",
             "memory_write",
             "memory_edit",
             "memory_read",
@@ -2122,6 +2149,14 @@ mod mcp_tests {
             "advisor",
             "lsp_diagnostics",
             "skills_search",
+        ] {
+            assert!(is_reserved_builtin_tool_name(name), "{name}");
+        }
+        #[cfg(feature = "subagents")]
+        for name in [
+            <crate::extras::subagents::background::ResultTool as rig::tool::Tool>::NAME,
+            <crate::extras::subagents::background::ListTool as rig::tool::Tool>::NAME,
+            <crate::extras::subagents::background::CancelTool as rig::tool::Tool>::NAME,
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }

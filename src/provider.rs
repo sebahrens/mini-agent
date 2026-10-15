@@ -3076,7 +3076,7 @@ impl AnyAgent {
         self
     }
 
-    #[cfg(any(feature = "hooks", feature = "memory"))]
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     fn context_notices(&self, history: &[Message]) -> Vec<String> {
         #[cfg(feature = "memory")]
         if let Some(Ok(memory)) = &self.memory_context {
@@ -3715,9 +3715,17 @@ impl AnyAgent {
             if let Some(error) = self.reasoning_error() {
                 return runner::HeadlessTurn::failed_before_start(error.into());
             }
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
             let mut context_notices = self.context_notices(&history);
+            #[cfg(feature = "subagents")]
+            let background_notice =
+                crate::spend::run::Run::current().and_then(|run| run.background_notices());
+            #[cfg(feature = "subagents")]
+            if let Some(notice) = &background_notice {
+                context_notices.extend(notice.messages());
+            }
+
             #[cfg(feature = "hooks")]
             let (hook_prompt, hook_context) = {
                 if let Err(error) = crate::spend::run::admit_current_effect().await {
@@ -3745,9 +3753,9 @@ impl AnyAgent {
             let prompt = hook_prompt.as_str();
             #[cfg(feature = "hooks")]
             context_notices.extend(hook_context);
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let history = crate::agent::input::append_context_history(history, &context_notices);
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             crate::session::file_checkpoints::inserted_context(context_notices.len());
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
@@ -3905,11 +3913,15 @@ impl AnyAgent {
                     .await
                 }
             };
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let turn = {
                 let mut turn = turn;
                 turn.interactions
                     .splice(0..0, context_notices.into_iter().map(Message::system));
+                #[cfg(feature = "subagents")]
+                if let Some(notice) = background_notice {
+                    notice.acknowledge();
+                }
                 turn
             };
             turn
@@ -4207,9 +4219,17 @@ impl AnyAgent {
                 {
                     return spawn_blocked_runner(error.to_string(), work_scope);
                 }
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut context_notices = self.context_notices(&history);
+                #[cfg(feature = "subagents")]
+                let background_notice =
+                    crate::spend::run::Run::current().and_then(|run| run.background_notices());
+                #[cfg(feature = "subagents")]
+                if let Some(notice) = &background_notice {
+                    context_notices.extend(notice.messages());
+                }
+
                 #[cfg(feature = "hooks")]
                 let rewritten = match work_scope
                     .run(crate::startup::heap_future(|| {
@@ -4231,10 +4251,10 @@ impl AnyAgent {
                 let (rewritten, hook_context) = rewritten;
                 #[cfg(feature = "hooks")]
                 context_notices.extend(hook_context);
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let history =
                     crate::agent::input::append_context_history(history, &context_notices);
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 crate::session::file_checkpoints::inserted_context(context_notices.len());
                 #[cfg(feature = "hooks")]
                 if let Err(error) = prompt.apply_hook_text(rewritten) {
@@ -4261,6 +4281,8 @@ impl AnyAgent {
                 let native_capture = self.native_capture;
                 #[cfg(not(feature = "agent-skills"))]
                 let inner = self.inner;
+                #[cfg(feature = "subagents")]
+                let background_scope = std::sync::Arc::downgrade(&work_scope);
                 let paused = match inner {
                     AnyAgentInner::OpenRouter(a) => {
                         runner::spawn_agent_paused_input_in_scope_with_native_capture(
@@ -4381,8 +4403,12 @@ impl AnyAgent {
                         )
                     }
                 };
-                #[cfg(any(feature = "hooks", feature = "memory"))]
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let paused = paused.with_hook_context(context_notices);
+                #[cfg(feature = "subagents")]
+                let paused = paused.with_background_notice(
+                    background_notice.map(|notice| notice.with_scope(background_scope)),
+                );
                 paused
             }),
         );
@@ -7074,7 +7100,7 @@ impl NativeSessionEndOwner {
             .update_reasoning(session, self.host.as_ref(), next)
             .await
     }
-    #[cfg(feature = "hooks")]
+    #[cfg(any(feature = "hooks", feature = "subagents"))]
     pub(crate) async fn run(self, session: &mut crate::session::Session) -> anyhow::Result<()> {
         self.permit.run(session, self.host.as_ref()).await
     }

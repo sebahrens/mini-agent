@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use crate::event::AgentEvent;
 use crate::provider::AnyClient;
 
+pub(crate) mod background;
 pub(crate) mod builder;
 pub(crate) mod prompt;
 pub(crate) mod task_tool;

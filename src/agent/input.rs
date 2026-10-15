@@ -55,7 +55,7 @@ pub(crate) fn history_has_images(history: &[rig::message::Message]) -> bool {
 
 /// Append host context as transcript prose, matching canonical System rows.
 /// This never changes the provider's top-level system prefix.
-#[cfg(any(feature = "hooks", feature = "memory"))]
+#[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
 pub(crate) fn append_context_history(
     history: std::sync::Arc<[rig::completion::Message]>,
     notices: &[String],

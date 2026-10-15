@@ -3711,3 +3711,7 @@ serialized into the worker protocol.
 interactive turn runs. Use `"steer"` to deliver them at the next settled tool
 boundary instead. `/steer <message>` explicitly steers regardless of this setting.
 Only one steer may wait at a time; a second remains in the input draft.
+
+The `background_tasks` status-line item (with `subagents`) shows the current
+session’s active Task jobs and completed reports awaiting next-turn notice.
+`/tasks` lists, reads, or cancels these jobs; `/jobs` remains the Shell-job view.

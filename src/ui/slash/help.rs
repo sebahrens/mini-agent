@@ -98,6 +98,11 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /add [path...]         add file(s) to context (Tab completes paths)",
     );
+    #[cfg(feature = "subagents")]
+    emit(
+        false,
+        "  /tasks                list background subagents; result <id> / cancel <id>",
+    );
     emit(
         false,
         "  /jobs                 list this session's background jobs",

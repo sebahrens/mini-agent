@@ -123,6 +123,7 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
     {
         cmds.push("/subagent-model");
         cmds.push("/subagent-models");
+        cmds.push("/tasks");
     }
 
     cmds.sort_unstable();

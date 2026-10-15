@@ -169,6 +169,8 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.perm_mode.hash(&mut state);
     ctx.chain_label.hash(&mut state);
     ctx.background_jobs.hash(&mut state);
+    #[cfg(feature = "subagents")]
+    session.background_task_counts().hash(&mut state);
     ctx.todos.hash(&mut state);
     ctx.queued_inputs.hash(&mut state);
     ctx.btw_cost.to_bits().hash(&mut state);
@@ -707,6 +709,11 @@ fn resolve_item(
         "queue" => {
             (ctx.queued_inputs > 0 || always).then(|| format!("queue:{}", ctx.queued_inputs))
         }
+        #[cfg(feature = "subagents")]
+        "background_tasks" => {
+            let (active, ready) = session.background_task_counts();
+            (active > 0 || ready > 0 || always).then(|| format!("tasks:{active} ready:{ready}"))
+        }
         "background_jobs" => {
             (ctx.background_jobs > 0 || always).then(|| format!("jobs:{}", ctx.background_jobs))
         }
@@ -997,6 +1004,10 @@ pub fn default_spec() -> StatusLineConfig {
         seg("queue", None),
         sep(" "),
         seg("background_jobs", None),
+        sep(" "),
+        #[cfg(feature = "subagents")]
+        seg("background_tasks", None),
+        #[cfg(feature = "subagents")]
         sep(" "),
         seg("cost", None),
         sep(" "),

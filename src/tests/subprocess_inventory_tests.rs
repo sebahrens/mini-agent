@@ -1920,6 +1920,30 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"old retired\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"next retired\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/background.rs",
+        "self.entries.iter().map(|(id, status)| format!(\"[Background task {id} {}. Inspect its report with task_result; this notice grants no permission.]\", status.as_str())).collect()",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/background.rs",
+        "status: Status::Running,",
+        2,
+        "NON-PROCESS",
+    ),
+    (
         "src/auth/oauth.rs",
         "if matches!(status.as_u16(), 400 | 401)",
         1,
@@ -3098,7 +3122,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"first\".into()),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -3287,6 +3311,20 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Background task status text and saved-status fixture data are not process terminals.
+    (
+        "src/extras/subagents/background.rs",
+        &[
+            (
+                "779732c7068886c9542fe1fba43f4cb96453b76a265861474fc0922348b9e707",
+                1,
+            ),
+            (
+                "7e5addf15e647c8fdb449c18c8f16a0f21624365b53d2ee656a50639a262d64c",
+                1,
+            ),
+        ],
+    ),
     (
         "src/auth/oauth.rs",
         &[

@@ -1074,9 +1074,9 @@ async fn finish_goal_round(
                     None,
                 )
                 .await;
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let mut paused = paused;
-            #[cfg(any(feature = "hooks", feature = "memory"))]
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             super::adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
             let runner = paused.start_interactive();
             run.compaction_decision_tx = runner.compaction_decision_tx;

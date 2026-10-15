@@ -83,6 +83,12 @@ impl Wire {
                 seen.fetch_add(1, Ordering::AcqRel);
                 notify.notify_one();
                 if let Some(response) = response {
+                    let response = if let Some(response) = response.strip_prefix("HOLD_GATE\n") {
+                        release_server.notified().await;
+                        response.to_owned()
+                    } else {
+                        response
+                    };
                     if let Some(response) = response.strip_prefix("HOLD_PAIR\n") {
                         let (text, tail) = response.split_once("\n\n").unwrap();
                         let text = format!("{text}\n\n");
@@ -970,6 +976,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
         ],
         briefs: None,
         agent_type: Some("cost-fixture".into()),
+        run_in_background: false,
     };
     let work = super::run::scope(
         Some(run.clone()),
@@ -1678,4 +1685,185 @@ async fn usd_budget_readonly_report_rechecks_paid_and_free_observation_after_ear
         );
         assert!(current.iter().any(|line| line.contains("input 50")));
     }
+}
+
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_notify_once() {
+    let root = crate::tests::OwnedTestDirectory::new("background56-native-overlap");
+    let bindings = [
+        "ZS_CONFIG_DIR",
+        "ZS_DATA_DIR",
+        "ZS_LOCAL_DATA_DIR",
+        "ZS_STATE_DIR",
+        "ZS_CACHE_DIR",
+        "ZS_CREDENTIALS_DIR",
+    ]
+    .map(|name| (name, Some(root.path().join(name).into_os_string())));
+    let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
+    std::fs::write(root.path().join("owned-child.txt"), "EXACT_BACKGROUND_READ").unwrap();
+    let delta = serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"background-read","type":"function","function":{"name":"read","arguments":"{\"path\":\"owned-child.txt\"}"}}]});
+    let first = serde_json::json!({"id":"child","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+    let last = serde_json::json!({"id":"child","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60}});
+    let report = "## Findings\n- [confidence: high] EXACT_BACKGROUND_READ was read.\n\n## Unverified\n- None\n\n## Coverage\n- Covered: owned-child.txt.\n- Skipped: None.\n";
+    let mut child = Wire::new(vec![
+        Some(format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n")),
+        Some(format!("HOLD_GATE\n{}", response(report, false))),
+    ])
+    .await;
+    let (child_client, child_cfg) = child.client();
+    let mut priced_child = serde_json::to_value(child_cfg).unwrap();
+    priced_child["quick_models"] = serde_json::json!({"background-child":{"provider":"cost-wire","model":"fixture","input_token_cost":1.0,"output_token_cost":2.0}});
+    let child_cfg: Config = serde_json::from_value(priced_child).unwrap();
+    let child_config = crate::extras::subagents::SubagentConfig {
+        client: child_client,
+        provider_name: "cost-wire".into(),
+        model_name: "fixture".into(),
+        fallback_notice: None,
+        api_key: Some("inert-child-key".into()),
+        max_turns: 2,
+        config: child_cfg,
+    };
+    fn native(answer: &str, signature: &str) -> String {
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"id":"native-parent","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":signature}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":answer}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let body = events
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+    let mut parent = Wire::new(vec![
+        Some(native("first answer", "opaque-signature-one")),
+        Some(native("second answer", "opaque-signature-two")),
+        Some(native("third answer", "opaque-signature-three")),
+    ])
+    .await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({"session_title_model":"off","compact_enabled":false,"retry":{"max_attempts":1},"custom_providers":{"background-native":{"provider_type":"anthropic","base_url":format!("http://{}",parent.address)}}})).unwrap();
+    let cli = crate::cli::Cli {
+        no_tools: true,
+        no_context_files: true,
+        no_sandbox: true,
+        api_key: Some("inert-native-key".into()),
+        ..Default::default()
+    };
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = crate::session::Session::new(
+        "background-native",
+        "claude-opus-5-5",
+        128000,
+        "background proof",
+    );
+    session.working_dir = root.path().to_string_lossy().into();
+    session.set_input_output_prices(Some((2.0, 4.0)));
+    let sid = session.id.to_string();
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            crate::session::lock::release_session(&self.0);
+        }
+    }
+    let _release = Release(sid.clone());
+    let client = crate::provider::create_client(
+        "background-native",
+        cli.api_key.as_deref(),
+        &cfg.custom_providers_map(),
+        None,
+    )
+    .unwrap();
+    let ui = crate::ui::state::UiContext::new(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace.clone(),
+        client,
+        None,
+        None,
+        crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace),
+        None,
+    );
+    let snapshots = crate::startup::heap_future(|| {
+        crate::ui::drive_native_background_fixture(
+            ui,
+            child_config,
+            child.calls.clone(),
+            child.release.clone(),
+        )
+    })
+    .await;
+    assert_eq!(parent.calls.load(Ordering::Acquire), 3);
+    assert_eq!(child.calls.load(Ordering::Acquire), 2);
+    {
+        let requests = parent.bodies.lock().unwrap();
+        assert_eq!(requests[0]["system"], requests[1]["system"]);
+        assert_eq!(requests[1]["system"], requests[2]["system"]);
+        assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        assert_eq!(requests[1]["tools"], requests[2]["tools"]);
+        let mut initial_user = requests[0]["messages"][0].clone();
+        assert_eq!(
+            initial_user["content"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("cache_control"),
+            Some(serde_json::json!({"type":"ephemeral"}))
+        );
+        // Existing SDK moves its manual message cache marker to the latest user
+        // boundary. Literal input and every opaque native block stay unchanged.
+        assert_eq!(initial_user, requests[1]["messages"][0]);
+        assert_eq!(
+            requests[1]["messages"][1]["content"][0],
+            serde_json::json!({"type":"thinking","thinking":"","signature":"opaque-signature-one"})
+        );
+        assert_eq!(requests[1]["messages"][1], requests[2]["messages"][1]);
+        assert!(!requests[1].to_string().contains("[Background task "));
+        assert_eq!(
+            requests[2].to_string().matches("[Background task ").count(),
+            1
+        );
+    }
+    assert!(
+        child.bodies.lock().unwrap()[1]
+            .to_string()
+            .contains("EXACT_BACKGROUND_READ")
+    );
+    assert!(snapshots[1].recorded_total_cost() > snapshots[0].recorded_total_cost());
+    let rows = session.background_tasks();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status,
+        crate::extras::subagents::background::Status::Completed
+    );
+    assert_eq!(session.background_task_counts(), (0, 0));
+    let reloaded = crate::session::storage::load_session_exact(&sid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.background_tasks()[0].status,
+        crate::extras::subagents::background::Status::Completed
+    );
+    // Both exact loopback server tasks consumed their finite routes. Always
+    // abort/join on test teardown too; no listener survives this fixture.
+    parent.task.abort();
+    child.task.abort();
+    let _ = (&mut parent.task).await;
+    let _ = (&mut child.task).await;
 }

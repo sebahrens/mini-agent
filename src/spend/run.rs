@@ -29,6 +29,10 @@ pub(crate) struct Run {
     refused: Arc<std::sync::atomic::AtomicBool>,
     sdk_request: Arc<std::sync::Mutex<std::sync::Weak<SdkRequest>>>,
     accepted_usage: Arc<std::sync::Mutex<UsageDelta>>,
+    #[cfg(feature = "subagents")]
+    background_observation: Option<crate::session::background_observation::JobObservation>,
+    #[cfg(feature = "subagents")]
+    background_pool: std::sync::Weak<crate::extras::subagents::background::Pool>,
 }
 
 tokio::task_local! { static CURRENT: Option<Run>; }
@@ -57,7 +61,59 @@ impl Run {
             refused: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_observation: None,
+            #[cfg(feature = "subagents")]
+            background_pool: Default::default(),
         }
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_pool(
+        &self,
+    ) -> Option<Arc<crate::extras::subagents::background::Pool>> {
+        self.background_pool.upgrade()
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_ask_origin(
+        &self,
+    ) -> Option<crate::extras::subagents::background::AskOrigin> {
+        self.background_pool()?
+            .ask_origin(self.background_observation.clone()?)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_notices(
+        &self,
+    ) -> Option<crate::extras::subagents::background::NoticeLease> {
+        if !matches!(self.kind, RequestKind::Turn) || self.background_observation.is_some() {
+            return None;
+        }
+        self.background_pool()?.pending_notices()
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn belongs_to_account(&self, session: &str, account: &Account) -> bool {
+        self.session_id == session && self.account.same_owner(account)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_background_pool(
+        mut self,
+        pool: &Arc<crate::extras::subagents::background::Pool>,
+    ) -> Self {
+        self.background_pool = Arc::downgrade(pool);
+        self
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_background_observation(
+        mut self,
+        observation: crate::session::background_observation::JobObservation,
+    ) -> Self {
+        self.background_observation = Some(observation);
+        self
     }
 
     pub(crate) fn for_session(session: &mut Session, cfg: &Config, kind: RequestKind) -> Self {
@@ -78,6 +134,18 @@ impl Run {
                 (None, Some(Arc::from("usage ledger storage unavailable")))
             }
         };
+        #[cfg(feature = "subagents")]
+        let background_pool = crate::extras::subagents::background::Pool::for_session(
+            session,
+            cfg.resolve_task_max_concurrency(),
+        );
+        #[cfg(feature = "subagents")]
+        let setup_error = setup_error.or_else(|| {
+            background_pool
+                .as_ref()
+                .err()
+                .map(|_| Arc::<str>::from("background session state is invalid"))
+        });
         let mut run = Self {
             account: session.spend_account.clone(),
             ledger,
@@ -91,6 +159,13 @@ impl Run {
             refused: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_observation: None,
+            #[cfg(feature = "subagents")]
+            background_pool: background_pool
+                .as_ref()
+                .map(Arc::downgrade)
+                .unwrap_or_default(),
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(&session.provider),
         };
@@ -131,6 +206,10 @@ impl Run {
             refused: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_observation: None,
+            #[cfg(feature = "subagents")]
+            background_pool: Default::default(),
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
         };
@@ -316,14 +395,17 @@ impl Run {
         if self.reasoning_exclusive {
             usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
         }
-        Receipt::new(
+        let receipt = Receipt::new(
             &self.session_id,
             &self.provider,
             &self.model,
             self.kind,
             usage,
             self.prices,
-        )
+        );
+        #[cfg(feature = "subagents")]
+        let receipt = receipt.with_background_observation(self.background_observation.clone());
+        receipt
     }
     fn observe_receipt(&self, receipt: &Receipt) {
         let accounted = self.account.observe(receipt);

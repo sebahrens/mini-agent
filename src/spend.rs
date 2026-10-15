@@ -396,6 +396,8 @@ impl Row {
 pub(crate) struct Receipt {
     row: Arc<Row>,
     charged: Arc<AtomicBool>,
+    #[cfg(feature = "subagents")]
+    observation: Option<crate::session::background_observation::JobObservation>,
 }
 
 impl Receipt {
@@ -426,7 +428,17 @@ impl Receipt {
                 cost,
             }),
             charged: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "subagents")]
+            observation: None,
         }
+    }
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_background_observation(
+        mut self,
+        observation: Option<crate::session::background_observation::JobObservation>,
+    ) -> Self {
+        self.observation = observation;
+        self
     }
     #[cfg(test)]
     pub(crate) fn id(&self) -> Uuid {
@@ -444,6 +456,10 @@ struct State {
     unpriced_tokens: u64,
     tracking_error: bool,
     pending: BTreeMap<Uuid, Arc<Row>>,
+    #[cfg(feature = "subagents")]
+    pending_observations: BTreeMap<Uuid, crate::session::background_observation::JobObservation>,
+    #[cfg(feature = "subagents")]
+    observation: crate::session::background_observation::ObservationStamp,
     runtime_ledger: Option<Arc<Ledger>>,
     ledger_ready: bool,
     notice_shown: bool,
@@ -474,7 +490,7 @@ impl AccountSnapshot {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedAccount {
     version: u8,
@@ -489,20 +505,87 @@ struct SavedAccount {
     tracking_error: bool,
 }
 
-impl Serialize for Account {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+impl State {
+    fn saved(&self) -> SavedAccount {
         SavedAccount {
             version: 1,
-            model_calls: Some(state.model_calls),
-            call_history_complete: state.call_history_complete,
-            session_id: state.session_id.clone(),
-            legacy_estimate: state.legacy_estimate,
-            observed_cost: state.historical_observed_cost + state.observed_cost,
-            unpriced_tokens: state.unpriced_tokens,
-            tracking_error: state.tracking_error || !state.pending.is_empty(),
+            model_calls: Some(self.model_calls),
+            call_history_complete: self.call_history_complete,
+            session_id: self.session_id.clone(),
+            legacy_estimate: self.legacy_estimate,
+            observed_cost: self.historical_observed_cost + self.observed_cost,
+            unpriced_tokens: self.unpriced_tokens,
+            tracking_error: self.tracking_error || !self.pending.is_empty(),
         }
-        .serialize(serializer)
+    }
+}
+impl Serialize for Account {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .saved()
+            .serialize(serializer)
+    }
+}
+
+// Captures every early-return/error branch under the same existing store lock.
+// Only changes to the actual serde data advance the observation stamp.
+struct AccountMutation<'a> {
+    state: std::sync::MutexGuard<'a, State>,
+    #[cfg(feature = "subagents")]
+    before: SavedAccount,
+    #[cfg(feature = "subagents")]
+    observation: Option<crate::session::background_observation::JobObservation>,
+}
+impl std::ops::Deref for AccountMutation<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for AccountMutation<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+}
+impl Drop for AccountMutation<'_> {
+    fn drop(&mut self) {
+        #[cfg(feature = "subagents")]
+        if self.before != self.state.saved() {
+            self.state.observation.changed(self.observation.as_ref());
+        }
+    }
+}
+
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone)]
+pub(crate) struct AccountObservation {
+    original: Account,
+    saved: SavedAccount,
+    stamp: crate::session::background_observation::ObservationStamp,
+}
+#[cfg(feature = "subagents")]
+impl AccountObservation {
+    pub(crate) fn frozen(&self) -> Account {
+        Account(Arc::new(Mutex::new(State {
+            session_id: self.saved.session_id.clone(),
+            legacy_estimate: self.saved.legacy_estimate,
+            historical_observed_cost: self.saved.observed_cost,
+            unpriced_tokens: self.saved.unpriced_tokens,
+            tracking_error: self.saved.tracking_error,
+            model_calls: self.saved.model_calls.unwrap_or(0),
+            call_history_complete: self.saved.call_history_complete,
+            ..Default::default()
+        })))
+    }
+    pub(crate) fn validates_since(
+        &self,
+        previous: &Self,
+        owner: &Arc<crate::session::background_observation::ObservationOwner>,
+    ) -> bool {
+        Arc::ptr_eq(&self.original.0, &previous.original.0)
+            && self.stamp.validates_since(&previous.stamp, owner)
     }
 }
 impl<'de> Deserialize<'de> for Account {
@@ -536,15 +619,62 @@ impl<'de> Deserialize<'de> for Account {
 }
 
 impl Account {
+    #[cfg(feature = "subagents")]
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    fn edit(&self) -> AccountMutation<'_> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        AccountMutation {
+            #[cfg(feature = "subagents")]
+            before: state.saved(),
+            state,
+            #[cfg(feature = "subagents")]
+            observation: None,
+        }
+    }
+    #[cfg(feature = "subagents")]
+    fn edit_observation(
+        &self,
+        observation: Option<&crate::session::background_observation::JobObservation>,
+    ) -> AccountMutation<'_> {
+        let mut mutation = self.edit();
+        mutation.observation = observation.cloned();
+        mutation
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_observation_snapshot<T>(
+        &self,
+        capture: impl FnOnce(AccountObservation) -> T,
+    ) -> T {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        capture(AccountObservation {
+            original: self.clone(),
+            saved: state.saved(),
+            stamp: state.observation.clone(),
+        })
+    }
+    #[cfg(feature = "subagents")]
+    pub(crate) fn bind_observation_owner(
+        &self,
+        owner: &Arc<crate::session::background_observation::ObservationOwner>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observation
+            .bind(owner)
+    }
     pub(crate) fn take_budget_notice(&self) -> bool {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         let show = !state.notice_shown;
         state.notice_shown = true;
         show
     }
 
     pub(crate) fn runtime_ledger(&self, candidate: Arc<Ledger>) -> Arc<Ledger> {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         state.runtime_ledger.get_or_insert(candidate).clone()
     }
 
@@ -575,7 +705,7 @@ impl Account {
         Ok(())
     }
     pub(crate) fn inherit_uncertainty(&self, prior: AccountSnapshot) {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         state.tracking_error |= prior.tracking_error;
         state.call_history_complete &= !prior.tracking_error;
         state.unpriced_tokens = state.unpriced_tokens.max(prior.unpriced_tokens);
@@ -598,7 +728,7 @@ impl Account {
     /// a charge appended after the last successful session snapshot save.
     pub(crate) fn reconcile(&self, cap: Option<f64>, prior: &ledger::Totals) -> anyhow::Result<()> {
         let cap = validate_cap(cap)?;
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         state.cap = cap;
         state.model_calls = state
             .model_calls
@@ -631,7 +761,7 @@ impl Account {
     }
 
     pub(crate) fn inherit_call_count(&self, count: u64, complete: bool) {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         state.model_calls = state.model_calls.max(count);
         state.call_history_complete &= complete;
     }
@@ -690,7 +820,10 @@ impl Account {
     }
     pub(crate) fn observe(&self, receipt: &Receipt) -> anyhow::Result<bool> {
         let row = &receipt.row;
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(feature = "subagents")]
+        let mut state = self.edit_observation(receipt.observation.as_ref());
+        #[cfg(not(feature = "subagents"))]
+        let mut state = self.edit();
         anyhow::ensure!(
             row.session_id == state.session_id,
             "usage receipt belongs to another session"
@@ -737,6 +870,12 @@ impl Account {
             state.tracking_error = true;
             anyhow::bail!("usage receipt queue capacity reached");
         }
+        #[cfg(feature = "subagents")]
+        if let Some(observation) = &receipt.observation {
+            state
+                .pending_observations
+                .insert(row.id, observation.clone());
+        }
         state.pending.insert(row.id, row.clone());
         Ok(true)
     }
@@ -750,14 +889,24 @@ impl Account {
             .collect()
     }
     fn acknowledge(&self, id: Uuid) {
-        self.0
+        #[cfg(feature = "subagents")]
+        let observation = self
+            .0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .pending
-            .remove(&id);
+            .pending_observations
+            .get(&id)
+            .cloned();
+        #[cfg(feature = "subagents")]
+        let mut state = self.edit_observation(observation.as_ref());
+        #[cfg(not(feature = "subagents"))]
+        let mut state = self.edit();
+        state.pending.remove(&id);
+        #[cfg(feature = "subagents")]
+        state.pending_observations.remove(&id);
     }
     pub(crate) fn tracking_failed(&self) {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.edit();
         state.tracking_error = true;
         state.call_history_complete = false;
     }

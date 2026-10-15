@@ -784,6 +784,11 @@ where
         return Ok(None);
     };
 
+    #[cfg(feature = "subagents")]
+    let _background_pause = match &session.background_pool {
+        Some(pool) => Some(pool.pause_for_history().await?),
+        None => None,
+    };
     eprintln!("auto-compacting headless session...");
     let model = session.model.to_string();
     let (skipped, messages) =
@@ -1868,6 +1873,8 @@ impl Startup {
             }
             self.join_native_startup().await?;
             let result = heap_future(|| self.dispatch_print()).await;
+            #[cfg(feature = "subagents")]
+            self.session.close_background_tasks().await;
             // Every headless exit ends the session: a failed turn, a
             // persistence failure and a goal's own exit code alike
             // (mini-agent-rnpjm).
@@ -2392,6 +2399,8 @@ impl Startup {
                     });
             }
         }
+        #[cfg(feature = "subagents")]
+        self.session.close_background_tasks().await;
         if let Some(owner) = &mut self.native_headless {
             #[cfg(feature = "hooks")]
             {
@@ -2404,6 +2413,14 @@ impl Startup {
             if let Err(error) = owner.finish(&mut self.session).await {
                 persistence_failure = Some(error);
             }
+        }
+        #[cfg(feature = "subagents")]
+        if self.native_headless.is_none()
+            && !self.cli.no_session
+            && !self.session.background_history.is_empty()
+            && let Err(error) = session::storage::save_session(&self.session)
+        {
+            persistence_failure = Some(error);
         }
         if let Some((files_changed, pricing)) = json_context {
             let stop_reason = if pending_question.is_some() {

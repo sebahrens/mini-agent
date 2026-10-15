@@ -139,6 +139,23 @@ impl From<AskRequest> for UserRequest {
 }
 
 impl UserRequest {
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_for(&self, session: &crate::session::Session) -> bool {
+        match self {
+            Self::Permission(request) => request
+                .background
+                .as_ref()
+                .is_some_and(|origin| origin.valid(session)),
+            #[cfg(feature = "mcp")]
+            Self::McpPermission(request) => request
+                .request
+                .background
+                .as_ref()
+                .is_some_and(|origin| origin.valid(session)),
+            _ => false,
+        }
+    }
+
     pub(crate) fn cancel(self) {
         match self {
             Self::Permission(request) => {
@@ -187,6 +204,8 @@ pub struct QuestionRequest {
 
 #[derive(Debug)]
 pub struct AskRequest {
+    #[cfg(feature = "subagents")]
+    pub(crate) background: Option<crate::extras::subagents::background::AskOrigin>,
     /// Display attribution only; tool/input and grant patterns remain exact.
     pub agent_name: Option<String>,
     pub tool: CompactString,
@@ -206,10 +225,16 @@ pub struct AskRequest {
 
 /// Keep hook observation inside the caller's existing cancellable work scope,
 /// before the frontend adopts the exact reply sender. Hook output never grants.
+#[cfg_attr(not(feature = "subagents"), allow(unused_mut))]
 pub(crate) async fn send_permission_request(
     sender: &AskSender,
-    request: AskRequest,
+    mut request: AskRequest,
 ) -> Result<(), mpsc::error::SendError<UserRequest>> {
+    #[cfg(feature = "subagents")]
+    {
+        request.background =
+            crate::spend::run::Run::current().and_then(|run| run.background_ask_origin());
+    }
     #[cfg(feature = "hooks")]
     if !request.reply.is_closed() {
         crate::startup::heap_future(|| {

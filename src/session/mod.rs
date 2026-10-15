@@ -1,3 +1,5 @@
+#[cfg(feature = "subagents")]
+pub(crate) mod background_observation;
 pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
@@ -648,6 +650,21 @@ pub struct Session {
     /// clones cannot borrow a newer revision from the shared frontier cell.
     #[serde(skip)]
     pub(crate) native_publication: Option<native_publication::NativePublication>,
+    /// Exact runtime background-job provenance. Data restored from JSON never
+    /// installs an observation owner or makes an imported task live.
+    #[cfg(feature = "subagents")]
+    #[serde(skip)]
+    pub(crate) background_observations:
+        Option<std::sync::Arc<background_observation::ObservationOwner>>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip)]
+    pub(crate) background_pool: Option<std::sync::Arc<crate::extras::subagents::background::Pool>>,
+    #[cfg(feature = "subagents")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::extras::subagents::background::History::is_empty"
+    )]
+    pub(crate) background_history: crate::extras::subagents::background::History,
     pub messages: Vec<SessionMessage>,
     /// Provider-native identity and reasoning for persisted tool calls, keyed
     /// by the call record's `tool_call_id`. A session file written before this
@@ -818,6 +835,44 @@ impl GitStatus {
 }
 
 impl Session {
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_tasks(&self) -> Vec<crate::extras::subagents::background::SavedTask> {
+        if let Some(pool) = &self.background_pool {
+            return pool.list();
+        }
+        let mut rows = self.background_history.rows();
+        for row in &mut rows {
+            if row.status.is_active() {
+                row.status = crate::extras::subagents::background::Status::Interrupted;
+            }
+        }
+        rows
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn background_task_counts(&self) -> (usize, usize) {
+        self.background_pool
+            .as_ref()
+            .map_or((0, 0), |pool| pool.counts())
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) async fn reset_background_tasks(&mut self) {
+        self.close_background_tasks().await;
+        // Old running rows remain interrupted data; no task/approval is imported.
+        // A native context cannot use this replacement to bypass its prefix
+        // fence: the old publication retains exact store/pool identities.
+        self.background_pool = None;
+        self.background_observations = None;
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) async fn close_background_tasks(&self) {
+        if let Some(pool) = &self.background_pool {
+            pool.close().await;
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"
@@ -1004,6 +1059,12 @@ impl Session {
             retired_native_history: Vec::new(),
             native_frontier: native_replay::NativeFrontier::default(),
             native_publication: None,
+            #[cfg(feature = "subagents")]
+            background_observations: None,
+            #[cfg(feature = "subagents")]
+            background_pool: None,
+            #[cfg(feature = "subagents")]
+            background_history: Default::default(),
             messages: Vec::new(),
             tool_call_provenance: BTreeMap::new(),
             compactions: Vec::new(),

@@ -655,6 +655,8 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 }
 
 async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    #[cfg(feature = "subagents")]
+    ctx.session.reset_background_tasks().await;
     match mutate_and_persist_session(
         ctx.session,
         clear_session_mutation,
@@ -705,6 +707,8 @@ async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             return Ok(());
         }
     };
+    #[cfg(feature = "subagents")]
+    ctx.session.reset_background_tasks().await;
     let removed = match mutate_and_persist_session(
         ctx.session,
         undo_session_mutation,
