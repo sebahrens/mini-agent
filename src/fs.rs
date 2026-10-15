@@ -2897,6 +2897,8 @@ fn expand_home_relative(home: &Path, relative: &str) -> PathBuf {
 }
 
 pub(crate) use private::prepare_new_private_file;
+#[cfg(all(windows, feature = "mcp"))]
+pub(crate) use private::prepare_new_private_file_from_security_handle;
 
 #[cfg(test)]
 mod tests {

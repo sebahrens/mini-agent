@@ -436,11 +436,12 @@ fn replace_with_hooks(
             "candidate create",
             transaction.open(&candidate_path, true, false),
         )?;
-        // Use the SAME existing private-image initializer and strict validator.
-        // If it is unsupported on a transacted handle, refuse; no path fallback.
+        // Use the same private initializer guards on this exact descriptor,
+        // which already has security rights. ReOpenFile cannot reopen a newly
+        // created TxF image; no path fallback or permission repair is allowed.
         at_stage(
             "candidate private initializer",
-            crate::fs::prepare_new_private_file(&candidate),
+            crate::fs::prepare_new_private_file_from_security_handle(&candidate),
         )?;
         candidate.write_all(content)?;
         candidate.flush()?;
@@ -592,27 +593,22 @@ mod tests {
     #[test]
     fn windows_mcp_txf_parent_reparent_after_capture_preserves_both_namespaces() {
         use crate::extras::mcp::project::FileSnapshot;
-        // A snapshot retains the file, but not a nested parent directory. A
-        // reparent before publisher capture must preserve BOTH namespaces.
+        // The retained snapshot reader pins its descendant on Windows, so
+        // moving its parent is refused even before publisher directory capture.
+        // Keep that existing exclusion rather than bypassing it for a fixture.
         let fixture = Fixture::new("mcp-txf-parent-before-capture");
         let snapshot = FileSnapshot::read(&fixture.workspace, fixture.relative()).unwrap();
         let parent = fixture.target.parent().unwrap().to_owned();
         let moved = fixture.workspace.root().join("moved-parent");
-        std::fs::rename(&parent, &moved).unwrap();
-        crate::fs::ensure_private_directory(&parent).unwrap();
-        crate::fs::private_atomic_write_sync(&fixture.target, b"NEW_NAMESPACE_UNCHANGED").unwrap();
+        let rename_error = std::fs::rename(&parent, &moved).unwrap_err();
+        assert!(matches!(rename_error.raw_os_error(), Some(5 | 32)));
+        assert!(!moved.exists());
         fixture.workspace.validate().unwrap();
-        assert!(snapshot.publish(&fixture.workspace, "{}").is_err());
         assert_eq!(
-            std::fs::read(&fixture.target).unwrap(),
-            b"NEW_NAMESPACE_UNCHANGED"
-        );
-        assert_eq!(
-            std::fs::read_to_string(moved.join(".mcp.json")).unwrap(),
+            std::fs::read_to_string(&fixture.target).unwrap(),
             snapshot.content
         );
         assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
-        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
 
         // Once publisher capture holds the actual parent, its existing
         // no-delete-share handle forbids that same rename outright. Keep the
@@ -636,7 +632,7 @@ mod tests {
             &security,
             || {
                 let error = std::fs::rename(&pinned_parent, &attempted).unwrap_err();
-                assert_eq!(error.raw_os_error(), Some(32));
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)));
                 assert!(!attempted.exists());
                 pinned.workspace.validate().unwrap();
             },

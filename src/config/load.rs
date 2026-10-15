@@ -4841,6 +4841,8 @@ mod mcp_delta_tests {
     #[test]
     fn mcp_add_remove_preserves_unavailable_fields_unknown_nested_keys_and_no_project_copy() {
         let root = crate::tests::OwnedTestDirectory::new("mcp-global-delta");
+        let state = root.path().join("private-state");
+        crate::fs::ensure_private_directory(&state).unwrap();
         for (file, original) in [
             (
                 "config.toml",
@@ -4855,7 +4857,7 @@ mod mcp_delta_tests {
                 "model: original\nauto_update_prompts: false\nfuture_feature: {keep: [unknown, 雪]}\nmcp_servers:\n  existing:\n    command: runner\n    future_server_key: 17\n",
             ),
         ] {
-            let path = root.path().join(file);
+            let path = state.join(file);
             crate::fs::private_atomic_create_sync(&path, original.as_bytes()).unwrap();
             let server = crate::extras::mcp::config::McpServerConfig::Url {
                 url: "http://127.0.0.1:3000/mcp".into(),

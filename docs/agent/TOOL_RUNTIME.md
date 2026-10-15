@@ -1502,8 +1502,11 @@ parent directories are acquired as transaction writers and compared against the
 retained directory identities and current security observations. These data
 fingerprints confer no filesystem or runtime authority.
 
-The replacement uses the existing private-file initializer and validator. All
-transacted file handles and metadata clones are closed before replacement; the
+The replacement uses the existing private-file initializer guards and validator.
+Its already security-capable transacted descriptor is initialized directly;
+ordinary temporary files retain their existing `ReOpenFile` entrypoint. Both
+paths require an empty regular single-link image, set the explicit current-user
+owner and private DACL, and revalidate that same object. All transacted file handles and metadata clones are closed before replacement; the
 same owned KTM transaction performs replacement and commit. The normal snapshot
 read handle remains retained throughout. A failure before commit rolls back the
 transaction, without a nontransactional pathname replacement or restoration over

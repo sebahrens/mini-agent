@@ -932,6 +932,21 @@ mod windows {
             );
         }
         let reopened = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        prepare_new_private_file_from_security_handle(&reopened)
+    }
+
+    /// Initialize only an exclusively created empty temporary file whose exact
+    /// descriptor already carries READ_CONTROL, WRITE_DAC and WRITE_OWNER.
+    /// TxF-created files cannot be ReOpenFile'd outside their transaction.
+    /// The caller retains the descriptor; no pathname is opened or repaired.
+    pub(crate) fn prepare_new_private_file_from_security_handle(
+        file: &std::fs::File,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        if observe_private_temp!("original_metadata", file.metadata())?.len() != 0 {
+            return Err(super::private_file_error());
+        }
+        let handle = file.as_raw_handle() as Handle;
         let information = observe_private_temp!("reopened_metadata", information(handle))?;
         if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
             != 0
@@ -970,10 +985,7 @@ mod windows {
         });
         observe_private_temp!("current_owner_and_dacl", initialized)?;
         // Recheck the same object, including its explicit owner, after setup.
-        observe_private_temp!(
-            "strict_revalidation",
-            apply_private_dacl(reopened.as_raw_handle() as Handle, false)
-        )
+        observe_private_temp!("strict_revalidation", apply_private_dacl(handle, false))
     }
 
     fn apply_private_dacl(handle: Handle, expect_directory: bool) -> std::io::Result<()> {
@@ -2626,6 +2638,24 @@ mod windows {
         assert_eq!(dacl_sddl(&fresh, false).unwrap(), before);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"private bytes");
         drop(file);
+        use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+        // The same initialization guards also apply when the caller already
+        // owns a security-capable descriptor (including TxF candidates).
+        let direct = root.path().join("direct-security-handle");
+        let mut direct_file = std::fs::OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .create_new(true)
+            .open(&direct)
+            .unwrap();
+        prepare_new_private_file_from_security_handle(&direct_file).unwrap();
+        validate_checked(&direct_file).unwrap();
+        direct_file.write_all(b"direct private bytes").unwrap();
+        let direct_dacl = dacl_sddl(&direct, false).unwrap();
+        assert!(prepare_new_private_file_from_security_handle(&direct_file).is_err());
+        assert_eq!(dacl_sddl(&direct, false).unwrap(), direct_dacl);
+        assert_eq!(std::fs::read(&direct).unwrap(), b"direct private bytes");
+        drop(direct_file);
         let linked = root.path().join("linked");
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -2635,6 +2665,7 @@ mod windows {
         let before = dacl_sddl(&linked, false).unwrap();
         std::fs::hard_link(&linked, root.path().join("alias")).unwrap();
         assert!(prepare_new_private_file(&file).is_err());
+        assert!(prepare_new_private_file_from_security_handle(&file).is_err());
         assert_eq!(dacl_sddl(&linked, false).unwrap(), before);
         assert_eq!(file.metadata().unwrap().len(), 0);
     }
@@ -2930,6 +2961,9 @@ pub(crate) fn prepare_new_private_file(_: &std::fs::File) -> std::io::Result<()>
 
 #[cfg(windows)]
 pub(crate) use windows::prepare_new_private_file;
+
+#[cfg(all(windows, feature = "mcp"))]
+pub(crate) use windows::prepare_new_private_file_from_security_handle;
 
 #[cfg(windows)]
 pub(crate) use windows::validate_directory_checked;
