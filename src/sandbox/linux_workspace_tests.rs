@@ -266,6 +266,12 @@ async fn linux_native_workspace_cargo_artifacts_are_reused_at_host_real_paths() 
         compiler.is_file() && cargo.is_file(),
         "native runner must stage its existing Rust toolchain inside an already permitted readonly runtime root"
     );
+    // Ubuntu's cc spelling traverses /etc/alternatives, which the default
+    // empty-/etc sandbox intentionally does not expose. Use the same concrete
+    // installed linker in both runs so this control measures artifact paths
+    // and reuse without changing the sandbox's filesystem policy.
+    let linker = std::fs::canonicalize("/usr/bin/cc").expect("native runner needs a C linker");
+    assert!(linker.starts_with("/usr") && linker.is_file());
     let owned = NativeDirectory::new(Path::new("/tmp"), "cargo-native");
     let root = owned.0.join("repo");
     let cache = owned.0.join("runtime-cache");
@@ -293,7 +299,8 @@ async fn linux_native_workspace_cargo_artifacts_are_reused_at_host_real_paths() 
     )
     .unwrap();
     let script = format!(
-        "PATH='/usr/local/lib/mini-agent-native-rust/bin:/usr/bin:/bin' RUSTC='{}' CARGO_HOME='{}/cargo-home' CARGO_TARGET_DIR='{}/target' '{}' test --offline",
+        "PATH='/usr/local/lib/mini-agent-native-rust/bin:/usr/bin:/bin' RUSTFLAGS='-Clinker={}' RUSTC='{}' CARGO_HOME='{}/cargo-home' CARGO_TARGET_DIR='{}/target' '{}' test --offline",
+        linker.display(),
         compiler.display(),
         root.display(),
         root.display(),
