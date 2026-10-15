@@ -1,0 +1,266 @@
+{
+  "bead": "mini-agent-mxtlv",
+  "platform": "windows-x64",
+  "result": "PASS",
+  "scope": "actual official signed-out installed VSIX Chat UI through production participant and ACP, local scripted provider only",
+  "run_url": "https://github.com/sebahrens/mini-agent/actions/runs/38722072057",
+  "job_id": 116378810713,
+  "observer_sha": "f2e0242778907ec7a677e89d116ad4792ba801cc",
+  "workflow_sha256": "1e3190b800e20fcc91907f04f29d83b6a49d0c58682b5fad855ff818c196cb23",
+  "fixture_source_sha": "a235c1c77277ef1fc5aa9c3efa9d4af19051fa35",
+  "candidate_source_sha": "9c6f89e91e29b94d02021f7b5c850a1748d00c74",
+  "candidate_origin_run": 38718389670,
+  "identity": {
+    "fixture_source_sha": "a235c1c77277ef1fc5aa9c3efa9d4af19051fa35",
+    "candidate_source_sha": "9c6f89e91e29b94d02021f7b5c850a1748d00c74",
+    "candidate_origin_run": 38718389670,
+    "candidate": {
+      "source_sha": "9c6f89e91e29b94d02021f7b5c850a1748d00c74",
+      "binary_sha256": "f900e61032446e1ee55bc898640aa62b164ebb19c6245ab7a0582c80e82f15f6",
+      "vsix_sha256": "62f4168ce0ac0f961b6a3169b5e883dc8726acadf3c8251ba04ceeb0256bab1c",
+      "extension_sha256": "150f3c1a15566809601b050e84f4561523fd4e7d51744287f3a377708a7dfdc6",
+      "scope": "native installed UI candidate only; no distribution/license packaging claim"
+    },
+    "unchanged_extension_source_git_objects": {
+      "editors/vscode/src": "37be1ff4e1a721ec095018711fc378c21bab595e",
+      "editors/vscode/scripts": "ded6420ca27e6005970922438b215d9dfe1d4b2a",
+      "editors/vscode/package.json": "031b69eaefeb256737af73a631737e6aa330f687",
+      "editors/vscode/package-lock.json": "43011fcfd714b9a1156ec85c8de2972f65a52589",
+      "editors/vscode/tsconfig.json": "d00753c432c33b0d5dfed3b5fbfa86ad23f4bc7b",
+      "editors/vscode/.nvmrc": "db49bb14d78e76cc5ebbf481960bced880636a24"
+    }
+  },
+  "source_hash_policy": "canonical git show HEAD:path SHA256 plus working-tree bytes equal canonical after CRLF\u2192LF only",
+  "initializer": {
+    "fixture_source_sha": "a235c1c77277ef1fc5aa9c3efa9d4af19051fa35",
+    "transport_only_before_acl": {
+      "status": "PASS",
+      "run_id": 38721697047,
+      "reused": true
+    },
+    "initializer": "PASS",
+    "elapsed_seconds": 26.156000000000006,
+    "rows": [
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "config",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "data",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "local-data",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "state",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "cache",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "credentials",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "config/config.toml",
+        "protected": true
+      }
+    ],
+    "fixture_hashes": {
+      "chat_ui_platform.py": "3a2d560f544569462fa82203af5f05814b8b3a27b053e2c3218db7a8fabfaf8c",
+      "chat-ui-platform.test.py": "fcd058007ff18a576bc6f901d76f5698e0780c26eeec6b755497c7ac67a5d4c3",
+      "chat-ui-owner.py": "b6d62b6f044de739d1eff96d2c0e01be2cc4a7fb20420da3e1e1d23e3774ffd1"
+    }
+  },
+  "retirement": {
+    "root": "D:\\a\\_temp\\ma-chat-ui",
+    "provider_port": 50094,
+    "home_preserved": true,
+    "errors": [],
+    "private_fixture_initialization": [
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "config",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "data",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "local-data",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "state",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "cache",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "credentials",
+        "protected": true
+      },
+      {
+        "owner": "S-1-5-21-1643835476-1616584234-1346609752-500",
+        "relative": "config/config.toml",
+        "protected": true
+      }
+    ],
+    "pid": 9520,
+    "debug_port": 50101,
+    "binary_sha256": "f900e61032446e1ee55bc898640aa62b164ebb19c6245ab7a0582c80e82f15f6",
+    "vsix_sha256": "62f4168ce0ac0f961b6a3169b5e883dc8726acadf3c8251ba04ceeb0256bab1c",
+    "posts": 6,
+    "ui_acceptance": {
+      "rendered": true,
+      "allow": true,
+      "deny": true,
+      "cancel_closes_picker_without_tool_result": true,
+      "fixture_model_response_calls": 0
+    },
+    "exit_before_cleanup": 0,
+    "descendant_retirement": {
+      "backend": "windows-job",
+      "active_processes": 0,
+      "forced_descendants": false
+    },
+    "listeners_closed": {
+      "provider": true,
+      "cdp": true
+    },
+    "forced_cleanup": [],
+    "child_exit_codes": [
+      0,
+      0
+    ]
+  },
+  "scenario_sequence": [
+    "REPLY",
+    "PERMISSION_ALLOW",
+    "TOOL_RESULT",
+    "PERMISSION_DENY",
+    "TOOL_RESULT",
+    "PERMISSION_CANCEL"
+  ],
+  "allow_contains_fixture": true,
+  "deny_exact": "Permission denied by user",
+  "cancel_has_no_tool_result_or_followup": true,
+  "visual_review": [
+    "real-chat-rendered.png",
+    "permission-allow-picker.png"
+  ],
+  "artifact": {
+    "id": 11967196084,
+    "node_id": "MDg6QXJ0aWZhY3QxMTk2NzE5NjA4NA==",
+    "name": "mxtlv-native-chat-windows-x64",
+    "size_in_bytes": 400884,
+    "url": "https://api.github.com/repos/sebahrens/mini-agent/actions/artifacts/11967196084",
+    "archive_download_url": "https://api.github.com/repos/sebahrens/mini-agent/actions/artifacts/11967196084/zip",
+    "expired": false,
+    "digest": "sha256:006e6564c1f128eca2d2589255989c10c0d61aebf4535c50f7780059c9cf916f",
+    "created_at": "2026-10-15T10:43:25Z",
+    "updated_at": "2026-10-15T10:43:25Z",
+    "expires_at": "2026-10-18T10:43:24Z",
+    "workflow_run": {
+      "id": 38722072057,
+      "repository_id": 1314876015,
+      "head_repository_id": 1314876015,
+      "head_branch": "diag/mxtlv-chat-ui-windows-r5-20261015",
+      "head_sha": "f2e0242778907ec7a677e89d116ad4792ba801cc"
+    }
+  },
+  "evidence_root": "/private/tmp/mini-agent-mxtlv-native-remote-38722072057",
+  "evidence_hashes": {
+    "job.log": "9c4a79921d2f38e8610ee3c29c28882beac9ea0adcb2520b39c2ad41558efa99",
+    "run.json": "2ec6f73ea5a2d1ec16b5ba5e5a3f6d9eecaa92a83f044eacb02e6c6552ef1ec5",
+    "artifacts.json": "4fa46c111b044f7848d07c5e8a01605ce9d6a3574ee67442552449fb58eefdaf",
+    "proof/mxtlv-candidate-identity.json": "d22fa34fd4b84b727769403feec2967bd75ca4ca247b3d86a3643ca29343b466",
+    "proof/ma-chat-ui/host.json": "501b72e5a37d0a8e357be55443b98086b41d74dfb7606e2f15761070c864b03b",
+    "proof/ma-chat-ui/real-chat-rendered.png": "ad8356a4c975811fcaef31fa2e9bc8c4e6e308b45632d042281bbb4e6a6d228c",
+    "proof/ma-chat-ui/permission-cancel-pending.png": "a4aaa7410916ab23d7d7f108154562cb5f2b4a9032625c135d2dd2557c86c46c",
+    "proof/ma-chat-ui/fixture-model-events.jsonl": "b6a9ead9f8daefbd81e764d45700cb73261aa2ba0615e8295fd7a83f6310c9e2",
+    "proof/ma-chat-ui/permission-allow-picker.json": "bc98682aa746c170eeb2283edb975f229f0d32e67c908dcdb4e4869bbecaf3d0",
+    "proof/ma-chat-ui/permission-cancel-idle.json": "8a71ddd581368612c963173c81709bf84015f4825c900daf56d5b9b2e1875b27",
+    "proof/ma-chat-ui/ui-actions.log": "9b9bdc75cb3c53d5cf0bbc1db946d59bba170959c9875d59764ca11805fdecf8",
+    "proof/ma-chat-ui/permission-deny-picker.png": "4b5d32a87f6c0b57985c019d35a384f99e5edaf4a3314fee76f28f363890998f",
+    "proof/ma-chat-ui/permission-deny-rendered.png": "cd4d3f1042641c0f2c48e18c1aedbe0439fec22f5cce29441359eab9c37fdfba",
+    "proof/ma-chat-ui/dom-latest.json": "8a71ddd581368612c963173c81709bf84015f4825c900daf56d5b9b2e1875b27",
+    "proof/ma-chat-ui/private-fixture-init.log": "b0d8846d00340caa093635bb4a8b0b170b6657c0c5838b7577910303921413e2",
+    "proof/ma-chat-ui/permission-allow-rendered.png": "37578678c99e338a6b243c1545342814f2a142e9635b036eec7362de1651583c",
+    "proof/ma-chat-ui/permission-deny-picker.json": "57201518c9e9f04918f4660de07409956b7c2fe3c090a423dade30bc01fd2bb6",
+    "proof/ma-chat-ui/permission-cancel-idle.png": "0a75bacb3f2f89398d78fcf42bbd62d29221bd9877929acc3e67533f59e951b0",
+    "proof/ma-chat-ui/permission-cancel-pending.json": "864d9286669203b666e8174f13a7a04fdb65836c8884e3afab7a5f94e4e7c24e",
+    "proof/ma-chat-ui/permission-allow-rendered.json": "7359181c902006b76aedebfba7cec66623765814eb6388405bb9c7eca6de37ff",
+    "proof/ma-chat-ui/retirement.json": "de3c82111c1a9c683065d82719e0cb6733aba76bed56f971f6444147dedf05e9",
+    "proof/ma-chat-ui/install.log": "b2b684c7bb6eb6fbc327f158a55e9abb74e0e069bea56bd35157fa08fc7a4a89",
+    "proof/ma-chat-ui/permission-allow-picker.png": "43f017561d071ec59d2544ac1aa02bf9710762c8fb8d1471c3274df2492e9041",
+    "proof/ma-chat-ui/host.log": "c5c0397223765d24701745d8ec5ae7a65248a3f48c1137469faf4e5637cdef73",
+    "proof/ma-chat-ui/provider-events.jsonl": "b99b3dd345fa7717be9eb74d783055e96b5e047192df2b1275d13cf2b39fe62f",
+    "proof/ma-chat-ui/permission-deny-rendered.json": "2edc222d25a026d1369b46ac03a30857c77924ca1a38d345062ec789ed91ed9a",
+    "proof/ma-chat-ui/real-chat-rendered.json": "4c13748123abffa5f235badd4e8040fb8b18f5d8b7480c9350a861594462c99f",
+    "proof/private-fixture-preflight/result.json": "fce4570cbe4cf57cf16029b65a4223bb7e22afd887531c94ca12c7597b00db01",
+    "proof/private-fixture-preflight/private-fixture-init.log": "b0d8846d00340caa093635bb4a8b0b170b6657c0c5838b7577910303921413e2",
+    "proof/mxtlv-host/verified.json": "773d3660693db6cfffc0a546e1f984ca56e5afde4a01fa809ad8da222440e6ce",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/network-shared.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/editSessions.log": "cec862decd553771a8775e71a3f4206a3a36530eea54bb28496ffad11d3d097f",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/userDataSync.log": "7d1e57a051af7b60db012f6076bb0e45ac746a8d2d7d5af7cdacc351a30bb175",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/mcpGateway.log": "56b4504badda16112b1cb70bbec13b17e4c76a110fe1d7980dbd037b13fc5382",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/sharedprocess.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/tunnelHostService.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/terminal.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/remoteTunnelService.log": "af5a00928ca0bbbb39770896cfab54f51c814e2ffdf60e9924bc6cf1454dc3cb",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/telemetry.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/main.log": "7dc5130e4592800d78bbfe24922cde91bbccf83c1d788ccf1ff91dacf3103f9a",
+    "proof/ma-chat-ui/profile/logs/20261015T104306/cli.log": "4cf8d8de15a05ef653da32e22f3e64e8d6df319ac7754ffb444a06a5b742a2a4",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/network.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/views.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/notebook.rendering.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/renderer.log": "32763a4fd2dae46f3cfcaf25d3dc0d78d0b10114e3ca3c3f8de37b42100a6ac8",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/output_20261015T104309/agentSessionsOutput.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/output_20261015T104309/tasks.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/extHostTelemetry.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/exthost.log": "97793ee683c4f6c3ea1a02e504a68606755d59816f07546f434f64a42dd0f403",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/vscode.github-authentication/GitHub Authentication.log": "455793074ebb74dda817303cb643f1456f0a200dfdfb48601d1962bdb1399013",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/vscode.github/GitHub.log": "b3779f4db1ac2d5a4820a6cd7c4b5c011c5b93c28429168a1c5d0b04bc3804fd",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/output_logging_20261015T104310/1-Mini Agent.log": "03795503431ff590ecc66a97227a3ed6cad53d6c4e9e73d8c0a0ad6d8bbb6029",
+    "proof/ma-chat-ui/profile/logs/20261015T104307/window1/exthost/vscode.git/Git.log": "e1da71e5ac54e377a077d075c3c9e65323c285b164bf7fb62c89f5b694eafcf1"
+  },
+  "owned_ref_cleanup": "exact-owned ref deleted; ls-remote empty",
+  "limits": "Actual hosted Administrator process context, no broader sandbox-containment claim; native UI test VSIX only, no distribution-license packaging claim; no account/cloud/paid requests",
+  "root_review": {
+    "evidence_hashes_verified": 53,
+    "actual_provider_sequence": "Exact6 scenarios verified from retained messages; allowed OFFLINE_IDE_FIXTURE bytes, exact denial, no post-cancel request",
+    "retirement": "Retained raw JSON matches receipt; all UI flags/LM0/normal exits/no force/zero Job processes/listeners closed checked",
+    "visual": "Root viewed actual signed-out Windows rendered Chat screenshot",
+    "scope": "Candidate9c and fixturea235 kept separate; no account or final-main CI claim"
+  }
+}

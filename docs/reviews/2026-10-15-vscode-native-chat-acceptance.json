@@ -1,0 +1,22 @@
+{
+  "bead": "mini-agent-mxtlv",
+  "result": "PASS",
+  "scope": "Separate actual installed signed-out Chat UI on macOS, Linux and Windows using production participant/ACP and loopback provider; original VSCode1.91 compatibility proof retained. No account, paid request or broader containment claim.",
+  "platforms": [
+    {
+      "platform": "macos",
+      "receipt": "2026-10-15-vscode-native-chat-macos.json",
+      "sha256": "e9a19c143aae3dcb3f6aa6d969f5bb4a8199d847d053e41b6d54e3615b9ccb28"
+    },
+    {
+      "platform": "linux",
+      "receipt": "2026-10-15-vscode-native-chat-linux.json",
+      "sha256": "403c4ced4e338846c7f56c8c04ea266cc7c9db3608b56055cb0d36a577f2087e"
+    },
+    {
+      "platform": "windows",
+      "receipt": "2026-10-15-vscode-native-chat-windows.json",
+      "sha256": "50a6350b46029ee3d6d744cebf05f4601e59f1604440a1f354190ae284e2e8bb"
+    }
+  ]
+}

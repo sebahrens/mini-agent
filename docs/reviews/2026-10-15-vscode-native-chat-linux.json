@@ -125,5 +125,7 @@
     "proof/ma-chat-ui/profile/logs/20261015T101748/window1/exthost/vscode.git/Git.log": "4234f3f043957be6b0dbd89b97e95ad879febe331db6fae6c8e1ca75c0bc505c"
   },
   "remaining": "Windows actual native UI proof pending independently; Mac proof previously retained; no distribution packaging claim",
-  "root_review": "Root verified all50 evidence file hashes and visually inspected real-chat-rendered.png. Candidate9c/fixture1c identities remain separate; production extension Git objects match. Windows acceptance remains pending."
+  "root_review": "Root verified all50 evidence file hashes and visually inspected real-chat-rendered.png. Candidate9c/fixture1c identities remain separate; production extension Git objects match. Windows acceptance remains pending.",
+  "owned_ref_cleanup": "remote exact-ref deletion confirmed absent",
+  "followup": "Subsequent Windows native acceptance PASS; see 2026-10-15-vscode-native-chat-windows.json and combined receipt. Historical remaining field describes this earlier Linux proof."
 }

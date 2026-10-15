@@ -264,9 +264,9 @@ and **Deny once**, requires the actual allowed file content and exact denial in
 provider requests, and cancels through Chat while the picker is visible. It
 requires six loopback requests, no cancelled tool result, and normal application
 exit. A finite owner cleans up its process group and server on failure; native
-acceptance also records process and listener retirement. This proves the tested
-platform's UI flow; it does not supply Linux/Windows evidence or strengthen that
-platform's sandbox claims.
+acceptance also records process and listener retirement. Each platform requires
+its own native run; the evidence is limited to that platform's UI flow and
+existing sandbox behavior.
 
 The temporary Linux/Windows diagnostic uses the same provider and production
 participant. For `--app`, Linux supplies the extracted directory containing
@@ -292,3 +292,13 @@ node --test test/chat-ui-keys.test.mjs
 Only the separately recorded native run can establish success on an additional
 platform. Source identity, binary/VSIX hashes, screenshots, provider requests,
 normal exit, and descendant/listener retirement must all be retained together.
+
+Windows initializes only the eight newly created fixture private entries before
+launching the editor, with the current user as owner and a protected DACL for
+that user and SYSTEM. The helper rejects reparse points and linked config files.
+It uses noninteractive, encoded PowerShell with closed stdin and a 30-second
+deadline; `private-fixture-init.log` retains completion or the last failure stage.
+
+The [combined native acceptance receipt](reviews/2026-10-15-vscode-native-chat-acceptance.json)
+links the passing macOS, Linux, and Windows runs. Candidate binary/VSIX source
+and fixture source are recorded independently so unchanged builds can be reused.
