@@ -1,0 +1,64 @@
+{
+  "bead": "mini-agent-i7ro6.100",
+  "result": "Both required native Linux profile controls PASS across source-attributed focused runs.",
+  "main_profile_case": {
+    "name": "sandbox::general_profile::tests::profile100_native_host_profiles_preserve_masks_and_real_operations",
+    "source": "1c3a99d691ad6c41041819b2a9f71e6e3a4182f6",
+    "workflow_head": "cbab218062520570b1193bf5f6e8747df10f9999",
+    "run": 38701896949,
+    "job": 116311838878,
+    "passed": 1,
+    "seconds": 0.08,
+    "log": "/private/tmp/mini-agent-profile100-native-scratch-job.log",
+    "log_sha256": "3112ec05dd9f377aa2259651d8dfa933af778b08e3134a73ff5efe33d84efa7e",
+    "evidence_lines": [
+      908,
+      910
+    ],
+    "observed": "Both HostRead andHostFull actualkernel operations; existinghosthomewrite refusal, HostFullhostwrite positive, privatesecretrefusal/unchangedbytes, ancestorrename refusal, workspace+explicitwrite positives, retainedcommandlease and nohighFDleak."
+  },
+  "rustup_case": {
+    "name": "sandbox::general_profile::tests::profile100_native_host_read_runs_cargo_test_from_home_rustup",
+    "source": "0a2e280c0fcfb0b0bbe0e6e11b5d40517f492de3",
+    "workflow_head": "cf59acc4a3be95b31d67dfa7f4c6eb7490763a29",
+    "run": 38703344603,
+    "job": 116316602310,
+    "discovered": 2,
+    "executed": 1,
+    "passed": 1,
+    "seconds": 3.67,
+    "log": "/private/tmp/mini-agent-profile100-native-rustup-job.log",
+    "log_sha256": "33e058e493bd2bbdbdbfcb4cce9af529f2755a71bb7696e9b754e79cc4b569ce",
+    "evidence_lines": [
+      900,
+      902
+    ],
+    "observed": "Actual identity-checked installed Rustup image via heldFile copiedunder cargo/rustc/rustdoc names inownedHOME; retained realinstalledtoolchain; cargo --version andoffline cargo test actual1PASS; targetoutputs insideownedworkspace; hosttoolchain/root identities revalidated. No sharedtargetcopy/coldrepositoryCargo/network needed.",
+    "artifact": {
+      "id": 11957163607,
+      "name": "native-linux-profile100-rustup-followup",
+      "sha256": "87956e07cb099f2eb9eead543746f1f1c0d28c50028e7f6ae1dd674a49d5d659",
+      "bytes": 1356
+    }
+  },
+  "reuse": {
+    "production_prefix_sha256": "8174a8b42e8ed276334ae9c332a85829a4cd9723ee9939720f6f56a155009b1f",
+    "main_case_byteidentical_sha256": "e170e2e277f675c13d92af34ea066f32d7e1b1ada10c1e71fd1be19f8c393f6c",
+    "first_full_file_sha256": "0678ed6c55bfd05ecd4833de00c3788f93033d0f180dfe3795ceb4388aca5d0f",
+    "last_full_file_sha256": "4e0c172dd448ab284f4aba09d7b67870cc0a9dc0d6499af1c13de014e3f20f2b",
+    "main_367_full_file_sha256": "4e0c172dd448ab284f4aba09d7b67870cc0a9dc0d6499af1c13de014e3f20f2b",
+    "source_change": "1c3\u21920a2 altersONLYignoredLinuxRustupfixture proxycopy; firstprofilecase andallproductionprefix byteidentical. Prior7Linux99+headless1 notrerun; separateproofb342b8.",
+    "macOS": "Root separatelyowns actualchangedfixtureMac1PASS; Linux-onlyproxyfixturechange notcompiledonMac."
+  },
+  "limits": [
+    "Notfreshsingle-run2PASS orwholeCIgreen.",
+    "PreviousfirstprofileFAIL didnotrecordpreciseexitcheckpoint; scratchexpectationcorrection source-grounded.",
+    "PreviousRustupENOENT2 wasmissingfixturecompilerproxy; noproductionpolicylimits/share/permission changes."
+  ],
+  "source_patch": "/private/tmp/mini-agent-profile100-rustup-proxies-fixture.patch",
+  "source_patch_sha256": "9e3989b44e2b48a6ad38007ffe455566fced6da5d420cc379c3f5c312430e2ed",
+  "watchers": {
+    "lean_38906": "terminalSUCCESS exit0",
+    "Main_24170": "stillrunning367;knownfmtenvdocs failureseparate"
+  }
+}
