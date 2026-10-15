@@ -2896,12 +2896,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/config/mod.rs",
-        "output: 5.0,",
-        1,
-        "NON-PROCESS",
-    ),
+    ("src/config/mod.rs", "output: 5.0,", 1, "NON-PROCESS"),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"completed before deadline\".into()),",
