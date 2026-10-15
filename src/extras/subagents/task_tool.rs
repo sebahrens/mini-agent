@@ -1144,11 +1144,16 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // findings in the required sections, charged to this task's
                 // budget. If the restatement still fails validation, the host
                 // repair below keeps the original text quoted instead.
+                // The validation result of the response finally selected is
+                // carried to the host contract check instead of recomputed.
+                let mut known_violations = None;
                 if !task_budget.exhausted()
                     && let Ok(response) = run.response.as_ref()
                 {
                     let violations = report_contract_violations(response);
-                    if !violations.is_empty() {
+                    if violations.is_empty() {
+                        known_violations = Some(violations);
+                    } else {
                         let repair_agent =
                             agent.clone().for_subagent_report_repair(repair_max_tokens);
                         let repair = repair_agent
@@ -1161,13 +1166,23 @@ editing in a known location, grepping for a literal you will act on immediately.
                             )
                             .await;
                         run.usage = usage_saturating_add(run.usage, repair.usage);
-                        run.response = Ok(select_repaired_report(response, repair.response.ok()));
+                        let (selected, selected_violations) =
+                            select_repaired_report_with_violations(
+                                response,
+                                violations,
+                                repair.response.ok(),
+                            );
+                        run.response = Ok(selected);
+                        known_violations = Some(selected_violations);
                     }
                 }
 
-                let output = run
-                    .response
-                    .map(|response| enforce_bounded_report_contract(&response, max_report_bytes));
+                let output = run.response.map(|response| match known_violations {
+                    Some(violations) => {
+                        enforce_validated_report_contract(response, violations, max_report_bytes)
+                    }
+                    None => enforce_bounded_report_contract(&response, max_report_bytes),
+                });
                 let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
                 ChildExecution { output, cost_units }
             });
@@ -1348,6 +1363,19 @@ impl TaskOutcome {
             Self::NotStarted(reason) => format!("[not started: {reason}]\n"),
         }
     }
+
+    /// `self.render().len()`, computed without rendering.
+    fn rendered_len(&self) -> usize {
+        match self {
+            Self::Success(response) => {
+                SUBAGENT_OUTPUT_BEGINS.len() + quoted_len(response) + SUBAGENT_OUTPUT_ENDS.len()
+            }
+            Self::Partial(rendered) => rendered.len(),
+            Self::Failed(error) => "[failed: ]\n".len() + error.len(),
+            Self::Cancelled(reason) => "[cancelled: ]\n".len() + reason.len(),
+            Self::NotStarted(reason) => "[not started: ]\n".len() + reason.len(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1492,7 +1520,7 @@ fn truncate_sections(sections: &str, budget: usize) -> String {
 /// rather than truncating headings or leaving an unterminated child fence.
 fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
     let full = TaskOutcome::Success(response);
-    if full.render().len() <= budget {
+    if full.rendered_len() <= budget {
         return (full, false);
     }
     let TaskOutcome::Success(response) = full else {
@@ -1525,14 +1553,24 @@ fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
 }
 
 fn quote_untrusted_output(output: &str) -> String {
-    let mut quoted = output
-        .lines()
-        .map(|line| format!("> {line}\n"))
-        .collect::<String>();
+    let mut quoted = String::with_capacity(quoted_len(output));
+    for line in output.lines() {
+        quoted.push_str("> ");
+        quoted.push_str(line);
+        quoted.push('\n');
+    }
     if output.is_empty() {
         quoted.push_str("> \n");
     }
     quoted
+}
+
+/// `quote_untrusted_output(output).len()`, computed without allocating.
+fn quoted_len(output: &str) -> usize {
+    if output.is_empty() {
+        return "> \n".len();
+    }
+    output.lines().map(|line| line.len() + "> \n".len()).sum()
 }
 
 #[derive(Clone)]
@@ -1664,7 +1702,7 @@ async fn execute_tasks_with_budget(
         };
         // Charge exactly the representation returned to the parent: quotation
         // prefixes and host markers can exceed the raw response size substantially.
-        let body_len = outcome.render().len();
+        let body_len = outcome.rendered_len();
         let output_exhausted = output_exhausted || body_len > remaining_output;
         outcomes[index] = Some(outcome);
         output_bytes = output_bytes
@@ -1973,10 +2011,24 @@ fn report_repair_prompt(response: &str, violations: &[&str], max_report_bytes: u
 
 /// Use the repaired report only if it now satisfies the contract; otherwise
 /// keep the original, which the host repair then quotes.
+#[cfg(test)]
 fn select_repaired_report(original: &str, repaired: Option<String>) -> String {
+    select_repaired_report_with_violations(original, report_contract_violations(original), repaired)
+        .0
+}
+
+/// As [`select_repaired_report`], also returning the contract violations of
+/// the selected text (`original_violations` are those of `original`).
+fn select_repaired_report_with_violations(
+    original: &str,
+    original_violations: Vec<&'static str>,
+    repaired: Option<String>,
+) -> (String, Vec<&'static str>) {
     match repaired {
-        Some(repaired) if report_contract_violations(&repaired).is_empty() => repaired,
-        _ => original.to_string(),
+        Some(repaired) if report_contract_violations(&repaired).is_empty() => {
+            (repaired, Vec::new())
+        }
+        _ => (original.to_string(), original_violations),
     }
 }
 
@@ -1985,7 +2037,11 @@ fn enforce_report_contract(response: &str) -> String {
     if violations.is_empty() {
         return response.to_string();
     }
+    host_repaired_report(response, &violations)
+}
 
+/// The host-repaired contract for a response with known `violations`.
+fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
     let quoted_response = response
         .lines()
         .map(|line| format!("> {line}"))
@@ -2058,6 +2114,25 @@ fn enforce_bounded_report_contract(response: &str, max_report_bytes: usize) -> S
         }
     }
     partial_report(response, max_report_bytes, "report byte limit")
+}
+
+/// [`enforce_bounded_report_contract`] for a response whose contract
+/// violations were already computed; the result is identical.
+fn enforce_validated_report_contract(
+    response: String,
+    violations: Vec<&'static str>,
+    max_report_bytes: usize,
+) -> String {
+    if response.len() <= max_report_bytes {
+        if violations.is_empty() {
+            return response;
+        }
+        let enforced = host_repaired_report(&response, &violations);
+        if enforced.len() <= max_report_bytes {
+            return enforced;
+        }
+    }
+    partial_report(&response, max_report_bytes, "report byte limit")
 }
 
 /// Tokens charged against the subagent budget for one completion.
@@ -2170,6 +2245,69 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    const RENDER_SAMPLES: &[&str] = &[
+        "",
+        "\n",
+        "one line",
+        "trailing\n",
+        "crlf\r\nlines\r\n",
+        "bare\rreturn",
+        "blank\n\n\nlines",
+        "unicode ünïcødé 🦀\nsecond",
+        "[subagent output ends]\n> fake\n",
+    ];
+
+    #[test]
+    fn arithmetic_rendered_length_matches_every_rendering() {
+        for sample in RENDER_SAMPLES {
+            assert_eq!(
+                quoted_len(sample),
+                quote_untrusted_output(sample).len(),
+                "{sample:?}"
+            );
+            for outcome in [
+                TaskOutcome::Success(sample.to_string()),
+                TaskOutcome::Partial(sample.to_string()),
+                TaskOutcome::Failed(sample.to_string()),
+                TaskOutcome::Cancelled(sample.to_string()),
+                TaskOutcome::NotStarted(sample.to_string()),
+            ] {
+                assert_eq!(
+                    outcome.rendered_len(),
+                    outcome.render().len(),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prevalidated_report_contract_matches_the_full_check() {
+        let valid = "## Findings\n- [confidence: high] ok\n\n## Unverified\n- None\n\n## Coverage\n- Covered: a\n- Skipped: None\n";
+        let mut samples: Vec<String> = RENDER_SAMPLES.iter().map(|s| s.to_string()).collect();
+        samples.push(valid.to_string());
+        samples.push(valid.repeat(50));
+        for sample in &samples {
+            for cap in [64, 512, 4096, 262_144] {
+                assert_eq!(
+                    enforce_validated_report_contract(
+                        sample.clone(),
+                        report_contract_violations(sample),
+                        cap
+                    ),
+                    enforce_bounded_report_contract(sample, cap),
+                    "{sample:?} at {cap}"
+                );
+            }
+            let (selected, violations) = select_repaired_report_with_violations(
+                "prose",
+                report_contract_violations("prose"),
+                Some(sample.clone()),
+            );
+            assert_eq!(violations, report_contract_violations(&selected));
+        }
+    }
 
     #[derive(Clone)]
     struct FakeStep {

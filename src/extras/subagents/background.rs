@@ -53,6 +53,14 @@ pub(crate) struct SavedTask {
     pub notified: bool,
 }
 
+/// Equality of the persisted representation: like the serialized form, it
+/// ignores the runtime-only `notified` flag.
+impl PartialEq for SavedTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.status == other.status && self.result == other.result
+    }
+}
+
 pub(crate) fn read_history<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<SavedTask>, D::Error> {
@@ -177,9 +185,7 @@ impl History {
         let mut saved = saved.clone();
         saved.notified = false;
         if let Some(row) = state.rows.iter_mut().find(|row| row.id == saved.id) {
-            if serde_json::to_value(&*row).expect("bounded task data")
-                == serde_json::to_value(&saved).expect("bounded task data")
-            {
+            if *row == saved {
                 return;
             }
             *row = saved;
@@ -857,6 +863,37 @@ impl Drop for Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_task_equality_matches_its_persisted_representation() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let rows = [
+            (Status::Running, None, false),
+            (Status::Running, None, true),
+            (Status::Completed, Some("done".to_string()), false),
+            (Status::Completed, Some("other".to_string()), false),
+            (Status::Failed, Some("done".to_string()), true),
+        ]
+        .map(|(status, result, notified)| SavedTask {
+            id: id.clone(),
+            status,
+            result,
+            notified,
+        });
+        let other_id = SavedTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            ..rows[0].clone()
+        };
+        for left in rows.iter().chain([&other_id]) {
+            for right in rows.iter().chain([&other_id]) {
+                assert_eq!(
+                    left == right,
+                    serde_json::to_value(left).unwrap() == serde_json::to_value(right).unwrap()
+                );
+            }
+        }
+    }
+
     fn fixture(
         root: &crate::tests::OwnedTestDirectory,
     ) -> (
