@@ -2897,6 +2897,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/config/mod.rs",
+        "output: 5.0,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"completed before deadline\".into()),",
         1,
@@ -3515,6 +3521,15 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Task cost weight assertions compare a struct whose field is named
+    // `output`; the token tree constructs or executes no process.
+    (
+        "src/config/mod.rs",
+        &[(
+            "782910d94eb0c0ef2060f6be673146587c4524a418c2db104aee81d9fb6c3cb6",
+            1,
+        )],
+    ),
     // Compact partial marker assertions inspect a String, never a process.
     (
         "src/extras/subagents/task_tool.rs",

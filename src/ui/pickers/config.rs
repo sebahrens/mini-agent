@@ -284,6 +284,9 @@ mod tests {
                     | "task_max_prompts"
                     | "task_max_output_bytes"
                     | "task_max_cost_units"
+                    | "task_cost_weighting"
+                    | "task_cost_weights"
+                    | "task_cost_overrides"
                     | "task_timeout_secs"
             );
             assert_eq!(
