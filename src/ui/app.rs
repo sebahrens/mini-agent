@@ -654,15 +654,14 @@ struct GitStatusRefresh {
     fingerprint: Option<crate::ui::git_poll::GitFingerprint>,
 }
 
-/// Apply a finished refresh. `None` when it describes a workspace or session
-/// directory that is no longer current; otherwise whether anything shown
-/// changed.
+/// Apply a finished refresh. `None` when it describes a workspace that is no
+/// longer current; otherwise whether anything shown changed.
 fn apply_git_status_refresh(
     session: &mut Session,
     workspace_root: &Path,
     refresh: &GitStatusRefresh,
 ) -> Option<bool> {
-    if refresh.working_dir != workspace_root || refresh.branch_dir != session.working_dir {
+    if refresh.working_dir != workspace_root {
         return None;
     }
     let mut changed = false;
@@ -1981,7 +1980,9 @@ impl<'a> App<'a> {
         let request = self.loop_state.git_poll.start(now);
         let needs_status = crate::ui::statusline::needs_git_status();
         let working_dir = self.ui.workspace.root().to_path_buf();
-        let branch_dir = self.ui.session.working_dir.clone();
+        // Branch detection follows the active workspace binding, never the
+        // serialized session path.
+        let branch_dir = compact_str::CompactString::from(working_dir.to_string_lossy().as_ref());
         let tx = self.git_status_tx.clone();
         self.git_status_in_flight = true;
         tokio::spawn(async move {
