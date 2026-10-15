@@ -385,7 +385,9 @@ mod web_fetch_persistence_tests {
             Some(crate::session::PersistedToolMessage::Result {
                 output,
                 artifact_path,
+                images,
             }) => {
+                assert!(images.is_empty());
                 assert_eq!(output.as_str(), page);
                 assert_eq!(artifact_path.as_deref(), artifact.to_str());
             }
@@ -507,7 +509,7 @@ mod web_fetch_acp_tests {
         let mut asked = None;
         let mut done = false;
         let outcome=tokio::time::timeout(Duration::from_secs(5),async {loop {tokio::select! {
-            Some(ask)=rx.recv()=>{assert_eq!(ask.tool.as_str(),"web_fetch");asked=ask.tool_call_id;let _=ask.reply.send(crate::permission::ask::UserDecision::AllowOnce);},
+            Some(ask)=rx.recv()=>{let ask=ask.into_permission();assert_eq!(ask.tool.as_str(),"web_fetch");asked=ask.tool_call_id;let _=ask.reply.send(crate::permission::ask::UserDecision::AllowOnce);},
             event=runner.event_rx.recv()=>match event {
                 Some(crate::event::AgentEvent::ToolCall {id,name,..}) if name=="web_fetch"=>emitted=Some(id.to_string()),
                 Some(crate::event::AgentEvent::Done {..})=>done=true,

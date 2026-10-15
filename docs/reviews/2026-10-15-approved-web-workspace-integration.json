@@ -1,0 +1,183 @@
+{
+  "date": "2026-10-15",
+  "beads": [
+    "mini-agent-i7ro6.42",
+    "mini-agent-i7ro6.99"
+  ],
+  "source_parent": "a22ccbd9",
+  "authorization": "Explicit user approval for blocked actions; ordinary operator permission skip follows the existing native-tool contract.",
+  "implementation": {
+    "web": "Native fetch/search tools share parent HTTP policy; typed origin permissions, SSRF/redirect/size/deadline/cancellation guards, mandatory financial admission and bounded spill/replay preserved.",
+    "linux_workspace": "Canonical retained-descriptor real-path workspace mounts and captured spelling aliases; announced fallback only; independent worker containment unchanged.",
+    "integration": "Additive current builder/docs/inventory merges; fixture-only updates for typed permission requests, persisted image field and preamble alias argument."
+  },
+  "test_selection": {
+    "method": "Code-indexer caller trace plus physical defining-file tests for new unindexed modules. One combined default batch and minimal native-tool row; unchanged prior review/feature results reused.",
+    "default_selected": 82,
+    "minimal_selected": 39,
+    "headless_external_contract": 1,
+    "strict_default_all_targets": "passed",
+    "debug_install": "passed",
+    "full_local_suite": "not run"
+  },
+  "installed_offline_proof": {
+    "passed": true,
+    "stack_kib": 1024,
+    "provider_requests": 2,
+    "web_calls": 2,
+    "input_tokens": 200,
+    "output_tokens": 40,
+    "session_id": "3655c0e6-4f76-4463-8d1d-a03cea17b665",
+    "binary": "/private/tmp/mini-agent-approved-99-42-install/bin/mini-agent",
+    "external_requests": 0
+  },
+  "source_files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "8d5e62badd8216487bf6b26b035b4261188e4d54df61f7faa05ea630b2ecb175"
+    },
+    {
+      "path": "docs/agent/CONFIG.md",
+      "sha256": "89c64bb7c16c1e103a3ac88e1a8767e42fdfe8a134bf703a4f38f50ddf9d2fcf"
+    },
+    {
+      "path": "docs/agent/GET_STARTED.md",
+      "sha256": "8c499e59847bd4d2305c59855673afd5c96d88d311a0dc53f6235119acc30669"
+    },
+    {
+      "path": "docs/agent/TOOL_RUNTIME.md",
+      "sha256": "921e9ae600e6f5c1600553d2d182342d5dd07d1692dddea457cdb7d26f730576"
+    },
+    {
+      "path": "docs/specs/subprocess-trust.md",
+      "sha256": "16074b373baba81476121375fd9552286586244a2663fa0e5424963192ed8c26"
+    },
+    {
+      "path": "scripts/install-ci-bubblewrap.sh",
+      "sha256": "23e9506f63c8312329640812439ba9ba40b65abca79242fccb264d3170f58302"
+    },
+    {
+      "path": "scripts/tests/test_phase6_ci_workflow.py",
+      "sha256": "71df9c9db14bd5b358f3b798975f2c58dd9bfca34cfc28bcc6fc12c5f9bcc0cf"
+    },
+    {
+      "path": "src/agent/builder.rs",
+      "sha256": "08d5b7f964c35db8f2f479e7a96ff55a42eaa3988217afa4adaf758b5231cb63"
+    },
+    {
+      "path": "src/agent/tools/bash.rs",
+      "sha256": "6dd46fa7d8765aadc7a356c0a612d05d9e26551a558b4eac6e39403ff122ffb8"
+    },
+    {
+      "path": "src/agent/tools/mod.rs",
+      "sha256": "50e7b63564698b2023dc024efcefd3d7e6c6c7252b445d504c1da3dfa20dea21"
+    },
+    {
+      "path": "src/agent/tools/web_fetch.rs",
+      "sha256": "f97f80b6c61c10d2d67cf814c01b91605aefb9d63a80c7cde35d8440a8b65e89"
+    },
+    {
+      "path": "src/agent/tools/web_http.rs",
+      "sha256": "9b1ce330fed52b50db9f7f4e85433945e233a8596a9b803a5377d977fbb2fa64"
+    },
+    {
+      "path": "src/agent/tools/web_search.rs",
+      "sha256": "c8b078f33926c8f9b2e1a05bff93c801ff64e25e8bcad0f7caa74701dc0f0d30"
+    },
+    {
+      "path": "src/cli.rs",
+      "sha256": "ecbe3cae01c1f631d658cc4a25ffb390a843b4277d7a0cdb15fd4e70e9060031"
+    },
+    {
+      "path": "src/config/keys.rs",
+      "sha256": "11200261c70bc82bb4f79adc91cf3fc312bdfe5e4f1997afe445bd56e6cf781b"
+    },
+    {
+      "path": "src/config/mod.rs",
+      "sha256": "c12a8bf8b8c61052a4e19e0edd4af5914aa2d0c16f3afe8d8acdb364dee91e72"
+    },
+    {
+      "path": "src/extras/js/host.rs",
+      "sha256": "28e3cc1f792fe6000941b8a20d85afa3d8dc3896ac3da0334380c8de8a93e75c"
+    },
+    {
+      "path": "src/paths.rs",
+      "sha256": "0a33f87ecc74d065e101e0391f9783804ad7a2a41db40056086e2d2e22f8b871"
+    },
+    {
+      "path": "src/paths/workspace_spelling.rs",
+      "sha256": "d1806efc2b9e3b56a74300896a4cece0f19a5926284827db30f4ee9af389912c"
+    },
+    {
+      "path": "src/permission/checker.rs",
+      "sha256": "ae295b6d4b4bdfda0adc9c70efabf6631715305f4025fb1b2a9699f051e5cf24"
+    },
+    {
+      "path": "src/permission/mod.rs",
+      "sha256": "c1ee91f61cfe845125ac164f0bf76f5a05ddc18dba170324cba745da438da4c1"
+    },
+    {
+      "path": "src/permission/pattern.rs",
+      "sha256": "0549ab89b0b9b996862c0cb5fd62dfdc4dc0f832f4812bf9806d6dfd21f5e3fe"
+    },
+    {
+      "path": "src/sandbox.rs",
+      "sha256": "b48ed32210a3f0f4f07ffe9cdc279ff74c5156aae434137fd4ba0a92b99cfd39"
+    },
+    {
+      "path": "src/sandbox/linux_workspace_tests.rs",
+      "sha256": "28b2589c0e27a2260edc56d6d9a8c1f3c91bd0d0faf60ab8429e3c96d2230737"
+    },
+    {
+      "path": "src/sandbox/workspace_layout.rs",
+      "sha256": "52d5a89f1c82916f4f4983c3517937bb63cfdb9db711d1e318f7c9deaa1c27ae"
+    },
+    {
+      "path": "src/session/mod.rs",
+      "sha256": "84dabaa088859851315cd591a4b014d3bad90712ba20210e6529a9a686ff4aa3"
+    },
+    {
+      "path": "src/tests/subprocess_inventory_tests.rs",
+      "sha256": "0a14386d81139abe76fd9aace994dbfac1846412360ba4b0ba901f95ebcaf658"
+    },
+    {
+      "path": "tests/headless_json.rs",
+      "sha256": "5c2091097f86043d7e63faf9124d4e730325fcad29659fa5cbd7d27cb1e285b8"
+    }
+  ],
+  "logs": [
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-default.log",
+      "sha256": "bb79ae1d5fa36e66ca36384d75683168ab03cfd73347e3722a4136cf85e102b6"
+    },
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-headless.log",
+      "sha256": "6561bf8bdd49c9d47be13948f3fb63875545653f3992ad28f3aa31b272562f54"
+    },
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-clippy.log",
+      "sha256": "4ab7c980c62c6cc37e15f04ca330805b191d6c8479e340322f7ceacea5757958"
+    },
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-install.log",
+      "sha256": "149acc7d71f4d05383585176da134078503cb5478e2ef5fc4976ce712b74530c"
+    },
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-minimal.log",
+      "sha256": "eeb394f8e269f2622b78cef8986e3cb0b62ab7684e4697a2b54a447396c3d76d"
+    },
+    {
+      "path": "/private/tmp/mini-agent-approved-99-42-installed-proof.log",
+      "sha256": "d682d11e325b34454cd91887c1054e13360e37542fef897b728a5df3e3efc632"
+    }
+  ],
+  "remaining_linux_acceptance": {
+    "native": "Exact seven unit fixtures plus one headless integration must execute on suitable hosted Linux; local argument/source tests are not native execution proof.",
+    "root": "Existing root-workspace refusal preserved; explicit scope clarification pending.",
+    "git": "Current late-absent/nested Git native fixture retained in owning CI job."
+  },
+  "review_reuse": [
+    "/private/tmp/mini-agent-native-web-review",
+    "/private/tmp/mini-agent-99-review"
+  ]
+}

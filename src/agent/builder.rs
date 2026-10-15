@@ -2759,6 +2759,7 @@ mod js_tests {
                 Some("GOAL_AFTER_MEMORY"),
                 Some("STATIC_PERSONA"),
                 Some("STATIC_APPEND"),
+                None,
             );
             let mut snapshot = composition.snapshot();
             let mut preamble = composition.text;
@@ -2782,7 +2783,8 @@ mod js_tests {
         }
         assert_eq!(projected[0].as_bytes(), projected[1].as_bytes());
         context.memory = Some("x".repeat(crate::extras::memory::MAX_INJECT_BYTES + 1));
-        let composition = super::compose_preamble(&context, false, None, false, None, None, None);
+        let composition =
+            super::compose_preamble(&context, false, None, false, None, None, None, None);
         let mut snapshot = composition.snapshot();
         let mut preamble = composition.text;
         let before = preamble.clone();

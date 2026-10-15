@@ -1293,7 +1293,7 @@ mod web_permission_cancel_tests {
             true,
         );
         let approve = async {
-            let ask = rx.recv().await.unwrap();
+            let ask = rx.recv().await.unwrap().into_permission();
             assert!(
                 ask.input
                     .starts_with("http://fixture.invalid/one destinations=[")
@@ -1339,7 +1339,7 @@ mod web_permission_cancel_tests {
                 .await
         };
         let refuse = async {
-            let ask = rx.recv().await.unwrap();
+            let ask = rx.recv().await.unwrap().into_permission();
             cancel.cancel();
             let _ = ask
                 .reply
@@ -1623,7 +1623,7 @@ mod web_deadline_tests {
         let request = FetchRequest::get();
         let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
         let late = async {
-            let ask = rx.recv().await.unwrap();
+            let ask = rx.recv().await.unwrap().into_permission();
             tokio::time::sleep(Duration::from_millis(125)).await;
             assert!(ask.reply.is_closed());
             assert!(

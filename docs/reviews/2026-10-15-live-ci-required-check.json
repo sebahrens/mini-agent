@@ -1,0 +1,268 @@
+{
+  "bead": "mini-agent-ew67q.1",
+  "date": "2026-10-15",
+  "result": "passed",
+  "authorization": "User explicitly approved blocked actions, including bounded possible inert-document merge.",
+  "run_url": "https://github.com/sebahrens/mini-agent/actions/runs/38688121426",
+  "job_id": 116267576645,
+  "experiment": {
+    "main": "17e89841b5f9981d96e23f59678b72471844da49",
+    "refs": [
+      {
+        "ref": "acceptance/ew67q1-observer-20261015",
+        "sha": "4de3d26da376e00ffef902f54a62e9e7d8eafb62"
+      },
+      {
+        "ref": "acceptance/ew67q1-inert-pr-20261015",
+        "sha": "cc5ebf5ff4216bcb6325f295e35c09480e9cf3ec"
+      }
+    ],
+    "pr": 35,
+    "cleanup": {
+      "pr_closed_unmerged": true,
+      "both_owned_refs_deleted": true,
+      "main_unchanged": true,
+      "rules_unchanged": true
+    }
+  },
+  "identity_limit": "Repository owner authored the disposable PR; the actual merge request used the distinct non-owner GitHub Actions App installation token. This proves non-owner merger enforcement; it does not claim non-owner authorship.",
+  "observations": [
+    {
+      "observation": "aggregate_absent",
+      "sha": "cc5ebf5ff4216bcb6325f295e35c09480e9cf3ec",
+      "checks": 0,
+      "statuses": 0
+    },
+    {
+      "observation": "aggregate_absent",
+      "sha": "4104dedd860ace5092de71c3201215ec72465989",
+      "checks": 0,
+      "statuses": 0
+    },
+    {
+      "observation": "merge_response",
+      "http_status": 405,
+      "merged": null,
+      "message": "Repository rule violations found\n\nCannot update this protected ref.\n\nRequired status check \"ci-success\" is expected.\n\n",
+      "pr_number": 35,
+      "head_sha": "cc5ebf5ff4216bcb6325f295e35c09480e9cf3ec",
+      "credential": "workflow_GITHUB_TOKEN_installation",
+      "pr_author": "sebahrens",
+      "actor_author_distinct": true
+    },
+    {
+      "observation": "nonowner_refusal_observed",
+      "main_unchanged": true,
+      "required_check_causality": "needs_exact_response_or_owner_rule_suite_review",
+      "acceptance": "NOT_AUTOMATICALLY_CLOSED"
+    }
+  ],
+  "required_check_ruleset": {
+    "id": 24233900,
+    "name": "Require CI",
+    "target": "branch",
+    "source_type": "Repository",
+    "source": "sebahrens/mini-agent",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "~DEFAULT_BRANCH"
+        ]
+      }
+    },
+    "rules": [
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "strict_required_status_checks_policy": false,
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "ci-success",
+              "integration_id": 15368
+            }
+          ]
+        }
+      }
+    ],
+    "node_id": "RRS_lACqUmVwb3NpdG9yec5OX2pvzgFxx6w",
+    "created_at": "2026-09-30T09:53:58.096+02:00",
+    "updated_at": "2026-09-30T09:53:58.169+02:00",
+    "bypass_actors": [
+      {
+        "actor_id": 5,
+        "actor_type": "RepositoryRole",
+        "bypass_mode": "always"
+      }
+    ],
+    "current_user_can_bypass": "always",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/sebahrens/mini-agent/rulesets/24233900"
+      },
+      "html": {
+        "href": "https://github.com/sebahrens/mini-agent/rules/24233900"
+      }
+    }
+  },
+  "nonowner_evaluation": {
+    "id": 4534822633,
+    "actor_id": 41898282,
+    "actor_name": "github-actions[bot]",
+    "before_sha": "17e89841b5f9981d96e23f59678b72471844da49",
+    "after_sha": "67143e0f061abb0a9c373d46020187ddd32be5fa",
+    "ref": "refs/heads/main",
+    "repository_id": 1314876015,
+    "repository_name": "mini-agent",
+    "pushed_at": "2026-10-15T07:42:05+02:00",
+    "result": "fail",
+    "rule_evaluations": [
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "fail",
+        "rule_type": "update",
+        "details": "Cannot update this protected ref."
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "creation"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "non_fast_forward"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "deletion"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 24233900,
+          "name": "Require CI"
+        },
+        "enforcement": "active",
+        "result": "fail",
+        "rule_type": "required_status_checks",
+        "details": "Required status check \"ci-success\" is expected."
+      }
+    ]
+  },
+  "owner_bypass_evaluation": {
+    "id": 4534796932,
+    "actor_id": 135038620,
+    "actor_name": "sebahrens",
+    "before_sha": "2b52f928995051a3884878872041cc80b56e0312",
+    "after_sha": "17e89841b5f9981d96e23f59678b72471844da49",
+    "ref": "refs/heads/main",
+    "repository_id": 1314876015,
+    "repository_name": "mini-agent",
+    "pushed_at": "2026-10-15T07:39:45+02:00",
+    "result": "bypass",
+    "rule_evaluations": [
+      {
+        "rule_source": {
+          "type": "secret_scanning"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "secret_scanning"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "fail",
+        "rule_type": "update",
+        "details": "Cannot update this protected ref."
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "creation"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "non_fast_forward"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 20623676,
+          "name": "Blocking"
+        },
+        "enforcement": "active",
+        "result": "pass",
+        "rule_type": "deletion"
+      },
+      {
+        "rule_source": {
+          "type": "ruleset",
+          "id": 24233900,
+          "name": "Require CI"
+        },
+        "enforcement": "active",
+        "result": "fail",
+        "rule_type": "required_status_checks",
+        "details": "Required status check \"ci-success\" is expected."
+      }
+    ]
+  },
+  "artifacts": [
+    {
+      "file": "/private/tmp/mini-agent-ew67q1-approved/observer.log",
+      "sha256": "1cee31fb1dc0064ef4dc4c03d4d95d939d34cf6e4045bd4c03afc9b6a43625b2"
+    },
+    {
+      "file": "/private/tmp/mini-agent-ew67q1-approved/state.json",
+      "sha256": "7b3ffedd3b26d346f45e140d91e9ed170966e9cf8991901bf08dc481be08d158"
+    },
+    {
+      "file": "/private/tmp/mini-agent-ew67q1-inert-fixture/ci.yml",
+      "sha256": "e238a16bec734a528a4f699f24dccb3f38a84b4b6a348eedf6566532a99e3de3"
+    },
+    {
+      "file": "/private/tmp/mini-agent-ew67q1-inert-fixture/probe.py",
+      "sha256": "48d2378607e7710b6b353b1cf7cf900bf887e414398e4664bb136ab27b4d22f1"
+    }
+  ]
+}
