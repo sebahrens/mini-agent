@@ -2102,8 +2102,28 @@ pub(crate) struct NativeHostCompatibility {
     workspace: [u8; 32],
     permission: Option<[u8; 32]>,
     instruction_policy: [u8; 32],
+    /// Restriction captured from the actual initial native tool bundle.
+    /// This never attests containment or authorizes a JavaScript invocation.
+    #[serde(default)]
+    startup_js_omitted: bool,
 }
+/// A restrictive projection of the saved native context, never a capability grant.
+/// Only the canonical session's accepted native host record supplies this value.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeJsContext {
+    omitted: bool,
+    #[cfg(feature = "js")]
+    retained: bool,
+}
+
 impl NativeHostCompatibility {
+    pub(crate) fn js_context(&self) -> NativeJsContext {
+        NativeJsContext {
+            omitted: self.startup_js_omitted,
+            #[cfg(feature = "js")]
+            retained: true,
+        }
+    }
     pub(crate) fn validate(&self) -> Result<(), crate::session::native_replay::RestartReason> {
         if self.version == 1 {
             Ok(())
@@ -2196,6 +2216,7 @@ impl NativePolicyHasher {
 }
 
 struct NativeHostOwner {
+    startup_js_omitted: bool,
     workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: Option<PermCheck>,
     no_context_files: bool,
@@ -2254,6 +2275,7 @@ impl NativeHostOwner {
                 workspace,
                 permission,
                 instruction_policy: policy.finish(),
+                startup_js_omitted: self.startup_js_omitted,
             },
             revision,
         ))
@@ -2287,6 +2309,8 @@ pub struct AnyAgent {
     spend: Option<crate::spend::run::Run>,
     file_checkpoints: Option<crate::session::file_checkpoints::Recorder>,
     native_capture: Option<crate::agent::native_capture::NativeCapture>,
+    #[cfg(feature = "js")]
+    js_probe_pending: bool,
     native_host: Option<std::sync::Arc<NativeHostOwner>>,
     question_turn: Option<crate::question::QuestionTurn>,
     completion_verification: Option<runner::CompletionVerification>,
@@ -3002,6 +3026,13 @@ impl AnyAgent {
         }
     }
 
+    /// A settled generic frontend may rebuild this immutable tool bundle after
+    /// the full startup probe finishes. Active turns never gain tools in place.
+    #[cfg(feature = "js")]
+    pub(crate) fn js_readiness_changed(&self) -> bool {
+        self.js_probe_pending && crate::sandbox::worker::known_containment_status().is_some()
+    }
+
     pub(crate) fn without_skills(inner: AnyAgentInner) -> Self {
         Self {
             inner,
@@ -3009,6 +3040,8 @@ impl AnyAgent {
             spend: None,
             file_checkpoints: None,
             native_capture: None,
+            #[cfg(feature = "js")]
+            js_probe_pending: false,
             native_host: None,
             question_turn: None,
             completion_verification: None,
@@ -3568,6 +3601,8 @@ impl AnyAgent {
             spend: None,
             file_checkpoints: None,
             native_capture: None,
+            #[cfg(feature = "js")]
+            js_probe_pending: false,
             native_host: None,
             question_turn: None,
             completion_verification: None,
@@ -5134,6 +5169,7 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     tool_output_session_id: &str,
     tool_result_spills: Option<crate::session::ToolResultSpillStore>,
+    native_js_context: NativeJsContext,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
@@ -5142,6 +5178,82 @@ pub async fn build_agent_in_workspace(
         crate::extras::js::skills::session::SkillServiceOwner,
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+) -> AnyAgent {
+    #[cfg(feature = "js")]
+    let completed_probe = {
+        let completed = crate::sandbox::worker::known_containment_status();
+        if native_js_context.retained
+            && !native_js_context.omitted
+            && completed.is_none()
+            && cli.tool_is_eligible(cfg, "js")
+        {
+            // A prior native prefix may already advertise JS. Wait for this
+            // process's unchanged full proof rather than replacing its tools.
+            // The startup owner still retains/joins the original probe; this
+            // scoped waiter cannot cancel or poison its OnceLock initializer.
+            let owned = crate::sandbox::worker::StartupWorkerProbe::start().await;
+            let _ = owned.retire().await;
+            crate::sandbox::worker::known_containment_status()
+        } else {
+            completed
+        }
+    };
+    build_agent_with_probe_snapshot(
+        model,
+        cli,
+        cfg,
+        context,
+        workspace,
+        permission,
+        ask_tx,
+        sandbox,
+        read_tracker,
+        todo_store,
+        #[cfg(feature = "goal")]
+        goal_store,
+        tool_output_session_id,
+        tool_result_spills,
+        native_js_context,
+        reasoning_enabled,
+        temperature,
+        extra_body,
+        #[cfg(feature = "js")]
+        js_session_state,
+        #[cfg(feature = "skills")]
+        skill_service_owner,
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+        #[cfg(feature = "js")]
+        completed_probe,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_agent_with_probe_snapshot(
+    model: AnyModel,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    sandbox: Sandbox,
+    read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
+    tool_output_session_id: &str,
+    tool_result_spills: Option<crate::session::ToolResultSpillStore>,
+    native_js_context: NativeJsContext,
+    reasoning_enabled: bool,
+    temperature: Option<f64>,
+    extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
+    #[cfg(feature = "skills")] skill_service_owner: std::sync::Arc<
+        crate::extras::js::skills::session::SkillServiceOwner,
+    >,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "js")] completed_probe: Option<crate::sandbox::worker::WorkerContainmentStatus>,
 ) -> AnyAgent {
     let native_host = (
         workspace.clone(),
@@ -5158,8 +5270,16 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "js")]
     let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "js")]
-    let js_worker_containment_status =
-        resolve_js_worker_containment(js_tool_eligible, crate::sandbox::worker::containment_status);
+    let js_probe_pending =
+        js_tool_eligible && !native_js_context.omitted && completed_probe.is_none();
+    #[cfg(feature = "js")]
+    let js_worker_containment_status = resolve_js_worker_containment(js_tool_eligible, || {
+        if native_js_context.omitted {
+            context_pinned_js_worker_containment()
+        } else {
+            completed_probe.unwrap_or_else(pending_js_worker_containment)
+        }
+    });
     #[cfg(feature = "js")]
     let js_scratch = js_session_state.for_workspace(workspace.root());
     #[cfg(feature = "skills")]
@@ -5428,7 +5548,11 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_services(instruction_services);
     let mut agent = agent;
+    let startup_js_omitted = native_js_context.omitted;
+    #[cfg(feature = "js")]
+    let startup_js_omitted = startup_js_omitted || js_probe_pending;
     agent.native_host = Some(std::sync::Arc::new(NativeHostOwner {
+        startup_js_omitted,
         workspace: native_host.0,
         permission: native_host.1,
         no_context_files: native_host.2,
@@ -5439,6 +5563,10 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "agent-skills")]
         instructions: agent.instructions.clone(),
     }));
+    #[cfg(feature = "js")]
+    {
+        agent.js_probe_pending = js_probe_pending;
+    }
     agent.with_reasoning_controls(cfg, Default::default())
 }
 
@@ -5454,13 +5582,18 @@ pub async fn goal_outcome_recorder(
     cfg: &Config,
     owner: &std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    native_js_context: NativeJsContext,
 ) -> Option<runner::TaskOutcomeRecorder> {
     let services = resolve_skill_services(
         cli.tool_is_eligible(cfg, "js"),
-        &resolve_js_worker_containment(
-            cli.tool_is_eligible(cfg, "js"),
-            crate::sandbox::worker::containment_status,
-        ),
+        &resolve_js_worker_containment(cli.tool_is_eligible(cfg, "js"), || {
+            if native_js_context.omitted {
+                context_pinned_js_worker_containment()
+            } else {
+                crate::sandbox::worker::known_containment_status()
+                    .unwrap_or_else(pending_js_worker_containment)
+            }
+        }),
         owner,
         workspace,
         cfg.embedding.clone(),
@@ -5526,7 +5659,7 @@ pub struct JsRuntimeReport {
 /// Placeholder used before any agent build has performed the worker probe.
 /// It is an unknown state, not a containment refusal.
 pub(crate) const JS_RUNTIME_PROBE_PENDING_REASON: &str =
-    "startup containment probe has not run yet";
+    "JavaScript containment verification is pending; unavailable for this turn";
 
 impl JsRuntimeReport {
     /// The report to show before any agent build has recorded one. A compiled-in
@@ -5623,6 +5756,25 @@ fn js_runtime_report_from(
 }
 
 #[cfg(feature = "js")]
+fn context_pinned_js_worker_containment() -> crate::sandbox::worker::WorkerContainmentStatus {
+    let mut status = pending_js_worker_containment();
+    if let crate::sandbox::worker::WorkerContainmentStatus::Unavailable { reason, .. } = &mut status
+    {
+        *reason = "JavaScript is unavailable in this native context because verification was unfinished when it began; start a new session after verification to use JavaScript".into();
+    }
+    status
+}
+
+#[cfg(feature = "js")]
+fn pending_js_worker_containment() -> crate::sandbox::worker::WorkerContainmentStatus {
+    crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+        backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+        assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+        reason: JS_RUNTIME_PROBE_PENDING_REASON.to_string(),
+    }
+}
+
+#[cfg(feature = "js")]
 fn resolve_js_worker_containment(
     eligible: bool,
     probe: impl FnOnce() -> crate::sandbox::worker::WorkerContainmentStatus,
@@ -5666,7 +5818,7 @@ mod startup_capability_tests {
     }
 
     #[test]
-    fn eligible_javascript_capability_probes_once() {
+    fn eligible_javascript_capability_reads_one_completed_snapshot() {
         let calls = AtomicUsize::new(0);
         let containment = resolve_js_worker_containment(true, || {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -6899,6 +7051,7 @@ mod lsp_health_agent_tests {
             crate::extras::goal::GoalStore::default(),
             "doctor-lsp-agent",
             None,
+            NativeJsContext::default(),
             false,
             None,
             None,

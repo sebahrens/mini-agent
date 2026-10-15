@@ -104,6 +104,38 @@ QuickJS evaluation, then releases and observes its settlement on every exit.
 
 ## Worker lifecycle
 
+`src/sandbox/worker/startup_probe.rs` owns startup's unchanged full containment
+preflight as scoped blocking work. Fresh foreground agent construction reads
+only a completed platform status; an unfinished check cannot advertise JavaScript
+or initialize learned-skill services. The startup owner joins the physical job on
+retirement, including after a dropped waiter. Cancellation before the job starts
+leaves the platform cache uninitialized; cancellation after it starts does not
+interrupt or replace the native proof. A settled generic turn may rebuild its
+immutable tool bundle after the result arrives. Before any native history has
+been accepted, a stale idle bundle can likewise adopt a completed proof. If the
+probe loses the first native-request race, the accepted native host record retains
+a restrictive JavaScript omission across later rebuilds and save/reload. The
+operator is told JavaScript is unavailable for that context; a new session can
+use it after successful verification. This omission also excludes learned-JS and
+proposal services and their model-visible instructions. It never attests
+containment or grants a capability: the exact tools/system/opaque-history guard
+still checks every actual prepared request, including imported data.
+
+A restored native context whose earlier inventory may already include JavaScript
+retains the prior attestation gate. Its builder uses the same owned full-probe
+wrapper to await this process's proof; dropping that waiter still joins its
+physical blocking work. Fresh no-session requests and contexts pinned without
+JavaScript do not acquire this wait. Existing native signed history keeps its
+exact tools and prefix; late readiness never authorizes rewriting it. The probe's
+full matrix, image hashes, authenticated Ready and cleanup contracts are unchanged.
+
+The retained first-proven immutable image optimization is delivered independently
+in the macOS containment section below. It avoids repeated source hashing within
+one parent, not cross-process proof. Existing debug measurements are recorded in
+`docs/benchmarks/2026-09-09-macos-worker-startup-overlap.md`; they are not a release
+comparison. The original startup issue's release-profile measurement remains
+unperformed because the repository forbids development `--release` builds.
+
 `src/extras/js/memory.rs` owns each worker runtime's bounded allocator. The 64 MiB
 budget includes allocation headers and alignment padding and applies from runtime
 construction. QuickJS's separate native memory-limit precheck remains unset: it can

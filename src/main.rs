@@ -592,10 +592,16 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]
     if startup.cli.acp_enabled {
-        return startup::heap_future(|| {
-            extras::acp::serve(startup.cli, startup.cfg, startup.context)
-        })
-        .await;
+        #[cfg(feature = "js")]
+        let probe = startup.take_worker_probe();
+        let result =
+            startup::heap_future(|| extras::acp::serve(startup.cli, startup.cfg, startup.context))
+                .await;
+        #[cfg(feature = "js")]
+        if let Some(probe) = probe {
+            probe.retire().await?;
+        }
+        return result;
     }
 
     // `--loop-max 0` runs nothing. Answer it before feature start-up and the

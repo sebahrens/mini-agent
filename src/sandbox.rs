@@ -6096,7 +6096,14 @@ mod sandbox_tests {
         assert!(startup.contains("no successful production preflight"));
         assert!(startup.contains("fn preflight_startup_capabilities(&self)"));
         assert!(startup.contains("run_startup_probes_concurrently("));
-        assert!(startup.contains("crate::sandbox::worker::containment_status"));
+        assert!(startup.contains("heap_future(crate::sandbox::worker::StartupWorkerProbe::start)"));
+        let worker_probe = include_str!("sandbox/worker/startup_probe.rs");
+        assert!(
+            worker_probe
+                .contains("Self::start_in(AgentWorkScope::new(), super::containment_status)")
+        );
+        assert!(worker_probe.contains("spawn_blocking_scoped(move ||"));
+        assert!(worker_probe.contains("self.cleanup.settle().await"));
         assert!(startup.contains("spawn_scoped(scope, general)"));
         assert!(startup.contains("spawn_scoped(scope, worker)"));
 

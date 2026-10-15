@@ -86,6 +86,7 @@ impl SlashCtx<'_> {
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
+            native_js_context: self.session.native_js_context(),
             prebuild_invalidated: Some(self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,
@@ -112,6 +113,7 @@ impl SlashCtx<'_> {
 
     async fn build_agent_for_client(&self, client: &AnyClient, session: &Session) -> AnyAgent {
         AgentBuildCtx {
+            native_js_context: session.native_js_context(),
             prebuild_invalidated: Some(self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,

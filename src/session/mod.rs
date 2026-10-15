@@ -877,6 +877,16 @@ impl Session {
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"
     )]
+    pub(crate) fn native_js_context(&self) -> crate::provider::NativeJsContext {
+        self.native_history
+            .as_ref()
+            .and_then(|history| history.host.as_ref())
+            .map_or_else(
+                Default::default,
+                crate::provider::NativeHostCompatibility::js_context,
+            )
+    }
+
     pub(crate) fn native_history_snapshot(&self) -> Option<&native_replay::NativeHistory> {
         self.native_history.as_ref()
     }

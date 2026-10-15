@@ -26,6 +26,14 @@ pub async fn ensure_agent(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) {
+    #[cfg(feature = "js")]
+    if agent.as_ref().is_some_and(|captured| {
+        captured.js_readiness_changed() && ui.session.native_history_snapshot().is_none()
+    }) {
+        // Only this next settled generic turn rebuilds. Native signed history
+        // retains its exact tool prefix; no automatic reset is authorized here.
+        *agent = None;
+    }
     if let Some(captured) = agent.take() {
         *agent = Some(
             crate::startup::heap_future(|| {
@@ -989,8 +997,14 @@ async fn finish_goal_round(
 
     #[cfg(feature = "skills")]
     crate::extras::goal::driver::set_outcome_recorder(
-        crate::provider::goal_outcome_recorder(ui.cli, ui.cfg, &ui.skill_services, &ui.workspace)
-            .await,
+        crate::provider::goal_outcome_recorder(
+            ui.cli,
+            ui.cfg,
+            &ui.skill_services,
+            &ui.workspace,
+            ui.session.native_js_context(),
+        )
+        .await,
     );
 
     let outcome = driver::apply_decision(&ui.session.goal_store, &summary, decision, &verification);

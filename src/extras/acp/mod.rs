@@ -3833,6 +3833,7 @@ async fn execute_prompt(
             None
         };
     }
+    let native_js_context = history.session.native_js_context();
     let tool_output_session_id = session_id.to_string();
     let Some(agent) = run_owned_pre_run(
         &control,
@@ -3852,6 +3853,7 @@ async fn execute_prompt(
             goal_store,
             &tool_output_session_id,
             None,
+            native_js_context,
             false,
             temperature,
             extra_body,

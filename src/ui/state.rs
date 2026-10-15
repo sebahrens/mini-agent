@@ -100,6 +100,7 @@ impl<'a> UiContext<'a> {
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     pub(crate) fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
+            native_js_context: self.session.native_js_context(),
             prebuild_invalidated: Some(&self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,
@@ -169,6 +170,7 @@ impl<'a> UiContext<'a> {
 /// temperature, extra_body) and the `build_agent` call itself so every
 /// rebuild path stays in sync.
 pub(crate) struct AgentBuildCtx<'a> {
+    pub(crate) native_js_context: crate::provider::NativeJsContext,
     /// Foreground builds supersede the startup snapshot. Only the startup
     /// prebuild itself passes None.
     pub prebuild_invalidated: Option<&'a std::sync::atomic::AtomicBool>,
@@ -222,6 +224,7 @@ impl AgentBuildCtx<'_> {
             self.goal_store.clone(),
             self.tool_output_session_id,
             Some(self.tool_result_spills.clone()),
+            self.native_js_context,
             reasoning_enabled,
             temperature,
             extra_body,

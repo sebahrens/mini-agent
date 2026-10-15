@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod artifact_cleanup;
 
+#[cfg(feature = "js")]
+mod startup_probe;
+#[cfg(feature = "js")]
+pub(crate) use startup_probe::StartupWorkerProbe;
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -284,6 +289,13 @@ impl WorkerLauncher for BenchmarkWorkerLauncher {
 
 pub(crate) fn containment_status() -> WorkerContainmentStatus {
     ProductionWorkerLauncher.containment_status()
+}
+
+/// Observe only an already completed full preflight. This never starts or waits
+/// for a probe and cannot upgrade an unverified runtime to available.
+#[cfg(feature = "js")]
+pub(crate) fn known_containment_status() -> Option<WorkerContainmentStatus> {
+    platform::known_containment_status()
 }
 
 #[derive(Debug)]

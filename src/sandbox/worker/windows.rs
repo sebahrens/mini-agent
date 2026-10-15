@@ -137,6 +137,11 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
         && is_pipe(std::io::stderr().as_raw_handle())
 }
 
+#[cfg(feature = "js")]
+pub(super) fn known_containment_status() -> Option<WorkerContainmentStatus> {
+    STATUS.get().cloned()
+}
+
 pub(super) fn containment_status() -> WorkerContainmentStatus {
     cached_containment_status(&STATUS, probe_containment)
 }

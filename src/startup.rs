@@ -346,7 +346,7 @@ fn configured_sandbox_validation_probe<'a>(
     }
 }
 
-#[cfg(any(test, all(target_os = "windows", feature = "js")))]
+#[cfg(test)]
 fn run_startup_probes_concurrently<General, Worker, WorkerStatus>(
     general: General,
     worker: Worker,
@@ -532,6 +532,8 @@ pub(crate) struct Startup {
     shell_search_path: Option<std::ffi::OsString>,
     pub status_signals: Option<StatusSignals>,
     openrouter_pricing_refresh: Option<OpenRouterPricingRefresh>,
+    #[cfg(feature = "js")]
+    worker_probe: Option<crate::sandbox::worker::StartupWorkerProbe>,
     #[cfg(feature = "advisor")]
     pub handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     // Set by resolve_prompts:
@@ -1299,6 +1301,17 @@ impl Startup {
             owner.save_progress(&mut session).await?;
         }
 
+        #[cfg(all(feature = "js", feature = "loop"))]
+        let no_model_rounds = cli.is_loop_mode() && cli.loop_max == Some(0);
+        #[cfg(all(feature = "js", not(feature = "loop")))]
+        let no_model_rounds = false;
+        #[cfg(feature = "js")]
+        let worker_probe = if cli.tool_is_eligible(&cfg, "js") && !no_model_rounds {
+            Some(heap_future(crate::sandbox::worker::StartupWorkerProbe::start).await)
+        } else {
+            None
+        };
+
         Ok(Self {
             cli,
             cfg,
@@ -1326,6 +1339,8 @@ impl Startup {
             shell_search_path: std::env::var_os("PATH"),
             status_signals: None,
             openrouter_pricing_refresh: None,
+            #[cfg(feature = "js")]
+            worker_probe,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
             arch_msg: None,
@@ -1345,22 +1360,10 @@ impl Startup {
         configured_sandbox_validation_probe(&self.cli, &self.cfg)()
     }
 
-    /// Resolve the startup containment gates after the workspace has been captured. On Windows,
-    /// the regular AppContainer and LPAC worker preflights are independent. Starting both before
-    /// joining avoids adding their cold-start latencies while their separate process-local caches,
-    /// process-creation lock, and fail-closed consumers retain their existing contracts.
+    /// Validate the general sandbox after capturing the workspace. The independent
+    /// worker preflight is already owned by startup's blocking job; foreground
+    /// model construction observes only a completed worker result and never joins it.
     pub(crate) fn preflight_startup_capabilities(&self) -> anyhow::Result<()> {
-        #[cfg(all(target_os = "windows", feature = "js"))]
-        if self.cli.tool_is_eligible(&self.cfg, "js") {
-            let (general, _worker_status) = run_startup_probes_concurrently(
-                configured_sandbox_validation_probe(&self.cli, &self.cfg),
-                crate::sandbox::worker::containment_status,
-            )?;
-            // Worker unavailability is consumed later as an unavailable JS tool; the cached status
-            // is never upgraded or bypassed. General sandbox failure retains its startup error.
-            return general;
-        }
-
         self.validate_sandbox_availability()
     }
 
@@ -1838,7 +1841,31 @@ impl Startup {
     /// Each mode future is built on the heap by [`heap_future`], so neither its
     /// state nor its construction is reserved in this frame, which stays on the
     /// stack for the whole run.
-    pub(crate) async fn dispatch(mut self: Box<Self>) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(self: Box<Self>) -> anyhow::Result<()> {
+        #[cfg(feature = "js")]
+        let (startup, probe) = {
+            let mut startup = self;
+            let probe = startup.worker_probe.take();
+            (startup, probe)
+        };
+        #[cfg(not(feature = "js"))]
+        let startup = self;
+        let result = heap_future(|| startup.dispatch_inner()).await;
+        #[cfg(feature = "js")]
+        if let Some(probe) = probe {
+            probe.retire().await?;
+        }
+        result
+    }
+
+    #[cfg(all(feature = "js", feature = "acp"))]
+    pub(crate) fn take_worker_probe(
+        &mut self,
+    ) -> Option<crate::sandbox::worker::StartupWorkerProbe> {
+        self.worker_probe.take()
+    }
+
+    async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
@@ -2139,6 +2166,7 @@ impl Startup {
                     goal_store,
                     &self.session.id,
                     Some(self.session.tool_result_spills.clone()),
+                    self.session.native_js_context(),
                     true,
                     temperature,
                     extra_body,
@@ -2169,6 +2197,7 @@ impl Startup {
                     &self.cfg,
                     &skill_service_owner_for_goal,
                     &self.workspace,
+                    self.session.native_js_context(),
                 )
                 .await,
             );
@@ -2563,6 +2592,7 @@ impl Startup {
             goal_store,
             &self.session.id,
             Some(self.session.tool_result_spills.clone()),
+            self.session.native_js_context(),
             true,
             temperature,
             extra_body,

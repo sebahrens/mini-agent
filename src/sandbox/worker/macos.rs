@@ -373,6 +373,11 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
         && is_pipe(std::io::stderr().as_raw_fd())
 }
 
+#[cfg(feature = "js")]
+pub(super) fn known_containment_status() -> Option<WorkerContainmentStatus> {
+    STATUS.get().cloned()
+}
+
 pub(super) fn containment_status() -> WorkerContainmentStatus {
     STATUS.get_or_init(probe_containment).clone()
 }
