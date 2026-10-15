@@ -474,8 +474,8 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_max_turns`            | `usize`  | `20`                     | Max agent turns per subagent |
 | `task_max_prompts`          | `usize`  | `8`                      | Max child prompts in one tool call |
 | `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
-| `task_max_output_bytes`     | `usize`  | `1048576` (1 MiB)       | Hard cap on the complete returned tool output |
-| `task_max_cost_units`       | `u64`    | `2000000`                 | Aggregate provider token/cost-unit budget |
+| `task_max_output_bytes`     | `usize`  | `131072` (128 KiB)       | Hard cap on the complete returned tool output |
+| `task_max_cost_units`       | `u64`    | `4000000`                 | Aggregate provider token/cost-unit budget |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
@@ -538,8 +538,8 @@ Example `config.toml`:
 task_max_turns = 20
 task_max_prompts = 8
 task_max_concurrency = 4
-task_max_output_bytes = 1048576
-task_max_cost_units = 2000000
+task_max_output_bytes = 131072
+task_max_cost_units = 4000000
 task_timeout_secs = 300
 task_enabled = true
 subagent_model = "deepseek-v4-flash"
@@ -685,12 +685,12 @@ through ordinary `--config key=value` overrides; changing them needs no recompil
 
 | Setting | Default | Unit and effect |
 |---|---:|---|
-| `subagent_context_window` | `262144` | Estimated complete child request plus reserved response; capped by known selected-model capacity |
-| `subagent_max_tokens` | `16384` | Tokens in one child model response |
-| `task_max_report_bytes` | `262144` | Bytes retained from one child's report; also capped by the aggregate limit |
-| `task_max_output_bytes` | `1048576` | Bytes in all reports returned by one task call |
-| `task_max_cost_units` | `2000000` | Weighted usage units for the whole task, not dollars |
-| `task_report_repair_max_tokens` | `4096` | Tokens in one text-only report restatement |
+| `subagent_context_window` | automatic | Known selected-model capacity, up to `1048576`; unknown models use `131072`. Includes the reserved response. An explicit value overrides automatic sizing, still capped by known capacity. |
+| `subagent_max_tokens` | `32000` | Tokens in one child model response |
+| `task_max_report_bytes` | `32768` | Bytes retained from one child's report; also capped by the aggregate limit |
+| `task_max_output_bytes` | `131072` | Bytes in all reports returned by one task call |
+| `task_max_cost_units` | `4000000` | Weighted usage units for the whole task, not dollars |
+| `task_report_repair_max_tokens` | `8192` | Tokens in one text-only report restatement |
 | `task_report_repair_max_cost_units` | `65536` | Separate weighted repair allocation, still charged to the same task total and USD account |
 
 Concurrency remains 4, prompt count 8, model turns 20 per child, and the whole
@@ -698,8 +698,9 @@ call deadline 300 seconds. These are editable as `task_max_concurrency`,
 `task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Concurrency is
 editable without recompilation but requires restart: the session owns a fixed
 semaphore shared by foreground and background children. The other listed sizing
-limits apply to the next delegation. Reports occupy a
-bounded fraction of a 1M-token parent context by default; a large child context
+limits apply to the next delegation. Reports are capped at 32 KiB per child and 128 KiB per batch, roughly 8K
+and 32K tokens respectively (actual token counts vary). This keeps batch reports
+near 3% of a 1M-token parent context by default; a large child context
 is not permission to return an equally large report. Read/write authorization,
 write serialization, cancellation, and the session spend ceiling are unchanged.
 
@@ -709,11 +710,16 @@ Running and background children retain their admission snapshots. Saved project
 settings still require ordinary project trust, and higher local/CLI layers still
 win. The settings picker shows captured next-delegation values. Model/provider,
 tool permissions, and other restart-only settings retain their existing rules.
-For example, `/config subagent_context_window 1000000` can request a larger child
-window, while `/config subagent_max_tokens 32768` requests a larger response.
+For example, `/config subagent_context_window 1000000` pins a child context
+cap, while `/config subagent_max_tokens 64000` requests a larger response.
+Removing the saved `subagent_context_window` key restores automatic model-based
+sizing on the next startup.
 The selected child's known capacity and an explicitly configured parent
 `max_tokens`/`--max-tokens` ceiling still constrain it; the implicit parent 16K
 fallback alone is not a ceiling on a separately configured child.
+Generated config files leave that main response fallback unset. Existing
+`max_tokens` entries remain explicit ceilings; remove or raise that entry when
+you want a child response larger than its value.
 
 Context admission uses the existing token estimator over the complete prepared
 request (including history, system text and tool schemas) and reserves the

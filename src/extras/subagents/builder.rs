@@ -579,6 +579,26 @@ fn build_explore_preamble(
     preamble
 }
 
+/// Task admission has already resolved persona/custom-provider identity and
+/// clamped its captured window. Preserve it. Direct callers without that
+/// snapshot can resolve only the typed backend/model, never infer a custom
+/// alias from the main session; unknown models retain the safe default.
+fn child_context_window(model: &AnyModel, cfg: &crate::config::Config) -> u64 {
+    if let Some(window) = cfg.subagent_context_window {
+        return window;
+    }
+    let (provider, model) = match model {
+        AnyModel::OpenRouter(model, _) => ("openrouter", model.model.as_str()),
+        AnyModel::OpenAI(OpenAiModel::Responses(model)) => ("openai", model.model.as_str()),
+        AnyModel::OpenAI(OpenAiModel::Completions(model)) => ("openai", model.model.as_str()),
+        AnyModel::Anthropic(model) => ("anthropic", model.model.as_str()),
+        AnyModel::Gemini(model) => ("gemini", model.model.as_str()),
+        AnyModel::Ollama(model) => ("ollama", model.model.as_str()),
+        AnyModel::Copilot(model) => ("copilot", model.model.as_str()),
+    };
+    cfg.resolve_subagent_context_window(provider, model, None)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_explore_agent(
     model: AnyModel,
@@ -594,8 +614,9 @@ pub(crate) async fn build_explore_agent(
 ) -> AnyAgent {
     let max_tokens = cfg
         .max_tokens
-        .unwrap_or_else(|| cfg.resolve_subagent_max_tokens());
-    let context_window = cfg.subagent_context_window.unwrap_or(262_144);
+        .into_iter()
+        .fold(cfg.resolve_subagent_max_tokens(), u64::min);
+    let context_window = child_context_window(&model, cfg);
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
     let max_grep_results = cfg.resolve_subagent_max_grep_results();
@@ -1849,6 +1870,61 @@ mod settings127_context_tests {
     use rig::agent::AgentBuilder;
     use rig::streaming::StreamingChat;
     use rig::test_utils::{MockCompletionModel, MockExtensionsProbeTool, MockStreamEvent};
+
+    #[tokio::test]
+    async fn subagent130_direct_builder_capacity_drives_prepared_request_admission() {
+        let mut cfg = crate::config::Config {
+            context_window: Some(1_000_000),
+            ..Default::default()
+        };
+        cfg.quick_models = serde_json::from_value(serde_json::json!({
+            "child": {"provider":"openrouter", "model":"known-child", "context_window":1048576},
+            "foreign": {"provider":"custom-alias", "model":"unknown-child", "context_window":1048576}
+        })).unwrap();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        for (name, expected_window, expected_calls) in
+            [("unknown-child", 131_072, 0), ("known-child", 1_048_576, 1)]
+        {
+            let selected = client.completion_model(name);
+            let window = super::child_context_window(&selected, &cfg);
+            assert_eq!(window, expected_window);
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::text("ok"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            // This request exceeds the old 256-Ki child fallback. The main
+            // session's 1M setting must not make the unknown child accept it.
+            let preamble = "context ".repeat(150_000);
+            assert!(crate::session::Session::estimate_tokens(&preamble) > 262_144);
+            let agent = AgentBuilder::new(model.clone())
+                .preamble(&preamble)
+                .max_tokens(32_000)
+                .add_hook(ChildContextGuard { window })
+                .build();
+            let mut stream = agent
+                .stream_chat("brief", Vec::<rig::completion::Message>::new())
+                .await;
+            let mut failed = false;
+            while let Some(item) = stream.next().await {
+                failed |= item.is_err();
+            }
+            assert_eq!(model.request_count(), expected_calls);
+            assert_eq!(failed, expected_calls == 0);
+        }
+        // This is the already-clamped value owned by TaskTool admission,
+        // including a custom-provider/persona alias unavailable in AnyModel.
+        cfg.subagent_context_window = Some(77_000);
+        assert_eq!(
+            super::child_context_window(&client.completion_model("known-child"), &cfg),
+            77_000
+        );
+    }
 
     #[tokio::test]
     async fn subagent127_prepared_context_counts_history_tools_and_reserved_output_before_dispatch()

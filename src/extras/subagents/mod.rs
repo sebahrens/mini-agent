@@ -281,7 +281,12 @@ pub(crate) fn apply_saved_limit(
 /// credentials, tool grants, or a mutable reference to an active child.
 pub(crate) fn live_limit_values() -> Option<serde_json::Map<String, serde_json::Value>> {
     let guard = CONFIG.lock().unwrap_or_else(|error| error.into_inner());
-    let config = guard.as_ref()?;
+    live_limit_values_for(guard.as_ref()?)
+}
+
+fn live_limit_values_for(
+    config: &SubagentConfig,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut values = serde_json::to_value(&config.config)
         .ok()?
         .as_object()?
@@ -290,7 +295,11 @@ pub(crate) fn live_limit_values() -> Option<serde_json::Map<String, serde_json::
     for (key, value) in [
         (
             "subagent_context_window",
-            config.config.subagent_context_window.unwrap_or(262_144),
+            config.config.resolve_subagent_context_window(
+                &config.provider_name,
+                &config.model_name,
+                config.config.subagent_model.as_deref(),
+            ),
         ),
         (
             "subagent_max_tokens",
@@ -400,6 +409,45 @@ mod tests {
 mod settings127_tests {
     use super::*;
     #[test]
+    fn subagent130_live_limit_overlay_uses_selected_child_capacity() {
+        let mut cfg = crate::config::Config {
+            context_window: Some(1_000_000),
+            subagent_model: Some("child".into()),
+            ..Default::default()
+        };
+        cfg.quick_models = serde_json::from_value(serde_json::json!({
+            "child": {"provider":"openrouter", "model":"known-child", "context_window":1048576}
+        }))
+        .unwrap();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let mut installed = resolve_config(&cfg, None, "openrouter", "main-only", &client);
+        assert_eq!(
+            live_limit_values_for(&installed).unwrap()["subagent_context_window"],
+            1_048_576
+        );
+        installed.select_model("unknown-child".into());
+        assert_eq!(
+            live_limit_values_for(&installed).unwrap()["subagent_context_window"],
+            131_072
+        );
+        assert_eq!(
+            live_limit_values_for(&installed).unwrap()["subagent_max_tokens"],
+            32_000
+        );
+        apply_limit_setting(&mut installed, "subagent_context_window", "524288").unwrap();
+        assert_eq!(
+            live_limit_values_for(&installed).unwrap()["subagent_context_window"],
+            524_288
+        );
+    }
+
+    #[test]
     fn subagent127_next_delegation_updates_only_limits_and_keeps_active_snapshot() {
         let cfg = crate::config::Config::default();
         let main = crate::provider::create_client(
@@ -440,7 +488,7 @@ mod settings127_tests {
         apply_limit_setting(&mut installed, "task_max_report_bytes", "524288").unwrap();
         assert_eq!(installed.config.resolve_subagent_max_tokens(), 32768);
         assert_eq!(installed.max_turns, 31);
-        assert_eq!(active_child.config.resolve_subagent_max_tokens(), 16384);
+        assert_eq!(active_child.config.resolve_subagent_max_tokens(), 32_000);
         assert_eq!(active_child.max_turns, 20);
         assert_eq!(installed.provider_name, active_child.provider_name);
         assert_eq!(installed.model_name, active_child.model_name);

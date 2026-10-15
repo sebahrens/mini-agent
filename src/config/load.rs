@@ -552,7 +552,9 @@ pub(super) fn rich_default_config() -> Config {
         quick_models: Some(default_quick_models()),
         provider: Some(CompactString::new("openrouter")),
         model: Some(CompactString::new("deepseek-v4-pro")),
-        max_tokens: Some(16384),
+        // Keep the main response fallback implicit, including in generated
+        // config files; only authored max_tokens limits constrain children.
+        max_tokens: None,
         compact_enabled: Some(false),
         keep_recent_tool_results: Some(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS),
         max_text_file_size: Some(1_048_576),
@@ -570,13 +572,13 @@ pub(super) fn rich_default_config() -> Config {
         #[cfg(feature = "subagents")]
         task_max_prompts: Some(8),
         #[cfg(feature = "subagents")]
-        subagent_context_window: Some(262_144),
+        subagent_context_window: None,
         #[cfg(feature = "subagents")]
-        subagent_max_tokens: Some(16_384),
+        subagent_max_tokens: Some(32_000),
         #[cfg(feature = "subagents")]
-        task_max_report_bytes: Some(262_144),
+        task_max_report_bytes: Some(32_768),
         #[cfg(feature = "subagents")]
-        task_report_repair_max_tokens: Some(4096),
+        task_report_repair_max_tokens: Some(8192),
         #[cfg(feature = "subagents")]
         task_report_repair_max_cost_units: Some(65_536),
         #[cfg(feature = "subagents")]
@@ -584,9 +586,9 @@ pub(super) fn rich_default_config() -> Config {
         #[cfg(feature = "subagents")]
         subagents: None,
         #[cfg(feature = "subagents")]
-        task_max_output_bytes: Some(1024 * 1024),
+        task_max_output_bytes: Some(128 * 1024),
         #[cfg(feature = "subagents")]
-        task_max_cost_units: Some(2_000_000),
+        task_max_cost_units: Some(4_000_000),
         #[cfg(feature = "subagents")]
         task_timeout_secs: Some(300),
         #[cfg(feature = "advisor")]

@@ -1056,7 +1056,9 @@ impl Config {
 
     /// Independent child input capacity; the main session's context pin is not
     /// evidence about another model. Explicit matching quick-model metadata
-    /// and the selected provider's catalogue can only narrow the requested cap.
+    /// and the selected provider's catalogue determine the automatic capacity,
+    /// capped at 1 Mi tokens; unknown models use 128 Ki tokens. An explicit cap
+    /// can replace that default, but never exceed a known model capacity.
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_context_window(
         &self,
@@ -1064,7 +1066,6 @@ impl Config {
         model: &str,
         alias: Option<&str>,
     ) -> u64 {
-        let requested = self.subagent_context_window.unwrap_or(262_144);
         let quick = quick_models_map(self);
         let selected = alias
             .and_then(|alias| quick.get(alias))
@@ -1093,25 +1094,28 @@ impl Config {
             (Some(selected), Some(catalog)) => Some(selected.min(catalog)),
             (selected, catalog) => selected.or(catalog),
         };
+        let requested = self
+            .subagent_context_window
+            .unwrap_or_else(|| known.map_or(131_072, |capacity| capacity.min(1_048_576)));
         known.map_or(requested, |capacity| requested.min(capacity))
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_tokens(&self) -> u64 {
-        self.subagent_max_tokens.unwrap_or(16_384)
+        self.subagent_max_tokens.unwrap_or(32_000)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_report_bytes(&self) -> usize {
         self.task_max_report_bytes
-            .unwrap_or(262_144)
+            .unwrap_or(32_768)
             .min(self.resolve_task_max_output_bytes())
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_report_repair_max_tokens(&self) -> u64 {
         self.task_report_repair_max_tokens
-            .unwrap_or(4096)
+            .unwrap_or(8192)
             .min(self.resolve_subagent_max_tokens())
     }
 
@@ -1174,12 +1178,12 @@ impl Config {
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_output_bytes(&self) -> usize {
-        self.task_max_output_bytes.unwrap_or(1024 * 1024)
+        self.task_max_output_bytes.unwrap_or(128 * 1024)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_cost_units(&self) -> u64 {
-        self.task_max_cost_units.unwrap_or(2_000_000)
+        self.task_max_cost_units.unwrap_or(4_000_000)
     }
 
     #[cfg(feature = "subagents")]
@@ -1773,17 +1777,89 @@ mod subagent_settings127_tests {
     use super::*;
 
     #[test]
+    fn subagent130_only_explicit_parent_response_limits_constrain_children() {
+        let mut cfg = load::rich_default_config();
+        assert_eq!(cfg.max_tokens, None);
+        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
+        // First startup persists these defaults. Loading them again must not
+        // convert the implicit main response fallback into a child ceiling.
+        let serialized =
+            load::serialize_config_content(std::path::Path::new("config.toml"), &cfg).unwrap();
+        cfg = load::parse_config_content(std::path::Path::new("config.toml"), &serialized).unwrap();
+        assert_eq!(cfg.max_tokens, None);
+        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
+        cfg = load::merge_config_value_layer(
+            &cfg,
+            toml::from_str("max_tokens = 16384").unwrap(),
+            ConfigLayer::Cli,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_tokens, Some(16_384));
+        let raw = Config {
+            max_tokens: Some(16_384),
+            ..Default::default()
+        };
+        assert_eq!(raw.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn subagent130_automatic_capacity_uses_child_metadata_and_safe_unknown_default() {
+        for mut cfg in [Config::default(), load::rich_default_config()] {
+            // The default layer must leave automatic sizing unpinned.
+            assert_eq!(cfg.subagent_context_window, None);
+            cfg.context_window = Some(1_000_000);
+            cfg.quick_models = serde_json::from_value(serde_json::json!({
+                "small": {"provider":"custom", "model":"small", "context_window":200000},
+                "large": {"provider":"custom", "model":"large", "context_window":1048576},
+                "larger": {"provider":"custom", "model":"larger", "context_window":2097152}
+            }))
+            .unwrap();
+            for (model, expected) in [
+                ("small", 200_000),
+                ("large", 1_048_576),
+                ("larger", 1_048_576),
+                ("unknown", 131_072),
+            ] {
+                assert_eq!(
+                    cfg.resolve_subagent_context_window("custom", model, Some(model)),
+                    expected
+                );
+            }
+            // Matching a model name under another provider proves no capacity.
+            assert_eq!(
+                cfg.resolve_subagent_context_window("other", "small", Some("small")),
+                131_072
+            );
+            cfg.subagent_context_window = Some(524_288);
+            assert_eq!(
+                cfg.resolve_subagent_context_window("custom", "small", Some("small")),
+                200_000
+            );
+            assert_eq!(
+                cfg.resolve_subagent_context_window("custom", "large", Some("large")),
+                524_288
+            );
+            assert_eq!(
+                cfg.resolve_subagent_context_window("custom", "unknown", None),
+                524_288
+            );
+        }
+    }
+
+    #[test]
     fn subagent127_defaults_and_roundtrip_keep_context_response_and_reports_distinct() {
         let cfg = Config::default();
         assert_eq!(
             cfg.resolve_subagent_context_window("custom", "unknown", None),
-            262_144
+            131_072
         );
-        assert_eq!(cfg.resolve_subagent_max_tokens(), 16_384);
-        assert_eq!(cfg.resolve_task_max_report_bytes(), 262_144);
-        assert_eq!(cfg.resolve_task_max_output_bytes(), 1_048_576);
-        assert_eq!(cfg.resolve_task_max_cost_units(), 2_000_000);
-        assert_eq!(cfg.resolve_task_report_repair_max_tokens(), 4096);
+        assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
+        assert_eq!(cfg.resolve_task_max_report_bytes(), 32_768);
+        assert_eq!(cfg.resolve_task_max_output_bytes(), 131_072);
+        assert_eq!(cfg.resolve_task_max_cost_units(), 4_000_000);
+        assert_eq!(cfg.resolve_task_report_repair_max_tokens(), 8192);
         assert_eq!(cfg.resolve_task_report_repair_max_cost_units(), 65_536);
         let cfg: Config = serde_json::from_value(serde_json::json!({
             "context_window": 1_000_000, "subagent_context_window": 1_000_000,

@@ -27,8 +27,8 @@ const MAX_SUBAGENT_RESPONSE_BYTES: usize = 128 * 1024;
 
 const DEFAULT_MAX_PROMPTS: usize = 8;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-const DEFAULT_MAX_COST_UNITS: u64 = 2_000_000;
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 131_072;
+const DEFAULT_MAX_COST_UNITS: u64 = 4_000_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MIN_OUTPUT_BYTES: usize = 256;
 const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -4207,6 +4207,77 @@ mod tests {
     }
 
     #[test]
+    fn task130_runtime_defaults_match_config_and_preserve_explicit_limits() {
+        let defaults = TaskLimits::default();
+        assert_eq!(defaults.max_output_bytes, 131_072);
+        assert_eq!(defaults.max_cost_units, 4_000_000);
+        let configured = TaskLimits::from_config(&crate::config::Config::default());
+        assert_eq!(configured.max_output_bytes, defaults.max_output_bytes);
+        assert_eq!(configured.max_cost_units, defaults.max_cost_units);
+
+        let explicit = TaskLimits::from_config(&crate::config::Config {
+            task_max_output_bytes: Some(4096),
+            task_max_cost_units: Some(17),
+            ..Default::default()
+        });
+        assert_eq!(explicit.max_output_bytes, 4096);
+        assert_eq!(explicit.max_cost_units, 17);
+    }
+
+    #[test]
+    fn task130_default_budget_covers_eight_children_or_full_native_context() {
+        // An illustrative eight-child workload, not a per-child entitlement:
+        // all turns still consume the same observed aggregate budget.
+        let standard = Usage {
+            input_tokens: 200_000,
+            output_tokens: 32_000,
+            reasoning_tokens: 16_000, // Already included in OpenAI output.
+            ..Usage::new()
+        };
+        let standard_units = usage_cost_units(&standard, false, false, "", &Ok(String::new()));
+        assert_eq!(standard_units, 232_000);
+        let budget = LiveTaskBudget::new(TaskLimits::default().max_cost_units);
+        for _ in 0..8 {
+            budget.clone().charge(standard_units);
+        }
+        assert_eq!(budget.used.load(Ordering::Acquire), 1_856_000);
+        assert!(!budget.exhausted());
+
+        // Reserve the full 32k response inside a 1,048,576-token window.
+        // Even a wholly new one-hour cache write fits at the captured 2x
+        // default ratio; count its tier once, not again as ordinary input.
+        let input = 1_048_576 - 32_000;
+        let native = Usage {
+            cache_creation_input_tokens: input,
+            cache_creation: Some(rig::completion::CacheCreationUsage {
+                ephemeral_5m_input_tokens: 0,
+                ephemeral_1h_input_tokens: input,
+            }),
+            output_tokens: 32_000,
+            ..Usage::new()
+        };
+        let native_units = usage_cost_units_with_cache_policy(
+            &native,
+            true,
+            false,
+            "",
+            &Ok(String::new()),
+            crate::pricing::CacheMultipliers::default(),
+            true,
+        );
+        assert_eq!(native_units, 2_065_152);
+        let budget = LiveTaskBudget::new(TaskLimits::default().max_cost_units);
+        budget.clone().charge(native_units);
+        assert_eq!(budget.used.load(Ordering::Acquire), native_units);
+        assert!(!budget.exhausted());
+        budget.charge(budget.limit - native_units - 1);
+        assert!(!budget.exhausted());
+        budget.charge(1);
+        assert!(budget.exhausted());
+        assert_eq!(budget.used.load(Ordering::Acquire), 4_000_000);
+    }
+
+    #[test]
     fn task_tool_limits_cost_units_use_provider_usage_or_text_fallback() {
         let usage = Usage {
             total_tokens: 10,
@@ -4602,6 +4673,30 @@ mod tests {
 mod response_limit_tests {
     use super::TaskTool;
     #[test]
+    fn task130_child_response_default_retains_explicit_parent_ceilings() {
+        let child = TaskTool::new(None, None, true);
+        assert_eq!(
+            child.effective_response_max_tokens(&Default::default()),
+            32_000
+        );
+        let mut rich_default = crate::config::Config::default();
+        assert_eq!(child.effective_response_max_tokens(&rich_default), 32_000);
+        let cli_ceiling = TaskTool::new(None, None, true).with_response_max_tokens(1024);
+        assert_eq!(
+            cli_ceiling.effective_response_max_tokens(&rich_default),
+            1024
+        );
+
+        rich_default.max_tokens = Some(16_384);
+        assert_eq!(child.effective_response_max_tokens(&rich_default), 16_384);
+        let programmatic = crate::config::Config {
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(child.effective_response_max_tokens(&programmatic), 1024);
+    }
+
+    #[test]
     fn native_child_response_limit_preserves_parent_cli_ceiling_and_config_narrowing() {
         let cfg = crate::config::Config {
             max_tokens: Some(90),
@@ -4627,7 +4722,7 @@ mod response_limit_tests {
         assert_eq!(uncapped.effective_response_max_tokens(&cfg), 90);
         assert_eq!(
             uncapped.effective_response_max_tokens(&Default::default()),
-            crate::cli::Cli::default().resolve_max_tokens(&Default::default())
+            32_000
         );
     }
 }

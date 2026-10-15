@@ -80,5 +80,71 @@
     "src/ui/pickers/config.rs": "6195b81ceb299ff6edb8e6273da5b17938a722205aaa06e32348f73fcc1784e1",
     "src/ui/slash/config.rs": "d1225c75e7f602290a3898f8a7b71750c11f00c724bca99cd7ccc0afc0666d33",
     "tests/headless_json.rs": "f20b6d3fe6b72a4d002a050cedbd2f98a149e2f4f43bdbdb282247e00d70da73"
+  },
+  "user_defaults_followup130": {
+    "base_commit": "65304b8e0f73dd6f5932a78b7361b3e856a6c3fb",
+    "scope": "User-requested model-aware context, larger responses, compact reports, 4M aggregate budget and larger repair response. Supersedes earlier defaults above; weighting formula clarification remains pending.",
+    "defaults": {
+      "subagent_context_window": {
+        "known": "selected model capacity, capped at1048576 by default",
+        "unknown": 131072,
+        "explicit": "editable override, clamped to known capacity"
+      },
+      "subagent_max_tokens": 32000,
+      "task_max_report_bytes": 32768,
+      "task_max_output_bytes": 131072,
+      "task_max_cost_units": 4000000,
+      "task_report_repair_max_tokens": 8192,
+      "task_report_repair_max_cost_units": 65536
+    },
+    "validation": {
+      "initial_scoped": "31 passed; one local loopback listener refused by host sandbox, then its exact owning test passed outside host restriction. New mock-stream annotation corrected before these results.",
+      "initial_log": "/private/tmp/mini-agent-subagent130-owning-tests.log",
+      "loopback_log": "/private/tmp/mini-agent-subagent130-loopback-test.log",
+      "startup_followup": "5 owning default tests PASS after keeping main response fallback unset in generated config: actual serialize/parse, main16K unchanged, child32K, explicit ceilings, config precedence. Other unchanged owning results reused.",
+      "startup_log": "/private/tmp/mini-agent-subagent130-defaults-followup-tests.log",
+      "minimal": "2 affected config tests PASS with --no-default-features after final source change. No full local suite or unrelated native/worker/UI reruns.",
+      "minimal_log": "/private/tmp/mini-agent-subagent130-final-minimal-tests.log",
+      "build": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-subagent130-install PASS; final14.39s.",
+      "installed": {
+        "binary": "/private/tmp/mini-agent-subagent130-install/bin/mini-agent",
+        "binary_sha256": "d7172f5f61376a114999cb1be212a4d06221abfd1885f1055ec055649259df5b",
+        "root": "/private/tmp/mini-agent-subagent130-final-smoke-_ak3gmfi",
+        "default_exit": 0,
+        "main_response_default": 16384,
+        "main_context": 1000000,
+        "overrides": {
+          "subagent_max_tokens": 32000,
+          "task_max_report_bytes": 32768,
+          "task_max_output_bytes": 131072,
+          "task_max_cost_units": 4000000,
+          "task_report_repair_max_tokens": 8192,
+          "subagent_context_window": 1048576
+        },
+        "override_exit": 0,
+        "invalid_exit": 1,
+        "legacy_migrations": 0,
+        "scope": "Canonical empty isolated profile; default/override positives reused, negative assertion corrected for deliberately generic validation error. Generated-default roundtrip and actual child request admission covered by Rust tests. No provider requests."
+      },
+      "selection": "Code-indexer exact defining symbols/callers and scoped file search; one Cargo writer and shared warm target.",
+      "format": "cargo fmt and git diff --check PASS"
+    },
+    "weighting": "Current production formula remains cache-weighted input + output + separately reported reasoning/tool-prompt tokens, without output dollar-price multiplier. New scenario regressions cover eight measured workloads and one full1,048,576-token native cache-write window under4M; no speculative new weights without missing user formula.",
+    "limitations": [
+      "Existing explicit max_tokens entries still constrain child responses; generated profiles leave the main16K fallback unset so serialization does not manufacture an explicit child ceiling.",
+      "Direct builders preserve TaskTool admission snapshots. Without a snapshot, typed backend/model metadata is used; custom aliases cannot be reconstructed from AnyModel alone.",
+      "Context capacity is an admission bound and the aggregate observed weighted budget controls work; in-flight completions can overshoot.",
+      "Hosted source CI for these changes is pending; old653 passing results are not labeled as this new source."
+    ],
+    "source_sha256": {
+      "src/config/mod.rs": "6e14d5fe5c22af39ec5858c79ea35401aac59f8a2dcd37ce1e49db10acd29ef1",
+      "src/config/load.rs": "00dc388bee13aff871b92889556ef5f0f00f64343f29ea3e0b3113f6ba3cdb3b",
+      "src/config/keys.rs": "4a56c2af93ad6718de181ba4276ed3159cf815b609f553abe5dae4baad9d03d5",
+      "src/extras/subagents/builder.rs": "748dfb3c865b1a9d9688fd28a66dbfe0bfc5810595f1f72648203dad635ff077",
+      "src/extras/subagents/mod.rs": "268382b459651625617399dc58510f894461e5e7d31f9236745a8676d4e01da2",
+      "src/extras/subagents/task_tool.rs": "806615d747dbd033ec9473e015e5e744be317177f05ef0672329849f44358278",
+      "docs/agent/CONFIG.md": "d7da12c1f5bf8bcd75a2df31dd961055d10b6b5fcc6c559f45af40cfdadc993e",
+      "docs/agent/SUBAGENTS.md": "e220da4de971c4a2683915dd9aff66fe98c9212ece4fa96dfb875c68ae3ca7a0"
+    }
   }
 }
