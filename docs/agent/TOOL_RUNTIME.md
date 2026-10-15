@@ -1546,6 +1546,18 @@ workspace/trust selection instead of inheriting a global host-full grant.
 Windows uses its existing AppContainer explicit root keys and rejects the two
 host-wide levels.
 
+The macOS Workspace profile includes read-only public runtime assets needed by
+Homebrew and Apple command-line tools: `/opt/homebrew/Cellar`, its `opt` aliases,
+`/Library/Developer/CommandLineTools`, and the `Contents/Developer` subtree of
+system `/Applications/Xcode*.app` bundles. The exact developer-selector links
+at `/var/select/developer_dir` and its `/private` spelling are readable.
+Path normalization can inspect metadata on exact ancestors of the workspace,
+command cache and explicit roots. These metadata grants preserve the later
+private-path denials and do not expose parent-directory contents.
+Private-path and Git protections still apply. Other toolchains outside these
+locations need explicit read roots or HostRead.
+The layout follows [Homebrew's package terminology](https://docs.brew.sh/Manpage#terminology)
+and [Apple's command-line tools selection](https://developer.apple.com/documentation/xcode/configuring-command-line-tools-settings).
 
 ## Permission prompt attribution
 

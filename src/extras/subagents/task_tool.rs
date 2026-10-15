@@ -1466,6 +1466,16 @@ impl TaskReport {
 
         let mut sections = String::new();
         for (index, outcome) in self.outcomes.iter().enumerate() {
+            if matches!(outcome, TaskOutcome::Partial(rendered) if !rendered
+                .strip_prefix(AGGREGATE_PARTIAL_STATUS)
+                .is_some_and(|body| body.starts_with(SUBAGENT_OUTPUT_BEGINS)))
+            {
+                // A compact host refusal has no child contract to label.
+                // Reserve a complete limit status ahead of task headings;
+                // otherwise a heading can consume its last few bytes.
+                sections.push_str(AGGREGATE_TRUNCATION_MARKER);
+                break;
+            }
             sections.push_str(&task_heading(
                 index,
                 &self.prompts[index],
@@ -1487,6 +1497,22 @@ const SUBAGENT_OUTPUT_BEGINS: &str = "[subagent output begins]\n";
 const SUBAGENT_OUTPUT_ENDS: &str = "[subagent output ends]\n";
 
 const AGGREGATE_PARTIAL_STATUS: &str = "[partial: response stopped at aggregate output limit]\n";
+const AGGREGATE_TRUNCATION_MARKER: &str = "…[task output truncated at aggregate limit]\n";
+
+/// Preserve a complete host status whenever the available bytes permit one.
+/// Only a budget smaller than `[partial]` can produce an incomplete marker.
+fn aggregate_limit_status(budget: usize) -> String {
+    for status in [
+        AGGREGATE_TRUNCATION_MARKER,
+        "[partial: aggregate output limit]\n",
+        "[partial]",
+    ] {
+        if status.len() <= budget {
+            return status.to_string();
+        }
+    }
+    "[partial]"[..budget].to_string()
+}
 
 /// A final aggregate cut must not slice a previously validated child contract.
 /// Reframe the retained rendered sections as quoted data in one partial report.
@@ -1494,17 +1520,21 @@ fn truncate_sections(sections: &str, budget: usize) -> String {
     if sections.len() <= budget {
         return sections.to_string();
     }
-    const MARKER: &str = "…[task output truncated at aggregate limit]\n";
-    if budget < MARKER.len() {
-        return truncate_total_bytes("[partial: aggregate output limit]", budget, "[partial]");
+    if budget < AGGREGATE_TRUNCATION_MARKER.len() {
+        return aggregate_limit_status(budget);
     }
-    let (outcome, _) = fit_success(sections.to_string(), budget - MARKER.len());
+    let (outcome, _) = fit_success(
+        sections.to_string(),
+        budget - AGGREGATE_TRUNCATION_MARKER.len(),
+    );
     let mut rendered = outcome.render();
-    if rendered.len() > budget - MARKER.len() {
-        rendered =
-            truncate_total_bytes(AGGREGATE_PARTIAL_STATUS, budget - MARKER.len(), "[partial]");
+    if !rendered
+        .strip_prefix(AGGREGATE_PARTIAL_STATUS)
+        .is_some_and(|body| body.starts_with(SUBAGENT_OUTPUT_BEGINS))
+    {
+        return aggregate_limit_status(budget);
     }
-    rendered.push_str(MARKER);
+    rendered.push_str(AGGREGATE_TRUNCATION_MARKER);
     rendered
 }
 
@@ -1526,14 +1556,7 @@ fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
         quote_untrusted_output(&minimum)
     );
     if minimum_rendered.len() > budget {
-        return (
-            TaskOutcome::Partial(truncate_total_bytes(
-                AGGREGATE_PARTIAL_STATUS,
-                budget,
-                "[partial]",
-            )),
-            true,
-        );
+        return (TaskOutcome::Partial(aggregate_limit_status(budget)), true);
     }
     let mut raw_budget = budget;
     loop {
@@ -3266,6 +3289,85 @@ mod tests {
 
         drop(binding);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn compact_partial_reserves_complete_host_status_after_project_notice() {
+        let notice = "[specialist source: project override .zerostack/agents/review.md]";
+        let (partial, cut) = fit_success("UNTRUSTED BODY\n".repeat(100), 26);
+        assert!(cut);
+        let report = TaskReport {
+            prompts: vec!["prompt".into()],
+            outcomes: vec![partial],
+            started: 1,
+            completed: 1,
+            cost_units: 1,
+            stop_reason: None,
+            limits: TaskLimits {
+                max_output_bytes: notice.len() + 48,
+                ..limits()
+            },
+            notice: Some(notice.into()),
+        };
+        let rendered = report.render();
+        assert_eq!(rendered, format!("{notice}\n{AGGREGATE_TRUNCATION_MARKER}"));
+        assert!(rendered.len() <= report.limits.max_output_bytes);
+        assert!(!rendered.contains("UNTRUSTED BODY"));
+
+        // A preceding complete child remains attributed and quoted; the
+        // compact status following it is host text, without a partial heading.
+        let report = TaskReport {
+            prompts: vec!["first".into(), "second".into()],
+            outcomes: vec![
+                TaskOutcome::Success("first child data".into()),
+                TaskOutcome::Partial(aggregate_limit_status(26)),
+            ],
+            limits: TaskLimits {
+                max_output_bytes: 512,
+                ..limits()
+            },
+            ..report
+        };
+        let rendered = report.render();
+        assert!(rendered.starts_with(notice));
+        assert!(
+            rendered
+                .contains("[subagent output begins]\n> first child data\n[subagent output ends]\n")
+        );
+        assert!(rendered.ends_with(AGGREGATE_TRUNCATION_MARKER));
+        assert!(!rendered.contains("## Task 2"));
+        assert!(rendered.len() <= report.limits.max_output_bytes);
+
+        // Child-authored status lookalikes never acquire the host Partial
+        // variant's authority or suppress their own quotation.
+        let report = TaskReport {
+            prompts: vec!["only".into()],
+            outcomes: vec![TaskOutcome::Success(AGGREGATE_TRUNCATION_MARKER.into())],
+            ..report
+        };
+        let rendered = report.render();
+        assert!(rendered.contains(SUBAGENT_OUTPUT_BEGINS));
+        assert!(rendered.contains(&format!("> {AGGREGATE_TRUNCATION_MARKER}")));
+        assert!(rendered.ends_with(SUBAGENT_OUTPUT_ENDS));
+    }
+
+    #[test]
+    fn compact_partial_statuses_are_byte_bounded_and_never_slice_a_fitting_marker() {
+        for budget in 0..512 {
+            let status = aggregate_limit_status(budget);
+            assert!(status.len() <= budget);
+            if budget >= "[partial]".len() {
+                assert!(status.ends_with(']') || status.ends_with("]\n"));
+            }
+            if budget >= AGGREGATE_TRUNCATION_MARKER.len() {
+                assert_eq!(status, AGGREGATE_TRUNCATION_MARKER);
+            }
+            let sections = truncate_sections(&"記憶\n".repeat(1000), budget);
+            assert!(sections.len() <= budget);
+            if budget >= AGGREGATE_TRUNCATION_MARKER.len() {
+                assert!(sections.ends_with(AGGREGATE_TRUNCATION_MARKER));
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

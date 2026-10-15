@@ -1,0 +1,120 @@
+{
+  "scope": "mini-agent-i7ro6.100/.125/.128: actual Main CI failure repairs; .127 documentation corrections",
+  "base_commit": "cfd871504a8ffbd33285b442d4842f81aea5180c",
+  "failed_ci": {
+    "head": "367a2a2951767625b069752812feb9349382129c",
+    "run_id": 38703528939,
+    "url": "https://github.com/sebahrens/mini-agent/actions/runs/38703528939",
+    "status": "known failing historical source; successor acceptance remains separate"
+  },
+  "changes": [
+    "Reserve a complete host aggregate-limit marker when a compact partial child cannot retain a structured report; preserve project notice, quotation, byte bounds and child-authored marker isolation.",
+    "Compare shared Seatbelt Git protection blocks using identical cache inputs, independently of mutable runtime registries.",
+    "Permit the exact dyld root lookup, bounded read-only Homebrew and Apple Developer runtime assets, exact selector links and /var metadata.",
+    "Permit metadata only on escaped literal ancestors of bound workspace/cache/explicit roots; include this in profile cache identity; omit empty grants and preserve later private denials.",
+    "Make the Gitfile fixture use the same isolated Git configuration as adjacent fixtures; keep every rename-denial and successful-commit assertion.",
+    "Fix nonUnix mutable Sandbox test binding; update only inspected exact subprocess inventory source records, preserving the scanner and its negative controls.",
+    "Correct --config startup spelling and the editable default256KiB child report cap in settings documentation."
+  ],
+  "validation": {
+    "earlier_default_scoped": {
+      "result": "36 unique owning controls PASS across selected batches; report/live-budget/retirement/config/frontend tests and final3 source-inventory controls",
+      "scope": "Report source and inventory algorithms unchanged afterward; no repeat of unrelated module suites."
+    },
+    "native_final": {
+      "result": "PASS37/0FAIL/0IGNORED,25.67s",
+      "environment": {
+        "MINI_AGENT_REQUIRE_REAL_SANDBOX": "1"
+      },
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "--bin",
+        "mini-agent",
+        "--",
+        "extras::acp::protocol_tests::client_stdio_mcp_network_denial_survives_native_launch",
+        "extras::js::host::tests::spawn_uses_real_macos_seatbelt_write_boundary",
+        "extras::subagents::task_tool::tests::project_override_notice_and_near_limit_results_share_one_output_bound",
+        "extras::validation::tests::loop_validation_process_limits_seatbelt_scoped_cancellation_preserves_unrelated_command",
+        "sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend",
+        "sandbox::sandbox_tests::macos_seatbelt_workspace_binding_grants_real_workspace_writes",
+        "sandbox::sandbox_tests::macos_seatbelt_workspace_service_grants_real_workspace_writes",
+        "sandbox::sandbox_tests::seatbelt_children_use_private_temp_and_cannot_overwrite_shared_temp",
+        "sandbox::sandbox_tests::seatbelt_hook_has_no_controlling_terminal",
+        "sandbox::sandbox_tests::seatbelt_profiles_deny_git_metadata_writes_after_the_workspace_grant",
+        "sandbox::sandbox_tests::seatbelt_workspace_git_metadata_is_read_only",
+        "sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases",
+        "sandbox::sandbox_tests::seatbelt_workspace_gitfile_target_directory_cannot_be_renamed",
+        "sandbox::sandbox_tests::seatbelt_workspace_service_environment_names_cannot_replace_the_program",
+        "tests::hooks::subprocess_tests::seatbelt_readiness_distinguishes_missing_target_from_started_hook",
+        "tests::shell_mode_tests::explicit_shell_available_backend_runs_or_fails_closed_before_payload",
+        "tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary",
+        "ui::app::git_command_consumer_tests::actual_app_commit_confirmation_decline_edit_and_modified_keys_cannot_execute",
+        "ui::app::git_command_consumer_tests::actual_app_diff_uses_authoritative_native_rows_without_ansi_injection",
+        "ui::app::git_command_consumer_tests::actual_app_generated_commit_is_tool_free_charged_once_and_requires_confirmation",
+        "ui::app::git_command_consumer_tests::actual_app_generated_pr_requires_preview_and_shell_ask_before_gh",
+        "ui::app::git_command_consumer_tests::actual_app_malformed_generated_proposal_keeps_observed_usage_without_effects",
+        "ui::slash::git::native_actor_tests::actual_native_commit_refuses_unrelated_staged_files_and_directories",
+        "ui::slash::git::native_actor_tests::actual_native_commit_waits_for_normal_ask_and_commits_only_literal_selection",
+        "ui::slash::git::native_hook_tests::actual_native_late_unrelated_staging_cannot_enter_selected_only_commit",
+        "ui::slash::git::native_hook_tests::actual_native_posthook_redaction_cannot_replace_structured_guard_or_commit_success",
+        "ui::slash::git::native_pr_tests::actual_native_pr_asks_before_literal_gh_argv_and_reports_actual_url",
+        "ui::slash::git::native_pr_tests::actual_native_pr_assertion_unwind_settles_child_before_late_effect",
+        "ui::slash::git::native_pr_tests::actual_native_pr_foreground_abort_reaps_before_fifo_release_or_late_effect",
+        "ui::slash::git::native_pr_tests::actual_native_pr_posthook_redaction_cannot_spoof_inner_url_or_failure",
+        "sandbox::sandbox_tests::profile100_seatbelt_ladder_keeps_private_git_network_and_namespace_denies_last",
+        "sandbox::general_profile::tests::profile100_native_host_profiles_preserve_masks_and_real_operations",
+        "tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads",
+        "sandbox::sandbox_tests::macos_seatbelt_setup_failure_is_fail_closed",
+        "sandbox::sandbox_tests::macos_seatbelt_policy_command_matches_capability_matrix",
+        "sandbox::sandbox_tests::profile100_seatbelt_bound_ancestor_metadata_never_grants_parent_subtrees",
+        "sandbox::sandbox_tests::seatbelt_profile_cache_is_byte_identical_to_uncached_build",
+        "--include-ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "log": "/private/tmp/mini-agent-ci-repair-native37-final.log",
+      "scope": "All30 exact failed Mac parallel test identities plus7 native/profile/cache controls on the frozen final source. Includes actual ACP MCP network isolation, JS spawn, hooks, shell/environment, private credential/symlink/Git metadata, cancellation, Git UI consumers and native gh request/cleanup controls."
+    },
+    "clippy": {
+      "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+      "result": "PASS17.69s",
+      "log": "/private/tmp/mini-agent-ci-repair-clippy-final.log"
+    },
+    "install": {
+      "command": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-ci-repair-install",
+      "result": "PASS11.63s",
+      "binary": "/private/tmp/mini-agent-ci-repair-install/bin/mini-agent",
+      "log": "/private/tmp/mini-agent-ci-repair-install-final.log"
+    },
+    "format": "cargo fmt and git diff --check PASS",
+    "linux_reuse": "Native Linux HostRead/HostFull and actual HOME rustup cargo-test proofs in 2026-10-15-profile100-linux-native-acceptance.json remain applicable: Linux runtime implementation and src/sandbox/general_profile.rs hash unchanged.",
+    "settings_reuse": "Installed8override, main context1000000, actual child request/repair, minimal and subagents-only sizing proofs remain in 2026-10-15-subagent-settings-validation.json; child settings and request factories unchanged in this follow-up."
+  },
+  "limits": [
+    "Local native execution used Apple Command Line Tools; versioned Xcode Developer subtree boundaries are unit checked and the SBPL regex is parsed by real Seatbelt. Current hosted macOS acceptance is observed separately.",
+    "Windows actual successor compile/native acceptance remains pending; historical367 jobs stopped at E0596 before the three Git service controls.",
+    "The first restricted35-test attempt could not access native sandbox preflight/private cache/loopback. It is not acceptance evidence. Final37 used the already authorized native execution context.",
+    "Queued docs-only cfd run38704609857 was cancelled before starting because it shared the known-bad Rust source. Historical367 was left running; no manually duplicated full run was dispatched.",
+    "No full local Rust suite, release build, dependency change, worker containment change or permission-policy expansion."
+  ],
+  "selection": "Code-indexer owning symbols/callers, current physical source where index stale, and exact hosted failed identities. Root was sole Cargo/bd writer; independent source and CI tasks ran in parallel.",
+  "source_sha256": {
+    "src/extras/subagents/task_tool.rs": "b7dc33f9016ada92ac21dfcd1ddfbebc67ef15ec71a67c71d63aecdce2336a16",
+    "src/sandbox.rs": "776ebe35255810d66ae8c6786f816f81ff1f93a696f00a33157c7d77f9ed6587",
+    "src/sandbox/general_profile.rs": "4e0c172dd448ab284f4aba09d7b67870cc0a9dc0d6499af1c13de014e3f20f2b",
+    "src/tests/subprocess_inventory_tests.rs": "12697c1ebd494c3ae4272a4cc9dec79b08d14cde837d2e8e4947e906d5a10596",
+    "src/ui/slash/session_restore_tests.rs": "8f654d0c76333e4e6632c4e1c3ff30588186f688196fdaa4b7af6dac1c2fa88a",
+    "docs/agent/CONFIG.md": "ee8d385561dfc3c218b4a1bb434678ea052bb4c12e9ac5b486194c1452e46f40",
+    "docs/agent/SUBAGENTS.md": "55fe6aef484a75d20b8b2e94e136d1a1317bec3843988a9b119c5b5dd6c2b15d",
+    "docs/agent/TOOL_RUNTIME.md": "688f0bbf1ce9d84424952aec61f6931f1c9ee9c057beb7deb82db8d3d0e06ca4"
+  },
+  "log_sha256": {
+    "/private/tmp/mini-agent-ci-repair-native37-final.log": "d39b7e83a5f921231b94f97240994bd165b388eb59cc84ad7d77f7c9f7a069f9",
+    "/private/tmp/mini-agent-ci-repair-clippy-final.log": "7931b6fbd26cb5fcc6d87611a0b362b3ef6b0a153e9744a2b1c4f3cb3d23e70e",
+    "/private/tmp/mini-agent-ci-repair-install-final.log": "16a2be71264122b72ccf9094b803fb170831a6b53b9cdc997abc9cd66ca7934c"
+  },
+  "binary_sha256": "92277b6a6cdea1b4da67c51c271419f21b18b29b4bc058ee715468bc0860932e"
+}

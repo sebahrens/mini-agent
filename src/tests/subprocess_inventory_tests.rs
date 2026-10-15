@@ -1939,6 +1939,55 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Exact native-result and compact-status assertion identifiers are data.
+    (
+        "src/sandbox/general_profile.rs",
+        "assert_eq!(output.status, CommandStatus::Completed);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "output.exit_status.is_some_and(|status| status.success()),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "output.exit_status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "assert_eq!(output.stdout, b\"PROFILE100_NATIVE_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "assert!(status.len() <= budget);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "assert!(status.ends_with(']') || status.ends_with(\"]\\n\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "assert_eq!(status, AGGREGATE_TRUNCATION_MARKER);",
+        1,
+        "NON-PROCESS",
+    ),
     // Native persisted-result CompactString payload, not process output.
     (
         "src/agent/tools/web_fetch.rs",
@@ -3466,6 +3515,47 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Compact partial marker assertions inspect a String, never a process.
+    (
+        "src/extras/subagents/task_tool.rs",
+        &[
+            (
+                "a4163283c1da7dcc08d8a7a5af29f52305ff73782ee4c997ad45dbaaec2b5abe",
+                1,
+            ),
+            (
+                "4488de2505a6c90970027484e9cf589ecdebbcab82ce6d5bdf4811931eb84c77",
+                1,
+            ),
+            (
+                "1e8507c7079c6b2cc8311975805893306588cccc2a5205257bfed643670ccf51",
+                1,
+            ),
+        ],
+    ),
+    // Native profile fixtures inspect CommandOutput fields in exact assertions;
+    // these token trees contain no process construction or execution call.
+    (
+        "src/sandbox/general_profile.rs",
+        &[
+            (
+                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
+                2,
+            ),
+            (
+                "ee777ca22024364b409391190584f456071f7d4e5901eea682e855d543212017",
+                1,
+            ),
+            (
+                "0aadb10a43373eac2a37c716efa085d3fd9226d932993ab7e585c97d9cdd7aa9",
+                1,
+            ),
+            (
+                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                1,
+            ),
+        ],
+    ),
     // Native real-path tests inspect bounded CommandOutput data only.
     (
         "src/sandbox/linux_workspace_tests.rs",

@@ -3794,7 +3794,7 @@ permission source. Optional fetch `prompt` does not invoke a summarizing model.
 from the main session's context pin and dollar budget. `/config` persists these
 and the existing task turn/prompt/aggregate/cost/deadline settings
 and applies effective changes to the next delegation, preserving current child
-snapshots and higher layer/CLI precedence. `--set key=value` provides the same
+snapshots and higher layer/CLI precedence. `--config key=value` provides the same
 startup overrides. See [Editable child sizing](SUBAGENTS.md#editable-child-sizing)
 for provider/parent ceilings, estimated context admission and repair behavior.
 

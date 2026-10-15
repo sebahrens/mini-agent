@@ -2348,8 +2348,22 @@ impl Sandbox {
                 .cloned()
                 .collect::<Vec<_>>(),
         )?;
+        // Git and other runtimes normalize absolute paths by inspecting their
+        // ancestors. Permit only metadata on these exact bound path spellings;
+        // private read denials still follow this grant in the final profile.
+        let metadata_ancestors = seatbelt_namespace_denies(
+            &std::iter::once(workspace.to_path_buf())
+                .chain(std::iter::once(cache.to_path_buf()))
+                .chain(
+                    read_roots
+                        .iter()
+                        .chain(write_roots.iter())
+                        .map(|root| root.root().to_path_buf()),
+                )
+                .collect::<Vec<_>>(),
+        )?;
         let cache_read_identity = format!(
-            "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}",
+            "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}|metadata={metadata_ancestors}",
             self.profile
         );
 
@@ -2379,6 +2393,7 @@ impl Sandbox {
             &extra_reads,
             &extra_writes,
             &namespace_denies,
+            &metadata_ancestors,
             deny_network,
         );
         let profile: Arc<str> = Arc::from(profile);
@@ -5183,11 +5198,21 @@ fn seatbelt_profile_ladder(
     extra_reads: &str,
     extra_writes: &str,
     namespace_denies: &str,
+    metadata_ancestors: &str,
     deny_network: bool,
 ) -> String {
     let reads = if profile == SandboxProfile::Workspace {
+        // Like the contained worker profile, dyld needs this one directory
+        // lookup. A literal root grant does not grant reads of descendants.
+        // Public package bodies and Apple developer-tool runtimes are read
+        // assets, not filesystem write roots or private configuration grants.
+        let ancestor_metadata = if metadata_ancestors.is_empty() {
+            String::new()
+        } else {
+            format!("(allow file-read-metadata{metadata_ancestors})\n")
+        };
         format!(
-            "(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -7328,12 +7353,13 @@ mod sandbox_tests {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "seatbelt");
+        let cache = sandbox.get_cached_cache_dir().unwrap();
         let command = sandbox
             .build_seatbelt_command(
                 Path::new("/usr/bin/sandbox-exec"),
                 "printf sandboxed",
                 &workspace,
-                Path::new("/cache/mini-agent"),
+                &cache,
             )
             .unwrap();
         let args = command_argv(&command);
@@ -7342,9 +7368,12 @@ mod sandbox_tests {
             .find_map(|args| (args[0] == "-p").then_some(args[1].as_str()))
             .expect("Seatbelt profile argument");
         let grant = profile.find("(allow file-write*").unwrap();
-        let deny = profile
-            .find("(deny file-write*")
-            .expect("Git metadata write deny");
+        let git_deny = format!(
+            "(deny file-write*{})",
+            git_metadata::seatbelt_write_denies(&workspace)
+        );
+        let deny = profile.find(&git_deny).expect("Git metadata write deny");
+        let git_block = &profile[deny..deny + git_deny.len()];
         assert!(grant < deny, "the later filtered rule wins: {profile}");
         for entry in [
             "config",
@@ -7358,21 +7387,32 @@ mod sandbox_tests {
                 "(subpath \"{}\")",
                 workspace.join(".git").join(entry).display()
             );
-            assert!(profile[deny..].contains(&rule), "missing {rule}: {profile}");
+            assert!(git_block.contains(&rule), "missing {rule}: {profile}");
         }
         // `.git` itself cannot be renamed, but objects, refs, the index and
         // logs inside it stay writable.
         let pin = format!("(literal \"{}\")", workspace.join(".git").display());
-        assert!(profile[deny..].contains(&pin), "{profile}");
+        assert!(git_block.contains(&pin), "{profile}");
         let git_dir_rule = format!("(subpath \"{}\")", workspace.join(".git").display());
         assert!(!profile.contains(&git_dir_rule), "{profile}");
 
-        // The hook and workspace-service arms share the same profile.
-        let cache = sandbox.get_cached_cache_dir().unwrap();
+        // Compare the owning Git deny block with identical cache inputs.
+        // Later cache/private/namespace clauses are separate policy, and the
+        // protected-runtime registry may grow between these two renders.
         let shared = sandbox
             .get_seatbelt_profile(&workspace, &cache, true)
             .unwrap();
-        assert!(shared.contains(&profile[deny..profile.len() - "(deny network*)".len()]));
+        let shared_deny = shared
+            .find(&git_deny)
+            .expect("shared Git metadata write deny");
+        let shared_grant = shared.find("(allow file-write*").unwrap();
+        assert!(shared_grant < shared_deny, "{shared}");
+        assert_eq!(
+            &shared[shared_deny..shared_deny + git_deny.len()],
+            git_block
+        );
+        assert!(profile.ends_with("(deny network*)"));
+        assert!(shared.ends_with("(deny network*)"));
     }
 
     #[cfg(unix)]
@@ -7653,7 +7693,7 @@ echo COMMITTED"#;
         let sandbox = Sandbox::new(true, backend).with_working_dir(&workspace);
         let output = sandbox
             .output_command_with_limits(
-                "mv gitdir moved && echo MOVED; printf 'two\\n' >> file && git add file && git -c user.name=sandbox -c user.email=sandbox@example.invalid commit -qm sandboxed && echo COMMITTED",
+                "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; mv gitdir moved && echo MOVED; printf 'two\\n' >> file && git add file && git -c user.name=sandbox -c user.email=sandbox@example.invalid commit -qm sandboxed && echo COMMITTED",
                 DEFAULT_COMMAND_LIMITS,
             )
             .await
@@ -8048,12 +8088,50 @@ echo COMMITTED"#;
                 "\n (subpath \"/read\")",
                 "\n (subpath \"/write\")",
                 ancestors,
+                "",
                 true,
             );
             assert_eq!(
                 rendered.contains("(allow file-read*)"),
                 profile != SandboxProfile::Workspace
             );
+            assert_eq!(
+                rendered.contains("(allow file-read-data (literal \"/\"))"),
+                profile == SandboxProfile::Workspace
+            );
+            assert!(!rendered.contains("(subpath \"/\")"));
+            assert!(!rendered.contains("(allow file-read-metadata)"));
+            for runtime in [
+                "(allow file-read-metadata (literal \"/var\"))",
+                "(subpath \"/opt/homebrew/Cellar\")",
+                "(subpath \"/opt/homebrew/opt\")",
+                "(subpath \"/Library/Developer/CommandLineTools\")",
+                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")",
+                "(literal \"/var/select/developer_dir\")",
+                "(literal \"/private/var/select/developer_dir\")",
+            ] {
+                assert_eq!(
+                    rendered.contains(runtime),
+                    profile == SandboxProfile::Workspace,
+                    "{runtime}"
+                );
+            }
+            for outside in [
+                "/opt",
+                "/opt/homebrew",
+                "/opt/homebrew/etc",
+                "/opt/homebrew/var",
+                "/Applications",
+                "/Library",
+                "/private/var/select",
+                "/Users",
+            ] {
+                assert!(
+                    !rendered.contains(&format!("(subpath \"{outside}\")")),
+                    "{outside}"
+                );
+            }
+
             assert_eq!(
                 rendered.contains("(allow file-write*)"),
                 profile == SandboxProfile::HostFull
@@ -8073,6 +8151,23 @@ echo COMMITTED"#;
                 "empty filters must never become universal denies"
             );
         }
+        let developer =
+            regex::Regex::new("^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)").unwrap();
+        for runtime in [
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+            "/Applications/Xcode_26.1.app/Contents/Developer",
+            "/Applications/Xcode-beta.app/Contents/Developer/Toolchains",
+        ] {
+            assert!(developer.is_match(runtime), "{runtime}");
+        }
+        for outside in [
+            "/Applications/Other.app/Contents/Developer",
+            "/Users/person/Applications/Xcode.app/Contents/Developer",
+            "/Applications/Xcode.app/Contents/DeveloperSecrets",
+            "/Applications/Xcode.app/Contents/SharedFrameworks",
+        ] {
+            assert!(!developer.is_match(outside), "{outside}");
+        }
         let open_network = seatbelt_profile_ladder(
             SandboxProfile::HostFull,
             "/work",
@@ -8083,6 +8178,7 @@ echo COMMITTED"#;
             "",
             "",
             ancestors,
+            "",
             false,
         );
         assert!(open_network.ends_with("(allow network*)"));
@@ -8092,6 +8188,57 @@ echo COMMITTED"#;
                 .with_general_profile(SandboxProfile::HostFull, Vec::new(), Vec::new())
                 .profile_supported()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile100_seatbelt_bound_ancestor_metadata_never_grants_parent_subtrees() {
+        let roots = [
+            PathBuf::from("/profile100-meta/work/repo"),
+            PathBuf::from("/profile100-meta/cache/command"),
+            PathBuf::from("/profile100-meta/read/nested"),
+            PathBuf::from("/profile100-meta/write/nested"),
+            PathBuf::from("/profile100-meta/secret/nested"),
+        ];
+        let metadata = seatbelt_namespace_denies(&roots).unwrap();
+        assert!(!metadata.contains("(literal \"/\")"));
+        assert!(!metadata.contains("(subpath"));
+        let private = "\n (subpath \"/profile100-meta/secret\")";
+        let rendered = seatbelt_profile_ladder(
+            SandboxProfile::Workspace,
+            "/profile100-meta/work/repo",
+            "/profile100-meta/cache/command",
+            private,
+            "",
+            "",
+            "\n (subpath \"/profile100-meta/read/nested\")",
+            "\n (subpath \"/profile100-meta/write/nested\")",
+            "",
+            &metadata,
+            true,
+        );
+        let metadata_rule = format!("(allow file-read-metadata{metadata})");
+        let grant = rendered.find(&metadata_rule).unwrap();
+        assert!(rendered.find("(deny file-read*").unwrap() > grant);
+        for parent in [
+            "/profile100-meta",
+            "/profile100-meta/work",
+            "/profile100-meta/cache",
+            "/profile100-meta/read",
+            "/profile100-meta/write",
+            "/profile100-meta/secret",
+        ] {
+            assert!(
+                metadata.contains(&format!("(literal \"{parent}\")")),
+                "{parent}"
+            );
+            assert!(
+                !rendered[..rendered.find("(deny file-read*").unwrap()]
+                    .contains(&format!("(subpath \"{parent}\")")),
+                "{parent}"
+            );
+        }
+        assert!(rendered.contains(&format!("(deny file-read*{private})")));
     }
 
     #[test]
@@ -8302,7 +8449,10 @@ printf MACOS_SEATBELT_POLICY_PASS
         assert_eq!(output.stdout, b"MACOS_SEATBELT_POLICY_PASS");
         let matrix = sandbox.capability_matrix();
         assert_eq!(matrix.network, "all Seatbelt network operations denied");
-        assert!(matrix.filesystem_reads.contains("not claimed"));
+        assert_eq!(
+            matrix.filesystem_reads,
+            "workspace, command cache, explicit roots and system runtime files; private application/secret paths denied"
+        );
     }
 
     /// Shell probe shared by the workspace-binding Seatbelt tests: the child
@@ -8762,6 +8912,8 @@ echo PRIVATE_TEMP_PASS"#,
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        let metadata_ancestors =
+            seatbelt_namespace_denies(&[workspace.clone(), cache_dir.clone()]).unwrap();
         let uncached_profile = seatbelt_profile_ladder(
             SandboxProfile::Workspace,
             &workspace_str,
@@ -8772,6 +8924,7 @@ echo PRIVATE_TEMP_PASS"#,
             "",
             "",
             &namespace,
+            &metadata_ancestors,
             true,
         );
 

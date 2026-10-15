@@ -667,8 +667,9 @@ final aggregate cut inside a quoted child output still closes its
 Partial returns begin with a summary containing the stop reason and aggregate
 started/completed/cost accounting. Cost includes usage already observed from
 started siblings before they were cancelled, so partial work cannot bypass the
-aggregate budget. A 128 KiB per-child response cap remains as
-defense in depth, while `task_max_output_bytes` is a final hard cap over the
+aggregate budget. The editable `task_max_report_bytes` per-child report cap
+defaults to 256 KiB and is bounded by the aggregate limit, while
+`task_max_output_bytes` is a final hard cap over the
 entire rendered tool result, including headings and status markers.
 Scheduling charges completed responses with their quotation prefixes and host
 markers, plus any specialist notice, before starting queued work. Task labels

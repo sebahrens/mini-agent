@@ -296,6 +296,8 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
         .put("owner".into(), "\"outgoing\"".into())
         .unwrap();
     let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    #[cfg(not(unix))]
+    let mut sandbox = sandbox;
     #[cfg(unix)]
     let mut sandbox = sandbox.with_resolved_shell(Some(
         crate::sandbox::ShellCapability::resolve("/bin/sh", workspace.root(), None).unwrap(),
