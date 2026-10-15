@@ -860,6 +860,7 @@ fn in_one_frame<'a, T>(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_slash(
     text: &str,
     selected_session: Option<Box<Session>>,

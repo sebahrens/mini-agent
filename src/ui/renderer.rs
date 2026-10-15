@@ -4187,7 +4187,7 @@ mod frame_cost_tests {
             if token.contains('\n') || streamed < 200 {
                 renderer.render_viewport().unwrap();
             }
-            if tokens % 10 == 0 {
+            if tokens.is_multiple_of(10) {
                 renderer.paint_pending_chat().unwrap();
                 renderer.tick_spinner().unwrap();
             }
@@ -4968,7 +4968,7 @@ mod picker_overlay_tests {
             }
         }
         // The sessions picker draws ten entries under a three-row header.
-        assert!(10 + 3 <= PICKER_OVERLAY_MAX_ROWS);
+        const { assert!(10 + 3 <= PICKER_OVERLAY_MAX_ROWS) };
     }
 
     /// Rows a frame moved to column 0 of, from its `MoveTo(0, row)` sequences.

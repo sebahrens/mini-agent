@@ -155,9 +155,8 @@ async fn output_with_progress(
                 }
             }
             _ = async {
-                match due {
-                    Some(due) => tokio::time::sleep_until(due).await,
-                    None => {}
+                if let Some(due) = due {
+                    tokio::time::sleep_until(due).await;
                 }
             }, if pending => {
                 pending = false;

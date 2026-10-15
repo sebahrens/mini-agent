@@ -50,6 +50,7 @@ impl QuestionState {
         renderer.set_activity(super::terminal::AgentActivity::WaitingForUserAnswer)?;
         Ok(state)
     }
+    #[cfg(test)]
     pub(crate) fn abandoned(&self) -> bool {
         self.abandoned_with(true)
     }

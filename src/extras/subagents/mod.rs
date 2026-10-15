@@ -576,7 +576,7 @@ mod settings127_tests {
             ConfigLayer::Project,
         )
         .unwrap();
-        let before = serde_json::to_value(&installed.config).unwrap();
+        let before = serde_json::to_value(&*installed.config).unwrap();
         let sources = installed.config.provenance.sources.clone();
         for (key, literal) in [
             ("task_cost_weighting", "\"unknown\""),
@@ -593,7 +593,7 @@ mod settings127_tests {
                 apply_limit_setting_at(&mut installed, key, literal, ConfigLayer::Local).is_err(),
                 "{key}"
             );
-            assert_eq!(serde_json::to_value(&installed.config).unwrap(), before);
+            assert_eq!(serde_json::to_value(&*installed.config).unwrap(), before);
             assert_eq!(installed.config.provenance.sources, sources);
         }
     }

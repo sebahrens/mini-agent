@@ -2212,11 +2212,15 @@ impl<'a> App<'a> {
             Ok(context) => self.ui.adopt_session_start_context(context),
             #[cfg(not(feature = "hooks"))]
             Ok(never) => match never {},
+            #[cfg(feature = "hooks")]
             Err(error) => {
                 if let Some(owner) = &self.ui.native_startup {
                     owner.hook_retired(Err(error))?;
                 }
             }
+            // Without hooks no SessionStart task is ever spawned.
+            #[cfg(not(feature = "hooks"))]
+            Err(_) => {}
         }
         Ok(())
     }
@@ -2441,7 +2445,10 @@ impl<'a> App<'a> {
                         && !pending.stale
                         && Arc::ptr_eq(&pending.workspace, &self.ui.workspace)
                     {
+                        #[cfg(feature = "agent-skills")]
                         self.input.set_skill_commands(entries);
+                        #[cfg(not(feature = "agent-skills"))]
+                        let _ = entries;
                     }
                 }
                 Some(result) = async { Some(self.session_start_task.as_mut()?.await) } => {

@@ -524,6 +524,7 @@ impl Sanitized {
     }
 
     /// Whether the sanitised text contains a line break.
+    #[cfg(test)]
     pub fn has_newline(&self) -> bool {
         self.has_newline
     }

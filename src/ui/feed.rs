@@ -1909,6 +1909,7 @@ const MD_SEGMENT_COALESCE_ROWS: usize = 64;
 /// after it. Both belong to the fence's real close, so they are dropped
 /// whenever the region itself ends inside the fence and re-appear once a region
 /// contains the close (or is the last region of a running block).
+#[allow(clippy::too_many_arguments)]
 fn render_region(
     feed: &Feed,
     block: &Block,

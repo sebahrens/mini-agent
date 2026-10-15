@@ -1025,6 +1025,7 @@ fn icon_str(name: &str) -> &str {
 /// Resolve a powerline cap name to its glyph, or return the input unchanged so
 /// any literal string (including a raw Nerd Font codepoint) also works. These
 /// glyphs need a Nerd Font / Powerline-patched font to render.
+#[cfg(test)]
 pub fn powerline_glyph(name: &str) -> String {
     powerline_str(name).to_string()
 }

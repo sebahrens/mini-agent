@@ -262,6 +262,7 @@ async fn request(
 
 /// One bounded enumeration per accepted connection generation. A failed
 /// auxiliary catalogue does not discard the already connected tool service.
+#[cfg(test)]
 pub(crate) async fn discover(client: &McpClientHandle, timeout: Duration) -> Catalogue {
     let capabilities = client
         .peer()

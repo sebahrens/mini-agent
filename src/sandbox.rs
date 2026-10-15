@@ -1944,6 +1944,7 @@ impl Sandbox {
     /// canonical root was re-validated (pathname and directory identity) by
     /// `WorkspaceBinding::validate` at the top of the wrapping call, and the
     /// filesystem root is refused exactly like the unbound case.
+    #[cfg(test)]
     fn canonical_workspace_root(&self, requested_cwd: &Path) -> Result<PathBuf, String> {
         self.canonical_workspace_root_from(requested_cwd, None)
     }

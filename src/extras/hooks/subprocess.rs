@@ -80,6 +80,9 @@ impl HookPolicy {
 
     /// Resolve the project directory and explicit environment once for this
     /// policy. A different `project_dir` replaces the memo.
+    // The error is the hook's complete, already-rendered failure outcome,
+    // returned once per launch on a cold path.
+    #[allow(clippy::result_large_err)]
     fn launch_prep(&self, project_dir: &str) -> Result<Arc<HookLaunchPrep>, HookOutput> {
         let mut memo = self
             .prep
@@ -504,7 +507,7 @@ async fn run_hook_with_policy_and_limits(
     cmd.stderr(Stdio::piped());
     let spawn = match execution_root {
         Some(execution_root) => execution_root
-            .with_validated_root(&project_dir, || cmd.spawn_guarded())
+            .with_validated_root(project_dir, || cmd.spawn_guarded())
             .map_err(HookLaunchError::InvalidRoot)
             .and_then(|spawn| spawn.map_err(HookLaunchError::Spawn)),
         None => cmd.spawn_guarded().map_err(HookLaunchError::Spawn),
