@@ -1967,10 +1967,19 @@ mod extra_file_tests {
             &crate::cli::Cli::default(),
             None,
         );
+        let workspace = actual
+            .parts
+            .iter()
+            .find(|(name, _)| *name == "Workspace path")
+            .unwrap();
+        assert_eq!(
+            actual.text[workspace.1.clone()].trim(),
+            format!("Current working directory: {}", spelled.display())
+        );
         assert!(
-            actual
+            !actual
                 .text
-                .ends_with(&format!("Current working directory: {}", spelled.display()))
+                .contains("Sandboxed shell commands see this workspace at")
         );
         assert_eq!(binding.root(), real);
         assert_eq!(sandbox.shell_cwd_alias(), None);
