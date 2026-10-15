@@ -1551,12 +1551,16 @@ Homebrew and Apple command-line tools: `/opt/homebrew/Cellar`, its `opt` aliases
 `/Library/Developer/CommandLineTools`, Apple vendor frameworks under
 `/Library/Developer/PrivateFrameworks`, and the `Contents/Developer` and
 `Contents/SharedFrameworks` subtrees of system `/Applications/Xcode*.app`
-bundles. Only each such bundle's exact `Contents/Info.plist` metadata file is
-also readable; sibling files, other bundle contents, application bundles under
-user home directories, and the containing `/Applications` and `/Library`
-directories receive no subtree grant. These are read filters, not write roots.
+bundles. Only each such bundle's exact `Contents/Info.plist` metadata file and
+`Contents/Frameworks/libxcodebuildLoader.dylib` loader file are also readable.
+Canonical path lookup may inspect metadata on `/Applications` and the exact
+Xcode bundle and `Contents` ancestors; it does not grant their descendants
+metadata access or directory contents. Sibling files, other bundle contents,
+application bundles under user home directories, and the containing
+`/Applications` and `/Library` directories receive no subtree grant. These are read filters, not write roots.
 The exact developer-selector links
-at `/var/select/developer_dir` and its `/private` spelling are readable.
+at `/var/select/developer_dir` and `/var/select/sh`, with their `/private`
+spellings, are readable.
 Path normalization can inspect metadata on exact ancestors of the workspace,
 command cache and explicit roots. These metadata grants preserve the later
 private-path denials and do not expose parent-directory contents.

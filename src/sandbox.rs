@@ -5212,7 +5212,7 @@ fn seatbelt_profile_ladder(
             format!("(allow file-read-metadata{metadata_ancestors})\n")
         };
         format!(
-            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -8102,7 +8102,7 @@ echo COMMITTED"#;
             assert!(!rendered.contains("(subpath \"/\")"));
             assert!(!rendered.contains("(allow file-read-metadata)"));
             for runtime in [
-                "(allow file-read-metadata (literal \"/var\"))",
+                "(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))",
                 "(subpath \"/opt/homebrew/Cellar\")",
                 "(subpath \"/opt/homebrew/opt\")",
                 "(subpath \"/Library/Developer/CommandLineTools\")",
@@ -8110,6 +8110,9 @@ echo COMMITTED"#;
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")",
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")",
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")",
+                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$\")",
+                "(literal \"/var/select/sh\")",
+                "(literal \"/private/var/select/sh\")",
                 "(literal \"/var/select/developer_dir\")",
                 "(literal \"/private/var/select/developer_dir\")",
             ] {
@@ -8160,6 +8163,7 @@ echo COMMITTED"#;
             "^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)",
             "^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)",
             "^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$",
+            "^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$",
         ]
         .map(|pattern| regex::Regex::new(pattern).unwrap());
         for runtime in [
@@ -8167,6 +8171,7 @@ echo COMMITTED"#;
             "/Applications/Xcode_26.1.app/Contents/Developer",
             "/Applications/Xcode-beta.app/Contents/Developer/Toolchains",
             "/Applications/Xcode_16.4.app/Contents/Info.plist",
+            "/Applications/Xcode_26.6.app/Contents/Frameworks/libxcodebuildLoader.dylib",
             "/Applications/Xcode.app/Contents/SharedFrameworks",
             "/Applications/Xcode_16.4.app/Contents/SharedFrameworks/DVTSystemPrerequisites.framework/Versions/A/DVTSystemPrerequisites",
         ] {
@@ -8186,11 +8191,31 @@ echo COMMITTED"#;
             "/Applications/Xcode.app/Contents/PlugIns",
             "/Applications/Xcode.app/Contents/Info.plist.backup",
             "/Applications/Xcode.app/Contents/Info.plist/private",
+            "/Applications/Xcode.app/Contents/Frameworks/libxcodebuildLoader.dylib.backup",
+            "/Applications/Xcode.app/Contents/Frameworks/Other.dylib",
+            "/Users/person/Applications/Xcode.app/Contents/Frameworks/libxcodebuildLoader.dylib",
         ] {
             assert!(
                 !bundle_reads.iter().any(|filter| filter.is_match(outside)),
                 "{outside}"
             );
+        }
+        let bundle_metadata =
+            regex::Regex::new("^/Applications/Xcode[^/]*[.]app(/Contents)?$").unwrap();
+        for ancestor in [
+            "/Applications/Xcode.app",
+            "/Applications/Xcode_26.6.app/Contents",
+        ] {
+            assert!(bundle_metadata.is_match(ancestor), "{ancestor}");
+        }
+        for outside in [
+            "/Applications",
+            "/Applications/Other.app",
+            "/Applications/Xcode.app/Contents/Secrets",
+            "/Applications/Xcode.app/Contents/Developer",
+            "/Users/person/Applications/Xcode.app",
+        ] {
+            assert!(!bundle_metadata.is_match(outside), "{outside}");
         }
         let developer_frameworks = Path::new("/Library/Developer/PrivateFrameworks");
         assert!(
