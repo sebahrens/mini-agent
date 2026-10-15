@@ -215,6 +215,20 @@ class WindowsGitBootstrapTests(unittest.TestCase):
             with patch.object(MODULE.subprocess, "run", side_effect=failure), self.assertRaisesRegex(ValueError, "Required /usr/bin/cmp.*MSYS2 diffutils"):
                 MODULE.require_cmp(environment)
 
+    def test_required_pcre2_header_uses_exact_compiler_and_fixed_bounded_input(self):
+        environment = {"PATH": "/ucrt64/bin:/usr/bin:/bin"}
+        command = ["/ucrt64/bin/gcc", "-x", "c", "-fsyntax-only", "-"]
+        with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            MODULE.require_pcre2_header(Path("/ucrt64"), environment)
+        run.assert_called_once_with(command, input=b"#define PCRE2_CODE_UNIT_WIDTH 8\n#include <pcre2.h>\n",
+                                    env=environment, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=10, check=True)
+        for failure in [FileNotFoundError("gcc"), PermissionError("gcc"),
+                        subprocess.CalledProcessError(1, command),
+                        subprocess.TimeoutExpired(command, 10)]:
+            with self.subTest(failure=type(failure).__name__), patch.object(MODULE.subprocess, "run", side_effect=failure), self.assertRaisesRegex(ValueError, "Required UCRT64 pcre2.h.*mingw-w64-ucrt-x86_64-pcre2"):
+                MODULE.require_pcre2_header(Path("/ucrt64"), environment)
+
     def test_build_publishes_entire_dll_closure_and_cleans_version_failure(self):
         common = MODULE.common_module()
         producer = common.prepare_module()
@@ -236,6 +250,7 @@ class WindowsGitBootstrapTests(unittest.TestCase):
             if command[0].endswith("make"):
                 self.assertIn("NO_RUST=YesPlease", command)
                 self.assertIn("NO_OPENSSL=YesPlease", command)
+                self.assertFalse(any(argument.startswith("USE_LIBPCRE") for argument in command))
                 (cwd / "git.exe").write_bytes(pe_image(["libiconv-2.dll"]))
                 (cwd / "git-remote-http.exe").write_bytes(pe_image(["libcurl-4.dll"]))
             elif command[-1] == "--version":
@@ -243,12 +258,17 @@ class WindowsGitBootstrapTests(unittest.TestCase):
                 if cwd.name == "failed":
                     raise subprocess.CalledProcessError(1, command)
 
-        with patch.object(MODULE, "ROOT", self.root), patch.object(common, "ROOT", self.root), patch.object(MODULE, "common_module", return_value=common), patch.object(common, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "PATCH_SHA256", common.digest(policy.read_bytes())), patch.object(producer, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "prepare_module", return_value=producer), patch.object(MODULE, "toolchain_environment", return_value={"HOME": os.environ.get("HOME", ""), "SYSTEMROOT": "C:/Windows"}), patch.object(common, "run", side_effect=fake_run), patch.object(MODULE.subprocess, "check_output", return_value="/c/Windows\n"), patch.object(MODULE, "private_directory", side_effect=lambda path, env: path.mkdir(mode=0o700, exist_ok=True)), patch.object(common, "cache_lock", side_effect=AssertionError("fresh Windows builds must not use a POSIX-mode cache lock")):
+        with patch.object(MODULE, "ROOT", self.root), patch.object(common, "ROOT", self.root), patch.object(MODULE, "common_module", return_value=common), patch.object(common, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "PATCH_SHA256", common.digest(policy.read_bytes())), patch.object(producer, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "prepare_module", return_value=producer), patch.object(MODULE, "toolchain_environment", return_value={"HOME": os.environ.get("HOME", ""), "SYSTEMROOT": "C:/Windows"}), patch.object(MODULE, "require_pcre2_header"), patch.object(common, "run", side_effect=fake_run), patch.object(MODULE.subprocess, "check_output", return_value="/c/Windows\n"), patch.object(MODULE, "private_directory", side_effect=lambda path, env: path.mkdir(mode=0o700, exist_ok=True)), patch.object(common, "cache_lock", side_effect=AssertionError("fresh Windows builds must not use a POSIX-mode cache lock")):
             with patch.object(MODULE, "require_cmp", side_effect=ValueError("missing cmp")), patch.object(common, "run") as run:
                 with self.assertRaisesRegex(ValueError, "missing cmp"):
                     MODULE.bootstrap(output=self.root / "missing-cmp", **arguments)
                 run.assert_not_called()
                 self.assertFalse(arguments["cache_root"].exists(), "preflight must precede cache/build mutation")
+            with patch.object(MODULE, "require_pcre2_header", side_effect=ValueError("missing pcre2.h")), patch.object(common, "run") as run:
+                with self.assertRaisesRegex(ValueError, "missing pcre2.h"):
+                    MODULE.bootstrap(output=self.root / "missing-pcre2", **arguments)
+                run.assert_not_called()
+                self.assertFalse(arguments["cache_root"].exists(), "PCRE2 preflight must precede cache/build mutation")
             output = MODULE.bootstrap(output=self.root / "success", **arguments)
             self.assertEqual({p.name for p in output.iterdir()}, {"git.exe", "git-remote-http.exe", "git-remote-https.exe", "libcurl-4.dll", "libiconv-2.dll", "bundle.manifest"})
             self.assertEqual((output / "libcurl-4.dll").read_bytes(), (self.bin / "libcurl-4.dll").read_bytes())

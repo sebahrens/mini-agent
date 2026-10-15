@@ -109,6 +109,7 @@ Provision these signed MSYS2 packages in CI before invoking the helper:
       make patch python diffutils
       mingw-w64-ucrt-x86_64-gcc
       mingw-w64-ucrt-x86_64-curl-winssl
+      mingw-w64-ucrt-x86_64-pcre2
       mingw-w64-ucrt-x86_64-zlib
       mingw-w64-ucrt-x86_64-expat
       mingw-w64-ucrt-x86_64-libiconv
@@ -125,6 +126,10 @@ Provision these signed MSYS2 packages in CI before invoking the helper:
 
 Dependency acquisition belongs to the explicit publisher/CI step, not the source
 bootstrap. CI should retain its package/version inventory with build artifacts.
+The pinned MinGW configuration enables PCRE2; provision its UCRT64 headers and
+libraries rather than disabling that feature. Before allocating build staging,
+the helper checks the required header with the exact native compiler using a
+fixed syntax-only input and a ten-second bound. This probe produces no executable.
 Do not install the OpenSSL/gnutls curl variants alongside `curl-winssl`: the
 helper requires `curl-config --ssl-backends` to report Schannel only. The official
 [MSYS2 curl package recipe](https://github.com/msys2/MINGW-packages/blob/master/mingw-w64-curl/PKGBUILD)

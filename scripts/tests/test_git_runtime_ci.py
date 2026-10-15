@@ -244,6 +244,7 @@ class GitRuntimeCiTests(unittest.TestCase):
         steps = CHECK_PACKAGE_METADATA.parse_yaml_document(self.action)["runs"]["steps"]
         provision = next(step for step in steps if step.get("uses", "").startswith("msys2/setup-msys2@"))
         self.assertIn("diffutils", provision["with"]["install"].split())  # Git GIT-VERSION-GEN requires /usr/bin/cmp.
+        self.assertIn("mingw-w64-ucrt-x86_64-pcre2", provision["with"]["install"].split())
         for package in ["make patch python", "gcc", "curl-winssl", "zlib", "expat", "libiconv"]:
             self.assertIn(package, self.action)
         self.assertIn("shell: msys2 {0}", self.action)

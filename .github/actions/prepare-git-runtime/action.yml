@@ -39,6 +39,7 @@ runs:
           make patch python zstd diffutils
           mingw-w64-ucrt-x86_64-gcc
           mingw-w64-ucrt-x86_64-curl-winssl
+          mingw-w64-ucrt-x86_64-pcre2
           mingw-w64-ucrt-x86_64-zlib
           mingw-w64-ucrt-x86_64-expat
           mingw-w64-ucrt-x86_64-libiconv

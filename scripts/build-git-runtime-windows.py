@@ -275,6 +275,18 @@ def require_cmp(env: dict[str, str]) -> None:
         raise ValueError("Required /usr/bin/cmp is missing or unusable; install MSYS2 diffutils before building Git") from error
 
 
+def require_pcre2_header(prefix: Path, env: dict[str, str]) -> None:
+    # The pinned MinGW configuration enables PCRE2. Check its actual header
+    # with the already-validated compiler, without writing or running a binary.
+    source = b"#define PCRE2_CODE_UNIT_WIDTH 8\n#include <pcre2.h>\n"
+    try:
+        subprocess.run([str(prefix / "bin/gcc"), "-x", "c", "-fsyntax-only", "-"],
+                       input=source, env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("Required UCRT64 pcre2.h is missing or unusable; install mingw-w64-ucrt-x86_64-pcre2 before building Git") from error
+
+
 def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_root: Path, toolchain_prefix: Path, jobs: int) -> Path:
     if not 1 <= jobs <= 64:
         raise ValueError("Git bootstrap jobs must be between 1 and 64")
@@ -290,6 +302,7 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
         raise ValueError("Windows Git bundle output must not already exist")
     env = toolchain_environment(toolchain_prefix)
     require_cmp(env)
+    require_pcre2_header(toolchain_prefix, env)
     cache_root = cache_root.absolute()
     cache_root.parent.mkdir(parents=True, exist_ok=True)
     private_directory(cache_root, env)
