@@ -1408,3 +1408,104 @@ fn the_reasoning_clock_tick_rebuilds_only_the_header_row() {
         after_ptrs[1..after_ptrs.len() - 1]
     );
 }
+
+// --- cttyn.10: finalizing keeps the streamed stable segments ---
+
+#[track_caller]
+fn assert_same_rows_and_spans(actual: &FeedLines, expected: &FeedLines) {
+    assert_same_rows(actual, expected);
+    for index in 0..actual.len() {
+        assert_eq!(
+            actual[index].syntax_spans, expected[index].syntax_spans,
+            "row {index} syntax spans"
+        );
+    }
+}
+
+fn finalize_documents() -> Vec<String> {
+    let mut docs: Vec<String> = vec![
+        "# Heading\n\nSome **bold** text.\n\n```rust\nfn main() {\n    let x = \"雪\";\n}\n```\n\n- a\n- b\n\nclosing tail".into(),
+        "intro\n\n```python\ndef f():\n\n    return 1\n".into(),
+        "1. one\n\n2. two\n\n   continued\n\nafter the list\n".into(),
+        "> quote one\n> quote two\n\nplain\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\ntail without newline".into(),
+        "    indented code\n\n    more code\n\nparagraph\n".into(),
+        "Setext\n===\n\ntext `code` and [link](https://example.com)\n".into(),
+        "~~~\nunterminated tilde fence\n\nstill code".into(),
+    ];
+    // A long unbroken paragraph and list cross MAX_UNSTABLE_WINDOW.
+    docs.push(format!("{}\n\nend\n", "word ".repeat(2000).trim_end()));
+    docs.push(
+        (0..400)
+            .map(|i| format!("- item {i} with text\n"))
+            .collect(),
+    );
+    // Document-level definitions and HTML blocks.
+    docs.push("See [foo] and [bar].\n\nmore\n\n[foo]: https://x.test\n\nthen [foo] again\n".into());
+    docs.push("text[^1]\n\n[^1]: note\n\nafter [^1]\n".into());
+    docs.push("<!-- comment\n\nstill comment -->\n\nvisible\n".into());
+    docs.push("<pre>\nline\n\nline\n</pre>\n\nafter\n".into());
+    docs
+}
+
+#[test]
+fn finalized_streams_match_a_fresh_parse_for_any_chunking() {
+    for doc in finalize_documents() {
+        for step in [1usize, 5, 17, 4096] {
+            let mut feed = Feed::new();
+            feed.push_streaming_block(BlockStyle::Agent);
+            let mut start = 0;
+            while start < doc.len() {
+                let mut end = (start + step).min(doc.len());
+                while !doc.is_char_boundary(end) {
+                    end += 1;
+                }
+                assert!(feed.append_to_last(&doc[start..end]));
+                let _ = feed.lines(80);
+                start = end;
+            }
+            feed.finalize_last();
+            let mut fresh = Feed::new();
+            fresh.push_block(BlockStyle::Agent, doc.as_str());
+            assert_same_rows_and_spans(&feed.lines(80), &fresh.lines(80));
+        }
+    }
+}
+
+#[test]
+fn finalizing_reparses_only_the_tail_after_the_last_stable_boundary() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    for para in 0..50 {
+        assert!(feed.append_to_last(format!("paragraph {para} has some words\n\n")));
+        let _ = feed.lines(80);
+    }
+    let tail = "and the final unfinished line";
+    assert!(feed.append_to_last(tail));
+    let _ = feed.lines(80);
+    let before = feed.markdown_bytes_parsed();
+    feed.finalize_last();
+    let finalized = feed.lines(80);
+    assert_eq!(feed.markdown_bytes_parsed() - before, tail.len());
+
+    let mut fresh = Feed::new();
+    fresh.push_block(BlockStyle::Agent, feed.block_text(0).unwrap());
+    assert_same_rows_and_spans(&finalized, &fresh.lines(80));
+}
+
+#[test]
+fn finalizing_a_block_with_a_reference_definition_reparses_it_whole() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let text = "[foo]: https://x.test\n\nlater [foo] here\n";
+    for line in text.split_inclusive('\n') {
+        assert!(feed.append_to_last(line));
+        let _ = feed.lines(80);
+    }
+    let before = feed.markdown_bytes_parsed();
+    feed.finalize_last();
+    let finalized = feed.lines(80);
+    assert!(feed.markdown_bytes_parsed() - before >= text.len());
+    let mut fresh = Feed::new();
+    fresh.push_block(BlockStyle::Agent, text);
+    assert_same_rows_and_spans(&finalized, &fresh.lines(80));
+}

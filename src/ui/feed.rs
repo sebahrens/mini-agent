@@ -227,6 +227,10 @@ struct MdCache {
     parsed_len: usize,
     /// Rows for text[stable_len..parsed_len].
     suffix: Arc<Vec<LineEntry>>,
+    /// Whether a stable region ended at a boundary forced by
+    /// `MAX_UNSTABLE_WINDOW`. Such a split can render differently from a
+    /// whole-text parse, so finalizing the block must re-parse from scratch.
+    forced_split: bool,
 }
 
 impl MdCache {
@@ -737,8 +741,14 @@ impl Feed {
             {
                 reasoning.elapsed_secs = Some(started.elapsed().as_secs());
             }
-            // Re-layout the completed Markdown; exact syntax rows remain reusable.
-            *block.md_cache.borrow_mut() = None;
+            // The streamed stable segments are exactly what a whole-text parse
+            // produces, so finalizing re-parses only from the last stable
+            // boundary (the former tail included) on the next layout. A
+            // document-level construct the region split cannot reproduce
+            // forces the full re-parse; exact syntax rows remain reusable.
+            if finalize_needs_full_parse(block) {
+                *block.md_cache.borrow_mut() = None;
+            }
             *block.render_cache.borrow_mut() = None;
         }
         self.prune_completed_prefix();
@@ -1337,7 +1347,7 @@ fn find_stable_boundary(
     start: usize,
     up_to: usize,
     entry_fence: Option<&OpenFence>,
-) -> (usize, Option<OpenFence>) {
+) -> (usize, Option<OpenFence>, bool) {
     let up_to = up_to.min(text.len());
     let start = start.min(up_to);
     let search_text = &text[start..up_to];
@@ -1352,6 +1362,8 @@ fn find_stable_boundary(
     // still open (closing a replayable fence moves the boundary past it), so a
     // flag replaces cloning the fence for every code line.
     let mut stable_in_open_fence = fence.is_some();
+    // Whether `last_stable_pos` was last set by the forced-window rule.
+    let mut stable_forced = false;
     let mut byte_pos = start;
 
     // split_inclusive excludes a synthetic empty line after a trailing newline,
@@ -1370,10 +1382,12 @@ fn find_stable_boundary(
                 fence = None;
                 if replayable {
                     last_stable_pos = line_end;
+                    stable_forced = false;
                     stable_in_open_fence = false;
                 }
             } else if replayable {
                 last_stable_pos = line_end;
+                stable_forced = false;
                 stable_in_open_fence = true;
             }
             byte_pos = line_end;
@@ -1390,6 +1404,7 @@ fn find_stable_boundary(
                 deferred_blank.get_or_insert(line_end);
             } else {
                 last_stable_pos = line_end;
+                stable_forced = false;
                 stable_in_open_fence = false;
             }
             byte_pos = line_end;
@@ -1401,6 +1416,7 @@ fn find_stable_boundary(
             let continues_indented_code = in_indented_code && indent >= 4;
             if !continues_list && !continues_indented_code {
                 last_stable_pos = blank_end;
+                stable_forced = false;
                 stable_in_open_fence = false;
                 in_list = false;
                 in_indented_code = false;
@@ -1416,6 +1432,7 @@ fn find_stable_boundary(
             };
             if open.replayable {
                 last_stable_pos = line_end;
+                stable_forced = false;
                 stable_in_open_fence = true;
             }
             fence = Some(open);
@@ -1432,6 +1449,7 @@ fn find_stable_boundary(
 
         if line_end - last_stable_pos > MAX_UNSTABLE_WINDOW {
             last_stable_pos = line_end;
+            stable_forced = true;
             stable_in_open_fence = false;
             in_list = false;
             in_indented_code = false;
@@ -1442,7 +1460,7 @@ fn find_stable_boundary(
     }
 
     let last_stable_fence = if stable_in_open_fence { fence } else { None };
-    (last_stable_pos, last_stable_fence)
+    (last_stable_pos, last_stable_fence, stable_forced)
 }
 
 /// Largest run of text without a natural markdown boundary that is re-parsed on
@@ -1462,6 +1480,30 @@ fn is_list_item(trimmed: &str) -> bool {
         && trimmed
             .get(digit_count..)
             .is_some_and(|suffix| suffix.starts_with(". ") || suffix.starts_with(") "))
+}
+
+/// Whether a finalized block's streamed markdown layout can differ from a
+/// parse of its whole text, so the stable segments must be discarded:
+/// - a link or footnote definition applies to references in other regions,
+///   including later ones parsed on their own;
+/// - a boundary forced by `MAX_UNSTABLE_WINDOW` split a construct;
+/// - an HTML block (a line opening with `<`) such as a comment or `<pre>` may
+///   run across the blank lines the boundary scan treats as final.
+fn finalize_needs_full_parse(block: &Block) -> bool {
+    if block.style != BlockStyle::Agent {
+        return false;
+    }
+    let forced = block
+        .md_cache
+        .borrow()
+        .as_ref()
+        .is_some_and(|cache| cache.forced_split);
+    forced
+        || contains_global_markdown_definition(&block.text)
+        || block.text.lines().any(|line| {
+            let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            indent <= 3 && line[indent..].starts_with('<')
+        })
 }
 
 /// Link and footnote definitions can change the rendering of references that
@@ -1590,6 +1632,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
                         cache.stable_segments.clone(),
                         cache.has_rows(),
                         cache.parsed_len,
+                        cache.forced_split,
                     )
                 })
         })
@@ -1605,8 +1648,9 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             stable_segments,
             has_rows,
             previous_parsed_len,
+            previous_forced,
         )| {
-            let (stable_len, stable_fence) = find_stable_boundary(
+            let (stable_len, stable_fence, forced) = find_stable_boundary(
                 &block.text,
                 previous_stable_len,
                 completed_len,
@@ -1629,6 +1673,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
                 has_rows,
                 stable_len,
                 stable_fence,
+                previous_forced || (forced && stable_len > previous_stable_len),
             ))
         },
     );
@@ -1641,6 +1686,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         mut has_rows,
         stable_len,
         stable_fence,
+        forced_split,
     )) = incremental
     {
         if stable_len > previous_stable_len {
@@ -1687,6 +1733,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             stable_segments,
             parsed_len: completed_len,
             suffix: Arc::new(suffix),
+            forced_split,
         };
         let segments = cache.segments();
         *block.md_cache.borrow_mut() = Some(cache);
@@ -1695,7 +1742,8 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
 
     // Full re-parse: a new stable boundary must be established, or the width
     // changed and every row has to be laid out again.
-    let (stable_len, stable_fence) = find_stable_boundary(&block.text, 0, completed_len, None);
+    let (stable_len, stable_fence, forced_split) =
+        find_stable_boundary(&block.text, 0, completed_len, None);
     let mut stable_segments: Vec<Arc<Vec<LineEntry>>> = Vec::new();
     let mut has_rows = false;
     let mut stable_code = None;
@@ -1742,6 +1790,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         stable_segments,
         parsed_len: completed_len,
         suffix: Arc::new(suffix),
+        forced_split,
     };
     let segments = cache.segments();
     *block.md_cache.borrow_mut() = Some(cache);

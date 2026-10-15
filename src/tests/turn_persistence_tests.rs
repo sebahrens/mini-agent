@@ -557,3 +557,145 @@ fn hooks60_pending_notice_only_failure_rolls_back_exact_literal_turn() {
         assert_eq!(serde_json::to_value(&session).unwrap(), before);
     }
 }
+
+/// cttyn.10: the final response is painted before `Done` waits for the agent
+/// task to settle, so a slow retirement never holds back the last tokens.
+#[tokio::test]
+async fn done_paints_the_final_tokens_before_the_agent_task_settles() {
+    use crate::event::AgentEvent;
+    use crate::ui::state::{AgentRunState, ChainState, PendingMainTurn, SlashState, UiContext};
+    use clap::Parser;
+
+    let mut session = session();
+    let workspace = std::sync::Arc::new(
+        crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+    );
+    let mut context = crate::context::ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
+        workspace_root: workspace.root().to_path_buf(),
+        agents: None,
+        instruction_roots: Vec::new(),
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    let cli = crate::cli::Cli::parse_from(["mini-agent", "--no-session"]);
+    let cfg = crate::config::Config::default();
+    let client = crate::provider::AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap(),
+    );
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "answer it");
+    crate::ui::mark_main_turn_started(&mut session, &mut run, pending);
+    run.is_running = true;
+    // The agent task is still alive: settling waits until it drops its sender.
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel::<AgentEvent>(1);
+    run.agent_rx = Some(events_rx);
+    let mut ui = UiContext::new(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+        client,
+        None,
+        None,
+        crate::sandbox::Sandbox::new(false, "bwrap"),
+        None,
+    );
+    let mut renderer = crate::ui::renderer::Renderer::for_app_test().unwrap();
+    let capture = renderer.capture_bytes();
+    let slash = SlashState {
+        show_reasoning: false,
+        reasoning_enabled: false,
+        todo_tools_enabled: false,
+    };
+    let mut chain = ChainState::default();
+    #[cfg(any(feature = "loop", feature = "goal"))]
+    let (validation_tx, _validation_rx) = tokio::sync::mpsc::channel(1);
+
+    // A long first line is painted; the short last token arrives inside the
+    // repaint interval and stays unpainted until the turn finalizes.
+    let first = format!("{}\n", "word ".repeat(50));
+    let last = "zebra-final";
+    let saw_last = move |capture: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+        String::from_utf8_lossy(&capture.lock().unwrap()).contains(last)
+    };
+    for event in [
+        AgentEvent::Token(first.clone().into()),
+        AgentEvent::Token(last.into()),
+    ] {
+        crate::ui::event_handler::handle_agent_event(
+            event,
+            &mut renderer,
+            &mut run,
+            &mut ui,
+            &slash,
+            &mut chain,
+            #[cfg(any(feature = "loop", feature = "goal"))]
+            &validation_tx,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        !saw_last(&capture),
+        "the throttled token is not painted yet"
+    );
+
+    // Stand-in for the agent task's retirement: it finishes only after the
+    // final token is on screen (or gives up, failing the assertion below).
+    let watcher = tokio::spawn({
+        let capture = capture.clone();
+        async move {
+            let mut painted = false;
+            for _ in 0..200 {
+                if saw_last(&capture) {
+                    painted = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            drop(events_tx);
+            painted
+        }
+    });
+    crate::ui::event_handler::handle_agent_event(
+        AgentEvent::Done {
+            response: format!("{first}{last}").into(),
+            interactions: Vec::new(),
+        },
+        &mut renderer,
+        &mut run,
+        &mut ui,
+        &slash,
+        &mut chain,
+        #[cfg(any(feature = "loop", feature = "goal"))]
+        &validation_tx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        watcher.await.unwrap(),
+        "the final token was painted before the agent task settled"
+    );
+    assert!(run.agent_rx.is_none());
+}

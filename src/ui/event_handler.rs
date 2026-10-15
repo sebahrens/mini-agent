@@ -604,6 +604,12 @@ async fn handle_agent_done(
     // startup, or worktree-return presentation fails afterward.
     commit_turn_response(ui.session, &response, &interactions);
     ui.session.reanchor_calibration_to_current_messages();
+    // Paint the complete answer before retiring the agent task: settling can
+    // wait up to its timeout for the task to drain, and the last tokens must
+    // not sit unpainted meanwhile. Settling drains and discards events only,
+    // so it never changes what is painted. A paint failure is reported after
+    // retirement, which must run either way.
+    let painted = finalize_response_segment(renderer, run);
     run.settle(std::time::Duration::from_secs(5)).await?;
     crate::ui::settle_native_main_turn(
         run,
@@ -611,8 +617,7 @@ async fn handle_agent_done(
         crate::session::native_replay::RetiredNativeOutcome::Completed,
     )
     .await?;
-
-    finalize_response_segment(renderer, run)?;
+    painted?;
     if run.response_buf.is_empty() && !run.agent_line_started {
         renderer.feed_mut().push_line(BlockStyle::Agent, "< ");
     }
