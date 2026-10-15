@@ -2630,7 +2630,10 @@ impl<'a> App<'a> {
         }
 
         #[cfg(feature = "subagents")]
-        self.ui.session.close_background_tasks().await;
+        self.ui
+            .session
+            .close_background_tasks_within(TEARDOWN_TIMEOUT)
+            .await;
         #[cfg(feature = "lsp")]
         crate::extras::lsp::shutdown_live_managers().await;
         #[cfg(feature = "mcp")]
