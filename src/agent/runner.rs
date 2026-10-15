@@ -1657,11 +1657,56 @@ impl SubagentAdmission {
     }
 }
 
+/// The local input-token estimate of one prepared request, shared by every
+/// subagent hook that observes `CompletionRequestPrepared` in the same run.
+///
+/// rig advances the one-based turn for every model call (including retries and
+/// continuations) and emits exactly one prepared event per call, so
+/// `(turn, request address)` inside one run-scoped `HookContext` names exactly
+/// one prepared request. The first observer serializes it; later observers of
+/// the same event reuse that estimate instead of re-serializing the preamble,
+/// full history and every tool definition.
+#[cfg(feature = "subagents")]
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedRequestEstimate {
+    turn: usize,
+    request: usize,
+    input_tokens: Option<u64>,
+    /// Serializations performed in this run; observed by tests.
+    pub(crate) serializations: u64,
+}
+
+#[cfg(feature = "subagents")]
+pub(crate) fn prepared_request_input_estimate(
+    ctx: &rig::agent::HookContext,
+    request: &rig::completion::CompletionRequest,
+    turn: usize,
+) -> Option<u64> {
+    let address = std::ptr::from_ref(request) as usize;
+    let previous = ctx.scratchpad().get::<PreparedRequestEstimate>();
+    if let Some(cached) = previous
+        && cached.turn == turn
+        && cached.request == address
+    {
+        return cached.input_tokens;
+    }
+    let input_tokens = serde_json::to_string(request)
+        .ok()
+        .map(|text| crate::session::Session::estimate_tokens(&text));
+    ctx.scratchpad().insert(PreparedRequestEstimate {
+        turn,
+        request: address,
+        input_tokens,
+        serializations: previous.map_or(0, |cached| cached.serializations) + 1,
+    });
+    input_tokens
+}
+
 #[cfg(feature = "subagents")]
 impl<M: CompletionModel> rig::agent::AgentHook<M> for SharedUsageLedger {
     async fn on_event(
         &self,
-        _: &rig::agent::HookContext,
+        ctx: &rig::agent::HookContext,
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
         use rig::agent::{Flow, StepEvent};
@@ -1674,11 +1719,9 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for SharedUsageLedger {
             {
                 Flow::terminate("task cost-unit budget exhausted")
             }
-            StepEvent::CompletionRequestPrepared { request, .. } => {
-                let input_tokens = serde_json::to_string(request)
-                    .ok()
-                    .map(|text| crate::session::Session::estimate_tokens(&text))
-                    .unwrap_or(u64::MAX);
+            StepEvent::CompletionRequestPrepared { request, turn } => {
+                let input_tokens =
+                    prepared_request_input_estimate(ctx, request, turn).unwrap_or(u64::MAX);
                 let output_tokens = request.max_tokens.unwrap_or(0);
                 let fallback = Usage {
                     input_tokens,

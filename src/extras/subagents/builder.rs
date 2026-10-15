@@ -44,13 +44,12 @@ struct ChildContextGuard {
 impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
     async fn on_event(
         &self,
-        _: &rig::agent::HookContext,
+        ctx: &rig::agent::HookContext,
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
-        if let rig::agent::StepEvent::CompletionRequestPrepared { request, .. } = event {
-            let estimated = serde_json::to_string(request)
-                .ok()
-                .map(|text| crate::session::Session::estimate_tokens(&text));
+        if let rig::agent::StepEvent::CompletionRequestPrepared { request, turn } = event {
+            let estimated =
+                crate::agent::runner::prepared_request_input_estimate(ctx, request, turn);
             if estimated.is_none_or(|input| {
                 input.saturating_add(request.max_tokens.unwrap_or(0)) > self.window
             }) {
@@ -1924,6 +1923,90 @@ mod settings127_context_tests {
             super::child_context_window(&client.completion_model("known-child"), &cfg),
             77_000
         );
+    }
+
+    /// Observes the shared estimate after both prepared-request hooks ran.
+    #[derive(Clone, Default)]
+    struct SerializationProbe(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+    impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for SerializationProbe {
+        async fn on_event(
+            &self,
+            ctx: &rig::agent::HookContext,
+            event: rig::agent::StepEvent<'_, M>,
+        ) -> rig::agent::Flow {
+            if let rig::agent::StepEvent::CompletionRequestPrepared { .. } = event {
+                let count = ctx
+                    .scratchpad()
+                    .get::<crate::agent::runner::PreparedRequestEstimate>()
+                    .map_or(0, |estimate| estimate.serializations);
+                self.0.lock().unwrap().push(count);
+            }
+            rig::agent::Flow::cont()
+        }
+        fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+            kind == rig::agent::StepEventKind::CompletionRequestPrepared
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_request_is_serialized_once_for_context_guard_and_usage_ledger() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("probe-1", "context_probe", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("ok"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble("small")
+            .max_tokens(1024)
+            .tool(MockExtensionsProbeTool::default())
+            .default_max_turns(4)
+            .add_hook(ChildContextGuard { window: 1_000_000 })
+            .build();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let admission = crate::agent::runner::SubagentAdmission::new(|| true, {
+            let observed = observed.clone();
+            move |_, fallback| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((fallback.input_tokens, fallback.output_tokens))
+            }
+        });
+        let ledger = crate::agent::runner::SharedUsageLedger::default().with_admission(admission);
+        let probe = SerializationProbe::default();
+        let mut stream = agent
+            .stream_chat("brief", Vec::<rig::completion::Message>::new())
+            .add_hook(ledger.clone())
+            .add_hook(probe.clone())
+            .await;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(rig::agent::MultiTurnStreamItem::CompletionCall(call)) => {
+                    ledger.record_completion(call.usage)
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected stream error: {error}"),
+            }
+        }
+        assert_eq!(model.request_count(), 2);
+        // One serialization per prepared request, shared by both hooks.
+        assert_eq!(*probe.0.lock().unwrap(), vec![1, 2]);
+        // The ledger's text fallback is the same estimate the guard admitted.
+        let requests = model.requests();
+        let fallbacks = observed.lock().unwrap().clone();
+        assert_eq!(fallbacks.len(), 2);
+        for ((input, output), request) in fallbacks.into_iter().zip(requests.iter()) {
+            assert_eq!(
+                input,
+                crate::session::Session::estimate_tokens(&serde_json::to_string(request).unwrap())
+            );
+            assert_eq!(output, 1024);
+        }
     }
 
     #[tokio::test]
