@@ -378,6 +378,7 @@ win where applicable. Windows environment names are case-insensitive.
 |---|---|
 | `HOME`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | Home expansion and platform persistence defaults, through the directory library. Application root overrides above win. |
 | `PATH`, `PATHEXT`, `CARGO_HOME` | Executable lookup, Windows executable suffixes, and Windows worker installed/development executable discovery. Selected executable identities are still checked by their launch boundary. |
+| `RUSTUP_HOME` | Installed rustup settings/toolchain root used by the native Linux HostRead Cargo acceptance fixture; defaults to `HOME/.rustup`. This does not change application storage, subprocess inheritance, or sandbox grants. |
 | `USER`, `USERNAME`, `HOSTNAME`, `HOST` | User/host statusline labels; the first available name in each pair is used. |
 | `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, `NO_COLOR` | Non-credential platform/terminal inputs preserved only by the relevant subprocess allow-list; terminal libraries can also consult them. |
 | `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | Desktop clipboard IPC inputs inherited only by the fixed image clipboard helper. Presence of `WAYLAND_DISPLAY` selects `wl-paste`; otherwise Linux uses `xclip`. These do not enable background clipboard reads. |
