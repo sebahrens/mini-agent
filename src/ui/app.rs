@@ -692,6 +692,9 @@ struct EventLoopState {
     /// The model last handed to the model picker, so unchanged frames do not
     /// allocate it again.
     synced_model: Option<compact_str::CompactString>,
+    /// Last MCP prompt-source revalidation; the expensive check runs at most
+    /// once per second while the cheap reply/owner checks run every pass.
+    last_source_revalidation: Option<std::time::Instant>,
     #[cfg(test)]
     frames: usize,
 }
@@ -2095,9 +2098,14 @@ impl<'a> App<'a> {
         loop {
             // Source revalidation follows the existing 1 s tick below; the
             // cheap reply/owner checks still run on every iteration.
-            self.expire_abandoned_prompts(
-                self.last_branch_check.elapsed() >= Duration::from_secs(1),
-            )?;
+            let revalidate = self
+                .loop_state
+                .last_source_revalidation
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+            if revalidate {
+                self.loop_state.last_source_revalidation = Some(std::time::Instant::now());
+            }
+            self.expire_abandoned_prompts(revalidate)?;
             #[cfg(feature = "subagents")]
             if self.permission_prompt.is_none()
                 && self.question_prompt.is_none()
