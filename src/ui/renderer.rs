@@ -259,6 +259,15 @@ pub(crate) enum BottomRedrawPlan {
     Full,
 }
 
+/// Memoized input wrap layout (see `Renderer::input_layout`).
+#[derive(Clone)]
+struct InputLayout {
+    width: usize,
+    text: Arc<str>,
+    hash: u64,
+    rows: Arc<Vec<crate::ui::input::wrap::VisualRow>>,
+}
+
 /// One statusline row as painted, keyed by everything that shapes it.
 struct FittedStatusRow {
     key: u64,
@@ -608,6 +617,7 @@ pub(crate) struct OutputCounters {
     bottom_full_paints: std::sync::atomic::AtomicUsize,
     bottom_statusline_paints: std::sync::atomic::AtomicUsize,
     statusline_fits: std::sync::atomic::AtomicUsize,
+    input_layouts: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -637,6 +647,8 @@ pub(crate) struct FrameStats {
     pub(crate) bottom_statusline_paints: usize,
     /// Statusline rows fitted and painted (not served from the row cache).
     pub(crate) statusline_fits: usize,
+    /// Input wrap layouts computed (not served from the memo).
+    pub(crate) input_layouts: usize,
 }
 
 #[cfg(test)]
@@ -653,6 +665,7 @@ impl FrameStats {
             bottom_statusline_paints: self.bottom_statusline_paints
                 - earlier.bottom_statusline_paints,
             statusline_fits: self.statusline_fits - earlier.statusline_fits,
+            input_layouts: self.input_layouts - earlier.input_layouts,
         }
     }
 }
@@ -798,6 +811,8 @@ pub struct Renderer {
     bottom_dirty: bool,
     last_bottom_snapshot: Option<BottomSnapshot>,
     statusline_cache: Option<StatuslineCache>,
+    /// Last input wrap layout (see `input_layout`).
+    input_layout: std::cell::RefCell<Option<InputLayout>>,
     /// Painted statusline rows by row index (see `draw_statusline`).
     statusline_rows: std::cell::RefCell<Vec<Option<FittedStatusRow>>>,
     #[cfg(test)]
@@ -941,6 +956,7 @@ impl Renderer {
             last_bottom_snapshot: None,
             statusline_cache: None,
             statusline_rows: std::cell::RefCell::new(Vec::new()),
+            input_layout: std::cell::RefCell::new(None),
             #[cfg(test)]
             statusline_builds: 0,
             bottom_cursor: None,
@@ -1114,6 +1130,7 @@ impl Renderer {
             bottom_full_paints: c.bottom_full_paints.load(Relaxed),
             bottom_statusline_paints: c.bottom_statusline_paints.load(Relaxed),
             statusline_fits: c.statusline_fits.load(Relaxed),
+            input_layouts: c.input_layouts.load(Relaxed),
         }
     }
 
@@ -1509,10 +1526,35 @@ impl Renderer {
         let available_rows = rows.saturating_sub(self.statusline_reserve()) as usize;
         let max_input_rows = available_rows.min((available_rows * 3 / 10).max(5));
         let (cols, _) = self.terminal_size();
-        crate::ui::input::wrap::wrap_rows(input_line, input_text_width(cols))
+        self.input_layout(input_line, input_text_width(cols))
+            .rows
             .len()
             .min(max_input_rows)
             .max(1)
+    }
+
+    /// The soft-wrapped rows of `input` at `width` and the input's hash,
+    /// computed once per distinct (input, width) and shared by height
+    /// reconciliation, bottom drawing, the redraw snapshot and click
+    /// mapping. Validating the memo is one string comparison.
+    fn input_layout(&self, input: &str, width: usize) -> InputLayout {
+        let mut memo = self.input_layout.borrow_mut();
+        if let Some(layout) = memo.as_ref()
+            && layout.width == width
+            && *layout.text == *input
+        {
+            return layout.clone();
+        }
+        #[cfg(test)]
+        OutputCounters::bump(&self.test_counters.input_layouts, 1);
+        let layout = InputLayout {
+            width,
+            text: Arc::from(input),
+            hash: hash_value(input),
+            rows: Arc::new(crate::ui::input::wrap::wrap_rows(input, width)),
+        };
+        *memo = Some(layout.clone());
+        layout
     }
 
     /// Display width the input text soft-wraps at (the terminal width less
@@ -1710,7 +1752,7 @@ impl Renderer {
         let visible_idx = (row - self.input_base_row) as usize;
         let row_idx = self.input_first_visible + visible_idx;
         let (cols, _) = self.terminal_size();
-        let layout = crate::ui::input::wrap::wrap_rows(input_line, input_text_width(cols));
+        let layout = self.input_layout(input_line, input_text_width(cols)).rows;
         layout.get(row_idx)?;
         // Display column the click lands on, within the row's text. Clicks on
         // the prompt (or to its left) snap to the start of the row.
@@ -2268,7 +2310,7 @@ impl Renderer {
             cols,
             rows,
             statusline_height: self.statusline_height,
-            input_hash: hash_value(input_line),
+            input_hash: self.input_layout(input_line, input_text_width(cols)).hash,
             cursor_pos,
             is_running,
             spinner_frame: self.spinner_frame,
@@ -2453,7 +2495,7 @@ impl Renderer {
         // Soft-wrap: every logical line becomes one or more visual rows no
         // wider than the text area (see `crate::ui::input::wrap`).
         let visible_width = input_text_width(cols);
-        let layout = crate::ui::input::wrap::wrap_rows(input_line, visible_width);
+        let layout = self.input_layout(input_line, visible_width).rows;
         let line_count = layout.len();
 
         let available_rows = (rows.saturating_sub(reserve) as usize).max(1);
@@ -4136,6 +4178,36 @@ mod frame_buffer_tests {
         draw(&mut renderer, "draft text", 0, 8);
         assert_eq!(renderer.frame_stats().since(before).statusline_fits, 1);
         assert!(renderer.captured_output().contains("-- SCROLL --"));
+    }
+
+    #[test]
+    fn a_refresh_wraps_the_input_once_and_a_click_reuses_that_layout() {
+        let mut renderer = filled_renderer();
+        let long = "word ".repeat(200);
+        let refresh = |renderer: &mut Renderer, input: &str, cursor: usize| {
+            renderer
+                .frame(|r| {
+                    r.sync_input_height(input)?;
+                    r.render_viewport()?;
+                    r.draw_bottom(input, cursor, &[], 0, false)
+                })
+                .unwrap();
+        };
+        refresh(&mut renderer, &long, long.len());
+        let before = renderer.frame_stats();
+        let mut typed = long.clone();
+        for ch in "abc".chars() {
+            typed.push(ch);
+            refresh(&mut renderer, &typed, typed.len());
+        }
+        assert_eq!(renderer.frame_stats().since(before).input_layouts, 3);
+        let before = renderer.frame_stats();
+        for cursor in [0, 5, 10] {
+            refresh(&mut renderer, &typed, cursor);
+        }
+        let base = renderer.input_base_row;
+        assert!(renderer.input_cursor_for_click(base, 4, &typed).is_some());
+        assert_eq!(renderer.frame_stats().since(before).input_layouts, 0);
     }
 
     #[test]
