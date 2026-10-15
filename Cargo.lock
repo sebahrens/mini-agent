@@ -3343,6 +3343,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rig-core",
+ "ring",
  "rmcp",
  "rquickjs",
  "rusqlite",

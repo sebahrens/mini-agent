@@ -84,6 +84,27 @@ pub enum OutputFormat {
 pub struct Cli {
     #[arg(
         long,
+        value_name = "PROVIDER",
+        conflicts_with = "logout",
+        help = "Sign in to a provider account and exit (openai)"
+    )]
+    pub login: Option<String>,
+    #[arg(
+        long,
+        value_name = "NEW_OR_NUMBER",
+        requires = "login",
+        help = "Choose a saved ChatGPT registration, or new"
+    )]
+    pub login_account: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        conflicts_with = "login",
+        help = "Sign out of a provider account and exit (openai)"
+    )]
+    pub logout: Option<String>,
+    #[arg(
+        long,
         value_enum,
         exclusive = true,
         help = "Print a shell completion script and exit"

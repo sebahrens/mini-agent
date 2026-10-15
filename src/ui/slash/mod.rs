@@ -824,8 +824,10 @@ fn takes_path_args(command: &str) -> bool {
 /// its own split). Subagent model commands are routed in every build so a
 /// build without the feature can say so instead of doing nothing.
 pub(crate) fn routes_to_providers(command: &str) -> bool {
-    matches!(command, "/provider" | "/model" | "/models")
-        || providers::subagent_model_command(command).is_some()
+    matches!(
+        command,
+        "/provider" | "/model" | "/models" | "/login" | "/logout"
+    ) || providers::subagent_model_command(command).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]

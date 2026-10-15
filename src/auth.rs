@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::env::VarError;
 
+pub(crate) mod oauth;
+pub(crate) mod openai_plan;
+
 /// Kind of AI provider
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {

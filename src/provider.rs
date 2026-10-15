@@ -543,6 +543,9 @@ pub(crate) fn openai_completions_extra_body(
 }
 
 impl AnyClient {
+    pub(crate) fn uses_chatgpt_plan(&self) -> bool {
+        matches!(self, Self::OpenAI(OpenAiClient::Responses(client)) if client.http_client().is_chatgpt())
+    }
     /// Classify the actual adapter; logical aliases and model names are not
     /// replay authority. This does not attest endpoint/account compatibility.
     #[allow(
@@ -4554,6 +4557,31 @@ pub fn create_client(
     custom_providers: &HashMap<String, CustomProviderConfig>,
     config_api_keys: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<AnyClient> {
+    // A saved login is scoped to the official built-in route. Explicit CLI
+    // keys keep their override semantics; no custom/gateway inherits a login.
+    if provider_name.eq_ignore_ascii_case("openai")
+        && api_key.is_none_or(str::is_empty)
+        && !custom_providers.contains_key(provider_name)
+    {
+        let config = resolve_provider_config(provider_name, custom_providers)?;
+        if crate::auth::oauth::official_api_base(
+            resolve_base_url_with_env(&config, |name: &str| std::env::var(name)).as_deref(),
+        ) && let Some(registration) = crate::auth::oauth::selected()?
+        {
+            let http = reqwest::Client::builder()
+                .connect_timeout(resolve_connect_timeout(None))
+                .read_timeout(resolve_stream_idle_timeout(None))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            // No credential is stored in Rig; the captured registration adds
+            // a current bearer only at the checked official request boundary.
+            let client = openai::Client::builder()
+                .api_key("")
+                .http_client(ProviderHttpClient::with_chatgpt(http, registration))
+                .build()?;
+            return Ok(AnyClient::OpenAI(OpenAiClient::Responses(client)));
+        }
+    }
     create_client_with_env(
         provider_name,
         api_key,

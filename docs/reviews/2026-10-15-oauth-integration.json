@@ -1,0 +1,218 @@
+{
+  "bead": "mini-agent-i7ro6.47",
+  "status": "OpenAI source accepted; entire original OAuth bead remains open for Anthropic availability, real-account acceptance and remaining diagnostic labels",
+  "base": "3cc7b9903811d96acb04f1da685661f309a1cf52",
+  "owner_patch_sha256": "32549d69dfe812bafce1ba5986e24b13d17ff2962888f51f69b5b6acc04380ea",
+  "root_review": {
+    "scope": "One independent adversarial/reliability/testing review of identity validation, store/refresh ownership, credential destination, request policy and actual frontend callers; no blocking source finding remains",
+    "clarification": "Captured clients are registration-level: explicit reauthorization of the same issued client and validated subject renews that registration; logout fences access while signed out and switching registrations never lends tokens. Corrected an overbroad comment; no new auth epoch.",
+    "discovery": "/private/tmp/mini-agent-oauth47-official-discovery-evidence.json verifies exact authorize/token/revoke/JWKS constants against fetched official metadata",
+    "merge": "Preserved all current Vertex/GoogleAdc/Bedrock/Cargo/docs and ACP deliveries. ProviderBackend constructors initialize mutually exclusive auth fields; Vertex dispatch and multipart refusal retained. Added only exact OAuth NON-PROCESS rows and complete macro digests to current catalogues; no scanner exemptions, removed assertions or borrowed Azure/Bedrock rewrites."
+  },
+  "validation": {
+    "owner_reused": {
+      "oauth_owner": "11 PASS default+advisor before only test-variable/if-let lint cleanup; no assertions removed. Final minimal actual SDK/CLI controls validate current fixture and frontend source.",
+      "shared_transport": "6 PASS; existing actual Bedrock SDK1 PASS",
+      "ownership": "exact lexical1 and Windows-capable creation-boundary1 PASS with borrowed baseline fixture/row documented above",
+      "tty": "exact slash_command_needs_tty assertion1 PASS",
+      "strict": "default+advisor all-targets PASS45.79s",
+      "install": "cargo install --path . --debug --features advisor PASS44.03s",
+      "minimal": "CLI1 + actual SDK subscription wire1 PASS",
+      "installed": "physical1MiB CLI3 PASS; synthetic/account-free only"
+    },
+    "indexed_test_map": {
+      "bead": "mini-agent-i7ro6.47",
+      "index_session": "895d0d0a-468e-41f7-b9d0-82cf42028a24",
+      "index_state": "/private/tmp/mini-agent-oauth47-index",
+      "evidence": [
+        "/private/tmp/mini-agent-oauth47-final-callers.json",
+        "/private/tmp/mini-agent-oauth47-freeze-callers.json",
+        "/private/tmp/mini-agent-oauth47-selected-callers.json"
+      ],
+      "selection_limit": "Graph tests(response_error) included unrelated Gemini homonyms; rejected after file-qualified caller and physical-source confirmation. SDK request/result structs were read directly where the index did not resolve dependency details. No broad suite run.",
+      "owners": [
+        {
+          "changed": [
+            "auth/oauth.rs::Login::{begin,complete,callback}",
+            "verify_id",
+            "LockedStore::{open,install_login,save}",
+            "Registration::access_token",
+            "logout_at"
+          ],
+          "confirmed_callers": [
+            "main.rs::run_inner early --login/--logout",
+            "ui/slash/providers.rs::handle_login",
+            "provider_http.rs::prepare_request"
+          ],
+          "filters": [
+            "oauth47"
+          ],
+          "cfg": "default+advisor owner11; minimal changed CLI1 and actual SDK1; fixed synthetic JWT/local endpoints only"
+        },
+        {
+          "changed": [
+            "auth/openai_plan.rs::{endpoint,body,completed_sse,models}",
+            "provider_http.rs::{prepare_request,response_error,send,send_streaming,listing_get}"
+          ],
+          "confirmed_callers": [
+            "HttpClientExt::{send,send_streaming,send_multipart}",
+            "AnyClient listing client route",
+            "SDK OpenAI Responses agent actual tool follow-up and non-streaming auxiliary"
+          ],
+          "filters": [
+            "oauth47_actual_sdk_plan_tool_followup_and_auxiliary_use_one_selected_registration",
+            "provider_http::tests",
+            "provider::bedrock::tests::bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_without_rewriting_body"
+          ],
+          "cfg": "shared transport6 + unchanged Bedrock1 reused; plan-only static errors preserve typed status and Retry-After"
+        },
+        {
+          "changed": [
+            "provider.rs::create_client",
+            "AnyClient::uses_chatgpt_plan"
+          ],
+          "confirmed_callers": [
+            "startup actual client construction",
+            "SlashCtx::switch_client",
+            "existing actual factory test with scoped process environment"
+          ],
+          "filters": [
+            "oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes"
+          ],
+          "contract": "saved registration > config/env key, explicit CLI key wins; alternate endpoints/custom maps never inherit plan credentials"
+        },
+        {
+          "changed": [
+            "Cli::login/login_account/logout",
+            "main.rs::run_inner",
+            "slash routing/help/completion",
+            "App::slash_command_needs_tty"
+          ],
+          "confirmed_callers": [
+            "clap parse",
+            "App operator dispatch/TTY pause",
+            "providers::handle_login"
+          ],
+          "filters": [
+            "oauth47_cli_and_slash_commands_expose_login_without_an_api_key",
+            "ui::app::slash_tty_tests::slash_command_needs_tty_matches_only_stdin_consumers"
+          ],
+          "native": "same installed binary physical1MiB --help, --login anthropic refusal and --logout openai without credentials; real account/browser flow not performed"
+        },
+        {
+          "changed": [
+            "exact NON-PROCESS status rows/macro digests"
+          ],
+          "confirmed_callers": [
+            "existing lexical and Windows-capable source ownership validators"
+          ],
+          "filters": [
+            "tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification",
+            "tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary"
+          ],
+          "cfg": "exact2 only; no scanner exemptions or 27-test sweep; borrowed Azure naming/Bedrock row excluded from export"
+        }
+      ],
+      "unchanged_reused": "financial canonical arithmetic/receipt ownership, generic retry logic, non-OpenAI credentials and process creation boundaries remain unchanged."
+    },
+    "merged_tests": {
+      "passed": 22,
+      "failed": 0,
+      "seconds": 8.72,
+      "scope": "OAuth11, sharedHTTP6, Vertex2 actual route/redirect controls, currentinventory2, TTYrouting1",
+      "log": "/private/tmp/mini-agent-oauth47-merged-tests.log"
+    },
+    "debug_install": {
+      "command": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-oauth47-merged-install",
+      "seconds": 28.86,
+      "log": "/private/tmp/mini-agent-oauth47-merged-install.log"
+    },
+    "installed_cli": {
+      "binary": "/private/tmp/mini-agent-oauth47-merged-install/bin/mini-agent",
+      "sha256": "4e76fcd3f064765920d58dfdf5c4a37a9f5d0568edc32fc2ee394f98715ff844",
+      "results": [
+        {
+          "args": [
+            "--help"
+          ],
+          "exit": 0,
+          "marker": "--login",
+          "physical_stack_bytes": 1048576
+        },
+        {
+          "args": [
+            "--login",
+            "anthropic"
+          ],
+          "exit": 1,
+          "marker": "has not documented",
+          "physical_stack_bytes": 1048576
+        },
+        {
+          "args": [
+            "--logout",
+            "openai"
+          ],
+          "exit": 0,
+          "marker": "not signed in",
+          "physical_stack_bytes": 1048576
+        }
+      ],
+      "real_account_login": false,
+      "browser_launch": false,
+      "vendor_inference_requests": 0
+    },
+    "same_installed_vertex": {
+      "binary": "/private/tmp/mini-agent-oauth47-merged-install/bin/mini-agent",
+      "binary_sha256": "4e76fcd3f064765920d58dfdf5c4a37a9f5d0568edc32fc2ee394f98715ff844",
+      "stack_bytes": 1048576,
+      "external_calls": 0,
+      "passed": true,
+      "posts": 3,
+      "adc_token_fetches": 1,
+      "healthy_saves": 2,
+      "usage": [
+        30,
+        6
+      ],
+      "normal_quit": 0,
+      "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-vertex81-installed-4au_h91j/home/sessions/8967c9a9-d5bf-45ba-a394-acae931aafdf.json",
+      "errors": []
+    },
+    "same_installed_vertex_report": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-vertex81-installed-4au_h91j/report.json"
+  },
+  "remaining_acceptance": [
+    "No real vendor/account browser login was performed; manual login roundtrip from original tracker remains unverified.",
+    "No independently documented Anthropic Pro/Max third-party OAuth registration/client identity; no impersonated client or imported competitor tokens.",
+    "Windows OAuth loopback/store execution is not claimed from macOS proof; existing protected-file primitives are reused.",
+    "Doctor/setup source labels still use pure API-key AuthResolver; bounded nonrepairing metadata follow-up assigned, no startup gate blocks actual OAuth use."
+  ],
+  "primary_sources": {
+    "verified_date": "2026-10-15",
+    "openai": [
+      "https://developers.openai.com/siwc/token-sharing-open-source",
+      "https://developers.openai.com/siwc/token-sharing-open-source/sign-in",
+      "https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions",
+      "https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference",
+      "https://developers.openai.com/siwc/token-sharing-open-source/token-reference",
+      "https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations",
+      "https://auth.openai.com/.well-known/openid-configuration",
+      "https://developers.openai.com/api/docs/guides/tools-tool-search"
+    ],
+    "anthropic": [
+      "https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account",
+      "https://platform.claude.com/docs/en/cli-sdks-libraries/cli/authentication"
+    ],
+    "availability": "OpenAI public OSS registration documented: dynamic_agent_client entrypoint -> issued app/account client, fixed auth endpoints and resource, PKCE loopback, JWKS ID validation, protected rotating refresh and official stateless Responses transport. No independent Anthropic third-party Pro/Max client registration contract found; ant workspace API OAuth does not establish that consumer subscription contract."
+  },
+  "runtime_note": "No runtime/sandbox/cache implementation changed by the accompanying explicitly proposed86 specification; no content proof is reused.",
+  "orphan_cleanup": {
+    "bead": "mini-agent-i7ro6.117",
+    "groups": 13,
+    "verified_ownership": "Private smoke installations only; each leader PPID1/PGID==PID and every member identity checked. No current agent/Cargo process touched.",
+    "retirement": "All13 survived SIGTERM; exact ownership rechecked before SIGKILL; zero live members afterward.",
+    "record": "/private/tmp/mini-agent-2026-10-15-orphan-smoke-cleanup.json",
+    "sample": "/private/tmp/mini-agent-orphan-native60-sample.txt",
+    "followup": "mini-agent-i7ro6.118: old stack sample shows main teardown waiting for input reader, reader hot in Crossterm Unix read. Current-binary reproduction/fix is required; no current production cause claimed yet."
+  }
+}

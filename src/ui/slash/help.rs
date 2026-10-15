@@ -128,6 +128,11 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         "  /context               show context composition and pruning projection",
     );
     emit(false, "  /provider [name]       show or switch provider");
+    emit(false, "  /login openai [new|number]  continue with ChatGPT");
+    emit(
+        false,
+        "  /logout openai         sign out of the selected ChatGPT account",
+    );
     emit(
         false,
         "  /doctor                show bounded configuration and runtime diagnostics",

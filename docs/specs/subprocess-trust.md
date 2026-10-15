@@ -545,6 +545,10 @@ has a dedicated exact multiset inventory. That audit enumerates every raw standa
 and RMCP terminal and requires the first statement in its owning helper to retain the crate guard
 without moving or dropping it. New, duplicate, removed, or unguarded raw terminals fail.
 
+The OAuth module `src/auth/oauth.rs` uses existing owned blocking workers and the
+existing browser opener; its response status reads are HTTP metadata, classified
+`NON-PROCESS` with exact source/count entries. No new process launcher is added.
+
 The provider HTTP adapter in `src/provider_http.rs` introduces no process launches. Its exact
 response-status reads and HTTP response-builder status methods are `NON-PROCESS`; local HTTP
 fixtures run futures in one bounded scope without detached task or subprocess creation. The

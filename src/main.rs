@@ -214,6 +214,20 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
+    if let Some(provider) = cli.login.as_deref() {
+        startup::heap_future(|| auth::oauth::sign_in(provider, cli.login_account.as_deref()))
+            .await?;
+        println!("ChatGPT sign-in saved. Start mini-agent with --provider openai to use it.");
+        return Ok(());
+    }
+    if let Some(provider) = cli.logout.as_deref() {
+        anyhow::ensure!(
+            provider.eq_ignore_ascii_case("openai"),
+            "Only OpenAI has a documented provider login in this build"
+        );
+        println!("{}", auth::oauth::logout().await?);
+        return Ok(());
+    }
     if cli.doctor {
         let mut cfg = config::load_for_diagnostics_in_workspace(&app_paths, &workspace);
         config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;

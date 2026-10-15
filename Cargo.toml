@@ -123,6 +123,7 @@ thiserror = "2"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
+    "form",
     "native-tls",
     "charset",
     "http2",
@@ -130,6 +131,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 dirs = "6"
 sha2 = "0.11"
+ring = "=0.17.14"
 unicase = "2"
 unicode-normalization = "0.1"
 compact_str = { version = "0.10", features = ["serde"] }

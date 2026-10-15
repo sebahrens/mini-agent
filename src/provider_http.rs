@@ -17,8 +17,11 @@ pub struct ProviderHttpClient(std::sync::Arc<ProviderBackend>);
 struct ProviderBackend {
     client: reqwest::Client,
     identity: std::sync::Arc<()>,
+    chatgpt: Option<crate::auth::oauth::Registration>,
     vertex: Option<std::sync::Arc<crate::provider::vertex::VertexAuth>>,
     bedrock: Option<std::sync::Arc<crate::provider::bedrock::BedrockAuth>>,
+    #[cfg(test)]
+    test_wire: Option<reqwest::Url>,
 }
 
 impl Default for ProviderHttpClient {
@@ -38,8 +41,25 @@ impl ProviderHttpClient {
         Self(std::sync::Arc::new(ProviderBackend {
             client,
             identity: std::sync::Arc::new(()),
+            chatgpt: None,
             bedrock: None,
             vertex: None,
+            #[cfg(test)]
+            test_wire: None,
+        }))
+    }
+    pub(crate) fn with_chatgpt(
+        client: reqwest::Client,
+        registration: crate::auth::oauth::Registration,
+    ) -> Self {
+        Self(std::sync::Arc::new(ProviderBackend {
+            client,
+            identity: std::sync::Arc::new(()),
+            chatgpt: Some(registration),
+            bedrock: None,
+            vertex: None,
+            #[cfg(test)]
+            test_wire: None,
         }))
     }
     pub(crate) fn with_bedrock(
@@ -51,9 +71,11 @@ impl ProviderHttpClient {
             identity: std::sync::Arc::new(()),
             bedrock: Some(auth),
             vertex: None,
+            chatgpt: None,
+            #[cfg(test)]
+            test_wire: None,
         }))
     }
-
     pub(crate) fn with_vertex(
         client: reqwest::Client,
         auth: std::sync::Arc<crate::provider::vertex::VertexAuth>,
@@ -63,9 +85,34 @@ impl ProviderHttpClient {
             identity: std::sync::Arc::new(()),
             bedrock: None,
             vertex: Some(auth),
+            chatgpt: None,
+            #[cfg(test)]
+            test_wire: None,
         }))
     }
-
+    pub(crate) fn is_chatgpt(&self) -> bool {
+        self.0.chatgpt.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn chatgpt_test_wire(
+        registration: crate::auth::oauth::Registration,
+        url: reqwest::Url,
+    ) -> Self {
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        Self(std::sync::Arc::new(ProviderBackend {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            identity: std::sync::Arc::new(()),
+            chatgpt: Some(registration),
+            bedrock: None,
+            vertex: None,
+            test_wire: Some(url),
+        }))
+    }
     async fn prepare_request(
         &self,
         mut request: Request<Bytes>,
@@ -76,16 +123,48 @@ impl ProviderHttpClient {
         if let Some(auth) = &self.0.vertex {
             auth.prepare(&mut request).await?;
         }
+        if let Some(registration) = &self.0.chatgpt {
+            let prepare = async {
+                crate::auth::openai_plan::endpoint(request.method(), request.uri())?;
+                if request.method() == http::Method::POST {
+                    *request.body_mut() = crate::auth::openai_plan::body(request.body())?.into();
+                }
+                let token = registration.access_token().await?;
+                let mut header = http::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| anyhow::anyhow!("Invalid ChatGPT access token"))?;
+                header.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, header);
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            prepare.map_err(|error| http_client::Error::Instance(error.into()))?;
+        }
         let (parts, body) = request.into_parts();
+        let destination = parts.uri.to_string();
+        #[cfg(test)]
+        let destination = match &self.0.test_wire {
+            Some(base) => base
+                .join(
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map(|p| p.as_str())
+                        .unwrap_or("/"),
+                )
+                .unwrap()
+                .to_string(),
+            None => destination,
+        };
         Ok(self
             .0
             .client
-            .request(parts.method, parts.uri.to_string())
+            .request(parts.method, destination)
             .version(parts.version)
             .headers(parts.headers)
             .body(body))
     }
-
     pub(crate) fn listing_identity(&self) -> std::sync::Weak<()> {
         std::sync::Arc::downgrade(&self.0.identity)
     }
@@ -101,9 +180,8 @@ impl ProviderHttpClient {
             "invalid model listing request"
         );
         let mut response = self
-            .prepare_request(request.map(|_| Bytes::new()))
-            .await
-            .map_err(|_| anyhow::anyhow!("model listing authentication failed"))?
+            .prepare_request(request.map(Bytes::from))
+            .await?
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("model listing transport failed"))?;
@@ -128,7 +206,11 @@ impl ProviderHttpClient {
             );
             body.extend_from_slice(&chunk);
         }
-        Ok(body)
+        if self.is_chatgpt() {
+            crate::auth::openai_plan::models(&body)
+        } else {
+            Ok(body)
+        }
     }
 }
 
@@ -141,13 +223,17 @@ pub(crate) struct ProviderRetryAfterError {
     source: http_client::Error,
 }
 
-async fn response_error(response: reqwest::Response) -> http_client::Error {
+async fn response_error(response: reqwest::Response, private_auth: bool) -> http_client::Error {
     let status = response.status();
     let retry_after = response.headers().get(http::header::RETRY_AFTER).cloned();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+    let body = if private_auth {
+        "ChatGPT request was rejected; check your account access and plan limits".to_owned()
+    } else {
+        response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("failed to read error response body: {error}"))
+    };
     let source = http_client::Error::InvalidStatusCodeWithMessage(status, body);
     match retry_after {
         Some(retry_after) => http_client::Error::Instance(Box::new(ProviderRetryAfterError {
@@ -188,17 +274,41 @@ impl HttpClientExt for ProviderHttpClient {
         T: Into<Bytes> + Send,
         U: From<Bytes> + Send + 'static,
     {
-        let client = self.clone();
+        let this = self.clone();
         let request = request.map(Into::into);
         async move {
-            let response = client
+            let mut response = this
                 .prepare_request(request)
                 .await?
                 .send()
                 .await
                 .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
             if !response.status().is_success() {
-                return Err(response_error(response).await);
+                return Err(response_error(response, this.is_chatgpt()).await);
+            }
+            if this.is_chatgpt() {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|e| http_client::Error::Instance(Box::new(e)))?
+                {
+                    if chunk.len() > crate::auth::openai_plan::MAX_BODY.saturating_sub(bytes.len())
+                    {
+                        return Err(http_client::Error::Instance(
+                            anyhow::anyhow!("ChatGPT response byte limit exceeded").into(),
+                        ));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let bytes = crate::auth::openai_plan::completed_sse(&bytes)
+                    .map_err(|e| http_client::Error::Instance(e.into()))?;
+                let body: LazyBody<U> = Box::pin(async move { Ok(U::from(Bytes::from(bytes))) });
+                return Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .map_err(http_client::Error::Protocol);
             }
             lazy_response(response)
         }
@@ -212,6 +322,7 @@ impl HttpClientExt for ProviderHttpClient {
         U: From<Bytes> + Send + 'static,
     {
         let requires_signed_body = self.0.bedrock.is_some() || self.0.vertex.is_some();
+        let unsupported = self.is_chatgpt();
         let (parts, body) = request.into_parts();
         let request = self
             .0
@@ -226,12 +337,20 @@ impl HttpClientExt for ProviderHttpClient {
                     std::io::Error::other("Bedrock multipart is unsupported"),
                 )));
             }
+            if unsupported {
+                return Err(http_client::Error::Instance(
+                    anyhow::anyhow!(
+                        "Multipart APIs are not supported by ChatGPT plan authentication"
+                    )
+                    .into(),
+                ));
+            }
             let response = request
                 .send()
                 .await
                 .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
             if !response.status().is_success() {
-                return Err(response_error(response).await);
+                return Err(response_error(response, false).await);
             }
             lazy_response(response)
         }
@@ -248,17 +367,8 @@ impl HttpClientExt for ProviderHttpClient {
         let request = request.map(Into::into);
         let budget_guard = crate::spend::run::Run::current().and_then(|run| run.sdk_stream_guard());
         async move {
-            let response = match async {
-                client
-                    .prepare_request(request)
-                    .await?
-                    .send()
-                    .await
-                    .map_err(|error| http_client::Error::Instance(Box::new(error)))
-            }
-            .await
-            {
-                Ok(response) => response,
+            let request = match client.prepare_request(request).await {
+                Ok(request) => request,
                 Err(error) => {
                     if let Some(guard) = &budget_guard {
                         guard.finished();
@@ -266,11 +376,20 @@ impl HttpClientExt for ProviderHttpClient {
                     return Err(error);
                 }
             };
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(guard) = &budget_guard {
+                        guard.finished();
+                    }
+                    return Err(http_client::Error::Instance(Box::new(error)));
+                }
+            };
             if !response.status().is_success() {
                 if let Some(guard) = &budget_guard {
                     guard.finished();
                 }
-                return Err(response_error(response).await);
+                return Err(response_error(response, client.is_chatgpt()).await);
             }
             if let Some(guard) = budget_guard {
                 guard.opened();

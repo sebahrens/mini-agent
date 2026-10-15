@@ -790,6 +790,31 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // Provider credential and HTTP status values are application data.
+    (
+        "src/ui/slash/providers.rs",
+        "for line in crate::auth::oauth::status()? {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/oauth.rs",
+        "let status = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/oauth.rs",
+        ".is_ok_and(|r| r.status().as_u16() == 200)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        ".status(http::StatusCode::OK)",
+        1,
+        "NON-PROCESS",
+    ),
     // ACP AvailableCommand constructors build protocol descriptions, not processes.
     (
         "src/extras/acp/commands.rs",
@@ -1850,6 +1875,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/auth/oauth.rs",
+        "if matches!(status.as_u16(), 400 | 401)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/oauth.rs",
+        "anyhow::bail!(\"Provider authentication HTTP status {}\", status.as_u16());",
+        1,
+        "NON-PROCESS",
+    ),
     // TodoItem status data in the exact cancellation relay fixture below.
     (
         "src/extras/acp/mod.rs",
@@ -3206,6 +3243,19 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/auth/oauth.rs",
+        &[
+            (
+                "8ec5333edb019c40f0fe19338211f99ccc54bca434f77f4629228fc6afb3872e",
+                1,
+            ),
+            (
+                "54ce06e836d9bacb3b577c577930f047fc5e11b66494159d86f4ec436fc1af30",
+                1,
+            ),
+        ],
+    ),
     // Test-only diagnostic prints a numeric NTSTATUS, not a process status terminal.
     (
         "src/fs.rs",
@@ -4550,6 +4600,31 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // Provider credential and HTTP status values are application data.
+    (
+        "src/ui/slash/providers.rs",
+        "for line in crate::auth::oauth::status()? {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/oauth.rs",
+        "let status = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/oauth.rs",
+        ".is_ok_and(|r| r.status().as_u16() == 200)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        ".status(http::StatusCode::OK)",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",

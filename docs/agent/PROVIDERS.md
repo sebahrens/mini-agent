@@ -27,6 +27,71 @@ Select a provider via the config file, the `--provider` CLI flag, or the
 mini-agent --provider anthropic
 ```
 
+## Sign in with ChatGPT
+
+OpenAI documents [ChatGPT plan usage for open-source and locally hosted apps](https://developers.openai.com/siwc/token-sharing-open-source).
+Sign in before starting an agent, without an API key:
+
+```sh
+mini-agent --login openai
+mini-agent --provider openai
+```
+
+Inside the TUI, use `/login openai`; `/login openai new` registers another
+account or workspace, and `/login openai <number>` reauthorizes a registration
+listed by `/provider`. The CLI equivalents are `--login-account new` or
+`--login-account <number>`. The browser asks for consent. Ctrl-C cancels while
+waiting for the callback; the bounded token exchange then finishes under its
+owned cleanup scope. Identity and grant validation finish before the active account can change.
+
+The selected saved login takes precedence over environment/config API keys on
+the built-in `openai` route. An explicit `--api-key` still overrides it. Custom
+providers and alternate base URLs never inherit subscription credentials.
+Changing accounts replaces the client on the next explicit provider/login
+operation; an already captured subscription client cannot borrow another
+registration's tokens. `/logout openai` (or `--logout openai`) attempts to
+revoke the renewable session and clears local tokens. If remote revocation
+cannot be confirmed, the message points to ChatGPT Settings. API-key fallback
+is available after explicit logout if a key is configured.
+
+`src/auth/oauth.rs` implements OpenAI's [public-client registration](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
+with fresh state, nonce and PKCE, a stable opaque host UUID, and an issued
+client ID belonging to this app/account. It validates the ID-token RSA
+signature against OpenAI's published keys, issuer, audience, expiry, nonce,
+account identity and plan scopes before replacing credentials. No other
+application's client ID or credential file is used. Records live below
+`credentials_dir/provider-oauth`, with owner-only files, atomic replacement,
+bounded reads and a cross-process lock covering rotating refresh tokens.
+Revoked/expired authorization requires sign-in; it does not silently switch
+to a billed API key. Signing out retains the public host/account registration
+for later reauthorization.
+
+The dedicated `src/auth/openai_plan.rs` request policy follows the documented
+[Responses limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations):
+requests use the official `/v1/responses` endpoint with `store: false`,
+`stream: true`, full input history, encrypted reasoning, and local function
+definitions in a developer `additional_tools` input item. Ordinary SDK
+non-streaming helpers consume the actual completed SSE response, including its
+reported usage, through the same route. Server-stored item references,
+unsupported hosted tools and unsupported continuation parameters fail before
+HTTP. Global `max_tokens` and `temperature` settings are not sent on this
+subscription route; ordinary local run/tool budgets still apply. Histories
+that depend on server-stored API data require a new session.
+
+Plan allowance and optional credit use depend on the account and workspace;
+manage them in ChatGPT Settings. Local `/cost` dollar estimates use captured
+model rates and are not a ChatGPT subscription invoice.
+
+### Anthropic subscription availability
+
+There is no independently documented third-party Pro/Max client registration
+flow for mini-agent. Anthropic's [developer guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account)
+directs third-party apps to Claude Console API keys or supported cloud
+providers. Its [ant CLI OAuth login](https://platform.claude.com/docs/en/cli-sdks-libraries/cli/authentication)
+is workspace-scoped API authentication and does not establish a Pro/Max
+integration contract for another client. `/login anthropic` explains this
+limitation; mini-agent does not impersonate Claude Code or import its tokens.
+
 The model is set with `--model` or `ZS_MODEL`:
 
 ```

@@ -15,11 +15,74 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/model" => handle_model(parts, ctx).await,
         "/models" => handle_models(parts, ctx).await,
         "/models-add" => handle_models_add(parts, ctx).await,
+        "/login" | "/logout" => handle_login(parts, ctx).await,
         name => match subagent_model_command(name) {
             Some(command) => handle_subagent_model_command(command, parts, ctx).await,
             None => Ok(()),
         },
     }
+}
+
+async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if *ctx.is_running {
+        write_error(
+            ctx.renderer,
+            "Finish or stop the current turn before changing provider authentication",
+        );
+        return Ok(());
+    }
+    let provider = parts.get(1).copied().unwrap_or("openai");
+    if !provider.eq_ignore_ascii_case("openai") {
+        write_error(
+            ctx.renderer,
+            if provider.eq_ignore_ascii_case("anthropic") {
+                crate::auth::oauth::ANTHROPIC_UNAVAILABLE
+            } else {
+                "usage: /login openai [new|account-number], /logout openai"
+            },
+        );
+        return Ok(());
+    }
+    if parts.len() > if parts[0] == "/login" { 3 } else { 2 } {
+        write_error(
+            ctx.renderer,
+            "usage: /login openai [new|account-number], /logout openai",
+        );
+        return Ok(());
+    }
+    let result = if parts[0] == "/login" {
+        ctx.terminal_guard.suspend()?;
+        let result = crate::startup::heap_future(|| {
+            crate::auth::oauth::sign_in(provider, parts.get(2).copied())
+        })
+        .await;
+        ctx.terminal_guard.resume()?;
+        result.map(|()| "ChatGPT sign-in saved".to_owned())
+    } else {
+        crate::auth::oauth::logout().await
+    };
+    match result {
+        Ok(message) => {
+            write_ok(ctx.renderer, message);
+            if ctx.session.provider.eq_ignore_ascii_case("openai") {
+                ctx.switch_client("openai")?;
+                ctx.rebuild_agent().await;
+                if !ctx.client.uses_chatgpt_plan() {
+                    write_result(
+                        ctx.renderer,
+                        "Current client uses API credentials (explicit key or custom endpoint); the saved ChatGPT login is inactive on this route",
+                    );
+                }
+            } else {
+                write_result(
+                    ctx.renderer,
+                    "Select /provider openai to use the saved login",
+                );
+            }
+        }
+        Err(error) => write_error(ctx.renderer, error),
+    }
+    Ok(())
 }
 
 /// The subagent model commands, whatever spelling was typed.
@@ -455,6 +518,23 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             ctx.renderer,
             format!("current provider: {}", ctx.session.provider),
         );
+        if ctx.session.provider.eq_ignore_ascii_case("openai") {
+            write_result(
+                ctx.renderer,
+                if ctx.client.uses_chatgpt_plan() {
+                    "current authentication: ChatGPT registration"
+                } else {
+                    "current authentication: API/provider credentials"
+                },
+            );
+            for line in crate::auth::oauth::status()? {
+                write_result(ctx.renderer, line);
+            }
+            write_result(
+                ctx.renderer,
+                "Explicit --api-key overrides a saved login; custom endpoints never inherit it",
+            );
+        }
         return Ok(());
     }
     let new_provider = parts[1].trim();
