@@ -714,11 +714,20 @@ pub(crate) async fn rebind_mcp_manager(
     cfg: &Config,
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) {
-    if let Some(previous) = mcp.take() {
-        previous.shutdown().await;
-    }
+    // The previous worktree's servers drain while the new binding connects;
+    // both futures are boxed so this future stays small on the event loop.
+    let previous = mcp.take();
+    let shutdown = Box::pin(async move {
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+    });
     if cfg.mcp_servers.is_some() {
-        *mcp = Some(McpClientManager::connect_config_in_binding(cfg, workspace).await);
+        let connect = Box::pin(McpClientManager::connect_config_in_binding(cfg, workspace));
+        let ((), manager) = tokio::join!(shutdown, connect);
+        *mcp = Some(manager);
+    } else {
+        shutdown.await;
     }
 }
 

@@ -626,14 +626,15 @@ impl McpClientManager {
 
     pub async fn shutdown(self) {
         tracing::debug!("MCP shutting down {} connections", self.handles.len());
-        for mut handle in self.handles {
-            let name = handle.server_name.clone();
-            // Explicitly shut down the running service so child processes and
-            // HTTP connections are cleaned up properly, rather than relying on
-            // Drop which may not await teardown.
+        // Explicitly shut down each running service so child processes and
+        // HTTP connections are cleaned up properly, rather than relying on
+        // Drop which may not await teardown. Handles are independent, so their
+        // bounded drains and child waits overlap instead of adding up.
+        futures::future::join_all(self.handles.into_iter().map(|mut handle| async move {
             let _ = handle.running_service.close().await;
-            tracing::debug!("Disconnected from MCP server '{}'", name);
-        }
+            tracing::debug!("Disconnected from MCP server '{}'", handle.server_name);
+        }))
+        .await;
     }
 }
 
