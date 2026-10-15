@@ -673,10 +673,23 @@ mod tests {
             let outside_check = if profile == SandboxProfile::HostFull {
                 format!("printf host > {} || exit 15", quote(&outside))
             } else {
-                format!(
+                let readonly_check = format!(
                     "if printf forbidden > {} 2>/dev/null; then exit 15; fi",
-                    quote(&outside)
-                )
+                    quote(&fixture.home.join(".bashrc"))
+                );
+                if cfg!(target_os = "linux") {
+                    // /tmp is an intentional private writable tmpfs. This
+                    // sibling is scratch, not a writable view of the host.
+                    format!(
+                        "{readonly_check}; printf private-scratch > {} || exit 16",
+                        quote(&outside)
+                    )
+                } else {
+                    format!(
+                        "{readonly_check}; if printf forbidden > {} 2>/dev/null; then exit 16; fi",
+                        quote(&outside)
+                    )
+                }
             };
             let fd_check = if cfg!(target_os = "linux") {
                 "for f in /proc/self/fd/*; do n=${f##*/}; test \"$n\" -lt 512 || exit 19; done"
@@ -706,7 +719,8 @@ mod tests {
             assert_eq!(output.status, CommandStatus::Completed);
             assert!(
                 output.exit_status.is_some_and(|status| status.success()),
-                "{profile}: {}",
+                "{profile}: exit={:?}: {}",
+                output.exit_status,
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(output.stdout, b"PROFILE100_NATIVE_PASS");
@@ -719,6 +733,10 @@ mod tests {
                 b"workspace"
             );
             assert_eq!(std::fs::read(extra.join("written")).unwrap(), b"explicit");
+            assert_eq!(
+                std::fs::read(fixture.home.join(".bashrc")).unwrap(),
+                b"ordinary home data"
+            );
             assert_eq!(outside.exists(), profile == SandboxProfile::HostFull);
         }
     }
