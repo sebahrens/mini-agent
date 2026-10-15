@@ -550,6 +550,93 @@ pub(crate) fn prompt_block_rows(
 #[cfg(test)]
 type NativeSizeQuery = fn() -> io::Result<(u16, u16)>;
 
+/// Test-only output and paint counters shared by a renderer and the owned
+/// writers it hands out, so frame-cost assertions can measure writes, bytes,
+/// flushes and paints without parsing escape sequences.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct OutputCounters {
+    writes: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    flushes: std::sync::atomic::AtomicUsize,
+    viewport_paints: std::sync::atomic::AtomicUsize,
+    viewport_rows: std::sync::atomic::AtomicUsize,
+    bottom_full_paints: std::sync::atomic::AtomicUsize,
+    bottom_statusline_paints: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl OutputCounters {
+    fn bump(counter: &std::sync::atomic::AtomicUsize, by: usize) {
+        counter.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A snapshot of [`OutputCounters`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameStats {
+    /// `write` calls that reached the owned output.
+    pub(crate) writes: usize,
+    /// Bytes that reached the owned output.
+    pub(crate) bytes: usize,
+    /// `flush` calls on the owned output.
+    pub(crate) flushes: usize,
+    /// `render_viewport` calls that painted (not skipped).
+    pub(crate) viewport_paints: usize,
+    /// Chat rows painted by those calls.
+    pub(crate) viewport_rows: usize,
+    /// Full bottom-region draws.
+    pub(crate) bottom_full_paints: usize,
+    /// Statusline-only bottom draws.
+    pub(crate) bottom_statusline_paints: usize,
+}
+
+#[cfg(test)]
+impl FrameStats {
+    /// Counters accumulated since `earlier`.
+    pub(crate) fn since(self, earlier: FrameStats) -> FrameStats {
+        FrameStats {
+            writes: self.writes - earlier.writes,
+            bytes: self.bytes - earlier.bytes,
+            flushes: self.flushes - earlier.flushes,
+            viewport_paints: self.viewport_paints - earlier.viewport_paints,
+            viewport_rows: self.viewport_rows - earlier.viewport_rows,
+            bottom_full_paints: self.bottom_full_paints - earlier.bottom_full_paints,
+            bottom_statusline_paints: self.bottom_statusline_paints
+                - earlier.bottom_statusline_paints,
+        }
+    }
+}
+
+/// Elapsed-time trace for one painted region, emitted on the `ui::frame`
+/// target (`RUST_LOG=ui::frame=trace`). The clock is read only when the
+/// target is enabled, so disabled tracing costs one callsite check.
+struct FrameTrace {
+    region: &'static str,
+    started: Option<std::time::Instant>,
+}
+
+impl FrameTrace {
+    fn start(region: &'static str) -> Self {
+        let started = tracing::enabled!(target: "ui::frame", tracing::Level::TRACE)
+            .then(std::time::Instant::now);
+        Self { region, started }
+    }
+
+    fn finish(self, bytes: usize) {
+        if let Some(started) = self.started {
+            tracing::trace!(
+                target: "ui::frame",
+                region = self.region,
+                bytes,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "frame painted"
+            );
+        }
+    }
+}
+
 pub struct Renderer {
     /// An owned terminal-byte capture for App tests, never process stdout.
     #[cfg(test)]
@@ -560,6 +647,8 @@ pub struct Renderer {
     test_native_size_query: Option<NativeSizeQuery>,
     #[cfg(test)]
     native_size_queries: std::cell::Cell<usize>,
+    #[cfg(test)]
+    test_counters: Arc<OutputCounters>,
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
@@ -635,7 +724,13 @@ struct Notice {
 }
 
 #[cfg(test)]
-enum TestOutput {
+struct TestOutput {
+    sink: TestSink,
+    counters: Arc<OutputCounters>,
+}
+
+#[cfg(test)]
+enum TestSink {
     Capture(Arc<std::sync::Mutex<Vec<u8>>>),
     Fail,
     Stdout(io::Stdout),
@@ -643,6 +738,21 @@ enum TestOutput {
 
 #[cfg(test)]
 impl Write for TestOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.sink.write(bytes)?;
+        OutputCounters::bump(&self.counters.writes, 1);
+        OutputCounters::bump(&self.counters.bytes, written);
+        Ok(written)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()?;
+        OutputCounters::bump(&self.counters.flushes, 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Write for TestSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Fail => Err(io::Error::new(
@@ -685,6 +795,8 @@ impl Renderer {
             test_native_size_query: None,
             #[cfg(test)]
             native_size_queries: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_counters: Arc::new(OutputCounters::default()),
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -770,12 +882,33 @@ impl Renderer {
 
     #[cfg(test)]
     fn writer(&self) -> TestOutput {
-        if self.test_fail_next_write.replace(false) {
-            return TestOutput::Fail;
+        let sink = if self.test_fail_next_write.replace(false) {
+            TestSink::Fail
+        } else {
+            match &self.test_output {
+                Some(bytes) => TestSink::Capture(Arc::clone(bytes)),
+                None => TestSink::Stdout(io::stdout()),
+            }
+        };
+        TestOutput {
+            sink,
+            counters: Arc::clone(&self.test_counters),
         }
-        match &self.test_output {
-            Some(bytes) => TestOutput::Capture(Arc::clone(bytes)),
-            None => TestOutput::Stdout(io::stdout()),
+    }
+
+    /// Output and paint counters accumulated by this renderer.
+    #[cfg(test)]
+    pub(crate) fn frame_stats(&self) -> FrameStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.test_counters;
+        FrameStats {
+            writes: c.writes.load(Relaxed),
+            bytes: c.bytes.load(Relaxed),
+            flushes: c.flushes.load(Relaxed),
+            viewport_paints: c.viewport_paints.load(Relaxed),
+            viewport_rows: c.viewport_rows.load(Relaxed),
+            bottom_full_paints: c.bottom_full_paints.load(Relaxed),
+            bottom_statusline_paints: c.bottom_statusline_paints.load(Relaxed),
         }
     }
 
@@ -1457,6 +1590,7 @@ impl Renderer {
         if !self.chat_needs_redraw() {
             return Ok(());
         }
+        let trace = FrameTrace::start("viewport");
         let (cols, _rows) = self.terminal_size();
         let max_width = cols.saturating_sub(1 + self.chat_margin) as usize;
         let visible = self.visible_lines();
@@ -1553,6 +1687,12 @@ impl Renderer {
         }
 
         stdout.flush()?;
+        #[cfg(test)]
+        {
+            OutputCounters::bump(&self.test_counters.viewport_paints, 1);
+            OutputCounters::bump(&self.test_counters.viewport_rows, visible);
+        }
+        trace.finish(0);
         self.record_chat_drawn();
         Ok(())
     }
@@ -1965,6 +2105,8 @@ impl Renderer {
         ) {
             BottomRedrawPlan::Skip => return Ok(()),
             BottomRedrawPlan::StatuslineOnly => {
+                #[cfg(test)]
+                OutputCounters::bump(&self.test_counters.bottom_statusline_paints, 1);
                 self.draw_statusline(statusline, cols, snapshot.scroll_indicator)?;
                 self.restore_bottom_cursor()?;
                 self.record_bottom_drawn(snapshot);
@@ -1972,6 +2114,9 @@ impl Renderer {
             }
             BottomRedrawPlan::Full => {}
         }
+        #[cfg(test)]
+        OutputCounters::bump(&self.test_counters.bottom_full_paints, 1);
+        let trace = FrameTrace::start("bottom");
         let reserve = self.statusline_reserve();
         let mut stdout = self.writer();
 
@@ -2008,6 +2153,7 @@ impl Renderer {
             self.draw_statusline(statusline, cols, false)?;
             write!(stdout, "{}", Hide)?;
             stdout.flush()?;
+            trace.finish(0);
             self.bottom_cursor = None;
             self.record_bottom_drawn(snapshot);
             return Ok(());
@@ -2145,6 +2291,7 @@ impl Renderer {
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
         write!(stdout, "{}", Show)?;
         stdout.flush()?;
+        trace.finish(0);
         self.bottom_cursor = Some((cursor_x, cursor_row));
         // The draw itself settles `input_vscroll_offset` (cursor follow /
         // clamping); record the settled value so the next identical frame is
@@ -3340,5 +3487,148 @@ mod syntax_paint_tests {
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, &entry, None, false).unwrap();
         assert_eq!(String::from_utf8(painted).unwrap(), "雪");
+    }
+}
+
+#[cfg(test)]
+mod frame_cost_tests {
+    use super::*;
+    use crate::ui::event_handler::stream_repaint_due;
+    use crate::ui::feed::BlockStyle;
+
+    /// About `target_bytes` of markdown: headings, prose with links and
+    /// fenced code.
+    fn markdown_response(target_bytes: usize) -> String {
+        let mut text = String::with_capacity(target_bytes + 1024);
+        let mut section = 0usize;
+        while text.len() < target_bytes {
+            section += 1;
+            text.push_str(&format!(
+                "## Section {section}\n\nThis paragraph explains step {section} of the change \
+                 in plain prose, with `inline code`, **bold text** and a link to \
+                 https://example.com/docs/{section} so the painter sees URLs too.\n\n"
+            ));
+            text.push_str("```rust\n");
+            for line in 0..12 {
+                text.push_str(&format!(
+                    "fn step_{section}_{line}(value: u64) -> u64 {{ value.wrapping_mul({line}) + {section} }}\n"
+                ));
+            }
+            text.push_str("```\n\n");
+        }
+        text
+    }
+
+    /// Stream a large markdown response through the renderer the way the
+    /// streaming arm does (append to the running block, repaint when
+    /// `stream_repaint_due`, UI tick every tenth token) and report the
+    /// frame cost. Bounds are generous; the printed numbers are the baseline
+    /// recorded in docs/benchmarks/2026-10-15-tui-frame-cost.md.
+    #[test]
+    fn frame_cost_streaming_200kb_markdown() {
+        let response = markdown_response(200 * 1024);
+        let mut renderer = Renderer::for_app_test().unwrap();
+        renderer.sync_input_height("").unwrap();
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 0, true).unwrap();
+        renderer.feed_mut().push_streaming_block(BlockStyle::Agent);
+        let block = renderer.feed().block_count() - 1;
+        let before = renderer.frame_stats();
+        let started = std::time::Instant::now();
+        let mut streamed = 0usize;
+        let mut tokens = 0usize;
+        let mut offset = 0;
+        while offset < response.len() {
+            let mut end = (offset + 48).min(response.len());
+            while !response.is_char_boundary(end) {
+                end += 1;
+            }
+            let token = &response[offset..end];
+            offset = end;
+            tokens += 1;
+            streamed += token.len();
+            renderer.feed_mut().append_to(block, token);
+            if stream_repaint_due(
+                streamed,
+                token.contains('\n'),
+                Some(std::time::Duration::ZERO),
+            ) {
+                renderer.render_viewport().unwrap();
+            }
+            if tokens % 10 == 0 {
+                renderer.paint_pending_chat().unwrap();
+                renderer.tick_spinner().unwrap();
+            }
+        }
+        renderer.feed_mut().finalize_block(block);
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 0, false).unwrap();
+        let elapsed = started.elapsed();
+        let stats = renderer.frame_stats().since(before);
+        let paints = stats.viewport_paints.max(1);
+        println!(
+            "frame_cost: tokens={tokens} viewport_paints={} rows={} bottom_full={} \
+             writes={} flushes={} bytes={} bytes_per_paint={} writes_per_paint={} wall_ms={}",
+            stats.viewport_paints,
+            stats.viewport_rows,
+            stats.bottom_full_paints,
+            stats.writes,
+            stats.flushes,
+            stats.bytes,
+            stats.bytes / paints,
+            stats.writes / paints,
+            elapsed.as_millis()
+        );
+        assert!(stats.viewport_paints > 0);
+        assert!(stats.flushes > 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(300),
+            "streaming 200 KB took {elapsed:?}"
+        );
+    }
+
+    /// One `refresh_display`-shaped frame: input height, chat, bottom.
+    fn refresh_like(renderer: &mut Renderer, input: &str) {
+        renderer.sync_input_height(input).unwrap();
+        renderer.render_viewport().unwrap();
+        renderer
+            .draw_bottom(input, input.len(), &[], 0, false)
+            .unwrap();
+    }
+
+    /// Typing into the input under a full chat viewport: report the cost of
+    /// one keystroke frame.
+    #[test]
+    fn frame_cost_keystrokes_under_full_viewport() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..200 {
+            renderer.feed_mut().push_block(
+                BlockStyle::Agent,
+                format!("chat line {line} https://example.com/{line}"),
+            );
+        }
+        refresh_like(&mut renderer, "");
+        let before = renderer.frame_stats();
+        let mut input = String::new();
+        for ch in "a keystroke frame".chars() {
+            input.push(ch);
+            refresh_like(&mut renderer, &input);
+        }
+        let stats = renderer.frame_stats().since(before);
+        let keys = "a keystroke frame".chars().count();
+        println!(
+            "frame_cost_keys: keys={keys} viewport_paints={} bottom_full={} writes={} flushes={} \
+             bytes={} bytes_per_key={} writes_per_key={} flushes_per_key={}",
+            stats.viewport_paints,
+            stats.bottom_full_paints,
+            stats.writes,
+            stats.flushes,
+            stats.bytes,
+            stats.bytes / keys,
+            stats.writes / keys,
+            stats.flushes / keys,
+        );
+        assert_eq!(stats.viewport_paints, 0, "typing must not repaint the chat");
+        assert_eq!(stats.bottom_full_paints, keys);
     }
 }
