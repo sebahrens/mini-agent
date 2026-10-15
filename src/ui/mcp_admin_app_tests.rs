@@ -1594,9 +1594,11 @@ async fn actual_doctor_tracks_live_add_remove_catalogue_without_reloading_or_rpc
         std::fs::write(global, b"not valid config JSON").unwrap();
         let diagnostic_source = std::fs::read(global).unwrap();
         let requests = server.requests.lock().unwrap().len();
-        let prefix = app.renderer.captured_output().len();
+        // /doctor paints its report as one frame and the renderer repaints
+        // only changed rows, so read the transcript the report was written to.
+        let prefix = app.renderer.transcript_text().len();
         command(&mut app, "/doctor").await;
-        let rendered = app.renderer.captured_output();
+        let rendered = app.renderer.transcript_text();
         let current = &rendered[prefix..];
         let count = current.rsplit("MCP configured servers:").next().unwrap();
         assert!(

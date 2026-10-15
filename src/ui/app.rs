@@ -10073,7 +10073,9 @@ mod permission_loop_tests {
         assert!(app.input.buffer.is_empty());
         assert!(!app.input.picker.as_ref().is_some_and(Picker::active));
         assert!(!app.run.is_running);
-        assert!(app.renderer.captured_output().contains("/keys"));
+        // /help paints its listing as one frame, so read the transcript
+        // rather than the rows that frame happened to repaint.
+        assert!(app.renderer.transcript_text().contains("/keys"));
     }
 
     #[tokio::test]
