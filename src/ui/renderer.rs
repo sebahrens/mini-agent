@@ -259,6 +259,12 @@ pub(crate) enum BottomRedrawPlan {
     Full,
 }
 
+/// One statusline row as painted, keyed by everything that shapes it.
+struct FittedStatusRow {
+    key: u64,
+    bytes: Vec<u8>,
+}
+
 struct StatuslineCache {
     key: u64,
     lines: Arc<Vec<Vec<StatusSpan>>>,
@@ -601,6 +607,7 @@ pub(crate) struct OutputCounters {
     viewport_rows: std::sync::atomic::AtomicUsize,
     bottom_full_paints: std::sync::atomic::AtomicUsize,
     bottom_statusline_paints: std::sync::atomic::AtomicUsize,
+    statusline_fits: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -628,6 +635,8 @@ pub(crate) struct FrameStats {
     pub(crate) bottom_full_paints: usize,
     /// Statusline-only bottom draws.
     pub(crate) bottom_statusline_paints: usize,
+    /// Statusline rows fitted and painted (not served from the row cache).
+    pub(crate) statusline_fits: usize,
 }
 
 #[cfg(test)]
@@ -643,6 +652,7 @@ impl FrameStats {
             bottom_full_paints: self.bottom_full_paints - earlier.bottom_full_paints,
             bottom_statusline_paints: self.bottom_statusline_paints
                 - earlier.bottom_statusline_paints,
+            statusline_fits: self.statusline_fits - earlier.statusline_fits,
         }
     }
 }
@@ -788,6 +798,8 @@ pub struct Renderer {
     bottom_dirty: bool,
     last_bottom_snapshot: Option<BottomSnapshot>,
     statusline_cache: Option<StatuslineCache>,
+    /// Painted statusline rows by row index (see `draw_statusline`).
+    statusline_rows: std::cell::RefCell<Vec<Option<FittedStatusRow>>>,
     #[cfg(test)]
     statusline_builds: usize,
     /// Screen position of the input caret after the last full bottom draw;
@@ -928,6 +940,7 @@ impl Renderer {
             bottom_dirty: true,
             last_bottom_snapshot: None,
             statusline_cache: None,
+            statusline_rows: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             statusline_builds: 0,
             bottom_cursor: None,
@@ -1100,6 +1113,7 @@ impl Renderer {
             viewport_rows: c.viewport_rows.load(Relaxed),
             bottom_full_paints: c.bottom_full_paints.load(Relaxed),
             bottom_statusline_paints: c.bottom_statusline_paints.load(Relaxed),
+            statusline_fits: c.statusline_fits.load(Relaxed),
         }
     }
 
@@ -1222,6 +1236,7 @@ impl Renderer {
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.feed.set_monochrome(monochrome);
         self.monochrome = monochrome;
+        self.statusline_rows.borrow_mut().clear();
     }
 
     /// Set the chat buffer's left padding in columns. Clamped so content keeps
@@ -1250,6 +1265,7 @@ impl Renderer {
         self.chat_bg = chat_bg;
         self.input_bg = input_bg;
         self.status_bg = status_bg;
+        self.statusline_rows.borrow_mut().clear();
     }
 
     pub(crate) fn set_foreground_palette(&mut self, palette: ForegroundPalette) {
@@ -1258,6 +1274,7 @@ impl Renderer {
         }
         self.palette = palette;
         self.feed.set_palette(palette);
+        self.statusline_rows.borrow_mut().clear();
         self.last_chat_snapshot = None;
         self.last_bottom_snapshot = None;
     }
@@ -2042,11 +2059,15 @@ impl Renderer {
     fn draw_statusline(
         &self,
         statusline: &[Vec<StatusSpan>],
+        statusline_key: u64,
         cols: u16,
         is_scrolling: bool,
     ) -> io::Result<()> {
         let (_, rows) = self.terminal_size();
         let h = self.statusline_height as u16;
+        let mut cache = self.statusline_rows.borrow_mut();
+        cache.resize_with(h as usize, || None);
+        let mut out = frame_out!(self);
         for row_idx in 0..h {
             let screen_row = rows.saturating_sub(h - row_idx);
             let empty: Vec<StatusSpan> = Vec::new();
@@ -2061,24 +2082,38 @@ impl Renderer {
                 (0, None) if is_scrolling => Some(("-- SCROLL -- ".to_string(), Color::DarkYellow)),
                 _ => None,
             };
-            self.draw_statusline_row(
-                screen_row,
-                spans,
-                prefix.as_ref().map(|(text, color)| (text.as_str(), *color)),
-                cols,
-            )?;
+            let prefix = prefix.as_ref().map(|(text, color)| (text.as_str(), *color));
+            // The painted row depends only on the statusline content (its
+            // cache key), the geometry and the prefix; theme setters clear
+            // the cache. An unchanged row is one copy into the frame.
+            let row_key = hash_value((statusline_key, cols, screen_row, prefix));
+            let slot = &mut cache[row_idx as usize];
+            if slot.as_ref().is_none_or(|row| row.key != row_key) {
+                let mut bytes = Vec::with_capacity(256);
+                self.draw_statusline_row(&mut bytes, screen_row, spans, prefix, cols)?;
+                *slot = Some(FittedStatusRow {
+                    key: row_key,
+                    bytes,
+                });
+            }
+            if let Some(row) = slot {
+                out.write_all(&row.bytes)?;
+            }
         }
         Ok(())
     }
 
+    /// Fit and paint one statusline row into `stdout`.
     fn draw_statusline_row(
         &self,
+        stdout: &mut impl Write,
         screen_row: u16,
         spans: &[StatusSpan],
         prefix: Option<(&str, Color)>,
         cols: u16,
     ) -> io::Result<()> {
-        let mut stdout = frame_out!(self);
+        #[cfg(test)]
+        OutputCounters::bump(&self.test_counters.statusline_fits, 1);
         stdout.queue(MoveTo(0, screen_row))?;
         if let Some(bg) = self.status_bg {
             write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -2101,7 +2136,7 @@ impl Renderer {
         }
 
         let fitted = super::statusline::fit_line(spans, budget);
-        let spans = fitted.as_slice();
+        let spans: &[StatusSpan] = &fitted;
 
         // Fixed width of all text spans; flex shares what is left.
         let fixed: usize = spans
@@ -2176,7 +2211,9 @@ impl Renderer {
         prefix: Option<(&str, Color)>,
         cols: u16,
     ) -> io::Result<()> {
-        self.frame(|this| this.draw_statusline_row(screen_row, spans, prefix, cols))
+        self.frame(|this| {
+            this.draw_statusline_row(&mut frame_out!(this), screen_row, spans, prefix, cols)
+        })
     }
 
     fn status_foreground(
@@ -2361,7 +2398,7 @@ impl Renderer {
             BottomRedrawPlan::StatuslineOnly => {
                 #[cfg(test)]
                 OutputCounters::bump(&self.test_counters.bottom_statusline_paints, 1);
-                self.draw_statusline(statusline, cols, snapshot.scroll_indicator)?;
+                self.draw_statusline(statusline, statusline_key, cols, snapshot.scroll_indicator)?;
                 self.restore_bottom_cursor()?;
                 self.record_bottom_drawn(snapshot);
                 return Ok(());
@@ -2405,7 +2442,7 @@ impl Renderer {
                 self.draw_separator(sep_below, cols)?;
             }
 
-            self.draw_statusline(statusline, cols, false)?;
+            self.draw_statusline(statusline, statusline_key, cols, false)?;
             write!(stdout, "{}", Hide)?;
             trace.finish(self.frame_len() - frame_start);
             self.bottom_cursor = None;
@@ -2531,7 +2568,7 @@ impl Renderer {
         }
 
         // Status line
-        self.draw_statusline(statusline, cols, self.scroll_offset > 0)?;
+        self.draw_statusline(statusline, statusline_key, cols, self.scroll_offset > 0)?;
 
         // Cursor. Clamp to the visible input rows so that when the viewport is
         // scrolled away from the cursor row, the terminal caret stays inside
@@ -4044,6 +4081,61 @@ mod frame_buffer_tests {
             .unwrap();
         let single = renderer.frame_stats().since(before);
         assert_eq!((single.viewport_paints, single.flushes), (1, 1));
+    }
+
+    fn status_item(text: &str) -> StatusSpan {
+        StatusSpan::Text {
+            text: text.into(),
+            fg: None,
+            bg: None,
+            layout: crate::ui::statusline::SpanLayout::Item {
+                priority: 1,
+                plain: text.into(),
+                compact: None,
+                dynamic_color: false,
+            },
+        }
+    }
+
+    #[test]
+    fn cursor_only_keystrokes_reuse_the_fitted_statusline_rows() {
+        let mut renderer = filled_renderer();
+        renderer.set_statusline_height(2);
+        let statusline = vec![
+            vec![
+                status_item("model"),
+                StatusSpan::Flex,
+                status_item("ctx 4%"),
+            ],
+            vec![status_item("branch main")],
+        ];
+        let draw = |renderer: &mut Renderer, input: &str, cursor: usize, key: u64| {
+            let lines = renderer.cached_statusline(key, || statusline.clone());
+            renderer
+                .draw_bottom(input, cursor, &lines, key, false)
+                .unwrap();
+        };
+        draw(&mut renderer, "draft text", 10, 7);
+        let builds = renderer.statusline_builds();
+        let before = renderer.frame_stats();
+        for cursor in (0..10).rev() {
+            draw(&mut renderer, "draft text", cursor, 7);
+        }
+        let moved = renderer.frame_stats().since(before);
+        assert_eq!(moved.bottom_full_paints, 10);
+        assert_eq!(moved.statusline_fits, 0, "rows came from the cache");
+        assert_eq!(renderer.statusline_builds(), builds);
+        assert!(renderer.captured_output().matches("branch main").count() >= 11);
+
+        // New statusline content, or a scroll prefix, refits.
+        let before = renderer.frame_stats();
+        draw(&mut renderer, "draft text", 0, 8);
+        assert_eq!(renderer.frame_stats().since(before).statusline_fits, 2);
+        renderer.scroll_line_up();
+        let before = renderer.frame_stats();
+        draw(&mut renderer, "draft text", 0, 8);
+        assert_eq!(renderer.frame_stats().since(before).statusline_fits, 1);
+        assert!(renderer.captured_output().contains("-- SCROLL --"));
     }
 
     #[test]

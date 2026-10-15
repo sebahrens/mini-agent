@@ -485,11 +485,12 @@ fn clean_layout(spans: &mut Vec<StatusSpan>) {
 /// Cell-bounded layout used by the actual renderer at each terminal width.
 /// Wide layouts remain byte-for-byte identical. Narrow layouts shed decoration,
 /// then use compact forms, then drop complete items in ascending priority.
-pub(crate) fn fit_line(spans: &[StatusSpan], width: usize) -> Vec<StatusSpan> {
-    let mut result = spans.to_vec();
-    if fixed_width(&result) <= width {
-        return result;
+/// A line that already fits is returned borrowed, without cloning a span.
+pub(crate) fn fit_line(spans: &[StatusSpan], width: usize) -> std::borrow::Cow<'_, [StatusSpan]> {
+    if fixed_width(spans) <= width {
+        return std::borrow::Cow::Borrowed(spans);
     }
+    let mut result = spans.to_vec();
     result.retain(|span| {
         !matches!(
             span,
@@ -533,7 +534,7 @@ pub(crate) fn fit_line(spans: &[StatusSpan], width: usize) -> Vec<StatusSpan> {
     compact.sort_by_key(|&(priority, index)| (std::cmp::Reverse(priority), index));
     for (_, index) in compact {
         if fixed_width(&result) <= width {
-            return result;
+            return result.into();
         }
         if let StatusSpan::Text {
             text,
@@ -591,21 +592,23 @@ pub(crate) fn fit_line(spans: &[StatusSpan], width: usize) -> Vec<StatusSpan> {
     if fixed_width(&result) > width {
         for span in &mut result {
             if let StatusSpan::Text { text, .. } = span {
-                *text = ellipsize(text, width);
+                *text = ellipsize(text, width).into_owned();
             }
         }
     }
-    result
+    result.into()
 }
 
-pub(crate) fn ellipsize(text: &str, width: usize) -> String {
+/// `text` cut to `width` cells with a trailing ellipsis; borrowed when it
+/// already fits.
+pub(crate) fn ellipsize(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
     if crate::ui::utils::display_width(text) <= width {
         return text.into();
     }
     if width == 0 {
-        return String::new();
+        return std::borrow::Cow::Borrowed("");
     }
-    format!("{}…", crate::ui::utils::display_prefix(text, width - 1))
+    format!("{}…", crate::ui::utils::display_prefix(text, width - 1)).into()
 }
 
 /// Context fill as an integer percentage of the window, or `None` when the
