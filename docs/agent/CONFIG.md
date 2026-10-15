@@ -1850,10 +1850,19 @@ Available items:
 | `separator`           | Literal text from `text` (default a space). Trimmed around hidden items. |
 | `flex_separator`      | Expands to fill the remaining width; several split the space evenly. |
 
-The `git_changes` and `git_status` items schedule at most one bounded background
-`git status` refresh per second (only when one of them is used). The TUI keeps
-rendering the last completed result while Git runs, and discards a late result
-after a workspace switch. All other items are read from the session.
+The `git_changes` and `git_status` items run a bounded background `git status`
+(only when one of them is used) on an adaptive schedule
+(`src/ui/git_poll.rs`): right after events that can change the repository
+(tool results, file mutations, turn end, a submitted command, returning from
+an editor or lazygit; at most once per second), otherwise every 10 s. Before
+spawning Git the refresh compares the mtimes and lengths of `HEAD`, the index,
+the current branch ref, the ref directories, `packed-refs` and `FETCH_HEAD`,
+and skips the spawn when none changed; a full status still runs at least every
+30 s so edits made outside the agent appear. The branch name is read on the
+same background task, never on the UI task. The TUI keeps rendering the last
+completed result while Git runs, and discards a late result after a workspace
+switch. `worktree` and `host` are read once per workspace/process. All other
+items are read from the session.
 
 ## Status signals
 

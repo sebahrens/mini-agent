@@ -109,7 +109,7 @@ pub(super) mod test_support {
             },
             renderer: Renderer::for_app_test().unwrap(),
             input,
-            last_branch_check: std::time::Instant::now(),
+            loop_state: EventLoopState::default(),
             rewind_escape: None,
             git_status_tx,
             git_status_rx,
@@ -645,19 +645,55 @@ async fn read_worktree_choice(
 #[derive(Debug)]
 struct GitStatusRefresh {
     working_dir: PathBuf,
-    snapshot: Option<GitStatus>,
+    /// The session directory the branch was read from.
+    branch_dir: compact_str::CompactString,
+    branch: Option<compact_str::CompactString>,
+    /// `None` when the repository fingerprint was unchanged and the status
+    /// spawn was skipped (or the statusline does not show status).
+    snapshot: Option<Option<GitStatus>>,
+    fingerprint: Option<crate::ui::git_poll::GitFingerprint>,
 }
 
+/// Apply a finished refresh. `None` when it describes a workspace or session
+/// directory that is no longer current; otherwise whether anything shown
+/// changed.
 fn apply_git_status_refresh(
     session: &mut Session,
     workspace_root: &Path,
-    refresh: GitStatusRefresh,
-) -> bool {
-    if refresh.working_dir != workspace_root {
-        return false;
+    refresh: &GitStatusRefresh,
+) -> Option<bool> {
+    if refresh.working_dir != workspace_root || refresh.branch_dir != session.working_dir {
+        return None;
     }
-    session.git_status = refresh.snapshot;
-    true
+    let mut changed = false;
+    if session.git_branch != refresh.branch {
+        session.git_branch.clone_from(&refresh.branch);
+        changed = true;
+    }
+    if let Some(snapshot) = &refresh.snapshot
+        && session.git_status != *snapshot
+    {
+        session.git_status.clone_from(snapshot);
+        changed = true;
+    }
+    Some(changed)
+}
+
+/// Event-loop scheduling state owned by `run_inner`.
+#[derive(Default)]
+struct EventLoopState {
+    /// Persistent stream-tail / spinner deadline while a run is active.
+    running_tick: crate::ui::event_handler::RunningTick,
+    git_poll: crate::ui::git_poll::GitPoll,
+    /// While a coalesced batch of user events is applied, `refresh()` only
+    /// records that a frame is owed; the batch paints once at its end.
+    defer_paint: bool,
+    paint_owed: bool,
+    /// The model last handed to the model picker, so unchanged frames do not
+    /// allocate it again.
+    synced_model: Option<compact_str::CompactString>,
+    #[cfg(test)]
+    frames: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1047,37 +1083,62 @@ mod git_status_refresh_tests {
     #[test]
     fn late_refresh_cannot_replace_status_after_a_workspace_switch() {
         let mut session = Session::new("openai", "model", 128_000, "");
+        session.working_dir = "/current".into();
         session.git_status = Some(GitStatus {
             modified: 1,
             ..GitStatus::default()
         });
         let cached = session.git_status.clone();
+        let refresh = |dir: &str, snapshot: Option<Option<GitStatus>>| GitStatusRefresh {
+            working_dir: PathBuf::from(dir),
+            branch_dir: dir.into(),
+            branch: Some("main".into()),
+            snapshot,
+            fingerprint: None,
+        };
 
-        assert!(!apply_git_status_refresh(
-            &mut session,
-            Path::new("/current"),
-            GitStatusRefresh {
-                working_dir: PathBuf::from("/previous"),
-                snapshot: Some(GitStatus {
-                    untracked: 9,
-                    ..GitStatus::default()
-                }),
-            },
-        ));
+        assert_eq!(
+            apply_git_status_refresh(
+                &mut session,
+                Path::new("/current"),
+                &refresh(
+                    "/previous",
+                    Some(Some(GitStatus {
+                        untracked: 9,
+                        ..GitStatus::default()
+                    }))
+                ),
+            ),
+            None
+        );
         assert_eq!(session.git_status, cached);
+        assert_eq!(session.git_branch, None);
 
         let current = GitStatus {
             staged: 2,
             ..GitStatus::default()
         };
-        assert!(apply_git_status_refresh(
-            &mut session,
-            Path::new("/current"),
-            GitStatusRefresh {
-                working_dir: PathBuf::from("/current"),
-                snapshot: Some(current.clone()),
-            },
-        ));
+        let fresh = refresh("/current", Some(Some(current.clone())));
+        assert_eq!(
+            apply_git_status_refresh(&mut session, Path::new("/current"), &fresh),
+            Some(true)
+        );
+        assert_eq!(session.git_status, Some(current.clone()));
+        assert_eq!(session.git_branch.as_deref(), Some("main"));
+        // Identical results change nothing, so no frame is painted for them.
+        assert_eq!(
+            apply_git_status_refresh(&mut session, Path::new("/current"), &fresh),
+            Some(false)
+        );
+        // A skipped status spawn keeps the cached status.
+        assert_eq!(
+            apply_git_status_refresh(
+                &mut session,
+                Path::new("/current"),
+                &refresh("/current", None)
+            ),
+            Some(false)
+        );
         assert_eq!(session.git_status, Some(current));
     }
 }
@@ -1157,7 +1218,8 @@ pub(crate) struct App<'a> {
 
     renderer: Renderer,
     input: InputEditor,
-    last_branch_check: std::time::Instant,
+    /// Event-loop scheduling: running tick, Git polling, batched painting.
+    loop_state: EventLoopState,
     rewind_escape: Option<std::time::Instant>,
     git_status_tx: mpsc::Sender<GitStatusRefresh>,
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
@@ -1398,7 +1460,6 @@ impl<'a> App<'a> {
         crate::ui::statusline::init(ui.cfg);
 
         ui.session.refresh_git_branch();
-        let last_branch_check = std::time::Instant::now();
 
         let mut renderer = Renderer::new()?;
         renderer.set_terminal_background(background.color);
@@ -1863,7 +1924,7 @@ impl<'a> App<'a> {
             slash,
             renderer,
             input,
-            last_branch_check,
+            loop_state: EventLoopState::default(),
             rewind_escape: None,
             git_status_tx,
             git_status_rx,
@@ -1905,20 +1966,57 @@ impl<'a> App<'a> {
         Ok(app)
     }
 
+    /// Dispatch a branch/status refresh when the adaptive schedule says one
+    /// is due. Branch detection and the repository fingerprint run on the
+    /// blocking pool; `git status` is spawned only when the statusline shows
+    /// it and the fingerprint changed (or the observation is stale).
     fn request_git_status_refresh(&mut self) {
-        if self.git_status_in_flight || !crate::ui::statusline::needs_git_status() {
+        let now = std::time::Instant::now();
+        if self.git_status_in_flight || !self.loop_state.git_poll.due(now) {
             return;
         }
-
+        let request = self.loop_state.git_poll.start(now);
+        let needs_status = crate::ui::statusline::needs_git_status();
         let working_dir = self.ui.workspace.root().to_path_buf();
+        let branch_dir = self.ui.session.working_dir.clone();
         let tx = self.git_status_tx.clone();
         self.git_status_in_flight = true;
         tokio::spawn(async move {
-            let snapshot = Session::detect_git_status(&working_dir).await;
+            let observe = {
+                let working_dir = working_dir.clone();
+                let branch_dir = branch_dir.clone();
+                move || {
+                    (
+                        Session::detect_git_branch(&branch_dir),
+                        crate::ui::git_poll::fingerprint(&working_dir),
+                    )
+                }
+            };
+            let (branch, mut fingerprint) = tokio::task::spawn_blocking(observe)
+                .await
+                .unwrap_or((None, None));
+            let snapshot = if needs_status
+                && !request.may_skip_status(&working_dir, fingerprint.as_ref())
+            {
+                let snapshot = Session::detect_git_status(&working_dir).await;
+                // Observe after the status run: it may refresh the index
+                // itself, which must not count as the next change.
+                let root = working_dir.clone();
+                fingerprint =
+                    tokio::task::spawn_blocking(move || crate::ui::git_poll::fingerprint(&root))
+                        .await
+                        .unwrap_or(None);
+                Some(snapshot)
+            } else {
+                None
+            };
             let _ = tx
                 .send(GitStatusRefresh {
                     working_dir,
+                    branch_dir,
+                    branch,
                     snapshot,
+                    fingerprint,
                 })
                 .await;
         });
@@ -2029,11 +2127,22 @@ impl<'a> App<'a> {
                 }
             }
             self.ui.session.reasoning_enabled = self.slash.reasoning_enabled;
-            if self.last_branch_check.elapsed() >= Duration::from_secs(1) {
-                self.ui.session.refresh_git_branch();
-                self.request_git_status_refresh();
-                self.last_branch_check = std::time::Instant::now();
-            }
+            self.loop_state
+                .git_poll
+                .observe_running(self.run.is_running, std::time::Instant::now());
+            self.request_git_status_refresh();
+            let tick_deadline = self.loop_state.running_tick.deadline(
+                std::time::Instant::now(),
+                self.run.is_running,
+                self.renderer.chat_needs_redraw(),
+            );
+            // Only a pending forced refresh (turn end, tool result) wakes an
+            // otherwise idle loop; background polls ride on other events.
+            let forced_refresh = self
+                .loop_state
+                .git_poll
+                .forced_deadline()
+                .filter(|_| !self.git_status_in_flight);
 
             #[cfg(feature = "subagents")]
             let background_pool = self.ui.session.background_pool.clone();
@@ -2051,14 +2160,29 @@ impl<'a> App<'a> {
                 }
                 Some(refresh) = self.git_status_rx.recv() => {
                     self.git_status_in_flight = false;
-                    if apply_git_status_refresh(self.ui.session, self.ui.workspace.root(), refresh) {
-                        self.refresh()?;
-                    } else {
-                        self.request_git_status_refresh();
+                    let now = std::time::Instant::now();
+                    match apply_git_status_refresh(self.ui.session, self.ui.workspace.root(), &refresh) {
+                        Some(changed) => {
+                            self.loop_state.git_poll.finished(
+                                now,
+                                refresh.working_dir,
+                                refresh.fingerprint,
+                                refresh.snapshot.is_some(),
+                            );
+                            if changed {
+                                self.refresh()?;
+                            }
+                        }
+                        None => {
+                            self.loop_state.git_poll.retry_now();
+                            self.request_git_status_refresh();
+                        }
                     }
                 }
                 Some(ev) = self.user_rx.recv() => {
-                    match self.handle_user_event(ev).await? {
+                    // Construct the batch future in the short factory frame;
+                    // it awaits the measured large per-event handler.
+                    match crate::startup::heap_future(|| self.handle_user_event_batch(ev)).await? {
                         ControlFlow::Break(()) => break,
                         ControlFlow::Continue(()) => {}
                     }
@@ -2068,6 +2192,15 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
+                    if matches!(
+                        event,
+                        AgentEvent::ToolResult { .. }
+                            | AgentEvent::FileMutation { .. }
+                            | AgentEvent::Done { .. }
+                            | AgentEvent::Error { .. }
+                    ) {
+                        self.loop_state.git_poll.mark_changed(std::time::Instant::now());
+                    }
                     // This measured large child is unrelated to input, but
                     // its inline storage inflated every event-loop poll.
                     crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
@@ -2095,14 +2228,29 @@ impl<'a> App<'a> {
                     // A transient notice expired; the redraw clears it.
                     self.refresh()?;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
-                    self.renderer.feed_mut().tick_reasoning_at(std::time::Instant::now());
+                _ = tokio::time::sleep_until(
+                    forced_refresh.map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+                ), if forced_refresh.is_some() => {
+                    // The next iteration dispatches the due refresh.
+                }
+                // A persistent deadline (not a fresh sleep per iteration):
+                // it fires even while other events arrive faster than its
+                // period, painting the throttled stream tail within one
+                // stream interval and keeping the spinner cadence.
+                _ = tokio::time::sleep_until(
+                    tick_deadline.map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+                ), if tick_deadline.is_some() => {
+                    let now = std::time::Instant::now();
+                    let spinner_due = self.loop_state.running_tick.fired(now);
+                    self.renderer.feed_mut().tick_reasoning_at(now);
                     if self.renderer.paint_pending_chat()?
                         && self.input.picker.as_ref().is_some_and(|picker| picker.active())
                     {
                         self.refresh()?;
                     }
-                    self.renderer.tick_spinner()?;
+                    if spinner_due {
+                        self.renderer.tick_spinner()?;
+                    }
                 }
                 // The @ file picker fills from a background walk; repaint as
                 // results land so "scanning files..." never waits for a key.
@@ -2229,8 +2377,13 @@ impl<'a> App<'a> {
     /// background listing has landed since the last sync (or when `force`).
     fn sync_live_model_names(&mut self, force: bool) {
         let generation = crate::ui::slash::model_cache_generation();
-        self.input
-            .set_current_model(Some(self.ui.session.model.to_string()));
+        // Every frame passes here; allocate the picker's copy only when the
+        // session's model actually changed.
+        if force || self.loop_state.synced_model.as_ref() != Some(&self.ui.session.model) {
+            self.loop_state.synced_model = Some(self.ui.session.model.clone());
+            self.input
+                .set_current_model(Some(self.ui.session.model.to_string()));
+        }
         if force || generation != self.model_cache_generation {
             self.model_cache_generation = generation;
             self.input
@@ -2298,6 +2451,15 @@ impl<'a> App<'a> {
     }
 
     fn refresh(&mut self) -> io::Result<()> {
+        if self.loop_state.defer_paint {
+            // A coalesced batch of user events paints once at its end.
+            self.loop_state.paint_owed = true;
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.loop_state.frames += 1;
+        }
         self.input.set_file_workspace(self.ui.workspace.clone());
         self.sync_live_model_names(false);
         refresh_display(
@@ -2667,6 +2829,143 @@ impl<'a> App<'a> {
         }
         self.refresh()?;
         Ok(true)
+    }
+
+    /// Whether no modal owns input: no permission/question/chain prompt, no
+    /// active picker, Git or plan proposal, MCP operation, or deferred input.
+    /// Only in this mode may queued user events be applied without a frame
+    /// in between.
+    fn plain_input_mode(&self) -> bool {
+        let plain = self.permission_prompt.is_none()
+            && self.question_prompt.is_none()
+            && self.renderer.chain_prompt.is_none()
+            && !self.renderer.chain_but_mode
+            && !self.input.picker.as_ref().is_some_and(Picker::active)
+            && self.chain.plan.pending.is_none()
+            && self.deferred_user_events.is_empty();
+        #[cfg(feature = "git-worktree")]
+        let plain = plain && self.chain.git.pending.is_none();
+        #[cfg(feature = "mcp")]
+        let plain = plain && self.mcp_admin.is_none();
+        plain
+    }
+
+    /// Events that only edit the draft or move the view, and so may be
+    /// applied back to back with a single frame painted afterwards. Submits,
+    /// interrupts, completions, app shortcuts, clicks and every other event
+    /// stop a batch and are handled (and painted) individually.
+    fn coalescible_user_event(&self, event: &UserEvent) -> bool {
+        match event {
+            UserEvent::ScrollUp | UserEvent::ScrollDown | UserEvent::MouseDrag { .. } => true,
+            // An empty paste reads the clipboard image instead.
+            UserEvent::Paste(text) => !text.is_empty(),
+            UserEvent::Key(key) => {
+                key.kind == crossterm::event::KeyEventKind::Press
+                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+                    && matches!(
+                        key.code,
+                        KeyCode::Char(_)
+                            | KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Home
+                            | KeyCode::End
+                    )
+                    && matches!(
+                        self.keyboard_action(*key),
+                        None | Some(
+                            KeyAction::LineStart
+                                | KeyAction::LineEnd
+                                | KeyAction::Left
+                                | KeyAction::Right
+                                | KeyAction::DeleteBackward
+                                | KeyAction::DeleteForward
+                        )
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Handle one received user event plus whatever is already queued behind
+    /// it, painting once. Wheel notches, drags, typing and pastes arrive far
+    /// faster than frames are useful; each is still applied in order with
+    /// exactly the sequential semantics, consecutive drags collapse to the
+    /// last pointer position, and the batch stops at the first event that is
+    /// not a plain edit or that leaves plain input mode (a picker, prompt,
+    /// proposal or quit), which is then handled on its own.
+    async fn handle_user_event_batch(
+        &mut self,
+        first: UserEvent,
+    ) -> anyhow::Result<ControlFlow<(), ()>> {
+        const MAX_BATCH: usize = 64;
+        let mut event = first;
+        let mut lookahead: Option<UserEvent> = None;
+        let mut applied = 0usize;
+        loop {
+            if !self.coalescible_user_event(&event) || !self.plain_input_mode() {
+                self.flush_owed_paint()?;
+                if let Some(later) = lookahead.take() {
+                    self.deferred_user_events.push_front(later);
+                }
+                let submits = matches!(&event, UserEvent::Key(key) if key.code == KeyCode::Enter);
+                let flow = self.handle_user_event(event).await;
+                if submits {
+                    // A submitted `!` or `/` command can change the repository.
+                    self.loop_state
+                        .git_poll
+                        .mark_changed(std::time::Instant::now());
+                }
+                return flow;
+            }
+            self.loop_state.defer_paint = true;
+            let flow = self.handle_user_event(event).await;
+            self.loop_state.defer_paint = false;
+            let flow = match flow {
+                Ok(flow) => flow,
+                Err(error) => {
+                    self.loop_state.paint_owed = false;
+                    return Err(error);
+                }
+            };
+            applied += 1;
+            let next = match lookahead.take() {
+                Some(next) => Some(next),
+                None if flow.is_continue() && applied < MAX_BATCH && self.plain_input_mode() => {
+                    self.user_rx.try_recv().ok()
+                }
+                None => None,
+            };
+            let Some(mut next) = next else {
+                self.flush_owed_paint()?;
+                return Ok(flow);
+            };
+            if flow.is_break() || applied >= MAX_BATCH || !self.plain_input_mode() {
+                self.flush_owed_paint()?;
+                self.deferred_user_events.push_front(next);
+                return Ok(flow);
+            }
+            if matches!(next, UserEvent::MouseDrag { .. }) {
+                // Only the last of consecutive drags decides the selection.
+                while let Ok(after) = self.user_rx.try_recv() {
+                    if matches!(after, UserEvent::MouseDrag { .. }) {
+                        next = after;
+                    } else {
+                        lookahead = Some(after);
+                        break;
+                    }
+                }
+            }
+            event = next;
+        }
+    }
+
+    fn flush_owed_paint(&mut self) -> io::Result<()> {
+        if std::mem::take(&mut self.loop_state.paint_owed) {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
@@ -4296,7 +4595,9 @@ impl<'a> App<'a> {
                 && Arc::ptr_eq(&work.workspace, &self.ui.workspace),
             "Git work identity changed before settlement"
         );
+        let mut placed = false;
         while let Ok(observation) = work.observations.try_recv() {
+            placed = true;
             let limit = self.ui.cfg.mutation_diff_options().max_lines;
             let mut count = 0usize;
             for line in observation.text.lines().take(limit) {
@@ -4324,8 +4625,12 @@ impl<'a> App<'a> {
                 );
             }
         }
-        self.renderer.invalidate();
-        self.renderer.render_viewport()?;
+        // Runs on every event-loop iteration while Git work is pending:
+        // repaint only when an observation actually landed in the feed.
+        if placed {
+            self.renderer.invalidate();
+            self.renderer.render_viewport()?;
+        }
         Ok(())
     }
 
@@ -4786,10 +5091,16 @@ impl<'a> App<'a> {
         );
         #[cfg(not(feature = "multimodal"))]
         let pending_tokens = text_tokens;
-        let quick_models = config::quick_models_map(self.ui.cfg);
+        let no_quick_models = std::collections::HashMap::new();
+        let quick_models = self
+            .ui
+            .cfg
+            .quick_models
+            .as_ref()
+            .unwrap_or(&no_quick_models);
         let reserve = self.ui.cfg.resolve_reserve_tokens(
             &self.ui.session.model,
-            &quick_models,
+            quick_models,
             self.ui.session.context_window,
         );
         if self
@@ -4833,6 +5144,9 @@ impl<'a> App<'a> {
             self.ui.cfg,
         );
         self.chain.plan = Default::default();
+        // The echo is already on screen; show the spinner and Working
+        // activity before memory refresh, prebuild adoption and agent build.
+        self.paint_submission_started()?;
         start_main_run(
             text,
             true,
@@ -4982,6 +5296,16 @@ impl<'a> App<'a> {
             }
         }
         Ok(())
+    }
+
+    /// One frame drawn as running, so a submit shows its spinner while the
+    /// turn's startup work (memory refresh, prebuild, agent build) is
+    /// awaited. The run state itself is unchanged.
+    fn paint_submission_started(&mut self) -> io::Result<()> {
+        let was_running = std::mem::replace(&mut self.run.is_running, true);
+        let painted = self.refresh();
+        self.run.is_running = was_running;
+        painted
     }
 
     fn echo_main_submission(&mut self, text: &str) -> anyhow::Result<()> {
@@ -6596,6 +6920,11 @@ impl<'a> App<'a> {
         // Terminal resumption clears the screen even when the draft is unchanged.
         self.renderer.invalidate();
         self.renderer.forget_title();
+        // A suspension (editor, lazygit, pager) may have changed the
+        // repository; refresh the Git statusline on the next iteration.
+        self.loop_state
+            .git_poll
+            .mark_changed(std::time::Instant::now());
         self.running = Arc::new(AtomicBool::new(true));
         // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(
@@ -10091,6 +10420,290 @@ mod permission_loop_tests {
         tokio::time::timeout(Duration::from_secs(2), app.teardown())
             .await
             .unwrap();
+    }
+
+    fn key(c: char) -> UserEvent {
+        UserEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// The queued user events of a burst are applied in order with one frame
+    /// painted for the whole batch, ending in the sequential state.
+    #[tokio::test]
+    async fn queued_scrolls_and_keys_are_applied_in_order_with_one_frame() {
+        let root = crate::tests::OwnedTestDirectory::new("user-event-batch");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut batched_context =
+            crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut sequential_context = batched_context.clone();
+        let mut batched_session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut sequential_session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut batched = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut batched_session,
+            &mut batched_context,
+            workspace.clone(),
+        ));
+        let mut sequential = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut sequential_session,
+            &mut sequential_context,
+            workspace,
+        ));
+        let events = || {
+            let mut events = vec![UserEvent::ScrollUp; 10];
+            events.extend("hello batched typing".chars().map(key));
+            events.push(UserEvent::ScrollDown);
+            events
+        };
+        for app in [&mut batched, &mut sequential] {
+            for line in 0..200 {
+                app.renderer
+                    .write_line(&format!("transcript line {line}"), Color::White)
+                    .unwrap();
+            }
+            app.refresh().unwrap();
+        }
+        // Let the startup Git refresh land first: it may paint its own frame.
+        drain(&mut batched).await;
+        let (tx, rx) = mpsc::channel(64);
+        batched.user_tx = tx.clone();
+        batched.user_rx = rx;
+        for event in events() {
+            tx.try_send(event).unwrap();
+        }
+        let before = batched.loop_state.frames;
+        drain(&mut batched).await;
+        assert_eq!(
+            batched.loop_state.frames - before,
+            1,
+            "one frame for the whole queued burst"
+        );
+        let before = sequential.loop_state.frames;
+        for event in events() {
+            assert!(
+                sequential
+                    .handle_user_event(event)
+                    .await
+                    .unwrap()
+                    .is_continue()
+            );
+        }
+        assert!(sequential.loop_state.frames - before >= 31);
+        assert_eq!(batched.input.buffer, "hello batched typing");
+        assert_eq!(batched.input.buffer, sequential.input.buffer);
+        assert_eq!(batched.input.cursor, sequential.input.cursor);
+        assert!(batched.renderer.is_scrolling());
+        assert_eq!(
+            batched.renderer.is_scrolling(),
+            sequential.renderer.is_scrolling()
+        );
+        assert_eq!(
+            batched.renderer.buffer_line_at_row(0),
+            sequential.renderer.buffer_line_at_row(0)
+        );
+        // Consecutive drags collapse to the last pointer position, and a
+        // submit stops the batch so it is handled (and painted) on its own.
+        batched.renderer.selection_active = true;
+        batched.renderer.selection_start = Some(SelectionPoint::new(0, 0));
+        for col in 1..=12 {
+            tx.try_send(UserEvent::MouseDrag { row: 2, col }).unwrap();
+        }
+        tx.try_send(UserEvent::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+        let before = batched.loop_state.frames;
+        drain(&mut batched).await;
+        assert_eq!(batched.loop_state.frames - before, 2);
+        let idx = batched.renderer.buffer_line_at_row(2).unwrap();
+        assert_eq!(
+            batched.renderer.selection_end,
+            Some(SelectionPoint::new(idx, batched.renderer.chat_text_col(12)))
+        );
+        assert!(
+            batched.input.buffer.is_empty(),
+            "the kill key still applied"
+        );
+    }
+
+    /// Streaming one-line tokens faster than the stream interval repaints by
+    /// time, not per token, and the throttled tail is still painted promptly
+    /// by the event loop's persistent running tick.
+    #[tokio::test]
+    async fn streamed_one_line_tokens_repaint_at_the_stream_interval() {
+        let root = crate::tests::OwnedTestDirectory::new("stream-repaint-interval");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        app.refresh().unwrap();
+        let started = std::time::Instant::now();
+        let mut paints = 0usize;
+        for line in 0..500 {
+            app.handle_agent_event(AgentEvent::Token(format!("line {line}\n").into()))
+                .await
+                .unwrap();
+            if !app.renderer.chat_needs_redraw() {
+                paints += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let elapsed = started.elapsed();
+        let bound = (elapsed.as_millis()
+            / crate::ui::event_handler::STREAM_REPAINT_INTERVAL.as_millis())
+            as usize
+            + 2;
+        assert!(
+            paints <= bound,
+            "{paints} paints for 500 tokens in {elapsed:?} (bound {bound})"
+        );
+        assert!(paints >= 1, "the first token paints at once");
+        // A token skipped by the throttle is painted by the running tick
+        // within one stream interval, without any further event.
+        app.handle_agent_event(AgentEvent::Token("tail\n".into()))
+            .await
+            .unwrap();
+        assert!(app.renderer.chat_needs_redraw());
+        app.run.is_running = true;
+        drain(&mut app).await;
+        assert!(!app.renderer.chat_needs_redraw(), "the tail was painted");
+        app.run.is_running = false;
+    }
+
+    /// A submit paints the spinner and Working activity before the turn's
+    /// startup work (memory refresh, prebuild, agent build) is awaited.
+    #[tokio::test]
+    async fn submission_paints_the_spinner_before_the_run_starts() {
+        let root = crate::tests::OwnedTestDirectory::new("submission-spinner");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        app.refresh().unwrap();
+        app.echo_main_submission("spinner prompt").unwrap();
+        let before = app.renderer.captured_output().len();
+        app.paint_submission_started().unwrap();
+        let frame = &app.renderer.captured_output()[before..];
+        assert!(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .any(|glyph| frame.contains(glyph)),
+            "{frame:?}"
+        );
+        assert!(!app.run.is_running, "only the frame is drawn as running");
+        assert!(app.run.agent.is_none() && app.run.agent_rx.is_none());
+    }
+
+    /// Git status is refreshed on an adaptive schedule: at most one dispatch
+    /// per interval while idle, and one right after a tool result.
+    #[tokio::test]
+    async fn git_refresh_dispatches_once_per_interval_and_after_a_tool_result() {
+        let root = crate::tests::OwnedTestDirectory::new("git-poll-loop");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        // The startup refresh, then many idle loop iterations.
+        drain(&mut app).await;
+        let (tx, rx) = mpsc::channel(64);
+        app.user_tx = tx.clone();
+        app.user_rx = rx;
+        for _ in 0..20 {
+            tx.try_send(UserEvent::Resize).unwrap();
+        }
+        drain(&mut app).await;
+        assert_eq!(app.loop_state.git_poll.dispatches, 1);
+        // Pretend that dispatch happened a while ago: a tool result now
+        // refreshes immediately instead of waiting for the interval.
+        app.loop_state.git_poll = Default::default();
+        app.loop_state
+            .git_poll
+            .start(std::time::Instant::now() - Duration::from_secs(2));
+        let (_task, _retired, agent_events) = runner(&mut app).await;
+        sent(
+            &agent_events,
+            AgentEvent::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "true"}),
+            },
+        )
+        .await;
+        drain(&mut app).await;
+        assert_eq!(
+            app.loop_state.git_poll.dispatches, 1,
+            "a call alone is not a change"
+        );
+        sent(
+            &agent_events,
+            AgentEvent::ToolResult {
+                id: "call-1".into(),
+                name: "bash".into(),
+                output: "ok".into(),
+                images: Vec::new(),
+                is_error: false,
+            },
+        )
+        .await;
+        drain(&mut app).await;
+        assert_eq!(app.loop_state.git_poll.dispatches, 2);
+        app.run.is_running = false;
+        if let Some(abort) = app.run.main_abort.take() {
+            abort.abort();
+        }
     }
 }
 

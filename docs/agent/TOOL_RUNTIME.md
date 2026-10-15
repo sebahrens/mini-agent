@@ -1396,6 +1396,22 @@ The focused native stdio fixture proves same-process/restart prefix retention an
 closed refusal using inert signatures; it does not assert live-provider signature
 acceptance.
 
+Event-loop frame scheduling: streamed answer tokens and reasoning repaint by
+time only (`event_handler::stream_repaint_due`, at most every 40 ms after the
+first delta), and a persistent `RunningTick` deadline (not a fresh sleep per
+`select!` iteration) paints the throttled tail within one interval and keeps
+the 100 ms spinner cadence during event bursts. User events already queued
+behind the one received are applied in order without intermediate frames
+(`App::handle_user_event_batch`): wheel notches, drags (collapsed to the last
+position), plain edit keys and pastes; a submit, shortcut, click, prompt,
+picker or quit ends the batch and is handled on its own. A submit paints its
+spinner before memory refresh and agent build are awaited, and the memory
+block is re-read only when its files' mtimes or lengths changed. The input
+reader polls every 50 ms for a second after input and every 250 ms when
+quiet, peeks for pasted newlines only when the previous key arrived within
+the 10 ms paste window, and signals its exit so a pause waits for it without
+a sleep loop.
+
 The App event loop constructs measured large agent-event, key-handler, and
 slash-command futures through the existing short `heap_future` factory. This
 keeps their temporary storage out of parent polling frames while preserving

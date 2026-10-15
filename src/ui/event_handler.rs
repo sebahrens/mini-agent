@@ -65,23 +65,75 @@ pub async fn ensure_agent(
     }
 }
 
-/// Minimum spacing between streamed-token repaints once a segment is large.
+/// Minimum spacing between streamed repaints (answer tokens and reasoning).
 pub(crate) const STREAM_REPAINT_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(40);
 
-/// Whether a streamed token should repaint the chat now. Small segments and
-/// tokens that complete a line (markdown structure changes at line
-/// boundaries) always repaint; otherwise repaints are spaced by
-/// [`STREAM_REPAINT_INTERVAL`]. Never "only at newlines": a paragraph with no
-/// line break must not appear frozen.
-pub(crate) fn stream_repaint_due(
-    segment_len: usize,
-    completes_line: bool,
-    since_last_paint: Option<std::time::Duration>,
-) -> bool {
-    completes_line
-        || segment_len < 200
-        || since_last_paint.is_none_or(|elapsed| elapsed >= STREAM_REPAINT_INTERVAL)
+/// Cadence of the running spinner (and of the tail tick while no streamed
+/// text is waiting to be painted).
+pub(crate) const RUNNING_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a streamed delta should repaint the chat now. Purely time based:
+/// the first delta paints at once, later ones only once
+/// [`STREAM_REPAINT_INTERVAL`] has passed since the last stream paint. A
+/// skipped delta is never lost: the event loop's [`RunningTick`] paints the
+/// pending tail within one interval, so text without newlines (or a burst of
+/// one-line tokens) can neither freeze nor repaint at token rate.
+pub(crate) fn stream_repaint_due(since_last_paint: Option<std::time::Duration>) -> bool {
+    since_last_paint.is_none_or(|elapsed| elapsed >= STREAM_REPAINT_INTERVAL)
+}
+
+/// Persistent deadline for the event loop's running tick. A fresh `sleep` per
+/// `select!` iteration never fires while other events arrive faster than its
+/// period; this deadline survives iterations, so the pending stream tail is
+/// painted within [`STREAM_REPAINT_INTERVAL`] and the spinner keeps its
+/// [`RUNNING_TICK_INTERVAL`] cadence even during an event burst.
+#[derive(Debug, Default)]
+pub(crate) struct RunningTick {
+    deadline: Option<std::time::Instant>,
+    last_spinner: Option<std::time::Instant>,
+}
+
+impl RunningTick {
+    /// The deadline the loop should wait for, or `None` while idle. An
+    /// existing deadline is kept; it is only pulled in when streamed text is
+    /// waiting (`chat_pending`) and the stream interval ends sooner.
+    pub(crate) fn deadline(
+        &mut self,
+        now: std::time::Instant,
+        running: bool,
+        chat_pending: bool,
+    ) -> Option<std::time::Instant> {
+        if !running {
+            self.deadline = None;
+            return None;
+        }
+        let interval = if chat_pending {
+            STREAM_REPAINT_INTERVAL
+        } else {
+            RUNNING_TICK_INTERVAL
+        };
+        let candidate = now + interval;
+        let deadline = match self.deadline {
+            Some(existing) if existing <= candidate => existing,
+            _ => candidate,
+        };
+        self.deadline = Some(deadline);
+        Some(deadline)
+    }
+
+    /// The deadline fired. Returns whether the spinner frame is due, which
+    /// keeps its cadence independent of the faster stream-tail ticks.
+    pub(crate) fn fired(&mut self, now: std::time::Instant) -> bool {
+        self.deadline = None;
+        let due = self
+            .last_spinner
+            .is_none_or(|last| now.duration_since(last) >= RUNNING_TICK_INTERVAL);
+        if due {
+            self.last_spinner = Some(now);
+        }
+        due
+    }
 }
 
 pub async fn handle_agent_event(
@@ -160,7 +212,7 @@ pub async fn handle_agent_event(
             run.was_reasoning = true;
             let now = std::time::Instant::now();
             renderer.feed_mut().tick_reasoning_at(now);
-            if stream_repaint_due(safe.len(), safe.contains('\n'), run.last_stream_paint.map(|last| now.duration_since(last))) {
+            if stream_repaint_due(run.last_stream_paint.map(|last| now.duration_since(last))) {
                 renderer.render_viewport()?;
                 run.last_stream_paint = Some(now);
             }
@@ -194,17 +246,14 @@ pub async fn handle_agent_event(
             };
             renderer.feed_mut().append_to(idx, &safe);
 
-            // Throttle repaints by time, not by size: a long paragraph without
-            // a newline must keep appearing. Anything skipped here is painted
-            // by the next token past the interval or by the UI tick. The
-            // final full parse happens in handle_agent_done.
+            // Throttle repaints by time only, never by size or newlines: a
+            // long paragraph keeps appearing and code-heavy answers do not
+            // repaint at token rate. Anything skipped here is painted by the
+            // next token past the interval or by the event loop's running
+            // tick. The final full parse happens in handle_agent_done.
             let now = std::time::Instant::now();
             run.agent_line_started = true;
-            if !stream_repaint_due(
-                run.response_buf.len(),
-                safe.contains('\n'),
-                run.last_stream_paint.map(|last| now.duration_since(last)),
-            ) {
+            if !stream_repaint_due(run.last_stream_paint.map(|last| now.duration_since(last))) {
                 return Ok(());
             }
 
@@ -1134,8 +1183,8 @@ fn finalize_response_segment(
 #[cfg(test)]
 mod tests {
     use super::{
-        STREAM_REPAINT_INTERVAL, apply_usage_delta, should_auto_compact_between_turns,
-        stream_repaint_due,
+        RUNNING_TICK_INTERVAL, RunningTick, STREAM_REPAINT_INTERVAL, apply_usage_delta,
+        should_auto_compact_between_turns, stream_repaint_due,
     };
     use crate::event::UsageDelta;
     use crate::session::Session;
@@ -1145,13 +1194,45 @@ mod tests {
     fn long_streamed_paragraphs_keep_repainting_without_newlines() {
         let just_now = Some(Duration::from_millis(5));
         let a_while_ago = Some(STREAM_REPAINT_INTERVAL);
-        // Small segments and completed lines always repaint.
-        assert!(stream_repaint_due(50, false, just_now));
-        assert!(stream_repaint_due(5_000, true, just_now));
-        // A large segment without a newline is throttled, not frozen.
-        assert!(!stream_repaint_due(5_000, false, just_now));
-        assert!(stream_repaint_due(5_000, false, a_while_ago));
-        assert!(stream_repaint_due(5_000, false, None));
+        // The first delta of a stream paints at once; later deltas, whatever
+        // their size or newlines, are spaced by the interval.
+        assert!(stream_repaint_due(None));
+        assert!(!stream_repaint_due(just_now));
+        assert!(stream_repaint_due(a_while_ago));
+        // Throttled is never frozen: a delta skipped right after a paint is
+        // painted by the running tick no later than one stream interval on.
+        let start = std::time::Instant::now();
+        let mut tick = RunningTick::default();
+        let deadline = tick.deadline(start, true, true).unwrap();
+        assert!(deadline.duration_since(start) <= STREAM_REPAINT_INTERVAL);
+    }
+
+    #[test]
+    fn running_tick_deadline_survives_event_bursts_and_keeps_spinner_cadence() {
+        let start = std::time::Instant::now();
+        let mut tick = RunningTick::default();
+        assert_eq!(tick.deadline(start, false, true), None);
+        let first = tick.deadline(start, true, false).unwrap();
+        assert_eq!(first, start + RUNNING_TICK_INTERVAL);
+        // A burst of events re-entering the loop keeps the same deadline
+        // instead of restarting a fresh sleep each iteration.
+        for ms in 1..50 {
+            let now = start + Duration::from_millis(ms);
+            assert_eq!(tick.deadline(now, true, false), Some(first));
+        }
+        // Pending streamed text pulls the deadline in to the stream interval.
+        let now = start + Duration::from_millis(10);
+        let pulled = tick.deadline(now, true, true).unwrap();
+        assert_eq!(pulled, now + STREAM_REPAINT_INTERVAL);
+        assert!(pulled < first);
+        // The spinner advances on the first tick, then only every 100 ms even
+        // though stream-tail ticks fire every 40 ms.
+        assert!(tick.fired(pulled));
+        let next = tick.deadline(pulled, true, true).unwrap();
+        assert!(!tick.fired(next));
+        assert!(tick.fired(pulled + RUNNING_TICK_INTERVAL));
+        // Stopping the run clears the deadline.
+        assert_eq!(tick.deadline(next, false, false), None);
     }
 
     #[test]

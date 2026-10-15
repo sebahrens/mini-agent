@@ -23,6 +23,7 @@ pub(crate) use app::{InterruptTarget, interrupt_target};
 pub(crate) mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
+mod git_poll;
 pub(crate) mod highlight;
 pub(crate) mod input;
 pub(crate) mod markdown;
