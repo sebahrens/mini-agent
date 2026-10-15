@@ -438,6 +438,8 @@ pub(crate) struct ServerSourceProof {
     server: Option<McpServerConfig>,
     origin: Option<ServerOrigin>,
     declared_source: bool,
+    /// `fingerprint()` of these immutable fields, computed once.
+    fingerprint: std::sync::OnceLock<String>,
 }
 
 impl ServerSourceProof {
@@ -454,6 +456,7 @@ impl ServerSourceProof {
             server,
             origin,
             declared_source,
+            fingerprint: std::sync::OnceLock::new(),
         }
     }
 
@@ -470,6 +473,12 @@ impl ServerSourceProof {
     /// Opaque runtime comparison only; never emitted as a credential or model
     /// result, and never replaces the current source/trust revalidation.
     pub(crate) fn fingerprint(&self) -> String {
+        self.fingerprint
+            .get_or_init(|| self.compute_fingerprint())
+            .clone()
+    }
+
+    fn compute_fingerprint(&self) -> String {
         let origin = self.origin.as_ref().map(|origin| {
             (
                 &origin.source,

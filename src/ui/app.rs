@@ -2671,8 +2671,14 @@ impl<'a> App<'a> {
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
         self.input.set_file_workspace(self.ui.workspace.clone());
+        // Without /mcp admin state only a completion or Quit can be handled
+        // there; skip boxing that large future for every other event. The
+        // boxing itself stays for the startup stack budget.
         #[cfg(feature = "mcp")]
-        if crate::startup::heap_future(|| self.handle_mcp_user_event(&ev)).await? {
+        if (self.mcp_admin.is_some()
+            || matches!(ev, UserEvent::McpAdminDone { .. } | UserEvent::Quit))
+            && crate::startup::heap_future(|| self.handle_mcp_user_event(&ev)).await?
+        {
             return Ok(ControlFlow::Continue(()));
         }
         if crate::startup::heap_future(|| self.handle_plan_event(&ev)).await? {

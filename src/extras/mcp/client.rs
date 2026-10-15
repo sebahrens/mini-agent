@@ -52,6 +52,11 @@ pub struct McpClientHandle {
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub(crate) liveness: std::sync::Arc<()>,
     pub(crate) auxiliary: Arc<tokio::sync::OnceCell<super::catalogue::Catalogue>>,
+    /// Successful `tools/list` of this connection generation. A reconnect is a
+    /// new handle (and cell); failures are not cached. Without a
+    /// `notifications/tools/list_changed` subscription, re-listing on every
+    /// agent rebuild could not observe anything this cache hides.
+    pub(crate) tools: Arc<tokio::sync::OnceCell<Vec<Tool>>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -496,6 +501,7 @@ impl McpClientHandle {
                     source_proof: None,
                     liveness: std::sync::Arc::new(()),
                     auxiliary: Arc::new(tokio::sync::OnceCell::new()),
+                    tools: Arc::new(tokio::sync::OnceCell::new()),
                 })
             }
             McpServerConfig::Url {
@@ -636,6 +642,7 @@ impl McpClientHandle {
             source_proof: None,
             liveness: std::sync::Arc::new(()),
             auxiliary: Arc::new(tokio::sync::OnceCell::new()),
+            tools: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 

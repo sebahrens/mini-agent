@@ -66,15 +66,16 @@ impl McpTool {
             MCP_TOOL_DESCRIPTION_MAX_BYTES,
             "\n[description truncated]",
         );
-        let schema = serde_json::to_value(&definition.input_schema)
-            .map_err(|_| "input schema could not be serialized")?;
-        if serde_json::to_vec(&schema)
+        // One serialization for the size bound; the model value is the same
+        // object, so it is cloned rather than serialized a second time.
+        if serde_json::to_vec(&*definition.input_schema)
             .map_err(|_| "input schema could not be serialized")?
             .len()
             > MCP_TOOL_SCHEMA_MAX_BYTES
         {
             return Err("input schema exceeds 16 KiB");
         }
+        let schema = serde_json::Value::Object((*definition.input_schema).clone());
         Ok((description, schema, truncated))
     }
 }
@@ -102,24 +103,49 @@ fn parse_arguments(args: &str) -> Result<Option<JsonObject>, McpToolError> {
 }
 
 fn bounded_mcp_output(output: &str, spill_scope: &str, tool_name: &str) -> String {
-    bounded_mcp_output_with(output, |full_output| {
+    bounded_mcp_output_after(String::new(), output, spill_scope, tool_name)
+}
+
+/// `bounded_mcp_output` rendered after `head` (trusted host text that stays
+/// outside the fence), without copying the fenced result a second time.
+fn bounded_mcp_output_after(
+    head: String,
+    output: &str,
+    spill_scope: &str,
+    tool_name: &str,
+) -> String {
+    bounded_mcp_output_with_after(head, output, |full_output| {
         crate::session::storage::save_tool_output(spill_scope, tool_name, full_output)
     })
 }
 
+#[cfg(test)]
 fn bounded_mcp_output_with(
     output: &str,
     save: impl FnOnce(&str) -> anyhow::Result<PathBuf>,
 ) -> String {
+    bounded_mcp_output_with_after(String::new(), output, save)
+}
+
+fn bounded_mcp_output_with_after(
+    head: String,
+    output: &str,
+    save: impl FnOnce(&str) -> anyhow::Result<PathBuf>,
+) -> String {
+    // Bytes bound characters from above, so only a long result is counted.
+    if output.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+        return delimit_mcp_body_after(head, output, None);
+    }
     let output_chars = output.chars().count();
     if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
-        return delimit_mcp_body(output, None);
+        return delimit_mcp_body_after(head, output, None);
     }
 
     match save(output) {
         Ok(path) => {
             let (body, omitted) = truncated_mcp_body(output, output_chars);
-            delimit_mcp_body(
+            delimit_mcp_body_after(
+                head,
                 &body,
                 Some(format!(
                     "[mcp host: full output saved to: {}; {output_chars} characters; {omitted} omitted]",
@@ -129,7 +155,7 @@ fn bounded_mcp_output_with(
         }
         Err(error) => {
             tracing::debug!(%error, "failed to spill oversized MCP tool result");
-            format_unsaved_mcp_output(output, output_chars, &error.to_string())
+            format_unsaved_mcp_output(head, output, output_chars, &error.to_string())
         }
     }
 }
@@ -147,8 +173,13 @@ fn truncated_mcp_body(output: &str, output_chars: usize) -> (String, usize) {
     (format!("{head}\n…\n{tail}"), omitted)
 }
 
-fn delimit_mcp_body(body: &str, host_notice: Option<String>) -> String {
-    let mut rendered = String::from("[mcp output begins]\n");
+fn delimit_mcp_body_after(head: String, body: &str, host_notice: Option<String>) -> String {
+    let mut rendered = head;
+    // Each line gains a two-byte prefix; reserve for the common line length so
+    // a large body is not regrown repeatedly.
+    rendered
+        .reserve(body.len() + body.len() / 16 + 64 + host_notice.as_ref().map_or(0, String::len));
+    rendered.push_str("[mcp output begins]\n");
     for line in body.lines() {
         rendered.push_str("> ");
         rendered.push_str(line);
@@ -165,7 +196,12 @@ fn delimit_mcp_body(body: &str, host_notice: Option<String>) -> String {
     rendered
 }
 
-fn format_unsaved_mcp_output(output: &str, output_chars: usize, error: &str) -> String {
+fn format_unsaved_mcp_output(
+    head: String,
+    output: &str,
+    output_chars: usize,
+    error: &str,
+) -> String {
     let (body, omitted) = truncated_mcp_body(output, output_chars);
     let diagnostic = error
         .chars()
@@ -173,7 +209,8 @@ fn format_unsaved_mcp_output(output: &str, output_chars: usize, error: &str) -> 
         .take(300)
         .collect::<String>();
 
-    delimit_mcp_body(
+    delimit_mcp_body_after(
+        head,
         &body,
         Some(format!(
             "[mcp host: output could not be saved; {output_chars} characters; {omitted} omitted; re-run with a narrower request: {diagnostic}]"
@@ -306,17 +343,19 @@ impl ToolDyn for McpTool {
 
             let content =
                 render_success_content(result.content, result.structured_content.as_ref());
-            let bounded = bounded_mcp_output(
+            // Host coaching is trusted host text: it stays outside the fence
+            // that marks untrusted server output, and is written first so the
+            // fenced result is rendered once.
+            let head = coaching.map_or_else(String::new, |mut msg| {
+                msg.push_str("\n\n");
+                msg
+            });
+            Ok(bounded_mcp_output_after(
+                head,
                 &content,
                 &spill_scope,
                 &format!("mcp:{server_name}:{tool_name}"),
-            );
-            // Host coaching is trusted host text: it stays outside the fence
-            // that marks untrusted server output.
-            Ok(match coaching {
-                Some(msg) => format!("{msg}\n\n{bounded}"),
-                None => bounded,
-            })
+            ))
         })
     }
 }
@@ -359,15 +398,15 @@ fn render_success_content(
     let mut unsupported = 0_usize;
     for item in blocks {
         match item {
-            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::Text(t) => parts.push(t.text),
             ContentBlock::Image(img) => parts.push(format!(
                 "[image: {}, {} bytes]",
                 img.mime_type,
                 base64_decoded_len(&img.data)
             )),
-            ContentBlock::Resource(r) => match &r.resource {
+            ContentBlock::Resource(r) => match r.resource {
                 rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                    parts.push(text.clone());
+                    parts.push(text);
                 }
                 rmcp::model::ResourceContents::BlobResourceContents {
                     uri,
@@ -377,14 +416,19 @@ fn render_success_content(
                 } => parts.push(format!(
                     "[resource: {uri}, {}, {} bytes]",
                     mime_type.as_deref().unwrap_or("application/octet-stream"),
-                    base64_decoded_len(blob)
+                    base64_decoded_len(&blob)
                 )),
                 _ => unsupported += 1,
             },
             _ => unsupported += 1,
         }
     }
-    let mut content = parts.join("\n");
+    // A single block (the common case) is moved, not joined into a copy.
+    let mut content = if parts.len() == 1 {
+        parts.pop().unwrap_or_default()
+    } else {
+        parts.join("\n")
+    };
     // A successful result may carry its whole payload in
     // structuredContent with an empty `content` array. Dropping it
     // leaves the model with empty delimiters, so it may repeat a

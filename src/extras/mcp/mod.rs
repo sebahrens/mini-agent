@@ -403,6 +403,7 @@ impl McpClientManager {
             .map(|handle| {
                 let sem = sem.clone();
                 let peer = handle.peer();
+                let listed = handle.tools.clone();
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;
                 let source_proof = handle.source_proof.clone();
@@ -417,7 +418,10 @@ impl McpClientManager {
                     .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let result = client::list_all_tools_bounded(&peer, timeouts.list).await;
+                    let result = listed
+                        .get_or_try_init(|| client::list_all_tools_bounded(&peer, timeouts.list))
+                        .await
+                        .cloned();
                     let outcome = match &result {
                         Ok(_) => health::AttemptOutcome::Succeeded,
                         Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,

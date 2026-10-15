@@ -1541,6 +1541,15 @@ async fn mcp_tools_list_error_produces_notice() {
         notices[0]
     );
     assert!(manager.take_notices().is_empty(), "notices drain once");
+    assert!(
+        !manager.handles[0].tools.initialized(),
+        "a failed tools/list is never cached for the next rebuild"
+    );
+    let retried = manager
+        .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+        .await;
+    assert!(retried.is_empty());
+    assert_eq!(manager.take_notices().len(), 1, "a rebuild retries the RPC");
 
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
@@ -1642,6 +1651,24 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     assert!(notices[0].contains("probe"), "{}", notices[0]);
     assert!(notices[0].contains("alpha__probe"), "{}", notices[0]);
     assert!(notices[0].contains("beta__probe"), "{}", notices[0]);
+    // A rebuild of the same connection generation reuses its listed tools and
+    // still produces the identical namespaced catalogue.
+    assert!(
+        manager
+            .handles
+            .iter()
+            .all(|handle| handle.tools.initialized())
+    );
+    let cached = Arc::as_ptr(&manager.handles[0].tools);
+    let mut rebuilt: Vec<String> = manager
+        .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+        .await
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
+    rebuilt.sort();
+    assert_eq!(rebuilt, names);
+    assert_eq!(Arc::as_ptr(&manager.handles[0].tools), cached);
 
     let alpha_output = tools
         .iter_mut()
