@@ -156,6 +156,38 @@ fn held_path(file: &File) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_wide(&buffer)))
 }
 
+#[derive(Debug)]
+struct PublicationStageError {
+    stage: &'static str,
+    source: io::Error,
+}
+impl std::fmt::Display for PublicationStageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Windows MCP publication at {}: {}",
+            self.stage, self.source
+        )
+    }
+}
+impl std::error::Error for PublicationStageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+fn at_stage<T>(stage: &'static str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|source| io::Error::new(source.kind(), PublicationStageError { stage, source }))
+}
+#[cfg(test)]
+fn native_error_code(error: &io::Error) -> Option<i32> {
+    error.raw_os_error().or_else(|| {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<PublicationStageError>())
+            .and_then(|error| native_error_code(&error.source))
+    })
+}
+
 struct Transaction {
     handle: OwnedHandle,
     committed: bool,
@@ -180,7 +212,9 @@ impl Transaction {
         let path = wide(path)?;
         let access = GENERIC_READ
             | GENERIC_WRITE
-            | DELETE
+            // Workspace directory handles deliberately exclude delete sharing.
+            // A directory writer needs add-file/metadata access, not DELETE.
+            | if directory { 0 } else { DELETE }
             | READ_CONTROL
             | if create { WRITE_DAC | WRITE_OWNER } else { 0 };
         // SAFETY: terminated path, null optional pointers, live exact transaction.
@@ -333,9 +367,9 @@ fn check_parent_namespace(
 ) -> io::Result<()> {
     workspace.validate().map_err(io::Error::other)?;
     let (current, _) = workspace.open_parent(relative, false)?;
-    // A retained directory handle alone does not bind the original relative
-    // namespace: it can survive a rename and report a new held_path. Rewalk
-    // from the retained workspace and compare the exact approved parent.
+    // Bind the original relative namespace independently of an object's ID.
+    // Current directory handles also pin names by excluding delete sharing;
+    // retain this rewalk against earlier replacement or changed capture rules.
     check_directory(&current.into_std_file(), parent_identity, parent_security)
 }
 
@@ -365,16 +399,28 @@ fn replace_with_hooks(
     let parent_path = held_path(&parent)?;
     let target_path = parent_path.join(&name);
     let candidate_path = parent_path.join(super::sibling_temp_name(&name));
-    let mut transaction = Transaction::new()?;
+    let mut transaction = at_stage("begin transaction", Transaction::new())?;
     {
         // Exact directory writer locks exclude both namespace and security
         // mutation, including preheld WRITE_DAC/WRITE_OWNER interference.
-        let root = transaction.open(&root_path, false, true)?;
+        let root = at_stage(
+            "root directory writer",
+            transaction.open(&root_path, false, true),
+        )?;
         check_directory(&root, &workspace.identity, &root_security)?;
-        let parent = transaction.open(&parent_path, false, true)?;
+        let parent = at_stage(
+            "parent directory writer",
+            transaction.open(&parent_path, false, true),
+        )?;
         check_directory(&parent, &parent_identity, &parent_security)?;
-        check_parent_namespace(workspace, &relative, &parent_identity, &parent_security)?;
-        let mut target = transaction.open(&target_path, false, false)?;
+        at_stage(
+            "original parent namespace",
+            check_parent_namespace(workspace, &relative, &parent_identity, &parent_security),
+        )?;
+        let mut target = at_stage(
+            "target writer",
+            transaction.open(&target_path, false, false),
+        )?;
         check_shape(&target, false)?;
         crate::fs::ensure_same_file(
             &relative,
@@ -386,22 +432,37 @@ fn replace_with_hooks(
         {
             return Err(crate::fs::stale_content_error(&relative));
         }
-        let mut candidate = transaction.open(&candidate_path, true, false)?;
+        let mut candidate = at_stage(
+            "candidate create",
+            transaction.open(&candidate_path, true, false),
+        )?;
         // Use the SAME existing private-image initializer and strict validator.
         // If it is unsupported on a transacted handle, refuse; no path fallback.
-        crate::fs::prepare_new_private_file(&candidate)?;
+        at_stage(
+            "candidate private initializer",
+            crate::fs::prepare_new_private_file(&candidate),
+        )?;
         candidate.write_all(content)?;
         candidate.flush()?;
-        crate::fs::validate_private_file(&candidate)?;
+        at_stage(
+            "candidate private validation",
+            crate::fs::validate_private_file(&candidate),
+        )?;
         check_directory(&root, &workspace.identity, &root_security)?;
         check_directory(&parent, &parent_identity, &parent_security)?;
-        check_parent_namespace(workspace, &relative, &parent_identity, &parent_security)?;
+        at_stage(
+            "original parent namespace",
+            check_parent_namespace(workspace, &relative, &parent_identity, &parent_security),
+        )?;
         // All transacted File and temporary CheckedMetadata clones drop HERE.
     }
-    transaction.replace(&candidate_path, &target_path)?;
+    at_stage(
+        "transactional replacement",
+        transaction.replace(&candidate_path, &target_path),
+    )?;
     before_commit()?;
     workspace.validate().map_err(io::Error::other)?;
-    transaction.commit()?;
+    at_stage("transaction commit", transaction.commit())?;
     workspace.validate().map_err(io::Error::other)
 }
 
@@ -486,7 +547,7 @@ mod tests {
                 let held = metadata_writer(path, access).unwrap();
                 let error = snapshot.publish(&fixture.workspace, "{}").unwrap_err();
                 assert!(
-                    matches!(error.raw_os_error(), Some(32 | 6800)),
+                    matches!(native_error_code(&error), Some(32 | 6800)),
                     "unexpected native refusal: {error}"
                 );
                 assert_eq!(
@@ -507,58 +568,90 @@ mod tests {
         let snapshot = FileSnapshot::read(&fixture.workspace, fixture.relative()).unwrap();
         let original = fixture.workspace.root().to_owned();
         let retained = original.with_extension("retained");
-        std::fs::rename(&original, &retained).unwrap();
-        crate::fs::ensure_private_directory(&original).unwrap();
-        crate::fs::ensure_private_directory(&original.join("nested")).unwrap();
-        std::fs::write(&fixture.target, "NEW_NAMESPACE_UNCHANGED").unwrap();
-        assert!(snapshot.publish(&fixture.workspace, "{}").is_err());
+        // The existing binding intentionally excludes delete sharing. Keep
+        // that stronger namespace pin, rather than releasing it for this test.
+        let error = std::fs::rename(&original, &retained).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(!retained.exists());
+        fixture.workspace.validate().unwrap();
         assert_eq!(
             std::fs::read_to_string(&fixture.target).unwrap(),
-            "NEW_NAMESPACE_UNCHANGED"
-        );
-        assert_eq!(
-            std::fs::read_to_string(retained.join(fixture.relative())).unwrap(),
             snapshot.content
         );
+        let foreign = Fixture::new("mcp-txf-foreign-root");
+        let foreign_original = std::fs::read(&foreign.target).unwrap();
+        assert!(snapshot.publish(&foreign.workspace, "{}").is_err());
+        assert_eq!(std::fs::read(&foreign.target).unwrap(), foreign_original);
+        assert_eq!(
+            std::fs::read_to_string(&fixture.target).unwrap(),
+            snapshot.content
+        );
+        snapshot.publish(&fixture.workspace, "{}").unwrap();
     }
 
     #[test]
     fn windows_mcp_txf_parent_reparent_after_capture_preserves_both_namespaces() {
-        let fixture = Fixture::new("mcp-txf-parent-reparent");
-        let original = std::fs::read(&fixture.target).unwrap();
-        let file = fixture
+        use crate::extras::mcp::project::FileSnapshot;
+        // A snapshot retains the file, but not a nested parent directory. A
+        // reparent before publisher capture must preserve BOTH namespaces.
+        let fixture = Fixture::new("mcp-txf-parent-before-capture");
+        let snapshot = FileSnapshot::read(&fixture.workspace, fixture.relative()).unwrap();
+        let parent = fixture.target.parent().unwrap().to_owned();
+        let moved = fixture.workspace.root().join("moved-parent");
+        std::fs::rename(&parent, &moved).unwrap();
+        crate::fs::ensure_private_directory(&parent).unwrap();
+        crate::fs::private_atomic_write_sync(&fixture.target, b"NEW_NAMESPACE_UNCHANGED").unwrap();
+        fixture.workspace.validate().unwrap();
+        assert!(snapshot.publish(&fixture.workspace, "{}").is_err());
+        assert_eq!(
+            std::fs::read(&fixture.target).unwrap(),
+            b"NEW_NAMESPACE_UNCHANGED"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join(".mcp.json")).unwrap(),
+            snapshot.content
+        );
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+
+        // Once publisher capture holds the actual parent, its existing
+        // no-delete-share handle forbids that same rename outright. Keep the
+        // explicit namespace rewalk as an independent check, not a pin bypass.
+        let pinned = Fixture::new("mcp-txf-parent-after-capture");
+        let original = std::fs::read(&pinned.target).unwrap();
+        let file = pinned
             .workspace
-            .open_regular_relative(fixture.relative())
+            .open_regular_relative(pinned.relative())
             .unwrap();
         let expected = crate::fs::checked_file_metadata(&file).unwrap();
         let security = security_fingerprint(&file).unwrap();
-        let parent = fixture.target.parent().unwrap().to_owned();
-        let moved = fixture.workspace.root().join("moved-parent");
+        let pinned_parent = pinned.target.parent().unwrap().to_owned();
+        let attempted = pinned.workspace.root().join("attempted-reparent");
         let error = replace_with_hooks(
-            &fixture.workspace,
-            fixture.relative(),
+            &pinned.workspace,
+            pinned.relative(),
             b"{}",
             &expected,
             &ContentDigest::of(&original),
             &security,
             || {
-                std::fs::rename(&parent, &moved).unwrap();
-                crate::fs::ensure_private_directory(&parent).unwrap();
-                crate::fs::private_atomic_write_sync(&fixture.target, b"NEW_NAMESPACE_UNCHANGED")
-                    .unwrap();
-                fixture.workspace.validate().unwrap(); // Root itself never changed.
+                let error = std::fs::rename(&pinned_parent, &attempted).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(32));
+                assert!(!attempted.exists());
+                pinned.workspace.validate().unwrap();
             },
-            || Ok(()),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "controlled rollback",
+                ))
+            },
         )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            std::fs::read(&fixture.target).unwrap(),
-            b"NEW_NAMESPACE_UNCHANGED"
-        );
-        assert_eq!(std::fs::read(moved.join(".mcp.json")).unwrap(), original);
-        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
-        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read(&pinned.target).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&pinned_parent).unwrap().count(), 1);
+        assert!(!attempted.exists());
     }
 
     #[test]
@@ -584,7 +677,7 @@ mod tests {
                     for access in [WRITE_DAC, WRITE_OWNER] {
                         let error = metadata_writer(path, access).unwrap_err();
                         assert!(
-                            matches!(error.raw_os_error(), Some(32 | 6800)),
+                            matches!(native_error_code(&error), Some(32 | 6800)),
                             "unexpected native exclusion: {error}"
                         );
                     }
