@@ -336,21 +336,6 @@ pub struct FeedLines {
 }
 
 impl FeedLines {
-    fn new(segments: Vec<Arc<Vec<LineEntry>>>) -> Self {
-        let mut starts = Vec::with_capacity(segments.len());
-        let mut len = 0usize;
-        for segment in &segments {
-            starts.push(len);
-            len = len.saturating_add(segment.len());
-        }
-        Self {
-            segments,
-            starts,
-            len,
-            partial: false,
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.len
     }

@@ -4059,7 +4059,6 @@ mod syntax_paint_tests {
 #[cfg(test)]
 mod frame_cost_tests {
     use super::*;
-    use crate::ui::event_handler::stream_repaint_due;
     use crate::ui::feed::BlockStyle;
 
     /// About `target_bytes` of markdown: headings, prose with links and
@@ -4087,7 +4086,7 @@ mod frame_cost_tests {
 
     /// Stream a large markdown response through the renderer the way the
     /// streaming arm does (append to the running block, repaint when
-    /// `stream_repaint_due`, UI tick every tenth token) and report the
+    /// the pre-throttle paint rule, UI tick every tenth token) and report the
     /// frame cost. Bounds are generous; the printed numbers are the baseline
     /// recorded in docs/benchmarks/2026-10-15-tui-frame-cost.md.
     #[test]
@@ -4114,11 +4113,11 @@ mod frame_cost_tests {
             tokens += 1;
             streamed += token.len();
             renderer.feed_mut().append_to(block, token);
-            if stream_repaint_due(
-                streamed,
-                token.contains('\n'),
-                Some(std::time::Duration::ZERO),
-            ) {
+            // The pre-throttle rule (paint on every newline and while the
+            // response is short) keeps this renderer workload comparable to
+            // the recorded baseline; the event loop's time throttle is
+            // measured separately in ui::app.
+            if token.contains('\n') || streamed < 200 {
                 renderer.render_viewport().unwrap();
             }
             if tokens % 10 == 0 {
