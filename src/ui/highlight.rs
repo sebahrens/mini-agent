@@ -608,6 +608,7 @@ fn is_keyword(language: Language, word: &str) -> bool {
 /// `MAX_HIGHLIGHT_BYTES` bytes, `MAX_HIGHLIGHT_LINES` lines, and no line
 /// (including its newline) longer than `MAX_LINE_BYTES`. One pass with an
 /// early exit; streaming callers keep a [`BudgetScan`] instead of rescanning.
+#[cfg(test)]
 pub(crate) fn within_budget(text: &str) -> bool {
     BudgetScan::of(text).within()
 }

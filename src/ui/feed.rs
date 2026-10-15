@@ -323,6 +323,8 @@ pub struct FeedLines {
     segments: Vec<Arc<Vec<LineEntry>>>,
     starts: Vec<usize>,
     len: usize,
+    /// Set on a tail-first layout that does not start at the top of the feed.
+    partial: bool,
 }
 
 impl FeedLines {
@@ -337,6 +339,7 @@ impl FeedLines {
             segments,
             starts,
             len,
+            partial: false,
         }
     }
 
@@ -367,6 +370,7 @@ impl FeedLines {
             segments: self.segments[..segments].to_vec(),
             starts: self.starts[..segments].to_vec(),
             len: self.starts.get(segments).copied().unwrap_or(self.len),
+            partial: self.partial,
         }
     }
 
@@ -381,7 +385,22 @@ impl FeedLines {
     pub(crate) fn with_segment(&self, segment: Arc<Vec<LineEntry>>) -> Self {
         let mut segments = self.segments.clone();
         segments.push(segment);
-        Self::new(segments)
+        let mut lines = Self::new(segments);
+        lines.partial = self.partial;
+        lines
+    }
+
+    /// Whether these rows start at the top of the feed. Only a tail-first
+    /// layout ([`Feed::lines_tail`]) can be incomplete.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "renderer opt-in for the resume viewport (cttyn.9)"
+        )
+    )]
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.partial
     }
 
     #[cfg(test)]
@@ -449,10 +468,20 @@ struct LayoutCache {
     width: usize,
     generation: u64,
     lines: Arc<FeedLines>,
-    /// Segments contributed by the omitted-blocks notice.
+    /// Segments contributed by the omitted-blocks notice (0 while the
+    /// layout is partial).
     notice_segments: usize,
-    /// Segments contributed by each block, in order.
+    /// First block laid out. A tail-first layout ([`Feed::lines_tail`])
+    /// covers only `blocks[first_block..]`; 0 means the layout is complete.
+    first_block: usize,
+    /// Segments contributed by each laid-out block, in order.
     block_segments: Vec<usize>,
+}
+
+impl LayoutCache {
+    fn complete(&self) -> bool {
+        self.first_block == 0
+    }
 }
 
 fn mark_dirty(dirty_from: &Cell<usize>, index: usize) {
@@ -836,6 +865,7 @@ impl Feed {
     /// Append text to the block at `idx`. Returns `false` when no such block
     /// exists. Streaming callers use this with their tracked block index so
     /// tokens never land on a block another producer pushed after theirs.
+    #[cfg(test)]
     pub fn append_to(&mut self, idx: usize, text: impl AsRef<str>) -> bool {
         let text = text.as_ref();
         if has_terminal_control(text) {
@@ -941,18 +971,84 @@ impl Feed {
     /// `visible_range`, `line_at_visual_row`, `selected_text`) operate on the
     /// cached visual rows instead of re-laying out the feed on every call.
     pub fn lines(&self, width: usize) -> Arc<FeedLines> {
+        self.layout(width, None)
+    }
+
+    /// Tail-first layout: the rows of the last blocks, at least `min_rows` of
+    /// them when the feed has that many, without laying out the history above.
+    ///
+    /// The result is a suffix of `lines(width)`: indices count from the first
+    /// laid-out block, so it is only for painting a bottom-anchored viewport
+    /// (`FeedLines::is_complete` says whether earlier rows exist). A later
+    /// `lines(width)` keeps these rows and lays out only the remaining
+    /// blocks; [`Feed::advance_layout`] does the same in budgeted steps.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "renderer opt-in for the resume viewport (cttyn.9)"
+        )
+    )]
+    pub(crate) fn lines_tail(&self, width: usize, min_rows: usize) -> Arc<FeedLines> {
+        self.layout(width, Some(min_rows))
+    }
+
+    /// Lay out up to `max_blocks` more blocks above a tail-first layout at
+    /// `width`, e.g. from an idle tick. Returns whether the layout at `width`
+    /// is now complete (a later `lines(width)` lays out nothing).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "idle-tick completion of the resume layout (cttyn.9)"
+        )
+    )]
+    pub(crate) fn advance_layout(&self, width: usize, max_blocks: usize) -> bool {
+        let mut slot = self.layout_cache.borrow_mut();
+        let Some(cache) = slot.take() else {
+            return false;
+        };
+        if cache.width != width || cache.generation != self.generation {
+            // Stale: the next lines() / lines_tail() call refreshes it first.
+            *slot = Some(cache);
+            return false;
+        }
+        if cache.complete() {
+            *slot = Some(cache);
+            return true;
+        }
+        let first = cache.first_block.saturating_sub(max_blocks.max(1));
+        let cache = self.prepend_blocks(cache, first);
+        let complete = cache.complete();
+        *slot = Some(cache);
+        complete
+    }
+
+    fn layout(&self, width: usize, tail_rows: Option<usize>) -> Arc<FeedLines> {
         {
             let cache = self.layout_cache.borrow();
             if let Some(c) = cache.as_ref()
                 && c.width == width
                 && c.generation == self.generation
+                && (c.complete() || tail_rows.is_some_and(|rows| c.lines.len() >= rows))
             {
                 return c.lines.clone();
             }
         }
         let dirty_from = self.layout_dirty_from.replace(usize::MAX);
         let previous = self.layout_cache.borrow_mut().take();
-        let cache = self.compute_lines(width, previous, dirty_from);
+        let mut cache = self.compute_lines(width, previous, dirty_from, tail_rows);
+        match tail_rows {
+            None if !cache.complete() => cache = self.prepend_blocks(cache, 0),
+            // A reused tail can be shorter than a taller viewport now needs.
+            Some(min_rows) => {
+                while !cache.complete() && cache.lines.len() < min_rows {
+                    let first = cache.first_block - 1;
+                    cache = self.prepend_blocks(cache, first);
+                }
+            }
+            None => {}
+        }
         #[cfg(test)]
         self.layout_computes.set(self.layout_computes.get() + 1);
         let lines = Arc::clone(&cache.lines);
@@ -982,64 +1078,160 @@ impl Feed {
         self.wrap_bytes.get()
     }
 
-    /// Lay out the feed at `width`. Called by `lines` on a cache miss.
+    /// Lay out the feed at `width`. Called by `layout` on a cache miss.
     ///
     /// When `previous` was laid out at the same width and only blocks from
     /// `dirty_from` on changed since, its rows for the earlier blocks are kept
     /// (in place when no reader still holds them) and only the changed tail is
-    /// laid out again.
+    /// laid out again. Without a reusable layout, `tail_rows` asks for a
+    /// tail-first layout of at least that many rows instead of every block.
     fn compute_lines(
         &self,
         width: usize,
         previous: Option<LayoutCache>,
         dirty_from: usize,
+        tail_rows: Option<usize>,
     ) -> LayoutCache {
-        let reusable = previous
-            .filter(|cache| cache.width == width && dirty_from != usize::MAX && dirty_from > 0);
-        let (mut lines, notice_segments, mut block_segments) = match reusable {
-            Some(cache) => {
-                let keep_blocks = dirty_from
-                    .min(cache.block_segments.len())
-                    .min(self.blocks.len());
-                let keep = cache.notice_segments
-                    + cache.block_segments[..keep_blocks].iter().sum::<usize>();
-                let mut lines = match Arc::try_unwrap(cache.lines) {
-                    Ok(lines) => lines,
-                    Err(shared) => shared.prefix(keep),
-                };
-                lines.truncate(keep);
-                let mut block_segments = cache.block_segments;
-                block_segments.truncate(keep_blocks);
-                (lines, cache.notice_segments, block_segments)
-            }
-            None => {
-                let mut lines = FeedLines::default();
-                if self.pruned_blocks > 0 {
-                    lines.push(Arc::new(plain_block_lines(
-                        &Block::new(
-                            BlockStyle::System,
-                            format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
-                        ),
-                        width,
-                        self.palette,
-                    )));
+        let reusable = previous.filter(|cache| {
+            cache.width == width
+                && cache.first_block <= self.blocks.len()
+                && if dirty_from == usize::MAX {
+                    cache.generation == self.generation
+                } else {
+                    // A change above a partial layout may have shifted the
+                    // indices of the blocks it covers.
+                    dirty_from >= cache.first_block.max(1)
                 }
-                let notice = lines.segments.len();
-                (lines, notice, Vec::with_capacity(self.blocks.len()))
-            }
+        });
+        let Some(cache) = reusable else {
+            return match tail_rows {
+                Some(min_rows) => self.tail_layout(width, min_rows),
+                None => self.prepend_blocks(
+                    LayoutCache {
+                        width,
+                        generation: self.generation,
+                        lines: Arc::new(FeedLines::default()),
+                        notice_segments: 0,
+                        first_block: self.blocks.len(),
+                        block_segments: Vec::new(),
+                    },
+                    0,
+                ),
+            };
         };
-        for block in self.blocks.iter().skip(block_segments.len()) {
+        let first_block = cache.first_block;
+        let keep_blocks = dirty_from
+            .saturating_sub(first_block)
+            .min(cache.block_segments.len())
+            .min(self.blocks.len() - first_block);
+        let keep =
+            cache.notice_segments + cache.block_segments[..keep_blocks].iter().sum::<usize>();
+        let mut lines = match Arc::try_unwrap(cache.lines) {
+            Ok(lines) => lines,
+            Err(shared) => shared.prefix(keep),
+        };
+        lines.truncate(keep);
+        let mut block_segments = cache.block_segments;
+        block_segments.truncate(keep_blocks);
+        for block in self.blocks.iter().skip(first_block + keep_blocks) {
             #[cfg(test)]
             self.blocks_laid_out.set(self.blocks_laid_out.get() + 1);
             let before = lines.segments.len();
             push_block_segments(self, block, width, &mut lines);
             block_segments.push(lines.segments.len() - before);
         }
+        lines.partial = first_block > 0;
         LayoutCache {
             width,
             generation: self.generation,
             lines: Arc::new(lines),
+            notice_segments: cache.notice_segments,
+            first_block,
+            block_segments,
+        }
+    }
+
+    /// Lay out blocks from the end until `min_rows` rows exist or every block
+    /// is laid out.
+    fn tail_layout(&self, width: usize, min_rows: usize) -> LayoutCache {
+        let mut first_block = self.blocks.len();
+        let mut rows = 0usize;
+        let mut reversed: Vec<Vec<Arc<Vec<LineEntry>>>> = Vec::new();
+        while first_block > 0 && rows < min_rows {
+            first_block -= 1;
+            #[cfg(test)]
+            self.blocks_laid_out.set(self.blocks_laid_out.get() + 1);
+            let segments = block_segments(self, &self.blocks[first_block], width);
+            rows += segments.iter().map(|segment| segment.len()).sum::<usize>();
+            reversed.push(segments);
+        }
+        let mut lines = FeedLines::default();
+        let mut block_segments = Vec::with_capacity(reversed.len());
+        for segments in reversed.into_iter().rev() {
+            block_segments.push(segments.len());
+            for segment in segments {
+                lines.push(segment);
+            }
+        }
+        lines.partial = first_block > 0;
+        let cache = LayoutCache {
+            width,
+            generation: self.generation,
+            lines: Arc::new(lines),
+            notice_segments: 0,
+            first_block,
+            block_segments,
+        };
+        if first_block == 0 {
+            // Every block fit: add the omitted-blocks notice to complete it.
+            self.prepend_blocks(cache, 0)
+        } else {
+            cache
+        }
+    }
+
+    /// Extend a layout upward so it covers `blocks[first..]`, adding the
+    /// omitted-blocks notice once it reaches the first block. Keeps every
+    /// already laid-out row.
+    fn prepend_blocks(&self, cache: LayoutCache, first: usize) -> LayoutCache {
+        if first >= cache.first_block {
+            return cache;
+        }
+        let width = cache.width;
+        let mut lines = FeedLines::default();
+        let mut notice_segments = 0;
+        if first == 0 && self.pruned_blocks > 0 {
+            lines.push(Arc::new(plain_block_lines(
+                &Block::new(
+                    BlockStyle::System,
+                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
+                ),
+                width,
+                self.palette,
+            )));
+            notice_segments = 1;
+        }
+        let mut block_segments =
+            Vec::with_capacity(cache.first_block - first + cache.block_segments.len());
+        for block in self.blocks.range(first..cache.first_block) {
+            #[cfg(test)]
+            self.blocks_laid_out.set(self.blocks_laid_out.get() + 1);
+            let before = lines.segments.len();
+            push_block_segments(self, block, width, &mut lines);
+            block_segments.push(lines.segments.len() - before);
+        }
+        block_segments.extend_from_slice(&cache.block_segments);
+        let tail = Arc::try_unwrap(cache.lines).unwrap_or_else(|shared| (*shared).clone());
+        for segment in tail.segments {
+            lines.push(segment);
+        }
+        lines.partial = first > 0;
+        LayoutCache {
+            width,
+            generation: cache.generation,
+            lines: Arc::new(lines),
             notice_segments,
+            first_block: first,
             block_segments,
         }
     }
@@ -1054,7 +1246,7 @@ impl Feed {
     /// reference for the incremental rebuild).
     #[cfg(test)]
     pub(crate) fn full_layout_for_test(&self, width: usize) -> FeedLines {
-        let cache = self.compute_lines(width, None, 0);
+        let cache = self.compute_lines(width, None, 0, None);
         Arc::try_unwrap(cache.lines).expect("fresh layout is unshared")
     }
 

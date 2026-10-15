@@ -1607,3 +1607,115 @@ fn retention_pruning_keeps_the_incremental_layout_exact() {
     }
     assert_eq!(feed.lines(80)[0].text, "[20 earlier feed blocks omitted]");
 }
+
+// --- cttyn.9: tail-first layout for a resumed feed ---
+
+fn resumed_feed(blocks: usize) -> Feed {
+    let mut feed = Feed::new();
+    for index in 0..blocks {
+        feed.push_block(
+            BlockStyle::Agent,
+            format!("answer {index} with `code`\n\n```rust\nlet x = {index};\n```\n"),
+        );
+    }
+    feed
+}
+
+#[test]
+fn a_tail_first_layout_renders_only_the_blocks_the_viewport_needs() {
+    let feed = resumed_feed(2000);
+    let rows_per_block = {
+        let one = resumed_feed(1);
+        one.lines(80).len()
+    };
+    let tail = feed.lines_tail(80, 50);
+    assert!(!tail.is_complete());
+    assert!(tail.len() >= 50);
+    let needed = 50usize.div_ceil(rows_per_block);
+    assert!(
+        feed.block_renders() <= needed,
+        "rendered {} blocks for 50 rows ({rows_per_block} rows per block)",
+        feed.block_renders()
+    );
+
+    // The tail is exactly the bottom of the full layout.
+    let full = feed.full_layout_for_test(80);
+    let offset = full.len() - tail.len();
+    for row in 0..tail.len() {
+        assert_eq!(tail[row].text, full[offset + row].text, "row {row}");
+        assert_eq!(
+            tail[row].syntax_spans,
+            full[offset + row].syntax_spans,
+            "row {row}"
+        );
+    }
+    // Repeated tail requests reuse it.
+    assert!(Arc::ptr_eq(&tail, &feed.lines_tail(80, 50)));
+
+    // Scrolling to the top (a full layout) renders the rest exactly once,
+    // keeping the tail's rows.
+    let renders = feed.block_renders();
+    let lines = feed.lines(80);
+    assert!(lines.is_complete());
+    assert_eq!(feed.block_renders() - renders, 2000 - renders);
+    assert_same_rows(&lines, &full);
+    assert_eq!(
+        lines.segment_ptrs_for_test().last(),
+        tail.segment_ptrs_for_test().last()
+    );
+}
+
+#[test]
+fn advancing_a_tail_layout_in_steps_completes_it_without_rerendering() {
+    let mut feed = resumed_feed(300);
+    feed.push_streaming_block(BlockStyle::Agent);
+    let idx = feed.block_count() - 1;
+    let _ = feed.lines_tail(80, 40);
+    // Streaming into the live block keeps the tail incremental.
+    assert!(feed.append_to(idx, "streamed tokens\nmore"));
+    let visited = feed.blocks_laid_out();
+    let tail = feed.lines_tail(80, 40);
+    assert_eq!(feed.blocks_laid_out() - visited, 1);
+    assert!(!tail.is_complete());
+
+    let mut steps = 0;
+    while !feed.advance_layout(80, 64) {
+        steps += 1;
+        assert!(steps < 10, "advance makes progress");
+    }
+    let renders = feed.block_renders();
+    let lines = feed.lines(80);
+    assert_eq!(feed.block_renders(), renders, "already laid out");
+    assert_same_rows(&lines, &feed.full_layout_for_test(80));
+
+    // A taller viewport extends a reused tail; a change above it starts over.
+    let mut feed = resumed_feed(300);
+    let short = feed.lines_tail(80, 10).len();
+    assert!(feed.lines_tail(80, 200).len() >= 200.max(short));
+    feed.place_after_anchor("missing", BlockStyle::Plain, "appended");
+    feed.toggle_reasoning_at_row(80, 0);
+    let tail = feed.lines_tail(80, 20);
+    let full = feed.full_layout_for_test(80);
+    let offset = full.len() - tail.len();
+    for row in 0..tail.len() {
+        assert_eq!(tail[row].text, full[offset + row].text, "row {row}");
+    }
+}
+
+#[test]
+fn a_short_or_pruned_feed_tail_layout_is_complete() {
+    let feed = resumed_feed(3);
+    let tail = feed.lines_tail(80, 500);
+    assert!(tail.is_complete());
+    assert_same_rows(&tail, &feed.full_layout_for_test(80));
+
+    let mut pruned = Feed::new();
+    let (max_blocks, _, _) = Feed::retention_limits_for_test();
+    for index in 0..max_blocks + 3 {
+        pruned.push_block(BlockStyle::Plain, format!("row {index}"));
+    }
+    let _ = pruned.lines_tail(80, 5);
+    let lines = pruned.lines(80);
+    assert_eq!(lines[0].text, "[3 earlier feed blocks omitted]");
+    assert_same_rows(&lines, &pruned.full_layout_for_test(80));
+}
