@@ -450,6 +450,7 @@ fn is_dot_entry(entry: &ignore::DirEntry) -> bool {
 /// `.git` before descending into them, never emits the root itself, lists
 /// directories alongside files, and stops after [`MAX_WALK_FILES`] files
 /// (directories do not count toward that cap).
+#[cfg(test)]
 pub(crate) fn walk_files_streaming(
     root: &str,
     cancel: &AtomicBool,
@@ -525,6 +526,7 @@ fn walk_entries_streaming(
 
 /// Collect the full walk into a `Vec` (used by the synchronous fallback and
 /// tests).
+#[cfg(test)]
 pub(crate) fn walk_files(root: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
     walk_files_streaming(root, &AtomicBool::new(false), |batch| {

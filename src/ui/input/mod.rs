@@ -723,6 +723,7 @@ impl InputEditor {
         self.picker = Some(Picker::Prefixed(picker, "."));
     }
 
+    #[cfg(test)]
     pub(crate) fn start_session_picker(
         &mut self,
         catalogue: crate::session::catalogue::Catalogue,

@@ -86,6 +86,7 @@ pub(crate) fn is_command_alias(name: &str) -> bool {
 /// commands within each block are likewise alphabetical. The result is sorted,
 /// so ranking ties fall back to name order. Every command `/help` lists must
 /// appear here; a test in `crate::ui::slash::help` enforces that.
+#[cfg(test)]
 pub(crate) fn available_commands() -> Vec<&'static str> {
     static_commands().0.clone()
 }
@@ -183,6 +184,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
 /// it does not contain the query. A leading `/` is ignored so `/re` and `re`
 /// rank the same: exact name, then prefix, then a match starting at a word
 /// boundary, then any other substring.
+#[cfg(test)]
 pub(crate) fn match_rank(name: &str, query_lower: &str) -> Option<u8> {
     match_rank_lower(&name.to_lowercase(), query_lower)
 }
