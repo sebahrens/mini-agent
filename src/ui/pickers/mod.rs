@@ -11,8 +11,8 @@ pub(crate) mod test_surface;
 
 use std::io::Write;
 
-use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
+use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::Clear;
 
@@ -31,33 +31,26 @@ fn picker_command<C: crossterm::Command + std::fmt::Display>(
     }
 }
 
-fn picker_size() -> std::io::Result<(u16, u16)> {
-    #[cfg(test)]
-    {
-        test_surface::size()
-    }
-    #[cfg(not(test))]
-    {
-        crossterm::terminal::size()
-    }
+/// Geometry and writer of the test picker surface. Production pickers draw
+/// only through `Renderer::draw_picker_with`, which owns both.
+#[cfg(test)]
+pub(crate) fn picker_size() -> std::io::Result<(u16, u16)> {
+    test_surface::size()
 }
-fn picker_writer() -> impl std::io::Write {
-    #[cfg(test)]
-    {
-        test_surface::writer()
-    }
-    #[cfg(not(test))]
-    {
-        std::io::stdout()
-    }
+#[cfg(test)]
+pub(crate) fn picker_writer() -> impl std::io::Write {
+    test_surface::writer()
 }
 
-pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
-    if query.is_empty() {
+/// Fuzzy-rank an already-lowercased `item_l` against a lowercase `query_l`:
+/// a substring scores above a subsequence, and boundaries and early
+/// positions score higher. Callers that filter many candidates lowercase
+/// each haystack once (when the list is set) and the query once per
+/// keystroke.
+pub(crate) fn fuzzy_score_lower(item_l: &str, query_l: &str) -> Option<i32> {
+    if query_l.is_empty() {
         return Some(0);
     }
-    let item_l = item.to_lowercase();
-    let query_l = query.to_lowercase();
     let is_boundary = |bytes: &[u8], pos: usize| -> bool {
         pos == 0
             || matches!(
@@ -66,7 +59,7 @@ pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
             )
     };
 
-    if let Some(pos) = item_l.find(&query_l) {
+    if let Some(pos) = item_l.find(query_l) {
         let mut score = 1000;
         if is_boundary(item_l.as_bytes(), pos) {
             score += 200;
@@ -163,8 +156,9 @@ pub(crate) fn picker_window(
 }
 
 /// Paint a one-line status message (e.g. "no matches") on the row just above
-/// `floor_row`.
+/// `floor_row`. Commands are queued and flushed once.
 pub(crate) fn draw_picker_message(
+    mut out: &mut dyn Write,
     message: &str,
     monochrome: bool,
     floor_row: u16,
@@ -172,24 +166,25 @@ pub(crate) fn draw_picker_message(
     let Some(row) = floor_row.checked_sub(1) else {
         return Ok(());
     };
-    let mut stdout = picker_writer();
-    stdout.execute(picker_command(MoveTo(0, row)))?;
-    write!(
-        stdout,
-        "{}",
-        picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
+    queue!(
+        &mut out,
+        picker_command(MoveTo(0, row)),
+        picker_command(Clear(crossterm::terminal::ClearType::CurrentLine)),
     )?;
     write!(
-        stdout,
-        "{}{}{}",
-        SetForegroundColor(resolve_color(Color::DarkGrey, monochrome)),
-        message,
-        ResetColor
+        out,
+        "{}{message}{ResetColor}",
+        SetForegroundColor(resolve_color(Color::DarkGrey, monochrome))
     )?;
-    stdout.flush()
+    out.flush()
 }
 
+/// Draw `matches` as a list overlay; see [`draw_picker_rows`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_picker_list(
+    out: &mut dyn Write,
+    cols: u16,
     matches: &[String],
     selected: usize,
     monochrome: bool,
@@ -197,48 +192,65 @@ pub(crate) fn draw_picker_list(
     floor_row: u16,
     reserved_above: u16,
 ) -> std::io::Result<()> {
-    if matches.is_empty() {
-        return draw_picker_message(empty_message.unwrap_or("no matches"), monochrome, floor_row);
+    draw_picker_rows(
+        out,
+        cols,
+        matches.len(),
+        |index| std::borrow::Cow::Borrowed(matches[index].as_str()),
+        selected,
+        monochrome,
+        empty_message,
+        floor_row,
+        reserved_above,
+    )
+}
+
+/// Draw a list overlay of `len` entries ending above `floor_row`. Only the
+/// visible window is formatted (`row(index)` is called for at most ten
+/// entries); every row is queued and the writer is flushed once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_picker_rows<'a>(
+    mut out: &mut dyn Write,
+    cols: u16,
+    len: usize,
+    row: impl Fn(usize) -> std::borrow::Cow<'a, str>,
+    selected: usize,
+    monochrome: bool,
+    empty_message: Option<&str>,
+    floor_row: u16,
+    reserved_above: u16,
+) -> std::io::Result<()> {
+    if len == 0 {
+        return draw_picker_message(
+            out,
+            empty_message.unwrap_or("no matches"),
+            monochrome,
+            floor_row,
+        );
     }
 
-    let (cols, _rows) = picker_size()?;
-    let mut stdout = picker_writer();
-    let window = picker_window(floor_row, reserved_above, matches.len(), selected);
-
-    for (i, item) in matches
-        .iter()
-        .enumerate()
-        .skip(window.start)
-        .take(window.end - window.start)
-    {
+    let window = picker_window(floor_row, reserved_above, len, selected);
+    for i in window.start..window.end {
         let render_row = window.top_row + (i - window.start) as u16;
-        stdout.execute(picker_command(MoveTo(0, render_row)))?;
-        write!(
-            stdout,
-            "{}",
-            picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
+        queue!(
+            &mut out,
+            picker_command(MoveTo(0, render_row)),
+            picker_command(Clear(crossterm::terminal::ClearType::CurrentLine)),
         )?;
 
-        let item = display_safe(item);
+        let text = row(i);
+        let item = display_safe(&text);
         let truncated = crate::ui::utils::display_prefix(&item, cols.saturating_sub(3) as usize);
-
-        if i == selected {
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(resolve_color(Color::Green, monochrome))
-            )?;
-            write!(stdout, "▸ {}", truncated)?;
+        let (color, marker) = if i == selected {
+            (Color::Green, '▸')
         } else {
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(resolve_color(Color::DarkGrey, monochrome))
-            )?;
-            write!(stdout, "  {}", truncated)?;
-        }
-        write!(stdout, "{}", ResetColor)?;
+            (Color::DarkGrey, ' ')
+        };
+        write!(
+            out,
+            "{}{marker} {truncated}{ResetColor}",
+            SetForegroundColor(resolve_color(color, monochrome)),
+        )?;
     }
-    stdout.flush()?;
-    Ok(())
+    out.flush()
 }

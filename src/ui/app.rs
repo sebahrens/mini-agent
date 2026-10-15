@@ -13926,8 +13926,8 @@ mod plan_approval_tests {
             );
             assert_eq!(
                 native_fault.counts(),
-                (1, 1),
-                "geometry succeeded before actual native writer failure"
+                (0, 1),
+                "renderer-owned geometry, then the actual native writer failure"
             );
             assert!(matches!(
                 app.input.picker,

@@ -3,13 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
-use crossterm::ExecutableCommand;
-use crossterm::cursor::MoveTo;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
-use crossterm::terminal::Clear;
-
-use super::super::utils::resolve_color;
-
 /// Paths per batch sent from the background walk to the picker. Small
 /// batches keep the first matches visible quickly on large trees.
 const WALK_BATCH_SIZE: usize = 25;
@@ -54,17 +47,63 @@ mod mcp_resource_tests {
     }
 }
 
+/// Matches kept per query; the overlay draws at most ten of them.
+const MAX_MATCHES: usize = 50;
+
+/// One walked (or virtual) entry. The lowercase form and the directory flag
+/// are computed once, in the walk thread, so filtering is an allocation-free
+/// `contains` and drawing never touches the filesystem.
+pub(crate) struct CacheEntry {
+    path: PathBuf,
+    lower: String,
+    is_dir: bool,
+}
+
+impl CacheEntry {
+    fn new(path: PathBuf, is_dir: bool) -> Self {
+        let lower = path.to_string_lossy().to_lowercase();
+        CacheEntry {
+            path,
+            lower,
+            is_dir,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counters: (cache entries examined by filtering, full rescans).
+    static FILTER_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_filter_counts() -> (usize, usize) {
+    FILTER_COUNTS.with(|counts| counts.replace((0, 0)))
+}
+
+#[cfg(test)]
+fn count_filter(scanned: usize, rescan: bool) {
+    FILTER_COUNTS.with(|counts| {
+        let (entries, rescans) = counts.get();
+        counts.set((entries + scanned, rescans + usize::from(rescan)));
+    });
+}
+
 pub struct FilePicker {
     pub active: bool,
     pub query: String,
     pub cursor: usize,
     pub matches: Vec<PathBuf>,
+    /// Whether each entry of `matches` is a directory (drawn with a `/`).
+    match_dirs: Vec<bool>,
     pub selected: usize,
     pub(crate) argument_start: Option<usize>,
-    file_cache: Vec<PathBuf>,
+    file_cache: Vec<CacheEntry>,
+    /// Lowercase query the current `matches` were computed for.
+    query_lower: String,
     monochrome: bool,
     loading: bool,
-    walk_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    walk_rx: Option<mpsc::Receiver<Vec<CacheEntry>>>,
     walk_cancel: Arc<AtomicBool>,
     walk_workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
 }
@@ -76,9 +115,11 @@ impl FilePicker {
             query: String::new(),
             cursor: 0,
             matches: Vec::new(),
+            match_dirs: Vec::new(),
             selected: 0,
             argument_start: None,
             file_cache: Vec::new(),
+            query_lower: String::new(),
             monochrome: false,
             loading: false,
             walk_rx: None,
@@ -101,12 +142,9 @@ impl FilePicker {
     /// Opaque MCP operands are completion strings, never filesystem walk roots.
     #[cfg(feature = "mcp")]
     pub(crate) fn append_virtual_items(&mut self, items: impl Iterator<Item = PathBuf>) {
-        self.file_cache.extend(items);
+        self.file_cache
+            .extend(items.map(|path| CacheEntry::new(path, false)));
         self.filter();
-    }
-
-    fn color(&self, color: Color) -> Color {
-        resolve_color(color, self.monochrome)
     }
 
     pub fn activate(&mut self) {
@@ -135,6 +173,7 @@ impl FilePicker {
         self.query.clear();
         self.cursor = 0;
         self.matches.clear();
+        self.match_dirs.clear();
         self.selected = 0;
         self.file_cache.clear();
         self.loading = false;
@@ -156,12 +195,12 @@ impl FilePicker {
             handle.spawn_blocking(move || {
                 if let Some(workspace) = workspace {
                     if workspace.validate().is_ok() {
-                        walk_files_streaming_path(workspace.root(), &cancel, |batch| {
+                        walk_entries_streaming(workspace.root(), &cancel, |batch| {
                             workspace.validate().is_ok() && tx.send(batch).is_ok()
                         });
                     }
                 } else {
-                    walk_files_streaming(".", &cancel, |batch| tx.send(batch).is_ok());
+                    walk_entries_streaming(Path::new("."), &cancel, |batch| tx.send(batch).is_ok());
                 }
             });
         } else {
@@ -172,7 +211,7 @@ impl FilePicker {
     fn load_files_sync(&mut self) {
         if let Some(workspace) = &self.walk_workspace {
             let mut files = Vec::new();
-            walk_files_streaming_path(workspace.root(), &AtomicBool::new(false), |batch| {
+            walk_entries_streaming(workspace.root(), &AtomicBool::new(false), |batch| {
                 if workspace.validate().is_err() {
                     return false;
                 }
@@ -183,7 +222,10 @@ impl FilePicker {
                 self.file_cache = files;
             }
         } else {
-            self.file_cache = walk_files(".");
+            walk_entries_streaming(Path::new("."), &AtomicBool::new(false), |batch| {
+                self.file_cache.extend(batch);
+                true
+            });
         }
         self.filter();
     }
@@ -216,6 +258,7 @@ impl FilePicker {
                 || !self.matches.is_empty();
             self.file_cache.clear();
             self.matches.clear();
+            self.match_dirs.clear();
             self.deactivate();
             return changed;
         }
@@ -224,6 +267,7 @@ impl FilePicker {
         }
         let mut changed = false;
         let mut done = false;
+        let first_new = self.file_cache.len();
         if let Some(rx) = &self.walk_rx {
             loop {
                 match rx.try_recv() {
@@ -243,8 +287,10 @@ impl FilePicker {
             self.loading = false;
             self.walk_rx = None;
         }
-        if changed || done {
-            self.filter();
+        if changed {
+            // Only the new entries can add matches: everything before them
+            // was already scanned for this query.
+            self.filter_from(first_new);
         }
         changed || done
     }
@@ -276,23 +322,36 @@ impl FilePicker {
         }
     }
 
+    /// Rescan the whole cache for the current query (the query changed).
     fn filter(&mut self) {
-        if self.file_cache.is_empty() {
-            self.matches.clear();
+        self.query_lower = self.query.to_lowercase();
+        self.matches.clear();
+        self.match_dirs.clear();
+        self.selected = 0;
+        #[cfg(test)]
+        count_filter(0, true);
+        self.filter_from(0);
+    }
+
+    /// Append matches for the query from `file_cache[start..]` until
+    /// [`MAX_MATCHES`] are kept. Matches stay in cache (walk) order, so
+    /// filtering a streamed batch gives the same result as a full rescan.
+    fn filter_from(&mut self, start: usize) {
+        if self.matches.len() >= MAX_MATCHES {
             return;
         }
-        let query_lower = self.query.to_lowercase();
-        self.matches = self
-            .file_cache
-            .iter()
-            .filter(|p| {
-                let lower = p.to_string_lossy().to_lowercase();
-                lower.contains(&query_lower)
-            })
-            .take(50)
-            .cloned()
-            .collect();
-        self.selected = 0;
+        let query = self.query_lower.as_str();
+        for entry in self.file_cache.iter().skip(start) {
+            #[cfg(test)]
+            count_filter(1, false);
+            if entry.lower.contains(query) {
+                self.matches.push(entry.path.clone());
+                self.match_dirs.push(entry.is_dir);
+                if self.matches.len() >= MAX_MATCHES {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -322,70 +381,57 @@ impl FilePicker {
         self.matches.get(self.selected)
     }
 
+    /// Seed the cache directly. Directories are classified here, once,
+    /// against the bound workspace (or the process directory).
     #[cfg(test)]
     pub fn test_set_cache(&mut self, files: Vec<PathBuf>) {
-        self.file_cache = files;
+        let workspace = self.walk_workspace.clone();
+        self.file_cache = files
+            .into_iter()
+            .map(|path| {
+                let is_dir = match &workspace {
+                    Some(workspace) => workspace.root().join(&path).is_dir(),
+                    None => path.is_dir(),
+                };
+                CacheEntry::new(path, is_dir)
+            })
+            .collect();
         self.loading = false;
     }
 
-    pub fn draw(&mut self, floor_row: u16) -> std::io::Result<()> {
+    /// Draw the overlay from cached state only: background results are
+    /// taken by `try_finish_loading` (polled by the event loop), and the
+    /// directory marker comes from the walk, so drawing performs no
+    /// filesystem calls.
+    pub fn draw(&self, out: &mut dyn Write, cols: u16, floor_row: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-
-        self.try_finish_loading();
-        if !self.active {
-            return Ok(());
-        }
-
         if self.loading && self.matches.is_empty() {
-            return super::draw_picker_message("scanning files...", self.monochrome, floor_row);
+            return super::draw_picker_message(
+                out,
+                "scanning files...",
+                self.monochrome,
+                floor_row,
+            );
         }
-        if self.matches.is_empty() {
-            return super::draw_picker_message("no matches", self.monochrome, floor_row);
-        }
-
-        let (cols, _rows) = super::picker_size()?;
-        let mut stdout = super::picker_writer();
-        let window = super::picker_window(floor_row, 0, self.matches.len(), self.selected);
-
-        for i in window.start..window.end {
-            let render_row = window.top_row + (i - window.start) as u16;
-            stdout.execute(super::picker_command(MoveTo(0, render_row)))?;
-            write!(
-                stdout,
-                "{}",
-                super::picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
-            )?;
-
-            let path = &self.matches[i];
-            let mut display = super::display_safe(&path.to_string_lossy()).into_owned();
-            let directory = if let Some(workspace) = &self.walk_workspace {
-                workspace.validate().is_ok() && workspace.root().join(path).is_dir()
-            } else {
-                Path::new(&path).is_dir()
-            };
-            if directory {
-                display.push('/');
-            }
-            let truncated =
-                crate::ui::utils::display_prefix(&display, cols.saturating_sub(3) as usize);
-
-            if i == self.selected {
-                write!(stdout, "{}", SetForegroundColor(self.color(Color::Green)))?;
-                write!(stdout, "▸ {}", truncated)?;
-            } else {
-                write!(
-                    stdout,
-                    "{}",
-                    SetForegroundColor(self.color(Color::DarkGrey))
-                )?;
-                write!(stdout, "  {}", truncated)?;
-            }
-            write!(stdout, "{}", ResetColor)?;
-        }
-        stdout.flush()?;
-        Ok(())
+        super::draw_picker_rows(
+            out,
+            cols,
+            self.matches.len(),
+            |index| {
+                let mut display = self.matches[index].to_string_lossy().into_owned();
+                if self.match_dirs[index] {
+                    display.push('/');
+                }
+                display.into()
+            },
+            self.selected,
+            self.monochrome,
+            None,
+            floor_row,
+            0,
+        )
     }
 }
 
@@ -407,15 +453,20 @@ fn is_dot_entry(entry: &ignore::DirEntry) -> bool {
 pub(crate) fn walk_files_streaming(
     root: &str,
     cancel: &AtomicBool,
-    emit: impl FnMut(Vec<PathBuf>) -> bool,
+    mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
-    walk_files_streaming_path(Path::new(root), cancel, emit);
+    walk_entries_streaming(Path::new(root), cancel, |batch| {
+        emit(batch.into_iter().map(|entry| entry.path).collect())
+    });
 }
 
-fn walk_files_streaming_path(
+/// The walk behind [`walk_files_streaming`], emitting picker cache entries
+/// whose lowercase text and directory flag are computed here, off the UI
+/// task.
+fn walk_entries_streaming(
     root: &Path,
     cancel: &AtomicBool,
-    mut emit: impl FnMut(Vec<PathBuf>) -> bool,
+    mut emit: impl FnMut(Vec<CacheEntry>) -> bool,
 ) {
     let walker = ignore::WalkBuilder::new(root)
         // Dot-entries are pruned by `filter_entry` below so the walker never
@@ -455,7 +506,7 @@ fn walk_files_streaming_path(
         if rel.is_empty() {
             continue;
         }
-        batch.push(PathBuf::from(rel));
+        batch.push(CacheEntry::new(PathBuf::from(rel), !is_file));
         entries += 1;
         if is_file {
             files += 1;
@@ -481,6 +532,105 @@ pub(crate) fn walk_files(root: &str) -> Vec<PathBuf> {
         true
     });
     files
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn naive_matches(paths: &[PathBuf], query: &str) -> Vec<PathBuf> {
+        let query = query.to_lowercase();
+        paths
+            .iter()
+            .filter(|path| path.to_string_lossy().to_lowercase().contains(&query))
+            .take(MAX_MATCHES)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn char_input_on_a_20k_cache_scans_once_and_matches_a_naive_filter() {
+        let paths: Vec<PathBuf> = (0..MAX_WALK_FILES)
+            .map(|index| PathBuf::from(format!("Dir{}/File_{index}.RS", index % 37)))
+            .collect();
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(paths.clone());
+        take_filter_counts();
+        picker.char_input('e');
+        picker.char_input('_');
+        picker.char_input('1');
+        assert_eq!(picker.matches, naive_matches(&paths, "e_1"));
+        assert_eq!(picker.matches.len(), MAX_MATCHES);
+        let (scanned, rescans) = take_filter_counts();
+        assert_eq!(rescans, 3, "one rescan per query change");
+        // Each rescan stops at the 50th match instead of lowercasing the
+        // whole cache.
+        assert!(scanned < 3 * 2_000, "scanned {scanned} entries");
+        picker.char_input('9');
+        picker.char_input('9');
+        picker.char_input('9');
+        assert_eq!(picker.matches, naive_matches(&paths, "e_1999"));
+    }
+
+    #[tokio::test]
+    async fn streamed_batches_filter_only_new_entries_with_the_rescan_result() {
+        let mut picker = FilePicker::new();
+        picker.active = true;
+        picker.query = "b".into();
+        picker.filter();
+        let (tx, rx) = mpsc::channel();
+        picker.walk_rx = Some(rx);
+        picker.loading = true;
+        let mut all = Vec::new();
+        take_filter_counts();
+        for batch in 0..40 {
+            let paths: Vec<PathBuf> = (0..WALK_BATCH_SIZE)
+                .map(|index| PathBuf::from(format!("{}{batch}-{index}", ["a", "b"][index % 2])))
+                .collect();
+            all.extend(paths.clone());
+            tx.send(
+                paths
+                    .into_iter()
+                    .map(|path| CacheEntry::new(path, false))
+                    .collect(),
+            )
+            .unwrap();
+            assert!(picker.try_finish_loading());
+        }
+        drop(tx);
+        assert!(picker.try_finish_loading());
+        assert!(!picker.is_loading());
+        assert_eq!(picker.matches, naive_matches(&all, "b"));
+        let (scanned, rescans) = take_filter_counts();
+        assert_eq!(rescans, 0, "streaming never rescans the cache");
+        // Batches after the 50th match are not scanned at all.
+        assert_eq!(scanned, 4 * WALK_BATCH_SIZE + 4);
+    }
+
+    #[test]
+    fn draw_uses_the_cached_directory_flag_without_touching_the_filesystem() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-draw-cache");
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut picker = FilePicker::new();
+        picker.active = true;
+        picker.walk_workspace = Some(binding.clone());
+        walk_entries_streaming(binding.root(), &AtomicBool::new(false), |batch| {
+            picker.file_cache.extend(batch);
+            true
+        });
+        picker.filter();
+        assert_eq!(picker.match_dirs, vec![true, false]);
+        drop(binding);
+        drop(root);
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 80, 20).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("src/"), "{rendered:?}");
+        assert!(rendered.contains("src/main.rs"));
+        assert!(!rendered.contains("main.rs/"));
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
-use super::draw_picker_list;
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
+use super::draw_picker_rows;
 
 /// Slash commands that are always available, regardless of which optional
 /// features were compiled in. Feature-gated commands are appended by
@@ -84,6 +87,22 @@ pub(crate) fn is_command_alias(name: &str) -> bool {
 /// so ranking ties fall back to name order. Every command `/help` lists must
 /// appear here; a test in `crate::ui::slash::help` enforces that.
 pub(crate) fn available_commands() -> Vec<&'static str> {
+    static_commands().0.clone()
+}
+
+/// The sorted command list and its lowercase forms, built once per process:
+/// the slash picker opens on every `/` and borrows these instead of
+/// rebuilding and re-sorting the list.
+fn static_commands() -> &'static (Vec<&'static str>, Vec<String>) {
+    static COMMANDS: OnceLock<(Vec<&'static str>, Vec<String>)> = OnceLock::new();
+    COMMANDS.get_or_init(|| {
+        let commands = build_available_commands();
+        let lower = commands.iter().map(|name| name.to_lowercase()).collect();
+        (commands, lower)
+    })
+}
+
+fn build_available_commands() -> Vec<&'static str> {
     let mut cmds: Vec<&'static str> = BASE_COMMANDS.to_vec();
 
     #[cfg(feature = "agent-skills")]
@@ -165,8 +184,12 @@ pub(crate) fn reserved_command(name: &str) -> bool {
 /// rank the same: exact name, then prefix, then a match starting at a word
 /// boundary, then any other substring.
 pub(crate) fn match_rank(name: &str, query_lower: &str) -> Option<u8> {
-    let name_lower = name.to_lowercase();
-    let bare = name_lower.strip_prefix('/').unwrap_or(&name_lower);
+    match_rank_lower(&name.to_lowercase(), query_lower)
+}
+
+/// [`match_rank`] for an already-lowercased name.
+fn match_rank_lower(name_lower: &str, query_lower: &str) -> Option<u8> {
+    let bare = name_lower.strip_prefix('/').unwrap_or(name_lower);
     let query = query_lower.strip_prefix('/').unwrap_or(query_lower);
     if query.is_empty() {
         return Some(0);
@@ -190,8 +213,15 @@ pub struct ListPicker {
     pub query: String,
     pub cursor: usize,
     pub matches: Vec<String>,
+    /// Index into `items` of each entry of `matches`.
+    match_indices: Vec<usize>,
     pub selected: usize,
-    items: Vec<String>,
+    items: Vec<Cow<'static, str>>,
+    /// Lowercase form of each entry of `items`, computed when items are set.
+    items_lower: Vec<Cow<'static, str>>,
+    /// Widest item name in characters (the description column), computed
+    /// when items are set.
+    name_width: usize,
     /// One-line description per entry of `items`, shown after the name;
     /// empty when the list has none. Filtering only looks at the names.
     descriptions: Vec<String>,
@@ -207,8 +237,11 @@ impl ListPicker {
             query: String::new(),
             cursor: 0,
             matches: Vec::new(),
+            match_indices: Vec::new(),
             selected: 0,
             items: Vec::new(),
+            items_lower: Vec::new(),
+            name_width: 0,
             descriptions: Vec::new(),
             current: None,
             monochrome: false,
@@ -216,19 +249,36 @@ impl ListPicker {
     }
 
     pub fn with_static_commands() -> Self {
+        let (commands, lower) = static_commands();
         let mut picker = ListPicker::new();
-        picker.items = available_commands().iter().map(|s| s.to_string()).collect();
+        picker.items = commands.iter().map(|name| Cow::Borrowed(*name)).collect();
+        picker.items_lower = lower
+            .iter()
+            .map(|name| Cow::Borrowed(name.as_str()))
+            .collect();
+        picker.name_width = width_of(&picker.items);
         picker
     }
 
     pub(crate) fn append_described_items(&mut self, entries: Vec<(String, String)>) {
         self.descriptions.resize(self.items.len(), String::new());
         for (name, description) in entries {
-            if !self.items.contains(&name) {
-                self.items.push(name);
+            if !self.items.iter().any(|item| *item == name) {
+                self.items_lower.push(Cow::Owned(name.to_lowercase()));
+                self.name_width = self.name_width.max(name.chars().count());
+                self.items.push(Cow::Owned(name));
                 self.descriptions.push(description);
             }
         }
+    }
+
+    fn set_names(&mut self, items: Vec<String>) {
+        self.items_lower = items
+            .iter()
+            .map(|name| Cow::Owned(name.to_lowercase()))
+            .collect();
+        self.items = items.into_iter().map(Cow::Owned).collect();
+        self.name_width = width_of(&self.items);
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -241,14 +291,16 @@ impl ListPicker {
     }
 
     pub fn set_items(&mut self, items: Vec<String>) {
-        self.items = items;
+        self.set_names(items);
         self.descriptions.clear();
     }
 
     /// Set `(name, description)` entries. Names are matched and inserted;
     /// descriptions are only drawn.
     pub fn set_described_items(&mut self, entries: Vec<(String, String)>) {
-        (self.items, self.descriptions) = entries.into_iter().unzip();
+        let (items, descriptions) = entries.into_iter().unzip();
+        self.set_names(items);
+        self.descriptions = descriptions;
     }
 
     /// Mark `name` as the current value: it is labelled `(current)` and
@@ -260,34 +312,32 @@ impl ListPicker {
     /// The rows the overlay draws for `matches`: the bare name, or for
     /// described lists the padded name, its description and a `(current)`
     /// marker on the current entry.
+    #[cfg(test)]
     pub(crate) fn display_rows(&self) -> Vec<String> {
-        if self.descriptions.is_empty() {
-            return self.matches.clone();
-        }
-        let width = self
-            .items
-            .iter()
-            .map(|n| n.chars().count())
-            .max()
-            .unwrap_or(0);
-        self.matches
-            .iter()
-            .map(|name| {
-                let description = self
-                    .items
-                    .iter()
-                    .position(|item| item == name)
-                    .and_then(|index| self.descriptions.get(index))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let marker = if self.current.as_deref() == Some(name.as_str()) {
-                    "  (current)"
-                } else {
-                    ""
-                };
-                format!("{name:<width$}  {description}{marker}")
-            })
+        (0..self.matches.len())
+            .map(|index| self.display_row(index).into_owned())
             .collect()
+    }
+
+    /// The drawn row for `matches[index]`; only visible rows are formatted.
+    pub(crate) fn display_row(&self, index: usize) -> Cow<'_, str> {
+        let name = self.matches[index].as_str();
+        if self.descriptions.is_empty() {
+            return Cow::Borrowed(name);
+        }
+        let description = self
+            .match_indices
+            .get(index)
+            .and_then(|item| self.descriptions.get(*item))
+            .map(String::as_str)
+            .unwrap_or("");
+        let marker = if self.current.as_deref() == Some(name) {
+            "  (current)"
+        } else {
+            ""
+        };
+        let width = self.name_width;
+        Cow::Owned(format!("{name:<width$}  {description}{marker}"))
     }
 
     pub fn activate(&mut self) {
@@ -295,6 +345,7 @@ impl ListPicker {
         self.query.clear();
         self.cursor = 0;
         self.matches.clear();
+        self.match_indices.clear();
         self.selected = 0;
         self.filter();
     }
@@ -332,17 +383,24 @@ impl ListPicker {
     fn filter(&mut self) {
         let query_lower = self.query.to_lowercase();
         let mut ranked: Vec<(u8, usize)> = self
-            .items
+            .items_lower
             .iter()
             .enumerate()
-            .filter_map(|(index, name)| match_rank(name, &query_lower).map(|rank| (rank, index)))
+            .filter_map(|(index, name)| {
+                match_rank_lower(name, &query_lower).map(|rank| (rank, index))
+            })
             .collect();
         // Stable on the caller's order: for commands that order is alphabetical.
         ranked.sort_unstable();
-        self.matches = ranked
+        self.match_indices = ranked
             .into_iter()
             .take(50)
-            .map(|(_, index)| self.items[index].clone())
+            .map(|(_, index)| index)
+            .collect();
+        self.matches = self
+            .match_indices
+            .iter()
+            .map(|index| self.items[*index].to_string())
             .collect();
         self.selected = if self.query.is_empty() {
             self.current
@@ -374,12 +432,21 @@ impl ListPicker {
         self.matches.get(self.selected).map(|s| s.as_str())
     }
 
-    pub fn draw(&self, empty_message: Option<&str>, floor_row: u16) -> std::io::Result<()> {
+    pub fn draw(
+        &self,
+        out: &mut dyn std::io::Write,
+        cols: u16,
+        empty_message: Option<&str>,
+        floor_row: u16,
+    ) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        draw_picker_list(
-            &self.display_rows(),
+        draw_picker_rows(
+            out,
+            cols,
+            self.matches.len(),
+            |index| self.display_row(index),
             self.selected,
             self.monochrome,
             empty_message,
@@ -387,4 +454,12 @@ impl ListPicker {
             0,
         )
     }
+}
+
+fn width_of(items: &[Cow<'static, str>]) -> usize {
+    items
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0)
 }

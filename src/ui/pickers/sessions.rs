@@ -23,6 +23,8 @@ pub(crate) struct SessionsPicker {
     pub matches: Vec<usize>,
     pub catalogue: Catalogue,
     pub workspace: Arc<crate::paths::WorkspaceBinding>,
+    /// Lowercase filter text per catalogue row, built once in `new`.
+    haystacks: Vec<String>,
     monochrome: bool,
     outcome: Option<SessionPick>,
 }
@@ -33,6 +35,17 @@ impl SessionsPicker {
         workspace: Arc<crate::paths::WorkspaceBinding>,
         all: bool,
     ) -> Self {
+        let haystacks = catalogue
+            .rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {} {} {} {}",
+                    row.title, row.id, row.working_dir, row.provider, row.model
+                )
+                .to_lowercase()
+            })
+            .collect();
         let mut picker = Self {
             active: true,
             all,
@@ -41,6 +54,7 @@ impl SessionsPicker {
             matches: Vec::new(),
             catalogue,
             workspace,
+            haystacks,
             monochrome: false,
             outcome: None,
         };
@@ -54,17 +68,13 @@ impl SessionsPicker {
         self.outcome.take()
     }
     fn filter(&mut self) {
+        let query = self.query.to_lowercase();
         let mut ranked: Vec<_> = self
-            .catalogue
-            .rows
+            .haystacks
             .iter()
             .enumerate()
-            .filter_map(|(index, row)| {
-                let text = format!(
-                    "{} {} {} {} {}",
-                    row.title, row.id, row.working_dir, row.provider, row.model
-                );
-                super::fuzzy_score(&text, &self.query)
+            .filter_map(|(index, text)| {
+                super::fuzzy_score_lower(text, &query)
                     .map(|score| (std::cmp::Reverse(score), index))
             })
             .collect();

@@ -115,8 +115,13 @@ impl RewindPicker {
         self.outcome.take()
     }
 
-    pub fn draw(&self, floor_row: u16) -> std::io::Result<()> {
-        self.list.draw(None, floor_row)
+    pub fn draw(
+        &self,
+        out: &mut dyn std::io::Write,
+        cols: u16,
+        floor_row: u16,
+    ) -> std::io::Result<()> {
+        self.list.draw(out, cols, None, floor_row)
     }
 
     /// Handle a key while the picker is open. Always returns `true`: the picker

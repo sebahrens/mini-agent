@@ -144,6 +144,34 @@ pub(super) fn writer() -> PickerWriter {
         PickerWriter::Native(io::stdout())
     })
 }
+/// The renderer-owned writer as seen by a picker under test: the controlled
+/// native fault replaces it, so write errors on the actual (uncaptured) draw
+/// path stay observable; otherwise writes reach the renderer's writer.
+pub(crate) enum NativeWriter<'a> {
+    Renderer(&'a mut dyn Write),
+    Fault,
+}
+pub(crate) fn native_writer(writer: &mut dyn Write) -> NativeWriter<'_> {
+    if STATE.with(|state| state.borrow().fault) {
+        NativeWriter::Fault
+    } else {
+        NativeWriter::Renderer(writer)
+    }
+}
+impl Write for NativeWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Renderer(writer) => writer.write(bytes),
+            Self::Fault => Err(fault()),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Renderer(writer) => writer.flush(),
+            Self::Fault => Err(fault()),
+        }
+    }
+}
 fn fault() -> io::Error {
     STATE.with(|state| state.borrow_mut().writes += 1);
     io::Error::new(
@@ -204,9 +232,10 @@ fn captured_picker_messages_lists_and_unwind_restore_the_native_fault() {
         assert!(crossterm::Command::is_ansi_code_supported(&captured));
         let mut writer = writer();
         crossterm::ExecutableCommand::execute(&mut writer, captured).unwrap();
-        super::draw_picker_message("scanning files...", true, 10).unwrap();
-        super::draw_picker_list(&[], 0, true, Some("no matches"), 10, 0).unwrap();
-        super::draw_picker_list(&["owned 雪".into()], 0, true, None, 10, 0).unwrap();
+        super::draw_picker_message(&mut writer, "scanning files...", true, 10).unwrap();
+        super::draw_picker_list(&mut writer, 30, &[], 0, true, Some("no matches"), 10, 0).unwrap();
+        super::draw_picker_list(&mut writer, 30, &["owned 雪".into()], 0, true, None, 10, 0)
+            .unwrap();
     });
     assert_eq!(fault.counts(), (0, 0));
     let rendered = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
@@ -221,7 +250,7 @@ fn captured_picker_messages_lists_and_unwind_restore_the_native_fault() {
         )))
         .is_err()
     );
-    let error = super::draw_picker_message("uncaptured", true, 10).unwrap_err();
+    let error = super::draw_picker_message(&mut writer(), "uncaptured", true, 10).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(
         error.to_string(),

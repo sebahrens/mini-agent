@@ -61,48 +61,68 @@ impl Picker {
         }
     }
 
+    /// Draw the open overlay through the renderer, which owns the writer and
+    /// the geometry: rows are queued and flushed once, and no picker queries
+    /// the terminal size itself.
     pub(crate) fn draw_with_renderer(
         &mut self,
         renderer: &mut crate::ui::renderer::Renderer,
     ) -> std::io::Result<()> {
-        if let Picker::Sessions(picker) = self {
-            renderer
-                .draw_picker_with(|writer, cols, floor, bg| picker.draw(writer, cols, floor, bg))
-        } else {
-            #[cfg(test)]
-            if let Some(result) = renderer.draw_captured_picker(|floor| self.draw(floor)) {
-                return result;
-            }
-            self.draw(renderer.picker_floor_row())
+        #[cfg(test)]
+        if let Some(result) = renderer.draw_captured_picker(|floor| self.draw(floor)) {
+            return result;
         }
+        renderer.draw_picker_with(|writer, cols, floor, bg| {
+            #[cfg(test)]
+            let mut writer = crate::ui::pickers::test_surface::native_writer(writer);
+            #[cfg(test)]
+            let writer: &mut dyn std::io::Write = &mut writer;
+            self.draw_to(writer, cols, floor, bg)
+        })
     }
 
-    /// Draw the overlay so it ends just above `floor_row`, the separator over
-    /// the input (see `Renderer::picker_floor_row`).
+    /// Draw on the test picker surface (captured, or the controlled native
+    /// writer) so the overlay ends just above `floor_row`.
+    #[cfg(test)]
     pub fn draw(&mut self, floor_row: u16) -> std::io::Result<()> {
+        let (cols, _) = crate::ui::pickers::picker_size()?;
+        let mut writer = crate::ui::pickers::picker_writer();
+        self.draw_to(&mut writer, cols, floor_row, None)
+    }
+
+    /// Draw the overlay into `out` so it ends just above `floor_row`, the
+    /// separator over the input (see `Renderer::picker_floor_row`).
+    pub(crate) fn draw_to(
+        &mut self,
+        out: &mut dyn std::io::Write,
+        cols: u16,
+        floor_row: u16,
+        bg: Option<crossterm::style::Color>,
+    ) -> std::io::Result<()> {
         match self {
-            Picker::Config(p) => p
-                .list
-                .draw(Some("type a key or select; Esc closes"), floor_row),
-            Picker::File(p) => p.draw(floor_row),
-            Picker::Command(p) => p.draw(None, floor_row),
+            Picker::Config(p) => p.list.draw(
+                out,
+                cols,
+                Some("type a key or select; Esc closes"),
+                floor_row,
+            ),
+            Picker::File(p) => p.draw(out, cols, floor_row),
+            Picker::Command(p) => p.draw(out, cols, None, floor_row),
             Picker::Prefixed(p, prefix) => {
                 let msg = if *prefix == "/provider " {
                     Some("no matches  (type a registered custom gateway name)")
                 } else {
                     None
                 };
-                p.draw(msg, floor_row)
+                p.draw(out, cols, msg, floor_row)
             }
-            Picker::Models(p) => p.draw(floor_row),
-            Picker::Rewind(p) => p.draw(floor_row),
-            Picker::Sessions(_) => Err(std::io::Error::other(
-                "sessions picker requires its renderer",
-            )),
+            Picker::Models(p) => p.draw(out, cols, floor_row),
+            Picker::Rewind(p) => p.draw(out, cols, floor_row),
+            Picker::Sessions(p) => p.draw(out, cols, floor_row, bg),
             // A new command has no history match; stay out of the way
             // instead of announcing "no matches" for every keystroke.
             Picker::Bang(p) if p.matches.is_empty() => Ok(()),
-            Picker::Bang(p) => p.draw(None, floor_row),
+            Picker::Bang(p) => p.draw(out, cols, None, floor_row),
         }
     }
 }

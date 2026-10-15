@@ -1,12 +1,13 @@
+use std::borrow::Cow;
 use std::io::Write;
 
-use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
+use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::Clear;
 
 use super::super::utils::resolve_color;
-use super::{draw_picker_list, fuzzy_score};
+use super::{draw_picker_rows, fuzzy_score_lower};
 
 pub struct ModelsPicker {
     pub active: bool,
@@ -16,6 +17,9 @@ pub struct ModelsPicker {
     pub selected: usize,
     quick: Vec<String>,
     provider: Vec<String>,
+    /// Lowercase forms of `quick` and `provider`, computed in `set_groups`.
+    quick_lower: Vec<String>,
+    provider_lower: Vec<String>,
     pub group: usize,
     monochrome: bool,
     /// The command whose argument this picker completes: `/model ` (the
@@ -36,6 +40,8 @@ impl ModelsPicker {
             selected: 0,
             quick: Vec::new(),
             provider: Vec::new(),
+            quick_lower: Vec::new(),
+            provider_lower: Vec::new(),
             group: 0,
             monochrome: false,
             prefix: "/models ",
@@ -53,17 +59,21 @@ impl ModelsPicker {
     }
 
     /// The rows drawn for `matches`, with `(current)` after the current model.
+    #[cfg(test)]
     pub(crate) fn display_rows(&self) -> Vec<String> {
-        self.matches
-            .iter()
-            .map(|name| {
-                if self.current.as_deref() == Some(name.as_str()) {
-                    format!("{name}  (current)")
-                } else {
-                    name.clone()
-                }
-            })
+        (0..self.matches.len())
+            .map(|index| self.display_row(index).into_owned())
             .collect()
+    }
+
+    /// The drawn row for `matches[index]`; only visible rows are formatted.
+    fn display_row(&self, index: usize) -> Cow<'_, str> {
+        let name = self.matches[index].as_str();
+        if self.current.as_deref() == Some(name) {
+            Cow::Owned(format!("{name}  (current)"))
+        } else {
+            Cow::Borrowed(name)
+        }
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -76,6 +86,8 @@ impl ModelsPicker {
     }
 
     pub fn set_groups(&mut self, quick: Vec<String>, provider: Vec<String>) {
+        self.quick_lower = quick.iter().map(|name| name.to_lowercase()).collect();
+        self.provider_lower = provider.iter().map(|name| name.to_lowercase()).collect();
         self.quick = quick;
         self.provider = provider;
     }
@@ -135,14 +147,16 @@ impl ModelsPicker {
     }
 
     fn filter(&mut self) {
-        let src = if self.group == 0 {
-            &self.quick
+        let (src, lower) = if self.group == 0 {
+            (&self.quick, &self.quick_lower)
         } else {
-            &self.provider
+            (&self.provider, &self.provider_lower)
         };
+        let query_lower = self.query.to_lowercase();
         let mut scored: Vec<(i32, &String)> = src
             .iter()
-            .filter_map(|n| fuzzy_score(n, &self.query).map(|s| (s, n)))
+            .zip(lower)
+            .filter_map(|(n, l)| fuzzy_score_lower(l, &query_lower).map(|s| (s, n)))
             .collect();
         scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         self.matches = scored
@@ -180,21 +194,19 @@ impl ModelsPicker {
         self.matches.get(self.selected).map(|s| s.as_str())
     }
 
-    pub fn draw(&self, floor_row: u16) -> std::io::Result<()> {
+    pub fn draw(&self, mut out: &mut dyn Write, cols: u16, floor_row: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        let mut stdout = super::picker_writer();
         let window = super::picker_window(floor_row, 1, self.matches.len().max(1), self.selected);
 
         if let Some(header_row) = window.top_row.checked_sub(1)
             && floor_row >= 2
         {
-            stdout.execute(super::picker_command(MoveTo(0, header_row)))?;
-            write!(
-                stdout,
-                "{}",
-                super::picker_command(Clear(crossterm::terminal::ClearType::CurrentLine))
+            queue!(
+                &mut out,
+                super::picker_command(MoveTo(0, header_row)),
+                super::picker_command(Clear(crossterm::terminal::ClearType::CurrentLine)),
             )?;
             let tab = |label: &str, count: usize, active: bool| {
                 if active {
@@ -204,21 +216,20 @@ impl ModelsPicker {
                 }
             };
             write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkGrey))
-            )?;
-            write!(
-                stdout,
-                "{}  {}   (Tab to switch groups · /models refresh for the latest)",
+                out,
+                "{}{}  {}   (Tab to switch groups · /models refresh for the latest){}",
+                SetForegroundColor(self.color(Color::DarkGrey)),
                 tab("Quick", self.quick.len(), self.group == 0),
-                tab("Provider", self.provider.len(), self.group == 1)
+                tab("Provider", self.provider.len(), self.group == 1),
+                ResetColor
             )?;
-            write!(stdout, "{}", ResetColor)?;
         }
 
-        draw_picker_list(
-            &self.display_rows(),
+        draw_picker_rows(
+            out,
+            cols,
+            self.matches.len(),
+            |index| self.display_row(index),
             self.selected,
             self.monochrome,
             None,
