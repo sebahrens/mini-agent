@@ -716,6 +716,20 @@ struct BackgroundJobsInner {
     running: AtomicUsize,
 }
 
+/// What the output worker launches. A shell command is wrapped by the worker
+/// itself, on the blocking pool, so the caller's task (an executor worker, or
+/// the TUI task for `!`) never runs the sandbox preparation and Git metadata
+/// pin scan. The order is unchanged: workspace/shell validation and wrapping
+/// complete before the spawn, and nothing runs when wrapping fails.
+enum PendingCommand {
+    Built(ExecutionCommand),
+    Shell {
+        command: String,
+        /// Explicit child working directory applied after wrapping.
+        cwd: Option<PathBuf>,
+    },
+}
+
 struct OutputCommandOptions {
     cancellation: Option<watch::Receiver<bool>>,
     audit: Option<OwnedExplicitShellAudit>,
@@ -3548,28 +3562,17 @@ impl Sandbox {
             cwd: cwd.clone(),
             boundary,
         };
-        let mut cmd = match self.wrap_command(command) {
-            Ok(cmd) => cmd,
-            Err(error) => {
-                let output = CommandOutput {
-                    exit_status: None,
-                    stdout: Vec::new(),
-                    stderr: error.into_bytes(),
-                    status: CommandStatus::Failed,
-                    descendants_escaped: false,
-                };
-                audit_explicit_shell(&audit, &output);
-                let run = ExplicitShellRun { audit, output };
-                return Ok(run);
-            }
-        };
-        // Apply an explicit snapshot even for the intentional uncontained
-        // branch, which would otherwise inherit cwd only at the later spawn.
-        cmd.current_dir(&cwd);
         let cancellation = cancellation.map(CommandCancellation::subscribe);
+        // The output worker wraps the command on the blocking pool, so this
+        // (UI) task never runs the sandbox preparation. It applies the explicit
+        // cwd snapshot even for the intentional uncontained branch, which would
+        // otherwise inherit cwd only at the later spawn.
         let output = self
-            .output_built_command_with_limits_scoped(
-                cmd,
+            .output_pending_command_scoped(
+                PendingCommand::Shell {
+                    command: command.to_string(),
+                    cwd: Some(cwd),
+                },
                 limits,
                 cancellation,
                 Some(OwnedExplicitShellAudit::capture(
@@ -3847,18 +3850,6 @@ impl Sandbox {
                 descendants_escaped: false,
             });
         }
-        let cmd = match self.wrap_command(&command) {
-            Ok(command) => command,
-            Err(error) => {
-                return Ok(CommandOutput {
-                    exit_status: None,
-                    stdout: Vec::new(),
-                    stderr: error.into_bytes(),
-                    status: CommandStatus::Failed,
-                    descendants_escaped: false,
-                });
-            }
-        };
         let limits = CommandLimits {
             timeout,
             stdout_bytes: BACKGROUND_STREAM_BYTES,
@@ -3867,7 +3858,7 @@ impl Sandbox {
         };
         let (response_tx, response_rx) = oneshot::channel();
         self.run_built_output_command(
-            cmd,
+            PendingCommand::Shell { command, cwd: None },
             limits,
             OutputCommandOptions {
                 cancellation: Some(cancellation.subscribe()),
@@ -3908,20 +3899,17 @@ impl Sandbox {
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
     ) -> std::io::Result<CommandOutput> {
-        let cmd = match self.wrap_command(command) {
-            Ok(cmd) => cmd,
-            Err(error) => {
-                return Ok(CommandOutput {
-                    exit_status: None,
-                    stdout: Vec::new(),
-                    stderr: error.into_bytes(),
-                    status: CommandStatus::Failed,
-                    descendants_escaped: false,
-                });
-            }
-        };
-        self.output_built_command_with_limits_scoped(cmd, limits, cancellation, None, None)
-            .await
+        self.output_pending_command_scoped(
+            PendingCommand::Shell {
+                command: command.to_string(),
+                cwd: None,
+            },
+            limits,
+            cancellation,
+            None,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn output_built_command_with_limits(
@@ -3993,6 +3981,24 @@ impl Sandbox {
     async fn output_built_command_with_limits_scoped(
         &self,
         cmd: ExecutionCommand,
+        limits: CommandLimits,
+        cancellation: Option<watch::Receiver<bool>>,
+        audit: Option<OwnedExplicitShellAudit>,
+        input: Option<Vec<u8>>,
+    ) -> std::io::Result<CommandOutput> {
+        self.output_pending_command_scoped(
+            PendingCommand::Built(cmd),
+            limits,
+            cancellation,
+            audit,
+            input,
+        )
+        .await
+    }
+
+    async fn output_pending_command_scoped(
+        &self,
+        cmd: PendingCommand,
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
         audit: Option<OwnedExplicitShellAudit>,
@@ -4103,7 +4109,7 @@ impl Sandbox {
 
     async fn run_built_output_command(
         &self,
-        mut cmd: ExecutionCommand,
+        pending: PendingCommand,
         limits: CommandLimits,
         options: OutputCommandOptions,
         mut response_tx: oneshot::Sender<CommandOutput>,
@@ -4115,21 +4121,66 @@ impl Sandbox {
             input,
             capture,
         } = options;
-        if cancellation
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
-        {
-            let output = CommandOutput {
-                exit_status: None,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                status: CommandStatus::Cancelled,
-                descendants_escaped: false,
-            };
+        let settle_early = |output: CommandOutput, response_tx: oneshot::Sender<CommandOutput>| {
             if let Some(audit) = &audit {
                 audit.emit(&output);
             }
             let _ = response_tx.send(output);
+        };
+        let cancelled_output = || CommandOutput {
+            exit_status: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: CommandStatus::Cancelled,
+            descendants_escaped: false,
+        };
+        let is_cancelled = |cancellation: &Option<watch::Receiver<bool>>| {
+            cancellation
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow())
+        };
+        if is_cancelled(&cancellation) {
+            settle_early(cancelled_output(), response_tx);
+            return;
+        }
+        let mut cmd = match pending {
+            PendingCommand::Built(cmd) => cmd,
+            PendingCommand::Shell { command, cwd } => {
+                let sandbox = self.clone();
+                let wrapped = crate::agent::runner::spawn_blocking_scoped(move || {
+                    sandbox.wrap_command(&command)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err("sandbox: command preparation stopped before completion".to_string())
+                });
+                match wrapped {
+                    Ok(mut cmd) => {
+                        if let Some(cwd) = cwd {
+                            cmd.current_dir(&cwd);
+                        }
+                        cmd
+                    }
+                    Err(error) => {
+                        settle_early(
+                            CommandOutput {
+                                exit_status: None,
+                                stdout: Vec::new(),
+                                stderr: error.into_bytes(),
+                                status: CommandStatus::Failed,
+                                descendants_escaped: false,
+                            },
+                            response_tx,
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        // Preparation may have taken a while; a cancellation observed now
+        // still prevents the spawn.
+        if is_cancelled(&cancellation) {
+            settle_early(cancelled_output(), response_tx);
             return;
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -7002,6 +7053,51 @@ mod sandbox_tests {
             err.contains("unavailable"),
             "error should mention unavailability: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_shell_cancelled_before_preparation_never_wraps_on_the_caller() {
+        // An unavailable backend fails inside `wrap_command`. A Cancelled
+        // receipt therefore proves the caller returned without wrapping: the
+        // output worker observed the token before it prepared the command.
+        let mut sandbox = unavailable();
+        let receipts = sandbox.observe_explicit_shell_audits();
+        let cancellation = CommandCancellation::new();
+        cancellation.cancel();
+        let run = sandbox
+            .run_explicit_shell(
+                "!echo must not run",
+                DEFAULT_COMMAND_LIMITS,
+                Some(&cancellation),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.output.status, CommandStatus::Cancelled);
+        assert!(
+            run.output.stderr.is_empty(),
+            "wrap_command must not have run"
+        );
+        assert_eq!(
+            receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, status)| *status)
+                .collect::<Vec<_>>(),
+            vec![CommandStatus::Cancelled]
+        );
+
+        // Without cancellation the worker wraps, fails closed before any
+        // spawn, and still emits exactly one audit receipt.
+        let run = sandbox
+            .run_explicit_shell("!echo must not run", DEFAULT_COMMAND_LIMITS, None)
+            .await
+            .unwrap();
+        assert_eq!(run.output.status, CommandStatus::Failed);
+        assert!(String::from_utf8_lossy(&run.output.stderr).contains("unavailable"));
+        assert!(run.output.stdout.is_empty());
+        assert_eq!(receipts.lock().unwrap().len(), 2);
+        assert_eq!(receipts.lock().unwrap()[1].1, CommandStatus::Failed);
     }
 
     #[tokio::test]

@@ -541,6 +541,12 @@ for the `Sandbox` (private-path denials and their namespace ancestors) and
 strings derived from the validated roots; Git metadata alias inspection, `.git`
 write denials, guarded runtime paths and root validation run on every launch,
 including profile cache hits, and the profile bytes are unchanged.
+Shell launches (model `shell` calls, background jobs and `!` commands) are
+wrapped by their output worker on the blocking pool after its cancellation
+check, never on the caller's task, so the Git metadata pin scan cannot stall an
+executor worker or the TUI. The order stays validate, wrap, spawn: a wrapping
+failure is reported without spawning, and cancellation is re-checked before the
+spawn.
 
 Private mountpoint setup is an explicit, bounded no-follow operation that only
 creates missing empty private directories. Existing entries/permissions must
