@@ -392,7 +392,23 @@ impl Ledger {
     pub(crate) fn summary_for_session(&self, session_id: &str) -> anyhow::Result<LedgerSummary> {
         self.summary_with_session(Some(session_id))
     }
+    /// Startup reconciliation needs only `session`, `session_by_model` and
+    /// `last_session_request`. Every row is still bounded, parsed, validated
+    /// and checked for duplicate receipts, but the all-time/today/by-model
+    /// accumulators and the per-row re-serialization + SHA-256 fingerprint
+    /// (needed only to detect conflicting appends in `flush`) are skipped.
+    /// The session fields are identical to [`Self::summary_for_session`]'s.
+    pub(crate) fn session_summary(&self, session_id: &str) -> anyhow::Result<LedgerSummary> {
+        self.summary_with_mode(Some(session_id), ScanMode::SessionOnly)
+    }
     fn summary_with_session(&self, session_id: Option<&str>) -> anyhow::Result<LedgerSummary> {
+        self.summary_with_mode(session_id, ScanMode::Summary)
+    }
+    fn summary_with_mode(
+        &self,
+        session_id: Option<&str>,
+        mode: ScanMode,
+    ) -> anyhow::Result<LedgerSummary> {
         let _io = self
             .io
             .lock()
@@ -406,7 +422,7 @@ impl Ledger {
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
-        let scan = scan(&mut file, session_id)?;
+        let scan = scan_with(&mut file, session_id, mode)?;
         Self::revalidate(&binding, &file)?;
         file.release()?;
         #[cfg(test)]
@@ -523,7 +539,21 @@ impl Ledger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// Appending: receipt fingerprints detect conflicting duplicate IDs.
+    Flush,
+    /// Every accumulator, for `/cost` style summaries.
+    Summary,
+    /// Only the requested session's accumulators; duplicate IDs still fail.
+    SessionOnly,
+}
+
 fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
+    scan_with(file, session_id, ScanMode::Flush)
+}
+
+fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyhow::Result<Scan> {
     let length = file.metadata()?.len();
     anyhow::ensure!(
         length <= MAX_LEDGER_BYTES as u64,
@@ -547,6 +577,7 @@ fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
         identities: BTreeMap::new(),
         summary: LedgerSummary::default(),
     };
+    let mut seen = std::collections::BTreeSet::new();
     let today = chrono::Utc::now().date_naive();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         scanned.records += 1;
@@ -558,13 +589,23 @@ fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
             .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
         row.validate()
             .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
-        let fingerprint = Sha256::digest(serde_json::to_vec(&row)?).into();
-        anyhow::ensure!(
-            scanned.identities.insert(row.id, fingerprint).is_none(),
-            "usage ledger contains duplicate receipts"
-        );
+        if mode == ScanMode::Flush {
+            let fingerprint = Sha256::digest(serde_json::to_vec(&row)?).into();
+            anyhow::ensure!(
+                scanned.identities.insert(row.id, fingerprint).is_none(),
+                "usage ledger contains duplicate receipts"
+            );
+        } else {
+            anyhow::ensure!(
+                seen.insert(row.id),
+                "usage ledger contains duplicate receipts"
+            );
+        }
+        // All-time totals always run: they enforce the ledger-wide overflow
+        // bounds. Today/by-model totals are subsets and cannot fail when it
+        // succeeds, so skipping them never changes the scan's outcome.
         scanned.summary.all_time.add(&row)?;
-        if row.ts.date_naive() == today {
+        if mode != ScanMode::SessionOnly && row.ts.date_naive() == today {
             scanned.summary.today.add(&row)?;
         }
         if session_id == Some(row.session_id.as_str()) {
@@ -590,6 +631,9 @@ fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
             } else {
                 scanned.summary.session_model_details_capped = true;
             }
+        }
+        if mode == ScanMode::SessionOnly {
+            continue;
         }
         let key = (row.provider.clone(), row.model.clone());
         if scanned.summary.by_model.contains_key(&key)
@@ -624,6 +668,84 @@ mod tests {
                 false,
             ),
         )
+    }
+    #[test]
+    fn startup_session_summary_equals_full_scan_session_totals() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-session-scan");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        assert_eq!(
+            ledger.session_summary("a").unwrap().session.records,
+            0,
+            "missing storage is empty"
+        );
+        for (session, models) in [("a", ["m1", "m2", "m3"]), ("b", ["m1", "m4", "m5"])] {
+            let account = Account::new(session, None, 0.0).unwrap();
+            for index in 0..120u64 {
+                let model = models[(index % 3) as usize];
+                let prices = if index % 5 == 0 {
+                    PriceSnapshot::capture(None, Default::default(), false)
+                } else {
+                    PriceSnapshot::capture(Some((1.0, 3.0)), Default::default(), false)
+                };
+                let usage = if index % 7 == 0 {
+                    UsageDelta::default()
+                } else {
+                    UsageDelta {
+                        input_tokens: 1_000 + index,
+                        output_tokens: 10 * index,
+                        cached_input_tokens: index,
+                        ..Default::default()
+                    }
+                };
+                let kind = [RequestKind::Turn, RequestKind::Title, RequestKind::Subagent]
+                    [(index % 3) as usize];
+                account
+                    .observe(&Receipt::new(
+                        session, "provider", model, kind, usage, prices,
+                    ))
+                    .unwrap();
+            }
+            ledger.flush(&account).unwrap();
+        }
+        for session in ["a", "b", "absent"] {
+            let full = ledger.summary_for_session(session).unwrap();
+            let quick = ledger.session_summary(session).unwrap();
+            assert_eq!(
+                format!("{:?}", quick.session),
+                format!("{:?}", full.session),
+                "{session}"
+            );
+            assert_eq!(
+                format!("{:?}", quick.session_by_model),
+                format!("{:?}", full.session_by_model)
+            );
+            assert_eq!(
+                quick.session_model_details_capped,
+                full.session_model_details_capped
+            );
+            assert_eq!(
+                format!("{:?}", quick.last_session_request),
+                format!("{:?}", full.last_session_request)
+            );
+            assert_eq!(
+                format!("{:?}", quick.all_time),
+                format!("{:?}", full.all_time)
+            );
+        }
+        assert_eq!(ledger.session_summary("a").unwrap().session.records, 120);
+        // Duplicate receipts still fail the session-only scan.
+        let mut bytes = std::fs::read(&ledger.path).unwrap();
+        let first = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .unwrap()
+            .to_vec();
+        bytes.extend_from_slice(&first);
+        std::fs::write(&ledger.path, &bytes).unwrap();
+        assert!(ledger.summary_for_session("a").is_err());
+        assert!(ledger.session_summary("a").is_err());
     }
     #[test]
     fn spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent() {

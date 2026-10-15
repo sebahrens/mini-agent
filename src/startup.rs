@@ -1178,11 +1178,21 @@ impl Startup {
         let ledger = account.runtime_ledger(std::sync::Arc::new(crate::spend::Ledger::new(
             &paths.state_dir,
         )));
-        if let Err(error) = reconciliation_scope
+        // A fresh session id has no ledger rows to reconcile; without a cost
+        // cap nothing at startup depends on the ledger, so the scan (which
+        // grows with usage history) is skipped. Appends still scan it fully.
+        let reconcile = session_resumed || max_budget_usd.is_some();
+        if !reconcile {
+            // Exactly what reconciling against the (necessarily empty)
+            // session totals of a full scan would record.
+            session
+                .spend_account
+                .reconcile(max_budget_usd, &Default::default())?;
+        } else if let Err(error) = reconciliation_scope
             .run(async move {
                 crate::agent::runner::spawn_blocking_scoped(move || {
                     let result = ledger
-                        .summary_for_session(&session_id)
+                        .session_summary(&session_id)
                         .and_then(|summary| account.reconcile(max_budget_usd, &summary.session));
                     if result.is_err() {
                         account.tracking_failed();
