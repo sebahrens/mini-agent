@@ -358,8 +358,17 @@ pub(crate) fn refresh_display(
     Ok(())
 }
 
-/// Idle cadence of the event thread's poll loop.
+/// Poll cadence of the event thread shortly after input. It bounds how long
+/// a pause (editor, pager, teardown), which normally follows a key, waits for
+/// the reader to notice it should stop.
 const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// Poll cadence once input has been quiet for [`IDLE_RAMP`]: an idle TUI
+/// wakes its reader 4 times a second instead of 20.
+const IDLE_POLL_QUIET: Duration = Duration::from_millis(250);
+
+/// How long after the last input the reader keeps the short poll.
+const IDLE_RAMP: Duration = Duration::from_secs(1);
 
 /// How far ahead the event thread peeks after an `Enter`/`Ctrl+J` to decide
 /// whether it is really a pasted newline, and how long it waits for the next
@@ -403,16 +412,56 @@ pub(crate) fn is_paste_newline_key(code: KeyCode, modifiers: KeyModifiers) -> bo
 #[derive(Default)]
 pub(crate) struct PasteBurst {
     active: bool,
+    /// When the reader last received any input event.
+    last_input: Option<Instant>,
+    /// When the reader last received a key press.
+    last_key: Option<Instant>,
 }
 
 impl PasteBurst {
     /// Poll timeout for the next event: short while a burst is alive so its
     /// end is detected quickly, idle cadence otherwise.
     pub(crate) fn wait_timeout(&self) -> Duration {
+        self.wait_timeout_at(Instant::now())
+    }
+
+    /// [`Self::wait_timeout`] at `now`: the burst window, the short idle poll
+    /// right after input, or the quiet poll once input has stopped.
+    pub(crate) fn wait_timeout_at(&self, now: Instant) -> Duration {
         if self.active {
             PASTE_BURST_WINDOW
-        } else {
+        } else if self
+            .last_input
+            .is_some_and(|last| now.saturating_duration_since(last) < IDLE_RAMP)
+        {
             IDLE_POLL
+        } else {
+            IDLE_POLL_QUIET
+        }
+    }
+
+    /// Record an input event read at `now` (after classifying it).
+    pub(crate) fn on_input(&mut self, now: Instant, key_press: bool) {
+        self.last_input = Some(now);
+        if key_press {
+            self.last_key = Some(now);
+        }
+    }
+
+    /// How long to peek after a plain `Enter` read at `now` for more input
+    /// behind it. Without bracketed paste a pasted line arrives as a stream
+    /// of keys microseconds apart, so the full [`PASTE_BURST_WINDOW`] is
+    /// waited only when the previous key came that recently; a typed submit
+    /// (or a terminal with bracketed paste, where pasted text never arrives
+    /// as keys) only checks input that is already queued, adding no delay.
+    pub(crate) fn enter_peek_window(&self, now: Instant) -> Duration {
+        if self
+            .last_key
+            .is_some_and(|last| now.saturating_duration_since(last) < PASTE_BURST_WINDOW)
+        {
+            PASTE_BURST_WINDOW
+        } else {
+            Duration::ZERO
         }
     }
 
@@ -438,17 +487,16 @@ fn event_counts_as_paste_followup(event: &event::Event) -> bool {
     matches!(event, event::Event::Key(key) if key.kind == KeyEventKind::Press)
 }
 
-/// Peek through non-key terminal events without treating them as pasted text.
-/// Every event read here is retained in order for normal dispatch.
-fn queue_paste_followups(pending: &mut VecDeque<event::Event>) -> bool {
+/// Peek up to `window` through non-key terminal events without treating
+/// them as pasted text; a zero window still sees input already queued. Every
+/// event read here is retained in order for normal dispatch.
+fn queue_paste_followups(pending: &mut VecDeque<event::Event>, window: Duration) -> bool {
     if pending.iter().any(event_counts_as_paste_followup) {
         return true;
     }
-    let deadline = Instant::now() + PASTE_BURST_WINDOW;
+    let deadline = Instant::now() + window;
     loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
-        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if !matches!(event::poll(remaining), Ok(true)) {
             return false;
         }
@@ -577,10 +625,47 @@ fn force_terminate(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// The terminal input thread, plus a completion signal so a pause can wait
+/// for it to stop without polling `is_finished` in a sleep loop.
+pub(crate) struct InputReader {
+    handle: std::thread::JoinHandle<()>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl InputReader {
+    pub(crate) fn spawn(body: impl FnOnce() + Send + 'static) -> Self {
+        /// Signals completion when the thread body returns or unwinds.
+        struct Done(std::sync::mpsc::SyncSender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let (signal, done) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let _done = Done(signal);
+            body();
+        });
+        Self { handle, done }
+    }
+
+    /// Wait up to `timeout` for the thread to finish; true once it has.
+    pub(crate) fn wait_finished(&self, timeout: Duration) -> bool {
+        !matches!(
+            self.done.recv_timeout(timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+
+    pub(crate) fn join(self) {
+        let _ = self.handle.join();
+    }
+}
+
 pub(crate) fn spawn_event_thread(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> InputReader {
     spawn_event_thread_with_events(user_tx, running, VecDeque::new())
 }
 
@@ -588,8 +673,8 @@ pub(crate) fn spawn_event_thread_with_events(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
     mut pending_events: VecDeque<event::Event>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> InputReader {
+    InputReader::spawn(move || {
         let mut paste_burst = PasteBurst::default();
         let mut errors = ReaderErrors::default();
         let on_error = |errors: &mut ReaderErrors| match errors.on_error() {
@@ -603,6 +688,7 @@ pub(crate) fn spawn_event_thread_with_events(
                 false
             }
         };
+        let mut enter_peek = PASTE_BURST_WINDOW;
         while running.load(Ordering::Relaxed) {
             let next_event = if let Some(pending) = pending_events.pop_front() {
                 Ok(pending)
@@ -619,8 +705,14 @@ pub(crate) fn spawn_event_thread_with_events(
                 }
                 event::read()
             };
-            if next_event.is_ok() {
+            let read_at = Instant::now();
+            if let Ok(event) = &next_event {
                 errors.on_success();
+                // Classify an Enter against the key before it, then record.
+                let key_press = event_counts_as_paste_followup(event);
+                let window = paste_burst.enter_peek_window(read_at);
+                paste_burst.on_input(read_at, key_press);
+                enter_peek = window;
             }
             match next_event {
                 Ok(event::Event::Key(key)) => {
@@ -633,8 +725,8 @@ pub(crate) fn spawn_event_thread_with_events(
                     // PasteBurst). Enter/j with other modifiers passes
                     // through (Shift/Alt+Enter = literal newline).
                     let ev = if is_paste_newline_key(key.code, key.modifiers) {
-                        let pending =
-                            paste_burst.active || queue_paste_followups(&mut pending_events);
+                        let pending = paste_burst.active
+                            || queue_paste_followups(&mut pending_events, enter_peek);
                         match paste_burst.on_enter(pending) {
                             EnterVerdict::Submit => UserEvent::Key(key),
                             // Reuse the paste path: inserts a literal '\n'
@@ -2152,13 +2244,69 @@ mod paste_followup_tests {
             event::Event::Paste("two\nlines".into()),
         ]);
         let mut pending = original.clone();
-        assert!(queue_paste_followups(&mut pending));
+        assert!(queue_paste_followups(&mut pending, PASTE_BURST_WINDOW));
         assert_eq!(pending, original);
         let mut burst = PasteBurst::default();
         assert_eq!(
-            burst.on_enter(queue_paste_followups(&mut pending)),
+            burst.on_enter(queue_paste_followups(&mut pending, Duration::ZERO)),
             EnterVerdict::Newline
         );
+    }
+
+    #[test]
+    fn typed_enter_skips_the_paste_peek_but_a_keystream_enter_waits_for_it() {
+        let start = Instant::now();
+        let mut burst = PasteBurst::default();
+        // No key yet, or the previous key long ago: only queued input counts.
+        assert_eq!(burst.enter_peek_window(start), Duration::ZERO);
+        burst.on_input(start, true);
+        assert_eq!(
+            burst.enter_peek_window(start + Duration::from_millis(250)),
+            Duration::ZERO
+        );
+        // A key microseconds before the Enter is how an unbracketed paste
+        // arrives: keep the full heuristic window.
+        assert_eq!(
+            burst.enter_peek_window(start + Duration::from_millis(1)),
+            PASTE_BURST_WINDOW
+        );
+        // Mouse or resize events do not make an Enter look pasted.
+        let later = start + Duration::from_secs(5);
+        burst.on_input(later, false);
+        assert_eq!(burst.enter_peek_window(later), Duration::ZERO);
+    }
+
+    #[test]
+    fn idle_poll_lengthens_once_input_goes_quiet() {
+        let start = Instant::now();
+        let mut burst = PasteBurst::default();
+        assert_eq!(burst.wait_timeout_at(start), IDLE_POLL_QUIET);
+        burst.on_input(start, true);
+        assert_eq!(burst.wait_timeout_at(start), IDLE_POLL);
+        assert_eq!(
+            burst.wait_timeout_at(start + IDLE_RAMP - Duration::from_millis(1)),
+            IDLE_POLL
+        );
+        assert_eq!(burst.wait_timeout_at(start + IDLE_RAMP), IDLE_POLL_QUIET);
+        assert_eq!(burst.on_enter(true), EnterVerdict::Newline);
+        assert_eq!(burst.wait_timeout_at(start + IDLE_RAMP), PASTE_BURST_WINDOW);
+    }
+
+    #[test]
+    fn input_reader_signals_completion_without_polling() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let reader = InputReader::spawn(move || {
+            let _ = wait.recv();
+        });
+        assert!(!reader.wait_finished(Duration::from_millis(5)));
+        release.send(()).unwrap();
+        assert!(reader.wait_finished(Duration::from_secs(2)));
+        // Repeated waits after completion return at once.
+        assert!(reader.wait_finished(Duration::from_secs(2)));
+        reader.join();
+        let panicking = InputReader::spawn(|| panic!("reader failed"));
+        assert!(panicking.wait_finished(Duration::from_secs(2)));
+        panicking.join();
     }
 
     #[test]

@@ -1201,7 +1201,7 @@ pub(crate) struct App<'a> {
     #[cfg(feature = "subagents")]
     background_requests: std::collections::VecDeque<crate::permission::ask::UserRequest>,
     running: Arc<AtomicBool>,
-    event_handle: Option<std::thread::JoinHandle<()>>,
+    event_handle: Option<super::InputReader>,
     prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
     /// Last model-cache generation handed to the model picker.
@@ -7399,21 +7399,41 @@ mod mid_turn_pressure_tests {
 /// iteration. Once stopped, the reader can finish at most its current event.
 fn pause_input_reader(
     running: &AtomicBool,
-    handle: &mut Option<std::thread::JoinHandle<()>>,
+    handle: &mut Option<super::InputReader>,
     receiver: &mut mpsc::Receiver<UserEvent>,
     deferred: &mut std::collections::VecDeque<UserEvent>,
 ) {
+    /// How often a wait re-drains the queue for a reader blocked on a full
+    /// channel; the reader's own exit wakes the wait at once.
+    const DRAIN_INTERVAL: Duration = Duration::from_millis(5);
     running.store(false, Ordering::Relaxed);
-    if let Some(thread) = handle.take() {
-        while !thread.is_finished() {
-            if let Ok(event) = receiver.try_recv() {
+    let Some(reader) = handle.take() else {
+        return;
+    };
+    let mut wait = || {
+        loop {
+            // Free the queue so the reader's current send can complete, even
+            // when background producers refill it meanwhile.
+            while let Ok(event) = receiver.try_recv() {
                 deferred.push_back(event);
             }
-            // Yield to the reader even if background producers refill the queue.
-            std::thread::sleep(Duration::from_millis(1));
+            if reader.wait_finished(DRAIN_INTERVAL) {
+                break;
+            }
         }
-        let _ = thread.join();
+        while let Ok(event) = receiver.try_recv() {
+            deferred.push_back(event);
+        }
+    };
+    // The wait (at most one reader poll) must not stall other tasks queued
+    // on this worker of a multi-threaded runtime.
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
+    reader.join();
 }
 
 /// Slash commands that read the tty synchronously while the terminal is
@@ -7487,7 +7507,7 @@ mod input_reader_lifecycle_tests {
             let reader_sender = sender.clone();
             let reader_running = running.clone();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let mut handle = Some(std::thread::spawn(move || {
+            let mut handle = Some(crate::ui::InputReader::spawn(move || {
                 entered_tx.send(()).unwrap();
                 reader_sender
                     .blocking_send(UserEvent::Paste(format!("reader-{round}")))
