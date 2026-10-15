@@ -2660,6 +2660,17 @@ fn make_fetch_with_timeout(
     executor: Arc<FetchExecutor>,
     duration: Duration,
 ) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
+    make_fetch_with_timeout_observed(permission_bridge, runtime, executor, duration, None)
+}
+
+#[cfg(all(feature = "sandbox", test))]
+fn make_fetch_with_timeout_observed(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    executor: Arc<FetchExecutor>,
+    duration: Duration,
+    wait_pending: Option<Arc<tokio::sync::Notify>>,
+) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
     move |url: String, options: Opt<Object<'_>>| {
         let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
         let executor = executor.clone();
@@ -2667,8 +2678,15 @@ fn make_fetch_with_timeout(
         let task_control = control.clone();
         let fetch = runtime
             .spawn_blocking(move || executor.execute_controlled(&url, &request, task_control));
-        block_on_fetch_host_call(&runtime, &permission_bridge, duration, fetch, control)
-            .map_err(fetch_host_error)
+        block_on_fetch_host_call(
+            &runtime,
+            &permission_bridge,
+            duration,
+            fetch,
+            control,
+            wait_pending.as_deref(),
+        )
+        .map_err(fetch_host_error)
     }
 }
 
@@ -2684,13 +2702,25 @@ fn block_on_fetch_host_call(
     duration: Duration,
     call: tokio::task::JoinHandle<Result<FetchResult, FetchError>>,
     control: Arc<FetchCallControl>,
+    wait_pending: Option<&tokio::sync::Notify>,
 ) -> Result<FetchResult, FetchError> {
-    runtime.block_on(await_fetch_host_call(
+    let mut wait = std::pin::pin!(await_fetch_host_call(
         permission_bridge,
         duration,
         call,
         control,
-    ))
+    ));
+    runtime.block_on(std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(wait.as_mut(), cx);
+        if result.is_pending()
+            && let Some(pending) = wait_pending
+        {
+            // The actual outer timeout has now been polled and registered.
+            // Sender dispatch alone can run before this host thread polls it.
+            pending.notify_one();
+        }
+        result
+    }))
 }
 
 #[cfg(feature = "sandbox")]
@@ -7601,11 +7631,13 @@ mod tests {
             }),
             permission_bridge: owner.bridge(),
         });
-        let fetch = make_fetch_with_timeout(
+        let wait_pending = Arc::new(tokio::sync::Notify::new());
+        let fetch = make_fetch_with_timeout_observed(
             owner.bridge(),
             tokio::runtime::Handle::current(),
             executor,
             outer_timeout,
+            Some(wait_pending.clone()),
         );
 
         let mut host_call = Some(tokio::task::spawn_blocking(move || {
@@ -7637,6 +7669,9 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(15), started.notified())
                 .await
                 .expect("blocked sender must start");
+            tokio::time::timeout(Duration::from_secs(15), wait_pending.notified())
+                .await
+                .expect("outer fetch timeout must be registered before advancing time");
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(61)).await;
             tokio::time::resume();

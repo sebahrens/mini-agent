@@ -95,6 +95,13 @@ with `--exact --ignored --test-threads=1` and requires exactly one pass (mini-ag
 locally with `cargo test --features skills
 worker_supervisor_reused_test_worker_stdout_stays_protocol_only -- --ignored --test-threads=1`.
 
+The dispatched-fetch host fixture advances Tokio's virtual clock only after the
+actual outer wait has returned `Pending` and its timer is registered, as well as
+after the controlled sender has started. Sender dispatch runs on another blocking
+thread and alone does not prove that the host thread has armed its timeout. The
+fixture keeps the sender held through timeout classification and subsequent
+QuickJS evaluation, then releases and observes its settlement on every exit.
+
 ## Worker lifecycle
 
 `src/extras/js/memory.rs` owns each worker runtime's bounded allocator. The 64 MiB
