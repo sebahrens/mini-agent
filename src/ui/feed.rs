@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ops::Index;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use crate::config::ReasoningDisplay;
 use compact_str::CompactString;
 use crossterm::style::Color;
 
-use super::events::sanitize_output;
+use super::events::{Sanitized, sanitize_output};
 use super::markdown::{StyledMarkdown, markdown_with_code_state, word_wrap};
 use super::renderer::LineEntry;
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
@@ -157,6 +157,10 @@ pub struct Block {
     /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
     md_cache: RefCell<Option<MdCache>>,
     syntax_cache: RefCell<super::highlight::TokenCache>,
+    /// Incremental highlight-budget verdict for `text`, computed on first use
+    /// and extended by appends so a repaint never rescans the whole block.
+    /// `None` until a layout needs it, and again after the text is rewritten.
+    highlight_budget: Cell<Option<super::highlight::BudgetScan>>,
     revision: u64,
     render_cache: RefCell<Option<BlockRenderCache>>,
     /// Producer key (a tool-call id) that later blocks can be placed after,
@@ -249,6 +253,27 @@ struct OpenFence {
 }
 
 impl Block {
+    /// Whether the block's text fits the syntax-highlighting budget. Scans the
+    /// text once; later appends extend the verdict incrementally.
+    fn within_highlight_budget(&self) -> bool {
+        match self.highlight_budget.get() {
+            Some(scan) => scan.within(),
+            None => {
+                let scan = super::highlight::BudgetScan::of(&self.text);
+                self.highlight_budget.set(Some(scan));
+                scan.within()
+            }
+        }
+    }
+
+    /// Record `appended` (already pushed onto `text`) in the budget verdict.
+    fn note_appended(&self, appended: &str) {
+        if let Some(mut scan) = self.highlight_budget.get() {
+            scan.push(appended);
+            self.highlight_budget.set(Some(scan));
+        }
+    }
+
     pub fn new(style: BlockStyle, text: impl Into<String>) -> Self {
         let mut text = terminal_safe(text.into());
         let reasoning = (style == BlockStyle::Reasoning).then(|| ReasoningBlock {
@@ -264,6 +289,7 @@ impl Block {
             running: false,
             md_cache: RefCell::new(None),
             syntax_cache: RefCell::new(super::highlight::TokenCache::default()),
+            highlight_budget: Cell::new(None),
             revision: 0,
             render_cache: RefCell::new(None),
             anchor: None,
@@ -507,8 +533,21 @@ impl Feed {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn append_reasoning(&mut self, text: &str) {
-        let index = match self
+        let index = self.reasoning_index();
+        self.append_to(index, text);
+    }
+
+    /// Append an already sanitised reasoning delta to the live reasoning block.
+    pub(crate) fn append_reasoning_sanitized(&mut self, text: &Sanitized) {
+        let index = self.reasoning_index();
+        self.append_sanitized(index, text);
+    }
+
+    /// Index of the running reasoning block, pushing one when none is live.
+    fn reasoning_index(&mut self) -> usize {
+        match self
             .blocks
             .iter()
             .rposition(|block| block.running && block.reasoning.is_some())
@@ -518,8 +557,7 @@ impl Feed {
                 self.push_streaming_block(BlockStyle::Reasoning);
                 self.blocks.len() - 1
             }
-        };
-        self.append_to(index, text);
+        }
     }
 
     pub(crate) fn finish_reasoning(&mut self) {
@@ -714,22 +752,31 @@ impl Feed {
     /// exists. Streaming callers use this with their tracked block index so
     /// tokens never land on a block another producer pushed after theirs.
     pub fn append_to(&mut self, idx: usize, text: impl AsRef<str>) -> bool {
+        let text = text.as_ref();
+        if has_terminal_control(text) {
+            let safe = sanitize_output(text);
+            self.append_clean(idx, &safe, || safe.chars().count())
+        } else {
+            self.append_clean(idx, text, || text.chars().count())
+        }
+    }
+
+    /// [`Feed::append_to`] for a delta that already went through the
+    /// sanitiser: the feed's own control scan and char count are skipped.
+    pub fn append_sanitized(&mut self, idx: usize, text: &Sanitized) -> bool {
+        self.append_clean(idx, text.as_str(), || text.char_count())
+    }
+
+    /// Append terminal-safe `text`; `chars` counts it for a reasoning header.
+    fn append_clean(&mut self, idx: usize, text: &str, chars: impl FnOnce() -> usize) -> bool {
         if let Some(block) = self.blocks.get_mut(idx) {
             self.generation += 1;
             let old_len = block.text.len();
-            let text = text.as_ref();
-            if has_terminal_control(text) {
-                let safe = sanitize_output(text);
-                if let Some(reasoning) = block.reasoning.as_mut() {
-                    reasoning.chars = reasoning.chars.saturating_add(safe.chars().count());
-                }
-                block.text.push_str(&safe);
-            } else {
-                if let Some(reasoning) = block.reasoning.as_mut() {
-                    reasoning.chars = reasoning.chars.saturating_add(text.chars().count());
-                }
-                block.text.push_str(text);
+            if let Some(reasoning) = block.reasoning.as_mut() {
+                reasoning.chars = reasoning.chars.saturating_add(chars());
             }
+            block.text.push_str(text);
+            block.note_appended(text);
             let compacted = compact_oversized_block(&mut block.text);
             self.total_bytes = self
                 .total_bytes
@@ -738,6 +785,7 @@ impl Feed {
             block.revision = block.revision.wrapping_add(1);
             *block.render_cache.borrow_mut() = None;
             if compacted {
+                block.highlight_budget.set(None);
                 *block.md_cache.borrow_mut() = None;
                 block.syntax_cache.borrow_mut().clear();
                 self.retention_generation = self.retention_generation.wrapping_add(1);
@@ -767,6 +815,7 @@ impl Feed {
             self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
             last.revision = last.revision.wrapping_add(1);
+            last.highlight_budget.set(None);
             *last.md_cache.borrow_mut() = None;
             last.syntax_cache.borrow_mut().clear();
             *last.render_cache.borrow_mut() = None;
@@ -1220,7 +1269,11 @@ fn find_stable_boundary(
     let mut in_indented_code = false;
     let mut deferred_blank = None;
     let mut last_stable_pos = start;
-    let mut last_stable_fence = entry_fence.cloned();
+    // Whether the fence open at `last_stable_pos` is the currently open
+    // `fence`. A stable boundary inside a fence is always inside the fence
+    // still open (closing a replayable fence moves the boundary past it), so a
+    // flag replaces cloning the fence for every code line.
+    let mut stable_in_open_fence = fence.is_some();
     let mut byte_pos = start;
 
     // split_inclusive excludes a synthetic empty line after a trailing newline,
@@ -1233,16 +1286,17 @@ fn find_stable_boundary(
         let line = line.strip_suffix('\r').unwrap_or(line);
         let line_end = byte_pos + completed_line.len();
 
-        if let Some(open) = fence.clone() {
-            if fence_closing(line, &open) {
+        if let Some(open) = fence.as_ref() {
+            let replayable = open.replayable;
+            if fence_closing(line, open) {
                 fence = None;
-                if open.replayable {
+                if replayable {
                     last_stable_pos = line_end;
-                    last_stable_fence = None;
+                    stable_in_open_fence = false;
                 }
-            } else if open.replayable {
+            } else if replayable {
                 last_stable_pos = line_end;
-                last_stable_fence = Some(open);
+                stable_in_open_fence = true;
             }
             byte_pos = line_end;
             continue;
@@ -1258,7 +1312,7 @@ fn find_stable_boundary(
                 deferred_blank.get_or_insert(line_end);
             } else {
                 last_stable_pos = line_end;
-                last_stable_fence = None;
+                stable_in_open_fence = false;
             }
             byte_pos = line_end;
             continue;
@@ -1269,7 +1323,7 @@ fn find_stable_boundary(
             let continues_indented_code = in_indented_code && indent >= 4;
             if !continues_list && !continues_indented_code {
                 last_stable_pos = blank_end;
-                last_stable_fence = None;
+                stable_in_open_fence = false;
                 in_list = false;
                 in_indented_code = false;
             }
@@ -1284,7 +1338,7 @@ fn find_stable_boundary(
             };
             if open.replayable {
                 last_stable_pos = line_end;
-                last_stable_fence = Some(open.clone());
+                stable_in_open_fence = true;
             }
             fence = Some(open);
             byte_pos = line_end;
@@ -1300,7 +1354,7 @@ fn find_stable_boundary(
 
         if line_end - last_stable_pos > MAX_UNSTABLE_WINDOW {
             last_stable_pos = line_end;
-            last_stable_fence = None;
+            stable_in_open_fence = false;
             in_list = false;
             in_indented_code = false;
             deferred_blank = None;
@@ -1309,6 +1363,7 @@ fn find_stable_boundary(
         byte_pos = line_end;
     }
 
+    let last_stable_fence = if stable_in_open_fence { fence } else { None };
     (last_stable_pos, last_stable_fence)
 }
 
@@ -1377,9 +1432,12 @@ fn render_region(
     entry_fence: Option<&OpenFence>,
     entry_code: Option<super::highlight::CodeState>,
     width: usize,
+    highlighting: bool,
     ends_inside_fence: bool,
 ) -> StyledMarkdown {
-    let highlighting = !feed.monochrome && super::highlight::within_budget(&block.text);
+    // `highlighting` already holds the whole block's budget verdict. A region
+    // (with its replayed fence opener) is a subset of the block's lines, so it
+    // never exceeds a budget the block fits.
     let mut rendered = match entry_fence {
         Some(fence) => {
             let mut replayed = String::with_capacity(fence.opener.len() + 1 + text.len());
@@ -1424,7 +1482,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         block.text.len()
     };
 
-    let highlighting = !feed.monochrome && super::highlight::within_budget(&block.text);
+    let highlighting = !feed.monochrome && block.within_highlight_budget();
 
     // Try an exact cache hit before scanning markdown boundaries. Appending an
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
@@ -1459,39 +1517,54 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         })
     };
 
+    // Find the new stable boundary once: it decides both whether the cached
+    // prefix is still valid and where the next finalized region ends.
+    let incremental = incremental_base.and_then(
+        |(
+            previous_stable_len,
+            previous_fence,
+            stable_code,
+            stable_segments,
+            has_rows,
+            previous_parsed_len,
+        )| {
+            let (stable_len, stable_fence) = find_stable_boundary(
+                &block.text,
+                previous_stable_len,
+                completed_len,
+                previous_fence.as_ref(),
+            );
+            // A link or footnote definition can change how an earlier reference
+            // renders, so its arrival invalidates the cached prefix. Nothing
+            // inside a fence is a definition, so a region that stays inside one
+            // never needs the check.
+            let stays_in_fence = previous_fence.is_some() && stable_fence == previous_fence;
+            (stays_in_fence
+                || !contains_global_markdown_definition(
+                    &block.text[previous_parsed_len..completed_len],
+                ))
+            .then_some((
+                previous_stable_len,
+                previous_fence,
+                stable_code,
+                stable_segments,
+                has_rows,
+                stable_len,
+                stable_fence,
+            ))
+        },
+    );
+
     if let Some((
         previous_stable_len,
         previous_fence,
         mut stable_code,
         mut stable_segments,
         mut has_rows,
-        _,
-    )) = incremental_base.filter(
-        |(previous_stable_len, previous_fence, _, _, _, previous_parsed_len)| {
-            // A link or footnote definition can change how an earlier reference
-            // renders, so its arrival invalidates the cached prefix. Nothing
-            // inside a fence is a definition, so a region that stays inside one
-            // never needs the check.
-            let (_, fence_at_end) = find_stable_boundary(
-                &block.text,
-                *previous_stable_len,
-                completed_len,
-                previous_fence.as_ref(),
-            );
-            let stays_in_fence = previous_fence.is_some() && fence_at_end == *previous_fence;
-            stays_in_fence
-                || !contains_global_markdown_definition(
-                    &block.text[*previous_parsed_len..completed_len],
-                )
-        },
-    ) {
-        let (stable_len, stable_fence) = find_stable_boundary(
-            &block.text,
-            previous_stable_len,
-            completed_len,
-            previous_fence.as_ref(),
-        );
-
+        stable_len,
+        stable_fence,
+    )) = incremental
+    {
         if stable_len > previous_stable_len {
             let mut finalized = render_region(
                 feed,
@@ -1500,6 +1573,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
                 previous_fence.as_ref(),
                 stable_code,
                 width,
+                highlighting,
                 stable_fence.is_some(),
             );
             stable_code = finalized.code_state.take();
@@ -1518,6 +1592,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             stable_fence.as_ref(),
             stable_code,
             width,
+            highlighting,
             false,
         );
         let mut suffix = suffix.lines;
@@ -1554,6 +1629,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             None,
             None,
             width,
+            highlighting,
             stable_fence.is_some(),
         );
         stable_code = finalized.code_state.take();
@@ -1571,6 +1647,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         stable_fence.as_ref(),
         stable_code,
         width,
+        highlighting,
         false,
     );
     let mut suffix = suffix.lines;

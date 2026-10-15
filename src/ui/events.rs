@@ -488,7 +488,93 @@ pub fn sanitize_for_review(text: &str) -> CompactString {
     sanitize(text, true)
 }
 
+/// Text that has been through [`sanitize_output`], with the facts streaming
+/// callers need from that pass. Only [`sanitize_delta`] constructs it, so a
+/// consumer such as `Feed::append_sanitized` can skip its own control scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sanitized {
+    text: CompactString,
+    has_newline: bool,
+    chars: usize,
+}
+
+impl Sanitized {
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the sanitised text contains a line break.
+    pub fn has_newline(&self) -> bool {
+        self.has_newline
+    }
+
+    /// Number of `char`s in the sanitised text.
+    pub fn char_count(&self) -> usize {
+        self.chars
+    }
+}
+
+impl std::ops::Deref for Sanitized {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+/// [`sanitize_output`] for a streamed delta (a token or reasoning chunk).
+/// Clean text, the common case, is checked and measured in one pass and
+/// copied once (inline for short tokens).
+pub fn sanitize_delta(text: &str) -> Sanitized {
+    let mut chars = 0usize;
+    let mut has_newline = false;
+    let mut clean = true;
+    for c in text.chars() {
+        chars += 1;
+        if c == '\n' {
+            has_newline = true;
+        } else if needs_terminal_sanitizing(c) {
+            clean = false;
+            break;
+        }
+    }
+    if clean {
+        return Sanitized {
+            text: CompactString::from(text),
+            has_newline,
+            chars,
+        };
+    }
+    let text = sanitize_slow(text, false);
+    Sanitized {
+        has_newline: text.contains('\n'),
+        chars: text.chars().count(),
+        text,
+    }
+}
+
+/// Whether [`sanitize`] would return `text` unchanged: it holds no character
+/// other than `\n` that [`needs_terminal_sanitizing`] flags.
+fn is_terminal_clean(text: &str) -> bool {
+    // Printable ASCII and `\n` are always kept; only other bytes need the
+    // per-char check.
+    text.bytes()
+        .all(|b| (0x20..0x7f).contains(&b) || b == b'\n')
+        || !text
+            .chars()
+            .any(|c| c != '\n' && needs_terminal_sanitizing(c))
+}
+
 fn sanitize(text: &str, mark_format_chars: bool) -> CompactString {
+    // Fast path: nothing to remove or rewrite, so copy once (inline when short)
+    // instead of rebuilding the string char by char.
+    if is_terminal_clean(text) {
+        return CompactString::from(text);
+    }
+    sanitize_slow(text, mark_format_chars)
+}
+
+fn sanitize_slow(text: &str, mark_format_chars: bool) -> CompactString {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -598,7 +684,37 @@ fn skip_control_string(chars: &mut Chars<'_>) {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{needs_terminal_sanitizing, sanitize_for_review, sanitize_output};
+    use super::{needs_terminal_sanitizing, sanitize_delta, sanitize_for_review, sanitize_output};
+
+    #[test]
+    fn clean_text_takes_the_fast_path_without_heap_allocation() {
+        assert!(!sanitize_output("plain token").is_heap_allocated());
+        assert_eq!(sanitize_output("plain token"), "plain token");
+        assert_eq!(sanitize_output("雪 é\nnext"), "雪 é\nnext");
+        let long = "x".repeat(100);
+        assert_eq!(sanitize_output(&long), long);
+    }
+
+    #[test]
+    fn sanitized_deltas_report_the_facts_of_the_sanitised_text() {
+        let clean = sanitize_delta("雪 a\nb");
+        assert_eq!(clean.as_str(), "雪 a\nb");
+        assert!(clean.has_newline());
+        assert_eq!(clean.char_count(), 5);
+        assert!(!sanitize_delta("tok").has_newline());
+        // A lone `\r` becomes a line break only through the full sanitiser.
+        let dirty = sanitize_delta("a\rb\x1b[31m\u{202e}c\t");
+        assert_eq!(dirty.as_str(), sanitize_output("a\rb\x1b[31m\u{202e}c\t"));
+        assert!(dirty.has_newline());
+        assert_eq!(dirty.char_count(), dirty.as_str().chars().count());
+        for text in ["", "\n", "\r", "x\r\n", "\u{85}", "\u{feff}ok"] {
+            let delta = sanitize_delta(text);
+            let expected = sanitize_output(text);
+            assert_eq!(delta.as_str(), expected.as_str(), "{text:?}");
+            assert_eq!(delta.has_newline(), expected.contains('\n'), "{text:?}");
+            assert_eq!(delta.char_count(), expected.chars().count(), "{text:?}");
+        }
+    }
 
     #[test]
     fn csi_sequences_are_removed_through_their_final_byte() {

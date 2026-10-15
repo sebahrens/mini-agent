@@ -1277,3 +1277,64 @@ fn syntax_unclosed_adversarial_and_oversized_streams_keep_literal_content() {
     bounded.replace_last(BlockStyle::Agent, "```rust\nlet n=2;\n```");
     assert!(indexed_rows(&bounded.lines(80)).any(|r| r.syntax_spans.is_some()));
 }
+
+// --- cttyn.18: the highlight budget is not rescanned per repaint ---
+
+#[test]
+fn a_tail_only_append_to_a_large_running_block_never_rescans_the_budget() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let line = format!("{}\n", "word ".repeat(19));
+    let mut text = String::from("```rust\n");
+    while text.len() < 30 * 1024 {
+        text.push_str(&line);
+    }
+    assert!(feed.append_to_last(&text));
+    let _ = feed.lines(80);
+    let scans = crate::ui::highlight::budget_scans_for_test();
+    let parsed = feed.markdown_bytes_parsed();
+    for token in ["tail", " more", " tokens"] {
+        assert!(feed.append_to_last(token));
+        let _ = feed.lines(80);
+    }
+    assert_eq!(crate::ui::highlight::budget_scans_for_test(), scans);
+    assert_eq!(feed.markdown_bytes_parsed(), parsed);
+    // Completing lines extends the verdict incrementally too.
+    for _ in 0..3 {
+        assert!(feed.append_to_last(&line));
+        let _ = feed.lines(80);
+    }
+    assert_eq!(crate::ui::highlight::budget_scans_for_test(), scans);
+
+    // The rows still match a from-scratch layout of the same text.
+    let mut expected = Feed::new();
+    expected.push_streaming_block(BlockStyle::Agent);
+    let full = feed.block_text(0).unwrap().to_string();
+    assert!(expected.append_to_last(&full));
+    assert_same_rows(&feed.lines(80), &expected.lines(80));
+}
+
+#[test]
+fn growing_past_the_highlight_budget_drops_highlighting_like_a_fresh_layout() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    assert!(feed.append_to_last("```rust\n"));
+    for _ in 0..600 {
+        assert!(feed.append_to_last("let x = 1;\n"));
+        let _ = feed.lines(80);
+    }
+    let full = feed.block_text(0).unwrap().to_string();
+    let mut fresh = Feed::new();
+    fresh.push_streaming_block(BlockStyle::Agent);
+    assert!(fresh.append_to_last(&full));
+    let streamed = feed.lines(80);
+    let expected = fresh.lines(80);
+    assert_same_rows(&streamed, &expected);
+    for index in 0..expected.len() {
+        assert_eq!(
+            streamed[index].syntax_spans.is_some(),
+            expected[index].syntax_spans.is_some(),
+            "row {index} highlighting"
+        );
+    }
+}

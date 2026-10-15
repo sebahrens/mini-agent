@@ -22,6 +22,12 @@ pub(crate) struct TokenSpan {
 thread_local! {
     static PARSED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BUDGET_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Full budget scans ([`within_budget`] / `BudgetScan::of`) on this thread (test-only).
+#[cfg(test)]
+pub(crate) fn budget_scans_for_test() -> usize {
+    BUDGET_SCANS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
 pub(crate) fn parsed_lines_for_test() -> usize {
@@ -598,16 +604,68 @@ fn is_keyword(language: Language, word: &str) -> bool {
             Language::Json | Language::Toml | Language::Diff => false,
         }
 }
+/// Whether `text` is small enough to highlight: at most
+/// `MAX_HIGHLIGHT_BYTES` bytes, `MAX_HIGHLIGHT_LINES` lines, and no line
+/// (including its newline) longer than `MAX_LINE_BYTES`. One pass with an
+/// early exit; streaming callers keep a [`BudgetScan`] instead of rescanning.
 pub(crate) fn within_budget(text: &str) -> bool {
-    text.len() <= MAX_HIGHLIGHT_BYTES
-        && text
-            .split_inclusive('\n')
-            .take(MAX_HIGHLIGHT_LINES + 1)
-            .count()
-            <= MAX_HIGHLIGHT_LINES
-        && text
-            .split_inclusive('\n')
-            .all(|line| line.len() <= MAX_LINE_BYTES)
+    BudgetScan::of(text).within()
+}
+
+/// Incremental form of [`within_budget`] for append-only text. Every limit is
+/// monotone under appends, so once a scan is over budget it stays over and
+/// further appends cost nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BudgetScan {
+    bytes: usize,
+    /// Completed lines (newlines seen).
+    newlines: usize,
+    /// Bytes after the last newline.
+    open_line: usize,
+    over: bool,
+}
+
+impl BudgetScan {
+    /// Scan `text` from the start (counted by `budget_scans_for_test`).
+    pub(crate) fn of(text: &str) -> Self {
+        #[cfg(test)]
+        BUDGET_SCANS.with(|n| n.set(n.get() + 1));
+        let mut scan = Self::default();
+        scan.push(text);
+        scan
+    }
+
+    pub(crate) fn push(&mut self, text: &str) {
+        if self.over {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(text.len());
+        if self.bytes > MAX_HIGHLIGHT_BYTES {
+            self.over = true;
+            return;
+        }
+        for byte in text.bytes() {
+            if byte == b'\n' {
+                // `split_inclusive` counts the newline in the line's length.
+                if self.open_line + 1 > MAX_LINE_BYTES {
+                    self.over = true;
+                    return;
+                }
+                self.newlines += 1;
+                self.open_line = 0;
+            } else {
+                self.open_line += 1;
+            }
+        }
+        let lines = self.newlines + usize::from(self.open_line > 0);
+        if lines > MAX_HIGHLIGHT_LINES || self.open_line > MAX_LINE_BYTES {
+            self.over = true;
+        }
+    }
+
+    pub(crate) fn within(&self) -> bool {
+        !self.over
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +694,41 @@ mod tests {
         for s in &*colored {
             assert!("*/ let x = \"雪\";".is_char_boundary(s.range.start));
             assert!("*/ let x = \"雪\";".is_char_boundary(s.range.end));
+        }
+    }
+    #[test]
+    fn budget_scan_matches_within_budget_under_any_chunking() {
+        let long_line = "x".repeat(MAX_LINE_BYTES);
+        let cases = [
+            String::new(),
+            "a".into(),
+            "a\n".into(),
+            "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES),
+            "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES) + "y",
+            "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES + 1),
+            long_line.clone(),
+            format!("{long_line}\n"),
+            format!("{}\n", &long_line[1..]),
+            "x".repeat(MAX_HIGHLIGHT_BYTES),
+            "x\n".repeat(MAX_HIGHLIGHT_BYTES / 2 + 1),
+            "雪".repeat(MAX_LINE_BYTES),
+        ];
+        for text in &cases {
+            let expected = within_budget(text);
+            assert_eq!(BudgetScan::of(text).within(), expected);
+            for step in [1usize, 3, 7, 64] {
+                let mut scan = BudgetScan::default();
+                let mut start = 0;
+                while start < text.len() {
+                    let mut end = (start + step).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    scan.push(&text[start..end]);
+                    start = end;
+                }
+                assert_eq!(scan.within(), expected, "step {step}");
+            }
         }
     }
     #[test]

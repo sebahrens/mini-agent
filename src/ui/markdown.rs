@@ -19,7 +19,9 @@ pub(crate) fn palette_color(color: Color, palette: super::feed::ForegroundPalett
 }
 
 pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString; 4]> {
-    if text.is_empty() || max_width == 0 {
+    // Display width never exceeds the byte length, so short text fits without
+    // being measured.
+    if text.is_empty() || max_width == 0 || text.len() <= max_width {
         return smallvec![CompactString::from(text)];
     }
     if display_width(text) <= max_width {
@@ -31,9 +33,16 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
     let mut line_width: usize = 0;
 
     for word in text.split_inclusive(char::is_whitespace) {
-        let word_trimmed = word.trim_end_matches(char::is_whitespace);
-        let word_w = display_width(word);
+        // `split_inclusive` ends each piece at its first whitespace character,
+        // so a word carries at most one trailing whitespace character: measure
+        // once and subtract that character's width instead of re-measuring.
+        let trailing = word.chars().next_back().filter(|c| c.is_whitespace());
+        let word_trimmed = match trailing {
+            Some(c) => &word[..word.len() - c.len_utf8()],
+            None => word,
+        };
         let trimmed_w = display_width(word_trimmed);
+        let word_w = trimmed_w + display_width(&word[word_trimmed.len()..]);
 
         if word_trimmed.is_empty() {
             if line_width > 0 && line_width < max_width {
@@ -50,7 +59,7 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
             line.push(' ');
             line.push_str(word_trimmed);
             line_width += 1 + trimmed_w;
-            if word.ends_with(char::is_whitespace) {
+            if trailing.is_some() {
                 line.push(' ');
                 line_width += 1;
             }
@@ -85,7 +94,7 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
                 line.push_str(word_trimmed);
                 line_width += trimmed_w;
             }
-            if word.ends_with(char::is_whitespace) {
+            if trailing.is_some() {
                 line.push(' ');
                 line_width += 1;
             }
@@ -141,7 +150,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
         text,
         max_width,
         super::feed::ForegroundPalette::default(),
-        true,
+        super::highlight::within_budget(text),
         None,
         None,
     )
@@ -153,6 +162,10 @@ pub(crate) struct StyledMarkdown {
     pub code_state: Option<super::highlight::CodeState>,
 }
 
+/// Lay out `text` as styled markdown rows. `highlighting` must already include
+/// the highlight budget verdict ([`super::highlight::within_budget`]) for
+/// `text` or for a document `text` is a line-aligned part of; it is not
+/// re-checked here, so streaming callers do not rescan the block per region.
 pub(crate) fn markdown_with_code_state(
     text: &str,
     max_width: usize,
@@ -167,7 +180,6 @@ pub(crate) fn markdown_with_code_state(
             code_state: entry_code_state,
         };
     }
-    let highlighting = highlighting && super::highlight::within_budget(text);
     let mut code_state = None;
     let mut last_code_state = None;
 
@@ -714,6 +726,34 @@ mod narrow_table_tests {
         flush_table(&rows, &[], 7, &mut out);
         assert!(!out.is_empty());
         assert!(out.iter().all(|line| display_width(&line.text) <= 7));
+    }
+
+    #[test]
+    fn a_trailing_whitespace_width_adds_to_the_word_width() {
+        // word_wrap measures a word once and adds its single trailing
+        // whitespace character; that is exact only if no whitespace joins a
+        // width sequence with the character before it.
+        let whitespace = (0u32..=0x3000)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace());
+        for ws in whitespace {
+            for prefix in [
+                "a",
+                "雪",
+                "😀",
+                "\u{644}",
+                "e\u{301}",
+                "\u{2764}\u{fe0f}",
+                "x\u{200d}",
+            ] {
+                let word = format!("{prefix}{ws}");
+                assert_eq!(
+                    display_width(&word),
+                    display_width(prefix) + display_width(&ws.to_string()),
+                    "{word:?}"
+                );
+            }
+        }
     }
 
     #[test]
