@@ -768,6 +768,35 @@ the child and protocol pipes to the supervisor, so no bootstrap challenge, authe
 request, or brokered effect can precede proof completion. Ready-time descriptor revalidation,
 rehashing and unlink remain unchanged.
 
+**Reviewed proposal — retained executable selection (`mini-agent-i7ro6.86`), not delivered.**
+The current independently hashed source/destination publication contract above remains in force.
+A future process-local optimization may retain the first generation's already-proven image only
+after its authenticated Ready rehash, identity-bound unlink, and complete successful native
+containment preflight, including parent-death cleanup and final sentinel checks. Every generation
+used by that matrix must prove the same full content digest; the trusted parent-death helper's
+bounded, exactly parsed record must carry its own post-Ready image digest. A source change between
+matrix cases must refuse cache commitment even if its size or timestamps match or it is later
+restored. Failed or incomplete preflight must drop the pending candidate.
+
+Such selection fixes the executable bytes for the parent lifetime; executable updates require a
+parent restart. It is not transparent pathname refresh. The retained object must be an opaque,
+nonserializable, parent-owned read-only close-on-exec descriptor with no pathname, writable alias,
+extended ACL or remaining link. At most one object, capped at 512 MiB, may be retained; larger
+executables continue through the uncached publisher. Descriptor identity and flags can reject a
+changed object, but metadata never authorizes replacement bytes. The approved scoped threat model
+still trusts the parent and OS and excludes hostile same-UID peers; this ownership guarantee is
+not a Darwin kernel write seal or a Security.framework identity claim.
+
+Each subsequent generation must still receive a fresh private directory, lease and distinct image
+inode. Its full image hash and identity checks must finish before that generation's image executes
+as the unconfined trusted guardian; reduced hashing/startup overlap is an explicit cost of this
+choice. The existing post-spawn failure guard, authenticated Ready image rehash/unlink, cancellation,
+group reaping and publication retirement remain required. Copy fallback must use positional reads
+or serialize shared descriptor offsets. No retained descriptor or cached availability may reach a
+worker, and no capability is advertised before this process's complete containment attestation.
+This optimization can save repeated source hashing within one parent, not cross-process cold
+startup. Implementation and native acceptance are still required before any content proof is reused.
+
 Unit tests cover source/root rejection, exclusive copy-on-write cloning, secure cross-volume copy,
 source/image mutation independence, publication permissions and identity, descriptor flags,
 pre-proof startup ordering, child reaping on digest mismatch and missing pipes,

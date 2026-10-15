@@ -1,0 +1,80 @@
+{
+  "bead": "mini-agent-i7ro6.86",
+  "status": "proposed; no cached content proof or changed production launch behavior enabled",
+  "source_base": "3cc7b9903811d96acb04f1da685661f309a1cf52",
+  "decision": "Freeze the first fully proven parent-selected executable for this parent lifetime. Executable updates take effect only after parent restart. No metadata-based transparent refresh.",
+  "canonical_amendment": "A process may replace repeated source-descriptor hashing only with a private retained first-generation image that has already passed source+destination byte proof, authenticated Ready rehash and identity-bound unlink, and whose complete native denial/readback/parent-death containment preflight has succeeded. It must still freshly hash every distinct generation image before handing out protocol pipes and rehash that image after authenticated Ready. Until this amendment is reviewed, implemented and accepted with its owning/native controls, current independent source+image hashes remain normative. Every remaining containment-matrix case must prove that same exact content digest; a changed generation before matrix completion refuses commitment.",
+  "construction": [
+    "Do not make another cold-start copy. After existing full publication and authenticated Ready, transfer the exclusively constructed image FD into a private pending candidate only after nlink==0/owned0500/noACL/RO/CLOEXEC identity checks. Close every writable and temporary path FD before admission. The current full preflight retains the candidate locally while its remaining canaries and cleanup execute.",
+    "Only production run_full_containment_preflight may commit a candidate; installed-benchmark/test preflight cannot populate the production cache. Any matrix, parent-death, sentinel or cleanup failure drops the candidate. Available status is never derived from cached content or metadata.",
+    "Store at most one nonserializable opaque snapshot with its content digest and unlink-adjusted identity. A cache candidate over512MiB stays uncached; the existing uncached path remains supported. Never evict/replace a committed snapshot or infer a new trust epoch from path metadata. No exposed cache-clear or arbitrary-FD adoption API."
+  ],
+  "warm_publication": [
+    "Production launch after successful status uses this exact retained object without consulting original source pathname bytes. Source replacement/mutation/deletion, even matching size/timestamps, cannot substitute another object. Restart creates a new cache/trust epoch and proves selected bytes again.",
+    "Validate cached FD identity, owner/mode/link count/ACL/RO/CLOEXEC on each use as rejection checks; none of this authorizes replacement bytes. Clone to the ordinary exclusive private per-generation image using existing fclonefileat semantics and narrow EXDEV/ENOTSUP fallback. Pread or serialized offsets are mandatory because duplicated descriptors share offsets.",
+    "Every fresh generation receives a distinct inode and UUID directory/lease. Retain the current destination hash, pre-proof pending-guardian ownership, no-Hello/pipes-before-proof rule, authenticated Ready image rehash+unlink, cancellation/group reap and lease retirement.",
+    "The trusted guardian must execute this same proven generation image, not re-open the mutable original executable. Original source path is data only for the existing denial canary. No cached FD/digest/proof is exported through worker protocol or ambient inherited descriptors.",
+    "Finish fresh image proof before starting the exact generation image as guardian. Preserve the pending-child guard for remaining errors and authenticated Ready rehash. Reduced overlap is an explicit cost."
+  ],
+  "threat_boundary": "This is ownership immutability under the existing approved scope, not a Darwin kernel write seal or loaded-Mach-O signature claim. Parent code, OS and operator-selected current executable remain trusted. Hostile same-UID peers/debuggers and parent compromise remain outside the canonical scoped threat model. A plain RO FD of an externally writable original never qualifies.",
+  "controls": [
+    "Original source same-size/matching-mtime rewrite and replacement leave exact candidate unchanged; retaining an original RO FD fails this negative control.",
+    "After authenticated Ready and unlink, exact identity/link/mode/RO/CLOEXEC/noACL proof admits candidate; candidate cannot be made from arbitrary/deserialized/test/failed matrix state. Original source update/deletion does not change selected snapshot; new parent epoch selects new proven bytes.",
+    "Independent warm generations have distinct inodes and hashes, clone/crossvolume fallback preserve bytes and concurrent offsets, altered cached identity/flags reject. Every fresh destination/Ready mutation fails closed.",
+    "Before-proof startup error and digest mismatch kill/reap before image cleanup; missing pipes, unauthenticated Ready, cancellation and guardian parent-death preserve current controls. No candidate commits on any matrix/cleanup failure.",
+    "Actual installed production native containment self-check/matrix plus warm production supervisor cancellation/recovery must pass; stage measurements use current approved debug artifact, no release build."
+  ],
+  "premise_evidence": {
+    "primitive_probe": "/private/tmp/mini-agent-snapshot-design-probe.json",
+    "current_baseline": "/private/tmp/mini-agent-snapshot86-3cc-baseline.json",
+    "artifact_bytes": 156816288,
+    "config_ms": 60.62,
+    "selfcheck_ms": 1911.06,
+    "selfcheck": "JS runtime check: PASS (2)",
+    "scope": "single uncontrolled sample, no precise savings projection"
+  },
+  "benefit_limit": "Saves only repeated warm source hashing and original path lookup. It cannot remove cross-process startup or advertise JS before attestation. Startup scheduling remains .5 work.",
+  "alternatives": [
+    "Metadata/path memoization rejected because matching metadata does not prove unchanged bytes.",
+    "Persistent cached attestation rejected because it cannot prove this process/generation containment.",
+    "An eager extra snapshot copy/hash rejected because it adds cold-start cost; reuse already proven first-generation image instead.",
+    "Leaving all hashes unchanged is the baseline and fallback; cache stays off if ownership proof or native controls fail."
+  ],
+  "simplification": "One existing image lifetime transfer, one opaque process-local retained object and one source variant inside the existing publisher. No cache database, registry, global async refresh, new worker trust authority or second protocol.",
+  "independent_review": {
+    "reviewer": "/root/windows_ci",
+    "finding": "Full containment matrix must refer to the same pending content generation; later parent-death canary source reopening may otherwise validate a different executable",
+    "resolution": "Commit additionally requires exact equality of first retained image SHA256 and each fully proven generation used by remaining matrix cases. Existing trusted parent-death child bounded record will carry its already-proved image digest alongside PID/UUID, with exact parsing/cap and unchanged cleanup checks. No final pathname metadata or final source rehash may substitute for per-case proof.",
+    "extra_control": "Mutate/replace original executable after first authenticated Ready and before later canary publication, with matching size/timestamps; no cache candidate may commit. Restore-before-final-path-check also must not authorize mixed proof.",
+    "status": "Accepted bounded design after two specific ordering/generation findings; implementation and native acceptance remain outstanding",
+    "execution_order_finding": "A newly cloned image must finish its independent digest and identity checks before it executes as the unconfined guardian. Source proof alone is insufficient.",
+    "execution_order_resolution": "Finish fresh image proof before starting the exact generation image as guardian. Preserve the pending-child guard for remaining errors and authenticated Ready rehash. Reduced overlap is an explicit cost."
+  },
+  "current_measurement": {
+    "commit": "3cc7b990",
+    "binary": "/private/tmp/mini-agent-vertex81-merged-install/bin/mini-agent",
+    "binary_bytes": 156816288,
+    "sha256": "555a96fecec4d33eb1c0979711e75dcea5b568d19f5e0542cb6e4c784efa31bf",
+    "profile": "required cargo install --debug; no release build",
+    "sample_count_per_operation": 1,
+    "scope": "isolated full CLI wall time, uncontrolled single sample; not source/image stage breakdown or portable speedup",
+    "measurements": [
+      {
+        "operation": "--print-config",
+        "wall_ms": 60.62,
+        "exit": 0,
+        "stdout_bytes": 11476,
+        "stderr_bytes": 0,
+        "passed_records": 0
+      },
+      {
+        "operation": "--js-runtime-check",
+        "wall_ms": 1911.06,
+        "exit": 0,
+        "stdout_bytes": 27,
+        "stderr_bytes": 0,
+        "passed_records": 1
+      }
+    ]
+  }
+}
