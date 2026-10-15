@@ -1592,7 +1592,9 @@ pub(crate) fn persist_session_if_settled(
     if !persistence_enabled || run.pending_turn.is_some() {
         return Ok(false);
     }
-    crate::session::storage::save_session(session)?;
+    // Turn-end snapshots are serialized here and written off the UI task;
+    // exit and session switch join them (see `flush_deferred_sessions`).
+    crate::session::storage::save_session_deferred(session)?;
     Ok(true)
 }
 

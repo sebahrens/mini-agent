@@ -346,8 +346,10 @@ pub(super) fn requires_native_publication(session_id: &str) -> bool {
 
 /// Legacy snapshots may not erase a native marker already stored under the
 /// exact newly owned lock. No imported marker supplies a native permit.
-pub(super) fn publish_legacy_owned(session: &Session, bytes: &[u8]) -> anyhow::Result<()> {
-    let path = lock_path(&session.id)?;
+/// Publication by id, so the deferred turn-end writer can run it on the
+/// blocking pool with the same `held.io` exclusion and namespace checks.
+pub(super) fn publish_legacy_owned_id(session_id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let path = lock_path(session_id)?;
     let held = HELD
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -368,8 +370,8 @@ pub(super) fn publish_legacy_owned(session: &Session, bytes: &[u8]) -> anyhow::R
             "native checkpoint requires its original owner"
         );
     }
-    held.prepare_legacy_target(&session.id)?;
-    held.publish(&session.id, bytes)
+    held.prepare_legacy_target(session_id)?;
+    held.publish(session_id, bytes)
 }
 
 /// Result of trying to take ownership of a session id.
@@ -464,6 +466,10 @@ pub fn release_session(session_id: &str) {
     let Ok(path) = lock_path(session_id) else {
         return;
     };
+    // A queued turn-end snapshot belongs to this ownership; finish it first.
+    if let Err(error) = super::storage::flush_deferred_session(session_id) {
+        tracing::warn!("deferred session save failed before release: {error:#}");
+    }
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(lease) = held.remove(&path) {
         // Unlock explicitly rather than relying on close: a child forked by a

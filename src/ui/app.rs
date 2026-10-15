@@ -2380,6 +2380,13 @@ impl<'a> App<'a> {
         if let Some(mgr) = self.ui.mcp_manager.take() {
             mgr.shutdown().await;
         }
+        // Turn-end snapshots are written off the UI task; every one must be
+        // complete before exit returns.
+        match tokio::task::spawn_blocking(crate::session::storage::flush_deferred_sessions).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("deferred session save failed: {error:#}"),
+            Err(error) => tracing::warn!(%error, "deferred session save join failed"),
+        }
     }
 
     /// Hand the model picker the current provider's cached ids when a

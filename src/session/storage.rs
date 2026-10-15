@@ -205,6 +205,9 @@ pub(crate) fn atomic_write_with_failure(
 }
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
+    // A synchronous save supersedes any queued turn-end snapshot and must not
+    // race an in-flight one: drop the queued bytes and join the writer first.
+    deferred::supersede(&session.id);
     if super::native_publication::is_native_bearing(session) {
         return super::native_publication::save_snapshot(session);
     }
@@ -215,19 +218,73 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
         .validate_native_persistence()
         .map_err(anyhow::Error::from)?;
     let json = serialize_bounded_session(session)?;
+    write_legacy_snapshot(&session.id, json.as_bytes())
+}
+
+/// Turn-end save: the session is serialized here, on the caller's task, and
+/// the bytes are handed to a per-session single-flight blocking writer
+/// (latest snapshot wins). The write itself is the same atomic, fsynced,
+/// lock-owned publication as [`save_session`]. Without a Tokio runtime, or for
+/// native-bearing sessions, this is exactly [`save_session`].
+///
+/// A failure of an earlier deferred write is returned by the next call (and by
+/// [`flush_deferred_sessions`]), so callers still warn about it.
+pub fn save_session_deferred(session: &Session) -> anyhow::Result<()> {
+    let Some(runtime) = deferred::runtime() else {
+        return save_session(session);
+    };
+    if super::native_publication::is_native_bearing(session) || disabled("sessions") {
+        return save_session(session);
+    }
+    session
+        .validate_native_persistence()
+        .map_err(anyhow::Error::from)?;
+    let json = serialize_bounded_session(session)?;
+    deferred::queue(&runtime, &session.id, json.into_bytes())
+}
+
+/// Join every deferred session write; returns the first failure. Exit paths
+/// call this so saves are complete before the process returns.
+pub fn flush_deferred_sessions() -> anyhow::Result<()> {
+    deferred::flush(None)
+}
+
+/// Join the deferred writer of one session (session switch / lock release).
+pub fn flush_deferred_session(session_id: &str) -> anyhow::Result<()> {
+    deferred::flush(Some(session_id))
+}
+
+/// Opt this test thread into deferred turn-end saves until dropped.
+#[cfg(test)]
+pub(crate) struct DeferSavesForTest(());
+
+#[cfg(test)]
+pub(crate) fn defer_saves_for_test() -> DeferSavesForTest {
+    deferred::ENABLED_FOR_TEST.with(|enabled| enabled.set(true));
+    DeferSavesForTest(())
+}
+
+#[cfg(test)]
+impl Drop for DeferSavesForTest {
+    fn drop(&mut self) {
+        deferred::ENABLED_FOR_TEST.with(|enabled| enabled.set(false));
+    }
+}
+
+fn write_legacy_snapshot(session_id: &str, json: &[u8]) -> anyhow::Result<()> {
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
-    let path = session_path(&session.id)?;
+    let path = session_path(session_id)?;
     // The snapshot replaces the whole file, so only the process that owns the
     // session may write it; another owner's turns would otherwise be lost
     // (mini-agent-e42za). Without an established lock, only an atomic
     // create-only publication of a missing target is eligible.
-    match crate::session::lock::claim_session(&session.id) {
+    match crate::session::lock::claim_session(session_id) {
         Ok(crate::session::lock::SessionClaim::Owned) => {
-            super::lock::publish_legacy_owned(session, json.as_bytes())
+            super::lock::publish_legacy_owned_id(session_id, json)
         }
         Ok(crate::session::lock::SessionClaim::HeldElsewhere) => {
-            Err(crate::session::lock::held_elsewhere_error(&session.id))
+            Err(crate::session::lock::held_elsewhere_error(session_id))
         }
         Err(error) => {
             // Without exact ownership, classification cannot exclude an
@@ -240,9 +297,166 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
             let root = crate::paths::WorkspaceBinding::capture(&dir)?;
             root.validate_private_root()?;
             let parent = crate::fs::checked_file_metadata(&root.try_clone_directory_file()?)?;
-            crate::fs::private_atomic_create_checked_sync(&path, json.as_bytes(), &parent)?;
+            crate::fs::private_atomic_create_checked_sync(&path, json, &parent)?;
             root.validate_private_root()?;
             Ok(())
+        }
+    }
+}
+
+mod deferred {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    #[derive(Default)]
+    struct Slot {
+        queued: Option<Vec<u8>>,
+        writing: bool,
+        error: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct Writers {
+        slots: Mutex<HashMap<String, Slot>>,
+        idle: Condvar,
+    }
+
+    static WRITERS: LazyLock<Writers> = LazyLock::new(Writers::default);
+
+    #[cfg(test)]
+    thread_local! {
+        /// Deferral is opt-in per test thread so existing tests keep reading
+        /// the disk synchronously after a save.
+        pub(super) static ENABLED_FOR_TEST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn runtime() -> Option<tokio::runtime::Handle> {
+        #[cfg(test)]
+        if !ENABLED_FOR_TEST.with(std::cell::Cell::get) {
+            return None;
+        }
+        tokio::runtime::Handle::try_current().ok()
+    }
+
+    fn slots() -> std::sync::MutexGuard<'static, HashMap<String, Slot>> {
+        WRITERS
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn queue(
+        runtime: &tokio::runtime::Handle,
+        session_id: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let (start, previous) = {
+            let mut slots = slots();
+            let slot = slots.entry(session_id.to_string()).or_default();
+            slot.queued = Some(bytes);
+            let start = !slot.writing;
+            slot.writing = true;
+            (start, slot.error.take())
+        };
+        if start {
+            let id = session_id.to_string();
+            runtime.spawn_blocking(move || drain(&id));
+        }
+        match previous {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => Ok(()),
+        }
+    }
+
+    /// Clears `writing` if a write panics, so joins never hang.
+    struct PanicReset<'a>(&'a str);
+    impl Drop for PanicReset<'_> {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let mut slots = slots();
+            if let Some(slot) = slots.get_mut(self.0) {
+                slot.writing = false;
+                slot.error = Some("deferred session save panicked".into());
+            }
+            WRITERS.idle.notify_all();
+        }
+    }
+
+    fn drain(session_id: &str) {
+        let _reset = PanicReset(session_id);
+        loop {
+            let bytes = {
+                let mut slots = slots();
+                let Some(slot) = slots.get_mut(session_id) else {
+                    WRITERS.idle.notify_all();
+                    return;
+                };
+                match slot.queued.take() {
+                    Some(bytes) => bytes,
+                    None => {
+                        // Cleared under the same lock `queue` checks, so a
+                        // snapshot queued now starts a new writer.
+                        slot.writing = false;
+                        WRITERS.idle.notify_all();
+                        return;
+                    }
+                }
+            };
+            let result = super::write_legacy_snapshot(session_id, &bytes);
+            let mut slots = slots();
+            if let Some(slot) = slots.get_mut(session_id) {
+                slot.error = result.err().map(|error| format!("{error:#}"));
+            }
+        }
+    }
+
+    fn wait_idle(
+        mut slots: std::sync::MutexGuard<'static, HashMap<String, Slot>>,
+        session_id: Option<&str>,
+    ) -> std::sync::MutexGuard<'static, HashMap<String, Slot>> {
+        loop {
+            let busy = match session_id {
+                Some(id) => slots.get(id).is_some_and(|slot| slot.writing),
+                None => slots.values().any(|slot| slot.writing),
+            };
+            if !busy {
+                return slots;
+            }
+            slots = WRITERS
+                .idle
+                .wait(slots)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(super) fn supersede(session_id: &str) {
+        let mut slots = slots();
+        let Some(slot) = slots.get_mut(session_id) else {
+            return;
+        };
+        slot.queued = None;
+        let mut slots = wait_idle(slots, Some(session_id));
+        slots.remove(session_id);
+    }
+
+    pub(super) fn flush(session_id: Option<&str>) -> anyhow::Result<()> {
+        let mut slots = wait_idle(slots(), session_id);
+        let mut first = None;
+        slots.retain(|id, slot| {
+            if session_id.is_some_and(|wanted| wanted != id) {
+                return true;
+            }
+            if first.is_none() {
+                first = slot.error.take();
+            }
+            false
+        });
+        match first {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => Ok(()),
         }
     }
 }

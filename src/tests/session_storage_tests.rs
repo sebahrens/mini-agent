@@ -1552,3 +1552,72 @@ fn resuming_an_unowned_session_keeps_its_id() {
     );
     drop(env);
 }
+
+#[tokio::test]
+async fn deferred_turn_end_saves_are_single_flight_latest_wins_and_flushed() {
+    use crate::session::storage::{
+        defer_saves_for_test, flush_deferred_sessions, save_session_deferred,
+    };
+    let _env = setup_test_env();
+    let _defer = defer_saves_for_test();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "first question");
+    save_session_deferred(&session).unwrap();
+    for index in 0..16 {
+        session.add_message(MessageRole::Assistant, &format!("answer {index}"));
+        save_session_deferred(&session).unwrap();
+    }
+    flush_deferred_sessions().unwrap();
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&reloaded[0]).unwrap(),
+        serde_json::to_value(&session).unwrap(),
+        "the latest snapshot is on disk after the flush"
+    );
+
+    // A synchronous save supersedes a queued snapshot and is never
+    // overwritten by an older deferred one.
+    session.add_message(MessageRole::User, "queued");
+    save_session_deferred(&session).unwrap();
+    session.add_message(MessageRole::Assistant, "synchronous final");
+    save_session(&session).unwrap();
+    flush_deferred_sessions().unwrap();
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reloaded[0]).unwrap(),
+        serde_json::to_value(&session).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn deferred_turn_end_save_failure_is_reported_and_keeps_prior_snapshot() {
+    use crate::session::storage::{
+        defer_saves_for_test, flush_deferred_sessions, save_session_deferred,
+    };
+    use std::os::unix::fs::symlink;
+
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    save_session(&session).unwrap();
+    let expected = serde_json::to_value(&session).unwrap();
+    let _defer = defer_saves_for_test();
+    let sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions");
+    let saved_sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions.saved");
+    std::fs::rename(&sessions_dir, &saved_sessions_dir).unwrap();
+    symlink(&saved_sessions_dir, &sessions_dir).unwrap();
+    session.add_message(MessageRole::Assistant, "unsaved answer");
+    let queued = save_session_deferred(&session);
+    let flushed = flush_deferred_sessions();
+    std::fs::remove_file(&sessions_dir).unwrap();
+    std::fs::rename(&saved_sessions_dir, &sessions_dir).unwrap();
+    assert!(
+        queued.is_ok(),
+        "the failure is reported by the join, not the queue"
+    );
+    assert!(flushed.is_err());
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected);
+}
