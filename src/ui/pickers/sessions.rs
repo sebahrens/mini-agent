@@ -23,10 +23,28 @@ pub(crate) struct SessionsPicker {
     pub matches: Vec<usize>,
     pub catalogue: Catalogue,
     pub workspace: Arc<crate::paths::WorkspaceBinding>,
-    /// Lowercase filter text per catalogue row, built once in `new`.
+    /// Lowercase filter text per catalogue row, built when rows are set.
     haystacks: Vec<String>,
+    /// The catalogue still being read on the blocking pool.
+    pending: Option<std::sync::mpsc::Receiver<Result<Catalogue, String>>>,
+    /// Why the catalogue could not be listed, shown in place of rows.
+    load_error: Option<String>,
     monochrome: bool,
     outcome: Option<SessionPick>,
+}
+
+fn haystacks(catalogue: &Catalogue) -> Vec<String> {
+    catalogue
+        .rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {} {} {}",
+                row.title, row.id, row.working_dir, row.provider, row.model
+            )
+            .to_lowercase()
+        })
+        .collect()
 }
 
 impl SessionsPicker {
@@ -35,17 +53,7 @@ impl SessionsPicker {
         workspace: Arc<crate::paths::WorkspaceBinding>,
         all: bool,
     ) -> Self {
-        let haystacks = catalogue
-            .rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "{} {} {} {} {}",
-                    row.title, row.id, row.working_dir, row.provider, row.model
-                )
-                .to_lowercase()
-            })
-            .collect();
+        let haystacks = haystacks(&catalogue);
         let mut picker = Self {
             active: true,
             all,
@@ -55,11 +63,68 @@ impl SessionsPicker {
             catalogue,
             workspace,
             haystacks,
+            pending: None,
+            load_error: None,
             monochrome: false,
             outcome: None,
         };
         picker.filter();
         picker
+    }
+
+    /// Open the picker at once and read the catalogue (up to 100 session
+    /// files) on the blocking pool; `poll_catalogue` takes the result. Keys
+    /// typed meanwhile edit the query, which then filters the loaded rows.
+    /// Without a runtime the catalogue is read in place.
+    pub(crate) fn loading(workspace: Arc<crate::paths::WorkspaceBinding>, all: bool) -> Self {
+        let mut picker = Self::new(Catalogue::default(), workspace.clone(), all);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let list = move || {
+            crate::session::catalogue::list(&workspace, all).map_err(|error| error.to_string())
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    let _ = tx.send(list());
+                });
+            }
+            Err(_) => {
+                let _ = tx.send(list());
+            }
+        }
+        picker.pending = Some(rx);
+        picker.poll_catalogue();
+        picker
+    }
+
+    /// Whether the catalogue is still being read.
+    pub(crate) fn is_loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Take the background catalogue if it arrived. Returns true when the
+    /// picker changed and should be repainted.
+    pub(crate) fn poll_catalogue(&mut self) -> bool {
+        let Some(rx) = &self.pending else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("session listing stopped before it finished".into())
+            }
+        };
+        self.pending = None;
+        match result {
+            Ok(catalogue) => {
+                self.haystacks = haystacks(&catalogue);
+                self.catalogue = catalogue;
+                self.filter();
+            }
+            Err(error) => self.load_error = Some(error),
+        }
+        true
     }
     pub(crate) fn set_monochrome(&mut self, value: bool) {
         self.monochrome = value;
@@ -245,12 +310,18 @@ impl SessionsPicker {
             )?;
         }
         if count == 0 {
-            line(
-                writer,
-                top + 2,
-                "No matching saved sessions",
-                Color::DarkGrey,
-            )?;
+            let message = if self.is_loading() {
+                "loading sessions…".to_owned()
+            } else if let Some(error) = &self.load_error {
+                format!("could not list sessions: {error}")
+            } else {
+                "No matching saved sessions".to_owned()
+            };
+            line(writer, top + 2, &message, Color::DarkGrey)?;
+        }
+        if self.is_loading() || self.load_error.is_some() {
+            line(writer, floor_row.saturating_sub(1), "", Color::DarkGrey)?;
+            return writer.flush();
         }
         let note = format!(
             "{} shown{}{}",
@@ -338,6 +409,77 @@ pub(crate) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loading_picker_keeps_the_query_and_filters_rows_when_they_arrive() {
+        let root = crate::tests::OwnedTestDirectory::new("session-picker-loading");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut picker = SessionsPicker::new(Catalogue::default(), workspace.clone(), false);
+        picker.pending = Some(rx);
+        assert!(picker.is_loading() && !picker.poll_catalogue());
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 160, 20, None).unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("loading sessions")
+        );
+        picker.paste("zebra");
+        picker.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(picker.take_outcome().is_none(), "nothing to select yet");
+        let row = |title: &str| crate::session::catalogue::SessionRow {
+            id: uuid::Uuid::new_v4().to_string().into(),
+            title: title.into(),
+            updated_at: chrono::Utc::now().to_rfc3339().into(),
+            working_dir: workspace.root().to_string_lossy().into(),
+            message_count: 1,
+            provider: "anthropic".into(),
+            model: "test".into(),
+            current_workspace: true,
+        };
+        tx.send(Ok(Catalogue {
+            rows: vec![row("drop me"), row("Zebra row")],
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(picker.poll_catalogue());
+        assert!(!picker.is_loading());
+        assert_eq!(picker.query, "zebra");
+        assert_eq!(picker.matches, vec![1]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut failed = SessionsPicker::new(Catalogue::default(), workspace.clone(), true);
+        failed.pending = Some(rx);
+        tx.send(Err("denied".into())).unwrap();
+        assert!(failed.poll_catalogue());
+        let mut bytes = Vec::new();
+        failed.draw(&mut bytes, 160, 20, None).unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("could not list sessions: denied")
+        );
+
+        // The real loader runs off this task and delivers the same catalogue.
+        let mut loaded = SessionsPicker::loading(workspace.clone(), false);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while loaded.is_loading() {
+                loaded.poll_catalogue();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(loaded.load_error.is_none(), "{:?}", loaded.load_error);
+        assert_eq!(
+            loaded.catalogue.rows.len(),
+            crate::session::catalogue::list(&workspace, false)
+                .unwrap()
+                .rows
+                .len()
+        );
+    }
     #[test]
     fn session_picker_keeps_unicode_query_row_identity_and_explicit_all_toggle() {
         let root = crate::tests::OwnedTestDirectory::new("session-picker");
@@ -361,6 +503,7 @@ mod tests {
             workspace.clone(),
             false,
         );
+        assert!(!picker.is_loading() && !picker.poll_catalogue());
         picker.paste("雪\u{1b}");
         assert_eq!(picker.query, "雪");
         assert_eq!(picker.matches, vec![0]);

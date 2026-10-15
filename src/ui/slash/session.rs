@@ -500,9 +500,10 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         if *ctx.is_running {
             return show_busy_sessions(ctx, all).await;
         }
-        let catalogue = crate::session::catalogue::list(ctx.workspace, all)?;
+        // The catalogue parses up to 100 session files: read it off the UI
+        // task while the picker shows "loading sessions…".
         ctx.input
-            .start_session_picker(catalogue, ctx.workspace.clone(), all);
+            .start_loading_session_picker(ctx.workspace.clone(), all);
     } else if parts[1] == "delete" && parts.len() >= 3 {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;

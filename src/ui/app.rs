@@ -3043,9 +3043,8 @@ impl<'a> App<'a> {
                         self.refresh()?;
                         return Ok(true);
                     }
-                    let catalogue = crate::session::catalogue::list(&self.ui.workspace, all)?;
                     self.input
-                        .start_session_picker(catalogue, self.ui.workspace.clone(), all);
+                        .start_loading_session_picker(self.ui.workspace.clone(), all);
                 }
                 crate::ui::pickers::sessions::SessionPick::Cancelled => {}
                 crate::ui::pickers::sessions::SessionPick::Selected(selection) => {
@@ -10525,6 +10524,27 @@ mod custom_command_tests {
 mod workspace_session_picker_tests {
     use super::test_support::fixture_app;
     use super::*;
+    /// The session catalogue is read on the blocking pool; poll it in as the
+    /// event loop's background tick does, then repaint.
+    async fn finish_session_catalogue(app: &mut App<'_>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.input.picker.as_ref().is_some_and(Picker::is_loading) {
+                if app
+                    .input
+                    .picker
+                    .as_mut()
+                    .is_some_and(Picker::poll_background)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("session catalogue loads");
+        assert!(!app.input.picker.as_ref().is_some_and(Picker::is_loading));
+        app.refresh().unwrap();
+    }
     fn environment(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
         crate::tests::ScopedProcessEnv::set(&[
             (
@@ -10631,6 +10651,8 @@ mod workspace_session_picker_tests {
         app.ui.permission = Some(Arc::new(std::sync::Mutex::new(checker)));
         app.run_slash_command("/sessions").await.unwrap();
         app.refresh().unwrap();
+        assert!(app.renderer.captured_output().contains("loading sessions"));
+        finish_session_catalogue(&mut app).await;
         let rendered = app.renderer.captured_output();
         assert!(rendered.contains("Current workspace"));
         assert!(rendered.contains("CURRENT_PICKER_ROW"));
@@ -10644,6 +10666,7 @@ mod workspace_session_picker_tests {
             .unwrap(),
             ControlFlow::Continue(())
         ));
+        finish_session_catalogue(&mut app).await;
         let rendered = app.renderer.captured_output();
         assert!(rendered.contains("All workspaces"));
         assert!(rendered.contains("FOREIGN_PICKER_ROW"));
@@ -10685,6 +10708,7 @@ mod workspace_session_picker_tests {
             );
         }
         app.run_slash_command("/sessions --all").await.unwrap();
+        finish_session_catalogue(&mut app).await;
         assert!(matches!(
             app.handle_user_event(UserEvent::Paste("FOREIGN_PICKER_ROW".into()))
                 .await
@@ -10715,6 +10739,7 @@ mod workspace_session_picker_tests {
         );
         let foreign_fork = app.ui.session.id.clone();
         app.run_slash_command("/sessions").await.unwrap();
+        finish_session_catalogue(&mut app).await;
         assert!(matches!(
             app.handle_user_event(UserEvent::Paste("CURRENT_PICKER_ROW".into()))
                 .await

@@ -36,7 +36,11 @@ impl Picker {
     /// Whether the picker is still filling in the background (the file
     /// picker's directory walk), so the UI should keep repainting it.
     pub fn is_loading(&self) -> bool {
-        matches!(self, Picker::File(p) if p.active && p.is_loading())
+        match self {
+            Picker::File(p) => p.active && p.is_loading(),
+            Picker::Sessions(p) => p.active && p.is_loading(),
+            _ => false,
+        }
     }
 
     /// Take background results that arrived since the last call. Returns true
@@ -44,6 +48,7 @@ impl Picker {
     pub fn poll_background(&mut self) -> bool {
         match self {
             Picker::File(p) if p.active => p.try_finish_loading(),
+            Picker::Sessions(p) if p.active => p.poll_catalogue(),
             _ => false,
         }
     }

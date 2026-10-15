@@ -735,6 +735,17 @@ impl InputEditor {
         self.picker = Some(Picker::Sessions(picker));
     }
 
+    /// Open the session picker while its catalogue is read off the UI task.
+    pub(crate) fn start_loading_session_picker(
+        &mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        all: bool,
+    ) {
+        let mut picker = crate::ui::pickers::sessions::SessionsPicker::loading(workspace, all);
+        picker.set_monochrome(self.monochrome);
+        self.picker = Some(Picker::Sessions(picker));
+    }
+
     pub(crate) fn take_session_outcome(
         &mut self,
     ) -> Option<crate::ui::pickers::sessions::SessionPick> {
