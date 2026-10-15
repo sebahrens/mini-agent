@@ -1549,15 +1549,17 @@ host-wide levels.
 The macOS Workspace profile includes read-only public runtime assets needed by
 Homebrew and Apple command-line tools: `/opt/homebrew/Cellar`, its `opt` aliases,
 `/Library/Developer/CommandLineTools`, Apple vendor frameworks under
-`/Library/Developer/PrivateFrameworks`, and the `Contents/Developer` and
-`Contents/SharedFrameworks` subtrees of system `/Applications/Xcode*.app`
-bundles. Only each such bundle's exact `Contents/Info.plist` metadata file and
-`Contents/Frameworks/libxcodebuildLoader.dylib` loader file are also readable.
+`/Library/Developer/PrivateFrameworks`, and the `Contents/Developer`,
+`Contents/Frameworks` and `Contents/SharedFrameworks` subtrees of system
+`/Applications/Xcode*.app` bundles. These runtime frameworks include the
+Xcode loader and its transitive framework dependencies. Each such bundle's
+exact `Contents/Info.plist` metadata file is also readable.
 Canonical path lookup may inspect metadata on `/Applications` and the exact
 Xcode bundle and `Contents` ancestors; it does not grant their descendants
 metadata access or directory contents. Sibling files, other bundle contents,
 application bundles under user home directories, and the containing
-`/Applications` and `/Library` directories receive no subtree grant. These are read filters, not write roots.
+`/Applications` and `/Library` directories receive no subtree grant. These are
+read filters, not write roots.
 The exact developer-selector links
 at `/var/select/developer_dir` and `/var/select/sh`, with their `/private`
 spellings, are readable.

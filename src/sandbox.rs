@@ -5212,7 +5212,7 @@ fn seatbelt_profile_ladder(
             format!("(allow file-read-metadata{metadata_ancestors})\n")
         };
         format!(
-            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -8110,7 +8110,7 @@ echo COMMITTED"#;
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")",
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")",
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")",
-                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$\")",
+                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")",
                 "(literal \"/var/select/sh\")",
                 "(literal \"/private/var/select/sh\")",
                 "(literal \"/var/select/developer_dir\")",
@@ -8163,7 +8163,7 @@ echo COMMITTED"#;
             "^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)",
             "^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)",
             "^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$",
-            "^/Applications/Xcode[^/]*[.]app/Contents/Frameworks/libxcodebuildLoader[.]dylib$",
+            "^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)",
         ]
         .map(|pattern| regex::Regex::new(pattern).unwrap());
         for runtime in [
@@ -8172,6 +8172,8 @@ echo COMMITTED"#;
             "/Applications/Xcode-beta.app/Contents/Developer/Toolchains",
             "/Applications/Xcode_16.4.app/Contents/Info.plist",
             "/Applications/Xcode_26.6.app/Contents/Frameworks/libxcodebuildLoader.dylib",
+            "/Applications/Xcode_16.4.app/Contents/Frameworks/Xcode3Core.framework/Versions/A/Xcode3Core",
+            "/Applications/Xcode.app/Contents/Frameworks",
             "/Applications/Xcode.app/Contents/SharedFrameworks",
             "/Applications/Xcode_16.4.app/Contents/SharedFrameworks/DVTSystemPrerequisites.framework/Versions/A/DVTSystemPrerequisites",
         ] {
@@ -8187,12 +8189,11 @@ echo COMMITTED"#;
             "/Applications/Xcode.app/Contents",
             "/Applications/Xcode.app/Contents/DeveloperSecrets",
             "/Applications/Xcode.app/Contents/SharedFrameworksBackup",
-            "/Applications/Xcode.app/Contents/Frameworks",
+            "/Applications/Xcode.app/Contents/FrameworksBackup",
             "/Applications/Xcode.app/Contents/PlugIns",
             "/Applications/Xcode.app/Contents/Info.plist.backup",
             "/Applications/Xcode.app/Contents/Info.plist/private",
-            "/Applications/Xcode.app/Contents/Frameworks/libxcodebuildLoader.dylib.backup",
-            "/Applications/Xcode.app/Contents/Frameworks/Other.dylib",
+            "/Applications/Other.app/Contents/Frameworks/Xcode3Core.framework",
             "/Users/person/Applications/Xcode.app/Contents/Frameworks/libxcodebuildLoader.dylib",
         ] {
             assert!(
