@@ -1,0 +1,941 @@
+{
+  "format": "mini-agent-startup-profile-pair/1",
+  "source": {
+    "base": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-startup5-profile-pair-caeidzv_",
+    "debug_root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-startup5-profile-pair-caeidzv_/debug-install",
+    "release_root": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-startup5-profile-pair-caeidzv_/release-install",
+    "source": "/Users/seb/projects/mini-agent/target/agent-worktrees/startup-worker-probe5",
+    "source_commit": "bc9f6e8654ead6266a9b4ca6acad705730e96bc7",
+    "identical_source_commit": "c79475ddcf9744eeff3e6f221c17369f32ee5e5d",
+    "source_tree": "a3f5d34b5b216aa25ed9fee2b53d6501cb1ac448",
+    "identical_source_tree": "a3f5d34b5b216aa25ed9fee2b53d6501cb1ac448",
+    "default_features": [
+      "loop",
+      "goal",
+      "git-worktree",
+      "mcp",
+      "acp",
+      "subagents",
+      "archmd",
+      "status-signals",
+      "multithread",
+      "export",
+      "js",
+      "sandbox",
+      "memory",
+      "agent-skills",
+      "lsp",
+      "hooks",
+      "multimodal"
+    ],
+    "cargo_lock_sha256": "2f59de9777562c9155c172272e0ef3b55394c7fc8d74e69f8d1a194e168ffae3",
+    "cargo_toml_sha256": "58bc87963b8f8cc8cb87860451554eebdbc5e49b226910ba83673a9c1b18e8ff",
+    "worker_source_sha256": "583dfe353a8a140202ffaf7039bd324449818962551321086b20de8f820b9464",
+    "worker_spec_sha256": "226a461f200d13a35e290ad940c8078d1ec60b40ca92cc3f336486d4207b596d"
+  },
+  "host": {
+    "system": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu": "Apple M3 Ultra",
+    "logical_cpus": 32,
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (Homebrew)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.3"
+  },
+  "features": "Cargo default features (same for both profiles)",
+  "release_exception": "One explicit user-approved isolated release-profile benchmark; no production optimization/settings changes",
+  "method": {
+    "cold": "Fresh private application roots and no expected-digest record; OS filesystem/dyld caches are not flushed",
+    "warm": "Independent new process using the same private application roots after one successful seed",
+    "sampling": "5 cold application states and 10 warm processes per command/profile; serial after both builds",
+    "scope": "Offline --print-config and real --js-runtime-check arithmetic only; no model/provider/account calls",
+    "home": "Actual HOME preserved; all application roots explicitly isolated"
+  },
+  "profiles": {
+    "debug": {
+      "binary": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-startup5-profile-pair-caeidzv_/debug-install/bin/mini-agent",
+      "sha256": "a3fa1bab769a230734d97a9de91c617e23b1a0f7dc2cf03366984dbfeadefaa8",
+      "size_bytes": 161722224,
+      "version": "mini-agent 1.9.4\nbuild: 33805fa09e7988b293bd2011304d4a4bca8a7dc5a1a0ceb6577907819e6a3b64\ntarget: aarch64-apple-darwin",
+      "commands": {
+        "print_config": {
+          "cold": {
+            "summary": {
+              "n": 5,
+              "median_wall_ms": 53.45241702161729,
+              "min_wall_ms": 47.9920000070706,
+              "max_wall_ms": 76.28675003070384,
+              "p95_nearest_rank_wall_ms": 76.28675003070384,
+              "median_user_ms": 19.602999999999994,
+              "median_system_ms": 6.9060000000000095
+            },
+            "samples": [
+              {
+                "wall_ms": 76.28675003070384,
+                "user_ms": 19.369,
+                "system_ms": 18.715000000000003,
+                "exit": 0,
+                "stdout_sha256": "61bf78427c1ede4c9b497f39b025c447ea71ec128f688c9de9b39e21ad763a0e",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 53.45241702161729,
+                "user_ms": 19.529999999999998,
+                "system_ms": 6.801999999999989,
+                "exit": 0,
+                "stdout_sha256": "493988e4207a5ca1220999f9f6cee18a0ee7a9bce39b6c2a38821868959a34dd",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 49.89970801398158,
+                "user_ms": 20.060999999999996,
+                "system_ms": 6.9060000000000095,
+                "exit": 0,
+                "stdout_sha256": "35cd2c1dcf6cedefde38ba470052af096679ed64065f95761c2bb2618de1b9d5",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 47.9920000070706,
+                "user_ms": 19.602999999999994,
+                "system_ms": 6.830000000000003,
+                "exit": 0,
+                "stdout_sha256": "d4396167a67972d53722e5b627d9cb52a8f618e71df09f6cf01ac38ea815fd45",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 55.606374982744455,
+                "user_ms": 19.742000000000008,
+                "system_ms": 7.003999999999983,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              }
+            ]
+          },
+          "warm": {
+            "summary": {
+              "n": 10,
+              "median_wall_ms": 35.687896073795855,
+              "min_wall_ms": 32.088000094518065,
+              "max_wall_ms": 36.09287494327873,
+              "p95_nearest_rank_wall_ms": 36.09287494327873,
+              "median_user_ms": 20.03949999999999,
+              "median_system_ms": 5.780499999999966
+            },
+            "samples": [
+              {
+                "wall_ms": 35.845792037434876,
+                "user_ms": 19.698999999999995,
+                "system_ms": 5.774000000000001,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 35.65525007434189,
+                "user_ms": 19.597000000000005,
+                "system_ms": 5.510000000000015,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 35.764665924943984,
+                "user_ms": 19.632999999999985,
+                "system_ms": 5.654999999999966,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 33.35387504193932,
+                "user_ms": 21.485000000000003,
+                "system_ms": 6.320999999999966,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 32.855583005584776,
+                "user_ms": 21.104000000000013,
+                "system_ms": 6.668999999999981,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 32.088000094518065,
+                "user_ms": 20.222999999999992,
+                "system_ms": 5.947999999999953,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 36.088834051042795,
+                "user_ms": 20.052999999999987,
+                "system_ms": 5.774999999999975,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 35.72054207324982,
+                "user_ms": 19.801999999999985,
+                "system_ms": 5.622999999999989,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 32.521040993742645,
+                "user_ms": 20.28000000000002,
+                "system_ms": 6.074000000000024,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 36.09287494327873,
+                "user_ms": 20.02599999999999,
+                "system_ms": 5.785999999999958,
+                "exit": 0,
+                "stdout_sha256": "7c185160942c2c19ab8973ba22e3ed550cc24712aa6e4aa60cb3c1d11bf27cbc",
+                "stdout_bytes": 11474,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              }
+            ]
+          }
+        },
+        "js_runtime_check": {
+          "cold": {
+            "summary": {
+              "n": 5,
+              "median_wall_ms": 1338.7537080561742,
+              "min_wall_ms": 1329.9965830519795,
+              "max_wall_ms": 1413.0081250332296,
+              "p95_nearest_rank_wall_ms": 1413.0081250332296,
+              "median_user_ms": 498.48199999999986,
+              "median_system_ms": 113.79400000000007
+            },
+            "samples": [
+              {
+                "wall_ms": 1413.0081250332296,
+                "user_ms": 500.38800000000003,
+                "system_ms": 121.93600000000005,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1338.7537080561742,
+                "user_ms": 497.27200000000005,
+                "system_ms": 113.70000000000002,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1336.3895410439,
+                "user_ms": 498.48199999999986,
+                "system_ms": 113.79400000000007,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1351.9225830677897,
+                "user_ms": 506.25399999999996,
+                "system_ms": 120.10200000000005,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1329.9965830519795,
+                "user_ms": 494.348,
+                "system_ms": 112.94999999999989,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              }
+            ]
+          },
+          "warm": {
+            "summary": {
+              "n": 10,
+              "median_wall_ms": 1269.6467499481514,
+              "min_wall_ms": 1226.4824999729171,
+              "max_wall_ms": 1287.720291991718,
+              "p95_nearest_rank_wall_ms": 1287.720291991718,
+              "median_user_ms": 437.4045,
+              "median_system_ms": 108.51500000000013
+            },
+            "samples": [
+              {
+                "wall_ms": 1234.9788330029696,
+                "user_ms": 432.99300000000017,
+                "system_ms": 108.39600000000016,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1226.4824999729171,
+                "user_ms": 438.974,
+                "system_ms": 107.72899999999996,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1276.0991659015417,
+                "user_ms": 453.6770000000003,
+                "system_ms": 109.18899999999998,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1275.3986249445006,
+                "user_ms": 455.4539999999996,
+                "system_ms": 108.63400000000011,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1279.225124977529,
+                "user_ms": 443.43800000000044,
+                "system_ms": 112.05600000000015,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1241.1210830323398,
+                "user_ms": 430.36099999999954,
+                "system_ms": 106.31000000000013,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1262.2543330071494,
+                "user_ms": 429.3170000000002,
+                "system_ms": 111.87400000000025,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1286.2591670127586,
+                "user_ms": 441.52299999999923,
+                "system_ms": 110.88999999999993,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1287.720291991718,
+                "user_ms": 429.60200000000003,
+                "system_ms": 104.62399999999982,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 1263.8948749518022,
+                "user_ms": 435.835,
+                "system_ms": 104.23599999999978,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              }
+            ]
+          }
+        }
+      }
+    },
+    "release": {
+      "binary": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-startup5-profile-pair-caeidzv_/release-install/bin/mini-agent",
+      "sha256": "aead2b1268c536740a3123f1ef29be9cf317b894598a07554c6ef8c6ae35aa82",
+      "size_bytes": 25524880,
+      "version": "mini-agent 1.9.4\nbuild: 28854a20f827bfa10b36b33b40718a44f102d30ac853366ee7bda0a14b5144a3\ntarget: aarch64-apple-darwin",
+      "commands": {
+        "print_config": {
+          "cold": {
+            "summary": {
+              "n": 5,
+              "median_wall_ms": 41.57566698268056,
+              "min_wall_ms": 38.870916003361344,
+              "max_wall_ms": 50.98345794249326,
+              "p95_nearest_rank_wall_ms": 50.98345794249326,
+              "median_user_ms": 11.186000000000362,
+              "median_system_ms": 6.304000000000087
+            },
+            "samples": [
+              {
+                "wall_ms": 50.98345794249326,
+                "user_ms": 11.77000000000028,
+                "system_ms": 10.321000000000247,
+                "exit": 0,
+                "stdout_sha256": "6f4a009583719f6151581351ce4167bb452c55102d140ae3b3c765ad7eb11964",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 40.30483297538012,
+                "user_ms": 11.838000000000015,
+                "system_ms": 6.323999999999774,
+                "exit": 0,
+                "stdout_sha256": "2a6f4cc86a4551fb42e819f837ed3d75ebca589619172d3ec3840186bb70baba",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 38.870916003361344,
+                "user_ms": 11.186000000000362,
+                "system_ms": 6.304000000000087,
+                "exit": 0,
+                "stdout_sha256": "62dddad2ce55e3b3592cf115ccc30393080407042f140240502cdbf9967b751a",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 42.98562498297542,
+                "user_ms": 10.84200000000024,
+                "system_ms": 5.9749999999998415,
+                "exit": 0,
+                "stdout_sha256": "57fa96904c3c8e2f35d630de8ad2e3269c133b51616ae570e1bc8e5c0c6a16a2",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 41.57566698268056,
+                "user_ms": 10.81899999999969,
+                "system_ms": 6.073999999999913,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              }
+            ]
+          },
+          "warm": {
+            "summary": {
+              "n": 10,
+              "median_wall_ms": 23.898978950455785,
+              "min_wall_ms": 21.576832979917526,
+              "max_wall_ms": 27.600750094279647,
+              "p95_nearest_rank_wall_ms": 27.600750094279647,
+              "median_user_ms": 11.402999999999608,
+              "median_system_ms": 5.281000000000091
+            },
+            "samples": [
+              {
+                "wall_ms": 27.002917020581663,
+                "user_ms": 11.777999999999622,
+                "system_ms": 5.891000000000091,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 26.59745793789625,
+                "user_ms": 11.349000000000053,
+                "system_ms": 5.1180000000004,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 21.576832979917526,
+                "user_ms": 11.371999999999716,
+                "system_ms": 5.1680000000002835,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 24.459749925881624,
+                "user_ms": 11.4339999999995,
+                "system_ms": 5.291999999999852,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 27.600750094279647,
+                "user_ms": 12.53100000000007,
+                "system_ms": 5.900000000000016,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 22.43170898873359,
+                "user_ms": 11.796999999999613,
+                "system_ms": 5.468999999999724,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 27.37416699528694,
+                "user_ms": 11.613999999999791,
+                "system_ms": 6.265999999999661,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 22.135457955300808,
+                "user_ms": 11.212000000000444,
+                "system_ms": 5.27000000000033,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 23.33295892458409,
+                "user_ms": 10.989999999999611,
+                "system_ms": 4.86299999999984,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 23.338207975029945,
+                "user_ms": 11.166000000000231,
+                "system_ms": 4.656999999999911,
+                "exit": 0,
+                "stdout_sha256": "861cc023fb91fe5fe875b56cd416d05986fc5fd6d74b98d231e5c9ad0f0bbb7d",
+                "stdout_bytes": 11493,
+                "source_digest_evidence": [],
+                "persistent_records": 0,
+                "owned_processes_after": 0
+              }
+            ]
+          }
+        },
+        "js_runtime_check": {
+          "cold": {
+            "summary": {
+              "n": 5,
+              "median_wall_ms": 866.8942500371486,
+              "min_wall_ms": 861.6668329341337,
+              "max_wall_ms": 891.7772920103744,
+              "p95_nearest_rank_wall_ms": 891.7772920103744,
+              "median_user_ms": 104.33899999999952,
+              "median_system_ms": 46.09599999999992
+            },
+            "samples": [
+              {
+                "wall_ms": 861.6668329341337,
+                "user_ms": 103.75900000000016,
+                "system_ms": 45.385000000000005,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 869.5590000133961,
+                "user_ms": 105.48299999999955,
+                "system_ms": 46.09599999999992,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 866.8942500371486,
+                "user_ms": 108.77200000000009,
+                "system_ms": 49.45999999999984,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 891.7772920103744,
+                "user_ms": 104.33899999999952,
+                "system_ms": 46.14300000000027,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 865.6951249577105,
+                "user_ms": 103.02399999999956,
+                "system_ms": 44.306999999999874,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "source_read"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              }
+            ]
+          },
+          "warm": {
+            "summary": {
+              "n": 10,
+              "median_wall_ms": 849.4092915207148,
+              "min_wall_ms": 816.2736659869552,
+              "max_wall_ms": 854.805166949518,
+              "p95_nearest_rank_wall_ms": 854.805166949518,
+              "median_user_ms": 103.5295000000005,
+              "median_system_ms": 53.831500000000254
+            },
+            "samples": [
+              {
+                "wall_ms": 816.2736659869552,
+                "user_ms": 94.40900000000063,
+                "system_ms": 40.61500000000029,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 820.356999989599,
+                "user_ms": 94.98099999999887,
+                "system_ms": 41.77399999999976,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 845.0545840896666,
+                "user_ms": 100.49000000000063,
+                "system_ms": 50.46000000000017,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 853.0295409727842,
+                "user_ms": 103.6280000000005,
+                "system_ms": 54.641999999999854,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 841.8234589044005,
+                "user_ms": 103.76399999999997,
+                "system_ms": 52.76699999999934,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 849.9092080164701,
+                "user_ms": 104.24300000000031,
+                "system_ms": 53.82599999999993,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 851.8358749570325,
+                "user_ms": 105.45099999999863,
+                "system_ms": 56.15499999999951,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 854.805166949518,
+                "user_ms": 103.4310000000005,
+                "system_ms": 55.71200000000065,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 853.47220802214,
+                "user_ms": 104.12799999999933,
+                "system_ms": 55.19599999999958,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              },
+              {
+                "wall_ms": 848.9093750249594,
+                "user_ms": 103.41500000000003,
+                "system_ms": 53.83700000000058,
+                "exit": 0,
+                "stdout_sha256": "051412cfae1589b5d3584801d4c254f9066f62a42995db3b9c597fed80c88f56",
+                "stdout_bytes": 27,
+                "source_digest_evidence": [
+                  "matched_image"
+                ],
+                "persistent_records": 1,
+                "owned_processes_after": 0
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "driver_sha256": "03acf66ce95edd0d727a606ed949faec3d78a7ae5172c08d60fd6d6d7277db0a",
+  "all_owned_processes_retired": true,
+  "builds": {
+    "debug": {
+      "command": "CARGO_BUILD_JOBS=6 cargo install --path . --locked --offline --debug --root <debug-root>",
+      "install_seconds": 49.2,
+      "log_sha256": "f00417585dd54abc6a4b9a2a12a295c08a2f44e33d0b25bc839020b5d85dcb72",
+      "profile": {
+        "opt-level": 0,
+        "debug": false,
+        "sha2@0.11_opt-level": 3
+      }
+    },
+    "release": {
+      "command": "CARGO_BUILD_JOBS=6 cargo install --path . --locked --offline --profile release --root <release-root>",
+      "install_seconds": 268.0,
+      "log_sha256": "5cb4d2a590a73a47ae9986cf220e0c7288e5f873f4b7a2a25305a245eae63799",
+      "profile": {
+        "opt-level": "z",
+        "lto": "thin",
+        "codegen-units": 1,
+        "strip": true,
+        "debug": false
+      }
+    },
+    "target": "Same owning checkout target/ directory, no target copying; profiles installed sequentially before timing."
+  },
+  "measurement_validation": {
+    "total_process_samples": 60,
+    "all_exits_zero": true,
+    "print_config_all_not_probed_and_no_digest_record": true,
+    "js_all_actual_runtime_check_pass_2": true,
+    "cold_js_each_source_read": true,
+    "warm_js_each_matched_image": true,
+    "private_application_roots": true,
+    "actual_home_unchanged": true,
+    "all_owned_processes_retired": true,
+    "root_confirmed_cargo_quiet_before_start": true
+  }
+}
