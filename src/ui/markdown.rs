@@ -137,6 +137,16 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
     }
 }
 
+/// `text.trim()` without reallocating: the leading whitespace is drained and
+/// the trailing whitespace truncated in place.
+fn trim_in_place(mut text: String) -> String {
+    let end = text.trim_end().len();
+    text.truncate(end);
+    let start = text.len() - text.trim_start().len();
+    text.drain(..start);
+    text
+}
+
 fn bullet_prefix(col: Color) -> &'static str {
     match col {
         Color::DarkGrey => "  ┊ ",
@@ -190,8 +200,11 @@ pub(crate) fn markdown_with_code_state(
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS,
     );
-    let mut result = Vec::new();
+    // Roughly one row per 40 source bytes; avoids repeated regrowth.
+    let mut result = Vec::with_capacity(text.len() / 40);
     let mut acc = String::new();
+    // Reused for prefixed rows (blockquote bar, list bullet, link note).
+    let mut prefixed = String::new();
 
     let mut in_heading = false;
     let mut in_code_block = false;
@@ -268,7 +281,8 @@ pub(crate) fn markdown_with_code_state(
                     title: _,
                     id: _,
                 } => {
-                    link_url = dest_url.to_string();
+                    link_url.clear();
+                    link_url.push_str(&dest_url);
                 }
                 _ => {}
             },
@@ -338,7 +352,9 @@ pub(crate) fn markdown_with_code_state(
                                 color: Color::DarkGrey,
                             });
                         } else {
-                            let prefixed = format!("│ {}", trimmed);
+                            prefixed.clear();
+                            prefixed.push_str("│ ");
+                            prefixed.push_str(trimmed);
                             for chunk in word_wrap(&prefixed, max_width) {
                                 quoted.push(LineEntry {
                                     syntax_spans: None,
@@ -363,11 +379,14 @@ pub(crate) fn markdown_with_code_state(
                     } else {
                         Color::White
                     };
-                    let bullet = if ordered_list {
-                        format!(" {}. ", list_item_count)
+                    prefixed.clear();
+                    if ordered_list {
+                        use std::fmt::Write as _;
+                        let _ = write!(prefixed, " {list_item_count}. ");
                     } else {
-                        bullet_prefix(color).to_string()
-                    };
+                        prefixed.push_str(bullet_prefix(color));
+                    }
+                    let bullet_len = prefixed.len();
                     let mut item_lines = Vec::new();
                     let mut first = true;
                     for line in acc.split('\n') {
@@ -379,7 +398,8 @@ pub(crate) fn markdown_with_code_state(
                                 color,
                             });
                         } else if first {
-                            let prefixed = format!("{}{}", bullet, trimmed);
+                            prefixed.truncate(bullet_len);
+                            prefixed.push_str(trimmed);
                             for chunk in word_wrap(&prefixed, max_width) {
                                 item_lines.push(LineEntry {
                                     syntax_spans: None,
@@ -413,11 +433,15 @@ pub(crate) fn markdown_with_code_state(
                 TagEnd::Link => {
                     if !link_url.is_empty() {
                         if in_table_cell {
-                            table_cell.push_str(&format!(" ({})", link_url));
+                            table_cell.push_str(" (");
+                            table_cell.push_str(&link_url);
+                            table_cell.push(')');
                         } else if !acc.is_empty() {
                             flush_acc(&acc, Color::DarkCyan, max_width, &mut result);
-                            let note = format!("  ↪ {}", link_url);
-                            for chunk in word_wrap(&note, max_width) {
+                            prefixed.clear();
+                            prefixed.push_str("  ↪ ");
+                            prefixed.push_str(&link_url);
+                            for chunk in word_wrap(&prefixed, max_width) {
                                 result.push(LineEntry {
                                     syntax_spans: None,
                                     text: chunk,
@@ -441,16 +465,14 @@ pub(crate) fn markdown_with_code_state(
                 }
                 TagEnd::TableHead => {
                     let cells = std::mem::take(&mut table_row);
-                    let cell_text: Vec<String> =
-                        cells.into_iter().map(|c| c.trim().to_string()).collect();
+                    let cell_text: Vec<String> = cells.into_iter().map(trim_in_place).collect();
                     if !cell_text.iter().all(|c| c.is_empty()) {
                         table_rows.push(cell_text);
                     }
                 }
                 TagEnd::TableRow => {
                     let cells = std::mem::take(&mut table_row);
-                    let cell_text: Vec<String> =
-                        cells.into_iter().map(|c| c.trim().to_string()).collect();
+                    let cell_text: Vec<String> = cells.into_iter().map(trim_in_place).collect();
                     if !cell_text.iter().all(|c| c.is_empty()) {
                         table_rows.push(cell_text);
                     }
@@ -470,11 +492,14 @@ pub(crate) fn markdown_with_code_state(
                 }
             }
             Event::Code(t) => {
-                if in_table_cell {
-                    table_cell.push_str(&format!("`{}`", t));
+                let target = if in_table_cell {
+                    &mut table_cell
                 } else {
-                    acc.push_str(&format!("`{}`", t));
-                }
+                    &mut acc
+                };
+                target.push('`');
+                target.push_str(&t);
+                target.push('`');
             }
             Event::SoftBreak | Event::HardBreak => {
                 if in_table_cell {
@@ -647,19 +672,19 @@ fn push_table_line(text: &str, color: Color, out: &mut Vec<LineEntry>) {
 
 fn format_table_row(cells: &[String], widths: &[usize], alignments: &[Alignment]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let mut cell_wrapped: Vec<Vec<String>> = Vec::new();
+    let mut cell_wrapped: Vec<SmallVec<[std::borrow::Cow<'_, str>; 1]>> =
+        Vec::with_capacity(cells.len());
     let mut max_subrows = 0usize;
 
     for (i, cell) in cells.iter().enumerate() {
         let width = widths.get(i).copied().unwrap_or(10);
-        let wrapped = if display_width(cell) <= width {
-            vec![cell.clone()]
+        let wrapped: SmallVec<[std::borrow::Cow<'_, str>; 1]> = if display_width(cell) <= width {
+            smallvec![std::borrow::Cow::Borrowed(cell.as_str())]
         } else {
-            let mut chunks = Vec::new();
-            for chunk in word_wrap(cell, width) {
-                chunks.push(chunk.to_string());
-            }
-            chunks
+            word_wrap(cell, width)
+                .into_iter()
+                .map(|chunk| std::borrow::Cow::Owned(chunk.into_string()))
+                .collect()
         };
         max_subrows = max_subrows.max(wrapped.len());
         cell_wrapped.push(wrapped);
@@ -670,7 +695,7 @@ fn format_table_row(cells: &[String], widths: &[usize], alignments: &[Alignment]
         line.push('\u{2502}');
         for (i, cw) in cell_wrapped.iter().enumerate() {
             let width = widths.get(i).copied().unwrap_or(10);
-            let text = cw.get(subrow).map(|s| s.as_str()).unwrap_or("");
+            let text = cw.get(subrow).map(|s| s.as_ref()).unwrap_or("");
             let text_w = display_width(text);
             let align = alignments.get(i).copied().unwrap_or(Alignment::None);
             let padding = width.saturating_sub(text_w);
