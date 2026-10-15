@@ -10,6 +10,16 @@ impl App<'_> {
         &self,
         owner: &crate::extras::mcp::elicitation::FrontendOwner,
     ) -> bool {
+        self.mcp_frontend_owner_current_with(owner, true)
+    }
+    /// `revalidate == false` keeps the cheap identity checks (session,
+    /// workspace, generation) but skips the operator work's MCP source
+    /// revalidation; prompt creation and replies always pass `true`.
+    pub(super) fn mcp_frontend_owner_current_with(
+        &self,
+        owner: &crate::extras::mcp::elicitation::FrontendOwner,
+        revalidate: bool,
+    ) -> bool {
         match owner {
             crate::extras::mcp::elicitation::FrontendOwner::Main(id) => {
                 self.run.is_running
@@ -32,7 +42,8 @@ impl App<'_> {
                         .and_then(|state| state.work.as_ref())
                         .is_some_and(|work| {
                             work.id == *generation
-                                && work.valid(&self.ui.session.id, &self.ui.workspace)
+                                && (!revalidate
+                                    || work.valid(&self.ui.session.id, &self.ui.workspace))
                         })
             }
         }

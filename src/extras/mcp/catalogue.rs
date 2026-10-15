@@ -201,12 +201,19 @@ pub(crate) fn operand(text: &str) -> Option<(String, String)> {
 }
 
 pub(crate) fn cached_choices(client: &McpClientHandle) -> (Vec<(String, String)>, Vec<String>) {
+    // Check the cached catalogue first: a server without prompts/resources
+    // (or whose discovery is still pending) never pays for source currency.
+    // Each later use revalidates the source again at RPC.
+    let Some(catalogue) = client
+        .auxiliary
+        .get()
+        .filter(|catalogue| !catalogue.prompts.is_empty() || !catalogue.resources.is_empty())
+    else {
+        return Default::default();
+    };
     if !source_current(client) {
         return Default::default();
     }
-    let Some(catalogue) = client.auxiliary.get() else {
-        return Default::default();
-    };
     let server = component(&client.server_name);
     let commands = catalogue
         .prompts

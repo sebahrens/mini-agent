@@ -51,10 +51,17 @@ impl QuestionState {
         Ok(state)
     }
     pub(crate) fn abandoned(&self) -> bool {
+        self.abandoned_with(true)
+    }
+    /// `revalidate == false` skips the bound origin's source revalidation and
+    /// checks only the cheap reply-channel state; replies stay authoritative.
+    pub(crate) fn abandoned_with(&self, revalidate: bool) -> bool {
         #[cfg(feature = "mcp")]
-        if self.origin.as_ref().is_some_and(|origin| !(origin.valid)()) {
+        if revalidate && self.origin.as_ref().is_some_and(|origin| !(origin.valid)()) {
             return true;
         }
+        #[cfg(not(feature = "mcp"))]
+        let _ = revalidate;
         self.request
             .as_ref()
             .is_some_and(|request| request.reply.is_closed())

@@ -1995,7 +1995,11 @@ impl<'a> App<'a> {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
-            self.expire_abandoned_permission()?;
+            // Source revalidation follows the existing 1 s tick below; the
+            // cheap reply/owner checks still run on every iteration.
+            self.expire_abandoned_prompts(
+                self.last_branch_check.elapsed() >= Duration::from_secs(1),
+            )?;
             #[cfg(feature = "subagents")]
             if self.permission_prompt.is_none()
                 && self.question_prompt.is_none()
@@ -2464,19 +2468,27 @@ impl<'a> App<'a> {
     }
 
     fn expire_abandoned_permission(&mut self) -> anyhow::Result<()> {
+        self.expire_abandoned_prompts(true)
+    }
+
+    /// Retire prompts whose owner or reply channel is gone. MCP source
+    /// revalidation (`revalidate`) is the expensive part: the event loop runs
+    /// it only on the 1 s tick, while prompt creation, key handling and the
+    /// reply paths always revalidate before an answer can be delivered.
+    fn expire_abandoned_prompts(&mut self, revalidate: bool) -> anyhow::Result<()> {
         #[cfg(feature = "mcp")]
         let stale_mcp_question = self
             .question_prompt
             .as_ref()
             .and_then(QuestionState::origin_owner)
-            .is_some_and(|owner| !self.mcp_frontend_owner_current(owner));
+            .is_some_and(|owner| !self.mcp_frontend_owner_current_with(owner, revalidate));
         #[cfg(not(feature = "mcp"))]
         let stale_mcp_question = false;
         if stale_mcp_question
             || self
                 .question_prompt
                 .as_ref()
-                .is_some_and(QuestionState::abandoned)
+                .is_some_and(|prompt| prompt.abandoned_with(revalidate))
         {
             if let Some(prompt) = self.question_prompt.take() {
                 prompt.finish(&mut self.renderer)?;
@@ -2489,7 +2501,7 @@ impl<'a> App<'a> {
             .permission_prompt
             .as_ref()
             .and_then(PermissionState::origin_owner)
-            .is_some_and(|owner| !self.mcp_frontend_owner_current(owner));
+            .is_some_and(|owner| !self.mcp_frontend_owner_current_with(owner, revalidate));
         #[cfg(not(feature = "mcp"))]
         let stale_mcp_permission = false;
         #[cfg(feature = "subagents")]
@@ -2504,7 +2516,7 @@ impl<'a> App<'a> {
             || self
                 .permission_prompt
                 .as_ref()
-                .is_some_and(PermissionState::abandoned)
+                .is_some_and(|prompt| prompt.abandoned_with(revalidate))
         {
             if let Some(prompt) = self.permission_prompt.take() {
                 prompt.decline_on_cancel(&self.ui);
