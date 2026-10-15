@@ -77,6 +77,16 @@ pub(crate) fn clone_subagent_event_tx() -> Option<mpsc::Sender<AgentEvent>> {
     SUBAGENT_EVENT_TX.try_with(|tx| tx.clone()).ok()
 }
 
+/// Whether delegation is configured for runs started now (the task tool can
+/// then route child events through the parent runner's event channel).
+pub(crate) fn installed() -> bool {
+    #[cfg(test)]
+    if TEST_CONFIG.try_with(|_| ()).is_ok() {
+        return true;
+    }
+    CONFIG.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 pub(crate) fn with_config<F, R>(f: F) -> Result<R, ConfigNotInitialized>
 where
     F: FnOnce(&SubagentConfig) -> R,

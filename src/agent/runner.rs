@@ -3103,6 +3103,23 @@ where
     .0
 }
 
+/// Capacity of a run's single ordered event channel.
+const RUN_EVENT_CAPACITY: usize = 32;
+/// Capacity when delegated children share the run's channel: several children
+/// plus the parent's token stream must not stall child tool execution while the
+/// UI repaints. Every event is still delivered, in order (they are persisted
+/// history), so the channel stays bounded and lossless rather than dropping.
+#[cfg(feature = "subagents")]
+const SUBAGENT_RUN_EVENT_CAPACITY: usize = 512;
+
+fn run_event_capacity() -> usize {
+    #[cfg(feature = "subagents")]
+    if crate::extras::subagents::installed() {
+        return SUBAGENT_RUN_EVENT_CAPACITY;
+    }
+    RUN_EVENT_CAPACITY
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_with_start_mode<M>(
     agent: Agent<M>,
@@ -3125,7 +3142,7 @@ where
     let spend_run = crate::spend::run::Run::current();
     let question_turn = crate::question::QuestionTurn::current();
     let retry_config = retry_config.bounded();
-    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(run_event_capacity());
     let steering = crate::agent::steering::Steering::default();
     let steering_hook = crate::agent::steering::SteeringHook {
         steering: steering.clone(),
@@ -7429,6 +7446,54 @@ mod tests {
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("unknown stream item variant"));
         assert!(output.contains("cacheStatus"));
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_enabled_runs_buffer_child_events_beyond_the_default_capacity() {
+        assert_eq!(super::run_event_capacity(), super::RUN_EVENT_CAPACITY);
+        let cfg = crate::config::Config::default();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let configured = crate::extras::subagents::SubagentConfig {
+            client,
+            provider_name: "openrouter".into(),
+            model_name: "fixture".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 2,
+            config: cfg,
+        };
+        crate::extras::subagents::scope_test_config(configured, async {
+            let capacity = super::run_event_capacity();
+            assert_eq!(capacity, super::SUBAGENT_RUN_EVENT_CAPACITY);
+            // Four children's bursts fit without waiting for a busy consumer,
+            // and every event still arrives, in send order.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(capacity);
+            for index in 0..4 * super::RUN_EVENT_CAPACITY * 2 {
+                tx.try_send(crate::event::AgentEvent::SubagentToolCall {
+                    name: index.to_string().into(),
+                    args: serde_json::json!({}),
+                })
+                .expect("child events must not wait at the default capacity");
+            }
+            drop(tx);
+            let mut received = 0;
+            while let Some(event) = rx.recv().await {
+                let crate::event::AgentEvent::SubagentToolCall { name, .. } = event else {
+                    panic!("unexpected event");
+                };
+                assert_eq!(name, received.to_string());
+                received += 1;
+            }
+            assert_eq!(received, 4 * super::RUN_EVENT_CAPACITY * 2);
+        })
+        .await;
     }
 
     #[cfg(feature = "subagents")]
