@@ -220,3 +220,50 @@ host and port.
 **Permission prompts not appearing**: ensure the client implements
 `session/request_permission` for ACP protocol version 1. Check the client's ACP
 support in its documentation.
+
+### Signed-out native Chat view acceptance
+
+Keep the existing VS Code 1.91 compatibility smoke. It tests the installed
+extension's ACP path, but its direct session export does not prove Chat view
+rendering. VS Code 1.122 added [signed-out, air-gapped BYOK
+support](https://code.visualstudio.com/updates/v1_122#_use-byok-without-a-github-sign-in).
+The separate native UI fixture uses a verified official 1.122.1 or newer host and
+an isolated profile, extension directory, workspace, and application paths.
+
+`test/chat-ui-provider` is a test-only extension implementing the supported
+[Language Model Chat Provider API](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider).
+It supplies a selectable local model so the host can construct Chat requests
+without an account. The production `@mini-agent` participant still runs from the
+installed VSIX and invokes its ordinary ACP backend. The acceptance requires
+zero calls to the fixture model's response handler: rendered responses must come
+from the separately observed loopback provider through ACP.
+
+From `editors/vscode`, run the bounded native fixture with an existing candidate
+VSIX and debug binary; it performs no Rust build or sign-in:
+
+```sh
+python3 test/chat-ui-owner.test.py
+python3 test/chat-ui-owner.py \
+  --root /private/tmp/ma-chat-ui-UNIQUE \
+  --app '/path/to/verified/Visual Studio Code.app' \
+  --vsix /path/to/current-candidate.vsix \
+  --binary /path/to/installed/debug/mini-agent \
+  --exercise-ui
+```
+
+Use a nonexistent root path. Verify the official archive against Microsoft's
+update metadata and validate the extracted application's signature before launch.
+Node 22 or newer supplies the controller's built-in WebSocket client. The fixture
+preserves `HOME`, does not inherit provider credentials, and keeps its dummy key,
+configuration, and all model endpoints inside its own test boundary.
+
+The driver types into the real Chat input using the owned Electron debugging
+connection. It captures workbench DOM and screenshots of the streamed response,
+permission picker, and completed or cancelled turns. It chooses **Allow once**
+and **Deny once**, requires the actual allowed file content and exact denial in
+provider requests, and cancels through Chat while the picker is visible. It
+requires six loopback requests, no cancelled tool result, and normal application
+exit. A finite owner cleans up its process group and server on failure; native
+acceptance also records process and listener retirement. This proves the tested
+platform's UI flow; it does not supply Linux/Windows evidence or strengthen that
+platform's sandbox claims.

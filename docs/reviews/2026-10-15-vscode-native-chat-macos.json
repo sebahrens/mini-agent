@@ -1,0 +1,265 @@
+{
+  "bead": "mini-agent-mxtlv",
+  "status": "actual macOS installed-VSIX Chat rendering + permission/cancel acceptance passed; other platform evidence not supplied",
+  "main_extension_source_commit": "2fbcb7919f0af7ab7e1d37b058c49cf0bc0273f8",
+  "host": {
+    "url": "https://vscode.download.prss.microsoft.com/dbazure/download/stable/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/VSCode-darwin-arm64.zip",
+    "name": "1.122.1",
+    "version": "8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e",
+    "productVersion": "1.122.1",
+    "hash": "fe2fd157bda9d6ed8a6a010100f61dcb30149d2a",
+    "timestamp": 1780040012948,
+    "sha256hash": "a1779965602fa549f9288b44391f325fd890d05a7a1335c6bb1d23bd86d9aad5",
+    "supportsFastUpdate": true
+  },
+  "host_signature": "codesign --verify --deep --strict --verbose=2 PASS unrestricted; restricted validation was not authoritative",
+  "binary": {
+    "path": "/private/tmp/mini-agent-ci-repair-install/bin/mini-agent",
+    "sha256": "92277b6a6cdea1b4da67c51c271419f21b18b29b4bc058ee715468bc0860932e",
+    "source": "Existing Root-provided installed debug artifact; no Rust compilation here"
+  },
+  "vsix": {
+    "path": "/private/tmp/mini-agent-mxtlv-current/current-main.vsix",
+    "sha256": "8b682feeec535a2033caf1d2f176c959a6197971d8740adaf5595a9657986a79",
+    "bundle_sha256": "150f3c1a15566809601b050e84f4561523fd4e7d51744287f3a377708a7dfdc6",
+    "scope": "Native test candidate, not a distribution/license packaging acceptance",
+    "embedded_binary_sha256": "92277b6a6cdea1b4da67c51c271419f21b18b29b4bc058ee715468bc0860932e"
+  },
+  "result": {
+    "root": "/private/tmp/ma-chat122-r3",
+    "provider_port": 53668,
+    "home_preserved": true,
+    "errors": [],
+    "pid": 33346,
+    "debug_port": 53671,
+    "binary_sha256": "92277b6a6cdea1b4da67c51c271419f21b18b29b4bc058ee715468bc0860932e",
+    "vsix_sha256": "8b682feeec535a2033caf1d2f176c959a6197971d8740adaf5595a9657986a79",
+    "posts": 6,
+    "ui_acceptance": {
+      "rendered": true,
+      "allow": true,
+      "deny": true,
+      "cancel_closes_picker_without_tool_result": true,
+      "fixture_model_response_calls": 0
+    },
+    "exit_before_cleanup": 0,
+    "forced_cleanup": [],
+    "child_exit_codes": [
+      0,
+      0
+    ]
+  },
+  "cleanup": {
+    "owned_root_processes_remaining": [],
+    "listeners_closed": {
+      "provider": true,
+      "cdp": true
+    },
+    "owned_app_process_group": 33346,
+    "owned_app_process_group_members_remaining": []
+  },
+  "native_command": "python3 test/chat-ui-owner.py --root /private/tmp/ma-chat122-r3 --app <verified1.122.1.app> --vsix <current-main.vsix> --binary /private/tmp/mini-agent-ci-repair-install/bin/mini-agent --exercise-ui",
+  "controls": {
+    "real_chat": "Real workbench DOM and screenshot show Mini Agent streamed OFFLINE_IDE_CHAT_RENDERED",
+    "allow_once": "Actual four-option production QuickPick; observed tool result contains OFFLINE_IDE_FIXTURE",
+    "deny_once": "Actual picker Deny once; exact Permission denied by user and no fixture bytes in that result",
+    "cancel": "Actual Chat Cancel while picker visible; picker closes, Chat idle, no cancelled tool result or follow-up model request",
+    "no_auth": "Fresh isolated profile, Sign In button remains visible, no auth APIs or login actions",
+    "not_export_only": "No require of installed extension exports, no direct ensureSession invocation; actual Chat input submits prompt",
+    "fixture_response": "Local model registered and selectable; its response handler invoked0 times"
+  },
+  "evidence": [
+    {
+      "path": "/private/tmp/ma-chat122-r3/cleanup-verification.json",
+      "sha256": "623c9f17a899ad5978011a7224c8c3b7a1ed5f074f6a671d114227666c2da343"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/dom-latest.json",
+      "sha256": "8edf2dc632c8e19528860ed39dc5661817b4f01031929dea92d6390b714df4d4"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/fixture-model-events.jsonl",
+      "sha256": "b6a9ead9f8daefbd81e764d45700cb73261aa2ba0615e8295fd7a83f6310c9e2"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/host.json",
+      "sha256": "fe08d47a2e8127fadb4813744df9444cb3bec9e1db921de2cd45a3b33ffa61f0"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/host.log",
+      "sha256": "cd11a80e5b350ec2d69d2f2207e4cf3975b9211820404d18041f10907602aa6f"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/install.log",
+      "sha256": "9d7fe2282259ba3082998650df0d6e10bee5a9dea83844245576eb52a10f68b8"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-allow-picker.json",
+      "sha256": "026045ac973750cdd84d85feaf797e1feca29537978d61ea006e9397d6aab716"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-allow-picker.png",
+      "sha256": "375349e35f561032f1f6f0ad54e56c649d5c462ff4ca61332bb80d0ea29712e8"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-allow-rendered.json",
+      "sha256": "9c871b64540393b6bc5d3e290d59da1f2f3b89c80865a6542e3e7a42b8315121"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-allow-rendered.png",
+      "sha256": "39bf2a19cebd22bf454bcc0fbe03c21a003329ec3766796842fd0e18fbd54956"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-cancel-idle.json",
+      "sha256": "8edf2dc632c8e19528860ed39dc5661817b4f01031929dea92d6390b714df4d4"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-cancel-idle.png",
+      "sha256": "3b415be7c2e66123d70ae240fc7796c738f6f41b3921f6dea60feae31e58b06e"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-cancel-pending.json",
+      "sha256": "59459bc29fa296a2248ce861f8939f4782cbf38ee713c4c27cb8b05287bb32fb"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-cancel-pending.png",
+      "sha256": "67b0ea078052e3286ecda6cf9b16afc8cd7277297a8c5ac0d742c272eb0cea04"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-deny-picker.json",
+      "sha256": "0879a9f58438ceb26589bd07de60960f4b72ba9ca74ce9c8cedd81d41302f635"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-deny-picker.png",
+      "sha256": "1c5ee8db64cefc7a9c9c24cd8ffa24fa40c994f88e064ec330963b855b6ba26d"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-deny-rendered.json",
+      "sha256": "7ee4187a361fb894fe581896d4fc156ab940d1e200e7968eda66795dc60e1862"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/permission-deny-rendered.png",
+      "sha256": "dca94b883dc0a59d3002c87d0febac3c28b54172b57c7c1ddf010dfb850ec5f5"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/provider-events.jsonl",
+      "sha256": "dfe8bd2a12260494cf1ca07428cf16c791584aa05c61758a340217d8227bd743"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/real-chat-rendered.json",
+      "sha256": "c2726fc569fb67a7ac8b069bda2288a07d8ebcac44416e576b5574b34b8de1a0"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/real-chat-rendered.png",
+      "sha256": "3010e374b0a3eb6fb1a5011c686b99b6ee6fff616d30fac63c6e1a13c7e161e8"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/retirement.json",
+      "sha256": "e46ac23cad117d647ae1165be8ee6c2334d1c386e8d6ba5186a86bae2ff48081"
+    },
+    {
+      "path": "/private/tmp/ma-chat122-r3/ui-actions.log",
+      "sha256": "17965ee5b7fdd8cf030f020fbad7b9084d84a36f6811fab5d94f689f4161c670"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "editors/vscode/test/chat-ui-owner.py",
+      "sha256": "9449c1ac10d0c8056604ee26c59290bf3f9e963c1b312f38c8298cbe7cb390cb"
+    },
+    {
+      "path": "editors/vscode/test/chat-ui-owner.test.py",
+      "sha256": "30f0f3854d1469b68c67ee4b8455503d9c1733b55ffa14c34ffcdf4b199452a7"
+    },
+    {
+      "path": "editors/vscode/test/chat-ui-cdp.mjs",
+      "sha256": "51d95c64ae8c2d8c41b145320923bbb826b2cff7f76129b27b760e892f17438e"
+    },
+    {
+      "path": "editors/vscode/test/chat-ui-provider/package.json",
+      "sha256": "09ade0dc491b2f29386b2b107be8d7a907ebb9c057922f5b60786e9e92e6f6e7"
+    },
+    {
+      "path": "editors/vscode/test/chat-ui-provider/extension.cjs",
+      "sha256": "ff66f38c03d2978ebc4ac6d95f814209f00ddb8877806fdfea91fdd25a129f34"
+    },
+    {
+      "path": "docs/vscode-acp-setup.md",
+      "sha256": "7f6c83abef5c547260eb8b722e2155afe0f085bb40847aa3cca339e7ff2dd085"
+    }
+  ],
+  "unit_tests": {
+    "command": "python3 test/chat-ui-owner.test.py",
+    "result": "3PASS/0.001s",
+    "scope": "scripted tool-call wire and strict actual allow/deny/cancel evidence validation only"
+  },
+  "syntax": [
+    "python3 -m py_compile test/chat-ui-owner.py PASS",
+    "node --check test/chat-ui-cdp.mjs PASS",
+    "node --check test/chat-ui-provider/extension.cjs PASS"
+  ],
+  "official_sources": [
+    "https://code.visualstudio.com/updates/v1_122#_use-byok-without-a-github-sign-in",
+    "https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider",
+    "https://code.visualstudio.com/api/extension-guides/ai/chat"
+  ],
+  "preserved_limits": [
+    "Old1.91 compatibility suite unchanged",
+    "No Linux/Windows native host evidence supplied",
+    "No account/profile changes, Cargo, push, or CI dispatch",
+    "Initial1.122 built-in custom endpoint attempt yielded Language model unavailable/0POST and normalquit0; retained separately under ma-chat122-r1",
+    "Manual exploratory proof r2 retained; extra postcancel prompt quit before dispatch excluded from acceptance"
+  ],
+  "production_extension_sources": [
+    {
+      "path": "editors/vscode/src/chat.ts",
+      "sha256": "2e8b08ba55741d23f1bd0f868b4ad1266b55dc9e81a56a832387ad20c3ec07ca"
+    },
+    {
+      "path": "editors/vscode/src/config.ts",
+      "sha256": "3cdf638aedc67e5cb177d9939afffc9219143b2b6b3d795b7260f15206a38d16"
+    },
+    {
+      "path": "editors/vscode/src/conversation.ts",
+      "sha256": "2b13095df773b5ce0fb7769d981a57f61090afda5d21885f85db383043e702e8"
+    },
+    {
+      "path": "editors/vscode/src/diagnostics.ts",
+      "sha256": "1110820d5b992b97ee96db265a6dab32bfcad728aaa304897ef43f5e8c79fc02"
+    },
+    {
+      "path": "editors/vscode/src/executable.ts",
+      "sha256": "901c9cbea6a7af7da3d56b7448277229730a975ba7120ac6462ccc30c37b07ed"
+    },
+    {
+      "path": "editors/vscode/src/extension.ts",
+      "sha256": "2d460096a6aa7116e65835a54334eddca8aee89933cdb2aa3293d81ae2c1f68c"
+    },
+    {
+      "path": "editors/vscode/src/log.ts",
+      "sha256": "8191af81ee3757c081bf94cef1c49b15432aa6727e0878d7dbf46423097b9f7b"
+    },
+    {
+      "path": "editors/vscode/src/permission.ts",
+      "sha256": "fbfe894fae949b693c3147b2d61dc7e351986ed30a03a43f554fec6a6ca85354"
+    },
+    {
+      "path": "editors/vscode/src/protocolSession.ts",
+      "sha256": "2c8b321038598b521f09fdd2ddfe8939cce3f062b84034689dcdcda8c45a3918"
+    },
+    {
+      "path": "editors/vscode/src/session.ts",
+      "sha256": "846e87ccf7f103aeb93fc66ae5c943e5bde9c8a573eb833c24ea83f93f9adc70"
+    },
+    {
+      "path": "editors/vscode/src/trust.ts",
+      "sha256": "139632df65e09bf92b5e266675f2bbf09a8c7bbd9da18ae4c326854c4e0d5a0e"
+    }
+  ],
+  "patch": {
+    "path": "/private/tmp/mini-agent-mxtlv-native-chat-owned.patch",
+    "sha256": "7fcd3e049b2749c20b96ed2c1047bbb33931a8c7bec03ab40452d7e813ec6e16",
+    "apply_check": "PASS against current Main, read-only git apply --check"
+  },
+  "integration_note": "Executed fixture hashes describe the frozen macOS acceptance cohort; integration removes one whitespace-only blank line. Linux and Windows actual Chat evidence is pending. No production extension or Rust changes in this fixture commit."
+}

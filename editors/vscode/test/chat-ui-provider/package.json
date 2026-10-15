@@ -1,0 +1,1 @@
+{"name":"offline-chat-fixture","publisher":"mini-agent-tests","version":"0.0.1","engines":{"vscode":"^1.122.0"},"main":"./extension.cjs","activationEvents":["onStartupFinished"],"contributes":{"languageModelChatProviders":[{"vendor":"mini-agent-offline-fixture","displayName":"Owned Offline Fixture"}]}}
