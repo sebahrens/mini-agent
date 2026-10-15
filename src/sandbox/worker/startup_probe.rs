@@ -10,6 +10,7 @@ use super::WorkerContainmentStatus;
 /// preflight result. Dropping this owner never aborts a running native probe.
 pub(crate) struct StartupWorkerProbe {
     task: tokio::task::JoinHandle<Option<WorkerContainmentStatus>>,
+    scope: Arc<AgentWorkScope>,
     cleanup: AgentRunCleanupGuard,
 }
 
@@ -52,9 +53,24 @@ impl StartupWorkerProbe {
                 }),)
             })
             .await;
-        Self { task, cleanup }
+        Self {
+            task,
+            scope,
+            cleanup,
+        }
     }
 
+    /// Called once its owner (TUI, ACP or headless run) has finished, when
+    /// nothing can consume the result any more. A probe still queued on the
+    /// blocking pool observes the cancellation and skips the native preflight
+    /// (an early quit no longer waits for it); a running preflight is joined
+    /// unchanged through its cleanup.
+    pub(crate) async fn retire_after_owner_exit(self) -> anyhow::Result<()> {
+        self.scope.cancellation_handle().cancel();
+        self.retire().await
+    }
+
+    /// Join the preflight to completion through its cleanup.
     pub(crate) async fn retire(self) -> anyhow::Result<()> {
         let result = self.task.await;
         self.cleanup.settle().await;
@@ -220,6 +236,52 @@ mod tests {
         .unwrap();
         assert!(matches!(
             result.get(),
+            Some(WorkerContainmentStatus::Available { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_worker_probe_owner_exit_skips_a_queued_probe_and_joins_a_running_one() {
+        // Queued: the gate holds the blocking child before the probe body.
+        let (scope, entered, release) = AgentWorkScope::new_with_blocking_test_gate();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = ran.clone();
+        let probe = StartupWorkerProbe::start_in(scope.clone(), move || {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            available()
+        })
+        .await;
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)).unwrap())
+            .await
+            .unwrap();
+        let retirement = tokio::spawn(probe.retire_after_owner_exit());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scope.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.release();
+        retirement.await.unwrap().unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(scope.active_children(), 0);
+
+        // Running: the native preflight completes and is joined unchanged.
+        let completed = Arc::new(OnceLock::new());
+        let result = completed.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let probe = StartupWorkerProbe::start_in(AgentWorkScope::new(), move || {
+            let _ = started.send(());
+            std::thread::sleep(Duration::from_millis(20));
+            result.set(available()).unwrap();
+            available()
+        })
+        .await;
+        entered.await.unwrap();
+        probe.retire_after_owner_exit().await.unwrap();
+        assert!(matches!(
+            completed.get(),
             Some(WorkerContainmentStatus::Available { .. })
         ));
     }

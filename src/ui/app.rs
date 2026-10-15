@@ -2348,27 +2348,37 @@ impl<'a> App<'a> {
         self.pause_event_thread();
 
         // Retire owned work before closing the services it can still use.
+        // Side questions, the main run and the prebuild are independent
+        // owners: cancel all of them at once and join them concurrently, each
+        // within its own bound. The prebuild cancels its scope first and then
+        // joins, so an in-flight MCP connect still completes its cleanup.
         const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
         self.btw_pricing.cancel_all();
-        for (_, abort, task, scope) in self.btw_abort.drain(..) {
-            abort.abort();
-            if let Err(error) =
-                retire_scoped_task(task, scope, "side-question", TEARDOWN_TIMEOUT).await
-            {
-                tracing::warn!(%error, "TUI side-question cleanup failed");
+        let side_questions =
+            futures::future::join_all(self.btw_abort.drain(..).map(|(_, abort, task, scope)| {
+                abort.abort();
+                retire_scoped_task(task, scope, "side-question", TEARDOWN_TIMEOUT)
+            }));
+        let prebuild = self.prebuild.take();
+        let prebuild = async move {
+            match prebuild {
+                Some(prebuild) => prebuild.retire(TEARDOWN_TIMEOUT).await,
+                None => Ok(()),
             }
+        };
+        let (side_questions, run, prebuild) =
+            tokio::join!(side_questions, self.run.retire(TEARDOWN_TIMEOUT), prebuild);
+        for error in side_questions.into_iter().filter_map(Result::err) {
+            tracing::warn!(%error, "TUI side-question cleanup failed");
         }
-
-        if let Err(error) = self.run.retire(TEARDOWN_TIMEOUT).await {
+        if let Err(error) = run {
             tracing::warn!(%error, "TUI main-run cleanup failed");
         }
         #[cfg(feature = "git-worktree")]
         if let Err(error) = self.settle_git_usage() {
             tracing::warn!(%error,"Git usage persistence during teardown failed");
         }
-        if let Some(prebuild) = self.prebuild.take()
-            && let Err(error) = prebuild.retire(TEARDOWN_TIMEOUT).await
-        {
+        if let Err(error) = prebuild {
             tracing::warn!(%error, "TUI prebuild cleanup failed");
         }
 

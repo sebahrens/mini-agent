@@ -1871,7 +1871,7 @@ impl Startup {
         let result = heap_future(|| startup.dispatch_inner()).await;
         #[cfg(feature = "js")]
         if let Some(probe) = probe {
-            probe.retire().await?;
+            probe.retire_after_owner_exit().await?;
         }
         result
     }
