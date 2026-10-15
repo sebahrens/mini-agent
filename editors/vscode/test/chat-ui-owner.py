@@ -3,7 +3,7 @@
 import argparse, hashlib, http.server, json, os, signal, socket, subprocess, threading, time, shutil
 import urllib.request
 from pathlib import Path
-from chat_ui_platform import NativeProcesses, fixture_environment, install_command, launch_command
+from chat_ui_platform import NativeProcesses, fixture_environment, install_command, launch_command, prepare_private_fixture
 
 def scripted_response(payload, fixture):
  messages = payload.get('messages', [])
@@ -67,12 +67,13 @@ base_url = "http://127.0.0.1:{port}/v1"
 api_key_env = "MINI_AGENT_IDE_FIXTURE_KEY"
 api_style = "completions"
 ''');(root/'config/config.toml').chmod(0o600)
+ private_initialization=prepare_private_fixture(root,os.environ)
  env=fixture_environment(os.environ)
  env['MINI_AGENT_CHAT_FIXTURE_EVENTS']=str(root/'fixture-model-events.jsonl')
  env.update({'ZS_CONFIG_DIR':str(root/'config'),'ZS_DATA_DIR':str(root/'data'),'ZS_LOCAL_DATA_DIR':str(root/'local-data'),'ZS_STATE_DIR':str(root/'state'),'ZS_CACHE_DIR':str(root/'cache'),'ZS_CREDENTIALS_DIR':str(root/'credentials'),'MINI_AGENT_IDE_FIXTURE_KEY':'unused-local-fixture-key'})
  common=['--user-data-dir',str(root/'profile'),'--extensions-dir',str(root/'extensions')]
  processes=NativeProcesses()
- children=[];forced=[];status={'root':str(root),'provider_port':port,'home_preserved':env.get('HOME')==os.environ.get('HOME'),'errors':[]}
+ children=[];forced=[];status={'root':str(root),'provider_port':port,'home_preserved':env.get('HOME')==os.environ.get('HOME'),'errors':[],'private_fixture_initialization':private_initialization}
  def run_owned(args,log,timeout):
   with log.open('wb') as output:
    c=processes.start(args,env,output);children.append(c)

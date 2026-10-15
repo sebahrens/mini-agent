@@ -17,6 +17,66 @@ def fixture_environment(inherited, platform=sys.platform):
     return {key: inherited[key] for key in keys if key in inherited}
 
 
+_WINDOWS_PRIVATE_FIXTURE_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$allowed = @($user.Value, 'S-1-5-18')
+$rows = @()
+foreach ($relative in @('', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml')) {
+    $path = if ($relative) { Join-Path $env:MINI_AGENT_CHAT_PRIVATE_ROOT $relative } else { $env:MINI_AGENT_CHAT_PRIVATE_ROOT }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Fixture private path is a reparse point' }
+    $acl = if ($item.PSIsContainer) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+    $acl.SetOwner($user)
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = if ($item.PSIsContainer) { [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [Security.AccessControl.InheritanceFlags]::None }
+    foreach ($sidValue in $allowed) {
+        $sid = New-Object Security.Principal.SecurityIdentifier($sidValue)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+        [void]$acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $path -AclObject $acl
+    $actual = Get-Acl -LiteralPath $path
+    $owner = $actual.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($owner -ne $user.Value -or -not $actual.AreAccessRulesProtected -or $rules.Count -ne 2) { throw 'Private fixture owner/DACL mismatch' }
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -notin $allowed -or $rule.IsInherited -or $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw 'Private fixture ACL is not restricted to current user and SYSTEM' }
+    }
+    $rows += @{relative=$relative;owner=$owner;protected=$true}
+}
+ConvertTo-Json -Compress -InputObject $rows
+"""
+
+
+def prepare_private_fixture(root, inherited, platform=sys.platform):
+    """Initialize only newly created fixture paths, including elevated-token owners."""
+    if platform != 'win32':
+        return None
+    import json
+    import stat
+    for relative in ['', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml']:
+        path = root / relative
+        metadata = path.lstat()
+        expected_file = relative == 'config/config.toml'
+        if stat.S_ISLNK(metadata.st_mode) or (metadata.st_file_attributes & 0x400):
+            raise ValueError('fixture private path must not be a reparse point')
+        if expected_file:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError('fixture config must be a singly linked regular file')
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError('fixture private root must be a directory')
+    system_root = inherited.get('SystemRoot') or inherited['SYSTEMROOT']
+    powershell = str(Path(system_root) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+    env = fixture_environment(inherited, 'win32')
+    env['MINI_AGENT_CHAT_PRIVATE_ROOT'] = str(root)
+    completed = subprocess.run([powershell, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', _WINDOWS_PRIVATE_FIXTURE_SCRIPT], env=env, capture_output=True, text=True, timeout=30, check=True)
+    rows = json.loads(completed.stdout)
+    if len(rows) != 8 or any(not row['protected'] for row in rows):
+        raise ValueError('incomplete private fixture initialization')
+    return rows
+
+
 def launch_command(app, platform=sys.platform):
     if platform == 'darwin':
         return [str(app / 'Contents/MacOS/Code')]

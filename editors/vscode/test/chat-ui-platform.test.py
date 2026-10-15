@@ -1,9 +1,12 @@
 """Deterministic platform adapter checks; native UI proof runs separately."""
 from pathlib import Path, PurePosixPath
 import subprocess
+import json
+import stat
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from chat_ui_platform import NativeProcesses, fixture_environment, install_command, launch_command, windows_command_line
+from chat_ui_platform import NativeProcesses, fixture_environment, install_command, launch_command, windows_command_line, prepare_private_fixture
 
 class PlatformTests(unittest.TestCase):
     def test_preserve_home_platform_runtime_and_exclude_account_secrets(self):
@@ -78,6 +81,38 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(result['forced_descendants'])
             self.assertEqual(result['forced_groups'],[42])
             self.assertEqual(result['members_remaining'],0)
+
+    def test_private_initialization_is_noop_on_existing_unix_platforms(self):
+        with patch('chat_ui_platform.subprocess.run') as run, patch('chat_ui_platform.Path.lstat') as metadata:
+            for platform in ['darwin','linux']:
+                self.assertIsNone(prepare_private_fixture(Path('/owned'),{},platform))
+            run.assert_not_called()
+            metadata.assert_not_called()
+
+    def test_windows_private_initialization_confines_paths_and_strips_secrets(self):
+        root=Path('C:/owned fixture')
+        observed=[]
+        def metadata(path):
+            observed.append(path.relative_to(root).as_posix())
+            isfile=path.name=='config.toml'
+            return SimpleNamespace(st_mode=stat.S_IFREG if isfile else stat.S_IFDIR,st_file_attributes=0,st_nlink=1)
+        rows=[{'relative':name,'owner':'S-1-5-21-fixture','protected':True} for name in ['', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml']]
+        with patch('chat_ui_platform.Path.lstat',metadata), patch('chat_ui_platform.subprocess.run',return_value=SimpleNamespace(stdout=json.dumps(rows))) as run:
+            self.assertEqual(prepare_private_fixture(root,{'SystemRoot':'C:/Windows','HOME':'original','OPENAI_API_KEY':'secret'},'win32'),rows)
+        self.assertEqual(observed,['.', 'config', 'data', 'local-data', 'state', 'cache', 'credentials', 'config/config.toml'])
+        command=run.call_args.args[0]
+        self.assertTrue(command[0].endswith('WindowsPowerShell/v1.0/powershell.exe'))
+        self.assertEqual(command[1:5],['-NoLogo','-NoProfile','-NonInteractive','-Command'])
+        self.assertEqual(run.call_args.kwargs['env'],{'HOME':'original','SystemRoot':'C:/Windows','MINI_AGENT_CHAT_PRIVATE_ROOT':str(root)})
+        self.assertTrue(run.call_args.kwargs['check'])
+        self.assertEqual(run.call_args.kwargs['timeout'],30)
+
+    def test_windows_private_initialization_rejects_link_before_mutation(self):
+        metadata=SimpleNamespace(st_mode=stat.S_IFDIR,st_file_attributes=0x400,st_nlink=1)
+        with patch('chat_ui_platform.Path.lstat',return_value=metadata), patch('chat_ui_platform.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError,'reparse'):
+                prepare_private_fixture(Path('C:/owned'),{'SystemRoot':'C:/Windows'},'win32')
+            run.assert_not_called()
 
     def test_windows_uses_job_for_start_stop_and_retirement(self):
         with patch('chat_ui_platform.sys.platform','win32'), patch('chat_ui_platform._WindowsJob') as job:
