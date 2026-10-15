@@ -1,0 +1,506 @@
+{
+  "beads": [
+    "mini-agent-i7ro6.120",
+    "mini-agent-i7ro6.81.4",
+    "mini-agent-i7ro6.47"
+  ],
+  "base": "524a8346",
+  "scope": {
+    "120": "All three existing local production path dependencies join deterministic content hashing and build-script rerun watches; manifest coverage guard prevents silent omissions.",
+    "81.4": "Two missing optional-feature AnyModel::Copilot arms dispatch through existing advisor/skill generalization helpers; real SDK caller tests added.",
+    "47": "Read-only bounded caller-root Doctor/setup presence inspection and shared exact saved-login route eligibility; no account/remote-health claim."
+  },
+  "patches": {
+    "120": {
+      "bead": "mini-agent-i7ro6.120",
+      "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+      "patch_sha256": "b74f5ddb1e3b07dffe4f220a6b104237af2a3244b9f715438fea7e2f14f934f9",
+      "patch_bytes": 10410,
+      "sources": {
+        "build.rs": "b37944faa40728438c8202f6cf2dc0212d4e7666f514c862d1a5472deed1bdc7",
+        "build_inputs.rs": "bb239017ecd1e96369a781d6ff33cbb50874fdca086761d4cea4fcc59000369b",
+        "src/tests/build_inputs_tests.rs": "3b807f67d81e907118ceb8b1b83f85d4ae388826f1a34bc4d6317fbe8ab0b1f7",
+        "docs/specs/phase-6-brokered-js-runtime.md": "577dd8805046ba4d74e824ff557c746a57b46b88fdc94cbd2e329dc6f3c8490e"
+      },
+      "scope": "Same existing static collector and build.rs rerun iteration, all3 production path dependencies; no new build dependencies or framework. Sorting/dedup/hashing/cache exclusion/source symlink rejection unchanged.",
+      "gates": {
+        "cargo_fmt_package": "pass",
+        "git_diff_check": "pass",
+        "owning_rust_tests": "pending Root warm checkout, no cold owner app compile"
+      },
+      "command": "cargo test --bin mini-agent tests::build_inputs_tests:: -- --nocapture",
+      "selected_tests": [
+        "build_inputs_include_path_dependency_and_detect_metadata_preserving_changes",
+        "build_input_identity_is_location_independent_and_ignores_uncompiled_caches",
+        "build_inputs_cover_embedded_guides_and_skill_packages_without_maintainer_docs",
+        "build_inputs_refuse_linked_source_and_embedded_files_or_directories",
+        "build_inputs_cover_every_root_manifest_production_path_dependency",
+        "build_inputs_manifest_guard_checks_target_build_and_workspace_but_not_dev_dependencies"
+      ],
+      "remaining_acceptance": "Root final same-source cargo install --path . --debug plus installed JS identity/containment selfcheck after integration; no actual accounts."
+    },
+    "81.4": {
+      "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+      "freeze": "757b7386c603814fa0aa51b20c56c56bc6a584df",
+      "patch": "/private/tmp/mini-agent-copilot81-cfgfix-final.patch",
+      "patch_sha256": "3b85117bb7cb48cb51512ff1c8e1eabec3e51054c5df86eeee96503c52d86f3f",
+      "files": [
+        {
+          "path": "docs/agent/PROVIDERS.md",
+          "sha256": "c402f88cec8b134f5ec95ccc4935fc7f96e8cf2966b22cc66783285f8c37f06f"
+        },
+        {
+          "path": "src/extras/advisor/mod.rs",
+          "sha256": "1c0b1f5dee7d5f3185b232711a290045d34c171cccddccb0b87b2915c81c6c91"
+        },
+        {
+          "path": "src/extras/js/skills/distill.rs",
+          "sha256": "a8d9b62b1ecaf46fe0c763d5cfe413af4410fe0e54db259d2d5315e408380848"
+        },
+        {
+          "path": "src/provider_copilot.rs",
+          "sha256": "892965e781914c8a0efeb0aeb1ab2c01f2bcc86d965c430e0efdeb4720768616"
+        },
+        {
+          "path": "src/provider_copilot_tests.rs",
+          "sha256": "05f43139845807fd77e5dd5bd0f581ee6ce0822fe969ba188a055d6c6b79c6a6"
+        }
+      ],
+      "all_feature_test_log": "/private/tmp/mini-agent-copilot81-cfg-all-features.log",
+      "test_result": "3 passed0failed; both advisor/distill actual chat+Responses and existing advisor params",
+      "strict_all_feature_lint": "PASS61s; /private/tmp/mini-agent-copilot81-cfg-all-features-clippy.log",
+      "doctor_scope_included": false
+    },
+    "47": {
+      "bead": "mini-agent-i7ro6.47",
+      "scope": "bounded Doctor/setup saved-login labels only; entire OAuth bead remains open",
+      "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+      "freeze": "bab01cc01bcfc4ea5ec7e0d85700cc5bf5700695",
+      "patch": "/private/tmp/mini-agent-login-labels47-final.patch",
+      "patch_sha256": "287d539de408777ddffb2e39a5fa02b8af5bedaf7cebf80348885a535e42eeaa",
+      "files": [
+        {
+          "path": "docs/agent/PROVIDERS.md",
+          "sha256": "5e10e7b231f2df74341c055010400bf427e55a3903a1df26c48cf2c8c5893e3c"
+        },
+        {
+          "path": "src/auth.rs",
+          "sha256": "3d951e787f499e24b45956042589517ec58e7c937885cd199fc00d41762efc9b"
+        },
+        {
+          "path": "src/auth/copilot.rs",
+          "sha256": "8284a0e1d7f53856b2972b142cd8db144a1f49115aeb77e2971eb3a9918b490d"
+        },
+        {
+          "path": "src/auth/copilot_tests.rs",
+          "sha256": "db4b57d8a2668ee55ce165f5345554e766b0947659f3747676cc06e197f7553e"
+        },
+        {
+          "path": "src/auth/oauth.rs",
+          "sha256": "eed0e5e130777ffb7bd1a581cf0e593284f30eb351e21cfd08d91c7742816c72"
+        },
+        {
+          "path": "src/auth/oauth_tests.rs",
+          "sha256": "c01f2e91ee3b445a805bcc0e36c4a6b007e4066c4b1098715935899c684218d8"
+        },
+        {
+          "path": "src/diagnostics.rs",
+          "sha256": "1bbaef86bd26f89d137ee3adb3fb71632b475bee2d2350fc8dcea0d4cbd85153"
+        },
+        {
+          "path": "src/main.rs",
+          "sha256": "6c033ecd4076e89c806ff2d1d9abde9f57aebc001a0d99a709c8137ba0dcedfd"
+        },
+        {
+          "path": "src/provider.rs",
+          "sha256": "50608ad2c496cbb61fca01e78c3495538986c9b3efb34a075941ea99b2ad869e"
+        },
+        {
+          "path": "src/setup/mod.rs",
+          "sha256": "9f1004ed4ea200974b3010b7ae8242e84abd28a51df6aab7938af4137c4a1361"
+        }
+      ]
+    }
+  },
+  "integrated_sha256": {
+    "build.rs": "b37944faa40728438c8202f6cf2dc0212d4e7666f514c862d1a5472deed1bdc7",
+    "build_inputs.rs": "bb239017ecd1e96369a781d6ff33cbb50874fdca086761d4cea4fcc59000369b",
+    "docs/agent/PROVIDERS.md": "928121502fdefb7745851a997ca849c7027ad0f11b60db721a0dc7aeaa459f0e",
+    "docs/specs/phase-6-brokered-js-runtime.md": "84a6a4bfcf20451b5e7805a7fffd8a2cfba603a56b68dffdf3d18fe0763df0a5",
+    "src/auth.rs": "3d951e787f499e24b45956042589517ec58e7c937885cd199fc00d41762efc9b",
+    "src/auth/copilot.rs": "8284a0e1d7f53856b2972b142cd8db144a1f49115aeb77e2971eb3a9918b490d",
+    "src/auth/copilot_tests.rs": "db4b57d8a2668ee55ce165f5345554e766b0947659f3747676cc06e197f7553e",
+    "src/auth/oauth.rs": "eed0e5e130777ffb7bd1a581cf0e593284f30eb351e21cfd08d91c7742816c72",
+    "src/auth/oauth_tests.rs": "c01f2e91ee3b445a805bcc0e36c4a6b007e4066c4b1098715935899c684218d8",
+    "src/diagnostics.rs": "1bbaef86bd26f89d137ee3adb3fb71632b475bee2d2350fc8dcea0d4cbd85153",
+    "src/extras/advisor/mod.rs": "1c0b1f5dee7d5f3185b232711a290045d34c171cccddccb0b87b2915c81c6c91",
+    "src/extras/js/skills/distill.rs": "a8d9b62b1ecaf46fe0c763d5cfe413af4410fe0e54db259d2d5315e408380848",
+    "src/main.rs": "6c033ecd4076e89c806ff2d1d9abde9f57aebc001a0d99a709c8137ba0dcedfd",
+    "src/provider.rs": "50608ad2c496cbb61fca01e78c3495538986c9b3efb34a075941ea99b2ad869e",
+    "src/provider_copilot.rs": "892965e781914c8a0efeb0aeb1ab2c01f2bcc86d965c430e0efdeb4720768616",
+    "src/provider_copilot_tests.rs": "05f43139845807fd77e5dd5bd0f581ee6ce0822fe969ba188a055d6c6b79c6a6",
+    "src/setup/mod.rs": "9f1004ed4ea200974b3010b7ae8242e84abd28a51df6aab7938af4137c4a1361",
+    "src/tests/build_inputs_tests.rs": "3b807f67d81e907118ceb8b1b83f85d4ae388826f1a34bc4d6317fbe8ab0b1f7"
+  },
+  "integration_adaptations": [
+    "Both provider-doc additions retained at their shared append location; all production source applied cleanly.",
+    "Phase6 exact-build source-list amendment merged with delivered86 retained-source amendment. No runtime/probe implementation changed in this batch."
+  ],
+  "root_tests": {
+    "command": "cargo test --locked --offline --features advisor,skills --bin mini-agent -- tests::build_inputs_tests:: login_labels47_ azure81_setup_source_uses_typed_auth_and_custom_isolation doctor_captured_session_metadata_omits_credentials_history_and_config_values oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes copilot81_cfg_ advisor_requests_keep_store_false_reasoning_and_extra_body --test-threads=1",
+    "passed": 16,
+    "failed": 0,
+    "execution_seconds": 0.72,
+    "compile_seconds": 82,
+    "required_combined_default_debug_install_seconds": 21.94,
+    "installed_doctor": {
+      "binary": "/private/tmp/mini-agent-final-auth-build120-install/bin/mini-agent",
+      "sha256": "bf61c2449264925af1b70b93735b3fdcb9cbcc05cda7746fb16cc9726d3ddb57",
+      "cases": [
+        {
+          "name": "saved-expired-presence",
+          "exit": 0,
+          "expected_label": "saved ChatGPT registration (resolved on request; values omitted)",
+          "credentials_unchanged": true,
+          "values_omitted": true
+        },
+        {
+          "name": "active-revocation-fence",
+          "exit": 0,
+          "expected_label": "saved ChatGPT registration; sign-in required (values omitted)",
+          "credentials_unchanged": true,
+          "values_omitted": true
+        },
+        {
+          "name": "explicit-cli-key",
+          "exit": 0,
+          "expected_label": "CLI --api-key (value omitted)",
+          "credentials_unchanged": true,
+          "values_omitted": true
+        },
+        {
+          "name": "copilot-missing-record",
+          "exit": 0,
+          "expected_label": "missing; run /login copilot or configure this route's credentials",
+          "credentials_unchanged": true,
+          "values_omitted": true
+        }
+      ],
+      "stack_bytes": 1048576,
+      "passed": true
+    },
+    "installed_native_identity_and_runtime": {
+      "binary": "/private/tmp/mini-agent-final-auth-build120-install/bin/mini-agent",
+      "sha256": "bf61c2449264925af1b70b93735b3fdcb9cbcc05cda7746fb16cc9726d3ddb57",
+      "bytes": 160222832,
+      "stack_bytes": 1048576,
+      "pid": 7622,
+      "pgid": 7622,
+      "forced_cleanup": false,
+      "exit": 0,
+      "elapsed_ms": 1478.372124955058,
+      "stdout": "JS runtime check: PASS (2)\n",
+      "stderr": "",
+      "passed": true
+    },
+    "format_and_whitespace": "passed"
+  },
+  "owning_evidence": {
+    "81.4": {
+      "bead": "mini-agent-i7ro6.81.4",
+      "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+      "freeze": "757b7386c603814fa0aa51b20c56c56bc6a584df",
+      "patch": "/private/tmp/mini-agent-copilot81-cfgfix-final.patch",
+      "patch_sha256": "3b85117bb7cb48cb51512ff1c8e1eabec3e51054c5df86eeee96503c52d86f3f",
+      "source_files": 5,
+      "source_contract": "Exactly two production arms delegate Copilot to existing advisor_call and complete_once. The only other Rust source change is cfg(test) fixture visibility/reuse; no converter, auth, permissions, JS execution/admission or transport policy changes. Doctor bab01 is excluded.",
+      "observed_failure": {
+        "run": 38660626104,
+        "jobs": [
+          116184111351,
+          116184111803
+        ],
+        "errors": [
+          "extras/advisor/mod.rs457 AnyModel::Copilot E0004",
+          "extras/js/skills/distill.rs768 AnyModel::Copilot E0004"
+        ],
+        "logs": [
+          "/private/tmp/mini-agent-2f2-all-features-ci.log",
+          "/private/tmp/mini-agent-2f2-skills-clippy-ci.log"
+        ]
+      },
+      "indexed_map": "/private/tmp/mini-agent-copilot81-cfg-indexed-map.json",
+      "physical_match_audit": "/private/tmp/mini-agent-copilot81-physical-anymodel-audit.json",
+      "physical_match_summary": {
+        "source_files_with_AnyModel": 18,
+        "qualified_match_sites": 16,
+        "typed_self_match_sites": 1,
+        "missing_Copilot_without_existing_wildcard": 0,
+        "existing_wildcards_manually_reviewed": 3,
+        "variant_glob_or_alias_found": false,
+        "authoritative_check": "actual all-feature test compilation and strict all-feature/all-target clippy"
+      },
+      "gates": [
+        {
+          "command": "cargo test --locked --offline --all-features --bin mini-agent -- copilot81_cfg_ advisor_requests_keep_store_false_reasoning_and_extra_body --test-threads=1",
+          "passed": 3,
+          "failed": 0,
+          "test_seconds": 0.03,
+          "compile_seconds": 93,
+          "log": "/private/tmp/mini-agent-copilot81-cfg-all-features.log",
+          "reason": "Observed misses were behind advisor and skills cfg; all features also compiles optional embedding code without executing model downloads."
+        },
+        {
+          "command": "cargo clippy --locked --offline --all-features --all-targets -- -D warnings",
+          "passed": true,
+          "elapsed_seconds": 61,
+          "log": "/private/tmp/mini-agent-copilot81-cfg-all-features-clippy.log",
+          "reason": "Strict observed all-feature lint boundary, including test-only fixture cfg, after actual CI exhaustiveness failure."
+        },
+        {
+          "command": "cargo fmt; git diff --check",
+          "passed": true
+        }
+      ],
+      "wire_controls": [
+        {
+          "name": "copilot81_cfg_advisor_uses_actual_chat_and_responses_converters",
+          "owner": "src/extras/advisor/mod.rs::run_advisor_completion",
+          "proof": [
+            "Two actual SDK routes: /chat/completions and /responses",
+            "Production captured direct credential/app identity and actual requested model verified",
+            "Advisor question/Conversation wrapper and caller extra_body.user appear on wire",
+            "Actual SSE is decoded to the expected advisor answer"
+          ]
+        },
+        {
+          "name": "copilot81_cfg_distillation_uses_actual_chat_and_responses_converters",
+          "owner": "src/extras/js/skills/distill.rs::generalize",
+          "proof": [
+            "Two actual SDK routes, not fabricated AnyModel values",
+            "Recorded JavaScript and recorded_javascript wrapper survive request construction",
+            "Actual streamed text is parsed by existing parse_generation",
+            "Generated export/source/tests/held-out expressions match the received draft",
+            "No proposal admitted or JavaScript executed by this wire control"
+          ]
+        },
+        {
+          "name": "advisor_requests_keep_store_false_reasoning_and_extra_body",
+          "proof": [
+            "Existing OpenAI advisor store/reasoning/extra-body behavior retained"
+          ]
+        }
+      ],
+      "reviews": [
+        {
+          "reviewer": "adversarial",
+          "findings": [],
+          "residual_risks": [],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "reliability",
+          "findings": [],
+          "residual_risks": [],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "testing",
+          "findings": [],
+          "residual_risks": [],
+          "testing_gaps": []
+        }
+      ],
+      "scope_limits": [
+        "One consolidated source/match review; no lint suppression, wildcard fallback or unused-variable workaround added.",
+        "No full suite, feature-matrix rerun, account/token changes, external cloud calls or paid calls.",
+        "Phase6 canonical invariants read and preserved; this is model-dispatch wiring and does not change worker/runtime/broker/protocol/sandbox/admission behavior.",
+        "Root owns combined debug install and existing physical/native regression acceptance; prior unchanged Copilot converter/auth/default/no-default passes are reused."
+      ],
+      "closure": "Await Root integration/push and owning CI acceptance; do not close based solely on the private patch."
+    },
+    "47": {
+      "bead": "mini-agent-i7ro6.47",
+      "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+      "freeze": "bab01cc01bcfc4ea5ec7e0d85700cc5bf5700695",
+      "scope": "bounded Doctor/setup saved-login labels only; entire OAuth bead remains open",
+      "indexed_maps": [
+        "/private/tmp/mini-agent-login-labels47-indexed-map.json",
+        "/private/tmp/mini-agent-login-labels47-final-index-map.json"
+      ],
+      "owning_test_command": "cargo test --locked --offline --bin mini-agent -- login_labels47_ azure81_setup_source_uses_typed_auth_and_custom_isolation doctor_captured_session_metadata_omits_credentials_history_and_config_values oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes --test-threads=1",
+      "test_result": {
+        "passed": 7,
+        "failed": 0,
+        "elapsed_seconds": 0.36,
+        "compile_seconds": 68,
+        "log": "/private/tmp/mini-agent-login-labels47-tests.log"
+      },
+      "lint": {
+        "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+        "passed": true,
+        "elapsed_seconds": 44.28,
+        "log": "/private/tmp/mini-agent-login-labels47-clippy.log",
+        "note": "Existing vendored Crossterm dependency reports unused parentheses. No lint error in this patch; dependency source is unchanged."
+      },
+      "format_and_whitespace": "cargo fmt and git diff --check passed",
+      "implementation_contracts": [
+        "Actual create_client and diagnostic labels share the exact OpenAI provider/CLI-key/custom-entry/official-endpoint eligibility predicate. Pure AuthResolver and CredentialSource enum semantics are unchanged.",
+        "Format owners decode only bounded private local bytes and return closed presence states. No selected(), LockedStore, Store::new(), repair, lock creation, registration/token authority, refresh, HTTP or subprocess is used by inspection.",
+        "Caller supplies explicit credentials_dir to Doctor and setup. Setup also captures the actual CLI key override, so labels do not ignore it.",
+        "Read-only inspection validates existing private directories and files using existing filesystem ownership/identity checks. Parent/link rejection does not repair permissive modes.",
+        "Active OpenAI registration without tokens remains a sign-in-required fence instead of being reported as API-key fallback. Copilot marker without a selected-host record is sign-in required, never falsely saved."
+      ],
+      "indexed_test_map": [
+        {
+          "symbols": [
+            "diagnostic_record_at",
+            "oauth::diagnostic_state_at"
+          ],
+          "controls": [
+            "login_labels47_openai_reader_is_bounded_nonrepairing_and_preserves_the_revocation_fence",
+            "login_labels47_private_inspection_rejects_links_and_preserves_permissive_modes"
+          ],
+          "proofs": [
+            "absent root is not created",
+            "existing record bytes unchanged and no session.lock",
+            "expired access with refresh is stored presence, no refresh attempt",
+            "revoked active and inactive records differ",
+            "malformed and oversized files remain unchanged/unavailable",
+            "record and parent-directory symlinks rejected",
+            "0644 file and0755 parent remain unmodified"
+          ]
+        },
+        {
+          "symbols": [
+            "chatgpt_login_route_with_env",
+            "provider_credential_with_env",
+            "DoctorReport::capture",
+            "setup::provider_credential_source"
+          ],
+          "controls": [
+            "login_labels47_doctor_and_setup_use_explicit_saved_account_state_and_actual_route_precedence",
+            "oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes",
+            "doctor_captured_session_metadata_omits_credentials_history_and_config_values",
+            "azure81_setup_source_uses_typed_auth_and_custom_isolation"
+          ],
+          "proofs": [
+            "saved OpenAI wins environment/config keys",
+            "CLI wins saved record",
+            "alternate endpoint and explicit custom entry do not inherit login",
+            "different explicit credential root changes result independently",
+            "actual Doctor renders reauthorization fence with token/account canaries omitted",
+            "existing Azure typed source/custom isolation unchanged"
+          ]
+        },
+        {
+          "symbols": [
+            "copilot::diagnostic_state_at",
+            "provider_credential_with_env"
+          ],
+          "controls": [
+            "login_labels47_copilot_marker_requires_a_private_record_for_the_captured_host"
+          ],
+          "proofs": [
+            "absent unresolved marker is sign-in required with no root creation",
+            "saved matching-host private record is reported",
+            "other host does not borrow record",
+            "CLI key ignores corrupt saved record",
+            "logged-out and malformed records differ",
+            "isolated custom alias does not inherit record"
+          ]
+        }
+      ],
+      "reviews": [
+        {
+          "reviewer": "adversarial",
+          "depth": "deep",
+          "findings": [],
+          "residual_risks": [
+            "Local presence is a snapshot, not remote account-health or entitlement proof; concurrent atomic replacement may change state after capture."
+          ],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "reliability",
+          "findings": [],
+          "residual_risks": [
+            "Existing synchronous filesystem read contract is retained; no filesystem wall-clock cancellation guarantee is claimed."
+          ],
+          "testing_gaps": []
+        },
+        {
+          "reviewer": "testing",
+          "findings": [],
+          "residual_risks": [],
+          "testing_gaps": [
+            "Windows existing-handle/private-directory primitives are reused; new Windows glue has not executed natively in this macOS checkout. Existing Windows CI compilation and targeted native execution, if needed, remain Root integration evidence."
+          ]
+        }
+      ],
+      "handoff_validation": [
+        "No Cargo manifest, lock, dependency, feature graph, model/tool transport or sandbox/runtime changes.",
+        "No repeated broad suite or cloud/account/paid calls.",
+        "Root explicitly owns required combined debug install and any installed operator proof; no redundant private install performed.",
+        "Entire47 remains open for its existing unresolved Anthropic/manual-login scope; this patch closes only Doctor/setup polish."
+      ]
+    },
+    "120": {
+      "index_state": "/private/tmp/mini-agent-118-index",
+      "index_session": "64df4e0c-3d22-40cc-a7ee-2ce122523e4e",
+      "index_evidence": "File-qualified grep build_inputs in src/tests/build_inputs_tests.rs confirms #[path=../../build_inputs.rs] direct source reuse, fingerprint wrapper and all four prior owning tests. Immutable baseline build helper/test source matches2f; new source read physically. Root build.rs direct mod/use/collect/rerun callers confirmed physically (index Rust/src graph alone not exhaustive for root build script).",
+      "mapping": [
+        {
+          "changed": "PATH_DEPENDENCIES + collect",
+          "callers": [
+            "build.rs::main",
+            "src/tests/build_inputs_tests.rs::fingerprint"
+          ],
+          "contracts": [
+            "Every local manifest/src/optional build script hashed",
+            "All3 dirs watched for new inputs",
+            "Sorted/dedup/relative names/length prefix unchanged"
+          ],
+          "tests": [
+            "build_inputs_include_path_dependency_and_detect_metadata_preserving_changes",
+            "build_input_identity_is_location_independent_and_ignores_uncompiled_caches",
+            "build_inputs_cover_embedded_guides_and_skill_packages_without_maintainer_docs",
+            "build_inputs_refuse_linked_source_and_embedded_files_or_directories"
+          ]
+        },
+        {
+          "changed": "test-only manifest_path_dependencies",
+          "callers": [
+            "build_inputs_cover_every_root_manifest_production_path_dependency",
+            "build_inputs_manifest_guard_checks_target_build_and_workspace_but_not_dev_dependencies"
+          ],
+          "contracts": [
+            "Root normal, target, build and workspace path entries included",
+            "Dev dependencies ignored",
+            "Root dependency set equals static hashed+watched set"
+          ],
+          "tests": [
+            "build_inputs_cover_every_root_manifest_production_path_dependency",
+            "build_inputs_manifest_guard_checks_target_build_and_workspace_but_not_dev_dependencies"
+          ]
+        }
+      ],
+      "cfg": "Pure filesystem/hash/TOML tests have no runtime feature gates; default warmed row sufficient for changed code. Unix symlink test requires native Unix; Windows unchanged not claimed from Mac.",
+      "reused": "Existing worker protocol codec/different fingerprint tests are byte-identical, no repeat needed. Final installed JS selfcheck validates actual rebuilt parent/worker identity end-to-end. No subprocess inventory or full modules/suites selected."
+    }
+  },
+  "reuse_limits": [
+    "Unchanged Copilot auth, ordinary converter/HTTP and physical TUI proofs from prior integration reused; new optional feature callers additionally execute actual Chat and Responses wire fixtures.",
+    "No new Cargo dependency graph or sandbox/runtime changes; previous full native86 mixed-source/cancel/recovery controls remain source-identical. Corrected final build identity additionally passes actual installed full containment+JS execution.",
+    "Entire47 remains open for Anthropic/manual-login scope. Parent81 original real-cloud acceptance remains unresolved.",
+    "No real login, account change or paid model call performed. Full current-source CI remains a separate goal gate."
+  ],
+  "reviews": {
+    "findings": [],
+    "resolved": [
+      "Missing Copilot exhaustive matches found by actual CI are now tested with all features; no wildcard/unused-warning suppression.",
+      "Private presence inspection cannot create/repair/lock/refresh/register credentials or acquire request authority.",
+      "Hashing observes dependency contents rather than source timestamps; generated build caches excluded and source symlinks rejected."
+    ]
+  }
+}

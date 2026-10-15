@@ -347,6 +347,38 @@ pub(crate) fn official_api_base(value: Option<&str>) -> bool {
     })
 }
 
+/// Presence only, under the explicitly captured credential root. In
+/// particular an active revoked registration fences API-key fallback.
+pub(crate) fn diagnostic_state_at(credentials_dir: &std::path::Path) -> super::LoginRecordState {
+    use super::LoginRecordState;
+    let inspect = || -> anyhow::Result<LoginRecordState> {
+        let Some(bytes) = super::diagnostic_record_at(
+            credentials_dir,
+            &["provider-oauth", "openai.json"],
+            MAX_BYTES,
+        )?
+        else {
+            return Ok(LoginRecordState::Absent);
+        };
+        let store: Store = serde_json::from_slice(&bytes)?;
+        store.validate()?;
+        let Some(active) = store.active.as_ref() else {
+            return Ok(LoginRecordState::Absent);
+        };
+        let account = store
+            .accounts
+            .iter()
+            .find(|a| &a.client_id == active)
+            .context("Active registration unavailable")?;
+        Ok(if account.tokens.is_some() {
+            LoginRecordState::Stored
+        } else {
+            LoginRecordState::SignInRequired
+        })
+    };
+    inspect().unwrap_or(LoginRecordState::Unavailable)
+}
+
 pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
     let root = root()?;
     let Some(store) = LockedStore::open(root.clone(), false)? else {

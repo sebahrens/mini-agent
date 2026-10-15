@@ -477,3 +477,53 @@ async fn copilot81_blocking_usage_underflow_and_actual_factory_redirect_fail_clo
         .unwrap();
     }
 }
+
+/// Reuse the actual Copilot wire reader and chat/Responses SSE producer for
+/// optional-feature callers. The returned server future remains caller-owned.
+#[cfg(any(feature = "advisor", feature = "skills"))]
+pub(crate) async fn text_fixture(
+    style: ApiStyle,
+    text: String,
+) -> (
+    AnyClient,
+    &'static str,
+    impl std::future::Future<Output = Value>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let client = crate::provider::create_client_with_env(
+        "copilot-cfg",
+        Some("OWNED_TOKEN"),
+        &HashMap::from([(
+            "copilot-cfg".into(),
+            serde_json::from_value(json!({"provider_type":"copilot","base_url":base})).unwrap(),
+        )]),
+        None,
+        |_| Err(VarError::NotPresent),
+    )
+    .unwrap();
+    let name = if style == ApiStyle::Responses {
+        "owned-codex"
+    } else {
+        "owned-chat"
+    };
+    let server = async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (headers, request) = read_request(&mut socket).await;
+        assert!(headers.starts_with(if style == ApiStyle::Responses {
+            "post /responses "
+        } else {
+            "post /chat/completions "
+        }));
+        assert!(headers.contains("authorization: bearer owned_token"));
+        assert!(headers.contains("copilot-integration-id: mini-agent"));
+        assert_eq!(request["model"], name);
+        let body = reply(style, 1).replace(
+            &serde_json::to_string("COPILOT_DONE").unwrap(),
+            &serde_json::to_string(&text).unwrap(),
+        );
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        request
+    };
+    (client, name, server)
+}

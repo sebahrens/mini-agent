@@ -510,7 +510,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     }
 
     if cli.setup {
-        match setup::run(&mut cfg)? {
+        match setup::run(&mut cfg, cli.api_key.as_deref(), &app_paths.credentials_dir)? {
             setup::SetupOutcome::Quit => return Ok(()),
             setup::SetupOutcome::LaunchAutoconfigure => {
                 // Environment-backed credentials are resolved at runtime; fall through to launch.

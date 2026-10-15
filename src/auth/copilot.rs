@@ -304,6 +304,38 @@ impl std::fmt::Debug for Registration {
         f.write_str("CopilotRegistration([REDACTED])")
     }
 }
+/// Read-only local presence for a captured host; no lock/cache repair or
+/// credential acquisition is performed and no registration is returned.
+pub(crate) fn diagnostic_state_at(
+    credentials_dir: &std::path::Path,
+    host: &str,
+) -> super::LoginRecordState {
+    use super::LoginRecordState;
+    let inspect = || -> anyhow::Result<LoginRecordState> {
+        let profile = Profile::for_host(host)?;
+        let Some(bytes) = super::diagnostic_record_at(
+            credentials_dir,
+            &["copilot", &profile.host, "session.json"],
+            MAX_BYTES,
+        )?
+        else {
+            return Ok(LoginRecordState::Absent);
+        };
+        let store: Store = serde_json::from_slice(&bytes)?;
+        store.validate()?;
+        ensure!(
+            store.profile.host == profile.host,
+            "Copilot host registration changed"
+        );
+        Ok(if store.tokens.is_some() {
+            LoginRecordState::Stored
+        } else {
+            LoginRecordState::Absent
+        })
+    };
+    inspect().unwrap_or(LoginRecordState::Unavailable)
+}
+
 pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
     let host = std::env::var("COPILOT_GITHUB_HOST")
         .unwrap_or_else(|_| "github.com".into())

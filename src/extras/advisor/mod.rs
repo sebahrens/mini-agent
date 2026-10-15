@@ -463,6 +463,7 @@ pub(crate) async fn run_advisor_completion(
         AnyModel::Anthropic(m) => advisor_call(m, prompt, params, retry).await,
         AnyModel::Gemini(m) => advisor_call(m, prompt, params, retry).await,
         AnyModel::Ollama(m) => advisor_call(m, prompt, params, retry).await,
+        AnyModel::Copilot(m) => advisor_call(m, prompt, params, retry).await,
     }
 }
 
@@ -1329,6 +1330,38 @@ mod request_param_tests {
         assert_eq!(body["store"], false, "{body}");
         assert_eq!(body["reasoning"]["effort"], "high", "{body}");
         assert_eq!(body["user"], "zdr-tenant", "{body}");
+    }
+
+    #[tokio::test]
+    async fn copilot81_cfg_advisor_uses_actual_chat_and_responses_converters() {
+        for style in [
+            crate::config::ApiStyle::Completions,
+            crate::config::ApiStyle::Responses,
+        ] {
+            let (client, name, server) =
+                crate::provider::copilot::tests::text_fixture(style, "OWNED_ADVISOR_RESULT".into())
+                    .await;
+            let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({"extra_body":{"user":"OWNED_ADVISOR_EXTRA"},"retry":{"max_attempts":1}})).unwrap();
+            let request = crate::startup::heap_future(|| {
+                run_advisor_completion(
+                    client.completion_model(name),
+                    "OWNED_ADVISOR_QUESTION",
+                    &[],
+                    8,
+                    name,
+                    &cfg,
+                )
+            });
+            let (body, result) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(server, request)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap(), "OWNED_ADVISOR_RESULT");
+            assert_eq!(body["user"], "OWNED_ADVISOR_EXTRA");
+            assert!(body.to_string().contains("OWNED_ADVISOR_QUESTION"));
+            assert!(body.to_string().contains("Conversation"));
+        }
     }
 
     #[test]

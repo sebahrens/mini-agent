@@ -6,6 +6,92 @@ use std::env::VarError;
 pub(crate) mod oauth;
 pub(crate) mod openai_plan;
 
+/// Local, read-only presence metadata. This never grants request authority or
+/// claims that an account is valid with the remote provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginRecordState {
+    Absent,
+    Stored,
+    SignInRequired,
+    Unavailable,
+}
+
+/// Inspect only the caller's explicit private credential tree. No directory,
+/// lock, identity or record is created/repaired, and no authentication is run.
+fn diagnostic_record_at(
+    credentials_dir: &std::path::Path,
+    components: &[&str],
+    limit: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let (filename, parents) = components.split_last().expect("fixed record layout");
+    let mut directory = credentials_dir.to_path_buf();
+    let mut retained = Vec::new();
+    for component in std::iter::once(None).chain(parents.iter().map(Some)) {
+        if let Some(component) = component {
+            directory.push(component);
+        }
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Credential directory unavailable"
+        );
+        let before = crate::fs::checked_path_metadata(&directory)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let handle = options.open(&directory)?;
+        crate::fs::validate_private_directory(&handle)?;
+        crate::fs::ensure_same_file(
+            &directory,
+            &before,
+            &crate::fs::checked_file_metadata(&handle)?,
+        )?;
+        retained.push((directory.clone(), handle));
+    }
+    let path = directory.join(filename);
+    let file = match crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Read)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        file.metadata()?.len() <= limit as u64,
+        "Credential record byte limit exceeded"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "Credential record byte limit exceeded"
+    );
+    for (path, handle) in retained {
+        crate::fs::ensure_same_file(
+            &path,
+            &crate::fs::checked_file_metadata(&handle)?,
+            &crate::fs::checked_path_metadata(&path)?,
+        )?;
+    }
+    Ok(Some(bytes))
+}
+
 /// Kind of AI provider
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {

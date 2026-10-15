@@ -19,6 +19,10 @@ fn fixture() -> crate::tests::OwnedTestDirectory {
         "assets/learned-skills/json-parse.json",
         "patched-deps/rig-core/Cargo.toml",
         "patched-deps/rig-core/src/lib.rs",
+        "patched-deps/google-cloud-auth/Cargo.toml",
+        "patched-deps/google-cloud-auth/src/lib.rs",
+        "patched-deps/crossterm/Cargo.toml",
+        "patched-deps/crossterm/src/lib.rs",
     ] {
         let path = directory.path().join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -37,38 +41,40 @@ fn fingerprint(root: &std::path::Path) -> String {
 #[test]
 fn build_inputs_include_path_dependency_and_detect_metadata_preserving_changes() {
     let root = fixture();
-    let path = root.path().join("patched-deps/rig-core/src/lib.rs");
-    let before = std::fs::metadata(&path).unwrap();
-    let original = fingerprint(root.path());
-    std::fs::write(&path, b"modified input\n").unwrap();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
+    for dependency in build_inputs::PATH_DEPENDENCIES {
+        let path = root.path().join(dependency).join("src/lib.rs");
+        let before = std::fs::metadata(&path).unwrap();
+        let original = fingerprint(root.path());
+        std::fs::write(&path, b"modified input\n").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert_eq!(before.len(), file.metadata().unwrap().len());
+        assert_eq!(
+            before.modified().unwrap(),
+            file.metadata().unwrap().modified().unwrap()
+        );
+        assert_ne!(
+            original,
+            fingerprint(root.path()),
+            "{dependency} content must change identity even with identical metadata"
+        );
+        let changed = fingerprint(root.path());
+        std::fs::write(
+            root.path().join(dependency).join("Cargo.toml"),
+            b"new manifest\n",
+        )
         .unwrap();
-    file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
-        .unwrap();
-    assert_eq!(before.len(), file.metadata().unwrap().len());
-    assert_eq!(
-        before.modified().unwrap(),
-        file.metadata().unwrap().modified().unwrap()
-    );
-    assert_ne!(
-        original,
-        fingerprint(root.path()),
-        "SDK content must change identity even with identical metadata"
-    );
-    let changed = fingerprint(root.path());
-    std::fs::write(
-        root.path().join("patched-deps/rig-core/Cargo.toml"),
-        b"new manifest\n",
-    )
-    .unwrap();
-    assert_ne!(
-        changed,
-        fingerprint(root.path()),
-        "the path dependency manifest is a compile input too"
-    );
+        assert_ne!(
+            changed,
+            fingerprint(root.path()),
+            "the path dependency manifest is a compile input too"
+        );
+    }
 }
 
 #[test]
@@ -81,6 +87,8 @@ fn build_input_identity_is_location_independent_and_ignores_uncompiled_caches() 
         "scripts/ignored.pyc",
         "scripts/ignored.pyo",
         "patched-deps/rig-core/target/debug/cache",
+        "patched-deps/google-cloud-auth/target/debug/cache",
+        "patched-deps/crossterm/target/debug/cache",
     ] {
         let path = first.path().join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -133,6 +141,8 @@ fn build_inputs_cover_embedded_guides_and_skill_packages_without_maintainer_docs
 fn build_inputs_refuse_linked_source_and_embedded_files_or_directories() {
     for (relative, directory) in [
         ("src/linked.rs", false),
+        ("patched-deps/google-cloud-auth/src/linked.rs", false),
+        ("patched-deps/crossterm/src/linked.rs", false),
         ("docs/agent/linked.md", false),
         ("docs/agent/linked-directory", true),
         ("docs/agent", true),
@@ -159,4 +169,68 @@ fn build_inputs_refuse_linked_source_and_embedded_files_or_directories() {
             .unwrap();
         assert!(message.contains("must not be a symbolic link"), "{message}");
     }
+}
+
+fn manifest_path_dependencies(manifest: &toml::Value) -> std::collections::BTreeSet<String> {
+    let targets = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values());
+    std::iter::once(manifest)
+        .chain(targets)
+        .chain(manifest.get("workspace"))
+        .flat_map(|section| {
+            ["dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(move |name| section.get(name).and_then(toml::Value::as_table))
+        })
+        .flat_map(|dependencies| dependencies.values())
+        .filter_map(|dependency| dependency.get("path").and_then(toml::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn build_inputs_cover_every_root_manifest_production_path_dependency() {
+    let manifest = toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+    assert_eq!(
+        manifest_path_dependencies(&manifest),
+        build_inputs::PATH_DEPENDENCIES
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "every production path dependency must join exact-build hashing and rerun inputs"
+    );
+}
+
+#[test]
+fn build_inputs_manifest_guard_checks_target_build_and_workspace_but_not_dev_dependencies() {
+    let manifest = toml::from_str(
+        r#"
+        [dependencies]
+        a = { path = "local/a" }
+        registry = "1"
+        [build-dependencies]
+        b = { path = "local/b" }
+        [target.'cfg(unix)'.dependencies]
+        c = { path = "local/c" }
+        [target.'cfg(windows)'.build-dependencies]
+        d = { path = "local/d" }
+        [workspace.dependencies]
+        e = { path = "local/e" }
+        [dev-dependencies]
+        f = { path = "test-only/f" }
+        [target.'cfg(unix)'.dev-dependencies]
+        g = { path = "test-only/g" }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        manifest_path_dependencies(&manifest),
+        ["local/a", "local/b", "local/c", "local/d", "local/e"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
 }

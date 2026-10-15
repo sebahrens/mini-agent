@@ -170,3 +170,72 @@ fn copilot81_cli_and_slash_commands_share_provider_login_surfaces() {
         assert!(crate::ui::pickers::list::available_commands().contains(&command));
     }
 }
+
+#[test]
+fn login_labels47_copilot_marker_requires_a_private_record_for_the_captured_host() {
+    use crate::auth::{CredentialSource, LoginRecordState as S};
+    use crate::diagnostics::{CredentialReport as R, provider_credential_with_env as inspect};
+    use std::env::VarError;
+    let root = crate::tests::OwnedTestDirectory::new("labels47-copilot");
+    let credentials = root.path().join("credentials");
+    let env = |_: &str| Err(VarError::NotPresent);
+    let cfg = crate::config::Config::default();
+    assert_eq!(diagnostic_state_at(&credentials, "github.com"), S::Absent);
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, env),
+        R::Copilot(S::Absent)
+    );
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, env).setup_label(),
+        "auth: Copilot sign-in required"
+    );
+    assert!(!credentials.exists());
+    let directory = credentials.join("copilot/github.com");
+    crate::fs::ensure_private_directory(&directory).unwrap();
+    let path = directory.join("session.json");
+    let mut data = store(profile());
+    let bytes = serde_json::to_vec(&data).unwrap();
+    crate::fs::private_atomic_write_sync(&path, &bytes).unwrap();
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, env),
+        R::Copilot(S::Stored)
+    );
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, env).setup_label(),
+        "auth: saved Copilot login"
+    );
+    assert_eq!(
+        inspect(&cfg, "copilot", Some("PRIVATE_CLI"), &credentials, env),
+        R::Source(CredentialSource::Cli)
+    );
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, |name| {
+            if name == "COPILOT_GITHUB_HOST" {
+                Ok("other.ghe.com".into())
+            } else {
+                env(name)
+            }
+        }),
+        R::Copilot(S::Absent)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!directory.join("session.lock").exists());
+    data.tokens = None;
+    crate::fs::private_atomic_write_sync(&path, &serde_json::to_vec(&data).unwrap()).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials, "github.com"), S::Absent);
+    crate::fs::private_atomic_write_sync(&path, b"bad PRIVATE_RECORD").unwrap();
+    assert_eq!(
+        inspect(&cfg, "copilot", None, &credentials, env),
+        R::Copilot(S::Unavailable)
+    );
+    let custom: crate::config::Config = serde_json::from_value(serde_json::json!({"custom_providers":{"gateway":{"provider_type":"copilot","base_url":"https://gateway.example"}}})).unwrap();
+    assert_eq!(
+        inspect(&custom, "gateway", None, &credentials, env),
+        R::Missing
+    );
+    assert_eq!(
+        inspect(&cfg, "copilot", Some("PRIVATE_CLI"), &credentials, env),
+        R::Source(CredentialSource::Cli)
+    );
+    assert!(!directory.join("session.lock").exists());
+}

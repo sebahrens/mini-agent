@@ -262,10 +262,13 @@ values.
 
 [`build_inputs.rs`](../../build_inputs.rs) enumerates and hashes these source inputs
 with stable repository-relative names and length-prefixed bytes. The production
-`patched-deps/rig-core` path dependency contributes its manifest, Rust source tree,
-and build script when present; the lockfile alone has no checksum for its local
-contents. Generated dependency build caches are excluded. Controlled native tests
-prove that a same-length, mtime-preserving SDK edit changes identity, while identical
+local path dependencies (`patched-deps/rig-core`, `patched-deps/google-cloud-auth`,
+and `patched-deps/crossterm`) each contribute their manifest, Rust source tree,
+and build script when present; the lockfile alone has no checksum for their local
+contents. A root-manifest guard keeps the collector and rebuild watch list aligned
+with production path dependencies, including target-specific and build dependencies.
+Generated dependency build caches are excluded. Controlled tests prove that a
+same-length, mtime-preserving edit in each dependency changes identity, while identical
 source copies at different paths have the same input digest.
 Embedded user guides (`docs/agent` and `docs/vscode-acp-setup.md`), persona/prompt/theme
 directories, and seed skill packages (`assets/learned-skills`) also contribute their

@@ -13,7 +13,11 @@ pub(crate) const EMBEDDED_DIRECTORIES: &[&str] = &[
     "data/prompts",
     "data/themes",
 ];
-pub(crate) const PATCHED_RIG: &str = "patched-deps/rig-core";
+pub(crate) const PATH_DEPENDENCIES: &[&str] = &[
+    "patched-deps/rig-core",
+    "patched-deps/google-cloud-auth",
+    "patched-deps/crossterm",
+];
 
 pub(crate) fn collect(root: &Path) -> Vec<PathBuf> {
     let mut files = [
@@ -34,15 +38,17 @@ pub(crate) fn collect(root: &Path) -> Vec<PathBuf> {
     for directory in EMBEDDED_DIRECTORIES {
         collect_directory(&root.join(directory), &mut files, false);
     }
-    // Cargo.lock has no content checksum for this path dependency. Its
-    // manifest and Rust sources are part of the production binary's identity.
-    let rig = root.join(PATCHED_RIG);
-    files.push(rig.join("Cargo.toml"));
-    let build = rig.join("build.rs");
-    if build.exists() {
-        files.push(build);
+    // Cargo.lock has no content checksums for local path dependencies. Their
+    // manifests, Rust sources and optional build scripts bind exact identity.
+    for dependency in PATH_DEPENDENCIES {
+        let dependency = root.join(dependency);
+        files.push(dependency.join("Cargo.toml"));
+        let build = dependency.join("build.rs");
+        if build.exists() {
+            files.push(build);
+        }
+        collect_directory(&dependency.join("src"), &mut files, true);
     }
-    collect_directory(&rig.join("src"), &mut files, true);
     files.sort();
     files.dedup();
     files

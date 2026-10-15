@@ -780,6 +780,7 @@ async fn generalize(
             }
             AnyModel::Gemini(model) => complete_once(model, prompt, preamble, retry_config).await,
             AnyModel::Ollama(model) => complete_once(model, prompt, preamble, retry_config).await,
+            AnyModel::Copilot(model) => complete_once(model, prompt, preamble, retry_config).await,
         }
     })
     .await
@@ -1088,6 +1089,46 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn copilot81_cfg_distillation_uses_actual_chat_and_responses_converters() {
+        for style in [
+            crate::config::ApiStyle::Completions,
+            crate::config::ApiStyle::Responses,
+        ] {
+            let text = serde_json::json!({"export_name":"ownedAdd","signature":"(value: number) => number","description":"Add one.","source":"function ownedAdd(_cap, value) { return value + 1; }","tests":["ownedAdd(1) === 2"],"held_out_expressions":["ownedAdd(9) === 10"],"tags":["owned"]}).to_string();
+            let (client, name, server) =
+                crate::provider::copilot::tests::text_fixture(style, text).await;
+            let retry = RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            };
+            let request = crate::startup::heap_future(|| {
+                generalize(
+                    &client,
+                    name,
+                    crate::config::PromptCacheTtl::default(),
+                    &retry,
+                    "const owned_recording = 7 + 1; owned_recording",
+                )
+            });
+            let (body, result) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(server, request)
+            })
+            .await
+            .unwrap();
+            let generated = result.unwrap();
+            assert_eq!(generated.export_name, "ownedAdd");
+            assert_eq!(
+                generated.source,
+                "function ownedAdd(_cap, value) { return value + 1; }"
+            );
+            assert_eq!(generated.tests, ["ownedAdd(1) === 2"]);
+            assert_eq!(generated.held_out_expressions, ["ownedAdd(9) === 10"]);
+            assert!(body.to_string().contains("owned_recording"));
+            assert!(body.to_string().contains("recorded_javascript"));
+        }
     }
 
     #[test]

@@ -67,6 +67,17 @@ Revoked/expired authorization requires sign-in; it does not silently switch
 to a billed API key. Signing out retains the public host/account registration
 for later reauthorization.
 
+Doctor and the setup provider list inspect a bounded, private local snapshot
+under the caller's captured `credentials_dir`. They distinguish a stored
+ChatGPT/Copilot login, a required sign-in, and an unavailable record; a Copilot
+login marker alone is not reported as saved. The same official-route, custom
+provider and explicit CLI-key eligibility used by the production factory controls
+these labels. An active ChatGPT registration requiring reauthorization remains
+visible instead of being mislabeled as an API-key fallback. Inspection creates no
+files, locks, directories or identities, changes no permissions, and performs no
+refresh or provider call. These are local presence labels, not account-health or
+entitlement checks; no token or account identity is included.
+
 The dedicated `src/auth/openai_plan.rs` request policy follows the documented
 [Responses limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations):
 requests use the official `/v1/responses` endpoint with `store: false`,
@@ -610,3 +621,9 @@ chat usage is rejected before arithmetic or tool execution. Copilot sessions use
 ordinary message history; this backend does not claim Anthropic native replay or
 OpenAI encrypted-item publication authority. No live Copilot entitlement was used
 for the local device-flow, refresh, tool/wire and installed terminal controls.
+
+Copilot uses the same existing completion helpers for optional advisor requests
+and model-based JavaScript skill distillation as the other typed backends. Both
+chat and Responses paths preserve caller prompts and response handling; skill
+parsing, capability scopes, proposal verification and admission remain owned by
+the existing distillation pipeline.

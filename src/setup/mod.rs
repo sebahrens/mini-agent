@@ -149,6 +149,8 @@ enum Screen {
 
 struct Ctx {
     cfg: Config,
+    credentials_dir: std::path::PathBuf,
+    cli_key: Option<String>,
     screen: Screen,
     cols: u16,
     rows: u16,
@@ -209,17 +211,15 @@ fn collect_models(cfg: &Config) -> Vec<(String, QuickModelConfig)> {
     models
 }
 
-fn provider_credential_source(cfg: &Config, name: &str) -> Option<crate::auth::CredentialSource> {
-    let empty = HashMap::new();
-    let providers = cfg.custom_providers.as_ref().unwrap_or(&empty);
-    let provider = crate::provider::resolve_provider_config(name, providers).ok()?;
-    crate::auth::AuthResolver::new(provider.kind)
-        .with_env_override(provider.api_key_env.as_deref())
-        .with_config_keys(cfg.api_keys.as_ref())
-        .with_custom_provider_name(Some(name))
-        .with_credential_isolation(provider.credential_isolation)
-        .credential_source_with_env(|name| std::env::var(name))
-        .ok()
+fn provider_credential_source(
+    cfg: &Config,
+    name: &str,
+    cli_key: Option<&str>,
+    credentials_dir: &std::path::Path,
+) -> crate::diagnostics::CredentialReport {
+    crate::diagnostics::provider_credential_with_env(cfg, name, cli_key, credentials_dir, |name| {
+        std::env::var(name)
+    })
 }
 
 fn masked_key(key: &str) -> String {
@@ -398,14 +398,13 @@ fn render_manage_providers(ctx: &Ctx, selected: usize, confirm_delete: bool) -> 
             } else {
                 "[unknown]".to_string()
             };
-            let key_str = match provider_credential_source(&ctx.cfg, name) {
-                Some(crate::auth::CredentialSource::NotRequired) => "key: not required",
-                Some(crate::auth::CredentialSource::AwsDefaultChain) => "auth: AWS SDK chain",
-                Some(crate::auth::CredentialSource::GoogleAdc) => "auth: Google ADC",
-                Some(crate::auth::CredentialSource::CopilotLogin) => "auth: saved Copilot login",
-                Some(_) => "key: set",
-                None => "key: not set",
-            };
+            let key_str = provider_credential_source(
+                &ctx.cfg,
+                name,
+                ctx.cli_key.as_deref(),
+                &ctx.credentials_dir,
+            )
+            .setup_label();
             write_line(
                 row,
                 4,
@@ -815,9 +814,13 @@ fn make_provider_detail_state(
     }
 }
 
-pub fn run(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
+pub fn run(
+    cfg: &mut Config,
+    cli_key: Option<&str>,
+    credentials_dir: &std::path::Path,
+) -> anyhow::Result<SetupOutcome> {
     terminal::enable_raw_mode()?;
-    let result = run_inner(cfg);
+    let result = run_inner(cfg, cli_key, credentials_dir);
     let _ = terminal::disable_raw_mode();
     let mut stdout = io::stdout();
     let _ = stdout.execute(Clear(ClearType::All));
@@ -827,11 +830,17 @@ pub fn run(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
     result
 }
 
-fn run_inner(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
+fn run_inner(
+    cfg: &mut Config,
+    cli_key: Option<&str>,
+    credentials_dir: &std::path::Path,
+) -> anyhow::Result<SetupOutcome> {
     let original = cfg.clone();
     let (cols, rows) = terminal::size()?;
     let mut ctx = Ctx {
         cfg: cfg.clone(),
+        credentials_dir: credentials_dir.to_owned(),
+        cli_key: cli_key.map(str::to_owned),
         screen: Screen::MainMenu,
         cols,
         rows,
@@ -1766,13 +1775,26 @@ mod tests {
             ("OWN_GATEWAY_KEY", None),
         ]);
         assert_eq!(
-            provider_credential_source(&Config::default(), "azure"),
-            Some(crate::auth::CredentialSource::Environment(
-                "AZURE_OPENAI_AD_TOKEN".into()
-            ))
+            provider_credential_source(
+                &Config::default(),
+                "azure",
+                None,
+                std::path::Path::new("unused-login-root")
+            ),
+            crate::diagnostics::CredentialReport::Source(
+                crate::auth::CredentialSource::Environment("AZURE_OPENAI_AD_TOKEN".into())
+            )
         );
         let cfg: Config = serde_json::from_value(serde_json::json!({"custom_providers":{"azure":{"provider_type":"azure","base_url":"https://gateway.example/openai/v1"}}})).unwrap();
-        assert_eq!(provider_credential_source(&cfg, "azure"), None);
+        assert_eq!(
+            provider_credential_source(
+                &cfg,
+                "azure",
+                None,
+                std::path::Path::new("unused-login-root")
+            ),
+            crate::diagnostics::CredentialReport::Missing
+        );
         let mut cfg = cfg;
         cfg.custom_providers
             .as_mut()
@@ -1781,10 +1803,15 @@ mod tests {
             .unwrap()
             .inherit_builtin_key = true;
         assert_eq!(
-            provider_credential_source(&cfg, "azure"),
-            Some(crate::auth::CredentialSource::Environment(
-                "AZURE_OPENAI_AD_TOKEN".into()
-            ))
+            provider_credential_source(
+                &cfg,
+                "azure",
+                None,
+                std::path::Path::new("unused-login-root")
+            ),
+            crate::diagnostics::CredentialReport::Source(
+                crate::auth::CredentialSource::Environment("AZURE_OPENAI_AD_TOKEN".into())
+            )
         );
         assert!(cfg.api_keys.is_none());
     }
@@ -1792,6 +1819,8 @@ mod tests {
     fn wizard(cfg: Config) -> Ctx {
         Ctx {
             cfg,
+            credentials_dir: std::path::PathBuf::new(),
+            cli_key: None,
             screen: Screen::MainMenu,
             cols: 80,
             rows: 24,

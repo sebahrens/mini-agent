@@ -11,6 +11,121 @@ const MAX_DIRECTORY_ENTRIES: usize = 128;
 #[cfg(feature = "lsp")]
 const MAX_LSP_SERVERS: usize = 32;
 
+/// Captured local source metadata only; no credential or registration escapes
+/// this operator-only classification.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CredentialReport {
+    Source(CredentialSource),
+    ChatGpt(crate::auth::LoginRecordState),
+    Copilot(crate::auth::LoginRecordState),
+    Missing,
+    InvalidRoute,
+}
+impl CredentialReport {
+    pub(crate) fn setup_label(&self) -> &'static str {
+        use crate::auth::LoginRecordState as S;
+        match self {
+            Self::Source(CredentialSource::NotRequired) => "key: not required",
+            Self::Source(CredentialSource::AwsDefaultChain) => "auth: AWS SDK chain",
+            Self::Source(CredentialSource::GoogleAdc) => "auth: Google ADC",
+            Self::Source(_) => "key: set",
+            Self::ChatGpt(S::Stored) => "auth: saved ChatGPT login",
+            Self::ChatGpt(S::SignInRequired) => "auth: ChatGPT sign-in required",
+            Self::ChatGpt(_) => "auth: ChatGPT record unavailable",
+            Self::Copilot(S::Stored) => "auth: saved Copilot login",
+            Self::Copilot(S::Absent | S::SignInRequired) => "auth: Copilot sign-in required",
+            Self::Copilot(S::Unavailable) => "auth: Copilot record unavailable",
+            Self::Missing => "key: not set",
+            Self::InvalidRoute => "auth: invalid route",
+        }
+    }
+    fn doctor_label(&self) -> String {
+        use crate::auth::LoginRecordState as S;
+        match self {
+            Self::Source(CredentialSource::Cli) => "CLI --api-key (value omitted)".into(),
+            Self::Source(CredentialSource::Environment(name)) => {
+                format!("environment {name} (value omitted)")
+            }
+            Self::Source(CredentialSource::Config(name)) => {
+                format!("config api_keys.{name} (value omitted)")
+            }
+            Self::Source(CredentialSource::NotRequired) => "not required".into(),
+            Self::Source(CredentialSource::AwsDefaultChain) => {
+                "AWS SDK credential chain (resolved on request; values omitted)".into()
+            }
+            Self::Source(CredentialSource::GoogleAdc) => {
+                "Google Application Default Credentials (resolved on request; values omitted)"
+                    .into()
+            }
+            Self::ChatGpt(S::Stored) => {
+                "saved ChatGPT registration (resolved on request; values omitted)".into()
+            }
+            Self::ChatGpt(S::SignInRequired) => {
+                "saved ChatGPT registration; sign-in required (values omitted)".into()
+            }
+            Self::ChatGpt(_) => {
+                "ChatGPT login record unavailable (read-only inspection; values omitted)".into()
+            }
+            Self::Copilot(S::Stored) => {
+                "saved Copilot login (resolved on request; values omitted)".into()
+            }
+            Self::Copilot(S::Absent | S::SignInRequired) => {
+                "missing; run /login copilot or configure this route's credentials".into()
+            }
+            Self::Copilot(S::Unavailable) => {
+                "Copilot login record unavailable (read-only inspection; values omitted)".into()
+            }
+            Self::Source(CredentialSource::CopilotLogin) => {
+                unreachable!("unresolved login marker is inspected before reporting")
+            }
+            Self::Missing => "missing; configure this route's credentials".into(),
+            Self::InvalidRoute => "provider configuration invalid (values omitted)".into(),
+        }
+    }
+}
+
+pub(crate) fn provider_credential_with_env<F>(
+    cfg: &Config,
+    name: &str,
+    cli_key: Option<&str>,
+    credentials_dir: &Path,
+    get_env: F,
+) -> CredentialReport
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    use crate::auth::LoginRecordState;
+    let custom = cfg.custom_providers_map();
+    let Ok(route) = crate::provider::resolve_provider_config(name, &custom) else {
+        return CredentialReport::InvalidRoute;
+    };
+    if crate::provider::chatgpt_login_route_with_env(name, cli_key, &custom, &get_env)
+        .unwrap_or(false)
+    {
+        let state = crate::auth::oauth::diagnostic_state_at(credentials_dir);
+        if state != LoginRecordState::Absent {
+            return CredentialReport::ChatGpt(state);
+        }
+    }
+    let source = AuthResolver::new(route.kind)
+        .with_cli_key(cli_key)
+        .with_env_override(route.api_key_env.as_deref())
+        .with_config_keys(cfg.api_keys.as_ref())
+        .with_custom_provider_name(Some(name))
+        .with_credential_isolation(route.credential_isolation)
+        .credential_source_with_env(&get_env);
+    match source {
+        Ok(CredentialSource::CopilotLogin) => {
+            CredentialReport::Copilot(crate::auth::copilot::diagnostic_state_at(
+                credentials_dir,
+                &get_env("COPILOT_GITHUB_HOST").unwrap_or_else(|_| "github.com".into()),
+            ))
+        }
+        Ok(source) => CredentialReport::Source(source),
+        Err(_) => CredentialReport::Missing,
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DoctorReport {
     text: String,
@@ -142,34 +257,14 @@ impl DoctorReport {
                 "resolved diagnostic settings; config errors may prevent startup"
             },
         );
-        let custom = cfg.custom_providers_map();
-        let credential = match crate::provider::resolve_provider_config(&provider, &custom) {
-            Ok(route) => {
-                let resolver = AuthResolver::new(route.kind)
-                    .with_cli_key(cli.api_key.as_deref())
-                    .with_env_override(route.api_key_env.as_deref())
-                    .with_config_keys(cfg.api_keys.as_ref())
-                    .with_custom_provider_name(Some(&provider))
-                    .with_credential_isolation(route.credential_isolation);
-                match resolver.credential_source_with_env(|name| std::env::var(name)) {
-                    Ok(CredentialSource::Cli) => "CLI --api-key (value omitted)".into(),
-                    Ok(CredentialSource::Environment(name)) => {
-                        format!("environment {name} (value omitted)")
-                    }
-                    Ok(CredentialSource::Config(name)) => {
-                        format!("config api_keys.{name} (value omitted)")
-                    }
-                    Ok(CredentialSource::NotRequired) => "not required".into(),
-                    Ok(CredentialSource::AwsDefaultChain) => {
-                        "AWS SDK credential chain (resolved on request; values omitted)".into()
-                    }
-                    Ok(CredentialSource::GoogleAdc) => "Google Application Default Credentials (resolved on request; values omitted)".into(),
-                    Ok(CredentialSource::CopilotLogin) => "saved Copilot login (resolved on request; values omitted)".into(),
-                    Err(_) => "missing; configure this route's credentials".into(),
-                }
-            }
-            Err(_) => "provider configuration invalid (values omitted)".into(),
-        };
+        let credential = provider_credential_with_env(
+            cfg,
+            &provider,
+            cli.api_key.as_deref(),
+            &paths.credentials_dir,
+            |name| std::env::var(name),
+        )
+        .doctor_label();
         report.row("credential source", credential);
         let window = session
             .map(|session| session.context_window)

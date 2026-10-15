@@ -275,4 +275,4 @@ pub(crate) fn reasoning_protocol(
 
 #[cfg(test)]
 #[path = "provider_copilot_tests.rs"]
-mod tests;
+pub(crate) mod tests;

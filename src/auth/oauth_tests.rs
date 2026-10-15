@@ -866,3 +866,175 @@ fn oauth47_cli_and_slash_commands_expose_login_without_an_api_key() {
         assert!(crate::ui::pickers::list::available_commands().contains(&command));
     }
 }
+
+fn labels47_store() -> Store {
+    let mut store = Store::new();
+    store.active = Some("owned-labels-app".into());
+    store.accounts.push(Account {
+        client_id: "owned-labels-app".into(),
+        subject: "PRIVATE_LABEL_SUBJECT".into(),
+        email: Some("PRIVATE_LABEL_EMAIL@example.invalid".into()),
+        tokens: Some(Tokens {
+            access: "PRIVATE_LABEL_ACCESS".into(),
+            refresh: "PRIVATE_LABEL_REFRESH".into(),
+            id: "PRIVATE_LABEL_ID".into(),
+            scopes: SCOPES.into(),
+            expires: 1,
+        }),
+    });
+    store
+}
+
+#[test]
+fn login_labels47_openai_reader_is_bounded_nonrepairing_and_preserves_the_revocation_fence() {
+    use crate::auth::LoginRecordState as S;
+    let root = crate::tests::OwnedTestDirectory::new("labels47-openai-reader");
+    let credentials = root.path().join("explicit-credentials");
+    assert_eq!(diagnostic_state_at(&credentials), S::Absent);
+    assert!(!credentials.exists());
+    let directory = credentials.join("provider-oauth");
+    crate::fs::ensure_private_directory(&directory).unwrap();
+    let path = directory.join("openai.json");
+    let mut data = labels47_store();
+    let bytes = serde_json::to_vec(&data).unwrap();
+    crate::fs::private_atomic_write_sync(&path, &bytes).unwrap();
+    assert_eq!(
+        diagnostic_state_at(&credentials),
+        S::Stored,
+        "expired access token still has a refresh; this is presence, not a health probe"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!directory.join("session.lock").exists());
+    data.accounts[0].tokens = None;
+    crate::fs::private_atomic_write_sync(&path, &serde_json::to_vec(&data).unwrap()).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::SignInRequired);
+    data.active = None;
+    crate::fs::private_atomic_write_sync(&path, &serde_json::to_vec(&data).unwrap()).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::Absent);
+    for invalid in [b"not json".to_vec(), vec![b'x'; MAX_BYTES + 1]] {
+        crate::fs::private_atomic_write_sync(&path, &invalid).unwrap();
+        assert_eq!(diagnostic_state_at(&credentials), S::Unavailable);
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    }
+    assert!(!directory.join("session.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn login_labels47_private_inspection_rejects_links_and_preserves_permissive_modes() {
+    use crate::auth::LoginRecordState as S;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let root = crate::tests::OwnedTestDirectory::new("labels47-reader-modes");
+    let credentials = root.path().join("credentials");
+    let directory = credentials.join("provider-oauth");
+    crate::fs::ensure_private_directory(&directory).unwrap();
+    let path = directory.join("openai.json");
+    let bytes = serde_json::to_vec(&labels47_store()).unwrap();
+    crate::fs::private_atomic_write_sync(&path, &bytes).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::Unavailable);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::Unavailable);
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let target = root.path().join("target.json");
+    std::fs::rename(&path, &target).unwrap();
+    symlink(&target, &path).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::Unavailable);
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    std::fs::remove_file(&path).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::rename(&directory, &outside).unwrap();
+    symlink(&outside, &directory).unwrap();
+    assert_eq!(diagnostic_state_at(&credentials), S::Unavailable);
+    assert!(!outside.join("session.lock").exists());
+}
+
+#[test]
+fn login_labels47_doctor_and_setup_use_explicit_saved_account_state_and_actual_route_precedence() {
+    use crate::auth::{CredentialSource, LoginRecordState as S};
+    use crate::diagnostics::{CredentialReport as R, provider_credential_with_env as inspect};
+    use std::env::VarError;
+    let root = crate::tests::OwnedTestDirectory::new("labels47-operator");
+    let credentials = root.path().join("captured");
+    let directory = credentials.join("provider-oauth");
+    crate::fs::ensure_private_directory(&directory).unwrap();
+    let path = directory.join("openai.json");
+    let mut data = labels47_store();
+    crate::fs::private_atomic_write_sync(&path, &serde_json::to_vec(&data).unwrap()).unwrap();
+    let cfg: crate::config::Config =
+        serde_json::from_value(serde_json::json!({"api_keys":{"openai":"PRIVATE_CONFIG_KEY"}}))
+            .unwrap();
+    let env = |name: &str| {
+        if name == "OPENAI_API_KEY" {
+            Ok("PRIVATE_ENV_KEY".into())
+        } else {
+            Err(VarError::NotPresent)
+        }
+    };
+    let saved = inspect(&cfg, "openai", None, &credentials, env);
+    assert_eq!(saved, R::ChatGpt(S::Stored));
+    assert_eq!(saved.setup_label(), "auth: saved ChatGPT login");
+    assert_eq!(
+        inspect(&cfg, "openai", Some("PRIVATE_CLI"), &credentials, env),
+        R::Source(CredentialSource::Cli)
+    );
+    assert_eq!(
+        inspect(&cfg, "openai", None, &root.path().join("other"), env),
+        R::Source(CredentialSource::Environment("OPENAI_API_KEY".into()))
+    );
+    assert_eq!(
+        inspect(&cfg, "openai", None, &credentials, |name| {
+            if name == "OPENAI_BASE_URL" {
+                Ok("https://gateway.example/v1".into())
+            } else {
+                env(name)
+            }
+        }),
+        R::Source(CredentialSource::Environment("OPENAI_API_KEY".into()))
+    );
+    let custom: crate::config::Config = serde_json::from_value(serde_json::json!({"custom_providers":{"openai":{"provider_type":"openai","base_url":"https://api.openai.com/v1","inherit_builtin_key":true}}})).unwrap();
+    assert_eq!(
+        inspect(&custom, "openai", None, &credentials, env),
+        R::Source(CredentialSource::Environment("OPENAI_API_KEY".into()))
+    );
+    data.accounts[0].tokens = None;
+    crate::fs::private_atomic_write_sync(&path, &serde_json::to_vec(&data).unwrap()).unwrap();
+    let fence = inspect(&cfg, "openai", None, &credentials, env);
+    assert_eq!(fence, R::ChatGpt(S::SignInRequired));
+    assert_eq!(fence.setup_label(), "auth: ChatGPT sign-in required");
+    // Render the actual Doctor with the supplied root, with no global store
+    // selection and no token/account details escaping into the report.
+    let _env =
+        crate::tests::ScopedProcessEnv::set(&[("OPENAI_BASE_URL", None), ("OPENAI_API_KEY", None)]);
+    let paths = crate::paths::AppPaths {
+        config_dir: root.path().join("config"),
+        data_dir: root.path().join("data"),
+        local_data_dir: root.path().join("local"),
+        state_dir: root.path().join("state"),
+        cache_dir: root.path().join("cache"),
+        credentials_dir: credentials.clone(),
+        project_dir: Some(root.path().to_owned()),
+    };
+    let cli = crate::cli::Cli {
+        provider: Some("openai".into()),
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let report =
+        crate::diagnostics::DoctorReport::capture(&cli, &cfg, &paths, None, None, false).render();
+    assert!(
+        report.contains("saved ChatGPT registration; sign-in required"),
+        "{report}"
+    );
+    assert!(!report.contains("PRIVATE_"));
+    assert!(!directory.join("session.lock").exists());
+}
