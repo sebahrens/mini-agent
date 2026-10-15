@@ -146,6 +146,9 @@ pub(super) mod test_support {
             #[cfg(feature = "mcp")]
             mcp_admin: None,
             model_cache_generation: 0,
+            session_start_task: None,
+            skill_commands: None,
+            update_notice: None,
         }
     }
 }
@@ -1272,6 +1275,165 @@ pub(crate) struct App<'a> {
     #[cfg(feature = "mcp")]
     mcp_admin: Option<Box<crate::ui::mcp_admin::State>>,
     model_cache_generation: u64,
+    /// SessionStart hook work deferred past the first frame (see
+    /// [`App::finish_startup_work`]).
+    session_start_task: Option<SessionStartTask>,
+    /// Startup skill discovery for the "/" picker, applied when it lands.
+    skill_commands: Option<PendingSkillCommands>,
+    /// Opt-in update check started in the background at startup.
+    update_notice: Option<tokio::sync::oneshot::Receiver<String>>,
+}
+
+struct PendingSkillCommands {
+    /// Discovery ran for this binding; a worktree rebind discards it.
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    rx: tokio::sync::oneshot::Receiver<Vec<(String, String)>>,
+    /// Joined (bounded) at teardown so discovery never outlives the App.
+    task: tokio::task::JoinHandle<()>,
+    /// A later explicit listing already replaced the picker entries.
+    stale: bool,
+}
+
+#[cfg(feature = "hooks")]
+type SessionStartOutput = crate::extras::hooks::OwnedSessionStartContext;
+#[cfg(not(feature = "hooks"))]
+type SessionStartOutput = std::convert::Infallible;
+type SessionStartTask = tokio::task::JoinHandle<SessionStartOutput>;
+
+/// `--worktree` / `--parallel` rebuild the agent inside `App::new`.
+fn worktree_startup_requested(cli: &crate::cli::Cli) -> bool {
+    #[cfg(feature = "git-worktree")]
+    {
+        cli.worktree.is_some() || cli.parallel
+    }
+    #[cfg(not(feature = "git-worktree"))]
+    {
+        let _ = cli;
+        false
+    }
+}
+
+/// Plain editing, paste, scroll and resize stay responsive while deferred
+/// startup work runs; everything else (submission, commands, keybound
+/// actions, quit) joins it first.
+fn defers_startup_work(event: &UserEvent) -> bool {
+    match event {
+        UserEvent::Paste(_) | UserEvent::ScrollUp | UserEvent::ScrollDown | UserEvent::Resize => {
+            true
+        }
+        UserEvent::Key(key) => {
+            key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+                && matches!(
+                    key.code,
+                    KeyCode::Char(_)
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                )
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod startup_work_tests {
+    use super::*;
+
+    #[test]
+    fn only_plain_editing_defers_startup_work() {
+        let key = |code, modifiers| UserEvent::Key(KeyEvent::new(code, modifiers));
+        assert!(defers_startup_work(&key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(defers_startup_work(&key(
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(defers_startup_work(&key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
+        assert!(defers_startup_work(&UserEvent::Paste("text".into())));
+        assert!(defers_startup_work(&UserEvent::Resize));
+        assert!(!defers_startup_work(&key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+        assert!(!defers_startup_work(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!defers_startup_work(&key(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!defers_startup_work(&key(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!defers_startup_work(&UserEvent::Quit));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn deferred_session_start_task_is_joined_before_work() {
+        let root = crate::tests::OwnedTestDirectory::new("deferred-session-start");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            ..Default::default()
+        };
+        let cfg: config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": {"startup-fixture": {"provider_type":"openai", "base_url":"http://127.0.0.1:1", "api_style":"completions"}}
+        }))
+        .unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("startup-fixture", "test-model", 128_000, "");
+        let ui = UiContext {
+            native_startup: None,
+            native_ticket: None,
+            pending_session_start_context: None,
+            cli: &cli,
+            cfg: &cfg,
+            session: &mut session,
+            context: &mut context,
+            workspace,
+            client: crate::provider::create_client(
+                "startup-fixture",
+                Some("unused-local-fixture-key"),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+            .unwrap(),
+            permission: None,
+            ask_tx: None,
+            sandbox: crate::sandbox::Sandbox::new(false, "none"),
+            prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+            status_signals: None,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        let mut app = test_support::fixture_app(ui);
+        let before = app.ui.session.messages.len();
+        app.session_start_task = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            crate::extras::hooks::OwnedSessionStartContext::for_test(vec![
+                "deferred hook context".into(),
+            ])
+        }));
+        assert!(app.startup_work_pending());
+        app.finish_startup_work().await.unwrap();
+        assert!(!app.startup_work_pending());
+        assert!(
+            app.ui.session.messages.len() > before,
+            "hook context is adopted before the first turn"
+        );
+        // Idempotent once joined.
+        app.finish_startup_work().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1456,7 +1618,9 @@ impl<'a> App<'a> {
 
         // No input thread exists yet: retain every unrelated decoded event for
         // its sole owner instead of flushing or racing raw terminal input.
-        let background = crate::ui::terminal::query_background(!ui.cli.no_color);
+        // The query is sent now and its reply collected after the renderer,
+        // input editor and history are built, overlapping the round trip.
+        let background_query = crate::ui::terminal::start_background_query(!ui.cli.no_color);
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -1464,7 +1628,6 @@ impl<'a> App<'a> {
         ui.session.refresh_git_branch();
 
         let mut renderer = Renderer::new()?;
-        renderer.set_terminal_background(background.color);
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
         renderer.set_title_status(ui.cfg.resolve_terminal_title());
@@ -1473,11 +1636,6 @@ impl<'a> App<'a> {
             prompt_marks: ui.cfg.resolve_terminal_prompt_marks(),
         });
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
-        let theme_warning = crate::context::themes::apply_initial(
-            ui.context,
-            ui.cfg.colors.as_ref(),
-            &mut renderer,
-        );
 
         let mut input = InputEditor::new();
         input.keybindings = keybindings;
@@ -1491,28 +1649,26 @@ impl<'a> App<'a> {
                 .map(|(name, template)| (format!("/{name}"), template.description))
                 .collect(),
         );
+        // Skill discovery walks and hashes every SKILL.md; populate the "/"
+        // picker when it lands instead of before the first frame.
         #[cfg(feature = "agent-skills")]
-        if let Ok(services) = ui.instruction_services()
-            && let Ok(snapshot) = services.refresh(false).await
-        {
-            input.set_skill_commands(
-                snapshot
-                    .packages
-                    .iter()
-                    .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
-                    .map(|(name, package)| {
-                        (
-                            format!("/{name}"),
-                            format!(
-                                "{} — {}",
-                                package.origin,
-                                skill_description(&package.record.description)
-                            ),
-                        )
-                    })
-                    .collect(),
-            );
-        }
+        let skill_commands = ui.instruction_services().ok().map(|services| {
+            let workspace = ui.workspace.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                if let Ok(snapshot) = services.refresh(false).await {
+                    let _ = tx.send(skill_command_entries(&snapshot));
+                }
+            });
+            PendingSkillCommands {
+                workspace,
+                rx,
+                task,
+                stale: false,
+            }
+        });
+        #[cfg(not(feature = "agent-skills"))]
+        let skill_commands: Option<PendingSkillCommands> = None;
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
         input.set_theme_names(ui.context.themes.keys().cloned().collect());
         if let Some(editor) = &ui.cfg.editor {
@@ -1531,6 +1687,16 @@ impl<'a> App<'a> {
         input.set_permission(ui.permission.clone());
         input.load_global_history();
 
+        // No input thread exists yet: retain every unrelated decoded event for
+        // its sole owner instead of flushing or racing raw terminal input.
+        let background = background_query.collect();
+        renderer.set_terminal_background(background.color);
+        let theme_warning = crate::context::themes::apply_initial(
+            ui.context,
+            ui.cfg.colors.as_ref(),
+            &mut renderer,
+        );
+
         let mut run = AgentRunState {
             agent,
             ..AgentRunState::default()
@@ -1545,21 +1711,29 @@ impl<'a> App<'a> {
             .feed_mut()
             .set_reasoning_display(ui.cfg.resolve_reasoning_display());
         ui.session.reasoning_enabled = slash.reasoning_enabled;
-        #[cfg(feature = "goal")]
-        let goal_block =
-            crate::extras::goal::prompt::goal_block(ui.session.goal_store.snapshot().as_ref());
-        #[cfg(not(feature = "goal"))]
-        let goal_block: Option<String> = None;
-        let (overhead, parts) = crate::agent::builder::estimate_overhead_breakdown(
-            ui.context,
-            slash.reasoning_enabled,
-            ui.cli,
-            ui.cfg,
-            &ui.sandbox,
-            goal_block.as_deref(),
-        );
-        ui.session.overhead_tokens = overhead;
-        ui.session.overhead_parts = parts;
+        // The background prebuild measures the real preamble and publishes it
+        // when it lands (the statusline shows no overhead until then); only
+        // startup paths without a prebuild estimate it here.
+        let prebuild_expected = auto_trigger_msg.is_none()
+            && run.agent.is_none()
+            && !worktree_startup_requested(ui.cli);
+        if !prebuild_expected {
+            #[cfg(feature = "goal")]
+            let goal_block =
+                crate::extras::goal::prompt::goal_block(ui.session.goal_store.snapshot().as_ref());
+            #[cfg(not(feature = "goal"))]
+            let goal_block: Option<String> = None;
+            let (overhead, parts) = crate::agent::builder::estimate_overhead_breakdown(
+                ui.context,
+                slash.reasoning_enabled,
+                ui.cli,
+                ui.cfg,
+                &ui.sandbox,
+                goal_block.as_deref(),
+            );
+            ui.session.overhead_tokens = overhead;
+            ui.session.overhead_parts = parts;
+        }
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
         let marker_path = crate::paths::process_paths()
@@ -1901,19 +2075,17 @@ impl<'a> App<'a> {
             None
         };
 
+        // SessionStart hooks only add context for the first turn. Keep them
+        // (and the native startup join they gate) off the first frame: the
+        // run loop adopts them when they finish, and any submission or
+        // non-editing event joins them first.
         #[cfg(feature = "hooks")]
-        if let Some(task) = session_start_task.take() {
-            match task.await {
-                Ok(context) => ui.adopt_session_start_context(context),
-                Err(error) => {
-                    if let Some(owner) = &ui.native_startup {
-                        owner.hook_retired(Err(error))?;
-                    }
-                }
-            }
+        let session_start_task = session_start_task.take();
+        #[cfg(not(feature = "hooks"))]
+        let session_start_task: Option<SessionStartTask> = None;
+        if session_start_task.is_none() {
+            ui.join_native_startup().await?;
         }
-
-        ui.join_native_startup().await?;
 
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
         let (title_tx, title_rx) = mpsc::channel::<SessionTitleResult>(4);
@@ -1963,9 +2135,52 @@ impl<'a> App<'a> {
             #[cfg(feature = "mcp")]
             mcp_admin: None,
             model_cache_generation: crate::ui::slash::model_cache_generation(),
+            session_start_task,
+            skill_commands,
+            update_notice: crate::update::take_startup_notice(),
         };
         app.request_git_status_refresh();
         Ok(app)
+    }
+
+    fn mark_startup_skill_commands_stale(&mut self) {
+        if let Some(pending) = self.skill_commands.as_mut() {
+            pending.stale = true;
+        }
+    }
+
+    /// Startup work deferred past the first frame is still outstanding.
+    fn startup_work_pending(&self) -> bool {
+        self.session_start_task.is_some() || self.ui.native_startup.is_some()
+    }
+
+    /// Join the deferred SessionStart hook task and native startup
+    /// publication. Every turn, command and exit path runs this first, so
+    /// they observe exactly the state the former blocking join produced.
+    async fn finish_startup_work(&mut self) -> anyhow::Result<()> {
+        if let Some(task) = self.session_start_task.take() {
+            let result = task.await;
+            self.adopt_session_start_result(result)?;
+        }
+        self.ui.join_native_startup().await
+    }
+
+    fn adopt_session_start_result(
+        &mut self,
+        result: Result<SessionStartOutput, tokio::task::JoinError>,
+    ) -> anyhow::Result<()> {
+        match result {
+            #[cfg(feature = "hooks")]
+            Ok(context) => self.ui.adopt_session_start_context(context),
+            #[cfg(not(feature = "hooks"))]
+            Ok(never) => match never {},
+            Err(error) => {
+                if let Some(owner) = &self.ui.native_startup {
+                    owner.hook_retired(Err(error))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dispatch a branch/status refresh when the adaptive schedule says one
@@ -2335,6 +2550,18 @@ impl<'a> App<'a> {
     }
 
     pub(super) async fn teardown_owners(&mut self) {
+        // Deferred SessionStart/native startup work must finish before session
+        // end hooks and the final save observe the session.
+        if let Err(error) = self.finish_startup_work().await {
+            tracing::warn!(%error, "deferred startup work failed during teardown");
+        }
+        if let Some(pending) = self.skill_commands.take()
+            && tokio::time::timeout(Duration::from_secs(5), pending.task)
+                .await
+                .is_err()
+        {
+            tracing::warn!("startup skill discovery did not finish during teardown");
+        }
         // The owning actor must retire before its manager/services are closed,
         // including callers that leave without entering the normal run wrapper.
         #[cfg(feature = "mcp")]
@@ -5962,6 +6189,7 @@ impl<'a> App<'a> {
                     )
                 })
                 .collect::<Vec<_>>();
+            self.mark_startup_skill_commands_stale();
             self.input.set_skill_commands(entries.clone());
             self.renderer.write_line(
                 "Agent Skills (instruction context; no permission grants):",
@@ -6927,6 +7155,12 @@ impl<'a> App<'a> {
             self.slash.reasoning_enabled,
         )
         .await;
+        // Startup skipped the overhead estimate when a prebuild was started;
+        // show the measured preamble as soon as the agent lands.
+        if let Some(snapshot) = self.run.agent.as_ref().and_then(AnyAgent::context_snapshot) {
+            self.ui.session.overhead_tokens = snapshot.tokens;
+            self.ui.session.overhead_parts = snapshot.parts.clone();
+        }
     }
 
     /// Stop and join the crossterm event thread so a synchronous stdin
@@ -7337,6 +7571,7 @@ impl<'a> App<'a> {
         {
             self.run.instruction_turn = None;
             self.run.pending_skill_turn = None;
+            self.mark_startup_skill_commands_stale();
             self.input.set_skill_commands(Vec::new());
         }
 
@@ -13298,6 +13533,27 @@ mod git_confirmation_stack_tests {
 }
 
 #[cfg(feature = "agent-skills")]
+#[cfg(feature = "agent-skills")]
+fn skill_command_entries(
+    snapshot: &crate::extras::skills::discovery::Discovery,
+) -> Vec<(String, String)> {
+    snapshot
+        .packages
+        .iter()
+        .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
+        .map(|(name, package)| {
+            (
+                format!("/{name}"),
+                format!(
+                    "{} — {}",
+                    package.origin,
+                    skill_description(&package.record.description)
+                ),
+            )
+        })
+        .collect()
+}
+
 fn skill_description(text: &str) -> String {
     let mut text = sanitize_output(text)
         .split_whitespace()

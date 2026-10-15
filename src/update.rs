@@ -106,6 +106,41 @@ pub(crate) fn should_check(
     true
 }
 
+static PENDING_STARTUP_NOTICE: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Starts the opt-in check in the background so the TUI never waits on the
+/// network or its cache writes; the run loop shows the notice when it lands.
+pub(crate) fn spawn_startup_notice(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    interactive: bool,
+    state: &Path,
+) {
+    if !should_check(cli, cfg, interactive) {
+        return;
+    }
+    let state = state.to_path_buf();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Some(notice) = checked_notice(&state).await {
+            let _ = tx.send(notice);
+        }
+    });
+    *PENDING_STARTUP_NOTICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(rx);
+}
+
+/// The receiver for a notice started by [`spawn_startup_notice`], once.
+pub(crate) fn take_startup_notice() -> Option<tokio::sync::oneshot::Receiver<String>> {
+    PENDING_STARTUP_NOTICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+#[cfg(test)]
 pub(crate) async fn startup_notice(
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
@@ -115,6 +150,10 @@ pub(crate) async fn startup_notice(
     if !should_check(cli, cfg, interactive) {
         return None;
     }
+    checked_notice(state).await
+}
+
+async fn checked_notice(state: &Path) -> Option<String> {
     let endpoint = github_latest_url(env!("CARGO_PKG_REPOSITORY"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     match check_cached(state, now, env!("CARGO_PKG_VERSION"), || {

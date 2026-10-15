@@ -460,6 +460,11 @@ impl OwnedSessionStartContext {
     pub(crate) fn into_notices(self) -> Vec<String> {
         self.notices
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(notices: Vec<String>) -> Self {
+        Self { notices }
+    }
 }
 
 pub(crate) async fn dispatch_session_start_with(

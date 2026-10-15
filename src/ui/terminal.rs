@@ -22,13 +22,7 @@ pub(crate) fn is_attached() -> bool {
 /// COLORFGBG's final ANSI color is the terminal background. Invalid or absent
 /// hints remain unknown; this never reads or discards terminal input.
 pub(crate) fn background_hint_is_light(hint: &str) -> Option<bool> {
-    if hint.len() > 128 {
-        return None;
-    }
-    let index = hint.rsplit(';').next()?.trim().parse::<u8>().ok()?;
-    Some(background_color_is_light(
-        crossterm::style::Color::AnsiValue(index),
-    ))
+    background_hint_color(hint).map(background_color_is_light)
 }
 
 #[derive(Default)]
@@ -40,11 +34,29 @@ pub(crate) struct BackgroundQuery {
 /// Query only before the App starts its input thread. Crossterm remains the
 /// sole decoder: unrelated keys, paste, mouse and incomplete replies are
 /// retained as their original events for that thread, never read as raw bytes.
-pub(crate) fn query_background(enabled: bool) -> BackgroundQuery {
+/// An OSC 11 query already written to the terminal. Startup overlaps the
+/// reply's round trip with other construction and collects it last, still
+/// before the input thread exists.
+pub(crate) struct PendingBackgroundQuery {
+    #[cfg(unix)]
+    deadline: Option<std::time::Instant>,
+    hint: Option<crossterm::style::Color>,
+}
+
+const BACKGROUND_REPLY_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Writes the OSC 11 query, unless `COLORFGBG` already names the background:
+/// then no query is sent and nothing waits on a terminal that may never reply.
+pub(crate) fn start_background_query(enabled: bool) -> PendingBackgroundQuery {
+    let hint = enabled
+        .then(|| std::env::var("COLORFGBG").ok())
+        .flatten()
+        .and_then(|hint| background_hint_color(&hint));
     #[cfg(unix)]
     {
         use std::io::IsTerminal;
         if enabled
+            && hint.is_none()
             && is_attached()
             && io::stdin().is_terminal()
             && io::stdout().is_terminal()
@@ -56,19 +68,53 @@ pub(crate) fn query_background(enabled: bool) -> BackgroundQuery {
                 .and_then(|()| out.flush())
                 .is_ok()
             {
-                return collect_background_events(Duration::from_millis(150), |remaining| {
+                return PendingBackgroundQuery {
+                    deadline: Some(std::time::Instant::now() + BACKGROUND_REPLY_TIMEOUT),
+                    hint,
+                };
+            }
+        }
+        PendingBackgroundQuery {
+            deadline: None,
+            hint,
+        }
+    }
+    #[cfg(not(unix))]
+    PendingBackgroundQuery { hint }
+}
+
+impl PendingBackgroundQuery {
+    /// Collects the reply within what remains of the original deadline.
+    pub(crate) fn collect(self) -> BackgroundQuery {
+        #[cfg(unix)]
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // A reply that already arrived is still decoded after the deadline.
+            return collect_background_events(
+                remaining.max(Duration::from_millis(1)),
+                |remaining| {
                     if crossterm::event::poll(remaining)? {
                         crossterm::event::read().map(Some)
                     } else {
                         Ok(None)
                     }
-                });
-            }
+                },
+            );
+        }
+        BackgroundQuery {
+            color: self.hint,
+            pending: Default::default(),
         }
     }
-    #[cfg(not(unix))]
-    let _ = enabled;
-    BackgroundQuery::default()
+}
+
+/// The `COLORFGBG` background as an ANSI color, when the hint is valid.
+fn background_hint_color(hint: &str) -> Option<crossterm::style::Color> {
+    if hint.len() > 128 {
+        return None;
+    }
+    let index = hint.rsplit(';').next()?.trim().parse::<u8>().ok()?;
+    Some(crossterm::style::Color::AnsiValue(index))
 }
 
 #[cfg(any(unix, test))]
@@ -274,6 +320,24 @@ mod background_hint_tests {
         assert_eq!(background_hint_is_light(&"0".repeat(129)), None);
         assert!(background_color_is_light(crossterm::style::Color::White));
         assert!(!background_color_is_light(crossterm::style::Color::Black));
+    }
+
+    #[test]
+    fn colorfgbg_short_circuits_the_osc_query() {
+        {
+            let _environment =
+                crate::tests::ScopedProcessEnv::set(&[("COLORFGBG", Some("0;15".into()))]);
+            let started = std::time::Instant::now();
+            let query = start_background_query(true).collect();
+            assert_eq!(query.color, Some(crossterm::style::Color::AnsiValue(15)));
+            assert!(query.pending.is_empty());
+            assert!(started.elapsed() < BACKGROUND_REPLY_TIMEOUT);
+            // Disabled colour negotiation ignores the hint as before.
+            assert_eq!(start_background_query(false).collect().color, None);
+        }
+        let _environment =
+            crate::tests::ScopedProcessEnv::set(&[("COLORFGBG", Some("bad".into()))]);
+        assert_eq!(start_background_query(true).collect().color, None);
     }
 
     fn key(

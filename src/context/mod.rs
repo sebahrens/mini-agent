@@ -449,6 +449,24 @@ pub fn load(no_context_files: bool) -> ContextFiles {
 /// process working directory. ACP sessions use this entry point so concurrent
 /// roots cannot affect one another.
 pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>) -> ContextFiles {
+    load_for_workspace_with(no_context_files, workspace_root, true)
+}
+
+/// [`load`] without reading persistent memory: the caller reads it once
+/// after it knows which compaction summary to exclude.
+#[cfg(feature = "memory")]
+pub fn load_deferring_memory(no_context_files: bool) -> ContextFiles {
+    let workspace_root = std::env::current_dir().ok();
+    load_for_workspace_with(no_context_files, workspace_root.as_deref(), false)
+}
+
+fn load_for_workspace_with(
+    no_context_files: bool,
+    workspace_root: Option<&Path>,
+    read_memory: bool,
+) -> ContextFiles {
+    #[cfg(not(feature = "memory"))]
+    let _ = read_memory;
     if let Err(e) = prompts::ensure_global() {
         tracing::warn!("failed to install default prompts: {e}");
     }
@@ -474,7 +492,9 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     let theme_map = themes::load();
     let theme_name = crate::session::storage::load_theme_name();
     #[cfg(feature = "memory")]
-    let memory = crate::extras::memory::Mem::open().context_block();
+    let memory = read_memory
+        .then(|| crate::extras::memory::Mem::open().context_block())
+        .flatten();
     ContextFiles {
         #[cfg(feature = "mcp")]
         mcp_discovery: Default::default(),

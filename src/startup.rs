@@ -1012,8 +1012,13 @@ impl Startup {
 
         // Load context first so prompts/themes are available early.
         let no_context_files = cli.resolve_no_context_files(&cfg);
-        #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
-        let mut context =
+        // Persistent memory is read once below, after the session is known,
+        // so a resumed session's compaction exclusion is applied in one pass.
+        #[cfg(feature = "memory")]
+        let mut context = context::load_deferring_memory(no_context_files)
+            .for_workspace_binding(no_context_files, &workspace);
+        #[cfg(not(feature = "memory"))]
+        let context =
             context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
         // Guarded Git global capture overlapped the read-only loading above;
         // it must be complete before any hook, MCP or project effect below.
@@ -1242,9 +1247,9 @@ impl Startup {
         // memory block must not carry the daily log's copy of it as well
         // (mini-agent-vx0yg).
         #[cfg(feature = "memory")]
-        if let Some(reference) = session.active_compaction_ref() {
-            context.memory =
-                crate::extras::memory::Mem::open().context_block_excluding(Some(reference));
+        {
+            context.memory = crate::extras::memory::Mem::open()
+                .context_block_excluding(session.active_compaction_ref());
         }
 
         // The invocation's captured workspace is authoritative until an
@@ -2645,7 +2650,7 @@ impl Startup {
     async fn dispatch_interactive(self) -> anyhow::Result<()> {
         let Startup {
             cli,
-            mut cfg,
+            cfg,
             mut session,
             mut context,
             workspace,
@@ -2667,8 +2672,7 @@ impl Startup {
             ..
         } = self;
 
-        cfg.update_notice =
-            crate::update::startup_notice(&cli, &cfg, is_interactive, &paths.state_dir).await;
+        crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
         let auto_trigger_msg = select_interactive_auto_trigger(&cli, arch_msg);
 
         crate::ui::run_interactive(
