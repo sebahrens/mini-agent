@@ -762,6 +762,8 @@ pub struct Renderer {
     frame: std::cell::RefCell<Vec<u8>>,
     /// Nesting depth of `frame` calls; the frame is flushed at depth zero.
     frame_depth: u32,
+    /// `terminal::resume_epoch` last seen; a change forces a full repaint.
+    seen_resume_epoch: u64,
     /// A line was written inside an open frame; the frame's close paints
     /// the chat once for all of them.
     deferred_line_paint: bool,
@@ -927,6 +929,7 @@ impl Renderer {
             frame: std::cell::RefCell::new(Vec::with_capacity(16 * 1024)),
             frame_depth: 0,
             deferred_line_paint: false,
+            seen_resume_epoch: crate::ui::terminal::resume_epoch(),
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
@@ -1065,6 +1068,12 @@ impl Renderer {
     /// use this pair; every `begin_frame` must be matched.
     pub(crate) fn begin_frame(&mut self) {
         if self.frame_depth == 0 {
+            // A resumed terminal cleared the screen behind the row tracking.
+            let epoch = crate::ui::terminal::resume_epoch();
+            if epoch != self.seen_resume_epoch {
+                self.seen_resume_epoch = epoch;
+                self.invalidate();
+            }
             let mut frame = self.frame.borrow_mut();
             frame.clear();
             frame.extend_from_slice(SYNC_BEGIN.as_bytes());
@@ -4848,5 +4857,34 @@ mod picker_overlay_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_repaint_tests {
+    use super::*;
+    use crate::ui::feed::BlockStyle;
+
+    #[test]
+    fn a_resumed_terminal_gets_a_full_repaint_on_the_next_frame() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..100 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("row {line}"));
+        }
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("draft", 5, &[], 0, false).unwrap();
+        crate::ui::terminal::note_resumed_for_test();
+        let before = renderer.frame_stats();
+        renderer
+            .frame(|r| {
+                r.render_viewport()?;
+                r.draw_bottom("draft", 5, &[], 0, false)
+            })
+            .unwrap();
+        let frame = renderer.frame_stats().since(before);
+        assert_eq!(frame.viewport_rows, renderer.visible_lines());
+        assert_eq!(frame.bottom_full_paints, 1);
     }
 }
