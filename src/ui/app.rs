@@ -10986,7 +10986,10 @@ mod permission_loop_tests {
         );
         assert!(paints >= 1, "the first token paints at once");
         // A token skipped by the throttle is painted by the running tick
-        // within one stream interval, without any further event.
+        // within one stream interval, without any further event. Pin the
+        // last paint to now so a loaded host cannot let the interval elapse
+        // before the tail token arrives.
+        app.run.last_stream_paint = Some(std::time::Instant::now());
         app.handle_agent_event(AgentEvent::Token("tail\n".into()))
             .await
             .unwrap();
@@ -13324,16 +13327,24 @@ mod context_diagnostic_tests {
             stored_before,
             "diagnostic must not save session"
         );
-        let output = app.renderer.captured_output();
+        // Listings print as one frame, so rows that scroll past inside it are
+        // never painted; read content from the transcript, and check that
+        // neither the transcript nor the painted bytes leak private text.
+        let output = app.renderer.transcript_text();
         assert!(output.contains("Context composition:") && output.contains("agent not built"));
         assert!(!output.contains("PRIVATE_USER_CONTENT"));
+        assert!(
+            !app.renderer
+                .captured_output()
+                .contains("PRIVATE_USER_CONTENT")
+        );
         app.input.load_text(" \t/doctor");
         crate::startup::heap_future(|| {
             app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         })
         .await
         .unwrap();
-        let output = app.renderer.captured_output();
+        let output = app.renderer.transcript_text();
         assert!(
             output.contains("price source: captured session rates")
                 && output.contains("Terminal attachment:")
