@@ -235,9 +235,6 @@ impl PermissionState {
             .and_then(|r| r.background.as_ref())
             .is_some_and(|origin| !origin.valid(session))
     }
-    pub(crate) fn abandoned(&self) -> bool {
-        self.abandoned_with(true)
-    }
     /// `revalidate == false` skips the bound origin's source revalidation and
     /// checks only the cheap reply-channel state; replies stay authoritative.
     pub(crate) fn abandoned_with(&self, revalidate: bool) -> bool {
