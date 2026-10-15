@@ -130,6 +130,10 @@ The preparation action disables the MSYS2 package cache when `collect-sources`
 is true: the pinned setup action otherwise ends with `pacman -Scc`, removing the
 exact signed installed archives that source collection verifies. Ordinary CI jobs
 keep package caching enabled.
+If detached-signature verification fails, collection stops and reports the exact
+package/signature basenames, exit status and at most 4 KiB of escaped GPG/keyring
+diagnostics. It never imports a missing key, relaxes trust or accepts an
+unverified package to continue source assembly.
 The pinned MinGW configuration enables PCRE2; provision its UCRT64 headers and
 libraries rather than disabling that feature. Before allocating build staging,
 the helper checks the required header with the exact native compiler using a

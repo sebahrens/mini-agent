@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import subprocess
 from pathlib import Path
 import tarfile
 import tempfile
@@ -31,6 +32,33 @@ class NativeSourceCollectorTests(unittest.TestCase):
         owner = tempfile.TemporaryDirectory(prefix="mini-agent-native-source-test-")
         self.addCleanup(owner.cleanup)
         self.root = Path(owner.name).resolve()
+
+    def test_msys_signature_failure_reports_bounded_reason_and_exact_files(self):
+        command = ["pacman-key", "--verify", "/owned/package.pkg.tar.zst.sig", "/var/cache/pacman/pkg/package.pkg.tar.zst"]
+        reason = b"gpg: Can't check signature: No public key\n\x1b[31m" + b"x" * 5000
+        def fail(argv, **options):
+            self.assertEqual(argv, command)
+            self.assertEqual(options["timeout"], 120)
+            options["stderr"].write(reason)
+            return subprocess.CompletedProcess(argv, 1)
+        with patch.object(COLLECT.subprocess, "run", side_effect=fail), self.assertRaises(COLLECT.CollectionError) as raised:
+            COLLECT.capture(command)
+        detail = str(raised.exception)
+        self.assertIn("No public key", detail)
+        self.assertIn('"exit": 1', detail)
+        self.assertIn('"files": ["package.pkg.tar.zst.sig", "package.pkg.tar.zst"]', detail)
+        self.assertNotIn("/owned", detail)
+        self.assertNotIn("\x1b", detail)
+        self.assertIn("\\u001b", detail)
+        self.assertLess(len(detail), 4500)
+
+    def test_other_metadata_failure_keeps_diagnostics_private(self):
+        def fail(argv, **options):
+            options["stderr"].write(b"unrelated private command diagnostic")
+            return subprocess.CompletedProcess(argv, 2)
+        with patch.object(COLLECT.subprocess, "run", side_effect=fail), self.assertRaises(COLLECT.CollectionError) as raised:
+            COLLECT.capture(["pacman", "-Q", "package"])
+        self.assertEqual(str(raised.exception), "required distro metadata/signature command failed: pacman")
 
     def test_alpine_installed_origin_commit_and_literal_checksums(self):
         database = self.root / "installed"

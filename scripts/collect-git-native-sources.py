@@ -44,9 +44,20 @@ def safe(value: str) -> str:
 
 
 def capture(command: list[str]) -> str:
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(command, stdout=output, stderr=subprocess.PIPE, timeout=120, check=False)
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        result = subprocess.run(command, stdout=output, stderr=errors, timeout=120, check=False)
         if result.returncode:
+            if len(command) == 4 and Path(command[0]).name == "pacman-key" and command[1] == "--verify":
+                # Fixed publisher-only signature verification has no credential
+                # arguments. Retain bounded, escaped GPG/keyring diagnostics;
+                # other metadata commands keep their closed error category.
+                errors.seek(0)
+                reason = errors.read(4096).decode("utf-8", errors="replace")
+                names = [Path(argument).name for argument in command[2:]]
+                raise CollectionError(
+                    "MSYS2 package signature verification failed: "
+                    + json.dumps({"exit": result.returncode, "files": names, "diagnostic": reason}, ensure_ascii=True)
+                )
             raise CollectionError(f"required distro metadata/signature command failed: {command[0]}")
         output.seek(0)
         data = output.read(2 * 1024 * 1024 + 1)
