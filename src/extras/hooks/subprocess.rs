@@ -46,6 +46,20 @@ pub(crate) struct HookPolicy {
     /// Content digests of workspace-resident hook files, verified before
     /// every launch. Dispatchers bound to a workspace always attach them.
     content_pins: Option<Arc<super::pins::HookContentPins>>,
+    /// Launch inputs resolved once and shared by every launch under this
+    /// policy (a handler's `if` condition and the handler itself).
+    prep: Arc<Mutex<Option<Arc<HookLaunchPrep>>>>,
+}
+
+/// Per-handler launch inputs that do not depend on the launched program.
+/// Containment checks are not part of it: program resolution, content-pin
+/// verification, sandbox wrapping (write-root validation, Git metadata alias
+/// inspection) and the execution-root identity check run on every launch.
+#[derive(Debug)]
+struct HookLaunchPrep {
+    requested: String,
+    project_dir: std::path::PathBuf,
+    explicit_env: Result<std::collections::BTreeMap<String, String>, String>,
 }
 
 impl HookPolicy {
@@ -60,7 +74,51 @@ impl HookPolicy {
             containment_supported: hook_containment_supported(sandbox_backend),
             env,
             content_pins: None,
+            prep: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Resolve the project directory and explicit environment once for this
+    /// policy. A different `project_dir` replaces the memo.
+    fn launch_prep(&self, project_dir: &str) -> Result<Arc<HookLaunchPrep>, HookOutput> {
+        let mut memo = self
+            .prep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(prep) = memo.as_ref()
+            && prep.requested == project_dir
+        {
+            return Ok(prep.clone());
+        }
+        let denied = |stderr: Vec<u8>| HookOutput {
+            started: false,
+            exit_code: None,
+            stdout: Vec::new(),
+            stderr,
+            status: HookStatus::PolicyDenied,
+            diagnostics: self.launch_denied_diagnostics(),
+        };
+        let canonical = match std::fs::canonicalize(project_dir) {
+            Ok(path) if path.parent().is_some() => path,
+            Ok(_) => {
+                return Err(denied(
+                    b"hook project directory cannot be the filesystem root".to_vec(),
+                ));
+            }
+            Err(error) => {
+                return Err(denied(
+                    format!("failed to resolve hook project directory: {error}").into_bytes(),
+                ));
+            }
+        };
+        let explicit_env = self.explicit_env(&canonical.to_string_lossy());
+        let prep = Arc::new(HookLaunchPrep {
+            requested: project_dir.to_owned(),
+            project_dir: canonical,
+            explicit_env,
+        });
+        *memo = Some(prep.clone());
+        Ok(prep)
     }
 
     /// Requires every launch under this policy to match `pins`.
@@ -374,37 +432,18 @@ async fn run_hook_with_policy_and_limits(
             };
         }
     };
-    let project_dir = match std::fs::canonicalize(project_dir) {
-        Ok(path) if path.parent().is_some() => path,
-        Ok(_) => {
-            return HookOutput {
-                started: false,
-                exit_code: None,
-                stdout: Vec::new(),
-                stderr: b"hook project directory cannot be the filesystem root".to_vec(),
-                status: HookStatus::PolicyDenied,
-                diagnostics: policy.launch_denied_diagnostics(),
-            };
-        }
-        Err(error) => {
-            return HookOutput {
-                started: false,
-                exit_code: None,
-                stdout: Vec::new(),
-                stderr: format!("failed to resolve hook project directory: {error}").into_bytes(),
-                status: HookStatus::PolicyDenied,
-                diagnostics: policy.launch_denied_diagnostics(),
-            };
-        }
+    let prep = match policy.launch_prep(project_dir) {
+        Ok(prep) => prep,
+        Err(output) => return output,
     };
-    let project_dir_text = project_dir.to_string_lossy();
+    let project_dir = prep.project_dir.as_path();
     let search_path = policy
         .env
         .get("PATH")
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"));
     let program =
-        match super::pins::resolve_hook_program(&program, search_path.as_deref(), &project_dir) {
+        match super::pins::resolve_hook_program(&program, search_path.as_deref(), project_dir) {
             Ok(path) => path,
             Err(message) => {
                 return HookOutput {
@@ -418,7 +457,7 @@ async fn run_hook_with_policy_and_limits(
             }
         };
     if let Some(pins) = &policy.content_pins
-        && let Err(message) = pins.verify_launch(&project_dir, &program, &args)
+        && let Err(message) = pins.verify_launch(project_dir, &program, &args)
     {
         tracing::warn!("hooks: {message}");
         return HookOutput {
@@ -431,8 +470,24 @@ async fn run_hook_with_policy_and_limits(
         };
     }
     let program = program.to_string_lossy().into_owned();
-    let explicit_env = match policy.explicit_env(&project_dir_text) {
+    let explicit_env = match &prep.explicit_env {
         Ok(env) => env,
+        Err(message) => {
+            return HookOutput {
+                started: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: message.clone().into_bytes(),
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
+            };
+        }
+    };
+    let mut cmd = match policy
+        .sandbox
+        .wrap_hook_command(&program, &args, project_dir, explicit_env)
+    {
+        Ok(command) => command,
         Err(message) => {
             return HookOutput {
                 started: false,
@@ -444,23 +499,6 @@ async fn run_hook_with_policy_and_limits(
             };
         }
     };
-    let mut cmd =
-        match policy
-            .sandbox
-            .wrap_hook_command(&program, &args, &project_dir, &explicit_env)
-        {
-            Ok(command) => command,
-            Err(message) => {
-                return HookOutput {
-                    started: false,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: message.into_bytes(),
-                    status: HookStatus::PolicyDenied,
-                    diagnostics: policy.launch_denied_diagnostics(),
-                };
-            }
-        };
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -806,4 +844,49 @@ pub(crate) async fn run_shell_condition_at_root(
         execution_root,
     )
     .await
+}
+
+#[cfg(test)]
+mod launch_prep_tests {
+    use super::*;
+
+    #[test]
+    fn condition_and_handler_share_one_launch_prep_per_policy() {
+        let root = crate::tests::OwnedTestDirectory::new("hook-launch-prep");
+        let other = crate::tests::OwnedTestDirectory::new("hook-launch-prep-other");
+        let policy = HookPolicy::new(
+            HookTrust::Trusted,
+            "unused",
+            std::collections::BTreeMap::from([("HOOK_FLAG".to_string(), "1".to_string())]),
+        );
+        let requested = root.path().to_string_lossy().into_owned();
+        let first = policy.launch_prep(&requested).ok().unwrap();
+        let second = policy.clone().launch_prep(&requested).ok().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the handler reuses its condition's prep"
+        );
+        assert_eq!(first.project_dir, root.path().canonicalize().unwrap());
+        let env = first.explicit_env.as_ref().unwrap();
+        assert_eq!(env.get("HOOK_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("ZEROSTACK_PROJECT_DIR").map(String::as_str),
+            Some(first.project_dir.to_string_lossy().as_ref())
+        );
+
+        let moved = policy
+            .launch_prep(&other.path().to_string_lossy())
+            .ok()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &moved));
+        assert_eq!(moved.project_dir, other.path().canonicalize().unwrap());
+        assert!(matches!(
+            policy.launch_prep("/definitely/missing/hook/project"),
+            Err(HookOutput {
+                status: HookStatus::PolicyDenied,
+                started: false,
+                ..
+            })
+        ));
+    }
 }

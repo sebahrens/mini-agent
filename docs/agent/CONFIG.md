@@ -1247,7 +1247,10 @@ best-effort, and these gaps remain:
 Bare command names (`sh`, `python3`) resolve only through absolute `PATH`
 entries; empty, `.`, or other relative entries are ignored so a planted file in
 the workspace can never shadow a system executable. `if` conditions always run
-through `/bin/sh` on Unix.
+through `/bin/sh` on Unix. A handler's `if` condition and the handler share one
+launch policy: the project directory and explicit environment are resolved once
+for both, while program resolution, content-pin verification, sandbox wrapping
+and execution-root validation still run for each launch.
 
 ### Global switches
 

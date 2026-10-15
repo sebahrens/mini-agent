@@ -822,10 +822,12 @@ impl HookDispatcher {
                 continue;
             }
 
+            // One policy per handler: its condition and its launch share the
+            // policy's launch prep and sandbox caches. Every launch still
+            // verifies pins and wraps (and validates) the sandbox afresh.
+            let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
+                .with_content_pins(self.content_pins_for(handler));
             if let Some(condition) = &handler.condition {
-                let policy =
-                    HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
-                        .with_content_pins(self.content_pins_for(handler));
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
                 let cond_output = crate::startup::heap_future(|| {
@@ -883,8 +885,6 @@ impl HookDispatcher {
             let project_dir = project_dir.to_string();
             let execution_root = execution_root.clone();
             let args = handler.args.clone();
-            let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
-                .with_content_pins(self.content_pins_for(handler));
             let diagnostics = policy.diagnostics();
             let trust = handler.trust;
             let audit_event = event.to_string();
