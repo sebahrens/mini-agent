@@ -350,7 +350,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `OPENROUTER_MODEL` | Legacy model fallback after `--model`/`ZS_MODEL`, before config; only applies when OpenRouter is the provider in effect. |
 | `MINI_AGENT_HOME` | Application home for roots without a more specific `ZS_*_DIR` override; precedes default home/platform layout discovery. |
 | `ZS_CONFIG_DIR`, `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, `ZS_CREDENTIALS_DIR` | Override the corresponding persistence root before `MINI_AGENT_HOME` and platform defaults. `--config` selects an explicit config file; these variables still control other roots. See application paths above for artifact and no-persist policy. |
-| `EXA_API_KEY`, `CONTEXT7_API_KEY`, `GREP_APP_API_KEY` | Credentials for the corresponding built-in MCP registrations when enabled. User-configured registrations retain their own configured headers. |
+| `EXA_API_KEY`, `CONTEXT7_API_KEY`, `GREP_APP_API_KEY` | Credentials for the corresponding built-in MCP registrations when enabled; `EXA_API_KEY` also supplies native `web_search`. User-configured registrations retain their own configured headers. |
 | `GITHUB_COPILOT_API_TOKEN`, `COPILOT_GITHUB_TOKEN` | Copilot model API token or explicitly supplied GitHub bootstrap token, respectively. CLI API key wins, then these designated sources, then `api_keys.copilot`, then a saved Copilot login. No ambient GitHub CLI/Actions tokens or editor caches are read. Isolated custom providers need their own token or explicit inheritance. |
 | `COPILOT_CLIENT_ID`, `COPILOT_GITHUB_HOST`, `COPILOT_API_URL` | Your device-flow-enabled GitHub OAuth app ID (required for `/login copilot` or `--login copilot`), authorization host (`github.com` or `SUBDOMAIN.ghe.com`), and optional model API origin. A configured endpoint wins the origin fallback; GitHub-issued endpoint selection stays within the captured host's approved Copilot service origins. See [Copilot credentials](PROVIDERS.md#github-copilot-credential-ownership). |
 | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub Gist sharing credentials. `GITHUB_TOKEN` is tried first; `GH_TOKEN` is used if the former cannot be read. Sharing is an explicit action and can disclose the shared session. |
@@ -3717,3 +3717,43 @@ Only one steer may wait at a time; a second remains in the input draft.
 The `background_tasks` status-line item (with `subagents`) shows the current
 session’s active Task jobs and completed reports awaiting next-turn notice.
 `/tasks` lists, reads, or cancels these jobs; `/jobs` remains the Shell-job view.
+
+### Native web tools
+
+Native `web_fetch` and `web_search` tools do not require JS or MCP. They can be
+selected with `--tools web_fetch,web_search`, and `--no-tools` removes both.
+`EXA_API_KEY` also supplies native Exa search; a missing key produces an error
+before network I/O. Exa service charges are separate from model-usage totals.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `web-fetch-origins` (`web_fetch_origins`) | omitted | Exact permitted HTTP(S) origins; omitted accepts any otherwise-safe public origin, an empty/invalid list denies all. This restriction does not grant permission. |
+| `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
+| `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
+
+These are authority-sensitive project config keys and require existing project
+trust. They are independent of `js-fetch-origins`/`js-fetch-allow-http`; changing
+native web settings does not widen the JS broker's grant or worker authority.
+
+Native network permission keys are `web_fetch` and `web_search`. They accept
+simple allow/ask/deny values or granular glob/regex rules, and the existing
+`permission-allow`, `permission-ask` and `permission-deny` maps also accept them.
+The input is a normalized URL followed by ` destinations=[IP:port,...]`. For
+example, this permits native retrieval from one origin while keeping other
+network destinations interactive:
+
+```toml
+web-fetch-origins = ["https://docs.rs"]
+[permission.web_fetch]
+"https://docs.rs/**" = "allow"
+```
+
+`--dangerously-skip-permissions` disables ordinary native web permission checks
+through the same explicit operator contract as other native tools. Mandatory
+financial admission, concurrency and all network-safety bounds remain active.
+
+No configuration or interactive approval bypasses private-address validation,
+DNS pinning, redirect checks, body bounds or the overall deadline. Search secrets
+are scoped only to the fixed Exa endpoint; no key or endpoint tool argument is
+accepted. Page/snippet text is literal untrusted context, not an execution or
+permission source. Optional fetch `prompt` does not invoke a summarizing model.

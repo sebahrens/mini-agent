@@ -558,6 +558,8 @@ impl PermissionChecker {
             ("git/unstage", &config.git_unstage),
             ("git/commit", &config.git_commit),
             ("js/fetch", &config.js_fetch),
+            ("web_fetch", &config.web_fetch),
+            ("web_search", &config.web_search),
             ("read", &config.read),
             ("write", &config.write),
             ("edit", &config.edit),
@@ -1018,6 +1020,8 @@ impl PermissionChecker {
                         | "memory_write"
                         | "memory_edit"
                         | "notebook_edit"
+                        | "web_fetch"
+                        | "web_search"
                 ) {
                     // Bash scripts and network destinations are opaque,
                     // security-sensitive permission keys. An unmatched call
@@ -1731,12 +1735,17 @@ impl PermissionChecker {
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
-            // Only path tools receive generated scope patterns. Every other
-            // AllowAlways key (shell scripts, `git/commit` messages, `js/fetch`
+            // Path scopes and explicitly decoded native web origins have
+            // generated literal matchers. Every other AllowAlways key (shell
+            // scripts, `git/commit` messages, `js/fetch`
             // URLs, MCP operations) is a literal the model controls, so a `*`
             // or `?` inside it must never widen the grant.
             let matches = if is_path_tool_name(tool) {
                 pattern.matches_path(input)
+            } else if matches!(tool, "web_fetch" | "web_search")
+                && pattern.is_generated_web_origin_scope()
+            {
+                pattern.matches(input)
             } else {
                 pattern.original == input
             };
@@ -1749,10 +1758,13 @@ impl PermissionChecker {
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
         let tool = canonical_permission_tool(&tool).to_string();
-        let generated_path_scope = self
-            .is_path_tool(&tool)
-            .then(|| Pattern::new_generated_path_scope(pattern_str))
-            .flatten();
+        let generated_path_scope = if matches!(tool.as_str(), "web_fetch" | "web_search") {
+            Pattern::new_generated_web_origin_scope(pattern_str)
+        } else if self.is_path_tool(&tool) {
+            Pattern::new_generated_path_scope(pattern_str)
+        } else {
+            None
+        };
         let has_generated = generated_path_scope.is_some();
         let pattern = if let Some(pattern) = generated_path_scope {
             pattern
@@ -1800,10 +1812,13 @@ impl PermissionChecker {
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
             let tool = canonical_permission_tool(tool).to_string();
-            let generated_path_scope = self
-                .is_path_tool(&tool)
-                .then(|| Pattern::new_generated_path_scope(pat))
-                .flatten();
+            let generated_path_scope = if matches!(tool.as_str(), "web_fetch" | "web_search") {
+                Pattern::new_generated_web_origin_scope(pat)
+            } else if self.is_path_tool(&tool) {
+                Pattern::new_generated_path_scope(pat)
+            } else {
+                None
+            };
             let has_generated = generated_path_scope.is_some();
             let pattern = if let Some(pattern) = generated_path_scope {
                 pattern

@@ -16,6 +16,7 @@ pub struct Pattern {
     /// resolution prefers the most specific matching pattern; see
     /// `docs/agent/CONFIG.md` ("Rule precedence").
     specificity: usize,
+    generated_web_origin: bool,
     /// True when the pattern can only match absolute paths it names
     /// explicitly (`/opt/**`, `~/src/**`, `^/opt/`), as opposed to a
     /// relative or match-anything pattern such as `**/*.rs` or `src/**`.
@@ -73,6 +74,7 @@ impl Pattern {
             folded_regex: Regex::new(&format!("(?i){}", glob_to_regex(&expanded)))
                 .expect("glob conversion must always produce a valid regular expression"),
             specificity: glob_specificity(&expanded),
+            generated_web_origin: false,
             absolute_anchored: is_absolute_path_text(&expanded),
             original,
             normalize_path_input: false,
@@ -89,6 +91,7 @@ impl Pattern {
             #[cfg(any(target_os = "macos", windows))]
             folded_regex: Regex::new(&format!("(?i)(?s){expanded}"))?,
             specificity: regex_specificity(&expanded),
+            generated_web_origin: false,
             absolute_anchored: expanded.strip_prefix('^').is_some_and(|rest| {
                 // A regex backslash starts an escape, so a UNC root is `\\\\` (two escaped backslashes).
                 rest.starts_with('/')
@@ -147,10 +150,43 @@ impl Pattern {
             folded_regex: Regex::new(&format!("(?i){regex}")).ok()?,
             regex: Regex::new(&regex).ok()?,
             specificity: path.chars().count(),
+            generated_web_origin: false,
             absolute_anchored: true,
             original: encoded.to_string(),
             normalize_path_input: true,
         })
+    }
+
+    /// Decode only an exact, canonically serialized HTTP(S) origin. Generated
+    /// web scopes use a distinct codec and never name a filesystem authority.
+    pub(crate) fn new_generated_web_origin_scope(encoded: &str) -> Option<Self> {
+        let origin = decode_hex_path(encoded.strip_prefix(WEB_ORIGIN_SCOPE_PREFIX)?)?;
+        let url = reqwest::Url::parse(&origin).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.query().is_some()
+            || url.host_str().is_none_or(|host| host.ends_with('.'))
+            || origin != url.origin().ascii_serialization()
+        {
+            return None;
+        }
+        let regex = format!("(?s)^{}/.*$", regex::escape(&origin));
+        Some(Self {
+            #[cfg(any(target_os = "macos", windows))]
+            folded_regex: Regex::new(&format!("(?i){regex}")).ok()?,
+            regex: Regex::new(&regex).ok()?,
+            original: encoded.to_owned(),
+            normalize_path_input: false,
+            specificity: origin.chars().count(),
+            absolute_anchored: false,
+            generated_web_origin: true,
+        })
+    }
+
+    pub(crate) fn is_generated_web_origin_scope(&self) -> bool {
+        self.generated_web_origin
     }
 
     /// Path match used for deny rules: on macOS and Windows it also matches
@@ -182,6 +218,12 @@ impl Pattern {
             self.matches(input)
         }
     }
+}
+
+const WEB_ORIGIN_SCOPE_PREFIX: &str = "mini-agent-literal-web-origin-v1:";
+
+pub(crate) fn web_origin_pattern(url: &reqwest::Url) -> String {
+    encode_generated_scope(WEB_ORIGIN_SCOPE_PREFIX, &url.origin().ascii_serialization())
 }
 
 const EXACT_SCOPE_PREFIX: &str = "mini-agent-literal-path-v1:exact:";
@@ -258,6 +300,16 @@ pub(crate) fn search_root_allow_scope(root: &str) -> (String, String) {
 /// are opaque hex on the wire); any other pattern is returned verbatim.
 #[cfg_attr(not(feature = "acp"), allow(dead_code))]
 pub(crate) fn describe_allow_pattern(pattern: &str) -> String {
+    if let Some(scope) = Pattern::new_generated_web_origin_scope(pattern) {
+        let origin = decode_hex_path(
+            scope
+                .original
+                .strip_prefix(WEB_ORIGIN_SCOPE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        return format!("URLs on exactly {origin}");
+    }
     let (kind, encoded) = if let Some(encoded) = pattern.strip_prefix(EXACT_SCOPE_PREFIX) {
         (GeneratedScopeKind::Exact, encoded)
     } else if let Some(encoded) = pattern.strip_prefix(DESCENDANT_SCOPE_PREFIX) {
@@ -358,4 +410,74 @@ fn glob_to_regex(pattern: &str) -> String {
     }
     re.push('$');
     re
+}
+
+#[cfg(test)]
+mod web_scope_codec_tests {
+    use super::*;
+    #[test]
+    fn web_scope_codec_preserves_literal_origin_scheme_effective_port_and_ipv6() {
+        for origin in [
+            "https://docs.rs",
+            "https://docs.rs:8443",
+            "http://docs.rs",
+            "https://[2606:4700:4700::1111]",
+            "https://*.example",
+        ] {
+            let url = reqwest::Url::parse(origin).unwrap();
+            let encoded = web_origin_pattern(&url);
+            let pattern = Pattern::new_generated_web_origin_scope(&encoded).unwrap();
+            assert!(pattern.is_generated_web_origin_scope());
+            assert!(!pattern.is_absolute_anchored());
+            assert!(pattern.matches(&format!("{origin}/a?q=1 destinations=[93.184.216.34:443]")));
+            assert!(!pattern.matches(&format!("{origin}.evil/a destinations=[93.184.216.34:443]")));
+            if origin.contains('*') {
+                assert!(!pattern.matches("https://sub.example/a destinations=[93.184.216.34:443]"));
+            }
+        }
+        let url = reqwest::Url::parse("https://docs.rs:443/").unwrap();
+        let pattern = Pattern::new_generated_web_origin_scope(&web_origin_pattern(&url)).unwrap();
+        assert!(pattern.matches("https://docs.rs/a destinations=[93.184.216.34:443]"));
+        assert!(!pattern.matches("http://docs.rs/a destinations=[93.184.216.34:80]"));
+        assert!(!pattern.matches("https://docs.rs:8443/a destinations=[93.184.216.34:8443]"));
+    }
+    #[test]
+    fn web_scope_codec_rejects_paths_userinfo_fragments_malformed_and_nonnormalized_origins() {
+        for origin in [
+            "",
+            "file:///etc",
+            "https://user:secret@docs.rs",
+            "https://docs.rs/path",
+            "https://docs.rs#fragment",
+            "https://docs.rs?q=1",
+            "https://docs.rs.",
+            "https://docs.rs/",
+            "https://DOCS.RS",
+            "https://docs.rs:443",
+        ] {
+            assert!(
+                Pattern::new_generated_web_origin_scope(&encode_generated_scope(
+                    WEB_ORIGIN_SCOPE_PREFIX,
+                    origin
+                ))
+                .is_none(),
+                "{origin}"
+            );
+        }
+        for encoded in [
+            "https://docs.rs/**",
+            "mini-agent-literal-web-origin-v1:zz",
+            "mini-agent-literal-web-origin-v1:1",
+            "mini-agent-literal-web-origin-v1:ff",
+        ] {
+            assert!(Pattern::new_generated_web_origin_scope(encoded).is_none());
+        }
+        assert!(
+            Pattern::new_generated_web_origin_scope(&descendant_path_pattern(
+                std::path::Path::new("https://docs.rs")
+            ))
+            .is_none()
+        );
+        assert!(!Pattern::new("https://docs.rs/**").is_generated_web_origin_scope());
+    }
 }

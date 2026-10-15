@@ -44,6 +44,8 @@ pub struct PermissionConfig {
     pub git_commit: Option<ToolPerm>,
     #[serde(rename = "js/fetch", alias = "fetch")]
     pub js_fetch: Option<ToolPerm>,
+    pub web_fetch: Option<ToolPerm>,
+    pub web_search: Option<ToolPerm>,
     pub read: Option<ToolPerm>,
     pub write: Option<ToolPerm>,
     pub edit: Option<ToolPerm>,
@@ -95,6 +97,8 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "git/unstage"
             | "git/commit"
             | "js/fetch"
+            | "web_fetch"
+            | "web_search"
             | "read"
             | "write"
             | "edit"

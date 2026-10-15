@@ -421,6 +421,24 @@ pub struct Config {
         alias = "js_fetch_allow_http"
     )]
     pub js_fetch_allow_http: Option<bool>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "web-fetch-origins",
+        alias = "web_fetch_origins"
+    )]
+    pub web_fetch_origins: Option<Vec<String>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "web-fetch-allow-http",
+        alias = "web_fetch_allow_http"
+    )]
+    pub web_fetch_allow_http: Option<bool>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "web-search-provider",
+        alias = "web_search_provider"
+    )]
+    pub web_search_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "allow-all-mcp-calls")]
     pub allow_all_mcp_calls: Option<bool>,
     /// Bound on one MCP `tools/call` round trip, in seconds. Default: 120.

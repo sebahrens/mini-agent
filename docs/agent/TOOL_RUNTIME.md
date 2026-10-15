@@ -1367,3 +1367,79 @@ thinking/signatures remain persisted protocol data and are never editor replay t
 The focused native stdio fixture proves same-process/restart prefix retention and
 closed refusal using inert signatures; it does not assert live-provider signature
 acceptance.
+
+The App event loop constructs measured large agent-event, key-handler, and
+slash-command futures through the existing short `heap_future` factory. This
+keeps their temporary storage out of parent polling frames while preserving
+the same awaits, interruption cleanup, and permission ownership. Fixed 1 MiB
+thread tests exercise a cold typed command, draft interruption, pending
+approval denial, mode cycling, and session-picker selection. The Windows
+default job discovers and runs both App stack consumers after compiling its
+existing feature suite; compilation alone is insufficient evidence for this
+stack budget. No production stack-size override is introduced.
+
+### Native web retrieval and search
+
+`src/agent/tools/web_http.rs` owns the parent-only URL/origin policy, public-address
+checks, process-wide DNS budget, request/response caps and pinned HTTP transports
+shared by native web tools and the JS broker. `web_fetch.rs` implements GET-only
+page retrieval and minimal HTML-to-text conversion; `web_search.rs` implements
+fixed-endpoint Exa search. These tools are available without the `js`, `sandbox`
+or `mcp` Cargo features and use the same mandatory model-tool decorators as other
+built-ins. `--no-tools` and named `--tools` selection apply normally.
+
+Every requested destination must use HTTPS unless the operator enables native
+HTTP explicitly. Normalized URLs, including every redirect, are limited to
+8 KiB before DNS and permission approval. Embedded credentials, fragments, ambiguous trailing-dot hosts,
+private/special addresses and mixed public/private DNS answers are refused. DNS
+answers are checked before approval and pinned for the exchange; redirects are
+never followed by reqwest. `web_fetch` independently validates and authorizes
+at most five redirects. Search posts only to `https://api.exa.ai/search`, captures
+`EXA_API_KEY` when the agent is built, and refuses every redirect. Keys never come
+from a tool argument, are never sent to returned search URLs, and backend error
+bodies are not exposed. Exact credential echoes in returned titles/snippets are
+redacted within the same character caps; result URLs containing the captured
+credential are omitted. A search can incur Exa charges; model-token/cash totals do
+not estimate those external service charges.
+
+Network approval uses `web_fetch` or `web_search`, the normalized URL and its
+complete destination-address list. Unmatched network calls ask in standard mode;
+headless requests fail closed without explicit permission. Readonly/planwrite
+modes do not silently authorize network access. Host-wide interactive grants
+still run all URL, origin and public-address checks on every request. An origin
+allowlist restricts possible destinations; it does not grant permission.
+The explicit operator `--dangerously-skip-permissions` mode disables ordinary
+permission checks as for other native tools. It retains mandatory financial
+admission, concurrency, destination checks, network caps and cancellation.
+
+The parent limits request headers to 64/16 KiB, response headers to 128/64 KiB,
+request bodies to 256 KiB and response bodies to 1 MiB. Encoded or non-UTF-8 bodies
+are rejected. A native HTTP operation has one ten-second deadline spanning DNS,
+approval, redirects and body consumption, with three-second DNS/connect/read
+bounds. Cancellation drops native approval and asynchronous socket work. The
+non-abortable OS resolver remains bounded by four process-wide permits; its
+actual scoped blocking closure retains the permit and turn ownership until it
+returns. Private spill writes also retain scoped ownership until the OS operation
+finishes; the network deadline does not claim to interrupt filesystem sync.
+No native operation retries a provider request.
+
+Fetch returns up to 50,000 converted text characters, quoted line by line as
+untrusted reference data. Script/style bodies are omitted; HTML parsing is a
+small text extractor, not a browser or rendering engine. Optional `prompt` is a
+retrieval-focus annotation for the caller; it performs no additional model call.
+Returned page text, query text and snippets never become commands, prompt-mode
+directives, file includes or permission grants. Truncated text is saved to the
+current logical session's private output directory when storage is available,
+with an explicit pointer or visible storage-failure notice. The exact opaque
+pointer-bearing output hash transfers the artifact reference alongside bounded
+replay text to existing session persistence; it does not invent SDK correlation ids. Canceled save waiters clean
+up uncommitted output through owned RAII results. Both tools advertise their own
+limits and retain them through live model-history and transcript persistence.
+
+Search returns at most five provider-ranked titles/URLs and 2,000-character text
+snippets per result. It requests bounded text rather than provider-generated
+summaries, visits no returned URL, filters malformed/credential-bearing result
+URLs, and quotes all content. Missing `EXA_API_KEY`, unknown providers, invalid
+arguments and provider HTTP errors give bounded visible errors. The only current
+provider is `exa`; `web-search-provider = "off"` removes search registration.
+The API contract is documented in [Exa's Search reference](https://exa.ai/docs/reference/search).

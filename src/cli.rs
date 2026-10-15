@@ -1334,6 +1334,8 @@ impl Cli {
             "advisor",
             #[cfg(feature = "lsp")]
             "lsp_diagnostics",
+            "web_fetch",
+            "web_search",
         ];
 
         !self.resolve_no_tools(cfg)

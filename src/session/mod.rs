@@ -29,7 +29,7 @@ pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
 pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
     matches!(
         name,
-        "read" | "shell" | "grep" | "find_files" | "list_dir" | "js"
+        "read" | "shell" | "grep" | "find_files" | "list_dir" | "js" | "web_fetch" | "web_search"
     )
 }
 pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 8;
@@ -73,6 +73,29 @@ impl ToolResultSpillStore {
         {
             correlation_ids.push(provider_call_id.to_owned());
         }
+        self.register_correlated(correlation_ids, tool_name, model_output, path);
+    }
+
+    /// Native self-bounded tools cannot see SDK call ids in `Tool::call`.
+    /// Their unique opaque artifact pointer binds this complete output hash;
+    /// persistence consumes the existing exact-output fallback, without parsing
+    /// model output or inventing a framework correlation id.
+    pub(crate) fn register_output(
+        &self,
+        tool_name: &str,
+        model_output: &str,
+        path: std::path::PathBuf,
+    ) {
+        self.register_correlated(Vec::new(), tool_name, model_output, path);
+    }
+
+    fn register_correlated(
+        &self,
+        correlation_ids: Vec<String>,
+        tool_name: &str,
+        model_output: &str,
+        path: std::path::PathBuf,
+    ) {
         let output_key = (tool_name.to_owned(), sha256(model_output));
         let spill = Arc::new(PendingToolResultSpill {
             path,
@@ -3018,7 +3041,16 @@ mod preflight_tests {
     fn self_bounded_tool_results_keep_their_own_limits_on_replay() {
         let mut session = Session::new("test", "mock", 128_000, "");
         let output = "bounded result\n".repeat(2_000);
-        for tool in ["read", "shell", "grep", "find_files", "list_dir", "js"] {
+        for tool in [
+            "read",
+            "shell",
+            "grep",
+            "find_files",
+            "list_dir",
+            "js",
+            "web_fetch",
+            "web_search",
+        ] {
             let (content, replay, artifact) = session.tool_result_content("id", tool, &output);
             assert_eq!(content, format!("{tool}:\n{output}"));
             assert_eq!(replay, output);

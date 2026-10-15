@@ -823,3 +823,12 @@ constructors.
 The cancellation/lane fixture's two `old retired` / `next retired` output fields
 are exact NON-PROCESS data entries. Its registered blocking operations mutate
 only the owned fixture file and join before root cleanup. No scanner changes.
+
+Native web tools share the parent HTTP policy in `src/agent/tools/web_http.rs`.
+The two `response.status()` redirect checks and two status-to-u16 result fields
+are reqwest response metadata, not process terminals; their exact expressions
+are classified `NON-PROCESS`. The redirect-status `matches!` context moved from
+the JS host to this shared module with its full token fingerprint unchanged.
+The native persisted-result test's `output.as_str()` assertion is CompactString
+payload data and has a separate exact macro-context classification. No process
+constructor, arbitrary macro or directory receives an exemption.

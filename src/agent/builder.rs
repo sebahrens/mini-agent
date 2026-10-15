@@ -42,6 +42,8 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "write"
             | "edit"
             | "notebook_edit"
+            | "web_fetch"
+            | "web_search"
             | "grep"
             | "find_files"
             | "list_dir"
@@ -595,6 +597,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "write",
         "edit",
         "notebook_edit",
+        "web_fetch",
         "grep",
         "find_files",
         "list_dir",
@@ -603,6 +606,9 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "ask_user_question",
     ];
     names.push("git");
+    if cfg.web_search_provider.as_deref() != Some("off") {
+        names.push("web_search");
+    }
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
         names.push("shell");
         names.push("job_status");
@@ -1009,6 +1015,26 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let mut base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::new();
+        if cli.tool_is_eligible(cfg, "web_fetch") {
+            base_tools.push(Box::new(tools::web_fetch::WebFetchTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                cfg.web_fetch_origins.as_deref(),
+                cfg.web_fetch_allow_http.unwrap_or(false),
+                tool_output_session_id,
+                tool_result_spills.clone(),
+            )));
+        }
+        if cli.tool_is_eligible(cfg, "web_search")
+            && cfg.web_search_provider.as_deref() != Some("off")
+        {
+            base_tools.push(Box::new(tools::web_search::WebSearchTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                cfg.web_search_provider.as_deref(),
+            )));
+        }
+
         base_tools.push(Box::new(
             tools::ReadTool::new_with_tracker(
                 permission.clone(),
@@ -2092,6 +2118,136 @@ mod extra_file_tests {
         assert!(headless.contains("In iterative loop mode"));
         assert!(!headless.to_ascii_lowercase().contains("ask the user"));
     }
+    #[tokio::test]
+    async fn web_native_builder_exposes_actual_sdk_schemas_and_honors_tool_selection() {
+        let root = crate::tests::OwnedTestDirectory::new("web-builder");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = empty_ctx();
+        context.workspace_root = root.path().to_path_buf();
+        for (tools, no_tools, provider, expected) in [
+            (
+                vec!["web_fetch", "web_search"],
+                false,
+                None,
+                vec!["web_fetch", "web_search"],
+            ),
+            (vec!["web_fetch"], false, None, vec!["web_fetch"]),
+            (vec!["web_fetch", "web_search"], true, None, vec![]),
+            (
+                vec!["web_fetch", "web_search"],
+                false,
+                Some("off"),
+                vec!["web_fetch"],
+            ),
+        ] {
+            let cli = crate::cli::Cli {
+                tools: tools.into_iter().map(String::from).collect(),
+                no_tools,
+                ..Default::default()
+            };
+            let cfg = crate::config::Config {
+                web_search_provider: provider.map(String::from),
+                ..Default::default()
+            };
+            let model = rig::test_utils::MockCompletionModel::from_turns([]);
+            let mut estimated = super::estimated_registered_tools(
+                &cli,
+                &cfg,
+                &crate::sandbox::Sandbox::new(false, "none"),
+            );
+            estimated.sort();
+            assert_eq!(estimated, expected);
+            let agent = crate::startup::heap_future(|| {
+                super::build_agent_inner(
+                    model.clone(),
+                    &cli,
+                    &cfg,
+                    &context,
+                    workspace.clone(),
+                    None,
+                    None,
+                    crate::sandbox::Sandbox::new(false, "none"),
+                    crate::agent::tools::ReadTracker::new(true),
+                    crate::agent::tools::TodoStore::default(),
+                    #[cfg(feature = "goal")]
+                    crate::extras::goal::GoalStore::default(),
+                    "web-builder",
+                    None,
+                    false,
+                    None,
+                    None,
+                    #[cfg(feature = "js")]
+                    crate::sandbox::worker::containment_status(),
+                    #[cfg(feature = "js")]
+                    crate::extras::js::session::ScratchStore::default(),
+                    #[cfg(feature = "skills")]
+                    None,
+                    #[cfg(feature = "mcp")]
+                    None,
+                )
+            })
+            .await;
+            let mut names = agent
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|d| {
+                    assert!(
+                        d.parameters["required"]
+                            .as_array()
+                            .is_some_and(|required| required.len() == 1)
+                    );
+                    assert_eq!(d.parameters["additionalProperties"], false);
+                    d.name
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, expected);
+            assert!(model.requests().is_empty());
+            if names.iter().any(|name| name == "web_fetch") {
+                let error = agent
+                    .tool_server_handle
+                    .call_tool("web_fetch", r#"{"url":"file:///etc/passwd"}"#)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("scheme"));
+                assert!(model.requests().is_empty());
+            }
+            // Exercise the real registered tools, including explicit permission
+            // skip (None above): financial admission precedes even their input
+            // validation or missing-key handling. No network is needed here.
+            for name in &names {
+                let account = crate::spend::Account::new("web-builder", Some(0.0), 0.0).unwrap();
+                let run = crate::spend::run::Run::fixture(
+                    account,
+                    Arc::new(crate::spend::Ledger::new(root.path())),
+                    "web-builder",
+                    crate::spend::PriceSnapshot::capture(
+                        Some((2.0, 4.0)),
+                        Default::default(),
+                        false,
+                    ),
+                );
+                let args = if name == "web_fetch" {
+                    r#"{"url":"file:///never-opened"}"#
+                } else {
+                    r#"{"query":""}"#
+                };
+                let error = crate::spend::run::scope(
+                    Some(run),
+                    agent.tool_server_handle.call_tool(name, args),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(crate::spend::run::BUDGET_STOP), "{error}");
+                assert!(model.requests().is_empty());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2128,6 +2284,8 @@ mod mcp_tests {
             "write",
             "edit",
             "notebook_edit",
+            "web_fetch",
+            "web_search",
             "grep",
             "find_files",
             "list_dir",

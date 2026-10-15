@@ -1226,15 +1226,15 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-PROJECT-AUTOMATION",
     ),
     (
-        "src/extras/js/host.rs",
+        "src/agent/tools/web_http.rs",
         "if is_followable_redirect(response.status()) {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/host.rs",
+        "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -1939,6 +1939,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Native persisted-result CompactString payload, not process output.
+    (
+        "src/agent/tools/web_fetch.rs",
+        "assert_eq!(output.as_str(), page);",
+        1,
+        "NON-PROCESS",
+    ),
     // Assertions inspect already-owned Git stdout/stderr/status; never launch methods.
     (
         "src/git/global_snapshot.rs",
@@ -3053,7 +3060,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/js/host.rs", "output.status,", 2, "NON-PROCESS"),
-    ("src/extras/js/host.rs", "status,", 1, "NON-PROCESS"),
+    ("src/agent/tools/web_http.rs", "status,", 1, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 200,", 7, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
@@ -3575,6 +3582,20 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
         ],
+    ),
+    (
+        "src/agent/tools/web_http.rs",
+        &[(
+            "5190609317dbab79fde23dab3907dc07258c750dd05ff75ec44868499bf4bcff",
+            1,
+        )],
+    ),
+    (
+        "src/agent/tools/web_fetch.rs",
+        &[(
+            "181d820a4307815360b374def867fdc9f2362f7b96104d1452ae72aec2bbb0d5",
+            1,
+        )],
     ),
     (
         "src/context/commands.rs",
@@ -4180,10 +4201,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "4b4be55dac813da63579ff80d76a858484598b955c750180378e47acac2ec2b1",
-                1,
-            ),
-            (
-                "5190609317dbab79fde23dab3907dc07258c750dd05ff75ec44868499bf4bcff",
                 1,
             ),
             (
@@ -5429,15 +5446,15 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     (
-        "src/extras/js/host.rs",
+        "src/agent/tools/web_http.rs",
         "if is_followable_redirect(response.status()) {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/host.rs",
+        "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (

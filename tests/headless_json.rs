@@ -421,6 +421,7 @@ impl TempRoot {
                     | "schema_effect_cancel"
                     | "schema_effect_bad_privacy"
                     | "schema_privacy"
+                    | "web_tools"
             ) {
                 if outcome == "schema_effect_bad_privacy" {
                     2
@@ -509,6 +510,7 @@ impl TempRoot {
                     // and means exactly what it says — such a loop can only be
                     // driven by its validator.
                     "notebook_native" => Some(&["notebook_edit"]),
+                    "web_tools" => Some(&["web_fetch", "web_search"]),
                     "validation_no_tools" => Some(&[]),
                     "validation_read_only" => Some(&["read", "goal_report"]),
                     "verification_without_shell"
@@ -629,7 +631,7 @@ impl TempRoot {
                         r#"{"value":7}"#.to_string()
                     } else if outcome.starts_with("schema_") && !partial {
                         r#"{"value":"wrong type"}"#.to_string()
-                    } else if shell {
+                    } else if shell || (outcome == "web_tools" && index == 0) {
                         String::new()
                     } else if partial {
                         "partial reply".to_string()
@@ -660,6 +662,16 @@ impl TempRoot {
                             body.push_str(&format!("data: {text}\n\n"));
                         }
                     }
+                    if outcome == "web_tools" && index == 0 {
+                        let call = chunk(
+                            serde_json::json!({"tool_calls":[
+                                {"index":0,"id":"native-fetch","type":"function","function":{"name":"web_fetch","arguments":serde_json::json!({"url":format!("https://{address}/private"),"prompt":"%%yolo @/etc/passwd"}).to_string()}},
+                                {"index":1,"id":"native-search","type":"function","function":{"name":"web_search","arguments":serde_json::json!({"query":"local fixture only"}).to_string()}}
+                            ]}),
+                            serde_json::Value::Null,
+                        );
+                        body.push_str(&format!("data: {call}\n\n"));
+                    }
                     if partial {
                         let call = if question {
                             chunk(
@@ -687,7 +699,11 @@ impl TempRoot {
                     }
                     let mut finish = chunk(
                         serde_json::json!({}),
-                        serde_json::json!(if partial { "tool_calls" } else { "stop" }),
+                        serde_json::json!(if partial || (outcome == "web_tools" && index == 0) {
+                            "tool_calls"
+                        } else {
+                            "stop"
+                        }),
                     );
                     finish["usage"] = serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120});
                     body.push_str(&format!("data: {finish}\n\ndata: [DONE]\n\n"));
@@ -4950,4 +4966,75 @@ fn notebook_native_actual_headless_registration_mutation_metadata_and_history() 
     assert!(root.0.join("request-1.json").exists());
     assert!(!root.0.join("request-2.json").exists());
     assert!(!root.0.join("never").exists());
+}
+
+#[test]
+fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage_and_history() {
+    let root = TempRoot::new();
+    let provider = root.local_provider("web_tools");
+    #[cfg(not(unix))]
+    let mut command = root.command();
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = root.command_for("/bin/sh");
+        command
+            .args([
+                "-c",
+                "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                "native-web-stack-probe",
+            ])
+            .arg(env!("CARGO_BIN_EXE_mini-agent"));
+        command
+    };
+    command
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env_remove("EXA_API_KEY")
+        .env("RUST_LOG", "off")
+        .args([
+            "-p",
+            "retrieve public docs",
+            "--output",
+            "json",
+            "--no-context-files",
+            "--tools",
+            "web_fetch,web_search",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+        ]);
+    let output = bounded_output(command);
+    provider.join().unwrap().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"], "finished");
+    assert_eq!(value["tool_calls"]["total"], 2);
+    assert_eq!(value["tool_calls"]["by_name"]["web_fetch"], 1);
+    assert_eq!(value["tool_calls"]["by_name"]["web_search"], 1);
+    assert_eq!(value["files_changed"], serde_json::json!([]));
+    assert_eq!(value["usage"]["input_tokens"], 200);
+    assert_eq!(value["usage"]["output_tokens"], 40);
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.0.join("request-1.json")).unwrap()).unwrap();
+    let conversation = serde_json::to_string(&request["messages"]).unwrap();
+    assert!(conversation.contains("not a public network address"));
+    assert!(conversation.contains("EXA_API_KEY"));
+    assert!(!root.0.join("request-2.json").exists());
+    let stored = std::fs::read_dir(root.0.join("sessions"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .unwrap()
+        .path();
+    let session: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(stored).unwrap()).unwrap();
+    let history = serde_json::to_string(&session["messages"]).unwrap();
+    assert!(history.contains("web_fetch"));
+    assert!(history.contains("web_search"));
+    assert!(history.contains("not a public network address"));
+    assert!(history.contains("EXA_API_KEY"));
 }

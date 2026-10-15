@@ -20,6 +20,9 @@ pub(crate) mod read_image;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
 pub(crate) mod todo;
+pub(crate) mod web_fetch;
+pub(crate) mod web_http;
+pub(crate) mod web_search;
 pub(crate) mod write;
 
 pub(crate) use normalize::{levenshtein_similarity, normalize_whitespace};
@@ -700,6 +703,16 @@ pub async fn check_perm(
     tool: &str,
     input_key: &str,
 ) -> Result<Option<String>, ToolError> {
+    check_perm_with_suggestion(permission, ask_tx, tool, input_key, None).await
+}
+
+pub(crate) async fn check_perm_with_suggestion(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    input_key: &str,
+    suggested_pattern: Option<String>,
+) -> Result<Option<String>, ToolError> {
     let Some(perm) = permission else {
         return Ok(None);
     };
@@ -719,7 +732,7 @@ pub async fn check_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, input_key, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, input_key, suggested_pattern, Vec::new()).await?;
             Ok(None)
         }
     }
