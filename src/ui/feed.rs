@@ -390,14 +390,6 @@ impl FeedLines {
         self.segments[segment].get(index - self.starts[segment])
     }
 
-    pub(crate) fn with_segment(&self, segment: Arc<Vec<LineEntry>>) -> Self {
-        let mut segments = self.segments.clone();
-        segments.push(segment);
-        let mut lines = Self::new(segments);
-        lines.partial = self.partial;
-        lines
-    }
-
     /// Whether these rows start at the top of the feed. Only a tail-first
     /// layout ([`Feed::lines_tail`]) can be incomplete.
     #[cfg_attr(
