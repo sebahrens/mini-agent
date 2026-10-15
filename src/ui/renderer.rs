@@ -688,6 +688,12 @@ pub struct Renderer {
     test_native_size_query: Option<NativeSizeQuery>,
     #[cfg(test)]
     native_size_queries: std::cell::Cell<usize>,
+    /// A captured renderer that still takes its geometry from the native
+    /// query (`test_native_size_query`), to count queries per frame.
+    #[cfg(test)]
+    test_native_geometry: bool,
+    /// Terminal geometry from the last native query (`terminal_size`).
+    cached_size: std::cell::Cell<Option<(u16, u16)>>,
     #[cfg(test)]
     test_counters: Arc<OutputCounters>,
     /// The frame being painted: every paint path appends here and the
@@ -842,6 +848,9 @@ impl Renderer {
             #[cfg(test)]
             native_size_queries: std::cell::Cell::new(0),
             #[cfg(test)]
+            test_native_geometry: false,
+            cached_size: std::cell::Cell::new(None),
+            #[cfg(test)]
             test_counters: Arc::new(OutputCounters::default()),
             frame: std::cell::RefCell::new(Vec::with_capacity(16 * 1024)),
             frame_depth: 0,
@@ -896,6 +905,16 @@ impl Renderer {
     pub(crate) fn for_app_test() -> io::Result<Self> {
         let mut renderer = Self::new()?;
         renderer.test_output = Some(Arc::new(std::sync::Mutex::new(Vec::new())));
+        Ok(renderer)
+    }
+
+    /// A captured renderer whose geometry comes from `query`, as if it
+    /// were the native terminal.
+    #[cfg(test)]
+    pub(crate) fn for_native_geometry_test(query: NativeSizeQuery) -> io::Result<Self> {
+        let mut renderer = Self::for_app_test()?;
+        renderer.test_native_geometry = true;
+        renderer.test_native_size_query = Some(query);
         Ok(renderer)
     }
 
@@ -1205,22 +1224,17 @@ impl Renderer {
         resolve_color(color, self.monochrome)
     }
 
-    fn terminal_size(&self) -> (u16, u16) {
-        #[cfg(test)]
-        if self.test_output.is_some() {
-            return (180, 50);
-        }
-        crossterm::terminal::size().unwrap_or((80, 24))
+    /// Geometry owned by a captured App fixture, which never queries the
+    /// process's real terminal.
+    #[cfg(test)]
+    fn fixture_size(&self) -> Option<(u16, u16)> {
+        (self.test_output.is_some() && !self.test_native_geometry).then_some((180, 50))
     }
 
-    /// Bottom drawing preserves native query errors. App fixtures own both
-    /// geometry and output, so they never query the process's real terminal.
-    fn checked_draw_size(&self) -> io::Result<(u16, u16)> {
+    /// One native terminal-size query (an ioctl on Unix).
+    fn query_native_size(&self) -> io::Result<(u16, u16)> {
         #[cfg(test)]
         {
-            if self.test_output.is_some() {
-                return Ok((180, 50));
-            }
             self.native_size_queries
                 .set(self.native_size_queries.get() + 1);
             if let Some(query) = self.test_native_size_query {
@@ -1228,6 +1242,46 @@ impl Renderer {
             }
         }
         crossterm::terminal::size()
+    }
+
+    /// The terminal geometry layout works against: the size cached by the
+    /// last bottom draw or resize, queried natively only when nothing is
+    /// cached yet. Falls back to 80x24 when the query fails.
+    fn terminal_size(&self) -> (u16, u16) {
+        #[cfg(test)]
+        if let Some(size) = self.fixture_size() {
+            return size;
+        }
+        if let Some(size) = self.cached_size.get() {
+            return size;
+        }
+        match self.query_native_size() {
+            Ok(size) => {
+                self.cached_size.set(Some(size));
+                size
+            }
+            Err(_) => (80, 24),
+        }
+    }
+
+    /// Bottom drawing queries the terminal once per frame and preserves
+    /// native query errors; the result refreshes the cached geometry. A size
+    /// that changed without a resize event marks the chat dirty so the next
+    /// frame lays it out again.
+    fn checked_draw_size(&mut self) -> io::Result<(u16, u16)> {
+        #[cfg(test)]
+        if let Some(size) = self.fixture_size() {
+            return Ok(size);
+        }
+        let size = self.query_native_size()?;
+        if self
+            .cached_size
+            .replace(Some(size))
+            .is_some_and(|old| old != size)
+        {
+            self.chat_dirty = true;
+        }
+        Ok(size)
     }
 
     #[cfg(test)]
@@ -1354,8 +1408,11 @@ impl Renderer {
 
     /// Forget the announced title activity: a suspended and resumed terminal
     /// restored the pre-attach title, so the next frame announces again.
+    /// The cached geometry is dropped too: resize events are not read while
+    /// the terminal is handed to another program.
     pub(crate) fn forget_title(&mut self) {
         self.title_activity = None;
+        self.cached_size.set(None);
     }
 
     /// The separator row above the input: the first row, counting down, that a
@@ -1890,6 +1947,9 @@ impl Renderer {
 
     pub fn resize(&mut self) {
         self.chat_dirty = true;
+        // The terminal changed size: forget the cached geometry so this
+        // frame's layout queries it once.
+        self.cached_size.set(None);
         let visible = self.visible_lines();
         let max_offset = self.buffer_len().saturating_sub(visible);
         if self.scroll_offset > max_offset {
@@ -3253,6 +3313,44 @@ mod captured_app_geometry_tests {
         let error = renderer.draw_bottom("draft", 5, &[], 0, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(renderer.native_size_queries.get(), 1);
+    }
+
+    fn fixed_query() -> io::Result<(u16, u16)> {
+        Ok((120, 40))
+    }
+
+    fn refresh_like(renderer: &mut Renderer, input: &str) {
+        renderer
+            .frame(|r| {
+                r.sync_input_height(input)?;
+                r.render_viewport()?;
+                r.draw_bottom(input, input.len(), &[], 0, false)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refresh_queries_the_native_terminal_size_at_most_once() {
+        let mut renderer = Renderer::for_native_geometry_test(fixed_query).unwrap();
+        renderer
+            .feed_mut()
+            .push_block(crate::ui::feed::BlockStyle::Agent, "chat");
+        refresh_like(&mut renderer, "");
+        assert!(
+            renderer.native_size_queries.get() <= 2,
+            "first frame fills the cache"
+        );
+        for draft in ["d", "dr", "dra"] {
+            let before = renderer.native_size_queries.get();
+            refresh_like(&mut renderer, draft);
+            assert_eq!(renderer.native_size_queries.get() - before, 1);
+        }
+        // A resize forgets the geometry: the next refresh lays out once more.
+        renderer.resize();
+        let before = renderer.native_size_queries.get();
+        refresh_like(&mut renderer, "dra");
+        assert!(renderer.native_size_queries.get() - before <= 2);
+        assert_eq!(renderer.terminal_size(), (120, 40));
     }
 
     #[test]
