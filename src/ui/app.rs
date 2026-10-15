@@ -136,6 +136,7 @@ pub(super) mod test_support {
             user_rx,
             tui_log_rx: None,
             deferred_user_events: Default::default(),
+            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
@@ -1194,6 +1195,9 @@ pub(crate) struct App<'a> {
     user_rx: mpsc::Receiver<UserEvent>,
     tui_log_rx: Option<mpsc::Receiver<String>>,
     deferred_user_events: std::collections::VecDeque<UserEvent>,
+    /// Custom slash templates for completion, re-read only when a template
+    /// layer directory changed.
+    custom_command_cache: crate::context::commands::CommandCache,
     #[cfg(feature = "subagents")]
     background_requests: std::collections::VecDeque<crate::permission::ask::UserRequest>,
     running: Arc<AtomicBool>,
@@ -1886,6 +1890,7 @@ impl<'a> App<'a> {
             user_rx,
             tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
+            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running,
@@ -5684,10 +5689,14 @@ impl<'a> App<'a> {
     }
 
     fn refresh_custom_commands(&mut self) {
-        let commands = crate::context::commands::load_for_workspace(&self.ui.workspace)
-            .into_iter()
-            .map(|(name, template)| (format!("/{name}"), template.description))
-            .collect::<Vec<_>>();
+        let commands = crate::context::commands::load_cached(
+            &mut self.custom_command_cache,
+            &self.ui.workspace,
+        )
+        .into_iter()
+        .flatten()
+        .map(|(name, template)| (format!("/{name}"), template.description.clone()))
+        .collect::<Vec<_>>();
         #[cfg(feature = "mcp")]
         let commands = {
             let mut commands = commands;

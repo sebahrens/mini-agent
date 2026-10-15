@@ -1,7 +1,7 @@
 //! Authored slash templates. Authority is parsed before literal substitution;
 //! arguments and included bytes can never create directives or more includes.
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) const MAX_TEMPLATE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_EXPANDED_BYTES: usize = 256 * 1024;
@@ -298,6 +298,128 @@ pub(crate) fn load_for_paths(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
 ) -> BTreeMap<String, CommandTemplate> {
+    let trusted = crate::config::load::project_config_is_trusted_in_workspace(paths, workspace);
+    load_layers(paths, workspace, trusted)
+}
+
+/// Template layer directories, global first, in merge order.
+const PROJECT_LAYERS: [&str; 2] = [".claude/commands", ".mini-agent/commands"];
+
+/// Cheap identity of one layer directory: its own and its target's
+/// metadata plus each entry's name, size and modification time (bounded by
+/// the loader's entry limit). Adding, removing, renaming or editing a
+/// template changes it without reading any template; a reload then re-runs
+/// every check of the full loader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirStamp {
+    link: (Option<std::time::SystemTime>, u64, bool),
+    target: Option<(Option<std::time::SystemTime>, u64)>,
+    entries: Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)>,
+}
+
+fn dir_stamp(path: &Path) -> Option<DirStamp> {
+    let link = std::fs::symlink_metadata(path).ok()?;
+    let target = std::fs::metadata(path).ok();
+    let mut entries: Vec<_> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .take(MAX_ENTRIES + 1)
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let meta = entry.metadata().ok();
+            (
+                entry.file_name(),
+                meta.as_ref().and_then(|meta| meta.modified().ok()),
+                meta.map_or(0, |meta| meta.len()),
+            )
+        })
+        .collect();
+    entries.sort_unstable();
+    Some(DirStamp {
+        link: (link.modified().ok(), link.len(), link.is_symlink()),
+        target: target.map(|meta| (meta.modified().ok(), meta.len())),
+        entries,
+    })
+}
+
+/// What a cached template map was loaded from. Project trust is part of the
+/// key and re-evaluated on every lookup, so revoking trust drops project
+/// templates at the next `/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandsStamp {
+    config_dir: PathBuf,
+    workspace: PathBuf,
+    trusted: bool,
+    layers: Vec<Option<DirStamp>>,
+}
+
+fn commands_stamp(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> CommandsStamp {
+    let trusted = crate::config::load::project_config_is_trusted_in_workspace(paths, workspace);
+    let mut layers = vec![dir_stamp(&paths.config_dir.join("commands"))];
+    if trusted {
+        layers.extend(
+            PROJECT_LAYERS
+                .iter()
+                .map(|layer| dir_stamp(&workspace.root().join(layer))),
+        );
+    }
+    CommandsStamp {
+        config_dir: paths.config_dir.clone(),
+        workspace: workspace.root().to_path_buf(),
+        trusted,
+        layers,
+    }
+}
+
+/// Templates loaded by [`load_cached`], with the layer stamp they match.
+#[derive(Default)]
+pub(crate) struct CommandCache {
+    loaded: Option<(CommandsStamp, BTreeMap<String, CommandTemplate>)>,
+}
+
+/// The workspace's templates for completion (names and descriptions), read
+/// from disk only when a layer directory changed since the previous call.
+/// Each call costs a few `stat`s, the directory listings and the trust
+/// check instead of reading and parsing every template. Execution paths keep
+/// using [`load_for_workspace`].
+pub(crate) fn load_cached<'a>(
+    cache: &'a mut CommandCache,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Option<&'a BTreeMap<String, CommandTemplate>> {
+    let Ok(paths) = crate::paths::process_paths() else {
+        cache.loaded = None;
+        return None;
+    };
+    Some(load_cached_for_paths(cache, &paths, workspace))
+}
+
+fn load_cached_for_paths<'a>(
+    cache: &'a mut CommandCache,
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> &'a BTreeMap<String, CommandTemplate> {
+    // Stamp before loading: a change made while loading leaves a stale
+    // stamp, so the next call reloads.
+    let stamp = commands_stamp(paths, workspace);
+    if cache
+        .loaded
+        .as_ref()
+        .is_none_or(|(cached, _)| *cached != stamp)
+    {
+        let commands = load_layers(paths, workspace, stamp.trusted);
+        cache.loaded = Some((stamp, commands));
+    }
+    &cache.loaded.as_ref().expect("loaded above").1
+}
+
+fn load_layers(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    trusted: bool,
+) -> BTreeMap<String, CommandTemplate> {
     let mut commands = BTreeMap::new();
     // Global definitions are only read through the private app root. Missing
     // command directories are optional and never created while listing.
@@ -312,12 +434,18 @@ pub(crate) fn load_for_paths(
             Err(error) => tracing::warn!(%error, "could not load private custom commands"),
         }
     }
-    if crate::config::load::project_config_is_trusted_in_workspace(paths, workspace) {
-        for layer in [".claude/commands", ".mini-agent/commands"] {
+    if trusted {
+        for layer in PROJECT_LAYERS {
             merge_layer(&mut commands, workspace, Path::new(layer));
         }
     }
     commands
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of template layer reads on this thread.
+    static LAYER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn merge_layer(
@@ -325,6 +453,8 @@ fn merge_layer(
     binding: &crate::paths::WorkspaceBinding,
     directory: &Path,
 ) {
+    #[cfg(test)]
+    LAYER_READS.with(|reads| reads.set(reads.get() + 1));
     let entries = match binding.read_relative_definition_layer(
         directory,
         "md",
@@ -400,6 +530,56 @@ mod tests {
         ] {
             assert!(CommandTemplate::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cached_templates_are_read_once_until_a_layer_directory_changes() {
+        let root = crate::tests::OwnedTestDirectory::new("command-cache");
+        let paths = paths(root.path());
+        let commands = paths.config_dir.join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        std::fs::write(
+            commands.join("fix-issue.md"),
+            "---\ndescription: One\n---\nFix",
+        )
+        .unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let reads = || LAYER_READS.with(std::cell::Cell::take);
+        reads();
+        let mut cache = CommandCache::default();
+        let first = load_cached_for_paths(&mut cache, &paths, &workspace).clone();
+        assert_eq!(first, load_for_paths(&paths, &workspace));
+        assert_eq!(first["fix-issue"].description, "One");
+        reads();
+        // A second `/` with unchanged directories reads no template.
+        load_cached_for_paths(&mut cache, &paths, &workspace);
+        assert_eq!(reads(), 0);
+        // Adding a template changes the layer and reloads it.
+        std::fs::write(commands.join("ship-it.md"), "Ship").unwrap();
+        let next = load_cached_for_paths(&mut cache, &paths, &workspace);
+        assert!(next.contains_key("ship-it") && next.contains_key("fix-issue"));
+        assert_eq!(reads(), 1);
+        std::fs::remove_file(commands.join("fix-issue.md")).unwrap();
+        let next = load_cached_for_paths(&mut cache, &paths, &workspace);
+        assert!(!next.contains_key("fix-issue"));
+        // Editing a template in place (same directory entries) reloads too.
+        std::fs::write(
+            commands.join("ship-it.md"),
+            "---\ndescription: Two\n---\nShip it",
+        )
+        .unwrap();
+        let next = load_cached_for_paths(&mut cache, &paths, &workspace);
+        assert_eq!(next["ship-it"].description, "Two");
+        // Another workspace never reuses the cached map.
+        let other_dir = root.path().join("other");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = crate::paths::WorkspaceBinding::capture(&other_dir).unwrap();
+        reads();
+        load_cached_for_paths(&mut cache, &paths, &other);
+        assert_eq!(reads(), 1);
     }
 
     #[test]
