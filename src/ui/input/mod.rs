@@ -345,6 +345,21 @@ pub struct InputEditor {
     kill_ring: Vec<CompactString>,
     yank_pos: Option<usize>,
     yank_len: usize,
+    /// Soft-wrap rows of the last buffer laid out for Up/Down, so repeated
+    /// row movement over an unchanged draft wraps it once.
+    wrap_memo: Option<WrapMemo>,
+    /// Wrap layouts computed for row movement (test-only proof of reuse).
+    #[cfg(test)]
+    wrap_layouts: usize,
+}
+
+/// Memoized [`wrap::wrap_rows`] of `text` at `width`. Validated by comparing
+/// the buffer itself, which is cheaper than re-wrapping it and cannot be
+/// fooled the way a hash could.
+struct WrapMemo {
+    width: usize,
+    text: CompactString,
+    rows: Vec<wrap::VisualRow>,
 }
 
 impl InputEditor {
@@ -381,6 +396,45 @@ impl InputEditor {
             kill_ring: Vec::with_capacity(MAX_KILL_RING),
             yank_pos: None,
             yank_len: 0,
+            wrap_memo: None,
+            #[cfg(test)]
+            wrap_layouts: 0,
+        }
+    }
+
+    /// Wrap layouts computed for Up/Down row movement so far (test-only).
+    #[cfg(test)]
+    pub(crate) fn wrap_layouts(&self) -> usize {
+        self.wrap_layouts
+    }
+
+    /// Make `wrap_memo` hold the buffer's soft-wrap rows at `width`,
+    /// wrapping once per distinct (buffer, width).
+    fn ensure_wrap_memo(&mut self, width: usize) {
+        let fresh = self
+            .wrap_memo
+            .as_ref()
+            .is_some_and(|memo| memo.width == width && memo.text == self.buffer);
+        if !fresh {
+            #[cfg(test)]
+            {
+                self.wrap_layouts += 1;
+            }
+            let rows = wrap::wrap_rows(&self.buffer, width);
+            match self.wrap_memo.as_mut() {
+                Some(memo) => {
+                    memo.width = width;
+                    memo.text.clone_from(&self.buffer);
+                    memo.rows = rows;
+                }
+                None => {
+                    self.wrap_memo = Some(WrapMemo {
+                        width,
+                        text: self.buffer.clone(),
+                        rows,
+                    });
+                }
+            }
         }
     }
 
@@ -1516,8 +1570,10 @@ impl InputEditor {
     /// `false` at the first/last row so the caller falls back to history.
     fn move_visual_row(&mut self, down: bool) -> Option<bool> {
         let width = self.wrap_width?;
-        let rows = wrap::wrap_rows(&self.buffer, width);
-        let (row, column) = wrap::cursor_position(&self.buffer, &rows, self.cursor);
+        let cursor = self.cursor;
+        self.ensure_wrap_memo(width);
+        let rows = &self.wrap_memo.as_ref().expect("wrapped above").rows;
+        let (row, column) = wrap::cursor_position(&self.buffer, rows, cursor);
         let target = if down {
             row + 1
         } else {
@@ -1529,7 +1585,7 @@ impl InputEditor {
         if target >= rows.len() {
             return Some(false);
         }
-        self.cursor = wrap::offset_in_row(&self.buffer, &rows, target, column);
+        self.cursor = wrap::offset_in_row(&self.buffer, rows, target, column);
         Some(true)
     }
 

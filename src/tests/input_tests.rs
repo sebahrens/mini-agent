@@ -458,6 +458,44 @@ fn up_and_down_move_by_wrapped_rows_then_reach_history() {
     assert_eq!(editor.buffer.as_str(), "earlier");
 }
 
+/// cttyn.19: Up/Down over an unchanged multi-line draft reuse one wrap
+/// layout; an edit or a new width wraps once more.
+#[test]
+fn row_movement_wraps_a_large_draft_once_per_buffer_and_width() {
+    let mut editor = InputEditor::new();
+    editor.set_wrap_width(40);
+    let draft = (0..400)
+        .map(|line| format!("line {line} of a long pasted draft that soft wraps at forty"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.buffer = draft.as_str().into();
+    editor.set_cursor(editor.buffer.len() / 2);
+    for _ in 0..50 {
+        editor.handle_key(press(KeyCode::Up));
+    }
+    for _ in 0..30 {
+        editor.handle_key(press(KeyCode::Down));
+    }
+    assert_eq!(editor.wrap_layouts(), 1);
+    let cursor = editor.cursor;
+    // Same moves as an uncached layout would make.
+    let rows = crate::ui::input::wrap::wrap_rows(&editor.buffer, 40);
+    let (row, _) = crate::ui::input::wrap::cursor_position(&editor.buffer, &rows, cursor);
+    let (start_row, _) =
+        crate::ui::input::wrap::cursor_position(&editor.buffer, &rows, editor.buffer.len() / 2);
+    assert_eq!(row + 20, start_row);
+    // An edit changes the buffer: one more layout, then reuse again.
+    type_str(&mut editor, "y");
+    editor.handle_key(press(KeyCode::Up));
+    editor.handle_key(press(KeyCode::Down));
+    assert_eq!(editor.wrap_layouts(), 2);
+    // A new width: one more.
+    editor.set_wrap_width(60);
+    editor.handle_key(press(KeyCode::Up));
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.wrap_layouts(), 3);
+}
+
 // --- word motion on Alt/Ctrl+arrows and Alt+Backspace (mini-agent-rmcpm) ---
 
 fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
