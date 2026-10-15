@@ -18,14 +18,49 @@ pub(crate) const DEFAULT_TOOL_CONCURRENCY: usize = 4;
 enum ToolAccess {
     Read,
     Write,
+    /// `job_status`: poll, wait and list only read the session job registry
+    /// (or await its change notification), so they share the lane. `stop`
+    /// mutates a job and stays exclusive, as does any unparseable request.
+    JobStatus,
 }
 
 fn access_for(name: &str) -> ToolAccess {
     match name {
         "read" | "grep" | "find_files" | "list_dir" | "todo_read" | "memory_read"
         | "memory_search" | "advisor" | "skills_search" => ToolAccess::Read,
+        "job_status" => ToolAccess::JobStatus,
         _ => ToolAccess::Write,
     }
+}
+
+/// The lease one call needs. Only `job_status` depends on its arguments.
+fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
+    match access {
+        ToolAccess::JobStatus => {
+            let action = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|value| match value {
+                    serde_json::Value::Object(map) => Some(
+                        map.get("action")
+                            .map(|action| action.as_str().map(str::to_owned)),
+                    ),
+                    _ => None,
+                });
+            match action {
+                Some(None) => ToolAccess::Read,
+                Some(Some(Some(action))) if matches!(action.as_str(), "poll" | "wait" | "list") => {
+                    ToolAccess::Read
+                }
+                _ => ToolAccess::Write,
+            }
+        }
+        access => access,
+    }
+}
+
+enum Lease<'a> {
+    Shared(#[allow(dead_code)] tokio::sync::RwLockReadGuard<'a, ()>),
+    Exclusive(#[allow(dead_code)] tokio::sync::RwLockWriteGuard<'a, ()>),
 }
 
 struct ConcurrencyBoundTool {
@@ -41,6 +76,13 @@ impl ConcurrencyBoundTool {
             inner,
             lane,
             access,
+        }
+    }
+
+    async fn lease(&self, args: &str) -> Lease<'_> {
+        match access_for_call(self.access, args) {
+            ToolAccess::Read => Lease::Shared(self.lane.read().await),
+            ToolAccess::Write | ToolAccess::JobStatus => Lease::Exclusive(self.lane.write().await),
         }
     }
 
@@ -68,24 +110,12 @@ impl ToolDyn for ConcurrencyBoundTool {
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         let spend = crate::spend::run::Run::current();
         let future = async move {
-            match self.access {
-                ToolAccess::Read => {
-                    let _lease = self.lane.read().await;
-                    crate::spend::run::admit_current_effect()
-                        .await
-                        .map_err(|error| ToolError::ToolCallError(error.into()))?;
-                    Self::question_admission()?;
-                    self.inner.call(args).await
-                }
-                ToolAccess::Write => {
-                    let _lease = self.lane.write().await;
-                    crate::spend::run::admit_current_effect()
-                        .await
-                        .map_err(|error| ToolError::ToolCallError(error.into()))?;
-                    Self::question_admission()?;
-                    self.inner.call(args).await
-                }
-            }
+            let _lease = self.lease(&args).await;
+            crate::spend::run::admit_current_effect()
+                .await
+                .map_err(|error| ToolError::ToolCallError(error.into()))?;
+            Self::question_admission()?;
+            self.inner.call(args).await
         };
         let future = crate::spend::run::scope(spend, future);
         #[cfg(feature = "acp")]
@@ -103,24 +133,12 @@ impl ToolDyn for ConcurrencyBoundTool {
             .cloned()
             .or_else(crate::spend::run::Run::current);
         let future = async move {
-            match self.access {
-                ToolAccess::Read => {
-                    let _lease = self.lane.read().await;
-                    crate::spend::run::admit_current_effect()
-                        .await
-                        .map_err(|error| ToolError::ToolCallError(error.into()))?;
-                    Self::question_admission()?;
-                    self.inner.call_with_extensions(args, extensions).await
-                }
-                ToolAccess::Write => {
-                    let _lease = self.lane.write().await;
-                    crate::spend::run::admit_current_effect()
-                        .await
-                        .map_err(|error| ToolError::ToolCallError(error.into()))?;
-                    Self::question_admission()?;
-                    self.inner.call_with_extensions(args, extensions).await
-                }
-            }
+            let _lease = self.lease(&args).await;
+            crate::spend::run::admit_current_effect()
+                .await
+                .map_err(|error| ToolError::ToolCallError(error.into()))?;
+            Self::question_admission()?;
+            self.inner.call_with_extensions(args, extensions).await
         };
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
@@ -139,28 +157,14 @@ impl ToolDyn for ConcurrencyBoundTool {
             .cloned()
             .or_else(crate::spend::run::Run::current);
         let future = async move {
-            match self.access {
-                ToolAccess::Read => {
-                    let _lease = self.lane.read().await;
-                    if let Err(error) = crate::spend::run::admit_current_effect().await {
-                        return ToolExecutionResult::denied(error.to_string());
-                    }
-                    if let Err(error) = Self::question_admission() {
-                        return ToolExecutionResult::denied(error.to_string());
-                    }
-                    self.inner.call_structured(args, extensions).await
-                }
-                ToolAccess::Write => {
-                    let _lease = self.lane.write().await;
-                    if let Err(error) = crate::spend::run::admit_current_effect().await {
-                        return ToolExecutionResult::denied(error.to_string());
-                    }
-                    if let Err(error) = Self::question_admission() {
-                        return ToolExecutionResult::denied(error.to_string());
-                    }
-                    self.inner.call_structured(args, extensions).await
-                }
+            let _lease = self.lease(&args).await;
+            if let Err(error) = crate::spend::run::admit_current_effect().await {
+                return ToolExecutionResult::denied(error.to_string());
             }
+            if let Err(error) = Self::question_admission() {
+                return ToolExecutionResult::denied(error.to_string());
+            }
+            self.inner.call_structured(args, extensions).await
         };
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
@@ -269,6 +273,75 @@ mod tests {
         first_release.notify_waiters();
         let _ = joined.await.unwrap();
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn job_status_reads_share_and_stop_stays_exclusive() {
+        for (args, expected) in [
+            (r#"{"action":"wait","id":"job-1"}"#, ToolAccess::Read),
+            (r#"{"action":"poll","id":"job-1"}"#, ToolAccess::Read),
+            (r#"{"id":"job-1"}"#, ToolAccess::Read),
+            (r#"{"action":"list"}"#, ToolAccess::Read),
+            (r#"{"action":"stop","id":"job-1"}"#, ToolAccess::Write),
+            (r#"{"action":"bogus"}"#, ToolAccess::Write),
+            (r#"{"action":7}"#, ToolAccess::Write),
+            ("not json", ToolAccess::Write),
+            ("[]", ToolAccess::Write),
+        ] {
+            assert_eq!(
+                access_for_call(access_for("job_status"), args),
+                expected,
+                "{args}"
+            );
+        }
+        assert_eq!(
+            access_for_call(access_for("shell"), r#"{"action":"wait"}"#),
+            ToolAccess::Write
+        );
+    }
+
+    #[tokio::test]
+    async fn job_status_wait_does_not_block_a_concurrent_read() {
+        let (wait, entered, release, maximum) = probe("job_status");
+        let mut read = wait.clone();
+        read.name = "read";
+        let tools = bind(vec![Box::new(wait), Box::new(read)]);
+        let joined = tokio::spawn(async move {
+            let one = tools[0].call(r#"{"action":"wait","id":"job-1"}"#.to_owned());
+            let two = tools[1].call("{}".to_owned());
+            tokio::join!(one, two)
+        });
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("read must run while job_status wait holds a shared lease");
+        release.notify_waiters();
+        let _ = joined.await.unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn job_status_stop_takes_the_exclusive_lane() {
+        let (stop, entered, release, maximum) = probe("job_status");
+        let mut read = stop.clone();
+        read.name = "read";
+        let tools = bind(vec![Box::new(stop), Box::new(read)]);
+        let joined = tokio::spawn(async move {
+            let one = tools[0].call(r#"{"action":"stop","id":"job-1"}"#.to_owned());
+            let two = tools[1].call("{}".to_owned());
+            tokio::join!(one, two)
+        });
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), entered.notified())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        entered.notified().await;
+        release.notify_one();
+        let _ = joined.await.unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

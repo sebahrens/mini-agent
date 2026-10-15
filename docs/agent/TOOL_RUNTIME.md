@@ -221,7 +221,10 @@ exit code.
 Tool calls issued together in one assistant message may execute up to four at
 once. Every registered tool shares a fair reader/writer lane: `read`, `grep`,
 `find_files`, `list_dir`, `todo_read`, and other explicitly classified
-read-only tools use shared access. Mutating tools (`write`, `edit`, `shell`,
+read-only tools use shared access. `job_status` chooses per call: `poll`,
+`wait` and `list` only read the session job registry and share the lane, so a
+60-second wait does not stall parallel reads; `stop` and malformed arguments
+take exclusive access. Mutating tools (`write`, `edit`, `shell`,
 `git`, `js`, `task`, and state writers), MCP tools, and unknown extension tools
 use exclusive access. Consequently independent reads overlap, results remain
 in the model's original call order, mutations remain serialized, and reads do
