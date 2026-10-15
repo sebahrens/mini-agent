@@ -530,6 +530,18 @@ allows host reads, and host-full allows host writes subject to the same private
 and Git exclusions. Windows rejects host levels and maps explicit roots into
 its existing AppContainer root roles. No profile alters the Phase 6 worker.
 
+Explicit read/write roots are captured once per `Sandbox` configuration and
+base directory (`Sandbox::general_roots`) and re-validated (canonical pathname
+and directory identity) before every launch; a root that fails validation is
+captured again, exactly as every launch did before the cache, and the retained
+write-root accounting still fails closed on an identity change. Each launch
+resolves its working directory once and reuses it for write-root accounting, the
+child cwd and the workspace grant. The Seatbelt builder reuses only inputs fixed
+for the `Sandbox` (private-path denials and their namespace ancestors) and
+strings derived from the validated roots; Git metadata alias inspection, `.git`
+write denials, guarded runtime paths and root validation run on every launch,
+including profile cache hits, and the profile bytes are unchanged.
+
 Private mountpoint setup is an explicit, bounded no-follow operation that only
 creates missing empty private directories. Existing entries/permissions must
 remain byte/metadata unchanged. Retained directory identities cover explicit

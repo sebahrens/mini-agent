@@ -41,6 +41,109 @@ type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
 type SeatbeltProfileKey = (String, String, String, String, bool);
 type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
+type GeneralRootsCache = Arc<Mutex<Vec<Arc<GeneralRoots>>>>;
+type SeatbeltPrivateCache = Arc<Mutex<Option<Arc<SeatbeltPrivateInputs>>>>;
+
+/// At most this many distinct base directories keep resolved explicit roots.
+const MAX_CACHED_GENERAL_ROOT_BASES: usize = 8;
+
+/// Explicit general-profile roots resolved against one base directory. The
+/// bindings are captured once per `Sandbox` configuration and only
+/// re-validated (pathname plus directory identity) on every launch; a binding
+/// that fails validation is dropped and the roots are captured again, which is
+/// exactly what every launch did before this cache existed.
+#[derive(Debug)]
+struct GeneralRoots {
+    base: PathBuf,
+    reads: Vec<Arc<crate::paths::WorkspaceBinding>>,
+    writes: Vec<Arc<crate::paths::WorkspaceBinding>>,
+    /// Seatbelt grants derived only from these validated roots and the
+    /// escaped (workspace, cache) literals.
+    seatbelt: Mutex<HashMap<(String, String), Arc<SeatbeltRootInputs>>>,
+}
+
+impl GeneralRoots {
+    fn validate(&self) -> Result<(), String> {
+        for root in self.reads.iter().chain(self.writes.iter()) {
+            root.validate()
+                .map_err(|_| "sandbox profile: an explicit root is unavailable or changed")?;
+        }
+        Ok(())
+    }
+}
+
+/// Seatbelt profile inputs computed from the explicit roots, workspace and
+/// cache of one launch shape.
+#[derive(Debug)]
+struct SeatbeltRootInputs {
+    extra_reads: String,
+    extra_writes: String,
+    metadata_ancestors: String,
+}
+
+/// Seatbelt inputs that depend only on the process-wide private application
+/// and credential paths, which are fixed for the lifetime of a `Sandbox`.
+#[derive(Debug)]
+struct SeatbeltPrivateInputs {
+    private_read_denies: String,
+    namespace: SeatbeltNamespaceDenies,
+}
+
+/// Ordered, de-duplicated `(literal ...)` namespace denials.
+#[derive(Debug, Clone, Default)]
+struct SeatbeltNamespaceDenies {
+    seen: HashSet<String>,
+    rendered: String,
+}
+
+impl SeatbeltNamespaceDenies {
+    fn extend(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        let Self { seen, rendered } = self;
+        extend_namespace_denies(paths, |_| true, seen, rendered)
+    }
+
+    /// The rendered denials followed by those `paths` add, leaving `self`
+    /// unchanged. Equivalent to rendering every path in one ordered pass.
+    fn rendered_with(&self, paths: &[PathBuf]) -> Result<String, String> {
+        let mut added = HashSet::new();
+        let mut rendered = self.rendered.clone();
+        extend_namespace_denies(
+            paths,
+            |literal| !self.seen.contains(literal),
+            &mut added,
+            &mut rendered,
+        )?;
+        Ok(rendered)
+    }
+}
+
+fn extend_namespace_denies(
+    paths: &[PathBuf],
+    unseen_before: impl Fn(&str) -> bool,
+    seen: &mut HashSet<String>,
+    rendered: &mut String,
+) -> Result<(), String> {
+    for path in paths {
+        for spelling in std::iter::once(path.clone()).chain(seatbelt_resolved_spelling(path)) {
+            for ancestor in spelling.ancestors().filter(|path| path.parent().is_some()) {
+                let literal = seatbelt_string_literal(ancestor, "protected namespace ancestor")?;
+                if unseen_before(&literal) && !seen.contains(&literal) {
+                    rendered.push_str("\n    (literal \"");
+                    rendered.push_str(&literal);
+                    rendered.push_str("\")");
+                    seen.insert(literal);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Explicit-root captures performed by this thread (test probe).
+    static GENERAL_ROOT_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Filesystem reach of ordinary contained commands; permission and network
 /// decisions remain independent, and the broker-only JS worker never uses it.
@@ -194,6 +297,11 @@ pub struct Sandbox {
     cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
     /// Cached Seatbelt profiles keyed by escaped workspace/cache/private roots and network policy.
     cached_seatbelt_profiles: SeatbeltProfileCache,
+    /// Explicit read/write roots resolved once per base directory; reset
+    /// whenever the configured roots change.
+    cached_general_roots: GeneralRootsCache,
+    /// Seatbelt denials of the process-wide private paths, built once.
+    cached_seatbelt_private: SeatbeltPrivateCache,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
     #[cfg(test)]
@@ -1597,30 +1705,52 @@ impl Sandbox {
     /// Account for the actual grants before publishing a model command. The
     /// Sandbox owner and its existing worker clone retain these capabilities;
     /// runtime accounting itself holds only weak references.
-    fn retain_git_write_roots(&self, cwd: &Path) -> Result<(), String> {
+    fn retain_git_write_roots(&self, cwd: &Path) -> Result<Option<PathBuf>, String> {
+        crate::git::global_snapshot::mark_effects_started();
+        if !self.enabled {
+            return Ok(None);
+        }
+        let workspace = canonical_non_root(cwd, "sandbox write root")?;
+        self.retain_canonical_git_write_roots(&workspace)?;
+        Ok(Some(workspace))
+    }
+
+    /// [`Self::retain_git_write_roots`] for a workspace that is already the
+    /// canonical, non-root output of `canonical_non_root` in this launch.
+    fn retain_canonical_git_write_roots(&self, workspace: &Path) -> Result<(), String> {
         crate::git::global_snapshot::mark_effects_started();
         if !self.enabled {
             return Ok(());
         }
-        let mut paths = vec![
-            canonical_non_root(cwd, "sandbox write root")?,
-            self.get_cached_cache_dir()?.as_ref().clone(),
+        let cache = self.get_cached_cache_dir()?;
+        let roots = self.general_roots(workspace)?;
+        // Every candidate is canonical: the workspace was resolved by this
+        // launch, the cache directory once per Sandbox (a retained binding's
+        // `validate` below fails closed if it is relinked), and explicit
+        // roots are validated bindings.
+        let mut candidates: Vec<(PathBuf, Option<&Arc<crate::paths::WorkspaceBinding>>)> = vec![
+            (workspace.to_path_buf(), None),
+            (cache.as_ref().clone(), None),
         ];
         #[cfg(windows)]
-        paths.extend(self.windows_appcontainer_write_roots.iter().cloned());
-        paths.extend(
-            general_profile::roots(&self.write_roots, cwd)?
+        for root in &self.windows_appcontainer_write_roots {
+            candidates.push((
+                root.canonicalize()
+                    .map_err(|_| "sandbox Git write-root authority cannot be resolved")?,
+                None,
+            ));
+        }
+        candidates.extend(
+            roots
+                .writes
                 .iter()
-                .map(|root| root.root().to_path_buf()),
+                .map(|root| (root.root().to_path_buf(), Some(root))),
         );
         let mut retained = self
             .git_write_roots
             .lock()
             .map_err(|_| "sandbox Git write-root authority is unavailable")?;
-        for path in paths {
-            let canonical = path
-                .canonicalize()
-                .map_err(|_| "sandbox Git write-root authority cannot be resolved")?;
+        for (canonical, resolved) in candidates {
             if let Some(old) = retained.iter().find(|old| old.root() == canonical) {
                 old.validate()?;
                 crate::git::runtime::record_model_root(old)?;
@@ -1635,6 +1765,8 @@ impl Sandbox {
                 .filter(|root| root.root() == canonical)
             {
                 workspace.clone()
+            } else if let Some(resolved) = resolved {
+                resolved.clone()
             } else {
                 Arc::new(
                     crate::paths::WorkspaceBinding::capture(&canonical)
@@ -1657,6 +1789,56 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Explicit general-profile roots for `base`, captured once and validated
+    /// on every call. A failed validation falls back to a fresh capture.
+    fn general_roots(&self, base: &Path) -> Result<Arc<GeneralRoots>, String> {
+        let mut cache = self
+            .cached_general_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = cache.iter().position(|roots| roots.base == base) {
+            let roots = cache[index].clone();
+            if roots.validate().is_ok() {
+                return Ok(roots);
+            }
+            cache.swap_remove(index);
+        }
+        let roots = Arc::new(GeneralRoots {
+            base: base.to_path_buf(),
+            reads: general_profile::roots(&self.read_roots, base)?,
+            writes: general_profile::roots(&self.write_roots, base)?,
+            seatbelt: Mutex::new(HashMap::new()),
+        });
+        if cache.len() < MAX_CACHED_GENERAL_ROOT_BASES {
+            cache.push(roots.clone());
+        }
+        Ok(roots)
+    }
+
+    fn seatbelt_private_inputs(&self) -> Result<Arc<SeatbeltPrivateInputs>, String> {
+        let mut cached = self
+            .cached_seatbelt_private
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(inputs) = cached.as_ref() {
+            return Ok(inputs.clone());
+        }
+        let private_paths = general_profile::private_paths()?;
+        let private_refs = private_paths
+            .iter()
+            .map(|path| (path.as_path(), "private/secret directory"))
+            .collect::<Vec<_>>();
+        let private_read_denies = seatbelt_private_read_denies(&private_refs)?;
+        let mut namespace = SeatbeltNamespaceDenies::default();
+        namespace.extend(&private_paths)?;
+        let inputs = Arc::new(SeatbeltPrivateInputs {
+            private_read_denies,
+            namespace,
+        });
+        *cached = Some(inputs.clone());
+        Ok(inputs)
+    }
+
     /// Canonical workspace path for the Seatbelt profile's write grant and
     /// for discovering the workspace Git metadata that stays read-only.
     ///
@@ -1669,9 +1851,29 @@ impl Sandbox {
     /// `WorkspaceBinding::validate` at the top of the wrapping call, and the
     /// filesystem root is refused exactly like the unbound case.
     fn canonical_workspace_root(&self, requested_cwd: &Path) -> Result<PathBuf, String> {
-        match &self.workspace_binding {
-            Some(workspace) => canonical_non_root(workspace.root(), "working directory"),
-            None => canonical_non_root(requested_cwd, "working directory"),
+        self.canonical_workspace_root_from(requested_cwd, None)
+    }
+
+    /// [`Self::canonical_workspace_root`] reusing `resolved_cwd`, the
+    /// canonical form of `requested_cwd` this launch already computed. A
+    /// bound root is canonical by construction and `validate` (pathname and
+    /// identity) ran at the top of the launch, so it is not resolved again.
+    fn canonical_workspace_root_from(
+        &self,
+        requested_cwd: &Path,
+        resolved_cwd: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        match (&self.workspace_binding, resolved_cwd) {
+            (Some(workspace), _) => {
+                if workspace.root().parent().is_none() {
+                    return Err(
+                        "sandbox: refusing to expose filesystem root as working directory".into(),
+                    );
+                }
+                Ok(workspace.root().to_path_buf())
+            }
+            (None, Some(resolved)) => Ok(resolved.to_path_buf()),
+            (None, None) => canonical_non_root(requested_cwd, "working directory"),
         }
     }
 
@@ -1689,6 +1891,9 @@ impl Sandbox {
         self.profile = profile;
         self.read_roots = read_roots;
         self.write_roots = write_roots;
+        // Clones configured before this call keep their own caches.
+        self.cached_general_roots = Arc::new(Mutex::new(Vec::new()));
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(HashMap::new()));
         self
     }
 
@@ -1791,6 +1996,8 @@ impl Sandbox {
             cached_essential_env: Arc::new(OnceLock::new()),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            cached_general_roots: Arc::new(Mutex::new(Vec::new())),
+            cached_seatbelt_private: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             complete_process_tree_for_test: false,
             #[cfg(test)]
@@ -2306,6 +2513,11 @@ impl Sandbox {
         cache: &Path,
         deny_network: bool,
     ) -> Result<Arc<str>, String> {
+        // Dynamic per launch: Git metadata aliases, `.git` write denials,
+        // guarded runtime paths and explicit-root identity are re-checked on
+        // every call, including cache hits. Only the private-path denials
+        // (fixed per Sandbox) and strings derived from validated roots are
+        // reused.
         #[cfg(target_os = "macos")]
         git_metadata::validate_workspace_aliases(workspace)?;
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
@@ -2313,12 +2525,8 @@ impl Sandbox {
         let app_paths = crate::paths::process_paths().map_err(|error| {
             format!("sandbox: failed to resolve private application paths: {error}")
         })?;
-        let private_paths = general_profile::private_paths()?;
-        let private_refs = private_paths
-            .iter()
-            .map(|path| (path.as_path(), "private/secret directory"))
-            .collect::<Vec<_>>();
-        let private_read_denies = seatbelt_private_read_denies(&private_refs)?;
+        let private = self.seatbelt_private_inputs()?;
+        let private_read_denies = &private.private_read_denies;
         // Recomputed per launch: the workspace may gain or relink a `.git`.
         let git_write_denies = git_metadata::seatbelt_write_denies(workspace);
         let mut protected = crate::git::runtime::protected_runtime_paths()?;
@@ -2329,42 +2537,15 @@ impl Sandbox {
                 .map(|path| (path.as_path(), "protected Git storage"))
                 .collect::<Vec<_>>(),
         )?;
-        let read_roots = general_profile::roots(&self.read_roots, workspace)?;
-        let write_roots = general_profile::roots(&self.write_roots, workspace)?;
-        let extra_reads = seatbelt_private_read_denies(
-            &read_roots
-                .iter()
-                .chain(write_roots.iter())
-                .map(|root| (root.root(), "explicit filesystem root"))
-                .collect::<Vec<_>>(),
-        )?;
-        let extra_writes = seatbelt_private_read_denies(
-            &write_roots
-                .iter()
-                .map(|root| (root.root(), "explicit write root"))
-                .collect::<Vec<_>>(),
-        )?;
-        let namespace_denies = seatbelt_namespace_denies(
-            &private_paths
-                .iter()
-                .chain(protected.iter())
-                .cloned()
-                .collect::<Vec<_>>(),
-        )?;
-        // Git and other runtimes normalize absolute paths by inspecting their
-        // ancestors. Permit only metadata on these exact bound path spellings;
-        // private read denials still follow this grant in the final profile.
-        let metadata_ancestors = seatbelt_namespace_denies(
-            &std::iter::once(workspace.to_path_buf())
-                .chain(std::iter::once(cache.to_path_buf()))
-                .chain(
-                    read_roots
-                        .iter()
-                        .chain(write_roots.iter())
-                        .map(|root| root.root().to_path_buf()),
-                )
-                .collect::<Vec<_>>(),
-        )?;
+        let roots = self.general_roots(workspace)?;
+        let root_inputs =
+            seatbelt_root_inputs(&roots, workspace, cache, &workspace_str, &cache_str)?;
+        let SeatbeltRootInputs {
+            extra_reads,
+            extra_writes,
+            metadata_ancestors,
+        } = root_inputs.as_ref();
+        let namespace_denies = private.namespace.rendered_with(&protected)?;
         let cache_read_identity = format!(
             "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}|metadata={metadata_ancestors}",
             self.profile
@@ -2390,13 +2571,13 @@ impl Sandbox {
             self.profile,
             &workspace_str,
             &cache_str,
-            &private_read_denies,
+            private_read_denies,
             &git_write_denies,
             &protected_storage,
-            &extra_reads,
-            &extra_writes,
+            extra_reads,
+            extra_writes,
             &namespace_denies,
-            &metadata_ancestors,
+            metadata_ancestors,
             deny_network,
         );
         let profile: Arc<str> = Arc::from(profile);
@@ -2424,12 +2605,14 @@ impl Sandbox {
         let requested_cwd = self
             .working_dir()
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
-        let cwd = self
-            .workspace_authority_path()
-            .map(Ok)
-            .unwrap_or_else(|| canonical_non_root(&requested_cwd, "working directory"))?;
-        let workspace_root = self.canonical_workspace_root(&requested_cwd)?;
-        self.retain_git_write_roots(&requested_cwd)?;
+        let resolved_cwd = self.retain_git_write_roots(&requested_cwd)?;
+        let cwd = match (self.workspace_authority_path(), resolved_cwd.as_ref()) {
+            (Some(alias), _) => alias,
+            (None, Some(resolved)) => resolved.clone(),
+            (None, None) => canonical_non_root(&requested_cwd, "working directory")?,
+        };
+        let workspace_root =
+            self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?;
         let cache_dir = self.get_cached_cache_dir()?;
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
@@ -2473,7 +2656,9 @@ impl Sandbox {
             .map(Ok)
             .unwrap_or_else(std::env::current_dir)
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
-        self.retain_git_write_roots(&requested_cwd)?;
+        // One resolution of the requested directory serves the write-root
+        // accounting, the child cwd and the profile's workspace grant.
+        let resolved_cwd = self.retain_git_write_roots(&requested_cwd)?;
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
@@ -2498,10 +2683,11 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredAndAvailable => {}
         }
-        let cwd = self
-            .workspace_authority_path()
-            .map(Ok)
-            .unwrap_or_else(|| canonical_non_root(&requested_cwd, "working directory"))?;
+        let cwd = match (self.workspace_authority_path(), resolved_cwd.as_ref()) {
+            (Some(alias), _) => alias,
+            (None, Some(resolved)) => resolved.clone(),
+            (None, None) => canonical_non_root(&requested_cwd, "working directory")?,
+        };
 
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
@@ -2543,7 +2729,8 @@ impl Sandbox {
             // The profile needs the real canonical workspace, not the fd
             // alias in `cwd`; the child's working directory is still bound
             // through the descriptor below.
-            let profile_workspace = self.canonical_workspace_root(&requested_cwd)?;
+            let profile_workspace =
+                self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?;
             let mut command =
                 self.build_seatbelt_command(seatbelt, command, &profile_workspace, &cache_dir)?;
             if self.workspace_binding.is_some() && cfg!(unix) {
@@ -2557,8 +2744,10 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        let git_metadata =
-            bwrap_git_metadata_binds(bwrap, &self.canonical_workspace_root(&requested_cwd)?)?;
+        let git_metadata = bwrap_git_metadata_binds(
+            bwrap,
+            &self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?,
+        )?;
         let mut command =
             self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata)?;
         self.bind_workspace_cwd(&mut command)?;
@@ -2658,7 +2847,7 @@ impl Sandbox {
             return Ok(cmd);
         }
 
-        self.retain_git_write_roots(&cwd)?;
+        self.retain_canonical_git_write_roots(&cwd)?;
         let cache_dir = self.get_cached_cache_dir()?;
 
         if self.backend == "seatbelt" {
@@ -2850,7 +3039,7 @@ impl Sandbox {
 
         let cwd = canonical_non_root(cwd, "workspace-service working directory")?;
         let cache_dir = self.get_cached_cache_dir()?;
-        self.retain_git_write_roots(&cwd)?;
+        self.retain_canonical_git_write_roots(&cwd)?;
 
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
@@ -3091,7 +3280,7 @@ impl Sandbox {
             "working directory",
         )?;
         let cache_dir = self.get_cached_cache_dir()?;
-        self.retain_git_write_roots(&cwd)?;
+        self.retain_canonical_git_write_roots(&cwd)?;
         windows::build_direct_helper(
             program,
             arguments,
@@ -5242,21 +5431,72 @@ fn seatbelt_profile_ladder(
 }
 
 fn seatbelt_namespace_denies(paths: &[PathBuf]) -> Result<String, String> {
-    let mut names = Vec::new();
-    for path in paths {
-        for spelling in std::iter::once(path.clone()).chain(seatbelt_resolved_spelling(path)) {
-            for ancestor in spelling.ancestors().filter(|path| path.parent().is_some()) {
-                let literal = seatbelt_string_literal(ancestor, "protected namespace ancestor")?;
-                if !names.contains(&literal) {
-                    names.push(literal);
-                }
-            }
-        }
+    let mut denies = SeatbeltNamespaceDenies::default();
+    denies.extend(paths)?;
+    Ok(denies.rendered)
+}
+
+/// Explicit-root read/write grants and the metadata-ancestor grant for one
+/// (workspace, cache) pair, memoized on the validated `roots` entry.
+fn seatbelt_root_inputs(
+    roots: &GeneralRoots,
+    workspace: &Path,
+    cache: &Path,
+    workspace_str: &str,
+    cache_str: &str,
+) -> Result<Arc<SeatbeltRootInputs>, String> {
+    let key = (workspace_str.to_owned(), cache_str.to_owned());
+    if let Some(inputs) = roots
+        .seatbelt
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return Ok(inputs.clone());
     }
-    Ok(names
-        .iter()
-        .map(|path| format!("\n    (literal \"{path}\")"))
-        .collect())
+    let extra_reads = seatbelt_private_read_denies(
+        &roots
+            .reads
+            .iter()
+            .chain(roots.writes.iter())
+            .map(|root| (root.root(), "explicit filesystem root"))
+            .collect::<Vec<_>>(),
+    )?;
+    let extra_writes = seatbelt_private_read_denies(
+        &roots
+            .writes
+            .iter()
+            .map(|root| (root.root(), "explicit write root"))
+            .collect::<Vec<_>>(),
+    )?;
+    // Git and other runtimes normalize absolute paths by inspecting their
+    // ancestors. Permit only metadata on these exact bound path spellings;
+    // private read denials still follow this grant in the final profile.
+    let metadata_ancestors = seatbelt_namespace_denies(
+        &std::iter::once(workspace.to_path_buf())
+            .chain(std::iter::once(cache.to_path_buf()))
+            .chain(
+                roots
+                    .reads
+                    .iter()
+                    .chain(roots.writes.iter())
+                    .map(|root| root.root().to_path_buf()),
+            )
+            .collect::<Vec<_>>(),
+    )?;
+    let inputs = Arc::new(SeatbeltRootInputs {
+        extra_reads,
+        extra_writes,
+        metadata_ancestors,
+    });
+    let mut cached = roots
+        .seatbelt
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cached.len() < MAX_CACHED_GENERAL_ROOT_BASES {
+        cached.insert(key, inputs.clone());
+    }
+    Ok(inputs)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -9019,6 +9259,104 @@ echo PRIVATE_TEMP_PASS"#,
             cached_profile.as_ref(),
             cached_again.as_ref(),
             "repeated cache reads must return identical profile text"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_profile_captures_explicit_roots_once_and_revalidates_each_launch() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        let scratch = ScratchDir::new();
+        let workspace = scratch.path().join("workspace");
+        let probe = scratch.path().join("probe-root");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&probe).unwrap();
+        let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
+        let configured = || {
+            Sandbox::new(true, "seatbelt").with_general_profile(
+                SandboxProfile::Workspace,
+                vec![probe.clone()],
+                Vec::new(),
+            )
+        };
+        let captures = || GENERAL_ROOT_CAPTURES.with(std::cell::Cell::get);
+
+        let sandbox = configured();
+        let before = captures();
+        let first = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert_eq!(
+            captures() - before,
+            1,
+            "first launch captures the root once"
+        );
+        let second = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert_eq!(
+            captures() - before,
+            1,
+            "a second launch reuses the captured root binding"
+        );
+        assert_eq!(first.as_ref(), second.as_ref());
+        let probe_literal =
+            seatbelt_string_literal(&probe.canonicalize().unwrap(), "test").unwrap();
+        assert!(first.contains(&format!("(subpath \"{probe_literal}\")")));
+
+        // An independent Sandbox computing everything from scratch emits the
+        // same bytes, so the hoisted inputs are not a different profile.
+        let fresh = configured()
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert_eq!(fresh.as_ref(), first.as_ref());
+
+        // Identity is still checked on every launch: a replaced root fails
+        // validation and is captured again rather than trusted from cache.
+        std::fs::remove_dir(&probe).unwrap();
+        std::fs::create_dir(&probe).unwrap();
+        let before_replacement = captures();
+        let third = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert_eq!(captures() - before_replacement, 1);
+        assert_eq!(third.as_ref(), first.as_ref());
+
+        // Reconfiguring the roots starts from an empty cache.
+        let reconfigured =
+            sandbox
+                .clone()
+                .with_general_profile(SandboxProfile::Workspace, Vec::new(), Vec::new());
+        let without_root = reconfigured
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert!(!without_root.contains(&format!("(subpath \"{probe_literal}\")")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_namespace_denies_extension_matches_one_ordered_pass() {
+        let scratch = ScratchDir::new();
+        let first = scratch.path().join("a/b/c");
+        let second = scratch.path().join("a/b/d");
+        let third = scratch.path().join("x/y");
+        let mut prefix = SeatbeltNamespaceDenies::default();
+        prefix.extend(std::slice::from_ref(&first)).unwrap();
+        let extended = prefix
+            .rendered_with(&[second.clone(), third.clone(), first.clone()])
+            .unwrap();
+        assert_eq!(
+            extended,
+            seatbelt_namespace_denies(&[first, second, third]).unwrap()
+        );
+        assert_eq!(
+            extended.matches("(literal").count(),
+            extended
+                .lines()
+                .filter(|line| line.contains("(literal"))
+                .collect::<HashSet<_>>()
+                .len(),
+            "every ancestor literal appears once"
         );
     }
 

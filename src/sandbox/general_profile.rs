@@ -56,6 +56,8 @@ pub(super) fn roots(
             } else {
                 cwd.join(path)
             };
+            #[cfg(test)]
+            super::GENERAL_ROOT_CAPTURES.with(|count| count.set(count.get() + 1));
             let root = crate::paths::WorkspaceBinding::capture(&absolute)
                 .map_err(|_| "sandbox profile: an explicit root is unavailable or changed")?;
             if root.root().parent().is_none() {
