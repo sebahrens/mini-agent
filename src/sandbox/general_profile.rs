@@ -784,7 +784,27 @@ mod tests {
         .unwrap();
         let fixture = Fixture::new();
         std::fs::create_dir_all(fixture.home.join(".cargo/bin")).unwrap();
-        std::fs::copy(&cargo_shim, fixture.home.join(".cargo/bin/cargo")).unwrap();
+        // Rustup dispatches by executable basename. Cargo invokes rustc and
+        // rustdoc through PATH, so retain the real installed proxy once and
+        // copy that same image under all three standard dispatch names.
+        let mut proxy = std::fs::File::open(&cargo_shim).unwrap();
+        crate::fs::ensure_same_file(
+            &cargo_shim,
+            &shim_identity,
+            &crate::fs::checked_file_metadata(&proxy).unwrap(),
+        )
+        .unwrap();
+        let permissions = proxy.metadata().unwrap().permissions();
+        for name in ["cargo", "rustc", "rustdoc"] {
+            std::io::Seek::seek(&mut proxy, std::io::SeekFrom::Start(0)).unwrap();
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(fixture.home.join(".cargo/bin").join(name))
+                .unwrap();
+            std::io::copy(&mut proxy, &mut target).unwrap();
+            target.set_permissions(permissions.clone()).unwrap();
+        }
         crate::fs::ensure_same_file(
             &cargo_shim,
             &shim_identity,
