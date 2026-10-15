@@ -86,21 +86,21 @@ pub struct Cli {
         long,
         value_name = "PROVIDER",
         conflicts_with = "logout",
-        help = "Sign in to a provider account and exit (openai)"
+        help = "Sign in to a provider account and exit (openai, copilot)"
     )]
     pub login: Option<String>,
     #[arg(
         long,
         value_name = "NEW_OR_NUMBER",
         requires = "login",
-        help = "Choose a saved ChatGPT registration, or new"
+        help = "Choose a saved ChatGPT registration, or new (OpenAI only)"
     )]
     pub login_account: Option<String>,
     #[arg(
         long,
         value_name = "PROVIDER",
         conflicts_with = "login",
-        help = "Sign out of a provider account and exit (openai)"
+        help = "Sign out of a provider account and exit (openai, copilot)"
     )]
     pub logout: Option<String>,
     #[arg(

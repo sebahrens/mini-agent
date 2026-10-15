@@ -8,7 +8,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rig::agent::Agent;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, Message};
-use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
+use rig::providers::{anthropic, copilot as copilot_sdk, gemini, ollama, openai, openrouter};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -23,6 +23,8 @@ use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 pub(crate) mod azure;
 #[path = "provider_bedrock.rs"]
 pub(crate) mod bedrock;
+#[path = "provider_copilot.rs"]
+pub(crate) mod copilot;
 #[path = "provider_effort.rs"]
 pub(crate) mod effort;
 #[path = "provider_vertex.rs"]
@@ -135,7 +137,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, azure, bedrock, vertex, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
+            "Unknown provider: '{}'. Supported: openrouter, openai, azure, bedrock, vertex, copilot, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
             name
         )
     })?;
@@ -224,6 +226,7 @@ where
         ProviderKind::Anthropic => "ANTHROPIC_BASE_URL",
         ProviderKind::OpenAI => "OPENAI_BASE_URL",
         ProviderKind::Azure => "AZURE_OPENAI_ENDPOINT",
+        ProviderKind::Copilot => "COPILOT_API_URL",
         _ => return None,
     };
     get_env(name)
@@ -274,6 +277,7 @@ pub enum AnyClient {
     OpenAI(OpenAiClient),
     Anthropic(anthropic::Client<ProviderHttpClient>),
     Gemini(gemini::Client<ProviderHttpClient>),
+    Copilot(copilot_sdk::Client<ProviderHttpClient>),
     Ollama(ollama::Client<ProviderHttpClient>),
 }
 
@@ -451,7 +455,10 @@ pub(crate) fn provider_request_params(
         AnyModel::OpenAI(OpenAiModel::Completions(_)) => {
             openai_completions_extra_body(provider_extra_body, reasoning)
         }
-        AnyModel::Anthropic(_) | AnyModel::Gemini(_) | AnyModel::Ollama(_) => provider_extra_body,
+        AnyModel::Anthropic(_)
+        | AnyModel::Gemini(_)
+        | AnyModel::Ollama(_)
+        | AnyModel::Copilot(_) => provider_extra_body,
     }
 }
 
@@ -543,6 +550,9 @@ pub(crate) fn openai_completions_extra_body(
 }
 
 impl AnyClient {
+    pub(crate) fn uses_copilot_login(&self) -> bool {
+        matches!(self, Self::Copilot(client) if client.http_client().is_copilot_login())
+    }
     pub(crate) fn uses_chatgpt_plan(&self) -> bool {
         matches!(self, Self::OpenAI(OpenAiClient::Responses(client)) if client.http_client().is_chatgpt())
     }
@@ -561,6 +571,7 @@ impl AnyClient {
             Self::OpenAI(OpenAiClient::Completions(_)) => HistoryProtocol::OpenAIChatCompletions,
             Self::Gemini(_) => HistoryProtocol::GeminiGenerateContent,
             Self::Ollama(_) => HistoryProtocol::OllamaChat,
+            Self::Copilot(_) => HistoryProtocol::OpenAIChatCompletions,
         }
     }
 
@@ -606,6 +617,7 @@ impl AnyClient {
             AnyModel::Anthropic(model) => complete!(model),
             AnyModel::Gemini(model) => complete!(model),
             AnyModel::Ollama(model) => complete!(model),
+            AnyModel::Copilot(model) => complete!(model),
         }
     }
 
@@ -616,6 +628,7 @@ impl AnyClient {
             AnyClient::Anthropic(_) => "anthropic",
             AnyClient::Gemini(_) => "gemini",
             AnyClient::Ollama(_) => "ollama",
+            AnyClient::Copilot(_) => "copilot",
         }
     }
 
@@ -678,6 +691,9 @@ impl AnyClient {
             AnyModel::Ollama(model) => {
                 AnyAgentInner::Ollama(build(model, max_tokens, temperature, params))
             }
+            AnyModel::Copilot(model) => {
+                AnyAgentInner::Copilot(build(model, max_tokens, temperature, params))
+            }
         };
         Ok(AnyAgent::without_skills(inner).with_turn_token_budget(budget))
     }
@@ -697,6 +713,7 @@ impl AnyClient {
         let protocol = match &model {
             AnyModel::Anthropic(_) => effort::Protocol::Anthropic,
             AnyModel::OpenRouter(..) => effort::Protocol::OpenRouter,
+            AnyModel::Copilot(model) => copilot::reasoning_protocol(model),
             AnyModel::OpenAI(OpenAiModel::Responses(_)) => effort::Protocol::OpenAiResponses,
             AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
             _ => effort::Protocol::Other,
@@ -757,6 +774,7 @@ impl AnyClient {
             }
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
+            AnyClient::Copilot(c) => AnyModel::Copilot(c.completion_model(name)),
         }
     }
 
@@ -932,6 +950,7 @@ impl AnyClient {
             AnyModel::Anthropic(model) => complete!(model),
             AnyModel::Gemini(model) => complete!(model),
             AnyModel::Ollama(model) => complete!(model),
+            AnyModel::Copilot(model) => complete!(model),
         }
     }
 
@@ -1603,6 +1622,17 @@ async fn summarize_with_model(
             )
             .await
         }
+        AnyModel::Copilot(m) => {
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
+        }
     }
 }
 
@@ -2013,6 +2043,7 @@ pub enum AnyModel {
     OpenAI(OpenAiModel),
     Anthropic(anthropic::completion::CompletionModel<ProviderHttpClient>),
     Gemini(gemini::completion::CompletionModel<ProviderHttpClient>),
+    Copilot(copilot_sdk::CompletionModel<ProviderHttpClient>),
     Ollama(ollama::CompletionModel<ProviderHttpClient>),
 }
 
@@ -2033,6 +2064,12 @@ impl AnyModel {
             Self::Anthropic(model) => ("anthropic", model.model.as_str(), false, true),
             Self::Gemini(model) => ("gemini", model.model.as_str(), true, false),
             Self::Ollama(model) => ("ollama", model.model.as_str(), false, false),
+            Self::Copilot(model) => (
+                "copilot",
+                model.model.as_str(),
+                false,
+                !model.uses_responses(),
+            ),
         };
         // These three converters merge a literal top-level model override.
         // Responses drops this unknown extra, Gemini routes by URL, and
@@ -2053,6 +2090,7 @@ pub enum AnyAgentInner {
     OpenAI(OpenAiAgent),
     Anthropic(Agent<anthropic::completion::CompletionModel<ProviderHttpClient>>),
     Gemini(Agent<gemini::completion::CompletionModel<ProviderHttpClient>>),
+    Copilot(Agent<copilot_sdk::CompletionModel<ProviderHttpClient>>),
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
@@ -2954,6 +2992,13 @@ impl AnyAgent {
             }
             AnyAgentInner::Gemini(_) => HistoryProtocol::GeminiGenerateContent,
             AnyAgentInner::Ollama(_) => HistoryProtocol::OllamaChat,
+            AnyAgentInner::Copilot(a) => {
+                if a.model.uses_responses() {
+                    HistoryProtocol::OpenAIResponses
+                } else {
+                    HistoryProtocol::OpenAIChatCompletions
+                }
+            }
         }
     }
 
@@ -3022,6 +3067,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(agent) => &mut agent.preamble,
             AnyAgentInner::Gemini(agent) => &mut agent.preamble,
             AnyAgentInner::Ollama(agent) => &mut agent.preamble,
+            AnyAgentInner::Copilot(agent) => &mut agent.preamble,
         };
         self.memory_context = Some(match preamble {
             Some(preamble) => snapshot.detach_memory(preamble).map(std::sync::Arc::from),
@@ -3055,6 +3101,7 @@ impl AnyAgent {
             }
             AnyAgentInner::Gemini(a) => (P::Other, &a.model.model),
             AnyAgentInner::Ollama(a) => (P::Other, &a.model.model),
+            AnyAgentInner::Copilot(a) => (copilot::reasoning_protocol(&a.model), &a.model.model),
         }
     }
     fn reasoning_params(&mut self) -> &mut Option<serde_json::Value> {
@@ -3065,6 +3112,7 @@ impl AnyAgent {
             AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &mut a.additional_params,
             AnyAgentInner::Gemini(a) => &mut a.additional_params,
             AnyAgentInner::Ollama(a) => &mut a.additional_params,
+            AnyAgentInner::Copilot(a) => &mut a.additional_params,
         }
     }
     /// Recompute from the original configured parameters, never from an earlier
@@ -3216,6 +3264,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => a.preamble.as_deref(),
             AnyAgentInner::Gemini(a) => a.preamble.as_deref(),
             AnyAgentInner::Ollama(a) => a.preamble.as_deref(),
+            AnyAgentInner::Copilot(a) => a.preamble.as_deref(),
         }
         .unwrap_or("")
     }
@@ -3265,6 +3314,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(agent) => guard(agent),
             AnyAgentInner::Gemini(agent) => guard(agent),
             AnyAgentInner::Ollama(agent) => guard(agent),
+            AnyAgentInner::Copilot(agent) => guard(agent),
         }
         self
     }
@@ -3300,6 +3350,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => add(a, turn, query, protocol),
             AnyAgentInner::Gemini(a) => add(a, turn, query, protocol),
             AnyAgentInner::Ollama(a) => add(a, turn, query, protocol),
+            AnyAgentInner::Copilot(a) => add(a, turn, query, protocol),
         }
         self
     }
@@ -3337,6 +3388,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => a.hooks.push(Rewrite(text)),
             AnyAgentInner::Gemini(a) => a.hooks.push(Rewrite(text)),
             AnyAgentInner::Ollama(a) => a.hooks.push(Rewrite(text)),
+            AnyAgentInner::Copilot(a) => a.hooks.push(Rewrite(text)),
         }
         self
     }
@@ -3352,6 +3404,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(_) => P::Anthropic,
             AnyAgentInner::Gemini(_) => P::Gemini,
             AnyAgentInner::Ollama(_) => P::Ollama,
+            AnyAgentInner::Copilot(a) => copilot::instruction_protocol(&a.model),
         }
     }
     #[cfg(feature = "agent-skills")]
@@ -3363,6 +3416,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => &a.additional_params,
             AnyAgentInner::Gemini(a) => &a.additional_params,
             AnyAgentInner::Ollama(a) => &a.additional_params,
+            AnyAgentInner::Copilot(a) => &a.additional_params,
         };
         self.instruction_protocol()
             .extra_body_overrides(params.as_ref())
@@ -3463,6 +3517,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => AnyAgentInner::Anthropic(prepared!(a)),
             AnyAgentInner::Gemini(a) => AnyAgentInner::Gemini(prepared!(a)),
             AnyAgentInner::Ollama(a) => AnyAgentInner::Ollama(prepared!(a)),
+            AnyAgentInner::Copilot(a) => AnyAgentInner::Copilot(prepared!(a)),
         })
     }
 
@@ -3478,6 +3533,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(a) => &a.tool_server_handle,
             AnyAgentInner::Gemini(a) => &a.tool_server_handle,
             AnyAgentInner::Ollama(a) => &a.tool_server_handle,
+            AnyAgentInner::Copilot(a) => &a.tool_server_handle,
         };
         Ok(handle.get_tool_defs(None).await?)
     }
@@ -3587,6 +3643,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(agent) => agent.default_max_turns = Some(turns),
             AnyAgentInner::Gemini(agent) => agent.default_max_turns = Some(turns),
             AnyAgentInner::Ollama(agent) => agent.default_max_turns = Some(turns),
+            AnyAgentInner::Copilot(agent) => agent.default_max_turns = Some(turns),
         }
         capped
     }
@@ -3830,6 +3887,23 @@ impl AnyAgent {
                     })
                     .await
                 }
+                AnyAgentInner::Copilot(a) => {
+                    crate::startup::heap_future(|| {
+                        runner::run_print_with_output_and_verification(
+                            a,
+                            &prompt,
+                            output,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                    })
+                    .await
+                }
             };
             #[cfg(any(feature = "hooks", feature = "memory"))]
             let turn = {
@@ -3961,6 +4035,17 @@ impl AnyAgent {
                     .await
                 }
                 AnyAgentInner::Ollama(a) => {
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
+                }
+                AnyAgentInner::Copilot(a) => {
                     runner::run_subagent(
                         a,
                         &prompt,
@@ -4279,6 +4364,22 @@ impl AnyAgent {
                             crate::agent::native_capture::NativeCaptureHook::default(),
                         )
                     }
+                    AnyAgentInner::Copilot(a) => {
+                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
+                            a,
+                            prompt,
+                            history,
+                            retry_config,
+                            turn_token_budget,
+                            #[cfg(feature = "skills")]
+                            turn_guard,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                            completion_verification,
+                            work_scope,
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                        )
+                    }
                 };
                 #[cfg(any(feature = "hooks", feature = "memory"))]
                 let paused = paused.with_hook_context(context_notices);
@@ -4324,6 +4425,9 @@ impl AnyAgent {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
                 AnyAgentInner::Ollama(a) => {
+                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                }
+                AnyAgentInner::Copilot(a) => {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
             })
@@ -4647,7 +4751,10 @@ where
         .filter(|_| {
             matches!(
                 config.kind,
-                ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex
+                ProviderKind::Azure
+                    | ProviderKind::Bedrock
+                    | ProviderKind::Vertex
+                    | ProviderKind::Copilot
             ) || matches!(&credential, ResolvedCredential::Bearer(_))
         })
         .map(|custom| {
@@ -4655,7 +4762,10 @@ where
             custom.headers.retain(|name, _| {
                 if matches!(
                     config.kind,
-                    ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex
+                    ProviderKind::Azure
+                        | ProviderKind::Bedrock
+                        | ProviderKind::Vertex
+                        | ProviderKind::Copilot
                 ) {
                     !matches!(
                         name.to_ascii_lowercase().as_str(),
@@ -4680,9 +4790,17 @@ where
         config.danger_accept_invalid_certs,
         http_custom,
         base_url.as_deref(),
-        config.kind == ProviderKind::Vertex,
+        matches!(config.kind, ProviderKind::Vertex | ProviderKind::Copilot),
     )?;
     match config.kind {
+        ProviderKind::Copilot => copilot::build_client(
+            credential,
+            base_url.as_deref(),
+            crate::auth::copilot::Profile::for_host(
+                &get_env("COPILOT_GITHUB_HOST").unwrap_or_else(|_| "github.com".into()),
+            )?,
+            http_client,
+        ),
         ProviderKind::Vertex => vertex::build_client(
             credential,
             base_url.as_deref().expect("Vertex endpoint validated"),
@@ -4786,7 +4904,9 @@ fn build_anthropic_client(
     http: reqwest::Client,
 ) -> anyhow::Result<AnyClient> {
     match credential {
-        ResolvedCredential::AwsDefaultChain | ResolvedCredential::GoogleAdc => {
+        ResolvedCredential::AwsDefaultChain
+        | ResolvedCredential::GoogleAdc
+        | ResolvedCredential::CopilotLogin => {
             anyhow::bail!("Anthropic cannot use cloud credential chains")
         }
         ResolvedCredential::ApiKey(key) => {
@@ -5190,6 +5310,40 @@ pub async fn build_agent_in_workspace(
                 &mut diagnostic_lsp,
                 m,
                 crate::context::instructions::InstructionProtocol::Ollama,
+                cli,
+                cfg,
+                context,
+                workspace,
+                permission,
+                ask_tx,
+                sandbox,
+                read_tracker,
+                todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
+                tool_output_session_id,
+                tool_result_spills,
+                reasoning_enabled,
+                temperature,
+                extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status,
+                #[cfg(feature = "js")]
+                js_scratch,
+                #[cfg(feature = "skills")]
+                skills.clone(),
+                #[cfg(feature = "mcp")]
+                mcp_manager,
+            )
+            .await,
+        ),
+        AnyModel::Copilot(m) => AnyAgentInner::Copilot(
+            builder::build_agent_inner_with_snapshot(
+                &mut context_snapshot,
+                #[cfg(feature = "lsp")]
+                &mut diagnostic_lsp,
+                m.clone(),
+                copilot::instruction_protocol(&m),
                 cli,
                 cfg,
                 context,
@@ -5681,6 +5835,29 @@ pub async fn build_btw_agent(
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Ollama,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    captured_instructions.clone(),
+                    permission,
+                    ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                )
+            })
+            .await,
+        ),
+        AnyModel::Copilot(m) => AnyAgentInner::Copilot(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
+                    m.clone(),
+                    copilot::instruction_protocol(&m),
                     #[cfg(feature = "multimodal")]
                     image_support,
                     cli,

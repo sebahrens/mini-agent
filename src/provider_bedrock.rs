@@ -91,7 +91,9 @@ impl BedrockAuth {
                 Some(key)
             }
             ResolvedCredential::AwsDefaultChain => None,
-            ResolvedCredential::Bearer(_) | ResolvedCredential::GoogleAdc => {
+            ResolvedCredential::Bearer(_)
+            | ResolvedCredential::GoogleAdc
+            | ResolvedCredential::CopilotLogin => {
                 anyhow::bail!("Bedrock native Messages uses an API key or AWS SDK credentials")
             }
         };

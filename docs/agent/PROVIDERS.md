@@ -1,10 +1,10 @@
 ---
-description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, AWS Bedrock, Vertex AI Claude, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
+description: "Configure LLM providers in mini-agent: OpenRouter, OpenAI-compatible endpoints, Azure OpenAI, AWS Bedrock, Vertex AI Claude, GitHub Copilot, Anthropic, Gemini, Ollama, custom headers, and prompt caching."
 ---
 
 # Providers
 
-mini-agent supports eight built-in providers and allows custom provider
+mini-agent supports nine built-in providers and allows custom provider
 definitions for OpenAI-compatible endpoints.
 
 ## Built-in Providers
@@ -16,6 +16,7 @@ definitions for OpenAI-compatible endpoints.
 | Azure OpenAI | `azure` / `azure-openai` | `AZURE_OPENAI_API_KEY` |
 | AWS Bedrock (Claude) | `bedrock` / `aws-bedrock` | AWS SDK chain or `AWS_BEARER_TOKEN_BEDROCK` |
 | Vertex AI (Claude) | `vertex` / `vertex-ai` | Google ADC or `VERTEX_ACCESS_TOKEN` |
+| GitHub Copilot | `copilot` / `github-copilot` | saved login, `GITHUB_COPILOT_API_TOKEN` or `COPILOT_GITHUB_TOKEN` |
 | Anthropic  | `anthropic`         | `ANTHROPIC_API_KEY`         |
 | Gemini     | `gemini` / `google` | `GEMINI_API_KEY`            |
 | Ollama     | `ollama`            | (no key required)           |
@@ -520,3 +521,92 @@ Google's [Claude request contract](https://docs.cloud.google.com/gemini-enterpri
 documents the publisher route and Vertex body version. The official
 [ADC builder](https://docs.rs/google-cloud-auth/1.17.0/google_cloud_auth/credentials/struct.Builder.html)
 documents source selection and scopes.
+
+## GitHub Copilot credential ownership
+
+`src/provider_copilot.rs` uses the maintained SDK's Copilot chat and Responses
+converters. The actual model selects its converter; Codex model IDs use
+Responses. `src/auth/copilot.rs` supplies the SDK's external `AuthContext` callback,
+so the application owns device authorization, refresh and private storage. The
+SDK's editor registration, ambient token files and interactive fallback are
+bypassed. Requests identify mini-agent and retain the SDK's tool/initiator rules.
+
+Declared direct API tokens use `GITHUB_COPILOT_API_TOKEN`; an explicit GitHub
+bootstrap token uses `COPILOT_GITHUB_TOKEN`. Generic `GH_TOKEN`, `GITHUB_TOKEN` and
+other providers' credentials are not borrowed. Device authorization uses your
+configured `COPILOT_CLIENT_ID`, with device flow enabled in that app. A captured
+registration binds one account generation and GitHub host; later login/logout
+cannot silently change an existing client's account.
+
+Credential files use the existing owner-only, no-follow atomic storage helpers.
+A rotated GitHub token is saved before fallible identity/model requests, marked
+unverified until its account matches the captured registration. It cannot supply
+a model credential before verification. Polling obeys the server interval and
+slow-down response, expires after at most 15 minutes and is cancellable. Auth
+requests have 30-second and 256 KiB bounds; a model credential acquisition has a
+30-second total deadline. Refresh work stays inside its caller's future.
+
+GitHub.com and a declared `COPILOT_GITHUB_HOST = SUBDOMAIN.ghe.com` keep separate
+private registrations. Token-derived API endpoints must remain on the approved
+Copilot service or that enterprise's exact Copilot endpoints. Explicit custom
+routes retain the existing credential-isolation/inheritance policy and disable
+redirects. GitHub Enterprise Server itself does not host Copilot subscriptions.
+
+GitHub documents [independent OAuth apps](https://docs.github.com/en/copilot/how-tos/copilot-sdk/setup/github-oauth),
+[device authorization](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow),
+and [GHE.com service routing](https://docs.github.com/en/copilot/reference/copilot-allowlist-reference).
+
+
+Configure your own GitHub OAuth app with device flow enabled, then authorize it:
+
+```sh
+export COPILOT_CLIENT_ID=YOUR_APP_CLIENT_ID
+mini-agent --login copilot
+mini-agent --provider copilot --model MODEL_ID
+mini-agent --logout copilot
+```
+
+The TUI equivalents are `/login copilot`, `/provider copilot`, `/model MODEL_ID`
+and `/logout copilot`; `/provider` shows the selected host's saved account and
+whether the current client uses it. Copilot stores one account per GitHub host;
+`--login-account` and the third `/login` argument apply only to OpenAI. A running
+turn must finish or stop before TUI authentication changes. The app displays the
+GitHub device verification URL and user code, waits the server's polling interval,
+honors `authorization_pending` and `slow_down`, and cancels on Ctrl-C. Device
+sessions stop after the advertised expiry, capped at fifteen minutes. Every auth
+HTTP operation has a thirty-second total deadline and a 256 KiB response cap;
+model/listing operations retain their existing owners and limits. No background
+refresh task is started. Local logout invalidates captured registration generations
+and pending sign-ins; revoke the OAuth app in GitHub settings to revoke the grant.
+
+For GitHub Enterprise Cloud data residency, set `COPILOT_GITHUB_HOST=SUBDOMAIN.ghe.com`
+before login and use that same host for requests. Only `github.com` and a single
+enterprise subdomain of `ghe.com` are accepted authorization hosts. Arbitrary
+GitHub Enterprise Server OAuth hosts are unsupported. A supplied direct model
+token can use an explicitly configured gateway origin; custom aliases isolate
+credentials unless `inherit_builtin_key = true` is set. `COPILOT_API_URL` is the
+built-in endpoint fallback and must be an origin without a path/query. Redirects
+are disabled for Copilot routes. Model HTTP errors preserve status and retry
+metadata while dropping untrusted response bodies. The API token returned by GitHub is accepted only
+for approved Copilot service origins for the captured GitHub host.
+
+An API-token alternative needs no OAuth app registration:
+
+```sh
+GITHUB_COPILOT_API_TOKEN=YOUR_MODEL_TOKEN mini-agent --provider copilot --model MODEL_ID
+# Or explicitly exchange a GitHub bootstrap token using the owned auth client:
+COPILOT_GITHUB_TOKEN=YOUR_GITHUB_TOKEN mini-agent --provider copilot --model MODEL_ID
+```
+
+`--api-key` wins, then `GITHUB_COPILOT_API_TOKEN`, then `COPILOT_GITHUB_TOKEN`, then
+`api_keys.copilot`, then the saved login. Token contents never select the credential
+type. `GH_TOKEN`, `GITHUB_TOKEN`, editor registrations and editor token caches are
+not Copilot sources. The integration sends its own mini-agent identity headers.
+A model is required explicitly; `/models refresh` lists models available to the
+current credential. Copilot uses the existing SDK's model classifier: IDs containing
+`codex` use Responses, other IDs use Chat Completions. `api_style` does not override
+that classifier. Both converters preserve SDK tool and usage behavior; malformed
+chat usage is rejected before arithmetic or tool execution. Copilot sessions use
+ordinary message history; this backend does not claim Anthropic native replay or
+OpenAI encrypted-item publication authority. No live Copilot entitlement was used
+for the local device-flow, refresh, tool/wire and installed terminal controls.

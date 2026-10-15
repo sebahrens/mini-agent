@@ -1,0 +1,467 @@
+{
+  "bead": "mini-agent-i7ro6.81.4",
+  "integration_base": "3c452a0b",
+  "frozen_source": "e7b6fe60db90f6f2968e1e1dfb85d46c08be0de3",
+  "patch_sha256": "71a93168afe7eaddbfaa00d6805409b6713dd79b8c37355d2a63de9f677030c3",
+  "source_files": [
+    {
+      "path": "docs/agent/CONFIG.md",
+      "sha256": "d77e68c32042a7f36df584f7ede8b9bbf953974e0e1cae2cbd6da302d1d435b1"
+    },
+    {
+      "path": "docs/agent/PROVIDERS.md",
+      "sha256": "569656661b7258874d947c4a8e815ba80160c5673df1e870e03a38c9493e23eb"
+    },
+    {
+      "path": "docs/specs/subprocess-trust.md",
+      "sha256": "c27d11b70c154cdb2d303ee47ae69b0d4106c8157ad43387b985e7441f096309"
+    },
+    {
+      "path": "patched-deps/rig-core/PATCH.md",
+      "sha256": "f573eeb754fa7cd17e8ad9ce04022310667f20d5a36d1a065cca305e3f3f339c"
+    },
+    {
+      "path": "patched-deps/rig-core/src/providers/copilot/auth/mod.rs",
+      "sha256": "57fbc3c3b7562d0e0035b37653e18820cf84a4bf341bb7a8e8ecff4a37a52ade"
+    },
+    {
+      "path": "patched-deps/rig-core/src/providers/copilot/mod.rs",
+      "sha256": "5635adabc4834c96f8e454c64a92f297c0a8b10235262ec446393c470be79b7b"
+    },
+    {
+      "path": "src/auth.rs",
+      "sha256": "9fca99ec412b015c11bf2bd0e1fefa896c0805d2eb6306b2b176c824eaf28f74"
+    },
+    {
+      "path": "src/auth/copilot.rs",
+      "sha256": "f41011406a44f13012ebe56703335906ad5b4420587a56c25323df3598e1ccc8"
+    },
+    {
+      "path": "src/auth/copilot_protocol_tests.rs",
+      "sha256": "183c4cd1eb4101a34628902b829b69852ac203cfe8753c383c9693c92991ecdf"
+    },
+    {
+      "path": "src/auth/copilot_tests.rs",
+      "sha256": "32be9d91bd738de342a7bb3ee12e4510207701343c338e4b46d5a321b6de0375"
+    },
+    {
+      "path": "src/cli.rs",
+      "sha256": "1a4e1bb964d99bac016e5a327f19e4a11cad015d45c24768cde814313a953068"
+    },
+    {
+      "path": "src/diagnostics.rs",
+      "sha256": "f494d7d469079008d2f6004161eeee819515fcfa22695636f1949c71cedd5bad"
+    },
+    {
+      "path": "src/extras/subagents/builder.rs",
+      "sha256": "2198458eb148e0202d47e212dc86cd32194f9062c02eef30b2f32d4e646eb86f"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "dc58e49d4b3c156ef60b4fc9142194091f54ede1a74003acab51c562ebf3d17c"
+    },
+    {
+      "path": "src/provider.rs",
+      "sha256": "746ef90e1ea78fa131d855d6899fb67e9b74c185032ca225d1da01402bcd3ccb"
+    },
+    {
+      "path": "src/provider_azure.rs",
+      "sha256": "e083d34185199f403cd82db5fac4ecdc80ea279e6d6f3ba377c73ce259f8b791"
+    },
+    {
+      "path": "src/provider_bedrock.rs",
+      "sha256": "3acd44638f248d7e0962495daa5b7127bb29ab5796a4875925c2676822e93cc4"
+    },
+    {
+      "path": "src/provider_copilot.rs",
+      "sha256": "4fc86eb3ca880e91f9b35c1f60712a47445cf6bedec0bf57b747910e5987f9b0"
+    },
+    {
+      "path": "src/provider_copilot_tests.rs",
+      "sha256": "43275b449333241fe99d47d2d27db7a6667d3e4e13545af4448812292ad789ea"
+    },
+    {
+      "path": "src/provider_http.rs",
+      "sha256": "4106b5f8a33954908155045da0c611b76932ef6e231049bcec55d8017672ac13"
+    },
+    {
+      "path": "src/provider_listing.rs",
+      "sha256": "6cfcc799ed83749a03c764e22649b4d6217e64c58e2bc7bf880a54087a7ef9d1"
+    },
+    {
+      "path": "src/setup/mod.rs",
+      "sha256": "642d9fdcac20480906ca1830d0cff708f63d06d131cb5d11721cabb85d7ce6e0"
+    },
+    {
+      "path": "src/tests/image_read_tests.rs",
+      "sha256": "7a8e75af59d13820e3e5256d9ff996c4d41c891615cbcf1b569a5de722bed65e"
+    },
+    {
+      "path": "src/tests/provider_tests.rs",
+      "sha256": "b7aac096b1c7981665c395e88ee0e7716f4754968be1370632981a87e22789ee"
+    },
+    {
+      "path": "src/tests/subprocess_inventory_tests.rs",
+      "sha256": "8d5fe500113bd280d2ba69c0e1dc5cc218538d8aa27778801b656a54cd4023d0"
+    },
+    {
+      "path": "src/ui/slash/help.rs",
+      "sha256": "80fc040c1be4045c8300a9a4091e358b5df5944c70d0d491dc70e20f31784884"
+    },
+    {
+      "path": "src/ui/slash/providers.rs",
+      "sha256": "83f6283791e42d14799728efa15a32981bfe0cc95db31d38bf298f5bf1b21c08"
+    }
+  ],
+  "all_27_source_hashes_match": true,
+  "owning_evidence": {
+    "bead": "mini-agent-i7ro6.81.4",
+    "base": "42dab26e159463892681814dee980fea9ee3b4f2",
+    "freeze": "e7b6fe60db90f6f2968e1e1dfb85d46c08be0de3",
+    "patch_sha256": "71a93168afe7eaddbfaa00d6805409b6713dd79b8c37355d2a63de9f677030c3",
+    "source_files": 27,
+    "indexed_navigation": [
+      "/private/tmp/mini-agent-copilot81-indexed-seams.json",
+      "/private/tmp/mini-agent-copilot81-final-index-map.json",
+      "/private/tmp/mini-agent-copilot81-final-index-callers.json"
+    ],
+    "indexed_test_map": [
+      {
+        "symbols": [
+          "AuthResolver::resolve_credential_with_env",
+          "CopilotAuth::new",
+          "create_client_with_env"
+        ],
+        "files": [
+          "src/auth.rs",
+          "src/provider.rs",
+          "src/provider_copilot.rs"
+        ],
+        "validation": [
+          "18 Copilot owning controls",
+          "tests::auth_tests::*",
+          "native_replay_protocol_classifier_uses_actual_custom_adapter_and_api_style",
+          "environment_endpoint_fallbacks_preserve_configured_routes_and_provider_scope",
+          "anthropic_bearer_factory_sends_only_typed_auth_and_preserves_sdk_defaults",
+          "anthropic_bearer_redirects_refuse_other_origins_and_isolated_custom_tokens",
+          "shadowing_custom_provider_uses_its_own_key_env_and_config_entry"
+        ]
+      },
+      {
+        "symbols": [
+          "Profile",
+          "LockedStore",
+          "Registration::auth_context",
+          "sign_in_profile",
+          "device_tokens",
+          "external_context"
+        ],
+        "files": [
+          "src/auth/copilot.rs"
+        ],
+        "validation": [
+          "actual local device-code initial interval/pending/slow_down/expiry",
+          "held HTTP cancel and whole acquisition timeout retire sockets and file lock",
+          "rotated token persists before identity request failure; retry verifies without reusing consumed refresh",
+          "identity mismatch and captured generation invalidation fail closed",
+          "pending sign-in cannot restore a logged-out generation",
+          "private owner-only record and symlink rejection",
+          "direct bootstrap cache refresh and foreign API origin rejection"
+        ]
+      },
+      {
+        "symbols": [
+          "Authenticator::auth_context",
+          "CompletionModel::uses_responses",
+          "validate_chat_usage",
+          "CopilotAuth::prepare",
+          "ProviderHttpClient::prepare_request",
+          "response_error"
+        ],
+        "files": [
+          "patched-deps/rig-core/src/providers/copilot/auth/mod.rs",
+          "patched-deps/rig-core/src/providers/copilot/mod.rs",
+          "src/provider_copilot.rs",
+          "src/provider_http.rs"
+        ],
+        "validation": [
+          "actual SDK chat and Responses tools plus exact app identity/usage",
+          "blocking and streaming malformed usage fail before arithmetic/tool execution",
+          "same-origin authenticated redirect is not followed",
+          "private HTTP error retires unread 1 MiB declared body and preserves 403",
+          "all six shared provider_http controls",
+          "bounded actual listing owner and pre-auth changed-route rejection"
+        ]
+      },
+      {
+        "symbols": [
+          "build_agent_in_workspace",
+          "spawn_runner",
+          "build_explore_agent",
+          "completion_model_with_cache_ttl"
+        ],
+        "files": [
+          "src/provider.rs",
+          "src/extras/subagents/builder.rs"
+        ],
+        "validation": [
+          "default and no-default compile actual cfg arms",
+          "existing Responses/Completions child request-shape controls",
+          "installed actual AnyAgent/UI chat and Responses Read tools, two generic-history saves, 30/6 usage",
+          "no JS/sandbox/runtime implementation changes, no additional containment row required"
+        ]
+      },
+      {
+        "symbols": [
+          "handle_login",
+          "main",
+          "Cli",
+          "status",
+          "logout"
+        ],
+        "files": [
+          "src/main.rs",
+          "src/cli.rs",
+          "src/ui/slash/providers.rs"
+        ],
+        "validation": [
+          "Copilot CLI/slash pure routing control",
+          "existing OpenAI CLI/slash routing control",
+          "installed missing app ID returns 1 without auth HTTP",
+          "installed Copilot account selector rejected before auth HTTP",
+          "installed signed-out logout returns 0",
+          "actual TUI /login copilot error resumes terminal, then ordinary model/tool turns complete",
+          "running actor refusal retains existing shared frontend owner"
+        ]
+      }
+    ],
+    "gates": [
+      {
+        "name": "owning default controls",
+        "passed": 18,
+        "source_note": "covered by consolidated affected run before final private-error/typed status refactor; final wire deltas repeated below"
+      },
+      {
+        "name": "consolidated affected callers",
+        "passed": 56,
+        "log": "/private/tmp/mini-agent-copilot81-affected.log",
+        "note": "One scanner failure was a reserved status identifier in a macro; numeric HTTP status read and exact NON-PROCESS row corrected, scanner passes final gate. Unchanged passing tests reused."
+      },
+      {
+        "name": "final no-default owning cfg row",
+        "passed": 18,
+        "log": "/private/tmp/mini-agent-copilot81-no-default.log",
+        "elapsed_seconds": 11.63,
+        "reason": "new enum dispatch arms span default subagents/hooks/multimodal/agent-skills cfg boundaries"
+      },
+      {
+        "name": "final default private HTTP + SDK tool converters + exact source ownership boundaries",
+        "passed": 10,
+        "log": "/private/tmp/mini-agent-copilot81-final-boundaries.log",
+        "elapsed_seconds": 26.39
+      },
+      {
+        "name": "strict all-target lint",
+        "command": "cargo clippy --locked --offline --all-targets -- -D warnings",
+        "passed": true,
+        "log": "/private/tmp/mini-agent-copilot81-clippy.log",
+        "elapsed_seconds": 57.26
+      },
+      {
+        "name": "required debug install",
+        "command": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-copilot81-install",
+        "passed": true,
+        "log": "/private/tmp/mini-agent-copilot81-install.log",
+        "elapsed_seconds": 38.36
+      },
+      {
+        "name": "format and whitespace",
+        "passed": true,
+        "command": "cargo fmt; git diff --check"
+      }
+    ],
+    "installed_proofs": {
+      "chat": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-copilot81-installed-pg6p37xx/report.json",
+      "responses": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-copilot81-installed-hlsybvcj/report.json"
+    },
+    "installed_driver": "/private/tmp/mini-agent-copilot81-installed.py",
+    "installed_invocations": [
+      "python3 /private/tmp/mini-agent-copilot81-installed.py --binary /private/tmp/mini-agent-copilot81-install/bin/mini-agent --style chat",
+      "python3 /private/tmp/mini-agent-copilot81-installed.py --binary /private/tmp/mini-agent-copilot81-install/bin/mini-agent --style responses"
+    ],
+    "installed_binary_sha256": "a7fea6d2c54911d48768160fdaf87f3b92f113108f04a79b57044c44718c4929",
+    "installed_observations": {
+      "stack_bytes": 1048576,
+      "per_style_posts": 3,
+      "per_style_read_tools": 1,
+      "per_style_generic_history_saves": 2,
+      "per_style_usage": [
+        30,
+        6
+      ],
+      "normal_quit": 0,
+      "external_calls": 0,
+      "native_authority": "none; both proofs assert generic history without Anthropic native publication",
+      "sdk_initiator_sequence": [
+        "user",
+        "agent",
+        "agent"
+      ],
+      "cleanup_errors": []
+    },
+    "reviews": [
+      {
+        "reviewer": "adversarial",
+        "depth": "deep",
+        "findings": [],
+        "resolved_findings": [
+          "Account/profile generation is captured before model dispatch; completed old/pending sign-ins cannot adopt a new or logged-out account.",
+          "Refresh rotation is privately persisted as unverified before fallible user/model HTTP; a failed identity request cannot lose the rotated token or authorize it prematurely.",
+          "SDK editor auth/cache is bypassed by one caller-owned AuthContext callback.",
+          "New Copilot private model errors drop untrusted bodies while retaining status/retry metadata."
+        ],
+        "residual_risks": [
+          "No live Copilot entitlement or OAuth app grant was used, as required; model/token endpoints follow the pinned existing SDK contract."
+        ],
+        "testing_gaps": []
+      },
+      {
+        "reviewer": "reliability",
+        "findings": [],
+        "residual_risks": [
+          "Credential filesystem operations retain the existing synchronous private-file helper contract; no separate filesystem wall-clock cancellation claim is made."
+        ],
+        "testing_gaps": []
+      },
+      {
+        "reviewer": "testing",
+        "findings": [],
+        "residual_risks": [],
+        "testing_gaps": [
+          "Successful interactive authorization is exercised against owned local HTTP fixtures; installed CLI/TUI proof intentionally stops before any real account authorization."
+        ]
+      }
+    ],
+    "scope_and_limits": [
+      "Configured independent GitHub OAuth app ID is required for device login; no borrowed editor client ID or persona.",
+      "One saved account per github.com or single-label GHE.com host; arbitrary GHES OAuth hosts unsupported.",
+      "Only IDs containing codex select the existing SDK Responses converter; api_style does not override its classifier.",
+      "Existing SDK history-based initiator semantics are retained; later ordinary turns with prior Assistant history remain agent-initiated.",
+      "Copilot uses generic session history and claims no Anthropic-native or OpenAI encrypted-item publication authority.",
+      "No Cargo manifest/lock or dependency feature graph changes. Existing accepted Vertex/Bedrock/Azure/OpenAI proofs reused where source is unchanged."
+    ],
+    "primary_sources": [
+      "https://docs.github.com/en/copilot/how-tos/copilot-sdk/setup/github-oauth",
+      "https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate",
+      "https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow",
+      "https://docs.github.com/en/copilot/reference/copilot-allowlist-reference",
+      "https://docs.github.com/en/enterprise-cloud%40latest/copilot/how-tos/copilot-in-your-ide/set-up-copilot/authenticate-to-ghecom"
+    ]
+  },
+  "root_checks": {
+    "SDK_HTTP_and_classifier": "12 passed in0.30s after60s warm compile",
+    "subprocess_classification_and_creation_boundary": "2 passed in23.99s from same compiled test binary; no Cargo rebuild",
+    "required_debug_install": "passed27.97s",
+    "fmt": "passed",
+    "installed": {
+      "chat": {
+        "binary": "/private/tmp/mini-agent-copilot81-merged-install/bin/mini-agent",
+        "binary_sha256": "932202b07d5e2ab4ec54b83147e901920ccb52d9e8978b9e60fa9a6c8e2ca85d",
+        "stack_bytes": 1048576,
+        "external_calls": 0,
+        "style": "chat",
+        "cli": [
+          {
+            "args": [
+              "--login",
+              "copilot"
+            ],
+            "exit": 1
+          },
+          {
+            "args": [
+              "--login",
+              "copilot",
+              "--login-account",
+              "new"
+            ],
+            "exit": 1
+          },
+          {
+            "args": [
+              "--logout",
+              "copilot"
+            ],
+            "exit": 0
+          }
+        ],
+        "owned_pid": 91744,
+        "owned_pgid": 91744,
+        "passed": true,
+        "posts": 3,
+        "auth_external_calls": 0,
+        "generic_history_saves": 2,
+        "usage": [
+          30,
+          6
+        ],
+        "normal_quit": 0,
+        "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-copilot81-installed-93j5ntv8/home/sessions/58d80654-be46-4b9c-8262-0a69ec798f9b.json",
+        "errors": [],
+        "cleanup_errors": []
+      },
+      "responses": {
+        "binary": "/private/tmp/mini-agent-copilot81-merged-install/bin/mini-agent",
+        "binary_sha256": "932202b07d5e2ab4ec54b83147e901920ccb52d9e8978b9e60fa9a6c8e2ca85d",
+        "stack_bytes": 1048576,
+        "external_calls": 0,
+        "style": "responses",
+        "cli": [
+          {
+            "args": [
+              "--login",
+              "copilot"
+            ],
+            "exit": 1
+          },
+          {
+            "args": [
+              "--login",
+              "copilot",
+              "--login-account",
+              "new"
+            ],
+            "exit": 1
+          },
+          {
+            "args": [
+              "--logout",
+              "copilot"
+            ],
+            "exit": 0
+          }
+        ],
+        "owned_pid": 91752,
+        "owned_pgid": 91752,
+        "passed": true,
+        "posts": 3,
+        "auth_external_calls": 0,
+        "generic_history_saves": 2,
+        "usage": [
+          30,
+          6
+        ],
+        "normal_quit": 0,
+        "persisted_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-copilot81-installed-gw2x0n7g/home/sessions/f69227ff-2d16-4fa2-a590-5eb9af6cd824.json",
+        "errors": [],
+        "cleanup_errors": []
+      }
+    }
+  },
+  "review_findings": [],
+  "residual_limits": [
+    "No real cloud/account authorization or paid model request was performed.",
+    "Retains SDK history-based Copilot initiator semantics.",
+    "Original parent81 manual cloud smoke requirement remains separate from child explicit local-fixture acceptance."
+  ]
+}

@@ -164,6 +164,7 @@ impl DoctorReport {
                         "AWS SDK credential chain (resolved on request; values omitted)".into()
                     }
                     Ok(CredentialSource::GoogleAdc) => "Google Application Default Credentials (resolved on request; values omitted)".into(),
+                    Ok(CredentialSource::CopilotLogin) => "saved Copilot login (resolved on request; values omitted)".into(),
                     Err(_) => "missing; configure this route's credentials".into(),
                 }
             }

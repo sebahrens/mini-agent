@@ -791,6 +791,37 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     // Provider credential and HTTP status values are application data.
+    // Copilot HTTP/status data and explicitly owned test-only Tokio actors.
+    (
+        "src/auth/copilot.rs",
+        "let response_code = response.status().as_u16();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/slash/providers.rs",
+        "for line in crate::auth::copilot::status()? {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { sign_in_profile(p, dir).await });",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { r.auth_context().await });",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { registration.auth_context().await });",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/ui/slash/providers.rs",
         "for line in crate::auth::oauth::status()? {",
@@ -4601,6 +4632,37 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     // Provider credential and HTTP status values are application data.
+    // Copilot HTTP/status data and explicitly owned test-only Tokio actors.
+    (
+        "src/auth/copilot.rs",
+        "let response_code = response.status().as_u16();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/slash/providers.rs",
+        "for line in crate::auth::copilot::status()? {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { sign_in_profile(p, dir).await });",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { r.auth_context().await });",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/auth/copilot_protocol_tests.rs",
+        "tasks.spawn(async move { registration.auth_context().await });",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/ui/slash/providers.rs",
         "for line in crate::auth::oauth::status()? {",

@@ -292,3 +292,23 @@ supplied bearer wire requests, actual tools/SSE/usage, fixed-route override
 rejection and destination isolation. Native domain tests retain the existing
 saved schema while deriving Vertex's absent body model from its exact path.
 Official contract: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude
+
+
+### Host-owned Copilot authentication
+
+Copilot's `ExternalAuthenticator` is a cloneable caller-owned async callback
+returning the existing `AuthContext`; `Authenticator` dispatches it directly,
+bypassing the SDK's editor client registration, ambient cache, device flow and
+credential HTTP. This retains the existing chat/Responses request converters,
+model classifier, tool loop and usage owners. `CompletionModel::uses_responses`
+exposes the converter selected by the SDK so host instructions match the actual
+wire protocol. The application strips borrowed editor identity headers and
+supplies its own identity and bounded credential acquisition in `src/auth/copilot.rs`.
+No other provider uses this callback and no new detached task is introduced.
+
+Copilot's own chat decoder validates prompt/total/completion/cache counts before
+unsigned subtraction or stream normalization. Malformed SSE usage is an error,
+rather than disappearing from accounting; the blocking converter rejects the
+same inconsistencies. OpenAI's shared decoder and Responses conversion remain
+unchanged. Local actual-SDK controls cover both streaming tool routes, blocking
+and streaming malformed usage, redirects, listing and auth destination isolation.

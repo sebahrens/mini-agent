@@ -683,6 +683,25 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
+        AnyModel::Copilot(m) => AnyAgentInner::Copilot(build_explore_agent_inner(
+            m.clone(),
+            crate::provider::copilot::instruction_protocol(&m),
+            max_turns,
+            max_tokens,
+            max_text_file_size,
+            max_read_lines,
+            max_grep_results,
+            max_find_results,
+            max_list_dir_entries,
+            &authorization,
+            provider_params.clone(),
+            #[cfg(feature = "archmd")]
+            arch_ref,
+            spec_ref,
+            &persona,
+            #[cfg(feature = "skills")]
+            skill_services.as_ref(),
+        )),
     };
     let agent = AnyAgent::with_runtime(
         inner,

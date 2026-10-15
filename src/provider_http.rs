@@ -18,6 +18,7 @@ struct ProviderBackend {
     client: reqwest::Client,
     identity: std::sync::Arc<()>,
     chatgpt: Option<crate::auth::oauth::Registration>,
+    copilot: Option<std::sync::Arc<crate::provider::copilot::CopilotAuth>>,
     vertex: Option<std::sync::Arc<crate::provider::vertex::VertexAuth>>,
     bedrock: Option<std::sync::Arc<crate::provider::bedrock::BedrockAuth>>,
     #[cfg(test)]
@@ -42,6 +43,7 @@ impl ProviderHttpClient {
             client,
             identity: std::sync::Arc::new(()),
             chatgpt: None,
+            copilot: None,
             bedrock: None,
             vertex: None,
             #[cfg(test)]
@@ -56,6 +58,7 @@ impl ProviderHttpClient {
             client,
             identity: std::sync::Arc::new(()),
             chatgpt: Some(registration),
+            copilot: None,
             bedrock: None,
             vertex: None,
             #[cfg(test)]
@@ -72,6 +75,7 @@ impl ProviderHttpClient {
             bedrock: Some(auth),
             vertex: None,
             chatgpt: None,
+            copilot: None,
             #[cfg(test)]
             test_wire: None,
         }))
@@ -86,12 +90,40 @@ impl ProviderHttpClient {
             bedrock: None,
             vertex: Some(auth),
             chatgpt: None,
+            copilot: None,
             #[cfg(test)]
             test_wire: None,
         }))
     }
+    pub(crate) fn with_copilot(
+        client: reqwest::Client,
+        auth: std::sync::Arc<crate::provider::copilot::CopilotAuth>,
+    ) -> Self {
+        Self(std::sync::Arc::new(ProviderBackend {
+            client,
+            identity: std::sync::Arc::new(()),
+            bedrock: None,
+            vertex: None,
+            chatgpt: None,
+            copilot: Some(auth),
+            #[cfg(test)]
+            test_wire: None,
+        }))
+    }
+    pub(crate) fn is_copilot_login(&self) -> bool {
+        self.0.copilot.as_ref().is_some_and(|auth| auth.is_login())
+    }
     pub(crate) fn is_chatgpt(&self) -> bool {
         self.0.chatgpt.is_some()
+    }
+    fn private_error_message(&self) -> Option<&'static str> {
+        if self.is_chatgpt() {
+            Some("ChatGPT request was rejected; check your account access and plan limits")
+        } else if self.0.copilot.is_some() {
+            Some("Copilot request was rejected; check your account access and plan limits")
+        } else {
+            None
+        }
     }
     #[cfg(test)]
     pub(crate) fn chatgpt_test_wire(
@@ -108,6 +140,7 @@ impl ProviderHttpClient {
                 .unwrap(),
             identity: std::sync::Arc::new(()),
             chatgpt: Some(registration),
+            copilot: None,
             bedrock: None,
             vertex: None,
             test_wire: Some(url),
@@ -121,6 +154,9 @@ impl ProviderHttpClient {
             auth.prepare(&mut request).await?;
         }
         if let Some(auth) = &self.0.vertex {
+            auth.prepare(&mut request).await?;
+        }
+        if let Some(auth) = &self.0.copilot {
             auth.prepare(&mut request).await?;
         }
         if let Some(registration) = &self.0.chatgpt {
@@ -223,11 +259,14 @@ pub(crate) struct ProviderRetryAfterError {
     source: http_client::Error,
 }
 
-async fn response_error(response: reqwest::Response, private_auth: bool) -> http_client::Error {
+async fn response_error(
+    response: reqwest::Response,
+    private_auth: Option<&'static str>,
+) -> http_client::Error {
     let status = response.status();
     let retry_after = response.headers().get(http::header::RETRY_AFTER).cloned();
-    let body = if private_auth {
-        "ChatGPT request was rejected; check your account access and plan limits".to_owned()
+    let body = if let Some(message) = private_auth {
+        message.to_owned()
     } else {
         response
             .text()
@@ -284,7 +323,7 @@ impl HttpClientExt for ProviderHttpClient {
                 .await
                 .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
             if !response.status().is_success() {
-                return Err(response_error(response, this.is_chatgpt()).await);
+                return Err(response_error(response, this.private_error_message()).await);
             }
             if this.is_chatgpt() {
                 let mut bytes = Vec::new();
@@ -321,7 +360,8 @@ impl HttpClientExt for ProviderHttpClient {
     where
         U: From<Bytes> + Send + 'static,
     {
-        let requires_signed_body = self.0.bedrock.is_some() || self.0.vertex.is_some();
+        let requires_signed_body =
+            self.0.bedrock.is_some() || self.0.vertex.is_some() || self.0.copilot.is_some();
         let unsupported = self.is_chatgpt();
         let (parts, body) = request.into_parts();
         let request = self
@@ -350,7 +390,7 @@ impl HttpClientExt for ProviderHttpClient {
                 .await
                 .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
             if !response.status().is_success() {
-                return Err(response_error(response, false).await);
+                return Err(response_error(response, None).await);
             }
             lazy_response(response)
         }
@@ -389,7 +429,7 @@ impl HttpClientExt for ProviderHttpClient {
                 if let Some(guard) = &budget_guard {
                     guard.finished();
                 }
-                return Err(response_error(response, client.is_chatgpt()).await);
+                return Err(response_error(response, client.private_error_message()).await);
             }
             if let Some(guard) = budget_guard {
                 guard.opened();

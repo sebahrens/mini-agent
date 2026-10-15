@@ -131,6 +131,14 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  /login openai [new|number]  continue with ChatGPT");
     emit(
         false,
+        "  /login copilot        authorize your GitHub OAuth app (device flow)",
+    );
+    emit(
+        false,
+        "  /logout copilot       clear the saved Copilot login for this host",
+    );
+    emit(
+        false,
         "  /logout openai         sign out of the selected ChatGPT account",
     );
     emit(

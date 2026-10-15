@@ -41,8 +41,35 @@ impl fmt::Debug for DeviceCodeHandler {
     }
 }
 
+/// Host-owned asynchronous credential acquisition. The future is awaited by
+/// the actual completion/listing call; no detached refresh or cache IO is added.
+#[derive(Clone)]
+pub struct ExternalAuthenticator(
+    Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<AuthContext, AuthError>> + Send>,
+            > + Send
+            + Sync,
+    >,
+);
+impl ExternalAuthenticator {
+    pub fn new<F, Fut>(provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<AuthContext, AuthError>> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(provider())))
+    }
+}
+impl fmt::Debug for ExternalAuthenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExternalAuthenticator([REDACTED])")
+    }
+}
+
 #[derive(Clone)]
 pub enum AuthSource {
+    External(ExternalAuthenticator),
     ApiKey(String),
     GitHubAccessToken(String),
     OAuth,
@@ -51,6 +78,7 @@ pub enum AuthSource {
 impl fmt::Debug for AuthSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::External(_) => f.write_str("External([REDACTED])"),
             Self::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
             Self::GitHubAccessToken(_) => f.write_str("GitHubAccessToken(<redacted>)"),
             Self::OAuth => f.write_str("OAuth"),
@@ -104,6 +132,7 @@ impl Authenticator {
 
     pub async fn auth_context(&self) -> Result<AuthContext, AuthError> {
         match &self.source {
+            AuthSource::External(provider) => (provider.0)().await,
             AuthSource::ApiKey(api_key) => Ok(AuthContext {
                 api_key: api_key.clone(),
                 api_base: None,

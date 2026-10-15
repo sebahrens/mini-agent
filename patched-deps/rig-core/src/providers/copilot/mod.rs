@@ -21,6 +21,7 @@
 //! ```
 
 mod auth;
+pub use auth::{AuthContext, AuthError, ExternalAuthenticator};
 
 use crate::client::{
     self, ApiKey, Capabilities, Capable, DebugExt, ModelLister, Nothing, Provider, ProviderBuilder,
@@ -124,6 +125,7 @@ pub use openai::EncodingFormat;
 
 #[derive(Clone)]
 pub enum CopilotAuth {
+    External(ExternalAuthenticator),
     ApiKey(String),
     GitHubAccessToken(String),
     OAuth,
@@ -143,6 +145,7 @@ where
 impl Debug for CopilotAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::External(_) => f.write_str("External([REDACTED])"),
             Self::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
             Self::GitHubAccessToken(_) => f.write_str("GitHubAccessToken(<redacted>)"),
             Self::OAuth => f.write_str("OAuth"),
@@ -223,6 +226,7 @@ impl ProviderBuilder for CopilotBuilder {
         H: HttpClientExt,
     {
         let auth = match builder.get_api_key() {
+            CopilotAuth::External(provider) => auth::AuthSource::External(provider.clone()),
             CopilotAuth::ApiKey(api_key) => auth::AuthSource::ApiKey(api_key.clone()),
             CopilotAuth::GitHubAccessToken(access_token) => {
                 auth::AuthSource::GitHubAccessToken(access_token.clone())
@@ -614,10 +618,33 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>,
 }
 
+fn validate_chat_usage(usage: &openai::completion::Usage) -> Result<(), CompletionError> {
+    if usage
+        .total_tokens
+        .checked_sub(usage.prompt_tokens)
+        .is_none()
+        || usage.completion_tokens.is_some_and(|output| {
+            usage.prompt_tokens.checked_add(output) != Some(usage.total_tokens)
+        })
+        || usage
+            .prompt_tokens_details
+            .as_ref()
+            .is_some_and(|details| details.cached_tokens > usage.prompt_tokens)
+    {
+        return Err(CompletionError::ResponseError(
+            "inconsistent Copilot usage metrics".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse<ChatCompletionResponse> {
     type Error = CompletionError;
 
     fn try_from(response: ChatCompletionResponse) -> Result<Self, Self::Error> {
+        if let Some(usage) = &response.usage {
+            validate_chat_usage(usage)?;
+        }
         let choice = response.choices.first().ok_or_else(|| {
             CompletionError::ResponseError("Response contained no choices".to_owned())
         })?;
@@ -768,6 +795,11 @@ where
     /// Use the edit-oriented `openai-intent` header for completion and streaming requests.
     pub fn with_edits_intent(self) -> Self {
         self.with_intent(CopilotIntent::Edits)
+    }
+
+    /// The actual model's selected converter, also used by host instruction policy.
+    pub fn uses_responses(&self) -> bool {
+        matches!(self.route(), CompletionRoute::Responses)
     }
 
     fn route(&self) -> CompletionRoute {
@@ -1611,11 +1643,21 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
         let data = match serde_json::from_str::<ChatStreamingChunk>(data) {
             Ok(data) => data,
             Err(error) => {
+                if serde_json::from_str::<serde_json::Value>(data)
+                    .is_ok_and(|value| value.get("usage").is_some_and(|usage| !usage.is_null()))
+                {
+                    return Err(CompletionError::ResponseError(
+                        "invalid Copilot usage metrics".into(),
+                    ));
+                }
                 tracing::debug!(?error, "Couldn't parse Copilot chat SSE payload");
                 return Ok(None);
             }
         };
 
+        if let Some(usage) = &data.usage {
+            validate_chat_usage(usage)?;
+        }
         Ok(Some(
             openai_chat_completions_compatible::normalize_first_choice_chunk(
                 data.id,

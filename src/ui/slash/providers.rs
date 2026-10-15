@@ -32,13 +32,58 @@ async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         return Ok(());
     }
     let provider = parts.get(1).copied().unwrap_or("openai");
+    if provider.eq_ignore_ascii_case("copilot") {
+        if parts.len() > 2 {
+            write_error(
+                ctx.renderer,
+                "usage: /login copilot, /logout copilot (one account per GitHub host)",
+            );
+            return Ok(());
+        }
+        let result = if parts[0] == "/login" {
+            ctx.terminal_guard.suspend()?;
+            let result = crate::startup::heap_future(crate::auth::copilot::sign_in).await;
+            ctx.terminal_guard.resume()?;
+            result.map(|()| "Copilot sign-in saved".to_owned())
+        } else {
+            crate::auth::copilot::logout().await
+        };
+        match result {
+            Ok(message) => {
+                write_ok(ctx.renderer, message);
+                if ctx.session.provider.eq_ignore_ascii_case("copilot") {
+                    match ctx.switch_client("copilot") {
+                        Ok(()) => {
+                            ctx.rebuild_agent().await;
+                            if !ctx.client.uses_copilot_login() {
+                                write_result(
+                                    ctx.renderer,
+                                    "Current route uses an explicit token; the saved Copilot login is inactive on this route",
+                                );
+                            }
+                        }
+                        // The retired registration is invalidated by logout;
+                        // it cannot issue another request under the old account.
+                        Err(error) => write_error(ctx.renderer, error),
+                    }
+                } else {
+                    write_result(
+                        ctx.renderer,
+                        "Select /provider copilot and /model MODEL to use the saved login",
+                    );
+                }
+            }
+            Err(error) => write_error(ctx.renderer, error),
+        }
+        return Ok(());
+    }
     if !provider.eq_ignore_ascii_case("openai") {
         write_error(
             ctx.renderer,
             if provider.eq_ignore_ascii_case("anthropic") {
                 crate::auth::oauth::ANTHROPIC_UNAVAILABLE
             } else {
-                "usage: /login openai [new|account-number], /logout openai"
+                "usage: /login openai [new|account-number] | copilot, /logout openai | copilot"
             },
         );
         return Ok(());
@@ -46,7 +91,7 @@ async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
     if parts.len() > if parts[0] == "/login" { 3 } else { 2 } {
         write_error(
             ctx.renderer,
-            "usage: /login openai [new|account-number], /logout openai",
+            "usage: /login openai [new|account-number] | copilot, /logout openai | copilot",
         );
         return Ok(());
     }
@@ -534,6 +579,19 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 ctx.renderer,
                 "Explicit --api-key overrides a saved login; custom endpoints never inherit it",
             );
+        }
+        if ctx.session.provider.eq_ignore_ascii_case("copilot") {
+            write_result(
+                ctx.renderer,
+                if ctx.client.uses_copilot_login() {
+                    "current authentication: Copilot registration"
+                } else {
+                    "current authentication: explicit Copilot/GitHub token"
+                },
+            );
+            for line in crate::auth::copilot::status()? {
+                write_result(ctx.renderer, line);
+            }
         }
         return Ok(());
     }

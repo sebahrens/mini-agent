@@ -302,6 +302,7 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
                 AnyModel::OpenRouter(model, _) => model.completion(request).await.map(|_| ()),
                 AnyModel::Gemini(model) => model.completion(request).await.map(|_| ()),
                 AnyModel::Ollama(model) => model.completion(request).await.map(|_| ()),
+                AnyModel::Copilot(model) => model.completion(request).await.map(|_| ()),
             }
         };
         // Both futures are owned by this join; no detached fixture task or

@@ -2438,6 +2438,9 @@ fn native_replay_protocol_classifier_uses_actual_custom_adapter_and_api_style() 
             AnyModel::Ollama(model) => {
                 AnyAgentInner::Ollama(rig::agent::AgentBuilder::new(model).build())
             }
+            AnyModel::Copilot(model) => {
+                AnyAgentInner::Copilot(rig::agent::AgentBuilder::new(model).build())
+            }
         };
         AnyAgent::without_skills(inner)
     };

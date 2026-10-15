@@ -788,3 +788,12 @@ already admitted image, not a process terminal. Its exact expression is register
 as NON-PROCESS in both inventories. The ACP lifecycle fixture's image-bearing
 ToolResult event vector is registered by its complete macro token digest; adding
 image fields does not exempt any process constructor or terminal.
+
+
+Copilot authorization response statuses and `/provider` credential status text
+are application data, classified `NON-PROCESS` by exact expression in both
+inventories. The Copilot protocol fixtures' eight `JoinSet` actors are likewise
+`NON-PROCESS`: each runs only local async credential HTTP, owns no subprocess,
+and is joined on completion or explicitly aborted and drained for cancellation
+controls. The retained `JoinSet` aborts remaining actors on unwinding. No process
+constructor, macro exemption, shell, or credential executable is introduced.

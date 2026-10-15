@@ -72,6 +72,7 @@ impl AnyClient {
             Self::Gemini(_) => Protocol::Gemini,
             Self::OpenRouter(_) => Protocol::OpenRouter,
             Self::Ollama(_) => Protocol::Ollama,
+            Self::Copilot(_) => Protocol::OpenAI,
         }
     }
     fn listing_request(
@@ -92,6 +93,7 @@ impl AnyClient {
                 Self::Gemini(c) => build!(c),
                 Self::OpenRouter(c) => build!(c),
                 Self::Ollama(c) => build!(c),
+                Self::Copilot(c) => build!(c),
             })
         })();
         result.map_err(|_| anyhow::anyhow!("invalid model listing route"))

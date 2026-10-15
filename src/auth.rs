@@ -1,3 +1,5 @@
+pub(crate) mod copilot;
+
 use std::collections::HashMap;
 use std::env::VarError;
 
@@ -12,6 +14,7 @@ pub enum ProviderKind {
     Azure,
     Bedrock,
     Vertex,
+    Copilot,
     Anthropic,
     Gemini,
     Ollama,
@@ -25,6 +28,7 @@ impl ProviderKind {
             "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
             "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
             "vertex" | "vertex-ai" => Some(Self::Vertex),
+            "copilot" | "github-copilot" => Some(Self::Copilot),
             "anthropic" => Some(Self::Anthropic),
             "gemini" | "google" => Some(Self::Gemini),
             "ollama" => Some(Self::Ollama),
@@ -110,6 +114,7 @@ pub enum ResolvedCredential {
     Bearer(String),
     AwsDefaultChain,
     GoogleAdc,
+    CopilotLogin,
 }
 
 /// The selected credential's origin, containing no credential bytes.
@@ -121,13 +126,14 @@ pub enum CredentialSource {
     NotRequired,
     AwsDefaultChain,
     GoogleAdc,
+    CopilotLogin,
 }
 
 impl ResolvedCredential {
     pub fn secret(&self) -> &str {
         match self {
             Self::ApiKey(value) | Self::Bearer(value) => value,
-            Self::AwsDefaultChain | Self::GoogleAdc => "",
+            Self::AwsDefaultChain | Self::GoogleAdc | Self::CopilotLogin => "",
         }
     }
 }
@@ -139,6 +145,7 @@ impl std::fmt::Debug for ResolvedCredential {
             Self::Bearer(_) => "Bearer([REDACTED])",
             Self::AwsDefaultChain => "AwsDefaultChain",
             Self::GoogleAdc => "GoogleAdc",
+            Self::CopilotLogin => "CopilotLogin",
         })
     }
 }
@@ -287,6 +294,7 @@ impl AuthResolver {
         let bearer_env = match self.provider_kind {
             ProviderKind::Anthropic => Some("ANTHROPIC_AUTH_TOKEN"),
             ProviderKind::Azure => Some("AZURE_OPENAI_AD_TOKEN"),
+            ProviderKind::Copilot => Some("COPILOT_GITHUB_TOKEN"),
             _ => None,
         };
         if custom.is_none()
@@ -358,6 +366,16 @@ impl AuthResolver {
             return Ok((ResolvedCredential::GoogleAdc, CredentialSource::GoogleAdc));
         }
 
+        if self.provider_kind == ProviderKind::Copilot
+            && custom.is_none()
+            && self.api_key_env_override.is_none()
+        {
+            return Ok((
+                ResolvedCredential::CopilotLogin,
+                CredentialSource::CopilotLogin,
+            ));
+        }
+
         // Ollama doesn't require an API key
         if self.provider_kind == ProviderKind::Ollama {
             return Ok((
@@ -419,6 +437,7 @@ impl ProviderKind {
             ProviderKind::Azure => "AZURE_OPENAI_API_KEY",
             ProviderKind::Bedrock => "AWS_BEARER_TOKEN_BEDROCK",
             ProviderKind::Vertex => "VERTEX_ACCESS_TOKEN",
+            ProviderKind::Copilot => "GITHUB_COPILOT_API_TOKEN",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::Ollama => "OLLAMA_API_KEY",
@@ -434,7 +453,10 @@ impl ProviderKind {
             ProviderKind::OpenAI => "https://api.openai.com/v1",
             // Azure has no shared tenant endpoint. Explicit custom routes
             // cannot receive a vendor-key exemption by matching an example.
-            ProviderKind::Azure | ProviderKind::Bedrock | ProviderKind::Vertex => "",
+            ProviderKind::Azure
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::Copilot => "",
             ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
             ProviderKind::Ollama => "http://localhost:11434",
@@ -462,6 +484,7 @@ impl ProviderKind {
             ProviderKind::Azure => "azure",
             ProviderKind::Bedrock => "bedrock",
             ProviderKind::Vertex => "vertex",
+            ProviderKind::Copilot => "copilot",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",

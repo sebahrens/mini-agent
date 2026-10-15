@@ -215,17 +215,33 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     if let Some(provider) = cli.login.as_deref() {
-        startup::heap_future(|| auth::oauth::sign_in(provider, cli.login_account.as_deref()))
-            .await?;
-        println!("ChatGPT sign-in saved. Start mini-agent with --provider openai to use it.");
+        if provider.eq_ignore_ascii_case("copilot") {
+            anyhow::ensure!(
+                cli.login_account.is_none(),
+                "Copilot stores one account per GitHub host; omit --login-account"
+            );
+            startup::heap_future(auth::copilot::sign_in).await?;
+            println!(
+                "Copilot sign-in saved. Start mini-agent with --provider copilot --model MODEL to use it."
+            );
+        } else {
+            startup::heap_future(|| auth::oauth::sign_in(provider, cli.login_account.as_deref()))
+                .await?;
+            println!("ChatGPT sign-in saved. Start mini-agent with --provider openai to use it.");
+        }
         return Ok(());
     }
     if let Some(provider) = cli.logout.as_deref() {
-        anyhow::ensure!(
-            provider.eq_ignore_ascii_case("openai"),
-            "Only OpenAI has a documented provider login in this build"
-        );
-        println!("{}", auth::oauth::logout().await?);
+        let message = if provider.eq_ignore_ascii_case("copilot") {
+            auth::copilot::logout().await?
+        } else {
+            anyhow::ensure!(
+                provider.eq_ignore_ascii_case("openai"),
+                "Supported provider logins: openai, copilot"
+            );
+            auth::oauth::logout().await?
+        };
+        println!("{message}");
         return Ok(());
     }
     if cli.doctor {
