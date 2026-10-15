@@ -304,6 +304,25 @@ struct DailyLog {
     content: String,
 }
 
+/// Inputs of one rendered memory context block; see `Mem::context_inputs`.
+#[derive(Debug, PartialEq, Eq)]
+struct ContextInputs {
+    today: String,
+    exclude_compaction: Option<String>,
+    stamps: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+}
+
+/// Files modified this recently are re-read: a later write within the same
+/// coarse timestamp tick and with the same length would otherwise be missed.
+const CONTEXT_INPUT_RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(test)]
+thread_local! {
+    /// Uncached context-block renders on this thread, for cache tests.
+    pub(crate) static CONTEXT_BLOCK_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// One block of the injected context: a rendered heading and its body.
 struct Section {
     title: String,
@@ -852,6 +871,88 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     /// `…[section omitted: <title>]`) rather than displacing a higher-priority
     /// section that already fit. A final whole-string `truncate_cjk` pass is
     /// kept as a hard backstop against unexpected overrun.
+    /// Metadata of every input [`Self::context_block_excluding`] reads:
+    /// MEMORY.md, the scratchpad, the daily-log directory and each daily log
+    /// it may select, plus the date and excluded compaction that shape the
+    /// block. `None` when an input changed too recently for its timestamp to
+    /// prove a later change (coarse-mtime filesystems), so it is re-read.
+    fn context_inputs(&self, exclude_compaction: Option<&str>) -> Option<ContextInputs> {
+        fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+            let metadata = fs::metadata(path).ok()?;
+            Some((metadata.modified().ok()?, metadata.len()))
+        }
+        let daily = self.daily_dir();
+        let mut paths = vec![self.memory_md(), self.scratchpad(), daily.clone()];
+        if let Ok(entries) = fs::read_dir(&daily) {
+            let mut logs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().and_then(|e| e.to_str()) == Some("md")
+                        && path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(Self::is_daily_log_stem)
+                })
+                .collect();
+            logs.sort();
+            paths.extend(logs);
+        }
+        let racy = std::time::SystemTime::now() - CONTEXT_INPUT_RACY_WINDOW;
+        let mut stamps = Vec::with_capacity(paths.len());
+        for path in paths {
+            let stamp = stamp(&path);
+            if stamp.is_some_and(|(modified, _)| modified > racy) {
+                return None;
+            }
+            stamps.push((path, stamp));
+        }
+        Some(ContextInputs {
+            today: self.today.clone(),
+            exclude_compaction: exclude_compaction.map(str::to_owned),
+            stamps,
+        })
+    }
+
+    /// [`Self::context_block_excluding`] that reuses the previously rendered
+    /// block when none of its inputs changed (by path, mtime and length), so
+    /// a submit does not re-read and re-render unchanged memory files.
+    pub fn context_block_excluding_cached(
+        &self,
+        exclude_compaction: Option<&str>,
+    ) -> Option<String> {
+        /// Last block per store (root and project); a process has one in
+        /// production, the bound only matters for tests with many stores.
+        type Cached = Vec<(PathBuf, ContextInputs, Option<String>)>;
+        static LAST: std::sync::Mutex<Cached> = std::sync::Mutex::new(Vec::new());
+        const MAX_STORES: usize = 8;
+        let store = self.project_dir();
+        let inputs = self.context_inputs(exclude_compaction);
+        if let Some(inputs) = &inputs
+            && let Some((_, _, block)) = LAST
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .find(|(cached, cached_inputs, _)| *cached == store && cached_inputs == inputs)
+        {
+            return block.clone();
+        }
+        #[cfg(test)]
+        CONTEXT_BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+        let block = self.context_block_excluding(exclude_compaction);
+        // Inputs are stamped before the read: a change racing the read only
+        // makes the next stamp differ, which reads again.
+        let mut cached = LAST.lock().unwrap_or_else(|error| error.into_inner());
+        cached.retain(|(cached_store, _, _)| *cached_store != store);
+        if let Some(inputs) = inputs {
+            if cached.len() >= MAX_STORES {
+                cached.remove(0);
+            }
+            cached.push((store, inputs, block.clone()));
+        }
+        block
+    }
+
     pub fn context_block(&self) -> Option<String> {
         self.context_block_excluding(None)
     }

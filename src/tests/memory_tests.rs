@@ -1997,3 +1997,42 @@ async fn memory62_actual_tool_mode_dispatch_dedups_note_facts() {
         "Fact\u{3000}A\n"
     );
 }
+
+#[test]
+fn cached_context_block_skips_unchanged_inputs_and_sees_every_change() {
+    use crate::extras::memory::CONTEXT_BLOCK_READS;
+    fn age(path: &std::path::Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(path).unwrap().set_modified(past).unwrap();
+    }
+    let reads = || CONTEXT_BLOCK_READS.with(std::cell::Cell::get);
+    let m = fresh("cached-context");
+    fs::write(memory_md(&m), "- remember alpha\n").unwrap();
+    fs::write(daily(&m, "2026-05-24"), "- log entry\n").unwrap();
+    age(&memory_md(&m));
+    age(&daily(&m, "2026-05-24"));
+    age(&pdir(&m).join("daily"));
+
+    let first = m.context_block_excluding_cached(None);
+    assert_eq!(first, m.context_block_excluding(None));
+    let before = reads();
+    assert_eq!(m.context_block_excluding_cached(None), first);
+    assert_eq!(reads(), before, "unchanged inputs are not read again");
+    // A different excluded compaction is a different block.
+    m.context_block_excluding_cached(Some("other"));
+    assert_eq!(reads(), before + 1);
+    m.context_block_excluding_cached(None);
+
+    // A changed file (even one freshly written) is always read.
+    fs::write(memory_md(&m), "- remember beta\n").unwrap();
+    let changed = m.context_block_excluding_cached(None).unwrap();
+    assert!(changed.contains("beta"), "{changed}");
+    // A changed daily log, aged so only its stamp differs, is read too.
+    age(&memory_md(&m));
+    m.context_block_excluding_cached(None);
+    fs::write(daily(&m, "2026-05-24"), "- log entry two\n").unwrap();
+    age(&daily(&m, "2026-05-24"));
+    let relogged = m.context_block_excluding_cached(None).unwrap();
+    assert!(relogged.contains("log entry two"), "{relogged}");
+    cleanup(&m);
+}

@@ -270,7 +270,9 @@ impl ContextFiles {
     }
 
     /// Refresh persistent-memory prompt context without destabilizing the
-    /// provider cache when its rendered content is byte-identical.
+    /// provider cache when its rendered content is byte-identical. Unchanged
+    /// memory files (same paths, mtimes and lengths) are not re-read: the
+    /// previously rendered block is reused, so a submit only stats them.
     ///
     /// `exclude_compaction` is the session's
     /// [`crate::session::Session::active_compaction_ref`]: that summary is
@@ -283,7 +285,7 @@ impl ContextFiles {
     ) -> bool {
         match tokio::task::spawn_blocking(move || {
             crate::extras::memory::Mem::open()
-                .context_block_excluding(exclude_compaction.as_deref())
+                .context_block_excluding_cached(exclude_compaction.as_deref())
         })
         .await
         {
