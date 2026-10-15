@@ -1509,3 +1509,101 @@ fn finalizing_a_block_with_a_reference_definition_reparses_it_whole() {
     fresh.push_block(BlockStyle::Agent, text);
     assert_same_rows_and_spans(&finalized, &fresh.lines(80));
 }
+
+// --- cttyn.12: a feed mutation re-lays out only the blocks it changed ---
+
+#[test]
+fn appending_a_token_relays_out_only_the_running_block() {
+    let mut feed = Feed::new();
+    for index in 0..3000 {
+        feed.push_block(BlockStyle::Agent, format!("completed **answer** {index}"));
+    }
+    feed.push_streaming_block(BlockStyle::Agent);
+    let idx = feed.block_count() - 1;
+    let _ = feed.lines(80);
+    for token in ["streaming", " tokens", " arrive\n", "and more"] {
+        let visited = feed.blocks_laid_out();
+        assert!(feed.append_to(idx, token));
+        let lines = feed.lines(80);
+        assert_eq!(feed.blocks_laid_out() - visited, 1, "only the live block");
+        assert_same_rows(&lines, &feed.full_layout_for_test(80));
+    }
+    // A reader still holding the previous rows keeps them intact.
+    let held = feed.lines(80);
+    let held_len = held.len();
+    assert!(feed.append_to(idx, " tail"));
+    let next = feed.lines(80);
+    assert_eq!(held.len(), held_len);
+    assert_same_rows(&next, &feed.full_layout_for_test(80));
+}
+
+#[test]
+fn incremental_layout_matches_a_full_layout_after_every_mutation() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    let mut seed = 0x2545_f491_u32;
+    let mut next = move |bound: u32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed % bound) as usize
+    };
+    let mut streaming: Option<usize> = None;
+    for step in 0..600 {
+        match next(11) {
+            0 | 1 => feed.push_block(BlockStyle::Plain, format!("plain {step} with words")),
+            2 => feed.push_anchored_block(&format!("a{}", step % 7), BlockStyle::Tool, "call"),
+            3 => {
+                feed.place_after_anchor(
+                    &format!("a{}", next(7)),
+                    BlockStyle::ToolResult,
+                    format!("result {step}"),
+                );
+            }
+            4 => {
+                if streaming.is_none() {
+                    feed.push_streaming_block(BlockStyle::Agent);
+                    streaming = Some(feed.block_count() - 1);
+                }
+            }
+            5 | 6 => {
+                if let Some(idx) = streaming {
+                    feed.append_to(idx, if next(2) == 0 { "tok " } else { "line\n\n" });
+                }
+            }
+            7 => {
+                if let Some(idx) = streaming.take() {
+                    feed.finalize_block(idx);
+                }
+            }
+            8 => feed.append_reasoning("thinking\n"),
+            9 => {
+                feed.finish_reasoning();
+                if next(4) == 0 {
+                    feed.set_reasoning_display(ReasoningDisplay::Full);
+                }
+            }
+            _ => {
+                let rows = feed.lines(80).len();
+                if rows > 0 {
+                    feed.toggle_reasoning_at_row(80, next(rows as u32));
+                }
+            }
+        }
+        let width = if step % 50 == 49 { 40 } else { 80 };
+        assert_same_rows(&feed.lines(width), &feed.full_layout_for_test(width));
+    }
+}
+
+#[test]
+fn retention_pruning_keeps_the_incremental_layout_exact() {
+    let mut feed = Feed::new();
+    let (max_blocks, _, _) = Feed::retention_limits_for_test();
+    for index in 0..max_blocks + 20 {
+        feed.push_block(BlockStyle::Plain, format!("row {index}"));
+        if index + 30 >= max_blocks {
+            assert_same_rows(&feed.lines(80), &feed.full_layout_for_test(80));
+        }
+    }
+    assert_eq!(feed.lines(80)[0].text, "[20 earlier feed blocks omitted]");
+}

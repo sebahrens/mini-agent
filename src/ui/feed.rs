@@ -344,6 +344,32 @@ impl FeedLines {
         self.len
     }
 
+    fn push(&mut self, segment: Arc<Vec<LineEntry>>) {
+        self.starts.push(self.len);
+        self.len = self.len.saturating_add(segment.len());
+        self.segments.push(segment);
+    }
+
+    /// Keep the first `segments` segments.
+    fn truncate(&mut self, segments: usize) {
+        if segments >= self.segments.len() {
+            return;
+        }
+        self.len = self.starts[segments];
+        self.segments.truncate(segments);
+        self.starts.truncate(segments);
+    }
+
+    /// A copy of the first `segments` segments, sharing their rows.
+    fn prefix(&self, segments: usize) -> Self {
+        let segments = segments.min(self.segments.len());
+        Self {
+            segments: self.segments[..segments].to_vec(),
+            starts: self.starts[..segments].to_vec(),
+            len: self.starts.get(segments).copied().unwrap_or(self.len),
+        }
+    }
+
     pub fn get(&self, index: usize) -> Option<&LineEntry> {
         if index >= self.len {
             return None;
@@ -392,6 +418,9 @@ pub struct Feed {
     /// feed each time; invalidated by any content mutation (generation bump)
     /// or a width change.
     layout_cache: RefCell<Option<LayoutCache>>,
+    /// Lowest block index mutated since `layout_cache` was built
+    /// (`usize::MAX` when none). Rows of the blocks before it are reused.
+    layout_dirty_from: Cell<usize>,
     /// Number of full layout passes; test-only proof that queries reuse the
     /// pre-wrapped rows.
     #[cfg(test)]
@@ -408,6 +437,10 @@ pub struct Feed {
     /// proof that streaming reasoning re-wraps only new text).
     #[cfg(test)]
     wrap_bytes: std::cell::Cell<usize>,
+    /// Blocks visited while rebuilding the feed layout (test-only proof that
+    /// a token appended to the last block reuses every earlier block's rows).
+    #[cfg(test)]
+    blocks_laid_out: std::cell::Cell<usize>,
 }
 
 /// Memoized layout of the whole feed at a viewport width and generation.
@@ -416,6 +449,14 @@ struct LayoutCache {
     width: usize,
     generation: u64,
     lines: Arc<FeedLines>,
+    /// Segments contributed by the omitted-blocks notice.
+    notice_segments: usize,
+    /// Segments contributed by each block, in order.
+    block_segments: Vec<usize>,
+}
+
+fn mark_dirty(dirty_from: &Cell<usize>, index: usize) {
+    dirty_from.set(dirty_from.get().min(index));
 }
 
 impl Feed {
@@ -430,6 +471,7 @@ impl Feed {
             generation: 0,
             reasoning_display: ReasoningDisplay::Collapsed,
             layout_cache: RefCell::new(None),
+            layout_dirty_from: Cell::new(usize::MAX),
             #[cfg(test)]
             layout_computes: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -438,7 +480,17 @@ impl Feed {
             block_renders: std::cell::Cell::new(0),
             #[cfg(test)]
             wrap_bytes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            blocks_laid_out: std::cell::Cell::new(0),
         }
+    }
+
+    /// Record a content mutation of the block at `index` (and possibly every
+    /// block after it): bump the generation and mark the layout dirty from
+    /// there.
+    fn touch(&mut self, index: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        mark_dirty(&self.layout_dirty_from, index);
     }
 
     pub(crate) fn set_palette(&mut self, palette: ForegroundPalette) {
@@ -446,7 +498,7 @@ impl Feed {
             return;
         }
         self.palette = palette;
-        self.generation = self.generation.wrapping_add(1);
+        self.touch(0);
         *self.layout_cache.borrow_mut() = None;
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
@@ -461,7 +513,7 @@ impl Feed {
             return;
         }
         self.monochrome = monochrome;
-        self.generation = self.generation.wrapping_add(1);
+        self.touch(0);
         *self.layout_cache.borrow_mut() = None;
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
@@ -485,7 +537,7 @@ impl Feed {
             return;
         }
         self.reasoning_display = display;
-        self.generation = self.generation.wrapping_add(1);
+        self.touch(0);
         for block in &mut self.blocks {
             if let Some(reasoning) = block.reasoning.as_mut() {
                 reasoning.expanded = None;
@@ -532,14 +584,14 @@ impl Feed {
             .unwrap_or(self.reasoning_display == ReasoningDisplay::Full);
         reasoning.expanded = Some(!expanded);
         *block.render_cache.borrow_mut() = None;
-        self.generation = self.generation.wrapping_add(1);
+        self.touch(index);
         true
     }
 
     /// Update live headers at most once per elapsed second. Completed durations
     /// are frozen, and unchanged blocks retain their layout allocations.
     pub(crate) fn tick_reasoning_at(&mut self, now: Instant) {
-        for block in &mut self.blocks {
+        for (index, block) in self.blocks.iter_mut().enumerate() {
             if !block.running {
                 continue;
             }
@@ -554,6 +606,7 @@ impl Feed {
                 reasoning.elapsed_secs = Some(elapsed);
                 *block.render_cache.borrow_mut() = None;
                 self.generation = self.generation.wrapping_add(1);
+                mark_dirty(&self.layout_dirty_from, index);
             }
         }
     }
@@ -596,7 +649,7 @@ impl Feed {
     }
 
     pub fn clear(&mut self) {
-        self.generation += 1;
+        self.touch(0);
         self.blocks.clear();
         self.total_bytes = 0;
         self.pruned_blocks = 0;
@@ -617,7 +670,7 @@ impl Feed {
     }
 
     pub fn push_block(&mut self, style: BlockStyle, text: impl Into<String>) {
-        self.generation += 1;
+        self.touch(self.blocks.len());
         let block = Block::new(style, text);
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.push_back(block);
@@ -634,7 +687,7 @@ impl Feed {
     ) {
         let mut block = Block::new(style, text);
         block.anchor = (!anchor.is_empty()).then(|| CompactString::from(anchor));
-        self.generation += 1;
+        self.touch(self.blocks.len());
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.push_back(block);
         self.prune_completed_prefix();
@@ -658,7 +711,7 @@ impl Feed {
         };
         let mut block = Block::new(style, text);
         block.attached_to = Some(CompactString::from(anchor));
-        self.generation += 1;
+        self.touch(position);
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.insert(position, block);
         self.prune_completed_prefix();
@@ -706,7 +759,7 @@ impl Feed {
     /// stream ends.
     pub fn push_streaming_block(&mut self, style: BlockStyle) {
         self.prune_completed_prefix();
-        self.generation += 1;
+        self.touch(self.blocks.len());
         let mut block = Block::new(style, "");
         block.running = true;
         if let Some(reasoning) = block.reasoning.as_mut() {
@@ -734,7 +787,8 @@ impl Feed {
         if let Some(block) = self.blocks.get_mut(idx)
             && block.running
         {
-            self.generation += 1;
+            self.generation = self.generation.wrapping_add(1);
+            mark_dirty(&self.layout_dirty_from, idx);
             block.running = false;
             if let Some(reasoning) = block.reasoning.as_mut()
                 && let Some(started) = reasoning.started.take()
@@ -801,7 +855,8 @@ impl Feed {
     /// Append terminal-safe `text`; `chars` counts it for a reasoning header.
     fn append_clean(&mut self, idx: usize, text: &str, chars: impl FnOnce() -> usize) -> bool {
         if let Some(block) = self.blocks.get_mut(idx) {
-            self.generation += 1;
+            self.generation = self.generation.wrapping_add(1);
+            mark_dirty(&self.layout_dirty_from, idx);
             let old_len = block.text.len();
             if let Some(reasoning) = block.reasoning.as_mut() {
                 reasoning.chars = reasoning.chars.saturating_add(chars());
@@ -832,7 +887,7 @@ impl Feed {
     /// Replace the last block, or push a new one if the feed is empty.
     #[cfg(test)]
     pub fn replace_last(&mut self, style: BlockStyle, text: impl Into<String>) {
-        self.generation += 1;
+        self.touch(self.blocks.len().saturating_sub(1));
         if let Some(last) = self.blocks.back_mut() {
             self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
             last.style = style;
@@ -862,7 +917,7 @@ impl Feed {
 
     #[cfg(test)]
     pub fn truncate_blocks(&mut self, len: usize) {
-        self.generation += 1;
+        self.touch(len);
         self.total_bytes = self
             .blocks
             .iter()
@@ -895,14 +950,13 @@ impl Feed {
                 return c.lines.clone();
             }
         }
-        let lines = Arc::new(self.compute_lines(width));
+        let dirty_from = self.layout_dirty_from.replace(usize::MAX);
+        let previous = self.layout_cache.borrow_mut().take();
+        let cache = self.compute_lines(width, previous, dirty_from);
         #[cfg(test)]
         self.layout_computes.set(self.layout_computes.get() + 1);
-        *self.layout_cache.borrow_mut() = Some(LayoutCache {
-            width,
-            generation: self.generation,
-            lines: Arc::clone(&lines),
-        });
+        let lines = Arc::clone(&cache.lines);
+        *self.layout_cache.borrow_mut() = Some(cache);
         lines
     }
 
@@ -928,23 +982,80 @@ impl Feed {
         self.wrap_bytes.get()
     }
 
-    /// Lay out every block at `width`. Called by `lines` on a cache miss.
-    fn compute_lines(&self, width: usize) -> FeedLines {
-        let mut segments = Vec::new();
-        if self.pruned_blocks > 0 {
-            segments.push(Arc::new(plain_block_lines(
-                &Block::new(
-                    BlockStyle::System,
-                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
-                ),
-                width,
-                self.palette,
-            )));
+    /// Lay out the feed at `width`. Called by `lines` on a cache miss.
+    ///
+    /// When `previous` was laid out at the same width and only blocks from
+    /// `dirty_from` on changed since, its rows for the earlier blocks are kept
+    /// (in place when no reader still holds them) and only the changed tail is
+    /// laid out again.
+    fn compute_lines(
+        &self,
+        width: usize,
+        previous: Option<LayoutCache>,
+        dirty_from: usize,
+    ) -> LayoutCache {
+        let reusable = previous
+            .filter(|cache| cache.width == width && dirty_from != usize::MAX && dirty_from > 0);
+        let (mut lines, notice_segments, mut block_segments) = match reusable {
+            Some(cache) => {
+                let keep_blocks = dirty_from
+                    .min(cache.block_segments.len())
+                    .min(self.blocks.len());
+                let keep = cache.notice_segments
+                    + cache.block_segments[..keep_blocks].iter().sum::<usize>();
+                let mut lines = match Arc::try_unwrap(cache.lines) {
+                    Ok(lines) => lines,
+                    Err(shared) => shared.prefix(keep),
+                };
+                lines.truncate(keep);
+                let mut block_segments = cache.block_segments;
+                block_segments.truncate(keep_blocks);
+                (lines, cache.notice_segments, block_segments)
+            }
+            None => {
+                let mut lines = FeedLines::default();
+                if self.pruned_blocks > 0 {
+                    lines.push(Arc::new(plain_block_lines(
+                        &Block::new(
+                            BlockStyle::System,
+                            format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
+                        ),
+                        width,
+                        self.palette,
+                    )));
+                }
+                let notice = lines.segments.len();
+                (lines, notice, Vec::with_capacity(self.blocks.len()))
+            }
+        };
+        for block in self.blocks.iter().skip(block_segments.len()) {
+            #[cfg(test)]
+            self.blocks_laid_out.set(self.blocks_laid_out.get() + 1);
+            let before = lines.segments.len();
+            push_block_segments(self, block, width, &mut lines);
+            block_segments.push(lines.segments.len() - before);
         }
-        for block in &self.blocks {
-            segments.extend(block_segments(self, block, width));
+        LayoutCache {
+            width,
+            generation: self.generation,
+            lines: Arc::new(lines),
+            notice_segments,
+            block_segments,
         }
-        FeedLines::new(segments)
+    }
+
+    /// Blocks visited by layout rebuilds so far (test-only).
+    #[cfg(test)]
+    pub(crate) fn blocks_laid_out(&self) -> usize {
+        self.blocks_laid_out.get()
+    }
+
+    /// A from-scratch layout through the per-block caches (test-only
+    /// reference for the incremental rebuild).
+    #[cfg(test)]
+    pub(crate) fn full_layout_for_test(&self, width: usize) -> FeedLines {
+        let cache = self.compute_lines(width, None, 0);
+        Arc::try_unwrap(cache.lines).expect("fresh layout is unshared")
     }
 
     /// Total number of visible rows for the given width.
@@ -1079,7 +1190,8 @@ impl Feed {
             }
         }
         if removed {
-            self.generation = self.generation.wrapping_add(1);
+            // The omitted-blocks notice and every later index change.
+            self.touch(0);
             self.retention_generation = self.retention_generation.wrapping_add(1);
         }
     }
@@ -1131,6 +1243,25 @@ fn compact_oversized_block(text: &mut String) -> bool {
     text.push_str(OMITTED_PREFIX);
     text.push_str(&suffix);
     true
+}
+
+/// Append the block's row segments to `lines`, sharing its cached rows.
+fn push_block_segments(feed: &Feed, block: &Block, width: usize, lines: &mut FeedLines) {
+    {
+        let cache = block.render_cache.borrow();
+        if let Some(cache) = cache.as_ref()
+            && cache.width == width
+            && cache.revision == block.revision
+        {
+            for segment in &cache.segments {
+                lines.push(Arc::clone(segment));
+            }
+            return;
+        }
+    }
+    for segment in block_segments(feed, block, width) {
+        lines.push(segment);
+    }
 }
 
 fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
