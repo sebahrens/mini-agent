@@ -20,7 +20,32 @@ use super::utils::{char_display_width, display_width, resolve_color};
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://[^\x00-\x1f\x7f\s<>]+").expect("compile URL regex"));
 
+#[cfg(test)]
+thread_local! {
+    /// URL regex scans on this thread, so paint tests can assert that rows
+    /// without URLs never reach the regex.
+    static URL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one URL regex scan (test builds only).
+fn note_url_scan() {
+    #[cfg(test)]
+    URL_SCANS.with(|scans| scans.set(scans.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn url_scans_for_test() -> usize {
+    URL_SCANS.with(std::cell::Cell::get)
+}
+
+/// Whether `text` might contain a URL for [`URL_RE`]: every match starts
+/// with `http`, so text without it is painted without a regex scan.
+fn may_contain_url(text: &str) -> bool {
+    text.contains("http")
+}
+
 fn wrap_urls_osc8(text: &str) -> String {
+    note_url_scan();
     let mut result = String::with_capacity(text.len() + 64);
     let mut last = 0;
     for m in URL_RE.find_iter(text) {
@@ -48,14 +73,24 @@ pub(crate) fn paint_row_text(
 ) -> io::Result<()> {
     match selected {
         Some((start, end)) => {
-            write!(out, "{}", paint_text(&chunk[..start]))?;
+            write_painted_text(out, &chunk[..start])?;
             write!(out, "{}", SetAttribute(Attribute::Reverse))?;
-            write!(out, "{}", paint_text(&chunk[start..end]))?;
+            write_painted_text(out, &chunk[start..end])?;
             write!(out, "{}", SetAttribute(Attribute::NoReverse))?;
-            write!(out, "{}", paint_text(&chunk[end..]))
+            write_painted_text(out, &chunk[end..])
         }
-        None => write!(out, "{}", paint_text(chunk)),
+        None => write_painted_text(out, chunk),
     }
+}
+
+/// Write `text` exactly as [`paint_text`] would paint it. Plain text
+/// (nothing to sanitize, no URL) is written straight from the row, with no
+/// allocation and no regex scan.
+fn write_painted_text(out: &mut impl Write, text: &str) -> io::Result<()> {
+    if !may_contain_url(text) && !text.chars().any(super::events::needs_terminal_sanitizing) {
+        return out.write_all(text.as_bytes());
+    }
+    out.write_all(paint_text(text).as_bytes())
 }
 
 /// Paint validated typed foreground spans without putting escape bytes in
@@ -95,7 +130,13 @@ pub(crate) fn paint_styled_row(
     };
     // A syntax boundary must not cut a pre-existing OSC8 URL into unrelated fragments.
     // Treat complete inert URL text as one foreground run; selection still overlays it.
-    let mut urls = URL_RE.find_iter(&entry.text).peekable();
+    let url_text: &str = if may_contain_url(&entry.text) {
+        note_url_scan();
+        &entry.text
+    } else {
+        ""
+    };
+    let mut urls = URL_RE.find_iter(url_text).peekable();
     let mut offset = 0;
     let mut span_index = 0;
     while offset < entry.text.len() {
@@ -4022,5 +4063,88 @@ mod frame_buffer_tests {
         assert_eq!(retry.bottom_full_paints, 1, "bottom repainted in full");
         assert_eq!(retry.viewport_paints, 1);
         assert!(renderer.captured_output().contains("lost"));
+    }
+}
+
+#[cfg(test)]
+mod paint_fast_path_tests {
+    use super::*;
+
+    /// The pre-fast-path painter: every chunk through `paint_text`.
+    fn reference_row(chunk: &str, selected: Option<(usize, usize)>) -> Vec<u8> {
+        let mut out = Vec::new();
+        match selected {
+            Some((start, end)) => {
+                write!(out, "{}", paint_text(&chunk[..start])).unwrap();
+                write!(out, "{}", SetAttribute(Attribute::Reverse)).unwrap();
+                write!(out, "{}", paint_text(&chunk[start..end])).unwrap();
+                write!(out, "{}", SetAttribute(Attribute::NoReverse)).unwrap();
+                write!(out, "{}", paint_text(&chunk[end..])).unwrap();
+            }
+            None => write!(out, "{}", paint_text(chunk)).unwrap(),
+        }
+        out
+    }
+
+    #[test]
+    fn plain_and_url_rows_paint_identical_bytes() {
+        let rows = [
+            "plain row",
+            "",
+            "unicode 雪 ✓ row",
+            "see https://example.com/a?b=c for details",
+            "two http://a.example and https://b.example/x",
+            "http without a scheme separator",
+            "control \x1b[31mred\x07 bell",
+            "ht\x07tp://formed.example after sanitizing",
+            "bidi \u{202e}reversed",
+        ];
+        for row in rows {
+            let len = row.len();
+            let mut selections = vec![None, Some((0, len))];
+            if let Some((mid, _)) = row.char_indices().nth(row.chars().count() / 2) {
+                selections.push(Some((0, mid)));
+                selections.push(Some((mid, len)));
+            }
+            for selected in selections {
+                let mut fast = Vec::new();
+                paint_row_text(&mut fast, row, selected).unwrap();
+                assert_eq!(
+                    fast,
+                    reference_row(row, selected),
+                    "row {row:?} {selected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn painting_plain_rows_never_scans_for_urls() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..1000 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Plain, format!("plain row {line} with words"));
+        }
+        let before = url_scans_for_test();
+        renderer.render_viewport().unwrap();
+        for _ in 0..20 {
+            renderer.scroll_line_up();
+            renderer.render_viewport().unwrap();
+        }
+        assert_eq!(url_scans_for_test() - before, 0);
+        renderer
+            .feed_mut()
+            .push_block(BlockStyle::Plain, "now https://example.com/linked");
+        renderer.render_viewport().unwrap();
+        renderer.scroll_to_bottom().unwrap();
+        renderer.invalidate();
+        renderer.render_viewport().unwrap();
+        assert!(url_scans_for_test() > before);
+        assert!(
+            renderer
+                .captured_output()
+                .contains("\x1b]8;;https://example.com/linked\x1b\\")
+        );
     }
 }
