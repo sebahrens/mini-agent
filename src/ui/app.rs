@@ -57,6 +57,50 @@ use super::{
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
+/// Echo a submitted prompt as `> line` rows plus a blank separator, painted
+/// as one frame instead of one chat repaint per line. The frame closes before
+/// the caller awaits anything, so the echo is on screen while the turn starts.
+fn echo_submission(renderer: &mut Renderer, text: &str) -> io::Result<()> {
+    renderer.frame(|renderer| {
+        for line in text.lines() {
+            renderer.write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
+        }
+        renderer.write_line("", Color::White)
+    })
+}
+
+#[cfg(test)]
+mod echo_frame_tests {
+    use super::*;
+
+    /// cttyn.6: an N-line submission echo is one chat paint, and it is on
+    /// screen when the call returns (before the caller awaits the turn).
+    #[test]
+    fn an_n_line_echo_paints_the_chat_once_and_immediately() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        renderer.render_viewport().unwrap();
+        let text = (0..50)
+            .map(|line| format!("prompt line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = renderer.frame_stats();
+        echo_submission(&mut renderer, &text).unwrap();
+        let paint = renderer.frame_stats().since(before);
+        assert_eq!(paint.viewport_paints, 1, "{paint:?}");
+        assert_eq!(paint.flushes, 1, "{paint:?}");
+        assert!(!renderer.chat_needs_redraw());
+        assert!(renderer.captured_output().contains("> prompt line 49"));
+        assert_eq!(renderer.feed().block_count(), 51);
+    }
+}
+
+/// Feed blocks laid out per idle step after a tail-first chat paint: small
+/// enough that a step (markdown + highlighting in a debug build) stays a few
+/// milliseconds, so keys and stream events are never held behind it.
+const FEED_LAYOUT_STEP_BLOCKS: usize = 16;
+/// Pause between idle layout steps; other ready events win the select.
+const FEED_LAYOUT_STEP_DELAY: Duration = Duration::from_millis(1);
+
 /// Pricing belongs to the side request, including when the main model changes
 /// before its completion. IDs are never reused and settlement consumes once.
 #[derive(Default)]
@@ -1896,11 +1940,7 @@ impl<'a> App<'a> {
             ui.join_native_startup().await?;
         }
         if let Some(ref trigger_msg) = auto_trigger_msg {
-            for line in trigger_msg.lines() {
-                let safe_line = sanitize_output(line);
-                renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
-            }
-            renderer.write_line("", Color::White)?;
+            echo_submission(&mut renderer, trigger_msg)?;
 
             if matches!(&ui.client, crate::provider::AnyClient::Anthropic(_))
                 || ui.session.native_history_snapshot().is_some()
@@ -2334,10 +2374,13 @@ impl<'a> App<'a> {
             // awaited prebuild and deferred events that immediately continue.
             #[cfg(feature = "mcp")]
             if let Some(manager) = self.ui.mcp_manager.as_mut() {
-                for notice in manager.take_notices() {
-                    self.renderer
-                        .write_line(&sanitize_output(&notice), C_ERROR)?;
-                }
+                let notices = manager.take_notices();
+                self.renderer.frame(|renderer| {
+                    for notice in &notices {
+                        renderer.write_line(&sanitize_output(notice), C_ERROR)?;
+                    }
+                    Ok(())
+                })?;
             }
             if (self.permission_prompt.is_none() && self.question_prompt.is_none())
                 && let Some(event) = self.deferred_user_events.pop_front()
@@ -2374,10 +2417,15 @@ impl<'a> App<'a> {
                     std::future::pending::<()>().await;
                 } => { self.refresh()?; }
                 Some(message) = async { self.tui_log_rx.as_mut()?.recv().await } => {
-                    for line in message.lines() {
-                        self.renderer.write_line(&sanitize_output(line), C_ERROR)?;
-                    }
-                    self.drain_tui_diagnostics()?;
+                    // The record and the burst drained after it: one paint.
+                    self.renderer.begin_frame();
+                    let written = message
+                        .lines()
+                        .try_for_each(|line| self.renderer.write_line(&sanitize_output(line), C_ERROR))
+                        .and_then(|()| self.drain_tui_diagnostics());
+                    let flushed = self.renderer.end_frame();
+                    written?;
+                    flushed?;
                 }
                 Some(result) = async { Some(self.update_notice.as_mut()?.await) } => {
                     self.update_notice = None;
@@ -2496,6 +2544,15 @@ impl<'a> App<'a> {
                         self.renderer.tick_spinner()?;
                     }
                 }
+                // A tail-first chat paint (a long resumed feed) left earlier
+                // blocks unlaid: finish them in small steps between events so
+                // scrolling up finds them ready and the history marker gets
+                // its exact count.
+                _ = tokio::time::sleep(FEED_LAYOUT_STEP_DELAY),
+                    if self.renderer.feed_layout_pending() =>
+                {
+                    self.renderer.advance_feed_layout(FEED_LAYOUT_STEP_BLOCKS)?;
+                }
                 // The @ file picker fills from a background walk; repaint as
                 // results land so "scanning files..." never waits for a key.
                 _ = tokio::time::sleep(Duration::from_millis(50)),
@@ -2542,26 +2599,30 @@ impl<'a> App<'a> {
     }
 
     fn drain_tui_diagnostics(&mut self) -> io::Result<()> {
-        // A trace burst cannot monopolize input or agent progress. The next
-        // event-loop iteration drains the remaining records.
-        if let Some(receiver) = self.tui_log_rx.as_mut() {
-            for _ in 0..16 {
-                let Ok(message) = receiver.try_recv() else {
-                    break;
-                };
-                for line in message.lines() {
-                    self.renderer.write_line(&sanitize_output(line), C_ERROR)?;
+        let receiver = self.tui_log_rx.as_mut();
+        // Every drained line is painted in one frame.
+        self.renderer.frame(|renderer| {
+            // A trace burst cannot monopolize input or agent progress. The
+            // next event-loop iteration drains the remaining records.
+            if let Some(receiver) = receiver {
+                for _ in 0..16 {
+                    let Ok(message) = receiver.try_recv() else {
+                        break;
+                    };
+                    for line in message.lines() {
+                        renderer.write_line(&sanitize_output(line), C_ERROR)?;
+                    }
                 }
             }
-        }
-        let dropped = crate::logging::take_dropped_tui_diagnostics();
-        if dropped > 0 {
-            self.renderer.write_line(
-                &format!("warning: {dropped} additional diagnostic records omitted"),
-                C_ERROR,
-            )?;
-        }
-        Ok(())
+            let dropped = crate::logging::take_dropped_tui_diagnostics();
+            if dropped > 0 {
+                renderer.write_line(
+                    &format!("warning: {dropped} additional diagnostic records omitted"),
+                    C_ERROR,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -4486,11 +4547,7 @@ impl<'a> App<'a> {
                 self.renderer.chain_but_mode = false;
                 self.chain.pending = None;
                 self.chain.label_msg = None;
-                for line in next.lines() {
-                    self.renderer
-                        .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
-                }
-                self.renderer.write_line("", Color::White)?;
+                echo_submission(&mut self.renderer, &next)?;
                 self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
                     .await?;
             }
@@ -4517,12 +4574,16 @@ impl<'a> App<'a> {
                 .take()
                 .expect("pending turn checked above");
             if persisted {
-                for error in pending.commit_side_effects(!self.ui.cli.no_session) {
-                    let _ = self.renderer.write_line(
-                        &format!("warning: failed to append chat history entry: {error}"),
-                        C_ERROR,
-                    );
-                }
+                let errors = pending.commit_side_effects(!self.ui.cli.no_session);
+                let _ = self.renderer.frame(|renderer| {
+                    for error in errors {
+                        let _ = renderer.write_line(
+                            &format!("warning: failed to append chat history entry: {error}"),
+                            C_ERROR,
+                        );
+                    }
+                    Ok(())
+                });
             }
         }
     }
@@ -4720,20 +4781,19 @@ impl<'a> App<'a> {
             "Git proposal is stale; run the command again"
         );
         match &proposal.action {
-            PreparedAction::Commit { paths, message } => {
-                self.renderer.write_line(
+            PreparedAction::Commit { paths, message } => self.renderer.frame(|renderer| {
+                renderer.write_line(
                     "Files requested by write/edit tools this turn (a request may have failed):",
                     C_TOOL,
                 )?;
                 for path in paths {
-                    self.renderer
-                        .write_line(&format!("  {}", sanitize_output(path)), C_TOOL)?;
+                    renderer.write_line(&format!("  {}", sanitize_output(path)), C_TOOL)?;
                 }
-                self.renderer.write_line(
+                renderer.write_line(
                     &format!("Commit message:\n{}", sanitize_output(message)),
                     C_AGENT,
-                )?;
-            }
+                )
+            })?,
             PreparedAction::PullRequest { title, body } => self.renderer.write_line(
                 &format!(
                     "PR title: {}\nPR body:\n{}",
@@ -5525,11 +5585,7 @@ impl<'a> App<'a> {
         } else {
             base_msg
         };
-        for line in msg.lines() {
-            self.renderer
-                .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
-        }
-        self.renderer.write_line("", Color::White)?;
+        echo_submission(&mut self.renderer, &msg)?;
         self.run.agent = None;
         self.start_main_run(&msg, question_origin).await?;
         Ok(())
@@ -5588,11 +5644,7 @@ impl<'a> App<'a> {
     }
 
     fn echo_main_submission(&mut self, text: &str) -> anyhow::Result<()> {
-        for line in text.lines() {
-            self.renderer
-                .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
-        }
-        self.renderer.write_line("", Color::White)?;
+        echo_submission(&mut self.renderer, text)?;
         Ok(())
     }
 
@@ -5678,14 +5730,17 @@ impl<'a> App<'a> {
                 if self.run.pending_inputs.is_empty() {
                     self.renderer.write_line("queue is empty", C_TOOL)?;
                 } else {
-                    self.renderer.write_line(
-                        &format!("queued ({}):", self.run.pending_inputs.len()),
-                        C_TOOL,
-                    )?;
-                    for (i, q) in self.run.pending_inputs.iter().enumerate() {
-                        self.renderer
-                            .write_line(&format!("  {}. {}", i + 1, sanitize_output(q)), C_TOOL)?;
-                    }
+                    let pending = &self.run.pending_inputs;
+                    self.renderer.frame(|renderer| {
+                        renderer.write_line(&format!("queued ({}):", pending.len()), C_TOOL)?;
+                        for (i, q) in pending.iter().enumerate() {
+                            renderer.write_line(
+                                &format!("  {}. {}", i + 1, sanitize_output(q)),
+                                C_TOOL,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
                 }
             }
             _ => self
@@ -5696,11 +5751,7 @@ impl<'a> App<'a> {
     }
 
     async fn run_btw(&mut self, text: &str) -> anyhow::Result<()> {
-        for line in text.lines() {
-            self.renderer
-                .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
-        }
-        self.renderer.write_line("", Color::White)?;
+        echo_submission(&mut self.renderer, text)?;
         let btw_text = text
             .trim_start()
             .strip_prefix("/btw")
@@ -6051,15 +6102,11 @@ impl<'a> App<'a> {
             )?;
             return Ok(());
         }
-        for line in text
-            .lines()
-            .filter(|_| !crate::ui::slash::config::is_command(text))
-        {
-            let safe_line = sanitize_output(line);
-            self.renderer
-                .write_line(&format!("> {}", safe_line), Color::Green)?;
+        if crate::ui::slash::config::is_command(text) {
+            self.renderer.write_line("", Color::White)?;
+        } else {
+            echo_submission(&mut self.renderer, text)?;
         }
-        self.renderer.write_line("", Color::White)?;
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as
@@ -6217,24 +6264,25 @@ impl<'a> App<'a> {
                 .collect::<Vec<_>>();
             self.mark_startup_skill_commands_stale();
             self.input.set_skill_commands(entries.clone());
-            self.renderer.write_line(
-                "Agent Skills (instruction context; no permission grants):",
-                C_TOOL,
-            )?;
-            for (name, description) in &entries {
-                self.renderer.write_line(
-                    &format!("  {}  {}", sanitize_output(name), description),
+            self.renderer.frame(|renderer| {
+                renderer.write_line(
+                    "Agent Skills (instruction context; no permission grants):",
                     C_TOOL,
                 )?;
-            }
-            if entries.is_empty() {
-                self.renderer
-                    .write_line("  no currently authorized skills", C_TOOL)?;
-            }
-            for diagnostic in snapshot.diagnostics.iter().take(16) {
-                self.renderer
-                    .write_line(&sanitize_output(diagnostic), C_ERROR)?;
-            }
+                for (name, description) in &entries {
+                    renderer.write_line(
+                        &format!("  {}  {}", sanitize_output(name), description),
+                        C_TOOL,
+                    )?;
+                }
+                if entries.is_empty() {
+                    renderer.write_line("  no currently authorized skills", C_TOOL)?;
+                }
+                for diagnostic in snapshot.diagnostics.iter().take(16) {
+                    renderer.write_line(&sanitize_output(diagnostic), C_ERROR)?;
+                }
+                Ok(())
+            })?;
             if !entries.is_empty() {
                 self.input.start_skills_picker();
             }
@@ -6824,16 +6872,16 @@ impl<'a> App<'a> {
                 .write_line("error: empty command after '!'", C_ERROR)?;
             return Ok(());
         }
-        for line in text.lines() {
-            let safe_line = sanitize_output(line);
-            self.renderer
-                .write_line(&format!("> {}", safe_line), Color::Green)?;
-        }
         // The blank separator anchors the live output tail shown while the
-        // command runs; the final output replaces it after the save.
+        // command runs; the final output replaces it after the save. The
+        // echo and the anchor paint as one frame before the command starts.
         let progress_anchor = format!("bang-shell:{}", uuid::Uuid::new_v4());
-        self.renderer
-            .write_line_anchored(&progress_anchor, "", Color::White)?;
+        self.renderer.frame(|renderer| {
+            for line in text.lines() {
+                renderer.write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
+            }
+            renderer.write_line_anchored(&progress_anchor, "", Color::White)
+        })?;
 
         let cancellation = CommandCancellation::new();
         let sandbox = self.ui.sandbox.clone();
@@ -6920,12 +6968,13 @@ impl<'a> App<'a> {
         // its transcript durable before fallible terminal presentation.
         self.save_session()?;
 
-        for line in result.lines() {
-            let safe_line = sanitize_output(line);
-            self.renderer
-                .write_line(&safe_line, if run.succeeded() { C_AGENT } else { C_ERROR })?;
-        }
-        self.renderer.write_line("", Color::White)?;
+        let color = if run.succeeded() { C_AGENT } else { C_ERROR };
+        self.renderer.frame(|renderer| {
+            for line in result.lines() {
+                renderer.write_line(&sanitize_output(line), color)?;
+            }
+            renderer.write_line("", Color::White)
+        })?;
 
         Ok(())
     }
@@ -7194,12 +7243,13 @@ impl<'a> App<'a> {
                 self.btw_total_out = self.btw_total_out.saturating_add(output_tokens);
                 self.btw_abort.retain(|(i, _, _, _)| *i != id);
                 self.btw_inflight = self.btw_inflight.saturating_sub(1);
-                self.renderer
-                    .write_line(&format!("[btw #{}] answer:", id), C_BTW)?;
-                for line in response.lines() {
-                    self.renderer.write_line(&sanitize_output(line), C_AGENT)?;
-                }
-                self.renderer.write_line("", Color::White)?;
+                self.renderer.frame(|renderer| {
+                    renderer.write_line(&format!("[btw #{}] answer:", id), C_BTW)?;
+                    for line in response.lines() {
+                        renderer.write_line(&sanitize_output(line), C_AGENT)?;
+                    }
+                    renderer.write_line("", Color::White)
+                })?;
             }
             BtwEvent::Error { id, message } => {
                 if self.btw_pricing.take(id).is_none() {
@@ -7555,19 +7605,21 @@ impl<'a> App<'a> {
                 }
             }
             crate::extras::git_worktree::MergeOutcome::Conflicts(files) => {
-                let _ = self.renderer.write_line(
-                    &format!("merge conflict in {} file(s):", files.len()),
-                    C_ERROR,
-                );
-                for f in &files {
-                    let _ = self.renderer.write_line(&format!("  {}", f), C_ERROR);
-                }
                 if let Some(ss) = self.ui.status_signals.as_ref() {
                     ss.send_git_conflict();
                 }
-                let _ = self
-                    .renderer
-                    .write_line("[a]bort  [l]eave for manual resolution", C_PERM);
+                // One frame, closed before the await below: the prompt is on
+                // screen while it waits for the user.
+                let _ = self.renderer.frame(|renderer| {
+                    let _ = renderer.write_line(
+                        &format!("merge conflict in {} file(s):", files.len()),
+                        C_ERROR,
+                    );
+                    for f in &files {
+                        let _ = renderer.write_line(&format!("  {}", f), C_ERROR);
+                    }
+                    renderer.write_line("[a]bort  [l]eave for manual resolution", C_PERM)
+                });
 
                 let action =
                     read_worktree_choice(&mut self.user_rx, &mut self.deferred_user_events, 'l')

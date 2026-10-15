@@ -377,13 +377,6 @@ impl FeedLines {
 
     /// Whether these rows start at the top of the feed. Only a tail-first
     /// layout ([`Feed::lines_tail`]) can be incomplete.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "renderer opt-in for the resume viewport (cttyn.9)"
-        )
-    )]
     pub(crate) fn is_complete(&self) -> bool {
         !self.partial
     }
@@ -1044,13 +1037,6 @@ impl Feed {
     /// (`FeedLines::is_complete` says whether earlier rows exist). A later
     /// `lines(width)` keeps these rows and lays out only the remaining
     /// blocks; [`Feed::advance_layout`] does the same in budgeted steps.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "renderer opt-in for the resume viewport (cttyn.9)"
-        )
-    )]
     pub(crate) fn lines_tail(&self, width: usize, min_rows: usize) -> Arc<FeedLines> {
         self.layout(width, Some(min_rows))
     }
@@ -1058,13 +1044,6 @@ impl Feed {
     /// Lay out up to `max_blocks` more blocks above a tail-first layout at
     /// `width`, e.g. from an idle tick. Returns whether the layout at `width`
     /// is now complete (a later `lines(width)` lays out nothing).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "idle-tick completion of the resume layout (cttyn.9)"
-        )
-    )]
     pub(crate) fn advance_layout(&self, width: usize, max_blocks: usize) -> bool {
         let mut slot = self.layout_cache.borrow_mut();
         let Some(cache) = slot.take() else {

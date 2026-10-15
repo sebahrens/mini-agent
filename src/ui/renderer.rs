@@ -457,6 +457,27 @@ pub(crate) fn history_indicator(
     (above > 0).then(|| HistoryIndicator::Above(format!(" ↑ {above} ")))
 }
 
+/// Marker shown while following the output over a tail-first layout that
+/// has not reached the top of the feed yet: earlier rows exist, but their
+/// count is unknown until the idle tick finishes the layout.
+pub(crate) const HISTORY_ABOVE_UNCOUNTED: &str = " ↑ earlier ";
+
+/// [`history_indicator`] for rows that may be a tail-first suffix of the
+/// transcript (`complete == false`), which is only painted while following
+/// the output (`offset == 0`).
+pub(crate) fn history_indicator_for(
+    offset: usize,
+    total: usize,
+    visible: usize,
+    complete: bool,
+) -> Option<HistoryIndicator> {
+    if complete || offset > 0 {
+        history_indicator(offset, total, visible)
+    } else {
+        Some(HistoryIndicator::Above(HISTORY_ABOVE_UNCOUNTED.to_string()))
+    }
+}
+
 /// First terminal row of the input box for a terminal with `rows` rows,
 /// `reserve` rows kept for the status line, and an input `visible_line_count`
 /// rows tall. Saturating: terminals shorter than the reserved area yield row 1
@@ -818,6 +839,9 @@ pub struct Renderer {
     painted_geometry: Option<u64>,
     /// Reused allocation for the next frame's row keys.
     row_keys_scratch: Vec<u64>,
+    /// The last chat paint used a tail-first layout that does not reach the
+    /// top of the feed; [`Renderer::advance_feed_layout`] completes it.
+    painted_partial: bool,
     bottom_dirty: bool,
     last_bottom_snapshot: Option<BottomSnapshot>,
     statusline_cache: Option<StatuslineCache>,
@@ -966,6 +990,7 @@ impl Renderer {
             painted_rows: Vec::new(),
             painted_geometry: None,
             row_keys_scratch: Vec::new(),
+            painted_partial: false,
             bottom_dirty: true,
             last_bottom_snapshot: None,
             statusline_cache: None,
@@ -1912,8 +1937,17 @@ impl Renderer {
         let (cols, _rows) = self.terminal_size();
         let max_width = cols.saturating_sub(1 + self.chat_margin) as usize;
         let visible = self.visible_lines();
-        let buffer = self.chat_lines(max_width);
+        // Following the output without a selection paints only the bottom
+        // rows, so a long resumed feed lays out just the blocks they need;
+        // scrolling, selection and clicks use the complete layout.
+        let tail_only = self.scroll_offset == 0 && !self.selection_active;
+        let buffer = if tail_only {
+            self.feed.lines_tail(max_width, visible)
+        } else {
+            self.chat_lines(max_width)
+        };
         let total = buffer.len();
+        let complete = buffer.is_complete();
         // The viewport may have grown since the offset was set (the input box
         // shrank, the terminal was resized); keep the offset inside the
         // scrollable range so the arithmetic below never underflows.
@@ -1950,12 +1984,12 @@ impl Renderer {
             selection.and_then(|(a, b)| selection_byte_range(&buffer[line].text, line, a, b))
         };
         let indicator =
-            history_indicator(self.scroll_offset, total, visible).map(
-                |indicator| match indicator {
+            history_indicator_for(self.scroll_offset, total, visible, complete).map(|indicator| {
+                match indicator {
                     HistoryIndicator::Scrolled(text) => (text, Color::DarkYellow),
                     HistoryIndicator::Above(text) => (text, Color::DarkGrey),
-                },
-            );
+                }
+            });
 
         // What each screen row shows, as a key: rows whose key matches the
         // last painted frame are already on screen and are skipped.
@@ -2054,6 +2088,7 @@ impl Renderer {
         self.painted_rows = painted;
         self.row_keys_scratch = keys;
         self.painted_geometry = Some(geometry);
+        self.painted_partial = !complete;
 
         #[cfg(test)]
         {
@@ -2150,11 +2185,43 @@ impl Renderer {
         // frame's layout queries it once, and repaint every chat row.
         self.cached_size.set(None);
         self.painted_geometry = None;
-        let visible = self.visible_lines();
-        let max_offset = self.buffer_len().saturating_sub(visible);
-        if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
+        // Following the output needs no row count: the next paint lays out
+        // only the tail at the new width.
+        if self.scroll_offset > 0 {
+            let visible = self.visible_lines();
+            let max_offset = self.buffer_len().saturating_sub(visible);
+            if self.scroll_offset > max_offset {
+                self.scroll_offset = max_offset;
+            }
         }
+    }
+
+    /// Whether the last chat paint used a tail-first layout that has not
+    /// reached the top of the feed (the event loop then runs
+    /// [`Renderer::advance_feed_layout`] between events).
+    pub(crate) fn feed_layout_pending(&self) -> bool {
+        self.painted_partial
+    }
+
+    /// Lay out up to `max_blocks` more feed blocks above a tail-first chat
+    /// paint (an idle-tick step). When the layout reaches the top, the
+    /// history marker is repainted with the exact row count. Returns whether
+    /// more layout work remains.
+    pub(crate) fn advance_feed_layout(&mut self, max_blocks: usize) -> io::Result<bool> {
+        if !self.painted_partial {
+            return Ok(false);
+        }
+        let width = self.max_line_width();
+        // Refreshes a layout made stale by a later mutation; a cheap `Arc`
+        // clone when it is current.
+        let _ = self.feed.lines_tail(width, self.visible_lines());
+        if !self.feed.advance_layout(width, max_blocks) {
+            return Ok(true);
+        }
+        self.painted_partial = false;
+        self.chat_dirty = true;
+        self.render_viewport()?;
+        Ok(false)
     }
 
     fn clear_shrunk_rows(&self, old_height: usize, new_height: usize) -> io::Result<()> {
@@ -4670,6 +4737,103 @@ mod row_diff_tests {
         assert_eq!(incremental, full_paint_text(&mut renderer));
     }
 
+    fn push_resumed_agent_blocks(renderer: &mut Renderer, blocks: usize) {
+        for block in 0..blocks {
+            renderer.feed_mut().push_block(
+                BlockStyle::Agent,
+                format!("**answer {block}** with `code` and *emphasis*\n\n- item {block}"),
+            );
+        }
+    }
+
+    /// cttyn.9: the first frame after replaying a long session lays out only
+    /// the blocks the viewport shows, paints what a full layout would, and
+    /// the idle completion plus scrolling still reach every block once.
+    #[test]
+    fn a_resumed_feed_first_frame_lays_out_only_the_visible_tail() {
+        const BLOCKS: usize = 2000;
+        let mut renderer = Renderer::for_app_test().unwrap();
+        push_resumed_agent_blocks(&mut renderer, BLOCKS);
+        let visible = renderer.visible_lines();
+        let mut screen = Screen::new(180, 50);
+        let mut from = 0;
+        renderer.render_viewport().unwrap();
+        // Each block is several rows, so the viewport needs at most
+        // `visible` blocks; nothing above them was parsed.
+        let first_frame_renders = renderer.feed().block_renders();
+        assert!(
+            first_frame_renders <= visible,
+            "first frame rendered {first_frame_renders} blocks for {visible} rows"
+        );
+        assert!(renderer.feed().blocks_laid_out() <= visible);
+        assert!(renderer.feed_layout_pending());
+        let first = rows_of(&mut renderer, &mut screen, &mut from);
+
+        // Reference: the same feed painted from a complete layout.
+        let mut reference = Renderer::for_app_test().unwrap();
+        push_resumed_agent_blocks(&mut reference, BLOCKS);
+        let total = reference.feed().lines(reference.line_width()).len();
+        reference.render_viewport().unwrap();
+        assert!(!reference.feed_layout_pending());
+        let mut ref_screen = Screen::new(180, 50);
+        let mut ref_from = 0;
+        let expected = rows_of(&mut reference, &mut ref_screen, &mut ref_from);
+        // Identical rows; only the top-row marker lacks the exact count.
+        assert_eq!(first[1..], expected[1..]);
+        let counted = format!(" ↑ {} ", total - visible);
+        assert!(
+            first[0].ends_with(HISTORY_ABOVE_UNCOUNTED.trim_end()),
+            "{:?}",
+            first[0]
+        );
+        assert!(
+            expected[0].ends_with(counted.trim_end()),
+            "{:?}",
+            expected[0]
+        );
+        assert_eq!(
+            first[0]
+                .trim_end_matches(HISTORY_ABOVE_UNCOUNTED.trim_end())
+                .trim_end(),
+            expected[0].trim_end_matches(counted.trim_end()).trim_end()
+        );
+
+        // The idle steps finish the layout and repaint the exact marker.
+        let mut steps = 0;
+        while renderer.advance_feed_layout(64).unwrap() {
+            steps += 1;
+            assert!(steps <= BLOCKS, "idle layout never completed");
+        }
+        assert!(!renderer.feed_layout_pending());
+        assert!(!renderer.advance_feed_layout(64).unwrap());
+        let completed = rows_of(&mut renderer, &mut screen, &mut from);
+        assert_eq!(completed, expected);
+        assert_eq!(completed, full_paint_text(&mut renderer));
+        // Every block was rendered exactly once across tail and completion.
+        assert_eq!(renderer.feed().block_renders(), BLOCKS);
+
+        // Scrolling to the top shows the first block without re-rendering.
+        renderer.scroll_to_top();
+        renderer.render_viewport().unwrap();
+        let top = rows_of(&mut renderer, &mut screen, &mut from);
+        assert!(top[0].contains("answer 0"), "{:?}", top[0]);
+        assert_eq!(top, full_paint_text(&mut renderer));
+        assert_eq!(renderer.feed().block_renders(), BLOCKS);
+    }
+
+    #[test]
+    fn scrolling_up_before_the_idle_layout_finishes_lays_out_everything() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        push_resumed_agent_blocks(&mut renderer, 500);
+        renderer.render_viewport().unwrap();
+        assert!(renderer.feed_layout_pending());
+        renderer.scroll_to_top();
+        renderer.render_viewport().unwrap();
+        assert_eq!(renderer.feed().block_renders(), 500);
+        assert!(!renderer.feed_layout_pending());
+        assert!(!renderer.advance_feed_layout(16).unwrap());
+    }
+
     #[test]
     fn scrolling_by_one_line_paints_only_the_rows_scrolled_in() {
         let mut renderer = Renderer::for_app_test().unwrap();
@@ -4709,6 +4873,9 @@ mod row_diff_tests {
                 .push_block(BlockStyle::Agent, format!("selectable line {line}"));
         }
         renderer.render_viewport().unwrap();
+        // The idle ticks finish the tail-first layout (and its history
+        // marker) before the user starts a drag.
+        while renderer.advance_feed_layout(64).unwrap() {}
         let first = renderer.buffer_line_at_row(10).unwrap();
         renderer.selection_active = true;
         renderer.selection_start = Some(SelectionPoint::new(first, 2));

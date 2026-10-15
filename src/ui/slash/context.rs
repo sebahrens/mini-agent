@@ -461,9 +461,14 @@ pub(crate) async fn handle(parts: &[&str], ctx: &mut super::SlashCtx<'_>) -> any
             .and_then(crate::provider::AnyAgent::context_snapshot),
         schemas,
     );
-    for line in diagnostic.render().lines() {
-        ctx.renderer.write_line(line, super::C_RESULT)?;
-    }
+    let report = diagnostic.render();
+    // The whole report paints as one frame.
+    ctx.renderer.frame(|renderer| {
+        for line in report.lines() {
+            renderer.write_line(line, super::C_RESULT)?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 

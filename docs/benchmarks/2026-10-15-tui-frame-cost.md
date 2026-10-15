@@ -63,8 +63,22 @@ cttyn.13); the chat is not repainted.
   full repaint; an open picker marks only the `PICKER_OVERLAY_MAX_ROWS`
   band above its floor (cttyn.26).
 - **Lines** (cttyn.6). `write_line` paints at once outside a frame, so text
-  printed before an await stays visible; inside a frame (synchronous slash
-  listings) it paints once at the frame's close.
+  printed before an await stays visible; inside a frame it paints once at
+  the frame's close. Synchronous slash listings, `/context`, submission
+  echoes (`app::echo_submission`), `!` command echo and output, `/btw`
+  answers, `/queue`, `/skills`, worktree proposals and merge-conflict
+  listings, and the diagnostics/MCP-notice drains each write one frame; a
+  frame always closes before the code awaits the user or a turn, so prompts
+  are on screen while they wait.
+- **Resume tail** (cttyn.9). Following the output without a selection,
+  `render_viewport` paints from `Feed::lines_tail(width, visible)`, which
+  lays out only the last blocks the viewport needs. While that layout does
+  not reach the top, the history marker reads ` ↑ earlier ` instead of a
+  row count; the event loop then calls `Renderer::advance_feed_layout` in
+  16-block idle steps until the layout is complete and repaints the exact
+  count. Scrolling, selection, clicks, `buffer_len` and a resize while
+  scrolled back use the complete `Feed::lines(width)`.
 - **Caches**: plain rows skip the URL regex (cttyn.11); fitted statusline
   rows are reused by key (cttyn.13); the input wrap layout is memoized per
-  draft and width (cttyn.19).
+  draft and width in the renderer, and `InputEditor` keeps its own memo for
+  Up/Down row movement, validated by comparing the buffer (cttyn.19).

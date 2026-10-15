@@ -952,6 +952,28 @@ fn history_above_the_view_is_always_signalled() {
     );
 }
 
+#[test]
+fn a_tail_first_paint_marks_history_above_without_a_count() {
+    use crate::ui::renderer::{HISTORY_ABOVE_UNCOUNTED, HistoryIndicator, history_indicator_for};
+    // Incomplete layout while following: earlier rows exist, count unknown.
+    assert_eq!(
+        history_indicator_for(0, 50, 50, false),
+        Some(HistoryIndicator::Above(HISTORY_ABOVE_UNCOUNTED.into()))
+    );
+    assert_eq!(HISTORY_ABOVE_UNCOUNTED, " ↑ earlier ");
+    // A complete layout keeps the exact count (or no marker).
+    assert_eq!(
+        history_indicator_for(0, 120, 20, true),
+        Some(HistoryIndicator::Above(" ↑ 100 ".into()))
+    );
+    assert_eq!(history_indicator_for(0, 10, 20, true), None);
+    // Scrolled views always come from a complete layout.
+    assert_eq!(
+        history_indicator_for(50, 120, 20, true),
+        Some(HistoryIndicator::Scrolled(" SCROLL 50% ".into()))
+    );
+}
+
 mod permission_prompt_layout_tests {
     use crate::ui::renderer::{
         PROMPT_COLLAPSE_HINT, PROMPT_EXPAND_HINT, expanded_prompt_max_rows, permission_prompt_rows,
