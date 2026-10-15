@@ -66,7 +66,7 @@ struct LineCappedStdout<R> {
     inner: R,
     max_line: usize,
     current_line: usize,
-    raw_line: Vec<u8>,
+    raw_line: super::forms::LineObserver,
     forms: super::forms::RawForms,
     overflowed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -84,19 +84,21 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCappedStdout<
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
         if let std::task::Poll::Ready(Ok(())) = &poll {
-            let read = &buf.filled()[before..];
-            for byte in read {
-                if *byte == b'\n' {
-                    let line = std::mem::take(&mut this.raw_line);
-                    this.forms.observe(&line);
-                    this.current_line = 0;
-                } else {
-                    this.current_line = this.current_line.saturating_add(1);
-                    if this.current_line > this.max_line {
-                        break;
-                    }
-                    this.raw_line.push(*byte);
+            let mut rest = &buf.filled()[before..];
+            while !rest.is_empty() {
+                let newline = super::forms::find_newline(rest);
+                let segment = &rest[..newline.unwrap_or(rest.len())];
+                this.current_line = this.current_line.saturating_add(segment.len());
+                if this.current_line > this.max_line {
+                    break;
                 }
+                this.raw_line.feed(segment);
+                let Some(newline) = newline else {
+                    break;
+                };
+                this.raw_line.end(&this.forms);
+                this.current_line = 0;
+                rest = &rest[newline + 1..];
             }
             if this.current_line > this.max_line {
                 this.overflowed
@@ -140,7 +142,7 @@ impl OwnedStdioTransport {
             inner: stdout,
             max_line,
             current_line: 0,
-            raw_line: Vec::new(),
+            raw_line: Default::default(),
             forms,
             overflowed: Arc::clone(&overflowed),
         };
@@ -1123,7 +1125,7 @@ mod tests {
             inner: std::io::Cursor::new(bytes),
             max_line: 16,
             current_line: 0,
-            raw_line: Vec::new(),
+            raw_line: Default::default(),
             forms: Default::default(),
             overflowed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };

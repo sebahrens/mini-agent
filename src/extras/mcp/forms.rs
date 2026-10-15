@@ -28,16 +28,30 @@ impl RawForms {
             #[serde(default)]
             id: Option<Value>,
         }
+        // A message that cannot spell the method needs no JSON lex at all.
+        if !may_name_form_method(bytes) {
+            return;
+        }
         // Ignored params/result fields are scanned without allocating their
         // values. Oversized forms get a rejected record before typed decoding;
         // ordinary large tool responses need no second materialized JSON tree.
         let Ok(header) = serde_json::from_slice::<Header>(bytes) else {
             return;
         };
-        if header.method.as_deref() != Some("elicitation/create") {
+        self.record(header.method.as_deref(), header.id.as_ref(), Some(bytes));
+    }
+    /// Header of a stdout line too large to carry a form. Its id still counts
+    /// toward reuse and exhaustion exactly like an oversized `observe` call.
+    fn observe_scanned(&self, scan: HeaderScan) {
+        if let Some((method, id)) = scan.finish() {
+            self.record(method.as_deref(), id.as_ref(), None);
+        }
+    }
+    fn record(&self, method: Option<&str>, id: Option<&Value>, bytes: Option<&[u8]>) {
+        if method != Some("elicitation/create") {
             return;
         }
-        let Some(id) = header.id.as_ref() else {
+        let Some(id) = id else {
             return;
         };
         if !(id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()) {
@@ -57,16 +71,17 @@ impl RawForms {
             return;
         }
         let unique = state.used.insert(id.clone());
-        let form = if unique && bytes.len() <= MAX_BYTES {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("params")
-                        .and_then(|params| Form::parse(params).ok())
-                })
-        } else {
-            None
+        let form = match bytes {
+            Some(bytes) if unique && bytes.len() <= MAX_BYTES => {
+                serde_json::from_slice::<Value>(bytes)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("params")
+                            .and_then(|params| Form::parse(params).ok())
+                    })
+            }
+            _ => None,
         };
         state.records.insert(id, form);
     }
@@ -80,6 +95,273 @@ impl RawForms {
             .remove(&serde_json::to_value(id).ok()?.to_string())
             .flatten()
     }
+}
+
+/// Whether `bytes` can contain a JSON string that decodes to
+/// `elicitation/create`: either literally, or through a `\u` or `\/` escape
+/// (the only JSON escapes that produce characters of that method name).
+fn may_name_form_method(bytes: &[u8]) -> bool {
+    static PATTERN: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+        regex::bytes::Regex::new(r"(?-u)elicitation/create|\\u|\\/").expect("static pattern")
+    });
+    PATTERN.is_match(bytes)
+}
+
+/// The remainder of a JSON string body: unescaped bytes and complete escapes.
+static STRING_BODY: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+    regex::bytes::Regex::new(r#"(?s-u)\A(?:[^"\\]|\\.)*"#).expect("static pattern")
+});
+/// Structural bytes at the top-level object depth.
+static TOP_STRUCTURE: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+    regex::bytes::Regex::new(r#"(?-u)[{}\[\]",:]"#).expect("static pattern")
+});
+/// Structural bytes that change nesting or start a string at any other depth.
+static NESTED_STRUCTURE: std::sync::LazyLock<regex::bytes::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::bytes::Regex::new(r#"(?-u)[{}\[\]"]"#).expect("static pattern")
+    });
+
+const HEADER_TOKEN_MAX: usize = 4 * 1024;
+const HEADER_KEY_MAX: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Method,
+    Id,
+    Other,
+}
+
+/// Streaming scanner for the top-level `method` and `id` of a JSON line that
+/// is too large to retain. It agrees with the serde header decode on every
+/// JSON object; on malformed input it can only report an id serde would have
+/// rejected, which records more (declined) ids, never fewer. A top-level array
+/// (which serde would decode positionally) yields no header: the transport
+/// never dispatches one as an elicitation request.
+#[derive(Default)]
+struct HeaderScan {
+    depth: usize,
+    seen_top: bool,
+    not_object: bool,
+    in_string: bool,
+    escape: bool,
+    expect_key: bool,
+    key: Option<Vec<u8>>,
+    pending: Option<Slot>,
+    value: Option<(Slot, Vec<u8>, bool)>,
+    method: Option<Result<Vec<u8>, ()>>,
+    id: Option<Result<Vec<u8>, ()>>,
+    duplicate: bool,
+}
+
+impl HeaderScan {
+    fn push(&mut self, bytes: &[u8]) {
+        if let Some(key) = &mut self.key {
+            if key.len() <= HEADER_KEY_MAX {
+                let room = HEADER_KEY_MAX + 1 - key.len();
+                key.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+        } else if let Some((_, value, overflow)) = &mut self.value
+            && !*overflow
+        {
+            if value.len() + bytes.len() > HEADER_TOKEN_MAX {
+                *overflow = true;
+            } else {
+                value.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    fn push_bare(&mut self, bytes: &[u8]) {
+        // Whitespace between tokens is insignificant; numbers and literals are
+        // the only other bare bytes and are kept for the value decode.
+        if self.value.is_some() && bytes.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            let bare: Vec<u8> = bytes
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect();
+            self.push(&bare);
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.in_string {
+                if self.escape {
+                    self.escape = false;
+                    self.push(&bytes[..1]);
+                    bytes = &bytes[1..];
+                    continue;
+                }
+                let end = STRING_BODY.find(bytes).map_or(0, |found| found.end());
+                self.push(&bytes[..end]);
+                if end == bytes.len() {
+                    return;
+                }
+                self.push(&bytes[end..=end]);
+                if bytes[end] == b'"' {
+                    self.in_string = false;
+                    self.end_string();
+                } else {
+                    self.escape = true;
+                }
+                bytes = &bytes[end + 1..];
+                continue;
+            }
+            let pattern = if self.depth == 1 {
+                &*TOP_STRUCTURE
+            } else {
+                &*NESTED_STRUCTURE
+            };
+            let Some(found) = pattern.find(bytes) else {
+                self.push_bare(bytes);
+                return;
+            };
+            let at = found.start();
+            self.push_bare(&bytes[..at]);
+            self.structural(bytes[at]);
+            bytes = &bytes[at + 1..];
+        }
+    }
+
+    fn structural(&mut self, byte: u8) {
+        if self.depth == 0 {
+            if byte == b'"' {
+                self.in_string = true;
+            }
+            if self.seen_top || byte != b'{' {
+                self.not_object = true;
+            }
+            self.seen_top = true;
+            if matches!(byte, b'{' | b'[') {
+                self.depth = 1;
+                self.expect_key = byte == b'{';
+            }
+            return;
+        }
+        match byte {
+            b'"' => {
+                self.in_string = true;
+                if self.depth == 1 && self.expect_key && self.value.is_none() {
+                    self.key = Some(vec![b'"']);
+                } else {
+                    self.push(b"\"");
+                }
+            }
+            b'{' | b'[' => {
+                self.push(&[byte]);
+                self.depth += 1;
+            }
+            b'}' | b']' => {
+                if self.depth == 1 {
+                    self.finish_value();
+                } else {
+                    self.push(&[byte]);
+                }
+                self.depth -= 1;
+            }
+            b',' if self.depth == 1 => {
+                self.finish_value();
+                self.expect_key = true;
+            }
+            b':' if self.depth == 1 => {
+                // Only `method` and `id` values are captured; any other value
+                // is skipped until its closing `,` or `}` at this depth.
+                if let Some(slot) = self.pending.take().filter(|slot| *slot != Slot::Other) {
+                    self.value = Some((slot, Vec::new(), false));
+                }
+                self.expect_key = false;
+            }
+            _ => self.push(&[byte]),
+        }
+    }
+
+    fn end_string(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let slot = match serde_json::from_slice::<String>(&key).as_deref() {
+            Ok("method") if key.len() <= HEADER_KEY_MAX => Slot::Method,
+            Ok("id") if key.len() <= HEADER_KEY_MAX => Slot::Id,
+            _ => Slot::Other,
+        };
+        self.pending = Some(slot);
+    }
+
+    fn finish_value(&mut self) {
+        let Some((slot, value, overflow)) = self.value.take() else {
+            return;
+        };
+        let token = if overflow { Err(()) } else { Ok(value) };
+        let target = match slot {
+            Slot::Method => &mut self.method,
+            Slot::Id => &mut self.id,
+            Slot::Other => return,
+        };
+        if target.replace(token).is_some() {
+            self.duplicate = true;
+        }
+    }
+
+    fn finish(self) -> Option<(Option<String>, Option<Value>)> {
+        if !self.seen_top || self.not_object || self.depth != 0 || self.in_string || self.duplicate
+        {
+            return None;
+        }
+        let method = match self.method {
+            None => None,
+            Some(Ok(raw)) => serde_json::from_slice::<Option<String>>(&raw).ok()?,
+            // An over-long method token cannot spell `elicitation/create`.
+            Some(Err(())) => Some(String::new()),
+        };
+        let id = match self.id {
+            None => None,
+            Some(Ok(raw)) => serde_json::from_slice::<Option<Value>>(&raw).ok()?,
+            // An over-long id token can never pass the 256-byte id bound.
+            Some(Err(())) => return None,
+        };
+        Some((method, id))
+    }
+}
+
+/// Raw-form observation for one stdout line. Bytes are retained only up to the
+/// form bound; a longer line can no longer carry a form, so only its header is
+/// scanned (for id reuse and exhaustion) instead of copying the whole line.
+#[derive(Default)]
+pub(crate) struct LineObserver {
+    raw: Vec<u8>,
+    scan: Option<HeaderScan>,
+}
+
+impl LineObserver {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        if let Some(scan) = &mut self.scan {
+            scan.feed(bytes);
+        } else if self.raw.len() + bytes.len() <= MAX_BYTES {
+            self.raw.extend_from_slice(bytes);
+        } else {
+            let mut scan = HeaderScan::default();
+            scan.feed(&self.raw);
+            scan.feed(bytes);
+            self.raw.clear();
+            self.scan = Some(scan);
+        }
+    }
+
+    pub(crate) fn end(&mut self, forms: &RawForms) {
+        match self.scan.take() {
+            Some(scan) => forms.observe_scanned(scan),
+            None => forms.observe(&self.raw),
+        }
+        self.raw.clear();
+    }
+}
+
+/// Position of the next line feed.
+pub(crate) fn find_newline(bytes: &[u8]) -> Option<usize> {
+    static NEWLINE: std::sync::LazyLock<regex::bytes::Regex> =
+        std::sync::LazyLock::new(|| regex::bytes::Regex::new(r"(?-u)\n").expect("static pattern"));
+    NEWLINE.find(bytes).map(|found| found.start())
 }
 
 #[derive(Clone, Debug)]
@@ -662,6 +944,106 @@ mod tests {
             records.take(&last_id).is_none(),
             "record-budget exhaustion closes the form catalogue"
         );
+    }
+    fn serde_header(bytes: &[u8]) -> Option<(Option<String>, Option<Value>)> {
+        #[derive(serde::Deserialize)]
+        struct Header {
+            #[serde(default)]
+            method: Option<String>,
+            #[serde(default)]
+            id: Option<Value>,
+        }
+        serde_json::from_slice::<Header>(bytes)
+            .ok()
+            .map(|header| (header.method, header.id))
+    }
+    #[test]
+    fn streamed_header_scan_agrees_with_serde_at_every_split() {
+        let lines: &[&str] = &[
+            r#"{"jsonrpc":"2.0","id":"owned","method":"elicitation/create","params":{"message":"a,b:}{]["}}"#,
+            r#"{"params":{"nested":{"id":"inner","method":"elicitation/create"}},"method":"elicitation\/create","id":7}"#,
+            r#"{ "method" : "elicitation/create" , "id" : "x\"y\\" , "result":[1,{"id":2}] }"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"elicitation/create"}]}}"#,
+            r#"{"id":null,"method":null}"#,
+            r#"{"id":{"object":true},"method":"elicitation/create"}"#,
+            r#"{"id":1,"id":2,"method":"elicitation/create"}"#,
+            r#"{"method":7,"id":1}"#,
+            r#""elicitation/create""#,
+            r#"{"id":1,"method":"elicitation/create""#,
+            r#"{"id":18446744073709551615,"method":"elicitation/create","params":{}}"#,
+            "{\"id\":\t-4 ,\n\"method\":\"elicitation/create\"}",
+        ];
+        let mut array = HeaderScan::default();
+        array.feed(br#"["elicitation/create",1]"#);
+        assert_eq!(array.finish(), None);
+        for line in lines {
+            let bytes = line.as_bytes();
+            let expected = serde_header(bytes);
+            for split in 0..=bytes.len() {
+                let mut scan = HeaderScan::default();
+                scan.feed(&bytes[..split]);
+                scan.feed(&bytes[split..]);
+                assert_eq!(scan.finish(), expected, "{line} split at {split}");
+            }
+        }
+    }
+    #[test]
+    fn oversized_stdout_lines_keep_id_reuse_accounting_without_retaining_bytes() {
+        let records = RawForms::default();
+        let padding = "x\\n\\\"".repeat(MAX_BYTES);
+        // The method and id follow a huge params value; nothing of the line
+        // beyond the form bound is retained, yet its id is still consumed.
+        let huge = format!(
+            r#"{{"jsonrpc":"2.0","params":{{"message":"{padding}","requestedSchema":{{"type":"object","properties":{{}}}}}},"method":"elicitation/create","id":"dup"}}"#
+        );
+        let mut line = LineObserver::default();
+        for chunk in huge.as_bytes().chunks(4093) {
+            line.feed(chunk);
+        }
+        assert!(line.raw.len() <= MAX_BYTES && line.scan.is_some());
+        line.end(&records);
+        assert!(line.raw.is_empty() && line.scan.is_none());
+        let id: rmcp::model::RequestId = serde_json::from_value(serde_json::json!("dup")).unwrap();
+        assert!(records.take(&id).is_none(), "oversized forms are declined");
+        let valid = serde_json::json!({"jsonrpc":"2.0","id":"dup","method":"elicitation/create","params":{"message":"Public data","requestedSchema":{"type":"object","properties":{"value":{"type":"string"}}}}});
+        let mut line = LineObserver::default();
+        line.feed(&serde_json::to_vec(&valid).unwrap());
+        line.end(&records);
+        assert!(
+            records.take(&id).is_none(),
+            "an oversized line still consumes its callback ID"
+        );
+        // Large responses that merely mention the method never mint or consume.
+        let response = format!(
+            r#"{{"jsonrpc":"2.0","id":"fresh","result":{{"text":"elicitation/create {padding}"}}}}"#
+        );
+        let mut line = LineObserver::default();
+        line.feed(response.as_bytes());
+        line.end(&records);
+        let mut fresh = valid.clone();
+        fresh["id"] = serde_json::json!("fresh");
+        records.observe(&serde_json::to_vec(&fresh).unwrap());
+        let fresh_id = serde_json::from_value(serde_json::json!("fresh")).unwrap();
+        assert!(records.take(&fresh_id).is_some());
+    }
+    #[test]
+    fn method_prefilter_still_sees_escaped_method_names() {
+        assert!(!may_name_form_method(
+            br#"{"id":1,"result":{"text":"plain"}}"#
+        ));
+        let records = RawForms::default();
+        for (n, method) in [r#""elicitation\/create""#, r#""elicitation/create""#]
+            .into_iter()
+            .enumerate()
+        {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":{n},"method":{method},"params":{{"message":"Public","requestedSchema":{{"type":"object","properties":{{"value":{{"type":"string"}}}}}}}}}}"#
+            );
+            assert!(may_name_form_method(line.as_bytes()));
+            records.observe(line.as_bytes());
+            let id = serde_json::from_value(serde_json::json!(n)).unwrap();
+            assert!(records.take(&id).is_some(), "{method}");
+        }
     }
     #[test]
     fn integer_constraints_preserve_exact_large_values_and_empty_string_is_explicit() {
