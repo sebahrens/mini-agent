@@ -847,6 +847,19 @@ pub(crate) fn routes_to_providers(command: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Run a synchronous listing command that prints many lines, painting the
+/// chat once for all of them instead of once per line. Only for handlers
+/// that never await and never write to the terminal themselves.
+fn in_one_frame<'a, T>(
+    ctx: &mut SlashCtx<'a>,
+    run: impl FnOnce(&mut SlashCtx<'a>) -> T,
+) -> anyhow::Result<T> {
+    ctx.renderer.begin_frame();
+    let value = run(ctx);
+    ctx.renderer.end_frame()?;
+    Ok(value)
+}
+
 pub(crate) async fn handle_slash(
     text: &str,
     selected_session: Option<Box<Session>>,
@@ -952,17 +965,13 @@ pub(crate) async fn handle_slash(
         #[cfg(feature = "export")]
         "/share" => crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await,
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
-        "/doctor" => doctor::handle(&parts, &mut ctx),
-        "/jobs" => jobs::handle(&parts, &mut ctx),
+        "/doctor" => in_one_frame(&mut ctx, |ctx| doctor::handle(&parts, ctx))?,
+        "/jobs" => in_one_frame(&mut ctx, |ctx| jobs::handle(&parts, ctx))?,
         #[cfg(feature = "subagents")]
-        "/tasks" => tasks::handle(&parts, &mut ctx),
-        "/help" => {
-            help::handle(&parts, &mut ctx);
-            Ok(())
-        }
+        "/tasks" => in_one_frame(&mut ctx, |ctx| tasks::handle(&parts, ctx))?,
+        "/help" => in_one_frame(&mut ctx, |ctx| help::handle(&parts, ctx)),
         "/welcome" | "/tutorial" => {
-            help::handle_welcome(ctx.renderer);
-            Ok(())
+            in_one_frame(&mut ctx, |ctx| help::handle_welcome(ctx.renderer))
         }
         "/tutor" => help::handle_tutor(ctx.renderer, ctx.terminal_guard),
         "/add" | "/drop" => add::handle(&path_parts, &mut ctx).await,
