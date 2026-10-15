@@ -540,7 +540,7 @@ mod tests {
         )
         .unwrap();
         assert!(runtime.program().is_file());
-        assert!(runtime.validate(&[storage.clone()]).is_err());
+        assert!(runtime.validate(std::slice::from_ref(&storage)).is_err());
         let root = Arc::new(crate::paths::WorkspaceBinding::capture(fixture.path()).unwrap());
         assert!(
             record_model_root(&root).is_err(),

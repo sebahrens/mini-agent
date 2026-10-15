@@ -57,6 +57,17 @@ class GitBootstrapTests(unittest.TestCase):
         owner = tempfile.TemporaryDirectory(prefix="mini-agent-git-bootstrap-test-")
         self.addCleanup(owner.cleanup)
         self.root = Path(owner.name)
+        toolchain = self.root / "fixture-toolchain"
+        toolchain.mkdir()
+        programs = {}
+        for name in ("cc", "curl-config", "pkg-config"):
+            program = toolchain / name
+            program.write_bytes(("fixture program " + name).encode())
+            program.chmod(0o700)
+            programs[name] = str(program)
+        self.enterContext(patch.object(
+            MODULE.shutil, "which", side_effect=lambda name, **_kwargs: programs.get(name)
+        ))
 
     def test_target_plan_refuses_cross_native_musl_and_msvc(self):
         with patch.object(MODULE, "native_target", return_value=TARGET):

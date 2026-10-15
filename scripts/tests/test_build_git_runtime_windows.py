@@ -202,6 +202,19 @@ class WindowsGitBootstrapTests(unittest.TestCase):
                 with patch.object(MODULE.subprocess, "check_output", side_effect=outputs), self.assertRaises(ValueError):
                     MODULE.toolchain_environment(Path("/ucrt64"))
 
+    def test_required_cmp_preflight_is_fixed_bounded_and_fails_clearly(self):
+        environment = {"HOME": os.environ.get("HOME", ""), "PATH": "/ucrt64/bin:/usr/bin:/bin"}
+        with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            MODULE.require_cmp(environment)
+        run.assert_called_once_with(["/usr/bin/cmp", "-s", "/dev/null", "/dev/null"], env=environment,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=10, check=True)
+        for failure in [FileNotFoundError("cmp"), PermissionError("cmp"),
+                        subprocess.CalledProcessError(2, ["/usr/bin/cmp"]),
+                        subprocess.TimeoutExpired(["/usr/bin/cmp"], 10)]:
+            with patch.object(MODULE.subprocess, "run", side_effect=failure), self.assertRaisesRegex(ValueError, "Required /usr/bin/cmp.*MSYS2 diffutils"):
+                MODULE.require_cmp(environment)
+
     def test_build_publishes_entire_dll_closure_and_cleans_version_failure(self):
         common = MODULE.common_module()
         producer = common.prepare_module()
@@ -231,6 +244,11 @@ class WindowsGitBootstrapTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, command)
 
         with patch.object(MODULE, "ROOT", self.root), patch.object(common, "ROOT", self.root), patch.object(MODULE, "common_module", return_value=common), patch.object(common, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "PATCH_SHA256", common.digest(policy.read_bytes())), patch.object(producer, "SOURCE_SHA256", common.digest(archive.read_bytes())), patch.object(common, "prepare_module", return_value=producer), patch.object(MODULE, "toolchain_environment", return_value={"HOME": os.environ.get("HOME", ""), "SYSTEMROOT": "C:/Windows"}), patch.object(common, "run", side_effect=fake_run), patch.object(MODULE.subprocess, "check_output", return_value="/c/Windows\n"), patch.object(MODULE, "private_directory", side_effect=lambda path, env: path.mkdir(mode=0o700, exist_ok=True)), patch.object(common, "cache_lock", side_effect=AssertionError("fresh Windows builds must not use a POSIX-mode cache lock")):
+            with patch.object(MODULE, "require_cmp", side_effect=ValueError("missing cmp")), patch.object(common, "run") as run:
+                with self.assertRaisesRegex(ValueError, "missing cmp"):
+                    MODULE.bootstrap(output=self.root / "missing-cmp", **arguments)
+                run.assert_not_called()
+                self.assertFalse(arguments["cache_root"].exists(), "preflight must precede cache/build mutation")
             output = MODULE.bootstrap(output=self.root / "success", **arguments)
             self.assertEqual({p.name for p in output.iterdir()}, {"git.exe", "git-remote-http.exe", "git-remote-https.exe", "libcurl-4.dll", "libiconv-2.dll", "bundle.manifest"})
             self.assertEqual((output / "libcurl-4.dll").read_bytes(), (self.bin / "libcurl-4.dll").read_bytes())

@@ -916,8 +916,7 @@ jobs:
           native='git::runner::guarded_runtime_tests::native_sandbox_late_absent_and_nested_config_cannot_reach_host_git'
           cargo test --locked --bin mini-agent "$native" -- --list \
             | tee "$RUNNER_TEMP/guarded-git-native-list.txt"
-          rg --fixed-strings --line-regexp "$native: test" \
-            "$RUNNER_TEMP/guarded-git-native-list.txt"
+          test "$(grep -Fxc "$native: test" "$RUNNER_TEMP/guarded-git-native-list.txt")" -eq 1
           cargo test --locked --bin mini-agent "$native" \
             -- --exact --ignored --nocapture --test-threads=1
           # Hooks are not a default feature. script(1) gives the test process a

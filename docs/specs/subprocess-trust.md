@@ -11,6 +11,21 @@ controls how mini-agent selects a subprocess boundary and records the authority 
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
 
+## Guarded Git runtime inventory
+
+The startup-only original Git `--exec-path` constructor is `TC-INTERNAL-GIT`:
+it runs one fixed read-only query with a cleared allowlisted environment,
+revalidates executable identity before and after the bounded owned child, and
+cannot dispatch model-selected arguments. Model operations still use the
+publisher-approved runtime. The environment-size validator only borrows a
+Command and inspects captured environment data (`NON-PROCESS`); its parser
+roundtrip fixture's unexecuted Command constructor is `TEST-ONLY`.
+
+Frozen-global, native sandbox and Windows service regression assertions inspect
+already-returned stdout, stderr and status data. Their exact source expressions,
+full structural macro digests and occurrence counts are `NON-PROCESS` in the
+checked catalogues. No scanner, launch assertion or negative control changes.
+
 ## Instruction-skill regression inventory
 
 ACP command announcements construct protocol `AvailableCommand` descriptions;

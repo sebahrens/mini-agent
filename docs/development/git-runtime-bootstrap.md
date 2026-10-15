@@ -106,7 +106,7 @@ Provision these signed MSYS2 packages in CI before invoking the helper:
     msystem: UCRT64
     update: true
     install: >-
-      make patch python
+      make patch python diffutils
       mingw-w64-ucrt-x86_64-gcc
       mingw-w64-ucrt-x86_64-curl-winssl
       mingw-w64-ucrt-x86_64-zlib

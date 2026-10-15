@@ -790,6 +790,26 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // Identity-checked startup-only original Git --exec-path query; never model argv.
+    (
+        "src/git/runner.rs",
+        "let mut command = Command::new(&program);",
+        1,
+        "TC-INTERNAL-GIT",
+    ),
+    // Guarded Git config fixture constructor and borrowed environment validator.
+    (
+        "src/git/global_snapshot.rs",
+        "let mut command = tokio::process::Command::new(runner.guarded_runtime().unwrap().program());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "pub(super) fn validate_environment(command: &tokio::process::Command) -> Result<(), String> {",
+        1,
+        "NON-PROCESS",
+    ),
     // Provider credential and HTTP status values are application data.
     // Copilot HTTP/status data and explicitly owned test-only Tokio actors.
     (
@@ -1919,6 +1939,80 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Assertions inspect already-owned Git stdout/stderr/status; never launch methods.
+    (
+        "src/git/global_snapshot.rs",
+        "assert_eq!(output.stdout, b\"retained@example.invalid\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "assert_eq!(output.stdout, b\"approved\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "output.stdout, b\"local preference\\n\",",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "assert_eq!(output.stdout, b\"https://example.invalid/repo\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "assert_eq!(output.stdout, b\"ordinary\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/git/runner.rs", "output.status,", 1, "NON-PROCESS"),
+    (
+        "src/git/runner.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/runner.rs",
+        "output.exit_status.is_some_and(|status| status.success()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/runner.rs",
+        "assert_eq!(output.status, CommandStatus::Completed);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/runner.rs",
+        "assert!(output.exit_status.is_some_and(|status| !status.success()));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/runner.rs",
+        "assert!(output.exit_status.is_some_and(|status| status.success()));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/runner.rs",
+        "assert_eq!(output.stdout, b\"ordinary\\n\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/windows_runtime_tests.rs",
+        "assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), value);",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"old retired\".into()),",
@@ -3311,6 +3405,39 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Exact full assertion tokens for frozen-global and Windows service data.
+    (
+        "src/git/global_snapshot.rs",
+        &[
+            (
+                "5398e26c5e66113bbdbb66079a5ec789a50e4984c0b098f141667a5ef9749703",
+                1,
+            ),
+            (
+                "46b14564c286f28a4d03f6ecfaa681e5f9888e03189053c370757335497aae63",
+                1,
+            ),
+            (
+                "9fb6e06551b42aa2b9cc40592d18182a87475df987b2fe43ac5ad1e310038ad7",
+                1,
+            ),
+            (
+                "5eaf28323eb12f1b2ce84d70659e79aedc8c95e796bf4c67b67bd65f442516b8",
+                1,
+            ),
+            (
+                "1f5cdcadf7b9660a47ba343bd823136ea5a67f15ce74a8f6a259d78e4d394bcf",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/git/windows_runtime_tests.rs",
+        &[(
+            "96656c0351161e9f473d2e6eef4f3b34ad62971d96595e6d5b0ef2228f008b36",
+            1,
+        )],
+    ),
     // Background task status text and saved-status fixture data are not process terminals.
     (
         "src/extras/subagents/background.rs",
@@ -4519,10 +4646,36 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/git/runner.rs",
-        &[(
-            "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
-            1,
-        )],
+        &[
+            (
+                "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
+                1,
+            ),
+            (
+                "8b1b2938a13a5c2c4409c8eb4a604d670a3d43f0a8f6a20bdd30288c927a78bb",
+                1,
+            ),
+            (
+                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                1,
+            ),
+            (
+                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
+                1,
+            ),
+            (
+                "a77bef71f18041ad560cfa5d7f941831db717c3ce841bb19085d4feda4390176",
+                1,
+            ),
+            (
+                "05e3b16e731da032d3b458cb2ffa859da145b5a7adefa4806895742048a416b2",
+                1,
+            ),
+            (
+                "1f5cdcadf7b9660a47ba343bd823136ea5a67f15ce74a8f6a259d78e4d394bcf",
+                1,
+            ),
+        ],
     ),
     (
         "src/git/tool.rs",
@@ -4682,6 +4835,19 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // Guarded Git config fixture constructor and borrowed environment validator.
+    (
+        "src/git/global_snapshot.rs",
+        "let mut command = tokio::process::Command::new(runner.guarded_runtime().unwrap().program());",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/git/global_snapshot.rs",
+        "pub(super) fn validate_environment(command: &tokio::process::Command) -> Result<(), String> {",
+        1,
+        "NON-PROCESS",
+    ),
     // Provider credential and HTTP status values are application data.
     // Copilot HTTP/status data and explicitly owned test-only Tokio actors.
     (

@@ -1,7 +1,10 @@
 """Owning policy tests for native Git prerequisites and preparation before Cargo."""
 from pathlib import Path
 import copy
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 from scripts.tests.test_phase6_ci_workflow import job_body, workflow_jobs
@@ -132,6 +135,24 @@ class GitRuntimeCiTests(unittest.TestCase):
         cls.release = (ROOT / ".github/workflows/release.yml").read_text()
         cls.action = ACTION.read_text()
 
+    def test_linux_native_discovery_requires_one_exact_match_without_rg(self):
+        body = job_body(self.ci, "linux-sandbox-policy")
+        native = "git::runner::guarded_runtime_tests::native_sandbox_late_absent_and_nested_config_cannot_reach_host_git"
+        self.assertIn("native='" + native + "'", body)
+        guard = next(line.strip() for line in body.splitlines()
+                     if line.strip().startswith("test ") and "guarded-git-native-list.txt" in line)
+        self.assertNotIn("rg ", guard)
+        with tempfile.TemporaryDirectory() as directory:
+            environment = os.environ | {"RUNNER_TEMP": directory, "native": native, "PATH": "/usr/bin:/bin"}
+            for rows, accepted in (("", False), (native + ": test\n", True),
+                                   ((native + ": test\n") * 2, False),
+                                   (native + "_other: test\n", False)):
+                with self.subTest(rows=rows):
+                    (Path(directory) / "guarded-git-native-list.txt").write_text(rows)
+                    result = subprocess.run(["/bin/bash", "-euc", guard], env=environment,
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_every_current_windows_cargo_job_prepares_once_before_cargo(self):
         jobs = windows_cargo_jobs(self.ci)
         self.assertEqual(set(jobs), EXPECTED_WINDOWS_JOBS)
@@ -220,6 +241,9 @@ class GitRuntimeCiTests(unittest.TestCase):
         self.assertEqual(self.action.count("if: runner.os == 'Windows'"), 3)
         self.assertIn("msystem: UCRT64", self.action)
         self.assertIn("path-type: minimal", self.action)
+        steps = CHECK_PACKAGE_METADATA.parse_yaml_document(self.action)["runs"]["steps"]
+        provision = next(step for step in steps if step.get("uses", "").startswith("msys2/setup-msys2@"))
+        self.assertIn("diffutils", provision["with"]["install"].split())  # Git GIT-VERSION-GEN requires /usr/bin/cmp.
         for package in ["make patch python", "gcc", "curl-winssl", "zlib", "expat", "libiconv"]:
             self.assertIn(package, self.action)
         self.assertIn("shell: msys2 {0}", self.action)

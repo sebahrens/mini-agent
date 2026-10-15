@@ -36,7 +36,7 @@ runs:
         path-type: minimal
         update: true
         install: >-
-          make patch python zstd
+          make patch python zstd diffutils
           mingw-w64-ucrt-x86_64-gcc
           mingw-w64-ucrt-x86_64-curl-winssl
           mingw-w64-ucrt-x86_64-zlib
