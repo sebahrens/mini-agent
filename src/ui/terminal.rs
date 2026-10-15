@@ -15,6 +15,36 @@ const DROP_RESTORE_ATTEMPTS: usize = 3;
 const DROP_RESTORE_BACKOFF: Duration = Duration::from_millis(10);
 static SYSTEM_TERMINAL_ATTACHED: AtomicBool = AtomicBool::new(false);
 
+// Counts successful terminal resumptions. Attaching clears the screen, so the
+// renderer repaints everything when it sees a new value. Test builds keep it
+// per thread so parallel fixtures never invalidate each other's renderers.
+#[cfg(not(test))]
+static RESUME_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static RESUME_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the terminal was resumed (and its screen cleared).
+pub(crate) fn resume_epoch() -> u64 {
+    #[cfg(not(test))]
+    return RESUME_EPOCH.load(Ordering::Acquire);
+    #[cfg(test)]
+    return RESUME_EPOCH.with(std::cell::Cell::get);
+}
+
+#[cfg(test)]
+pub(crate) fn note_resumed_for_test() {
+    note_resumed();
+}
+
+fn note_resumed() {
+    #[cfg(not(test))]
+    RESUME_EPOCH.fetch_add(1, Ordering::AcqRel);
+    #[cfg(test)]
+    RESUME_EPOCH.with(|epoch| epoch.set(epoch.get() + 1));
+}
+
 pub(crate) fn is_attached() -> bool {
     SYSTEM_TERMINAL_ATTACHED.load(Ordering::Acquire)
 }
@@ -1115,6 +1145,7 @@ impl TerminalGuard {
             .map_err(|error| TerminalLifecycleError::new("resumption", error));
         if result.is_ok() {
             SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
+            note_resumed();
         }
         result
     }
