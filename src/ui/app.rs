@@ -2382,6 +2382,29 @@ impl<'a> App<'a> {
                     }
                     self.drain_tui_diagnostics()?;
                 }
+                Some(result) = async { Some(self.update_notice.as_mut()?.await) } => {
+                    self.update_notice = None;
+                    if let Ok(notice) = result {
+                        self.renderer.write_line(&sanitize_output(&notice), Color::DarkGrey)?;
+                        self.renderer.write_line("", Color::White)?;
+                        self.refresh()?;
+                    }
+                }
+                Some(result) = async { Some((&mut self.skill_commands.as_mut()?.rx).await) } => {
+                    let pending = self.skill_commands.take().expect("polled pending skills");
+                    if let Ok(entries) = result
+                        && !pending.stale
+                        && Arc::ptr_eq(&pending.workspace, &self.ui.workspace)
+                    {
+                        self.input.set_skill_commands(entries);
+                    }
+                }
+                Some(result) = async { Some(self.session_start_task.as_mut()?.await) } => {
+                    self.session_start_task = None;
+                    self.adopt_session_start_result(result)?;
+                    self.ui.join_native_startup().await?;
+                    self.refresh()?;
+                }
                 Some(refresh) = self.git_status_rx.recv() => {
                     self.git_status_in_flight = false;
                     let now = std::time::Instant::now();
@@ -3222,6 +3245,9 @@ impl<'a> App<'a> {
     }
 
     async fn handle_user_event(&mut self, ev: UserEvent) -> anyhow::Result<ControlFlow<(), ()>> {
+        if self.startup_work_pending() && !defers_startup_work(&ev) {
+            self.finish_startup_work().await?;
+        }
         self.input.set_file_workspace(self.ui.workspace.clone());
         // Without /mcp admin state only a completion or Quit can be handled
         // there; skip boxing that large future for every other event. The
