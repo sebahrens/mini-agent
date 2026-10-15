@@ -1248,6 +1248,35 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
                 self.assertIn("README.md is missing required text", errors[0])
                 self.assertIn(f"`{feature}`", errors[0])
 
+    def test_exact_build_guard_rejects_missing_path_dependencies_or_traversal(self) -> None:
+        repository = SCRIPT.parents[1]
+        read_text = Path.read_text
+        for fragment in (
+            '"patched-deps/rig-core"',
+            '"patched-deps/google-cloud-auth"',
+            '"patched-deps/crossterm"',
+            'for dependency in PATH_DEPENDENCIES',
+            'files.push(dependency.join("Cargo.toml"))',
+            'dependency.join("build.rs")',
+            'collect_directory(&dependency.join("src"), &mut files, true)',
+        ):
+            with self.subTest(fragment=fragment):
+                def missing_build_input(path: Path, *args, **kwargs) -> str:
+                    text = read_text(path, *args, **kwargs)
+                    if path == repository / "build_inputs.rs":
+                        self.assertIn(fragment, text)
+                        return text.replace(fragment, "", 1)
+                    return text
+
+                with mock.patch.object(Path, "read_text", missing_build_input):
+                    errors = CHECK_PACKAGE_METADATA.validate_file_fragments(
+                        repository, "mini-agent"
+                    )
+
+                self.assertEqual(1, len(errors))
+                self.assertIn("build_inputs.rs is missing required text", errors[0])
+                self.assertIn(fragment, errors[0])
+
     def test_checked_in_package_recipes_install_compliance_documents(self) -> None:
         self.assertEqual(
             [],
