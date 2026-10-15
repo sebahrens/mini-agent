@@ -5212,7 +5212,7 @@ fn seatbelt_profile_ladder(
             format!("(allow file-read-metadata{metadata_ancestors})\n")
         };
         format!(
-            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -8106,7 +8106,10 @@ echo COMMITTED"#;
                 "(subpath \"/opt/homebrew/Cellar\")",
                 "(subpath \"/opt/homebrew/opt\")",
                 "(subpath \"/Library/Developer/CommandLineTools\")",
+                "(subpath \"/Library/Developer/PrivateFrameworks\")",
                 "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")",
+                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")",
+                "(regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")",
                 "(literal \"/var/select/developer_dir\")",
                 "(literal \"/private/var/select/developer_dir\")",
             ] {
@@ -8122,7 +8125,9 @@ echo COMMITTED"#;
                 "/opt/homebrew/etc",
                 "/opt/homebrew/var",
                 "/Applications",
+                "/Applications/Xcode.app/Contents",
                 "/Library",
+                "/Library/Developer",
                 "/private/var/select",
                 "/Users",
             ] {
@@ -8151,22 +8156,59 @@ echo COMMITTED"#;
                 "empty filters must never become universal denies"
             );
         }
-        let developer =
-            regex::Regex::new("^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)").unwrap();
+        let bundle_reads = [
+            "^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)",
+            "^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)",
+            "^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$",
+        ]
+        .map(|pattern| regex::Regex::new(pattern).unwrap());
         for runtime in [
             "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
             "/Applications/Xcode_26.1.app/Contents/Developer",
             "/Applications/Xcode-beta.app/Contents/Developer/Toolchains",
+            "/Applications/Xcode_16.4.app/Contents/Info.plist",
+            "/Applications/Xcode.app/Contents/SharedFrameworks",
+            "/Applications/Xcode_16.4.app/Contents/SharedFrameworks/DVTSystemPrerequisites.framework/Versions/A/DVTSystemPrerequisites",
         ] {
-            assert!(developer.is_match(runtime), "{runtime}");
+            assert!(
+                bundle_reads.iter().any(|filter| filter.is_match(runtime)),
+                "{runtime}"
+            );
         }
         for outside in [
             "/Applications/Other.app/Contents/Developer",
             "/Users/person/Applications/Xcode.app/Contents/Developer",
+            "/Users/person/Applications/Xcode.app/Contents/SharedFrameworks",
+            "/Applications/Xcode.app/Contents",
             "/Applications/Xcode.app/Contents/DeveloperSecrets",
-            "/Applications/Xcode.app/Contents/SharedFrameworks",
+            "/Applications/Xcode.app/Contents/SharedFrameworksBackup",
+            "/Applications/Xcode.app/Contents/Frameworks",
+            "/Applications/Xcode.app/Contents/PlugIns",
+            "/Applications/Xcode.app/Contents/Info.plist.backup",
+            "/Applications/Xcode.app/Contents/Info.plist/private",
         ] {
-            assert!(!developer.is_match(outside), "{outside}");
+            assert!(
+                !bundle_reads.iter().any(|filter| filter.is_match(outside)),
+                "{outside}"
+            );
+        }
+        let developer_frameworks = Path::new("/Library/Developer/PrivateFrameworks");
+        assert!(
+            Path::new(
+                "/Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/CoreDevice"
+            )
+            .starts_with(developer_frameworks)
+        );
+        for outside in [
+            "/Library/Developer",
+            "/Library/Developer/PrivateFrameworksBackup",
+            "/Library/Other/PrivateFrameworks",
+            "/Users/person/Library/Developer/PrivateFrameworks",
+        ] {
+            assert!(
+                !Path::new(outside).starts_with(developer_frameworks),
+                "{outside}"
+            );
         }
         let open_network = seatbelt_profile_ladder(
             SandboxProfile::HostFull,
