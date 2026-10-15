@@ -447,7 +447,8 @@ pub(crate) fn current_uid() -> u32 {
 
 #[cfg(windows)]
 pub(crate) use windows::{
-    atomic_create, atomic_write, ensure_directory, open_checked, open_existing, validate_checked,
+    atomic_create, atomic_write, create_directory_exclusive, ensure_directory, open_checked,
+    open_existing, validate_checked,
 };
 
 #[cfg(all(windows, feature = "skills"))]
@@ -1036,6 +1037,22 @@ mod windows {
         let result = apply_private_dacl(handle, directory);
         let _ = unsafe { CloseHandle(handle) };
         result
+    }
+
+    /// Create only a new directory, with its explicit user owner and protected
+    /// DACL installed at creation. Never repair or adopt an existing pathname.
+    /// The caller owns cleanup after success and performs retained validation.
+    pub(crate) fn create_directory_exclusive(path: &Path) -> std::io::Result<()> {
+        let descriptor = SecurityDescriptor::private()?;
+        let attributes = descriptor.attributes();
+        let path_wide = wide(path.as_os_str());
+        // SAFETY: the path and complete private descriptor remain live through
+        // this synchronous create; a failed create never opens/repairs a leaf.
+        if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
@@ -2739,6 +2756,54 @@ mod windows {
             assert_eq!(dacl_sddl(&private, false).unwrap(), before);
             assert_eq!(std::fs::read(&private).unwrap(), b"linked unchanged");
         }
+    }
+
+    #[test]
+    fn exclusive_private_directory_has_current_owner_closed_acl_and_never_adopts() {
+        let root = crate::tests::OwnedTestDirectory::new("exclusive-private-directory");
+        let path = root.path().join("new-private");
+        create_directory_exclusive(&path).unwrap();
+        let handle = open_handle(
+            &path,
+            GENERIC_READ | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .unwrap();
+        // SAFETY: open_handle returned an owned valid directory handle; the
+        // File closes it before the test fixture removes the directory tree.
+        let directory = unsafe { std::fs::File::from_raw_handle(handle) };
+        validate_directory_checked(&directory).unwrap();
+        let identity = super::super::checked_file_metadata(&directory).unwrap();
+        let acl = dacl_sddl(&path, true).unwrap();
+        std::fs::write(path.join("retained"), b"untouched").unwrap();
+        assert_eq!(
+            create_directory_exclusive(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(dacl_sddl(&path, true).unwrap(), acl);
+        assert_eq!(std::fs::read(path.join("retained")).unwrap(), b"untouched");
+        super::super::ensure_same_file(
+            &path,
+            &identity,
+            &super::super::checked_path_metadata(&path).unwrap(),
+        )
+        .unwrap();
+        // The ordinary strict admission path still verifies owner and closes
+        // the DACL; creation does not replace or weaken that existing check.
+        ensure_directory(&path).unwrap();
+        validate_directory_checked(&directory).unwrap();
+
+        let existing = root.path().join("unadopted");
+        std::fs::create_dir(&existing).unwrap();
+        let original_acl = dacl_sddl(&existing, true).unwrap();
+        assert!(create_directory_exclusive(&existing).is_err());
+        assert_eq!(dacl_sddl(&existing, true).unwrap(), original_acl);
+        let file = root.path().join("ordinary-file");
+        std::fs::write(&file, b"untouched").unwrap();
+        assert!(create_directory_exclusive(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"untouched");
     }
 
     #[cfg(test)]

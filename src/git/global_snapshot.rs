@@ -401,14 +401,22 @@ impl SnapshotDirectory {
             .canonicalize()
             .map_err(|_| "guarded Git private scratch parent is unavailable")?;
         let path = parent.join(format!("git-snapshot-{}", uuid::Uuid::new_v4()));
+        #[cfg(not(windows))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
+        #[cfg(not(windows))]
         builder
             .create(&path)
+            .map_err(|_| "guarded Git private scratch creation failed")?;
+        // Windows std directory creation can inherit an Administrators owner
+        // under an elevated token. Existing-directory validation must refuse
+        // that owner, so install our explicit private descriptor at creation.
+        #[cfg(windows)]
+        crate::fs::create_private_directory_exclusive(&path)
             .map_err(|_| "guarded Git private scratch creation failed")?;
         let owned = Self(path);
         crate::paths::ensure_private_directory(owned.path())

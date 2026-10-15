@@ -17,6 +17,8 @@ pub(crate) use private::with_open_test_hook as with_private_open_test_hook;
 
 #[cfg(all(test, unix))]
 pub(crate) use private::atomic_write_with_failure as private_atomic_write_with_failure_sync;
+#[cfg(windows)]
+pub(crate) use private::create_directory_exclusive as create_private_directory_exclusive;
 #[cfg(all(test, windows))]
 pub(crate) use private::dacl_sddl as private_dacl_sddl;
 pub(crate) use private::validate_directory_checked as validate_private_directory;

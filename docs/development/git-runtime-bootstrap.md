@@ -90,6 +90,13 @@ The helper and deterministic policy tests exist; an actual hosted Windows build,
 DLL-isolated execution and guarded Git acceptance are still required before
 describing this target as delivered.
 
+Runtime Git configuration mirrors use an exclusively created scratch directory.
+On Windows its current-user owner and protected user/SYSTEM DACL are installed
+at creation through the existing private-directory descriptor. A pre-existing
+leaf is refused without repair or adoption; ordinary strict owner, reparse and
+identity validation and the snapshot owner's cleanup remain in place. This
+avoids inheriting an elevated token's Administrators owner before validation.
+
 Git's pinned `config.mak.uname` has a MINGW compatibility branch. Its CMake path
 defaults to obtaining vcpkg dependencies during configuration, so this helper
 uses the existing Makefile with explicitly preinstalled dependencies instead.
