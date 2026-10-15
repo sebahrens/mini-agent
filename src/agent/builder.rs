@@ -286,10 +286,12 @@ fn build_preamble_with_overrides(
         goal_block,
         persona,
         appended,
+        None,
     )
     .text
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose_preamble(
     context: &ContextFiles,
     reasoning_enabled: bool,
@@ -298,6 +300,7 @@ fn compose_preamble(
     goal_block: Option<&str>,
     persona: Option<&str>,
     appended: Option<&str>,
+    shell_cwd_alias: Option<&Path>,
 ) -> PreambleComposition {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
@@ -421,6 +424,11 @@ fn compose_preamble(
     if !cwd.is_empty() {
         preamble.push_str("\n\nCurrent working directory: ");
         preamble.push_str(&cwd);
+        if let Some(alias) = shell_cwd_alias {
+            preamble.push_str("\nSandboxed shell commands see this workspace at ");
+            preamble.push_str(&alias.display().to_string());
+            preamble.push_str("; file tools keep the working-directory path above.");
+        }
     }
     record_part(&mut parts, &preamble, "Workspace path");
     for content in &extra_files_content {
@@ -513,11 +521,12 @@ fn compose_registered_preamble(
     let mut composition = compose_preamble(
         context,
         reasoning_enabled,
-        Some(workspace_root),
+        Some(sandbox.shell_workspace_spelling().unwrap_or(workspace_root)),
         cli.is_headless(),
         goal_block,
         cli.system_prompt.as_deref(),
         cli.append_system_prompt.as_deref(),
+        sandbox.shell_cwd_alias().as_deref(),
     );
     let has = |name: &str| registered_tools.contains(&name);
     if has("js") {
@@ -1814,6 +1823,157 @@ mod extra_file_tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(content, "hello world");
         assert!(!content.contains("[truncated"));
+    }
+
+    fn workspace_preamble_environment(
+        owned: &crate::tests::OwnedTestDirectory,
+    ) -> crate::tests::ScopedProcessEnv {
+        crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(owned.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(owned.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(owned.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(owned.path().join("cache").into_os_string()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn linux_workspace_preamble_without_fallback_preserves_exact_bytes_and_ranges() {
+        use rig::tool::Tool as _;
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-preamble");
+        let _environment = workspace_preamble_environment(&owned);
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(owned.path()).unwrap());
+        let sandbox =
+            crate::sandbox::Sandbox::new(true, "bwrap").with_workspace_binding(binding.clone());
+        let cli = crate::cli::Cli::default();
+        let context = empty_ctx();
+        let actual = super::compose_registered_preamble(
+            &context,
+            false,
+            binding.root(),
+            &sandbox,
+            &[],
+            &cli,
+            None,
+        );
+        let prior = super::compose_preamble(
+            &context,
+            false,
+            Some(binding.root()),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(actual.text, prior.text);
+        assert_eq!(sandbox.shell_cwd_alias(), None);
+        let mut offset = 0;
+        for (_, range) in &actual.parts {
+            assert_eq!(range.start, offset);
+            offset = range.end;
+        }
+        assert_eq!(offset, actual.text.len());
+        let normal = crate::agent::tools::ShellTool::new(None, None, sandbox.clone(), None);
+        let uncontained = crate::agent::tools::ShellTool::new(
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "bwrap"),
+            None,
+        );
+        assert_eq!(normal.description(), uncontained.description());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_workspace_fallback_notice_comes_from_actual_sandbox_in_preamble_and_schema() {
+        use rig::tool::Tool as _;
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-fallback-preamble");
+        let _environment = workspace_preamble_environment(&owned);
+        let binding = Arc::new(
+            crate::paths::WorkspaceBinding::capture(std::path::Path::new("/dev/shm")).unwrap(),
+        );
+        let sandbox =
+            crate::sandbox::Sandbox::new(true, "bwrap").with_workspace_binding(binding.clone());
+        let alias = sandbox
+            .shell_cwd_alias()
+            .expect("explicit device-root fallback");
+        let actual = super::compose_registered_preamble(
+            &empty_ctx(),
+            false,
+            binding.root(),
+            &sandbox,
+            &[],
+            &crate::cli::Cli::default(),
+            None,
+        );
+        let lines: Vec<_> = actual.text.lines().collect();
+        let cwd = lines
+            .iter()
+            .position(|line| line.starts_with("Current working directory:"))
+            .unwrap();
+        assert_eq!(lines[cwd], "Current working directory: /dev/shm");
+        assert_eq!(
+            lines[cwd + 1],
+            format!(
+                "Sandboxed shell commands see this workspace at {}; file tools keep the working-directory path above.",
+                alias.display()
+            )
+        );
+        let tool = crate::agent::tools::ShellTool::new(None, None, sandbox, None);
+        assert!(
+            tool.description()
+                .contains(&format!("workspace at {}", alias.display()))
+        );
+        let workspace = actual
+            .parts
+            .iter()
+            .find(|(name, _)| *name == "Workspace path")
+            .unwrap();
+        assert!(actual.text[workspace.1.clone()].ends_with(lines[cwd + 1]));
+        assert_eq!(actual.parts.last().unwrap().1.end, actual.text.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_workspace_preamble_retains_captured_spelling_without_granting_an_alias() {
+        use std::os::unix::fs::symlink;
+        let owned = crate::tests::OwnedTestDirectory::new("workspace-preamble-spelling");
+        let _environment = workspace_preamble_environment(&owned);
+        let real = owned.path().join("real");
+        let spelled = owned.path().join("spelled");
+        std::fs::create_dir(&real).unwrap();
+        symlink("real", &spelled).unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&spelled).unwrap());
+        let sandbox =
+            crate::sandbox::Sandbox::new(true, "bwrap").with_workspace_binding(binding.clone());
+        let actual = super::compose_registered_preamble(
+            &empty_ctx(),
+            false,
+            binding.root(),
+            &sandbox,
+            &[],
+            &crate::cli::Cli::default(),
+            None,
+        );
+        assert!(
+            actual
+                .text
+                .ends_with(&format!("Current working directory: {}", spelled.display()))
+        );
+        assert_eq!(binding.root(), real);
+        assert_eq!(sandbox.shell_cwd_alias(), None);
     }
 
     #[test]

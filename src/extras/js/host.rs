@@ -2441,29 +2441,36 @@ fn verify_executable_snapshot_seals(snapshot: &std::fs::File) -> Result<(), Effe
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn provide_snapshot_fd(command: &mut SandboxCommand, snapshot: &std::fs::File) {
-    use std::os::fd::AsRawFd;
+fn provide_snapshot_fd(
+    command: &mut SandboxCommand,
+    snapshot: &std::fs::File,
+) -> Result<(), EffectServiceError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
 
     const BWRAP_SNAPSHOT_FD: libc::c_int = 3;
-    let source_fd = snapshot.as_raw_fd();
-    // SAFETY: this callback uses only async-signal-safe fcntl/dup2 operations between fork and
-    // exec. `PreparedSpawnEffect` owns the sealed memfd until bwrap has been spawned. fd 3 is an
+    // Workspace setup installs fd 197 before this callback executes. The
+    // sealed image itself may occupy that slot, so retain a non-reserved
+    // duplicate now rather than copying whatever 197 holds after setup.
+    let duplicate = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    if duplicate < 0 {
+        return Err(EffectServiceError::BackendFailure);
+    }
+    // SAFETY: fcntl returned one newly owned CLOEXEC descriptor.
+    let source = unsafe { std::fs::File::from_raw_fd(duplicate) };
+    // SAFETY: this callback uses only async-signal-safe dup2 between fork and
+    // exec. The callback owns its exact sealed memfd duplicate until bwrap is spawned. fd 3 is an
     // input to bwrap's `--ro-bind-data`, not an inherited descriptor for the final process.
     unsafe {
         command.as_std_mut().pre_exec(move || {
-            if source_fd == BWRAP_SNAPSHOT_FD {
-                let flags = libc::fcntl(source_fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(source_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            } else if libc::dup2(source_fd, BWRAP_SNAPSHOT_FD) < 0 {
+            let source_fd = source.as_raw_fd();
+            if libc::dup2(source_fd, BWRAP_SNAPSHOT_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
+    Ok(())
 }
 
 impl SpawnEffectService {
@@ -2604,7 +2611,7 @@ impl SpawnEffectService {
                     .sandbox
                     .wrap_command_with_executable_snapshot(&prepared.arguments)
                     .map_err(|_| EffectServiceError::BackendFailure)?;
-                provide_snapshot_fd(&mut command, snapshot);
+                provide_snapshot_fd(&mut command, snapshot)?;
                 command
             }
             PreparedSpawnTarget::OpenedPath(_) => {
@@ -6201,7 +6208,7 @@ mod tests {
         let mut command = sandbox
             .wrap_command_with_executable_snapshot(&prepared.arguments)
             .unwrap();
-        provide_snapshot_fd(&mut command, snapshot);
+        provide_snapshot_fd(&mut command, snapshot).unwrap();
 
         std::fs::write(&executable, "#!/bin/sh\nprintf replacement").unwrap();
         let output = sandbox
@@ -6240,7 +6247,7 @@ mod tests {
         let mut command = sandbox
             .wrap_command_with_executable_snapshot(&prepared.arguments)
             .unwrap();
-        provide_snapshot_fd(&mut command, snapshot);
+        provide_snapshot_fd(&mut command, snapshot).unwrap();
         let output = sandbox
             .output_built_command_with_limits(
                 command,
@@ -6255,6 +6262,67 @@ mod tests {
             .unwrap();
         assert_eq!(output.status, CommandStatus::Completed);
         assert_eq!(output.stdout, b"elf-snapshot");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires native Linux namespaces and descriptor-capable bubblewrap"]
+    #[allow(unsafe_code)]
+    async fn linux_native_bound_snapshot_original_slot_197_keeps_image_and_closes_authority() {
+        use crate::sandbox::linux_workspace_tests::{
+            bound, plain_repository, protected_script, required_backend,
+        };
+        use std::os::fd::{AsRawFd, FromRawFd};
+        required_backend();
+        let owned = crate::tests::OwnedTestDirectory::new("bound-snapshot-native");
+        let workspace = plain_repository(owned.path(), "repo");
+        std::fs::write(workspace.join("README.md"), "original").unwrap();
+        let cache = owned.path().join("runtime-cache");
+        crate::fs::ensure_private_directory(&cache).unwrap();
+        let mut script = protected_script(&workspace, &workspace);
+        script.push_str("test ! -e /proc/self/fd/3 || exit 31; printf SNAPSHOT_IMAGE_PASS");
+        // The primary immutable image is env (not a configured shell).
+        let prepared = PreparedSpawnEffect::capture(
+            "/usr/bin/env",
+            vec!["/bin/sh".into(), "-c".into(), script],
+            true,
+        )
+        .unwrap();
+        let PreparedSpawnTarget::SealedSnapshot(original) = &prepared.target else {
+            panic!("expected sealed Linux image");
+        };
+        // Do not clobber an existing parent-owned fd. A focused native row
+        // owns its test process and forces the lowest available slot to 197.
+        let descriptor = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 197) };
+        assert!(descriptor >= 0);
+        let snapshot = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        assert_eq!(
+            snapshot.as_raw_fd(),
+            197,
+            "native fixture must own reserved slot 197"
+        );
+        verify_executable_snapshot_seals(&snapshot).unwrap();
+        let sandbox = bound(&workspace, &cache).with_shell("/definitely/not-a-shell");
+        let mut command = sandbox
+            .wrap_command_with_executable_snapshot(&prepared.arguments)
+            .unwrap();
+        provide_snapshot_fd(&mut command, &snapshot).unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, crate::sandbox::DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"/workspace is literal output, not a replacement token\nNATIVE_REAL_PATH_PASSSNAPSHOT_IMAGE_PASS");
+        assert_eq!(
+            std::fs::read(workspace.join("created.txt")).unwrap(),
+            b"shared"
+        );
+        verify_executable_snapshot_seals(&snapshot).unwrap();
     }
 
     /// mini-agent-wp7t6: control-byte output at the raw caps escapes six-fold on the wire. The

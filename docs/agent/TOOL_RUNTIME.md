@@ -185,6 +185,34 @@ receive only the non-credential environment even when the operator explicitly di
 containment. The dedicated sandbox cache is `<cache_dir>/sandbox-runtime`; the full application
 cache is not mounted.
 
+Linux general-process commands mount the retained workspace at its canonical real
+path, after runtime readonly mounts and the temporary filesystem. Absolute paths,
+`pwd`, and build artifacts therefore use the same workspace coordinates as the
+file tools. Captured symlink ancestor spellings are recreated without mounting
+their host parents; changed links refuse launch. Scripts and output are never
+translated. Only explicit namespace/control-path collisions use the `/workspace`
+fallback, which the system prompt and shell description announce. Filesystem
+root `/` remains refused. Ordinary setup errors do not trigger a fallback.
+
+`sandbox/workspace_layout.rs` owns this bounded general-process mount layout;
+`paths/workspace_spelling.rs` retains Linux spelling/link metadata alongside the
+existing canonical workspace capability. Neither changes file-tool permission
+roots. Both writable `--bind-fd` and readonly `--ro-bind-fd` support are required:
+bubblewrap checks the mounted workspace identity and consumes descriptor 197
+before executing model code. The immutable brokered-executable path supplies the
+same workspace descriptor and independently consumes its sealed fd 3 image.
+Git metadata masks follow the canonical workspace bind. The broker-only JavaScript
+worker still uses its separate empty-root profile and receives no workspace mount.
+
+The Linux-only test module `sandbox/linux_workspace_tests.rs` owns native real-path,
+spelling, fallback, replacement, cancellation, and build-artifact controls. Together
+with the immutable-image fd197 collision control and an actual offline headless
+shell/read parity test, these are seven lib tests plus one integration test. They
+are explicitly ignored by ordinary test runs and must be run with `--ignored` on
+a descriptor-capable native bubblewrap host; unavailable containment is a failure,
+not a successful skip. Fixture setup stages the identical Rust toolchain under
+the existing readonly `/usr` allowance and creates only owned UUID descendants.
+
 Captured stdout and stderr are returned in separately labelled sections. A
 non-zero exit is retained at the tail even under very small line caps; Unix
 signal deaths report the signal name and number instead of a synthetic `-1`
@@ -1443,3 +1471,22 @@ URLs, and quotes all content. Missing `EXA_API_KEY`, unknown providers, invalid
 arguments and provider HTTP errors give bounded visible errors. The only current
 provider is `exa`; `web-search-provider = "off"` removes search registration.
 The API contract is documented in [Exa's Search reference](https://exa.ai/docs/reference/search).
+
+## Native Linux workspace CI controls
+
+The existing `linux-sandbox-policy` CI job uses the Ubuntu 22.04 runner with its
+unchanged host security policy. It builds bubblewrap 0.11.0 from a checksum-pinned
+upstream archive using `scripts/install-ci-bubblewrap.sh --pinned-native`. APT uses
+only the selected Ubuntu distro source, and the installer copies only the compiled
+root-owned non-setuid binary. It does not change AppArmor, seccomp or user-namespace
+settings. The runner label is not containment evidence: existing worker probes,
+rlimit/seccomp finalization, and both JS/skills adversarial gates still must pass.
+
+Seven exact native workspace/snapshot tests and one actual offline headless
+shell/read test are discovered individually and run explicitly with `--ignored`;
+zero tests, a replaced identity, or a successful process reporting zero passes
+fails the gate. Full native logs and kernel/bubblewrap/toolchain identities are
+retained as CI artifacts. The identical Rust toolchain is staged under the existing
+readonly `/usr` allowance only for fixture use; no sandbox mount is widened.
+Owned fixture directories are retired after settlement. These controls do not
+resolve the separately recorded whole-filesystem-root `/` refusal.

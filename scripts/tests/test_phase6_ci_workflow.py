@@ -109,6 +109,83 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "tests::sandbox_platform_tests::", "--test-threads=1",
         ])
 
+    def test_native_workspace_gate_keeps_host_policy_and_exact_discovery(self) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        self.assertIn("runs-on: ubuntu-22.04", linux)
+        self.assertIn("scripts/install-ci-bubblewrap.sh --pinned-native", linux)
+        self.assertNotIn("sysctl -w", linux)
+        self.assertNotIn("--privileged", linux)
+        self.assertNotIn("seccomp=unconfined", linux)
+        self.assertIn("sysctl kernel.apparmor_restrict_unprivileged_userns", linux)
+        self.assertIn('test "${#names[@]}" -eq 7', linux)
+        self.assertIn('--exact --ignored --nocapture --test-threads=1', linux)
+        self.assertIn("test result: ok. 1 passed;", linux)
+        self.assertIn("headless-list.txt", linux)
+        self.assertIn("linux_native_shell_and_read_share_the_actual_headless_workspace", linux)
+        self.assertIn("name: Archive native Linux workspace proof\n        if: always()", linux)
+        self.assertIn("name: Retire owned native workspace fixtures\n        if: always()", linux)
+        # Existing worker checks remain enforced on the new native runner.
+        self.assertIn("linux_js_worker_containment -- --ignored --nocapture", linux)
+        self.assertIn("Run Phase 6 adversarial suites under js and skills", linux)
+
+    def test_native_workspace_names_match_the_actual_defining_sources(self) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        step = linux.split("- name: Test native Linux workspace real paths and snapshot authority", 1)[1].split("- name:", 1)[0]
+        names = re.findall(r"^\s+'([^']+::linux_native[^']+)'$", step, re.M)
+        actual = set()
+        for filename, prefix in [
+            ("src/sandbox/linux_workspace_tests.rs", "sandbox::linux_workspace_tests::"),
+            ("src/extras/js/host.rs", "extras::js::host::tests::"),
+        ]:
+            source = (REPOSITORY_ROOT / filename).read_text()
+            actual.update(prefix + name for name in re.findall(r"async fn (linux_native_\w+)\(", source))
+        self.assertEqual(len(actual), 7)
+        self.assertEqual(set(names), actual)
+        self.assertEqual(len(names), 7)
+        integration = "linux_native_shell_and_read_share_the_actual_headless_workspace"
+        source = (REPOSITORY_ROOT / "tests/headless_json.rs").read_text()
+        self.assertEqual(len(re.findall(r"(?:async )?fn " + integration + r"\(", source)), 1)
+        self.assertIn(integration, step)
+
+    def test_native_workspace_step_rejects_zero_tests_and_false_success(self) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        step = linux.split("- name: Test native Linux workspace real paths and snapshot authority", 1)[1].split("- name:", 1)[0]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1])
+        required_names = re.findall(r"^\s+'([^']+::linux_native[^']+)'$", script, re.M)
+        self.assertEqual(len(required_names), 7)
+        for count, pass_count, wrong_identity, succeeds in [(7, 1, False, True), (0, 1, False, False), (6, 1, False, False), (7, 0, False, False), (7, 1, True, False)]:
+            with self.subTest(count=count, pass_count=pass_count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                cargo = binary / "cargo"
+                discovered = required_names[:count]
+                if wrong_identity:
+                    discovered[-1] = "sandbox::linux_native_wrong_identity"
+                cargo.write_text(
+                    f"#!{sys.executable}\nimport sys\n"
+                    "args=sys.argv[1:]\n"
+                    "if '--list' in args:\n"
+                    " if '--test' in args: print('linux_native_shell_and_read_share_the_actual_headless_workspace: test')\n"
+                    f" else:\n  for name in {discovered!r}: print(name+': test')\n"
+                    f"else: print('test result: ok. {pass_count} passed; 0 failed; 0 ignored;')\n"
+                )
+                cargo.chmod(0o755)
+                for name in ["bwrap", "rustc"]:
+                    stub = binary / name
+                    stub.write_text("#!/bin/sh\nprintf 'fixture version\n'\n")
+                    stub.chmod(0o755)
+                # This simulator starts eight separate test subprocesses;
+                # allow bounded scheduling slack on a busy developer host.
+                result = subprocess.run(["bash", "-c", script], cwd=root,
+                    env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                if succeeds:
+                    logs = list((root / "target/native-workspace-evidence").glob("*.log"))
+                    self.assertEqual(len(logs), 8)
+                    self.assertTrue(all("test result: ok. 1 passed;" in log.read_text() for log in logs))
+
     SHARED_ADVERSARIAL_FILTERS = (
         "extras::js::tests::worker_protocol::",
         "extras::js::tests::worker_runtime::worker_runtime_",
@@ -219,7 +296,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         requirements = {
             "linux-sandbox-policy": (
                 "linux_js_worker_containment",
-                "ubuntu-latest",
+                "ubuntu-22.04",
             ),
             "macos-worker-containment-gate": (
                 "MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE=production-binary-v1",
@@ -813,10 +890,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("bash scripts/install-ci-bubblewrap.sh", linux)
         self.assertIn("kernel.apparmor_restrict_unprivileged_userns", linux)
-        self.assertIn(
-            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
-            linux,
-        )
+        self.assertNotIn("sysctl -w", linux)
+        self.assertIn("Record unchanged host namespace policy", linux)
 
         macos = job_body(self.workflow, "macos-worker-containment-gate")
         self.assertIn("TMPDIR: /private/tmp", macos)
@@ -1156,6 +1231,68 @@ class CiSuccessPolicyTests(unittest.TestCase):
 
 
 class BubblewrapInstallerTests(unittest.TestCase):
+    def test_pinned_native_archive_and_each_stage_fail_closed_without_policy_changes(self) -> None:
+        installer = REPOSITORY_ROOT / "scripts/install-ci-bubblewrap.sh"
+        text = installer.read_text()
+        self.assertNotIn("sysctl -w", text)
+        self.assertIn('"$pinned_native" -eq 1 && ! -r "$default_sources"', text)
+        expected_hash = "cfeeb15fcc47d177d195f06fdf0847e93ee3aa6bf46f6ac0a141fa142759e2c3"
+        phases = ["update", "install", "curl", "checksum", "tar", "meson", "ninja", "install_binary", "probe", "fd-probe"]
+        for failure in ["none", "curl", "checksum", "meson", "install_binary", "probe", "fd-probe"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sources = root / "ubuntu sources.sources"
+                sources.write_text("Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\nSuites: jammy\nComponents: universe\n")
+                log = root / "calls.jsonl"
+                binary = root / "bin"
+                binary.mkdir()
+                builds = root / "builds"
+                builds.mkdir()
+                sudo = binary / "sudo"
+                sudo.write_text('#!/bin/sh\nexec "$@"\n')
+                sudo.chmod(0o755)
+                stub_source = (
+                    f"#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n"
+                    "name=Path(sys.argv[0]).name; args=sys.argv[1:]; options={}\n"
+                    "while args and args[0]=='-o' and name=='apt-get':\n"
+                    " key,value=args[1].split('=',1);options[key]=value;args=args[2:]\n"
+                    "phase={'sha256sum':'checksum','install':'install_binary'}.get(name,name)\n"
+                    "if name=='apt-get': phase=args[0]\n"
+                    "if name=='bwrap': phase='probe' if args==['--version'] else 'fd-probe'\n"
+                    "stdin=sys.stdin.read() if name=='sha256sum' else ''\n"
+                    f"with open({str(log)!r},'a') as out:out.write(json.dumps([phase,args,options,stdin])+'\\n')\n"
+                    "if name=='apt-get':\n"
+                    f" assert options=={{'Dir::Etc::sourcelist':{str(sources)!r},'Dir::Etc::sourceparts':'-'}}\n"
+                    f"if phase=={failure!r}:sys.exit(19)\n"
+                    "if name=='bwrap':print('bubblewrap 0.11.0')\n"
+                )
+                for name in ["apt-get", "curl", "sha256sum", "tar", "meson", "ninja", "install", "bwrap"]:
+                    stub = binary / name
+                    stub.write_text(stub_source)
+                    stub.chmod(0o755)
+                result = subprocess.run(["bash", str(installer), "--pinned-native", str(sources)],
+                    env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""), "TMPDIR": str(builds)},
+                    capture_output=True, text=True, timeout=5)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                wanted = phases if failure == "none" else phases[:phases.index(failure)+1]
+                self.assertEqual([call[0] for call in calls], wanted, result.stderr)
+                self.assertEqual(result.returncode, 0 if failure == "none" else 19, result.stderr)
+                self.assertEqual(list(builds.iterdir()), [])
+                by_phase = {call[0]: call for call in calls}
+                if "curl" in by_phase:
+                    args = by_phase["curl"][1]
+                    self.assertIn("https://github.com/containers/bubblewrap/archive/refs/tags/v0.11.0.tar.gz", args)
+                    self.assertIn("--disable", args)
+                    self.assertIn("--max-time", args)
+                if "checksum" in by_phase:
+                    self.assertTrue(by_phase["checksum"][3].startswith(expected_hash + "  "))
+                    self.assertEqual(by_phase["checksum"][1], ["--check", "--status"])
+                if "install_binary" in by_phase:
+                    self.assertEqual(by_phase["install_binary"][1][-1], "/usr/bin/bwrap")
+                    self.assertEqual(by_phase["install_binary"][1][:7], ["-o", "root", "-g", "root", "-m", "0755", "--"])
+                if "fd-probe" in by_phase:
+                    self.assertEqual(by_phase["fd-probe"][1], ["--bind-fd", "0", "/", "--ro-bind-fd", "0", "/", "--version"])
+
     def test_isolated_sources_and_failures_preserve_the_install_gate(self) -> None:
         for failure in ["none", "update", "install", "probe", "missing"]:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:

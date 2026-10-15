@@ -78,14 +78,21 @@ impl Tool for ShellTool {
             .shell_capability()
             .map(|capability| capability.dialect().name())
             .unwrap_or("configured shell");
-        format!(
+        let mut description = format!(
             "Execute a {dialect} command in the current working directory. Foreground commands have a hard \
              {} second deadline and bounded output. Set background=true for builds, test suites, or servers; \
              this returns a session-scoped job id for the job_status tool and uses a 24 hour maximum. The \
              optional timeout can lower the applicable deadline. Commands keep the same sandbox and permission \
              policy in either mode.",
             self.foreground_timeout.as_secs()
-        )
+        );
+        if let Some(alias) = self.sandbox.shell_cwd_alias() {
+            description.push_str(&format!(
+                " Sandboxed shell commands see this workspace at {}; file tools keep the working-directory path stated in the system prompt.",
+                alias.display()
+            ));
+        }
+        description
     }
 
     fn parameters(&self) -> serde_json::Value {

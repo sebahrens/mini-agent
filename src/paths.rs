@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+mod workspace_spelling;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoundedUtf8Read {
     Content(String),
@@ -67,6 +70,8 @@ pub(crate) fn read_utf8_prefix(
 #[derive(Debug)]
 pub(crate) struct WorkspaceBinding {
     root: PathBuf,
+    #[cfg(target_os = "linux")]
+    spelling: workspace_spelling::WorkspaceSpelling,
     directory: std::fs::File,
     capability: cap_std::fs::Dir,
     identity: crate::fs::CheckedMetadata,
@@ -149,8 +154,12 @@ impl WorkspaceBinding {
                 "workspace path is not a directory",
             ));
         }
+        #[cfg(target_os = "linux")]
+        let spelling = workspace_spelling::WorkspaceSpelling::capture(path, &root)?;
         Ok(Self {
             root,
+            #[cfg(target_os = "linux")]
+            spelling,
             directory,
             capability,
             identity: metadata,
@@ -174,6 +183,8 @@ impl WorkspaceBinding {
         let capability = duplicate(&self.capability, &directory)?;
         let clone = Self {
             root: self.root.clone(),
+            #[cfg(target_os = "linux")]
+            spelling: self.spelling.clone(),
             directory,
             capability,
             identity: self.identity.clone(),
@@ -193,6 +204,16 @@ impl WorkspaceBinding {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spelled_root(&self) -> &Path {
+        self.spelling.path()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spelling_links(&self) -> &[workspace_spelling::WorkspaceLink] {
+        self.spelling.links()
     }
 
     pub(crate) fn logical_relative_path(&self, path: &Path) -> io::Result<PathBuf> {
@@ -880,6 +901,10 @@ impl WorkspaceBinding {
     /// Fail closed if the canonical target or its directory identity changed.
     /// Consumers call this immediately before each filesystem/process effect.
     pub(crate) fn validate(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        self.spelling
+            .validate()
+            .map_err(|_| "workspace spelling changed after session creation".to_string())?;
         let canonical = std::fs::canonicalize(&self.root)
             .map_err(|error| format!("workspace binding is unavailable: {error}"))?;
         if canonical != self.root {

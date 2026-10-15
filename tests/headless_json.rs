@@ -2114,6 +2114,98 @@ fn scripted_provider(
     })
 }
 
+#[cfg(all(target_os = "linux", feature = "goal"))]
+#[test]
+#[ignore = "requires native Linux namespaces and descriptor-capable bubblewrap"]
+fn linux_native_shell_and_read_share_the_actual_headless_workspace() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join("README.md"), "same-workspace-native-proof").unwrap();
+    let server = scripted_provider(
+        &root,
+        "[quick_models.native]\nprovider=\"local-test\"\nmodel=\"test\"\ninput_token_cost=0\noutput_token_cost=0\ncache_read_token_cost=0\ncache_write_token_cost=0\n",
+        vec![
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"native-pwd","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd -P\"}"}}]}),
+                "tool_calls",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"native-read","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]}),
+                "tool_calls",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","content":"yes, both tools see the same directory"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut command = root.command();
+    command
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--sandbox",
+            "--sandbox-backend",
+            "bwrap",
+            "--no-context-files",
+            "--no-session",
+            "--tools",
+            "shell,read",
+            "--allow",
+            "shell:pwd -P",
+            "--allow",
+            "read:README.md",
+            "--provider",
+            "local-test",
+            "--model",
+            "native",
+            "-p",
+            "run pwd and read README.md; do both tools see the same directory?",
+        ]);
+    let output = bounded_output(command);
+    // Join the bounded fixture before any assertion can unwind its ownership.
+    let requests = server.join().unwrap();
+    let requests = requests
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"yes, both tools see the same directory\n");
+    assert_eq!(requests.len(), 3);
+    let actual_root = root.0.canonicalize().unwrap().display().to_string();
+    let system = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "system")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(system.contains(&format!("Current working directory: {actual_root}")));
+    assert!(!system.contains("Sandboxed shell commands see this workspace at"));
+    let results: Vec<_> = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&actual_root)
+    );
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("same-workspace-native-proof")
+    );
+}
+
 /// Ctrl-C while the completion judge is waiting on its provider ends the run
 /// with the goal still active and the round uncounted, for a judge on the
 /// session's own model and for one on another provider (mini-agent-e3nb6).

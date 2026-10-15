@@ -1240,7 +1240,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/host.rs",
         "assert_eq!(output.status, CommandStatus::Completed);",
-        2,
+        3,
         "NON-PROCESS",
     ),
     (
@@ -1943,6 +1943,60 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_fetch.rs",
         "assert_eq!(output.as_str(), page);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.stdout, b\"/workspace is literal output, not a replacement token\\nNATIVE_REAL_PATH_PASSSNAPSHOT_IMAGE_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "output.exit_status.is_some_and(|status| status.success()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "assert_eq!(output.status, CommandStatus::Cancelled);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "assert_eq!(output.status, CommandStatus::Completed);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "output.stdout,",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "output.exit_status.is_some_and(|status| status.success()),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        "output.status,",
         1,
         "NON-PROCESS",
     ),
@@ -3412,6 +3466,32 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Native real-path tests inspect bounded CommandOutput data only.
+    (
+        "src/sandbox/linux_workspace_tests.rs",
+        &[
+            (
+                "8b1b2938a13a5c2c4409c8eb4a604d670a3d43f0a8f6a20bdd30288c927a78bb",
+                1,
+            ),
+            (
+                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                2,
+            ),
+            (
+                "50a8323724d9040f728c70e55be039dafab8ed4d3dec119f235b5166104199d3",
+                3,
+            ),
+            (
+                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
+                1,
+            ),
+            (
+                "fe5b6e0cbd6641269701daf5ba28e00171b8e8e60fbd76d3ac873c4a35fabc6a",
+                1,
+            ),
+        ],
+    ),
     // Exact full assertion tokens for frozen-global and Windows service data.
     (
         "src/git/global_snapshot.rs",
@@ -4197,7 +4277,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
-                2,
+                3,
             ),
             (
                 "4b4be55dac813da63579ff80d76a858484598b955c750180378e47acac2ec2b1",
@@ -4221,6 +4301,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "e44a0994c1278803b6647fefeb9a3c5bfeecf526b1c19fcc05d8fdb2a174d406",
+                1,
+            ),
+            (
+                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                1,
+            ),
+            (
+                "1555628fb189c32e86c4784f05d35633b042cf00398f75582580d5e20c4b5012",
                 1,
             ),
         ],
@@ -5379,7 +5467,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/host.rs",
         "assert_eq!(output.status, CommandStatus::Completed);",
-        2,
+        3,
         "NON-PROCESS",
     ),
     (

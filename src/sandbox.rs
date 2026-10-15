@@ -20,10 +20,13 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod git_metadata;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod linux_workspace_tests;
 #[cfg(any(windows, test))]
 mod profile_journal;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
+mod workspace_layout;
 
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
@@ -803,8 +806,8 @@ fn bwrap_path() -> Option<&'static Path> {
 #[cfg(target_os = "linux")]
 static BWRAP_BIND_FD: OnceLock<bool> = OnceLock::new();
 
-/// Whether the trusted bubblewrap understands `--ro-bind-fd` (bubblewrap
-/// 0.8.0 and later). The probe only parses options: `--version` exits before
+/// Whether the trusted bubblewrap understands BOTH writable and readonly
+/// descriptor binds. The probe only parses options: `--version` exits before
 /// any namespace is created, and an older bubblewrap rejects the unknown
 /// option with a failing status.
 #[cfg(target_os = "linux")]
@@ -813,12 +816,17 @@ fn bwrap_supports_bind_fd(bwrap: &Path) -> bool {
         let mut command = std::process::Command::new(bwrap);
         command
             .env_clear()
-            .args(["--ro-bind-fd", "0", "/", "--version"])
+            .args(bwrap_descriptor_probe_args())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         bounded_backend_probe(command).is_ok()
     })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bwrap_descriptor_probe_args() -> [&'static str; 7] {
+    ["--bind-fd", "0", "/", "--ro-bind-fd", "0", "/", "--version"]
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -841,7 +849,7 @@ fn bwrap_git_metadata_binds_with_capability(
 ) -> Result<git_metadata::BwrapGitMetadataBinds, String> {
     if !supported {
         return Err(
-            "bubblewrap must support --ro-bind-fd (0.8.0 or later); refusing launch without Git metadata protection"
+            "bubblewrap must support --bind-fd and --ro-bind-fd; refusing launch without retained workspace and Git metadata protection"
                 .to_string(),
         );
     }
@@ -2172,9 +2180,10 @@ impl Sandbox {
                 .to_string()
         })?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root)?;
-        Ok(self
-            .build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata)
-            .into())
+        let mut command =
+            self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata)?;
+        self.bind_workspace_cwd(&mut command)?;
+        Ok(command.into())
     }
 
     #[cfg(feature = "js")]
@@ -2294,7 +2303,8 @@ impl Sandbox {
         })?;
         let git_metadata =
             bwrap_git_metadata_binds(bwrap, &self.canonical_workspace_root(&requested_cwd)?)?;
-        let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata);
+        let mut command =
+            self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata)?;
         self.bind_workspace_cwd(&mut command)?;
         Ok(command.into())
     }
@@ -2819,8 +2829,8 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
-    ) -> Command {
-        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata);
+    ) -> Result<Command, String> {
+        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
         append_bwrap_isolation(&mut cmd, &sandbox_cwd);
         cmd.args(["--new-session", "--die-with-parent", "--"]);
@@ -2841,7 +2851,7 @@ impl Sandbox {
                 .arg(command);
         }
         configure_new_session_child_lifetime(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     #[cfg(feature = "js")]
@@ -2853,8 +2863,8 @@ impl Sandbox {
         cache_dir: &Path,
         arguments: &[String],
         git_metadata: git_metadata::BwrapGitMetadataBinds,
-    ) -> Command {
-        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata);
+    ) -> Result<Command, String> {
+        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
         cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
         // fd 3 is consumed by bubblewrap while constructing this read-only executable file.
         // It is deliberately not listed under `--preserve-fds`, so neither the target nor any
@@ -2876,7 +2886,7 @@ impl Sandbox {
         ]);
         cmd.args(arguments);
         configure_new_session_child_lifetime(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     fn build_bwrap_base_command(
@@ -2885,39 +2895,78 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
-    ) -> Command {
+    ) -> Result<Command, String> {
+        let layout =
+            workspace_layout::WorkspaceLayout::new(self.workspace_binding.as_deref(), cwd)?;
         let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
         for (key, value) in self.get_essential_env() {
             cmd.arg("--setenv").arg(key).arg(value);
         }
         cmd.args(["--setenv", "TMPDIR", "/tmp"]);
-        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
-            cmd.args(["--ro-bind-try", path, path]);
+        for (source, destination) in &layout.runtime_ro {
+            cmd.arg("--ro-bind-try").arg(source).arg(destination);
         }
         cmd.args(["--dir", "/etc"]);
         for path in ["/etc/localtime", "/etc/ld.so.cache"] {
             cmd.args(["--ro-bind-try", path, path]);
         }
-        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-        let sandbox_cwd = self.sandbox_cwd(cwd);
-        if sandbox_cwd != cwd {
-            cmd.args(["--dir", "/workspace"]);
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs"])
+            .arg(&layout.temporary_root);
+        // Empty-root layout only: never create aliases or directories after
+        // a writable workspace/cache bind, where setup could mutate the host.
+        for directory in &layout.alias_directories {
+            cmd.arg("--dir").arg(directory);
         }
-        cmd.arg("--bind").arg(cwd).arg(&sandbox_cwd);
+        for (path, target) in &layout.aliases {
+            cmd.arg("--symlink").arg(target).arg(path);
+        }
+        if self.workspace_binding.is_some() && cfg!(unix) {
+            // --bind-fd additionally checks the mounted dev/inode against
+            // the retained descriptor before allowing the child to run.
+            #[cfg(unix)]
+            cmd.arg("--bind-fd")
+                .arg(WORKSPACE_AUTHORITY_FD.to_string())
+                .arg(&layout.destination);
+        } else {
+            cmd.arg("--bind").arg(cwd).arg(&layout.destination);
+        }
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
         // After the writable workspace bind, so the read-only Git metadata
         // binds cover it.
-        git_metadata.apply(&mut cmd, &sandbox_cwd);
-        cmd
+        git_metadata.apply(&mut cmd, &layout.destination);
+        Ok(cmd)
     }
 
     fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
-        if self.workspace_binding.is_some() && cfg!(unix) {
-            PathBuf::from("/workspace")
+        self.workspace_binding.as_ref().map_or_else(
+            || cwd.to_path_buf(),
+            |workspace| workspace_layout::destination(workspace.root(), true),
+        )
+    }
+
+    /// Announce only the exceptional Linux general-process cwd remapping.
+    /// Pure: never probes a backend, creates storage or changes authority.
+    pub(crate) fn shell_cwd_alias(&self) -> Option<PathBuf> {
+        if cfg!(target_os = "linux") && self.enabled && self.backend == "bwrap" {
+            self.workspace_binding.as_ref().and_then(|workspace| {
+                workspace_layout::forbidden_destination(workspace.root())
+                    .then(|| self.sandbox_cwd(workspace.root()))
+            })
         } else {
-            cwd.to_path_buf()
+            None
         }
+    }
+
+    pub(crate) fn shell_workspace_spelling(&self) -> Option<&Path> {
+        #[cfg(target_os = "linux")]
+        if self.enabled && self.backend == "bwrap" {
+            return self
+                .workspace_binding
+                .as_ref()
+                .map(|workspace| workspace.spelled_root());
+        }
+        None
     }
 
     /// Runs a command on a background task so dropping the receiver is an
@@ -6352,13 +6401,15 @@ mod sandbox_tests {
     #[test]
     fn linux_sandbox_policy_command_matches_capability_matrix() {
         let sandbox = Sandbox::new(true, "bwrap");
-        let cmd = sandbox.build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            Path::new("/workspace"),
-            Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::none(),
-        );
+        let cmd = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                Path::new("/workspace"),
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::none(),
+            )
+            .unwrap();
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -6418,13 +6469,15 @@ mod sandbox_tests {
             crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
         );
         let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(binding);
-        let command = sandbox.build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            Path::new("/proc/self/fd/197"),
-            Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::none(),
-        );
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                Path::new("/proc/self/fd/197"),
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::none(),
+            )
+            .unwrap();
         let args: Vec<String> = command
             .as_std()
             .get_args()
@@ -6445,6 +6498,72 @@ mod sandbox_tests {
             .position(|arg| arg == "printf sandboxed")
             .unwrap();
         assert!(close < model_command);
+    }
+
+    #[test]
+    fn bwrap_descriptor_capability_probe_covers_writable_and_readonly_options() {
+        assert_eq!(
+            bwrap_descriptor_probe_args(),
+            ["--bind-fd", "0", "/", "--ro-bind-fd", "0", "/", "--version"]
+        );
+        let error = bwrap_git_metadata_binds_with_capability(Path::new("does-not-exist"), false)
+            .unwrap_err();
+        assert!(error.contains("--bind-fd and --ro-bind-fd"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_bwrap_real_path_overlay_follows_runtime_and_tmpfs_without_rewriting() {
+        let owned = crate::tests::OwnedTestDirectory::new("bwrap-real-path");
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(owned.path()).unwrap());
+        let root = binding.root().to_path_buf();
+        let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(binding);
+        let script = r#"printf '%s\n' '/workspace /home/user $PWD'; printf '%s' 'unchanged'"#;
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                script,
+                Path::new("/proc/self/fd/197"),
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::none(),
+            )
+            .unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+        let bind = args
+            .windows(3)
+            .position(|window| {
+                window[0] == "--bind-fd" && window[1] == "197" && window[2] == root.as_os_str()
+            })
+            .unwrap();
+        let temporary = args
+            .windows(2)
+            .position(|window| window[0] == "--tmpfs")
+            .unwrap();
+        assert!(temporary < bind);
+        for position in args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (*arg == "--ro-bind-try").then_some(index))
+        {
+            assert!(position < bind);
+        }
+        let chdir = args
+            .windows(2)
+            .find(|window| window[0] == "--chdir")
+            .unwrap();
+        assert_eq!(chdir[1], root.as_os_str());
+        assert_eq!(args.last().unwrap(), &std::ffi::OsStr::new(script));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| **arg == std::ffi::OsStr::new(script))
+                .count(),
+            1
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|window| window[0] == "--bind" && window[1] == "/proc/self/fd/197")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -6586,7 +6705,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     fn descriptor_binds(args: &[String]) -> Vec<(String, String)> {
         args.windows(3)
-            .filter(|window| window[0] == "--bind-fd" || window[0] == "--ro-bind-fd")
+            .filter(|window| {
+                (window[0] == "--bind-fd" || window[0] == "--ro-bind-fd") && window[1] != "197"
+            })
             .map(|window| {
                 assert!(
                     window[1].parse::<i32>().is_ok_and(|fd| fd >= 256),
@@ -6605,11 +6726,16 @@ mod sandbox_tests {
         let root = root.to_string_lossy();
         let workspace_bind = args
             .windows(3)
-            .position(|window| window[0] == "--bind" && window[1] == source && window[2] == root)
+            .position(|window| {
+                (window[0] == "--bind" && window[1] == source && window[2] == root)
+                    || (window[0] == "--bind-fd" && window[1] == "197" && window[2] == root)
+            })
             .expect("writable workspace bind");
         let first_descriptor_bind = args
-            .iter()
-            .position(|arg| arg == "--bind-fd" || arg == "--ro-bind-fd")
+            .windows(3)
+            .position(|window| {
+                (window[0] == "--bind-fd" || window[0] == "--ro-bind-fd") && window[1] != "197"
+            })
             .expect("Git metadata descriptor binds");
         assert!(
             workspace_bind < first_descriptor_bind,
@@ -6652,13 +6778,15 @@ mod sandbox_tests {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let binds = bwrap_git_metadata_binds_with_capability(&workspace, true).unwrap();
-        let command = Sandbox::new(true, "bwrap").build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            &workspace,
-            Path::new("/cache/mini-agent"),
-            binds,
-        );
+        let command = Sandbox::new(true, "bwrap")
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                binds,
+            )
+            .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
 
@@ -6668,39 +6796,39 @@ mod sandbox_tests {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "bwrap");
-        let command = sandbox.build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            &workspace,
-            Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
-        );
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+            )
+            .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
 
     #[cfg(unix)]
     #[test]
-    fn bound_bwrap_model_command_binds_git_metadata_under_the_workspace_alias() {
+    fn bound_bwrap_model_command_binds_git_metadata_under_the_real_workspace() {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
         let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(binding);
         let authority = Path::new("/proc/self/fd/197");
-        let command = sandbox.build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            authority,
-            Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::open(
-                &sandbox.canonical_workspace_root(&workspace).unwrap(),
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                authority,
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::open(
+                    &sandbox.canonical_workspace_root(&workspace).unwrap(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
-        assert_git_metadata_bound_after_workspace(
-            &command_argv(&command),
-            authority,
-            Path::new("/workspace"),
-        );
+            .unwrap();
+        assert_git_metadata_bound_after_workspace(&command_argv(&command), authority, &workspace);
     }
 
     #[cfg(unix)]
@@ -6709,13 +6837,15 @@ mod sandbox_tests {
         let (_scratch, root) = canonical_scratch();
         let (_main, worktree) = git_metadata::fixtures::linked_worktree(&root, &root);
         let sandbox = Sandbox::new(true, "bwrap");
-        let command = sandbox.build_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "printf sandboxed",
-            &worktree,
-            Path::new("/cache/mini-agent"),
-            git_metadata::BwrapGitMetadataBinds::open(&worktree).unwrap(),
-        );
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "printf sandboxed",
+                &worktree,
+                Path::new("/cache/mini-agent"),
+                git_metadata::BwrapGitMetadataBinds::open(&worktree).unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             descriptor_binds(&command_argv(&command)),
             vec![(

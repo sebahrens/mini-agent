@@ -867,7 +867,7 @@ jobs:
   linux-sandbox-policy:
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -881,13 +881,90 @@ jobs:
           rustflags: ''
 
       - name: Install bubblewrap
-        run: bash scripts/install-ci-bubblewrap.sh
+        run: bash scripts/install-ci-bubblewrap.sh --pinned-native
 
-      - name: Enable the hosted runner's unprivileged namespace boundary
+      - name: Record unchanged host namespace policy
         shell: bash
         run: |
-          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          uname -r
+          # Report, never disable or relax host policy. Real probes below fail
+          # closed if this runner cannot support the delivered boundaries.
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+
+      - name: Prepare owned native workspace fixtures
+        id: native_workspace_fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e /usr/mini-agent-native-tests
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /usr/mini-agent-native-tests
+          echo 'workspace_created=true' >> "$GITHUB_OUTPUT"
+          test ! -e /usr/local/lib/mini-agent-native-rust
+          sudo install -d -m 0755 /usr/local/lib/mini-agent-native-rust
+          echo 'toolchain_created=true' >> "$GITHUB_OUTPUT"
+          sysroot=$(rustc --print sysroot)
+          sudo cp -a -- "$sysroot/." /usr/local/lib/mini-agent-native-rust/
+          sudo chown -R root:root /usr/local/lib/mini-agent-native-rust
+          sudo chmod -R go-w /usr/local/lib/mini-agent-native-rust
+          /usr/local/lib/mini-agent-native-rust/bin/rustc -Vv
+          /usr/local/lib/mini-agent-native-rust/bin/cargo -V
+
+      - name: Test native Linux workspace real paths and snapshot authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=target/native-workspace-evidence
+          mkdir -p "$evidence"
+          bwrap --version | tee "$evidence/bubblewrap-version.txt"
+          uname -r | tee "$evidence/kernel.txt"
+          rustc -Vv | tee "$evidence/rustc.txt"
+          cargo test --locked --bin mini-agent linux_native -- --list > "$evidence/lib-list.txt"
+          mapfile -t names < <(sed -n 's/: test$//p' "$evidence/lib-list.txt")
+          test "${#names[@]}" -eq 7
+          required_names=(
+            'sandbox::linux_workspace_tests::linux_native_workspace_under_tmp_keeps_real_and_spelled_paths_and_git_masks'
+            'sandbox::linux_workspace_tests::linux_native_workspace_under_readonly_runtime_keeps_one_writable_view'
+            'sandbox::linux_workspace_tests::linux_native_workspace_control_destination_uses_visible_nonroot_fallback'
+            'sandbox::linux_workspace_tests::linux_native_workspace_replacement_after_construction_retains_original_tree_and_masks'
+            'sandbox::linux_workspace_tests::linux_native_workspace_cancellation_reaps_owned_real_path_children'
+            'sandbox::linux_workspace_tests::linux_native_workspace_cargo_artifacts_are_reused_at_host_real_paths'
+            'extras::js::host::tests::linux_native_bound_snapshot_original_slot_197_keeps_image_and_closes_authority'
+          )
+          for name in "${required_names[@]}"; do
+            test "$(grep -Fxc "$name: test" "$evidence/lib-list.txt")" -eq 1
+            log="$evidence/${name//::/_}.log"
+            cargo test --locked --bin mini-agent "$name" \
+              -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F 'test result: ok. 1 passed;' "$log"
+          done
+          cargo test --locked --test headless_json linux_native_shell_and_read -- --list \
+            > "$evidence/headless-list.txt"
+          test "$(grep -c ': test$' "$evidence/headless-list.txt")" -eq 1
+          cargo test --locked --test headless_json \
+            linux_native_shell_and_read_share_the_actual_headless_workspace \
+            -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$evidence/headless.log"
+          grep -F 'test result: ok. 1 passed;' "$evidence/headless.log"
+
+      - name: Archive native Linux workspace proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-linux-workspace-real-path
+          path: target/native-workspace-evidence
+          if-no-files-found: error
+
+      - name: Retire owned native workspace fixtures
+        if: always()
+        shell: bash
+        env:
+          WORKSPACE_CREATED: ${{ steps.native_workspace_fixtures.outputs.workspace_created }}
+          TOOLCHAIN_CREATED: ${{ steps.native_workspace_fixtures.outputs.toolchain_created }}
+        run: |
+          if [ "$WORKSPACE_CREATED" = true ]; then
+            sudo rm -rf -- /usr/mini-agent-native-tests
+          fi
+          if [ "$TOOLCHAIN_CREATED" = true ]; then
+            sudo rm -rf -- /usr/local/lib/mini-agent-native-rust
           fi
 
       - name: Test Linux sandbox capability policy
@@ -1058,7 +1135,7 @@ jobs:
           @{
             schema_version = 1
             platform = 'linux'
-            runner = 'ubuntu-latest'
+            runner = 'ubuntu-22.04'
             result = '${{ job.status }}'
             containment = @{
               backend = 'bubblewrap'

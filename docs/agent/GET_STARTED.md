@@ -119,6 +119,10 @@ sudo dnf install bubblewrap      # Fedora
 sudo pacman -S bubblewrap        # Arch
 ```
 
+The general-process sandbox also requires both `--bind-fd` and `--ro-bind-fd`;
+an older build lacking either refuses workspace commands. Spelling aliases inside
+readonly runtime directories require bubblewrap's idempotent `--symlink` behavior.
+
 Ubuntu 23.10 and later (including 24.04) set `kernel.apparmor_restrict_unprivileged_userns=1`,
 which stops bubblewrap from creating its user namespace. `bwrap --unshare-user --ro-bind / / true`
 then fails with `setting up uid map: Permission denied`. Choose one fix:
@@ -526,6 +530,15 @@ Offline policy probes—`--config-preservation-check`,
 intended for packaging and CI diagnostics rather than ordinary sessions.
 
 ## 6. Feature contract
+
+On Linux, sandboxed shell commands see the workspace at its canonical real path.
+Captured symlink ancestor spellings also resolve, while file tools retain their
+canonical permission root. Scripts and output are passed unchanged, so generated
+build paths can be reused outside the sandbox. Explicit proc/device/system or
+sandbox-control destination collisions use `/workspace`, announced in the system
+prompt and shell description; other setup failures refuse launch. Starting at
+filesystem root `/` remains forbidden. This concerns the general command sandbox,
+not the isolated JavaScript worker. macOS and Windows keep their existing paths.
 
 Sandboxing and memory support are compiled into the default build. The general-process sandbox is
 enabled by default: Linux uses `bwrap` when installed and trusted, supported macOS hosts use the
