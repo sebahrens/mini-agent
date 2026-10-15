@@ -216,7 +216,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     paths::install_process_paths(&app_paths)?;
     // Freeze operator Git source authority before hooks/MCP/project/model work.
     // Git retains a closed diagnostic if capture fails; other modes can run.
-    startup::heap_future(|| git::global_snapshot::initialize(workspace.root())).await;
+    // The capture overlaps read-only config/docs/context loading and is joined
+    // (`wait_initialized`) before any hook, MCP, sandbox or project effect.
+    git::global_snapshot::begin(workspace.root().to_path_buf());
     if let Some(provider) = cli.login.as_deref() {
         if provider.eq_ignore_ascii_case("copilot") {
             anyhow::ensure!(
@@ -248,6 +250,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if cli.doctor {
+        git::global_snapshot::wait_initialized().await;
         let mut cfg = config::load_for_diagnostics_in_workspace(&app_paths, &workspace);
         config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
         let mut report =
@@ -275,6 +278,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "js")]
     if cli.js_runtime_check {
+        git::global_snapshot::wait_initialized().await;
         startup::heap_future(|| extras::js::verify_runtime(workspace)).await?;
         println!("JS runtime check: PASS (2)");
         return Ok(());
@@ -358,6 +362,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         eprintln!("warning: {warning}");
     }
 
+    // Learned-skill operator commands may launch contained workers.
+    #[cfg(feature = "skills")]
+    git::global_snapshot::wait_initialized().await;
     #[cfg(feature = "skills")]
     extras::js::skills::operations::set_json_output(cli.learned_skill_json);
 

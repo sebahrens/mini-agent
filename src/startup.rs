@@ -1015,6 +1015,9 @@ impl Startup {
         #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
         let mut context =
             context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
+        // Guarded Git global capture overlapped the read-only loading above;
+        // it must be complete before any hook, MCP or project effect below.
+        crate::git::global_snapshot::wait_initialized().await;
 
         // --quick-model overrides provider + model
         let (mut provider, mut model) = cli.resolve_provider_and_model(&cfg);

@@ -127,6 +127,23 @@ impl GitRunner {
         }
     }
 
+    /// Guarded runner shared with [`GitRunner::discover`] in production, so
+    /// startup global capture and later statusline/tool calls materialize and
+    /// hash the approved runtime once per process. Every launch still
+    /// revalidates the retained on-disk runtime identity.
+    pub(super) fn discover_guarded_shared() -> Result<Self, String> {
+        #[cfg(not(test))]
+        {
+            CACHED_GIT_RUNNER
+                .get_or_init(Self::discover_guarded)
+                .clone()
+        }
+        #[cfg(test)]
+        {
+            Self::discover_guarded()
+        }
+    }
+
     pub(super) fn discover_guarded() -> Result<Self, String> {
         let approval = super::runtime::bundled_approval()
             .ok_or("publisher-approved Git runtime is unavailable in this build")?;
@@ -711,10 +728,20 @@ impl GitRunner {
             InternalProfile::Local,
             &hardened_config(InternalProfile::Local, false),
         );
-        let output = Sandbox::new(false, "git")
-            .output_built_command_with_limits(command, QUERY_LIMITS)
-            .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+        // The work-tree query is independent of the first one's answer; run
+        // both concurrently and discard it for bare or unborn repositories.
+        let toplevel = self.build_internal_command(
+            repo_path,
+            ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+            InternalProfile::Local,
+            &hardened_config(InternalProfile::Local, false),
+        );
+        let (first, second) = (Sandbox::new(false, "git"), Sandbox::new(false, "git"));
+        let (output, toplevel) = tokio::join!(
+            first.output_built_command_with_limits(command, QUERY_LIMITS),
+            second.output_built_command_with_limits(toplevel, QUERY_LIMITS),
+        );
+        let output = output.map_err(|_| format!("git {operation} runner failed"))?;
         let unborn = initializing
             && output.status == CommandStatus::Completed
             && output.exit_status.and_then(|status| status.code()) != Some(0)
@@ -750,16 +777,7 @@ impl GitRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !bare {
-            let command = self.build_internal_command(
-                repo_path,
-                ["rev-parse", "--path-format=absolute", "--show-toplevel"],
-                InternalProfile::Local,
-                &hardened_config(InternalProfile::Local, false),
-            );
-            let output = Sandbox::new(false, "git")
-                .output_built_command_with_limits(command, QUERY_LIMITS)
-                .await
-                .map_err(|_| format!("git {operation} runner failed"))?;
+            let output = toplevel.map_err(|_| format!("git {operation} runner failed"))?;
             let output = command_result(operation, QUERY_LIMITS, output)?;
             let top = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
                 format!("refusing git {operation}: Git repository roots are malformed")

@@ -42,6 +42,7 @@ pub(super) struct GlobalSources {
     sources: Vec<Source>,
     roots: Vec<PathBuf>,
     helpers: HashMap<Vec<u8>, Result<Helper, String>>,
+    selections: SelectionCache,
     #[cfg(windows)]
     shell: Result<Arc<super::runtime::TrustedShell>, String>,
 }
@@ -66,7 +67,11 @@ pub(crate) async fn initialize(workspace: &Path) {
         if EFFECTS_STARTED.load(Ordering::SeqCst) {
             return Err("guarded Git globals were not captured before project effects".into());
         }
-        let runner = GitRunner::discover_guarded()?;
+        // Materializing hashes the retained on-disk runtime; keep that off the
+        // async workers and share the runner with every later discovery.
+        let runner = tokio::task::spawn_blocking(GitRunner::discover_guarded_shared)
+            .await
+            .map_err(|_| "guarded Git runtime startup task failed".to_string())??;
         let result = GlobalSources::capture(&runner, workspace).await?;
         if EFFECTS_STARTED.load(Ordering::SeqCst) {
             return Err("guarded Git global capture overlapped project effects".into());
@@ -78,11 +83,49 @@ pub(crate) async fn initialize(workspace: &Path) {
     let _ = SOURCES.set(result);
 }
 
+type PendingCapture = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+static PENDING: std::sync::Mutex<Option<PendingCapture>> = std::sync::Mutex::new(None);
+
+/// Starts [`initialize`] on the runtime so read-only startup work (config,
+/// docs and context loading) overlaps the capture. [`wait_initialized`] must
+/// complete before hooks, MCP or project effects; an effect that starts first
+/// still fails the capture closed through `EFFECTS_STARTED`.
+pub(crate) fn begin(workspace: PathBuf) {
+    use futures::FutureExt as _;
+    if SOURCES.get().is_some() {
+        return;
+    }
+    let mut pending = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pending.is_some() {
+        return;
+    }
+    let task = tokio::spawn(async move { initialize(&workspace).await });
+    *pending = Some(task.map(|_| ()).boxed().shared());
+}
+
+/// Joins a capture started by [`begin`]. Idempotent and safe to call from
+/// concurrent tasks; returns at once when no capture is pending.
+pub(crate) async fn wait_initialized() {
+    if SOURCES.get().is_some() {
+        return;
+    }
+    let pending = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(pending) = pending {
+        pending.await;
+    }
+}
+
 pub(super) async fn capture(
     runner: &GitRunner,
     repository: &Path,
     roots: &[PathBuf],
 ) -> Result<SelectedGlobals, String> {
+    wait_initialized().await;
     let sources = SOURCES
         .get()
         .ok_or("guarded Git globals were not captured at startup")?
@@ -148,41 +191,34 @@ impl GlobalSources {
             if total > MAX_GRAPH_BYTES {
                 return Err("guarded Git global source graph exceeds its size bound".into());
             }
-            let parsed = runner
-                .snapshot_probe(
-                    workspace,
-                    &[
-                        OsString::from("config"),
-                        "--null".into(),
-                        "--no-includes".into(),
-                        "--file".into(),
-                        "-".into(),
-                        "--list".into(),
-                    ],
-                    Some(bytes.clone()),
-                    None,
-                )
-                .await?;
-            let entries = parse_entries(&parsed)?;
-            // Git itself performs ~user / %(prefix) path interpolation. Relative
-            // results retain their original source directory, never the mirror.
-            let paths = runner
-                .snapshot_probe(
-                    workspace,
-                    &[
-                        OsString::from("config"),
-                        "--null".into(),
-                        "--no-includes".into(),
-                        "--file".into(),
-                        "-".into(),
-                        "--type=path".into(),
-                        "--get-regexp".into(),
-                        r"^include(if\..*)?\.path$".into(),
-                    ],
-                    Some(bytes),
-                    None,
-                )
-                .await?;
+            // Both parser queries read the same captured bytes; run them
+            // concurrently. Git itself performs ~user / %(prefix) path
+            // interpolation. Relative results retain their original source
+            // directory, never the mirror.
+            let list_args = [
+                OsString::from("config"),
+                "--null".into(),
+                "--no-includes".into(),
+                "--file".into(),
+                "-".into(),
+                "--list".into(),
+            ];
+            let path_args = [
+                OsString::from("config"),
+                "--null".into(),
+                "--no-includes".into(),
+                "--file".into(),
+                "-".into(),
+                "--type=path".into(),
+                "--get-regexp".into(),
+                r"^include(if\..*)?\.path$".into(),
+            ];
+            let (parsed, paths) = tokio::join!(
+                runner.snapshot_probe(workspace, &list_args, Some(bytes.clone()), None),
+                runner.snapshot_probe(workspace, &path_args, Some(bytes), None),
+            );
+            let entries = parse_entries(&parsed?)?;
+            let paths = paths?;
             let mut expanded = parse_entries(&paths)?.into_iter();
             let mut includes = HashMap::new();
             for (index, entry) in entries.iter().enumerate() {
@@ -266,6 +302,7 @@ impl GlobalSources {
             sources,
             roots,
             helpers,
+            selections: SelectionCache::default(),
             #[cfg(windows)]
             shell: runner.capture_original_shell(&writable),
         })
@@ -279,6 +316,82 @@ impl GlobalSources {
     ) -> Result<SelectedGlobals, String> {
         let runtime = runner.guarded_runtime()?;
         runtime.validate(roots)?;
+        // The frozen graph's native selection depends only on the repository
+        // location when every condition is path-based. Reuse the
+        // origin-checked selection; runtime and helper authority below are
+        // revalidated on every call.
+        let key = self.selection_key(repository);
+        let cached = key.as_ref().and_then(|key| self.selections.get(key));
+        let selected = match cached {
+            Some(selected) => selected,
+            None => {
+                let selected = Arc::new(self.select_uncached(runner, repository).await?);
+                if let Some(key) = key {
+                    self.selections.insert(key, selected.clone());
+                }
+                selected
+            }
+        };
+        let mut entries = Vec::with_capacity(selected.len());
+        for entry in selected.iter() {
+            let mut entry = entry.clone();
+            if credential_helper(&entry.key)
+                && let Some(value) = &entry.value
+                && let Some(helper) = self.helpers.get(value)
+            {
+                let helper = helper.as_ref().map_err(Clone::clone)?;
+                super::runtime::require_disjoint(&helper.path, roots)?;
+                super::runtime::require_disjoint(&helper.target, roots)?;
+                helper.authority.validate()?;
+                let token = value
+                    .iter()
+                    .position(|byte| byte.is_ascii_whitespace())
+                    .unwrap_or(value.len());
+                let mut rewritten = helper.prefix.clone();
+                rewritten.extend_from_slice(&value[token..]);
+                entry.value = Some(rewritten);
+            }
+            entries.push(entry);
+        }
+        #[cfg(windows)]
+        let shell = if entries.iter().any(shell_dependent_service) {
+            Some(self.shell.clone())
+        } else {
+            None
+        };
+        Ok(SelectedGlobals {
+            environment: os_string(serialize(&entries)?)?,
+            #[cfg(windows)]
+            shell,
+        })
+    }
+
+    /// Cache key for a repository, or `None` when a captured condition can
+    /// change without the repository moving (`onbranch:`, `hasconfig:` or any
+    /// condition Git may add later).
+    fn selection_key(&self, repository: &Path) -> Option<SelectionKey> {
+        let dynamic = self
+            .sources
+            .iter()
+            .flat_map(|source| &source.entries)
+            .any(|entry| include_key(&entry.key) && !path_condition(&entry.key));
+        if dynamic {
+            return None;
+        }
+        Some(SelectionKey {
+            repository: repository.to_path_buf(),
+            admin: AdminIdentity::of(repository),
+        })
+    }
+
+    /// Native selection over a private mirror of the frozen graph, returning
+    /// the origin-checked global entries before helper authority rewriting.
+    async fn select_uncached(
+        &self,
+        runner: &GitRunner,
+        repository: &Path,
+    ) -> Result<Vec<Entry>, String> {
+        let runtime = runner.guarded_runtime()?;
         // This directory is outside every retained model write grant. Source
         // deletion on cancelled parsing can only fail the read-only query.
         let mirror = SnapshotDirectory::new(runtime.directory())?;
@@ -355,7 +468,7 @@ impl GlobalSources {
             if record[0] != b"global" {
                 continue;
             }
-            let mut entry = parse_entry(record[2])?;
+            let entry = parse_entry(record[2])?;
             if include_key(&entry.key) {
                 continue;
             }
@@ -371,36 +484,93 @@ impl GlobalSources {
             if !captured_origin {
                 return Err("guarded Git global selection escaped its captured sources".into());
             }
-            if credential_helper(&entry.key)
-                && let Some(value) = &entry.value
-                && let Some(helper) = self.helpers.get(value)
-            {
-                let helper = helper.as_ref().map_err(Clone::clone)?;
-                super::runtime::require_disjoint(&helper.path, roots)?;
-                super::runtime::require_disjoint(&helper.target, roots)?;
-                helper.authority.validate()?;
-                let token = value
-                    .iter()
-                    .position(|byte| byte.is_ascii_whitespace())
-                    .unwrap_or(value.len());
-                let mut rewritten = helper.prefix.clone();
-                rewritten.extend_from_slice(&value[token..]);
-                entry.value = Some(rewritten);
-            }
             entries.push(entry);
         }
-        #[cfg(windows)]
-        let shell = if entries.iter().any(shell_dependent_service) {
-            Some(self.shell.clone())
-        } else {
-            None
-        };
-        Ok(SelectedGlobals {
-            environment: os_string(serialize(&entries)?)?,
-            #[cfg(windows)]
-            shell,
+        Ok(entries)
+    }
+}
+
+/// Repository location plus the identity of its `.git` entry, so creating,
+/// replacing or relinking the administration directory selects afresh.
+#[derive(Clone, PartialEq, Eq)]
+struct SelectionKey {
+    repository: PathBuf,
+    admin: Option<AdminIdentity>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AdminIdentity {
+    directory: bool,
+    file_stamp: Option<(std::time::SystemTime, u64)>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl AdminIdentity {
+    fn of(repository: &Path) -> Option<Self> {
+        let metadata = repository.join(".git").symlink_metadata().ok()?;
+        let directory = metadata.is_dir();
+        Some(Self {
+            directory,
+            // A gitfile's target can be rewritten in place; a directory's
+            // mtime moves on every index/HEAD update, so only its inode counts.
+            file_stamp: (!directory)
+                .then(|| metadata.modified().ok().map(|time| (time, metadata.len())))
+                .flatten(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                (metadata.dev(), metadata.ino())
+            },
         })
     }
+}
+
+const MAX_CACHED_SELECTIONS: usize = 16;
+
+/// Bounded per-repository memo of native global selections.
+#[derive(Default)]
+struct SelectionCache(std::sync::Mutex<Vec<(SelectionKey, Arc<Vec<Entry>>)>>);
+
+impl SelectionCache {
+    fn get(&self, key: &SelectionKey) -> Option<Arc<Vec<Entry>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(cached, _)| cached == key)
+            .map(|(_, entries)| entries.clone())
+    }
+
+    fn insert(&self, key: SelectionKey, entries: Arc<Vec<Entry>>) {
+        let mut cache = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain(|(cached, _)| cached.repository != key.repository);
+        if cache.len() >= MAX_CACHED_SELECTIONS {
+            cache.remove(0);
+        }
+        cache.push((key, entries));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+/// `includeIf.gitdir:` / `gitdir/i:` conditions depend only on where the
+/// repository is; plain `include.path` has no condition.
+fn path_condition(key: &[u8]) -> bool {
+    if key == b"include.path" {
+        return true;
+    }
+    let condition = &key[b"includeif.".len().min(key.len())..];
+    condition.starts_with(b"gitdir:") || condition.starts_with(b"gitdir/i:")
 }
 
 /// Exclusive, private scratch for read-only native config evaluation. It never
@@ -962,6 +1132,7 @@ mod tests {
             sources: Vec::new(),
             roots: Vec::new(),
             helpers: HashMap::new(),
+            selections: SelectionCache::default(),
             #[cfg(windows)]
             shell: Err("fixture has no selected shell service".into()),
         };
@@ -1057,6 +1228,80 @@ mod tests {
             .unwrap();
         assert_eq!(output.stdout, b"https://example.invalid/repo\n");
     }
+    #[tokio::test]
+    async fn cached_selection_is_byte_identical_and_skips_dynamic_conditions() {
+        let fixture = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let project = fixture.path().join("project");
+        let authority = fixture.path().join("operator");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&authority).unwrap();
+        let runner = runner(&fixture.path().join("runtime"));
+        let empty = GlobalSources {
+            sources: Vec::new(),
+            roots: Vec::new(),
+            helpers: HashMap::new(),
+            selections: SelectionCache::default(),
+            #[cfg(windows)]
+            shell: Err("fixture has no selected shell service".into()),
+        };
+        runner
+            .clone()
+            .with_test_globals(empty)
+            .run(
+                &project,
+                "init",
+                ["init", "--quiet"],
+                super::super::runner::QUERY_LIMITS,
+            )
+            .await
+            .unwrap();
+        let canonical = project.canonicalize().unwrap();
+        let root = authority.join("global");
+        let work = authority.join("work");
+        std::fs::write(
+            &root,
+            format!(
+                "[user]\nname = approved\n[includeIf \"gitdir:{}/\"]\npath = work\n",
+                canonical.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(&work, "[user]\nemail = work@example.invalid\n").unwrap();
+        let captured = GlobalSources::capture_roots(&runner, &project, vec![root.clone()], None)
+            .await
+            .unwrap();
+        let roots = vec![canonical.clone()];
+        let first = captured.select(&runner, &project, &roots).await.unwrap();
+        assert_eq!(captured.selections.len(), 1, "path-only graph is cached");
+        let second = captured.select(&runner, &project, &roots).await.unwrap();
+        assert_eq!(first.environment, second.environment);
+        let uncached = captured.select_uncached(&runner, &project).await.unwrap();
+        let key = captured.selection_key(&project).unwrap();
+        assert!(*captured.selections.get(&key).unwrap() == uncached);
+        let text = first.environment.to_string_lossy().into_owned();
+        assert!(text.contains("work@example.invalid"), "{text}");
+        // Replacing the administration directory selects afresh.
+        std::fs::rename(project.join(".git"), project.join("moved-admin")).unwrap();
+        assert!(captured.selection_key(&project).unwrap() != key);
+        std::fs::rename(project.join("moved-admin"), project.join(".git")).unwrap();
+
+        std::fs::write(
+            &root,
+            "[user]\nname = approved\n[includeIf \"onbranch:later\"]\npath = work\n",
+        )
+        .unwrap();
+        let dynamic = GlobalSources::capture_roots(&runner, &project, vec![root], None)
+            .await
+            .unwrap();
+        dynamic.select(&runner, &project, &roots).await.unwrap();
+        assert_eq!(
+            dynamic.selections.len(),
+            0,
+            "branch conditions are never cached"
+        );
+        assert!(dynamic.selection_key(&project).is_none());
+    }
+
     #[tokio::test]
     async fn linked_admin_sources_do_not_become_trusted_global_input() {
         let fixture = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();

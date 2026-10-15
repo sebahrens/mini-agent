@@ -582,6 +582,10 @@ fn validate_approval(approval: &RuntimeApproval) -> Result<(), String> {
     }
     let mut names = std::collections::HashSet::new();
     let mut total = 0usize;
+    // The embedded payload is immutable static data, so its digest proof is
+    // computed once per process per payload. The containment-relevant proof,
+    // the on-disk digest in `materialize`, is never memoized.
+    let payload_verified = embedded_payload_verified(approval.files);
     for file in approval.files {
         let mut components = Path::new(file.relative_path).components();
         if !matches!(components.next(), Some(Component::Normal(_)))
@@ -589,7 +593,7 @@ fn validate_approval(approval: &RuntimeApproval) -> Result<(), String> {
             || file.relative_path.contains(['/', '\\', ':'])
             || !names.insert(file.relative_path.to_ascii_lowercase())
             || file.contents.len() > MAX_FILE_BYTES
-            || file.sha256 != hex_digest(file.contents)
+            || (!payload_verified && file.sha256 != hex_digest(file.contents))
         {
             return Err("guarded Git publisher payload is invalid".into());
         }
@@ -614,7 +618,34 @@ fn validate_approval(approval: &RuntimeApproval) -> Result<(), String> {
             return Err("guarded Git publisher payload omits a required executable".into());
         }
     }
+    if !payload_verified {
+        record_embedded_payload(approval.files);
+    }
     Ok(())
+}
+
+/// Static payload slices whose embedded digests were checked in this process.
+static VERIFIED_PAYLOADS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn payload_key(files: &'static [RuntimeFile]) -> (usize, usize) {
+    (files.as_ptr() as usize, files.len())
+}
+
+fn embedded_payload_verified(files: &'static [RuntimeFile]) -> bool {
+    VERIFIED_PAYLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&payload_key(files))
+}
+
+fn record_embedded_payload(files: &'static [RuntimeFile]) {
+    let mut verified = VERIFIED_PAYLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = payload_key(files);
+    if !verified.contains(&key) {
+        verified.push(key);
+    }
 }
 
 pub(crate) fn read_bounded(file: &std::fs::File, limit: usize) -> Result<Vec<u8>, String> {
@@ -793,6 +824,48 @@ mod tests {
             "preapproved helpers must not acquire a writable alias"
         );
         approved.validate().unwrap();
+    }
+
+    #[test]
+    fn embedded_payload_digest_memo_never_blesses_another_payload() {
+        let original = bundled_approval().expect("test requires approved bundle");
+        validate_approval(original).unwrap();
+        assert!(embedded_payload_verified(original.files));
+        validate_approval(original).unwrap();
+        // A different payload with a forged digest is still hashed and refused.
+        let forged: &'static [RuntimeFile] = Box::leak(
+            original
+                .files
+                .iter()
+                .map(|file| RuntimeFile {
+                    relative_path: file.relative_path,
+                    sha256: file.sha256,
+                    contents: if file.relative_path.starts_with("git") {
+                        b"tampered"
+                    } else {
+                        file.contents
+                    },
+                    executable: file.executable,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let tampered = RuntimeApproval {
+            id: original.id,
+            target: original.target,
+            policy: original.policy,
+            files: forged,
+        };
+        assert!(validate_approval(&tampered).is_err());
+        assert!(!embedded_payload_verified(forged));
+        // Structural checks still run for a memoized payload.
+        let wrong = RuntimeApproval {
+            id: original.id,
+            target: original.target,
+            policy: "attacker",
+            files: original.files,
+        };
+        assert!(validate_approval(&wrong).is_err());
     }
 
     #[test]
