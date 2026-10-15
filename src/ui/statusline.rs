@@ -91,6 +91,35 @@ pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'stati
 
 static SPEC: OnceLock<StatusLineConfig> = OnceLock::new();
 static NEEDS_GIT_STATUS: OnceLock<bool> = OnceLock::new();
+static TIME_ITEMS: OnceLock<TimeItems> = OnceLock::new();
+
+/// Which time-dependent items the spec shows; computed once with the spec so
+/// [`cache_key`] does not scan every segment on every frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct TimeItems {
+    clock: bool,
+    session_age: bool,
+    session_updated: bool,
+}
+
+impl TimeItems {
+    fn of(spec: &StatusLineConfig) -> Self {
+        let mut uses = Self::default();
+        for segment in spec.lines.iter().flat_map(|line| &line.segments) {
+            match segment.item.as_str() {
+                "clock" => uses.clock = true,
+                "session_age" => uses.session_age = true,
+                "session_updated" => uses.session_updated = true,
+                _ => {}
+            }
+        }
+        uses
+    }
+}
+
+fn time_items() -> TimeItems {
+    *TIME_ITEMS.get_or_init(|| TimeItems::of(spec()))
+}
 
 /// Parse the statusline spec from config once at startup. Clamps to 3 lines.
 pub fn init(cfg: &Config) {
@@ -100,6 +129,7 @@ pub fn init(cfg: &Config) {
     }
     spec.lines.truncate(MAX_STATUS_LINES);
     let needs_git = spec.needs_git_status();
+    let _ = TIME_ITEMS.set(TimeItems::of(&spec));
     let _ = SPEC.set(spec);
     let _ = NEEDS_GIT_STATUS.set(needs_git);
 }
@@ -130,15 +160,11 @@ pub fn build(session: &Session, ctx: &StatusContext) -> Vec<Vec<StatusSpan>> {
 pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     let mut state = std::collections::hash_map::DefaultHasher::new();
     session.id.hash(&mut state);
-    session.spend_account.model_call_count().hash(&mut state);
+    // One lock for both spend values the statusline shows.
+    session.spend_account.status_snapshot().hash(&mut state);
     session
         .known_input_output_prices()
         .is_some()
-        .hash(&mut state);
-    session
-        .spend_account
-        .snapshot()
-        .tracking_error
         .hash(&mut state);
     session.name.hash(&mut state);
     session.messages.len().hash(&mut state);
@@ -151,7 +177,18 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     session.total_cache_creation_input_tokens.hash(&mut state);
     session.total_real_input_tokens.hash(&mut state);
     session.recorded_total_cost().to_bits().hash(&mut state);
-    session.effective_context_tokens().hash(&mut state);
+    // The inputs of `effective_context_tokens` rather than the sum itself,
+    // which walks every message since the last calibration. Estimate changes
+    // move `total_estimated_tokens`; the newest message covers in-place edits.
+    session.calibrated_tokens.hash(&mut state);
+    session.calibrated_msg_count.hash(&mut state);
+    session.overhead_tokens.hash(&mut state);
+    session.total_estimated_tokens.hash(&mut state);
+    session
+        .messages
+        .last()
+        .map(|message| message.estimated_tokens)
+        .hash(&mut state);
     session.ctx_is_estimated().hash(&mut state);
     session.context_window.hash(&mut state);
     session.model.hash(&mut state);
@@ -185,24 +222,20 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.btw_out.hash(&mut state);
     ctx.sandbox_label.hash(&mut state);
 
-    let uses = |item: &str| {
-        spec()
-            .lines
-            .iter()
-            .flat_map(|line| &line.segments)
-            .any(|segment| segment.item == item)
-    };
-    if uses("clock") {
-        chrono::Local::now()
-            .format("%Y-%m-%d %H:%M")
-            .to_string()
+    let uses = time_items();
+    if uses.clock {
+        // The clock shows minutes; offsets are whole minutes, so the UTC
+        // minute changes exactly when the local display can.
+        chrono::Utc::now()
+            .timestamp()
+            .div_euclid(60)
             .hash(&mut state);
     }
-    if uses("session_age") {
-        fmt_elapsed(&session.created_at).hash(&mut state);
+    if uses.session_age {
+        elapsed_bucket(&session.created_at).hash(&mut state);
     }
-    if uses("session_updated") {
-        fmt_elapsed(&session.updated_at).hash(&mut state);
+    if uses.session_updated {
+        elapsed_bucket(&session.updated_at).hash(&mut state);
     }
     state.finish()
 }
@@ -257,6 +290,15 @@ pub fn build_lines(
 /// `/import`, a git branch name): strip control sequences and keep them on
 /// one row so they can neither drive the terminal nor break the layout.
 fn single_line_safe(text: &str) -> String {
+    // Most values (and every built-in glyph) need no change: skip the
+    // sanitizer's two intermediate allocations for them. Sanitizing keeps
+    // exactly these characters, and a newline is a control character.
+    if text
+        .chars()
+        .all(|c| !c.is_control() && !crate::ui::events::is_deceptive_format_char(c))
+    {
+        return text.to_owned();
+    }
     crate::ui::events::sanitize_output(text).replace('\n', " ")
 }
 
@@ -271,14 +313,9 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
         match seg.item.as_str() {
             "flex_separator" | "flex" => raw.push((StatusSpan::Flex, false)),
             "separator" | "sep" => {
-                let text = seg
-                    .text
-                    .as_ref()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| " ".to_string());
                 raw.push((
                     StatusSpan::Text {
-                        text: single_line_safe(&text),
+                        text: single_line_safe(seg.text.as_deref().unwrap_or(" ")),
                         fg: color(&seg.color),
                         bg: color(&seg.bg),
                         layout: SpanLayout::Separator,
@@ -307,7 +344,7 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                         plain,
                     };
                     if let Some(glyph) = resolve_icon(seg.icon.as_ref(), item) {
-                        text = format!("{} {text}", single_line_safe(&glyph));
+                        text = format!("{} {text}", single_line_safe(glyph));
                     }
                     // A live-state override (e.g. the context meter turning
                     // amber/red as it fills) wins over the configured color so
@@ -323,7 +360,7 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     if let Some(l) = &seg.left {
                         raw.push((
                             StatusSpan::Text {
-                                text: single_line_safe(&powerline_glyph(l)),
+                                text: single_line_safe(powerline_str(l)),
                                 fg: cap,
                                 bg: None,
                                 layout: SpanLayout::Decoration,
@@ -343,7 +380,7 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     if let Some(r) = &seg.right {
                         raw.push((
                             StatusSpan::Text {
-                                text: single_line_safe(&powerline_glyph(r)),
+                                text: single_line_safe(powerline_str(r)),
                                 fg: cap,
                                 bg: None,
                                 layout: SpanLayout::Decoration,
@@ -657,8 +694,9 @@ fn resolve_item(
             None => "calls:?".into(),
         }),
         "context" => Some(format!(
-            "ctx {}/{} {}%",
-            resolve_item("context_used", session, ctx, always)?,
+            "ctx {}{}/{} {}%",
+            if session.ctx_is_estimated() { "~" } else { "" },
+            fmt_tokens(session.effective_context_tokens()),
             fmt_tokens(session.context_window),
             context_percentage(session).unwrap_or(0)
         )),
@@ -759,22 +797,58 @@ fn basename(dir: &str) -> String {
 
 /// Full working-directory path with `$HOME` shortened to `~`.
 fn contract_home(dir: &str) -> String {
-    if let Some(home) =
-        crate::paths::process_home_dir().and_then(|h| h.to_str().map(|s| s.to_string()))
-    {
+    if let Some(home) = home_dir_text().as_deref() {
         if dir == home {
             return "~".to_string();
         }
-        if let Some(rest) = dir.strip_prefix(&format!("{home}/")) {
+        if let Some(rest) = dir
+            .strip_prefix(home)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
             return format!("~/{rest}");
         }
     }
     dir.to_string()
 }
 
+/// The process home directory as text, resolved once per process (tests
+/// keep reading their thread-local override).
+fn home_dir_text() -> Option<std::borrow::Cow<'static, str>> {
+    fn resolve() -> Option<String> {
+        crate::paths::process_home_dir().and_then(|h| h.to_str().map(str::to_owned))
+    }
+    #[cfg(test)]
+    {
+        resolve().map(std::borrow::Cow::Owned)
+    }
+    #[cfg(not(test))]
+    {
+        static HOME: OnceLock<Option<String>> = OnceLock::new();
+        HOME.get_or_init(resolve)
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+    }
+}
+
 /// Name of the linked git worktree for `dir` (from a `.git` file pointing into
 /// `.../worktrees/<name>`), or `None` when this is not a linked worktree.
 fn git_worktree(dir: &str) -> Option<String> {
+    // Read once per workspace instead of on every statusline build: a
+    // directory does not turn into (or stop being) a linked worktree while
+    // the TUI shows it.
+    static LAST: std::sync::Mutex<Option<(String, Option<String>)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((cached_dir, name)) = &*last
+        && cached_dir == dir
+    {
+        return name.clone();
+    }
+    let name = read_git_worktree(dir);
+    *last = Some((dir.to_owned(), name.clone()));
+    name
+}
+
+fn read_git_worktree(dir: &str) -> Option<String> {
     let dot_git = std::path::Path::new(dir).join(".git");
     if !dot_git.is_file() {
         return None;
@@ -792,12 +866,26 @@ fn git_worktree(dir: &str) -> Option<String> {
     None
 }
 
+fn elapsed_secs(rfc3339: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(rfc3339).ok()?;
+    Some(
+        (chrono::Utc::now() - then.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .max(0),
+    )
+}
+
+/// A value that changes whenever [`fmt_elapsed`]'s text can: every second
+/// below a minute, then every minute (coarser displays merely rebuild more
+/// often than needed). Hashing it avoids formatting a string per frame.
+fn elapsed_bucket(rfc3339: &str) -> Option<i64> {
+    let secs = elapsed_secs(rfc3339)?;
+    Some(if secs < 60 { secs } else { 60 + secs / 60 })
+}
+
 /// Short human elapsed time since an RFC3339 timestamp (e.g. `5m`, `2h10m`).
 fn fmt_elapsed(rfc3339: &str) -> Option<String> {
-    let then = chrono::DateTime::parse_from_rfc3339(rfc3339).ok()?;
-    let secs = (chrono::Utc::now() - then.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .max(0);
+    let secs = elapsed_secs(rfc3339)?;
     Some(if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -809,8 +897,14 @@ fn fmt_elapsed(rfc3339: &str) -> Option<String> {
     })
 }
 
-/// Machine hostname from env, falling back to `/etc/hostname` on unix.
+/// Machine hostname, resolved once per process.
 fn hostname() -> Option<String> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(read_hostname).clone()
+}
+
+/// Machine hostname from env, falling back to `/etc/hostname` on unix.
+fn read_hostname() -> Option<String> {
     if let Ok(h) = std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST"))
         && !h.is_empty()
     {
@@ -871,10 +965,10 @@ pub fn format_status(g: &GitStatus) -> String {
 /// Resolve a segment's `icon` setting to a glyph: `Auto(true)` uses the item's
 /// built-in icon, a custom string is looked up by name (or used literally), and
 /// anything else yields no icon. Needs a Nerd Font to render.
-fn resolve_icon(icon: Option<&IconSpec>, item: &str) -> Option<String> {
+fn resolve_icon<'a>(icon: Option<&'a IconSpec>, item: &str) -> Option<&'a str> {
     match icon {
-        Some(IconSpec::Auto(true)) => item_icon(item).map(|g| g.to_string()),
-        Some(IconSpec::Custom(s)) => Some(icon_glyph(s)),
+        Some(IconSpec::Auto(true)) => item_icon(item),
+        Some(IconSpec::Custom(s)) => Some(icon_str(s)),
         _ => None,
     }
 }
@@ -909,8 +1003,8 @@ pub fn item_icon(item: &str) -> Option<&'static str> {
 }
 
 /// Named icon lookup, with passthrough so any literal glyph also works.
-pub fn icon_glyph(name: &str) -> String {
-    let g = match name {
+fn icon_str(name: &str) -> &str {
+    match name {
         "branch" | "git" => "\u{e0a0}",
         "folder" | "dir" => "\u{f07b}",
         "chip" | "model" => "\u{f2db}",
@@ -922,15 +1016,18 @@ pub fn icon_glyph(name: &str) -> String {
         "pencil" | "edit" => "\u{f044}",
         "sync" | "refresh" => "\u{f021}",
         other => other,
-    };
-    g.to_string()
+    }
 }
 
 /// Resolve a powerline cap name to its glyph, or return the input unchanged so
 /// any literal string (including a raw Nerd Font codepoint) also works. These
 /// glyphs need a Nerd Font / Powerline-patched font to render.
 pub fn powerline_glyph(name: &str) -> String {
-    let g = match name {
+    powerline_str(name).to_string()
+}
+
+fn powerline_str(name: &str) -> &str {
+    match name {
         "pl_right" | "powerline_right" => "\u{e0b0}",   //
         "pl_left" | "powerline_left" => "\u{e0b2}",     //
         "pl_right_thin" => "\u{e0b1}",                  //
@@ -940,8 +1037,7 @@ pub fn powerline_glyph(name: &str) -> String {
         "pl_flame_right" => "\u{e0c0}",
         "pl_flame_left" => "\u{e0c2}",
         other => other,
-    };
-    g.to_string()
+    }
 }
 
 pub fn fmt_tokens(n: u64) -> String {

@@ -760,6 +760,17 @@ impl Account {
         (!state.session_id.is_empty()).then_some((state.model_calls, state.call_history_complete))
     }
 
+    /// The statusline's spend inputs under one lock: the display call count
+    /// (as [`Self::model_call_count`]) and whether tracking failed.
+    pub(crate) fn status_snapshot(&self) -> (Option<(u64, bool)>, bool) {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            (!state.session_id.is_empty())
+                .then_some((state.model_calls, state.call_history_complete)),
+            state.tracking_error,
+        )
+    }
+
     pub(crate) fn inherit_call_count(&self, count: u64, complete: bool) {
         let mut state = self.edit();
         state.model_calls = state.model_calls.max(count);

@@ -537,16 +537,23 @@ impl SecurityMode {
     }
 }
 
+impl SecurityMode {
+    /// The mode's display name, without allocating.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            SecurityMode::Standard => "standard",
+            SecurityMode::Restrictive => "restrictive",
+            SecurityMode::ReadOnly => "readonly",
+            SecurityMode::PlanWrite => "planwrite",
+            SecurityMode::Guarded => "guarded",
+            SecurityMode::Yolo => "yolo",
+        }
+    }
+}
+
 impl std::fmt::Display for SecurityMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SecurityMode::Standard => write!(f, "standard"),
-            SecurityMode::Restrictive => write!(f, "restrictive"),
-            SecurityMode::ReadOnly => write!(f, "readonly"),
-            SecurityMode::PlanWrite => write!(f, "planwrite"),
-            SecurityMode::Guarded => write!(f, "guarded"),
-            SecurityMode::Yolo => write!(f, "yolo"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
