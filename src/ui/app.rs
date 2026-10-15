@@ -649,7 +649,6 @@ async fn read_worktree_choice(
 struct GitStatusRefresh {
     working_dir: PathBuf,
     /// The session directory the branch was read from.
-    branch_dir: compact_str::CompactString,
     branch: Option<compact_str::CompactString>,
     /// `None` when the repository fingerprint was unchanged and the status
     /// spawn was skipped (or the statusline does not show status).
@@ -1096,7 +1095,6 @@ mod git_status_refresh_tests {
         let cached = session.git_status.clone();
         let refresh = |dir: &str, snapshot: Option<Option<GitStatus>>| GitStatusRefresh {
             working_dir: PathBuf::from(dir),
-            branch_dir: dir.into(),
             branch: Some("main".into()),
             snapshot,
             fingerprint: None,
@@ -2232,7 +2230,6 @@ impl<'a> App<'a> {
             let _ = tx
                 .send(GitStatusRefresh {
                     working_dir,
-                    branch_dir,
                     branch,
                     snapshot,
                     fingerprint,
