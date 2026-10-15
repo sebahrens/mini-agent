@@ -382,6 +382,7 @@ async fn actual_app_permission_prompt_refuses_config_mutation_without_answering_
     let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
     let (reply, mut decision) = tokio::sync::oneshot::channel();
     let request = crate::permission::ask::AskRequest {
+        diagnostic: None,
         #[cfg(feature = "subagents")]
         background: None,
         agent_name: None,

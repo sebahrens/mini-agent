@@ -100,10 +100,14 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
     let (target, key, literal) = match command {
         Command::Browse(target, key) => {
             ctx.input.open_config_picker(ctx.cfg, ctx.cli, target, key);
+            #[cfg(feature = "subagents")]
+            let scope = "startup settings and captured next-delegation subagent limits; saved subagent sizing applies to the next delegation, other saved policy requires restart";
+            #[cfg(not(feature = "subagents"))]
+            let scope = "startup-effective configuration; saved policy requires restart";
             write_ok(
                 ctx.renderer,
                 format!(
-                    "settings: {} target; values and sources describe startup-effective configuration. Choose a key; enter a TOML value. Saved policy requires restart.",
+                    "settings: {} target; values and sources describe {scope}. Choose a key; enter a TOML value.",
                     target.label()
                 ),
             );
@@ -174,8 +178,8 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
     let result = owned(move || edit.publish(approved)).await;
     match result {
         Ok(Ok(())) => {
-            // Only this presentation field is safe to apply in place. A higher
-            // captured layer still wins; no provider/tool/permission is rebuilt.
+            // Presentation and finite subagent sizing can update in place.
+            // A higher captured layer still wins; no provider/tool/permission is rebuilt.
             let higher = ctx.cfg.provenance.sources.get(key).is_some_and(|sources| {
                 sources.iter().any(|source| match target {
                     Target::Global => !matches!(source, crate::config::ConfigLayer::Global),
@@ -186,6 +190,28 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
                     Target::Local => matches!(source, crate::config::ConfigLayer::Cli),
                 })
             });
+            #[cfg(feature = "subagents")]
+            if !higher && crate::extras::subagents::LIVE_SETTING_KEYS.contains(&key) {
+                let layer = match target {
+                    Target::Global => crate::config::ConfigLayer::Global,
+                    Target::Project => crate::config::ConfigLayer::Project,
+                    Target::Local => crate::config::ConfigLayer::Local,
+                };
+                match crate::extras::subagents::apply_saved_limit(key, literal, layer) {
+                    Ok(true) => {
+                        write_ok(
+                            ctx.renderer,
+                            "Saved; applies to the next delegation. Running children retain their captured limits.",
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        write_error(ctx.renderer, format!("Saved; restart to apply: {error}"));
+                        return Ok(());
+                    }
+                }
+            }
             let live = if key == "reasoning_display" && !higher {
                 match literal {
                     "\"off\"" => Some(crate::config::ReasoningDisplay::Off),

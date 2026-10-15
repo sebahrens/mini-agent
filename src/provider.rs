@@ -3325,7 +3325,7 @@ impl AnyAgent {
         self
     }
     #[cfg(feature = "subagents")]
-    pub(crate) fn for_subagent_report_repair(mut self) -> Self {
+    pub(crate) fn for_subagent_report_repair(mut self, max_tokens: u64) -> Self {
         #[cfg(feature = "agent-skills")]
         {
             self.instructions = None;
@@ -3335,19 +3335,20 @@ impl AnyAgent {
         {
             self.skills = None;
         }
-        fn guard<M: rig::completion::CompletionModel>(agent: &mut Agent<M>) {
+        fn guard<M: rig::completion::CompletionModel>(agent: &mut Agent<M>, max_tokens: u64) {
+            agent.max_tokens = Some(agent.max_tokens.unwrap_or(max_tokens).min(max_tokens));
             agent
                 .hooks
                 .push(crate::extras::subagents::builder::ReportRepairGuard);
         }
         match &mut self.inner {
-            AnyAgentInner::OpenRouter(agent) => guard(agent),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => guard(agent),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => guard(agent),
-            AnyAgentInner::Anthropic(agent) => guard(agent),
-            AnyAgentInner::Gemini(agent) => guard(agent),
-            AnyAgentInner::Ollama(agent) => guard(agent),
-            AnyAgentInner::Copilot(agent) => guard(agent),
+            AnyAgentInner::OpenRouter(agent) => guard(agent, max_tokens),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => guard(agent, max_tokens),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => guard(agent, max_tokens),
+            AnyAgentInner::Anthropic(agent) => guard(agent, max_tokens),
+            AnyAgentInner::Gemini(agent) => guard(agent, max_tokens),
+            AnyAgentInner::Ollama(agent) => guard(agent, max_tokens),
+            AnyAgentInner::Copilot(agent) => guard(agent, max_tokens),
         }
         self
     }

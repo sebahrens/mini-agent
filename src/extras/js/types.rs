@@ -482,7 +482,8 @@ impl fmt::Display for PermRequestBuildError {
 pub enum PermissionDenial {
     Policy(String),
     User,
-    NonInteractive,
+    /// Parent-only display data; never serialized into the worker protocol.
+    NonInteractive(crate::permission::ask::AskDiagnostic),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -657,7 +658,13 @@ mod js_permission_types {
             PermOutcome::Allowed,
             PermOutcome::Denied(PermissionDenial::Policy("rule denied".to_string())),
             PermOutcome::Denied(PermissionDenial::User),
-            PermOutcome::Denied(PermissionDenial::NonInteractive),
+            PermOutcome::Denied(PermissionDenial::NonInteractive(
+                crate::permission::ask::AskDiagnostic {
+                    effective_mode: crate::permission::SecurityMode::Standard,
+                    selected_mode: crate::permission::SecurityMode::Standard,
+                    cause: crate::permission::ask::AskCause::ModePolicy,
+                },
+            )),
             PermOutcome::BackendFailure(PermissionBackendFailure::AskChannelClosed),
             PermOutcome::BackendFailure(PermissionBackendFailure::AskResponseDropped),
             PermOutcome::Cancelled,

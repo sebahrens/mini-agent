@@ -457,8 +457,8 @@ impl fmt::Display for PermissionBridgeError {
                 write!(f, "Permission denied: {reason}")
             }
             Self::Denied(PermissionDenial::User) => f.write_str("Permission denied by user"),
-            Self::Denied(PermissionDenial::NonInteractive) => {
-                f.write_str("Permission denied (non-interactive mode)")
+            Self::Denied(PermissionDenial::NonInteractive(diagnostic)) => {
+                f.write_str(&diagnostic.noninteractive_error())
             }
             Self::BackendFailure(reason) => {
                 write!(f, "permission backend failure: {reason:?}")
@@ -611,9 +611,9 @@ async fn resolve_permission(
         return PermOutcome::Allowed;
     };
 
-    let check = {
+    let (check, diagnostic) = {
         let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
-        match kind {
+        checker.check_diagnosed(|checker| match kind {
             PermissionCheckKind::Input => checker.check(request.tool(), request.key()),
             PermissionCheckKind::Path => checker.check_path(request.tool(), request.key()),
             PermissionCheckKind::StructuredInput { policy_input } => {
@@ -622,7 +622,7 @@ async fn resolve_permission(
             PermissionCheckKind::BoundPath => {
                 checker.check_bound_path(request.tool(), request.key())
             }
-        }
+        })
     };
 
     match check {
@@ -630,7 +630,7 @@ async fn resolve_permission(
         CheckResult::Denied(reason) => PermOutcome::Denied(PermissionDenial::Policy(reason)),
         CheckResult::Ask => {
             let Some(ask_tx) = ask_tx else {
-                return PermOutcome::Denied(PermissionDenial::NonInteractive);
+                return PermOutcome::Denied(PermissionDenial::NonInteractive(diagnostic));
             };
             let _prompt_guard =
                 invocation_cancellation.map(PermCancellation::begin_permission_prompt);
@@ -638,6 +638,7 @@ async fn resolve_permission(
             if crate::permission::ask::send_permission_request(
                 &ask_tx,
                 AskRequest {
+                    diagnostic: Some(diagnostic),
                     #[cfg(feature = "subagents")]
                     background: None,
             agent_name: crate::permission::ask::subagent_name(),
@@ -1890,6 +1891,14 @@ mod js_permission_bridge {
             .await
             .expect("ask request should arrive")
             .into_permission();
+        assert_eq!(
+            request.diagnostic,
+            Some(crate::permission::ask::AskDiagnostic {
+                effective_mode: SecurityMode::Restrictive,
+                selected_mode: SecurityMode::Restrictive,
+                cause: crate::permission::ask::AskCause::ConfiguredAskRule,
+            })
+        );
         request
             .reply
             .send(UserDecision::AllowOnce)
@@ -1898,6 +1907,57 @@ mod js_permission_bridge {
             .await
             .expect("approval task should not panic")
             .expect("approval should allow the request");
+    }
+
+    #[tokio::test]
+    async fn permission126_js_broker_benign_heredoc_yolo_zero_ask_standard_one() {
+        let input =
+            "python3 - <<'PY'\nprint('read only')\nPY\necho ok | wc -l > /tmp/owned-report.txt";
+        for mode in [SecurityMode::Yolo, SecurityMode::Standard] {
+            let permission = Arc::new(Mutex::new(
+                PermissionChecker::new(
+                    &PermissionConfigs::default(),
+                    mode,
+                    std::env::current_dir().ok(),
+                    None,
+                )
+                .unwrap(),
+            ));
+            let (sender, mut receiver) = tokio_mpsc::channel(1);
+            let owner = PermissionBridgeOwner::new(Some(permission), Some(sender), STEP_TIMEOUT);
+            let bridge = owner.bridge();
+            let call = bridge.check_async("shell", input);
+            tokio::pin!(call);
+            if mode == SecurityMode::Yolo {
+                tokio::time::timeout(Duration::from_secs(2), &mut call)
+                    .await
+                    .expect("unmatched Yolo broker check must not wait for approval")
+                    .unwrap();
+                assert!(receiver.try_recv().is_err());
+            } else {
+                let request = tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::select! {
+                        request = receiver.recv() => request.unwrap().into_permission(),
+                        result = &mut call => panic!("broker completed before approval: {result:?}"),
+                    }
+                }).await.unwrap();
+                assert_eq!(request.input, input);
+                assert_eq!(
+                    request.diagnostic,
+                    Some(crate::permission::ask::AskDiagnostic {
+                        effective_mode: mode,
+                        selected_mode: mode,
+                        cause: crate::permission::ask::AskCause::ModePolicy,
+                    })
+                );
+                request.reply.send(UserDecision::Deny).unwrap();
+                assert_eq!(
+                    call.await,
+                    Err(PermissionBridgeError::Denied(PermissionDenial::User))
+                );
+                assert!(receiver.try_recv().is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -2060,7 +2120,11 @@ mod js_permission_bridge {
                 .check_async("read", "noninteractive.txt")
                 .await,
             Err(PermissionBridgeError::Denied(
-                PermissionDenial::NonInteractive
+                PermissionDenial::NonInteractive(crate::permission::ask::AskDiagnostic {
+                    effective_mode: SecurityMode::Restrictive,
+                    selected_mode: SecurityMode::Restrictive,
+                    cause: crate::permission::ask::AskCause::ConfiguredAskRule,
+                })
             ))
         );
         assert!(!noninteractive_invocation.permission_prompt_pending());

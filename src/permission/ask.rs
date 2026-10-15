@@ -202,8 +202,68 @@ pub struct QuestionRequest {
     pub(crate) reply: oneshot::Sender<crate::question::QuestionAnswer>,
 }
 
+/// Closed display-only classification captured with the actual policy decision.
+/// It cannot authorize a tool, persist a grant, or contain configured secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskCause {
+    ModePolicy,
+    ConfiguredAskRule,
+    #[cfg(feature = "hooks")]
+    PreToolUseHook,
+    DestructiveShell,
+    DoomLoop,
+    ExternalDirectory,
+    GitExecutionMetadata,
+}
+
+impl AskCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ModePolicy => "mode policy",
+            Self::ConfiguredAskRule => "configured Ask rule",
+            #[cfg(feature = "hooks")]
+            Self::PreToolUseHook => "PreToolUse hook Ask",
+            Self::DestructiveShell => "destructive shell classification",
+            Self::DoomLoop => "repeated-call policy",
+            Self::ExternalDirectory => "external-directory policy",
+            Self::GitExecutionMetadata => "Git execution-metadata protection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AskDiagnostic {
+    pub effective_mode: super::SecurityMode,
+    pub selected_mode: super::SecurityMode,
+    pub cause: AskCause,
+}
+
+impl std::fmt::Display for AskDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "effective mode: {}; selected mode: {}; cause: {}",
+            self.effective_mode,
+            self.selected_mode,
+            self.cause.label()
+        )?;
+        if self.effective_mode != self.selected_mode {
+            f.write_str("; prompt mode narrowed the selected mode")?;
+        }
+        Ok(())
+    }
+}
+
+impl AskDiagnostic {
+    pub(crate) fn noninteractive_error(self) -> String {
+        format!("Permission denied (non-interactive mode); {self}")
+    }
+}
+
 #[derive(Debug)]
 pub struct AskRequest {
+    /// Snapshot from the decision, never reconstructed from current UI state.
+    pub diagnostic: Option<AskDiagnostic>,
     #[cfg(feature = "subagents")]
     pub(crate) background: Option<crate::extras::subagents::background::AskOrigin>,
     /// Display attribution only; tool/input and grant patterns remain exact.
@@ -444,5 +504,220 @@ mod tests {
             assert_eq!(result.unwrap(), "fast");
             assert_eq!(ids, vec![None, None]);
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::permission::checker::{PermCheck, PermissionChecker};
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+    use std::sync::{Arc, Mutex};
+
+    const BENIGN_HEREDOC: &str = "python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('README.md').read_text()[:20])\nPY\necho done\nwc -l README.md | tail -1 > /tmp/owned-report.txt";
+
+    fn checker(mode: SecurityMode, action: Option<Action>) -> PermCheck {
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    bash: action.map(ToolPerm::Simple),
+                    ..Default::default()
+                }),
+                mode,
+                std::env::current_dir().ok(),
+                Some(
+                    SecurityMode::NAMES
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                ),
+            )
+            .unwrap(),
+        ))
+    }
+
+    async fn expect_ask(permission: PermCheck, input: &str, expected: AskDiagnostic) {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let optional_permission = Some(permission.clone());
+        let optional_sender = Some(sender);
+        let call =
+            crate::agent::tools::check_perm(&optional_permission, &optional_sender, "shell", input);
+        tokio::pin!(call);
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                request = receiver.recv() => request.expect("approval channel closed").into_permission(),
+                result = &mut call => panic!("completed before approval: {result:?}"),
+            }
+        }).await.expect("actual checker approval was not delivered");
+        assert_eq!(request.tool, "shell");
+        assert_eq!(request.input, input);
+        assert_eq!(request.diagnostic, Some(expected));
+        // The displayed snapshot must survive later policy changes while the
+        // exact request is queued; never re-read a renderer's current mode.
+        permission.lock().unwrap().set_mode(SecurityMode::Yolo);
+        assert_eq!(request.diagnostic, Some(expected));
+        request.reply.send(UserDecision::Deny).unwrap();
+        assert!(
+            call.await
+                .unwrap_err()
+                .to_string()
+                .contains("Permission denied by user")
+        );
+        assert!(receiver.try_recv().is_err(), "one decision sends one Ask");
+    }
+
+    #[tokio::test]
+    async fn permission126_benign_heredoc_yolo_zero_ask_standard_one() {
+        let permission = Some(checker(SecurityMode::Yolo, None));
+        let (sender, mut receiver) = mpsc::channel(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::agent::tools::check_perm(&permission, &Some(sender), "shell", BENIGN_HEREDOC),
+        )
+        .await
+        .expect("unmatched Yolo check must not wait for approval")
+        .unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "unmatched Yolo must send zero Ask"
+        );
+        expect_ask(
+            checker(SecurityMode::Standard, None),
+            BENIGN_HEREDOC,
+            AskDiagnostic {
+                effective_mode: SecurityMode::Standard,
+                selected_mode: SecurityMode::Standard,
+                cause: AskCause::ModePolicy,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn permission126_explicit_ask_destructive_and_prompt_narrowing_are_distinct() {
+        expect_ask(
+            checker(SecurityMode::Yolo, Some(Action::Ask)),
+            BENIGN_HEREDOC,
+            AskDiagnostic {
+                effective_mode: SecurityMode::Yolo,
+                selected_mode: SecurityMode::Yolo,
+                cause: AskCause::ConfiguredAskRule,
+            },
+        )
+        .await;
+        expect_ask(
+            checker(SecurityMode::Yolo, None),
+            "rm -rf owned-output",
+            AskDiagnostic {
+                effective_mode: SecurityMode::Yolo,
+                selected_mode: SecurityMode::Yolo,
+                cause: AskCause::DestructiveShell,
+            },
+        )
+        .await;
+        let narrowed = checker(SecurityMode::Yolo, None);
+        assert!(
+            narrowed
+                .lock()
+                .unwrap()
+                .set_prompt_mode(SecurityMode::Standard)
+        );
+        let expected = AskDiagnostic {
+            effective_mode: SecurityMode::Standard,
+            selected_mode: SecurityMode::Yolo,
+            cause: AskCause::ModePolicy,
+        };
+        assert!(
+            expected
+                .to_string()
+                .contains("prompt mode narrowed the selected mode")
+        );
+        expect_ask(narrowed, BENIGN_HEREDOC, expected).await;
+    }
+
+    #[test]
+    fn permission126_path_and_repeated_call_causes_follow_actual_decisions() {
+        let root = crate::tests::OwnedTestDirectory::new("permission126-cause");
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                doom_loop: Some(Action::Ask),
+                ..Default::default()
+            }),
+            SecurityMode::Standard,
+            Some(root.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        let target = root
+            .path()
+            .join(".git/config")
+            .to_string_lossy()
+            .into_owned();
+        let (result, diagnostic) =
+            checker.check_diagnosed(|checker| checker.check_bound_path("write", &target));
+        assert_eq!(result, crate::permission::checker::CheckResult::Ask);
+        assert_eq!(diagnostic.cause, AskCause::GitExecutionMetadata);
+        let mut saw_doom_loop = false;
+        for _ in 0..8 {
+            let (result, diagnostic) =
+                checker.check_diagnosed(|checker| checker.check("shell", "echo repeated"));
+            assert_eq!(result, crate::permission::checker::CheckResult::Ask);
+            saw_doom_loop |= diagnostic.cause == AskCause::DoomLoop;
+        }
+        assert!(saw_doom_loop, "repeated-call Ask was not attributed");
+        let external = crate::tests::OwnedTestDirectory::new("permission126-external");
+        let input = external
+            .path()
+            .join("data.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                external_directory: Some(std::collections::HashMap::from([(
+                    format!("{}/**", external.path().display()),
+                    Action::Ask,
+                )])),
+                ..Default::default()
+            }),
+            SecurityMode::Standard,
+            Some(root.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        let (result, diagnostic) =
+            checker.check_diagnosed(|checker| checker.check_path("read", &input));
+        assert_eq!(result, crate::permission::checker::CheckResult::Ask);
+        assert_eq!(diagnostic.cause, AskCause::ExternalDirectory);
+    }
+
+    #[tokio::test]
+    async fn permission126_deny_precedence_and_headless_cause_are_preserved() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let denied = crate::agent::tools::check_perm(
+            &Some(checker(SecurityMode::Yolo, Some(Action::Deny))),
+            &Some(sender),
+            "shell",
+            BENIGN_HEREDOC,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denied.to_string(),
+            "Permission denied: Blocked by deny rule"
+        );
+        assert!(receiver.try_recv().is_err());
+        let error = crate::agent::tools::check_perm(
+            &Some(checker(SecurityMode::Yolo, Some(Action::Ask))),
+            &None,
+            "shell",
+            BENIGN_HEREDOC,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Permission denied (non-interactive mode); effective mode: yolo; selected mode: yolo; cause: configured Ask rule"
+        );
+        assert!(!error.to_string().contains("README"));
     }
 }

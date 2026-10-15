@@ -790,8 +790,8 @@ Accepted top-level keys:
 | `task_max_turns`          | integer | Maximum model turns per subagent. Default: `20`; requires `subagents`. |
 | `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
 | `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
-| `task_max_output_bytes`   | integer | Aggregate rendered output cap for a `task` call. Default: `262144`; requires `subagents`. |
-| `task_max_cost_units`     | integer | Aggregate reported token/cost-unit cap for a `task` call. Default: `500000`; requires `subagents`. |
+| `task_max_output_bytes`   | integer | Aggregate rendered output cap for a `task` call. Default: `1048576`; requires `subagents`. |
+| `task_max_cost_units`     | integer | Aggregate reported token/cost-unit cap for a `task` call. Default: `2000000`; requires `subagents`. |
 | `task_timeout_secs`       | integer | Whole-call subagent deadline. Default: `300`, maximum `86400`; requires `subagents`. |
 | `task_enabled`            | boolean | Register the `task` tool when subagents are compiled in. Default: `true`. |
 | `subagent_model`          | string  | Raw model id or quick-model alias used by subagents; absent inherits the main model. |
@@ -3783,3 +3783,16 @@ DNS pinning, redirect checks, body bounds or the overall deadline. Search secret
 are scoped only to the fixed Exa endpoint; no key or endpoint tool argument is
 accepted. Page/snippet text is literal untrusted context, not an execution or
 permission source. Optional fetch `prompt` does not invoke a summarizing model.
+
+### Next-delegation subagent limits
+
+`subagent_context_window` (262144 estimated input+reserved output),
+`subagent_max_tokens` (16384 response tokens), `task_max_report_bytes`
+(262144 bytes), `task_report_repair_max_tokens` (4096 response tokens), and
+`task_report_repair_max_cost_units` (65536 weighted usage units) are separate
+from the main session's context pin and dollar budget. `/config` persists these
+and the existing task turn/prompt/concurrency/aggregate/cost/deadline settings
+and applies effective changes to the next delegation, preserving current child
+snapshots and higher layer/CLI precedence. `--set key=value` provides the same
+startup overrides. See [Editable child sizing](SUBAGENTS.md#editable-child-sizing)
+for provider/parent ceilings, estimated context admission and repair behavior.

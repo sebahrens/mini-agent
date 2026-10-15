@@ -795,6 +795,7 @@ mod event60_tests {
                 crate::permission::ask::send_permission_request(
                     &sender,
                     crate::permission::ask::AskRequest {
+                        diagnostic: None,
                         #[cfg(feature = "subagents")]
                         background: None,
                         agent_name: Some("implementer".into()),

@@ -595,6 +595,7 @@ async fn handle_ask_inner(
     input: &str,
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
+    diagnostic: crate::permission::ask::AskDiagnostic,
 ) -> Result<(), ToolError> {
     crate::spend::run::admit_current_effect()
         .await
@@ -616,6 +617,7 @@ async fn handle_ask_inner(
     crate::permission::ask::send_permission_request(
         ask_tx,
         AskRequest {
+            diagnostic: Some(diagnostic),
             #[cfg(feature = "subagents")]
             background: None,
             agent_name: crate::permission::ask::subagent_name(),
@@ -679,20 +681,18 @@ pub(crate) async fn request_hook_approval(
             "Permission system unavailable for hook approval".to_string(),
         ));
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.hook_ask_decision(tool, input)
+        guard.check_diagnosed(|guard| guard.hook_ask_decision(tool, input))
     };
     match result {
         CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
         CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(tx, perm, tool, input, None, Vec::new()).await
+            handle_ask_inner(tx, perm, tool, input, None, Vec::new(), diagnostic).await
         }
     }
 }
@@ -716,9 +716,9 @@ pub(crate) async fn check_perm_with_suggestion(
     let Some(perm) = permission else {
         return Ok(None);
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check(tool, input_key)
+        guard.check_diagnosed(|guard| guard.check(tool, input_key))
     };
     match result {
         CheckResult::Allowed => Ok(None),
@@ -728,11 +728,18 @@ pub(crate) async fn check_perm_with_suggestion(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(tx, perm, tool, input_key, suggested_pattern, Vec::new()).await?;
+            handle_ask_inner(
+                tx,
+                perm,
+                tool,
+                input_key,
+                suggested_pattern,
+                Vec::new(),
+                diagnostic,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -749,9 +756,9 @@ pub(crate) async fn check_mcp_perm(
     let Some(perm) = permission else {
         return Ok(None);
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_mcp(input_key, trusted_identity, mcp_tool_name)
+        guard.check_diagnosed(|guard| guard.check_mcp(input_key, trusted_identity, mcp_tool_name))
     };
     match result {
         CheckResult::Allowed => Ok(None),
@@ -761,11 +768,18 @@ pub(crate) async fn check_mcp_perm(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(tx, perm, "mcp_tool", input_key, None, Vec::new()).await?;
+            handle_ask_inner(
+                tx,
+                perm,
+                "mcp_tool",
+                input_key,
+                None,
+                Vec::new(),
+                diagnostic,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -783,20 +797,29 @@ pub(crate) async fn check_mcp_auxiliary_perm(
     let Some(permission) = permission else {
         return Ok(());
     };
-    let result = permission
+    let (result, diagnostic) = permission
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .check_mcp_auxiliary(policy_input, identity, trusted_identity, operation);
+        .check_diagnosed(|guard| {
+            guard.check_mcp_auxiliary(policy_input, identity, trusted_identity, operation)
+        });
     match result {
         CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
         CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
         CheckResult::Ask => {
             let Some(sender) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".into(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(sender, permission, "mcp_tool", identity, None, Vec::new()).await
+            handle_ask_inner(
+                sender,
+                permission,
+                "mcp_tool",
+                identity,
+                None,
+                Vec::new(),
+                diagnostic,
+            )
+            .await
         }
     }
 }
@@ -824,9 +847,9 @@ pub(crate) async fn check_perm_path_with_suggestion(
     let Some(perm) = permission else {
         return Ok(None);
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_path(tool, path)
+        guard.check_diagnosed(|guard| guard.check_path(tool, path))
     };
     match result {
         CheckResult::Allowed => Ok(None),
@@ -836,9 +859,7 @@ pub(crate) async fn check_perm_path_with_suggestion(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
             handle_ask_inner(
                 tx,
@@ -847,6 +868,7 @@ pub(crate) async fn check_perm_path_with_suggestion(
                 path,
                 suggested_pattern,
                 additional_allow_patterns,
+                diagnostic,
             )
             .await?;
             Ok(None)
@@ -869,9 +891,9 @@ pub(crate) async fn check_perm_canonical_path(
     let Some(perm) = permission else {
         return Ok(None);
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_canonical_path(tool, path, external)
+        guard.check_diagnosed(|guard| guard.check_canonical_path(tool, path, external))
     };
     match result {
         CheckResult::Allowed => Ok(None),
@@ -881,11 +903,9 @@ pub(crate) async fn check_perm_canonical_path(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(tx, perm, tool, path, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, path, None, Vec::new(), diagnostic).await?;
             Ok(None)
         }
     }
@@ -944,9 +964,9 @@ pub(crate) async fn check_perm_bound_path(
     let Some(perm) = permission else {
         return Ok(None);
     };
-    let result = {
+    let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_bound_path(tool, logical)
+        guard.check_diagnosed(|guard| guard.check_bound_path(tool, logical))
     };
     match result {
         CheckResult::Allowed => Ok(None),
@@ -956,11 +976,9 @@ pub(crate) async fn check_perm_bound_path(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
-            handle_ask_inner(tx, perm, tool, logical, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, logical, None, Vec::new(), diagnostic).await?;
             Ok(None)
         }
     }

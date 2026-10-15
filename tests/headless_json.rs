@@ -2175,14 +2175,34 @@ fn linux_native_shell_and_read_share_the_actual_headless_workspace() {
     assert_eq!(output.stdout, b"yes, both tools see the same directory\n");
     assert_eq!(requests.len(), 3);
     let actual_root = root.0.canonicalize().unwrap().display().to_string();
-    let system = requests[0]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "system")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    // Native canonical text can arrive as a legacy string or ordered typed
+    // text parts. Reject every other wire shape instead of silently dropping it.
+    fn text(content: &serde_json::Value) -> String {
+        match content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => {
+                assert!(!parts.is_empty(), "text content parts must not be empty");
+                parts
+                    .iter()
+                    .map(|part| {
+                        assert_eq!(part["type"], "text", "only typed text parts are valid here");
+                        part["text"]
+                            .as_str()
+                            .expect("typed text must contain a string")
+                    })
+                    .collect()
+            }
+            _ => panic!("expected string or typed text-parts content"),
+        }
+    }
+    let system = text(
+        &requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "system")
+            .unwrap()["content"],
+    );
     assert!(system.contains(&format!("Current working directory: {actual_root}")));
     assert!(!system.contains("Sandboxed shell commands see this workspace at"));
     let results: Vec<_> = requests[2]["messages"]
@@ -2192,18 +2212,8 @@ fn linux_native_shell_and_read_share_the_actual_headless_workspace() {
         .filter(|message| message["role"] == "tool")
         .collect();
     assert_eq!(results.len(), 2);
-    assert!(
-        results[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains(&actual_root)
-    );
-    assert!(
-        results[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same-workspace-native-proof")
-    );
+    assert!(text(&results[0]["content"]).contains(&actual_root));
+    assert!(text(&results[1]["content"]).contains("same-workspace-native-proof"));
 }
 
 /// Ctrl-C while the completion judge is waiting on its provider ends the run

@@ -5232,7 +5232,7 @@ fn seatbelt_namespace_denies(paths: &[PathBuf]) -> Result<String, String> {
         .collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn seatbelt_shell_profile(
     workspace_str: &str,
     cache_str: &str,

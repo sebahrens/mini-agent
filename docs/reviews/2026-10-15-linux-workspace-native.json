@@ -1,0 +1,94 @@
+{
+  "bead": "mini-agent-i7ro6.99",
+  "result": "Native original seven plus actual headless one PASS across two source-attributed runs; unrelated profile100 failure remains separate.",
+  "native7": {
+    "run": 38696454311,
+    "job": 116294027223,
+    "workflow_head": "481195bda4140a9904c308034a9ae0410beef69f",
+    "checked_out_source": "b244b74c3fadcc55c319209ffe45472f749d8901",
+    "log": "/private/tmp/mini-agent-linux99-100-native-failure.log",
+    "log_sha256": "468818d393bbfde09d5fe196cc5a397ee77dc22c585e532674c3179c369dc3a8",
+    "discovered": 7,
+    "executed": 7,
+    "passed": 7,
+    "cases": [
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_under_tmp_keeps_real_and_spelled_paths_and_git_masks",
+        "log_line": 112,
+        "result": "PASS"
+      },
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_under_readonly_runtime_keeps_one_writable_view",
+        "log_line": 144,
+        "result": "PASS"
+      },
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_control_destination_uses_visible_nonroot_fallback",
+        "log_line": 176,
+        "result": "PASS"
+      },
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_replacement_after_construction_retains_original_tree_and_masks",
+        "log_line": 208,
+        "result": "PASS"
+      },
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_cancellation_reaps_owned_real_path_children",
+        "log_line": 240,
+        "result": "PASS"
+      },
+      {
+        "name": "sandbox::linux_workspace_tests::linux_native_workspace_cargo_artifacts_are_reused_at_host_real_paths",
+        "log_line": 272,
+        "result": "PASS"
+      },
+      {
+        "name": "extras::js::host::tests::linux_native_bound_snapshot_original_slot_197_keeps_image_and_closes_authority",
+        "log_line": 304,
+        "result": "PASS"
+      }
+    ]
+  },
+  "headless1": {
+    "run": 38700701572,
+    "job": 116307909553,
+    "workflow_head": "df52c373feb8b767cf7a9d141993c9963900b069",
+    "checked_out_source": "2e52c9f78149f4bb7042e0159f8b1c9ca083d10c",
+    "source_parent": "b244b74c3fadcc55c319209ffe45472f749d8901",
+    "log": "/private/tmp/mini-agent-linux99-100-followup-job.log",
+    "log_sha256": "098117197297527c9c00697af8c1e9379d11eb26fbfd52b9c591bfbbb19bd52f",
+    "discovered": 1,
+    "executed": 1,
+    "passed": 1,
+    "name": "linux_native_shell_and_read_share_the_actual_headless_workspace",
+    "seconds": 0.27,
+    "assertions": [
+      "actual captured workspace Current working directory and no namespace-alias notice",
+      "three actual provider requests",
+      "two actual tool results: shell actualroot and Read exactknownfixturebytes",
+      "finalstdout exactrequestedreply",
+      "strictString/nonemptyTypedTextParts wire extraction"
+    ]
+  },
+  "reuse_boundary": {
+    "production": "2e52 differsb244 onlytests/headless_json.rs localtypedtext extraction andmacOS-onlycfg(test) Seatbelt helper; no Linux production mutation.",
+    "owner_sha256": {
+      "src/sandbox/linux_workspace_tests.rs": {
+        "b244": "154e3b035c956dbde143574c307a18f6fcf95363ec93583ae16b226dcc2ca5c3",
+        "2e52": "154e3b035c956dbde143574c307a18f6fcf95363ec93583ae16b226dcc2ca5c3"
+      },
+      "src/extras/js/host.rs": {
+        "b244": "28e3cc1f792fe6000941b8a20d85afa3d8dc3896ac3da0334380c8de8a93e75c",
+        "2e52": "28e3cc1f792fe6000941b8a20d85afa3d8dc3896ac3da0334380c8de8a93e75c"
+      }
+    },
+    "not_claimed": [
+      "single-run eightPASS",
+      "profile100 acceptance",
+      "wholeCIgreen",
+      "globalroot workspace permission expansion"
+    ]
+  },
+  "source_fixture_patch": "/private/tmp/mini-agent-linux99-100-typed-text-fixture.patch",
+  "closure_gate": "Root integratedfixture +currentproduction Mainpush; normal fullCI finalaggregate remains separate."
+}

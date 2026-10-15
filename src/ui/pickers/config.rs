@@ -31,18 +31,26 @@ impl ConfigPicker {
             this.choose(key);
         } else {
             let values = crate::config::layers::normalized_json(cfg).ok();
+            #[cfg(feature = "subagents")]
+            let live_limits = crate::extras::subagents::live_limit_values();
             let entries = keys::CONFIG_KEYS
                 .iter()
                 .filter(|key| key.feature.is_none_or(keys::feature_enabled))
                 .map(|key| {
                     let dedicated = dedicated_value(cli, key.name);
+                    #[cfg(feature = "subagents")]
+                    let live_limit = live_limits.as_ref().and_then(|values| values.get(key.name));
+                    #[cfg(not(feature = "subagents"))]
+                    let live_limit: Option<&serde_json::Value> = None;
                     let value = preview(
                         key.name,
-                        dedicated
+                        live_limit.or(dedicated
                             .as_ref()
-                            .or_else(|| values.as_ref().and_then(|v| v.get(key.name))),
+                            .or_else(|| values.as_ref().and_then(|v| v.get(key.name)))),
                     );
-                    let source = if dedicated.is_some() {
+                    let source = if live_limit.is_some() {
+                        "captured next-delegation limits".into()
+                    } else if dedicated.is_some() {
                         "dedicated CLI".into()
                     } else {
                         cfg.provenance
@@ -87,8 +95,10 @@ impl ConfigPicker {
                             kind(key.shape),
                             if key.restart_required {
                                 "restart"
-                            } else {
+                            } else if key.name == "reasoning_display" {
                                 "live display"
+                            } else {
+                                "next delegation"
                             },
                             if crate::config::editor::may_need_project_approval(key.name) {
                                 ", project approval"
@@ -263,10 +273,52 @@ mod tests {
         assert_eq!(cfg.max_tokens, Some(51));
         for key in keys::CONFIG_KEYS {
             assert!(!key.description.is_empty());
-            assert_eq!(key.restart_required, key.name != "reasoning_display");
+            let next_delegation = matches!(
+                key.name,
+                "subagent_context_window"
+                    | "subagent_max_tokens"
+                    | "task_max_report_bytes"
+                    | "task_report_repair_max_tokens"
+                    | "task_report_repair_max_cost_units"
+                    | "task_max_turns"
+                    | "task_max_prompts"
+                    | "task_max_concurrency"
+                    | "task_max_output_bytes"
+                    | "task_max_cost_units"
+                    | "task_timeout_secs"
+            );
+            assert_eq!(
+                key.restart_required,
+                key.name != "reasoning_display" && !next_delegation
+            );
         }
         assert!(super::super::list::reserved_command("config"));
     }
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn subagent127_picker_exposes_every_next_delegation_limit_without_saving() {
+        for key in crate::extras::subagents::LIVE_SETTING_KEYS {
+            let mut picker = ConfigPicker::new(
+                &Config::default(),
+                &Default::default(),
+                Target::Global,
+                None,
+            );
+            // The ordinary catalogue deliberately displays only 50 matches.
+            // Search each key through the actual list input path.
+            for character in key.chars() {
+                picker.list.char_input(character);
+            }
+            let rows = picker.list.display_rows();
+            assert!(
+                rows.iter()
+                    .any(|row| row.starts_with(&format!("{key} "))
+                        && row.contains("next delegation")),
+                "missing {key}"
+            );
+        }
+    }
+
     #[test]
     fn config68_preview_hides_credentials_and_terminal_controls() {
         assert!(

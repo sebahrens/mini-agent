@@ -420,7 +420,7 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
         matches!(
             error,
             Err(crate::agent::tools::ToolError::Msg(ref message))
-                if message == "Permission denied (non-interactive mode)"
+                if message == "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: configured Ask rule"
         ),
         "ACP non-interactive Ask did not fail closed"
     );
@@ -428,7 +428,7 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityMode {
     Standard,
     Restrictive,
@@ -1560,7 +1560,7 @@ mod acp_permission_policy_tests {
 
         assert_eq!(
             error.to_string(),
-            "Permission denied (non-interactive mode)"
+            "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: configured Ask rule"
         );
         assert!(
             !target.exists(),
@@ -1585,7 +1585,9 @@ mod acp_permission_policy_tests {
         for result in [concurrent.0, concurrent.1] {
             assert_eq!(
                 message(result).as_deref(),
-                Some("Permission denied (non-interactive mode)")
+                Some(
+                    "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: configured Ask rule"
+                )
             );
         }
     }

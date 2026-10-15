@@ -1,0 +1,83 @@
+{
+  "scope": "mini-agent-i7ro6.123-.127 subagent sizing, live units, report validity, capability preflight and Ask diagnostics",
+  "base_commit": "dfc41db3f7124faef541b74aab21170a003b3bc8",
+  "defaults": {
+    "subagent_context_window": 262144,
+    "subagent_max_tokens": 16384,
+    "task_max_report_bytes": 262144,
+    "task_max_output_bytes": 1048576,
+    "task_max_cost_units": 2000000,
+    "task_report_repair_max_tokens": 4096,
+    "task_report_repair_max_cost_units": 65536
+  },
+  "validation": {
+    "default_scoped": "52 unique owning tests pass across targeted batches, including actual child/provider request counts, repair response cap37, shared live-unit stop before next request/effect, held sibling retirement, prepared context admission, live settings snapshots, real tool-definition preflight, Ask attribution through UI/ACP/hooks/JS/headless",
+    "subagents_only": "11 targeted tests pass with --no-default-features --features subagents; no unrelated modules exercised",
+    "minimal": "3 config/capability tests plus4 newly changed permission diagnostics pass with --no-default-features",
+    "clippy_default": "cargo clippy --locked --offline --all-targets -- -D warnings PASS42.21s",
+    "clippy_minimal": "cargo clippy --locked --offline --no-default-features --all-targets -- -D warnings PASS21.07s; closed hook cause variant cfg-gated to owning feature",
+    "native_mac_changed_fixture": "profile100_native_host_profiles_preserve_masks_and_real_operations --ignored PASS1/.07s; actual OS sandbox, after read-only-host versus Linux-private-scratch fixture correction",
+    "format": "cargo fmt and git diff --check PASS",
+    "build": "cargo install --path . --debug --locked --offline --root /private/tmp/mini-agent-subagent127-install PASS; final presentation update install9.02s",
+    "installed": {
+      "result": "PASS installed CLI:8 overrides accepted with CLI provenance, main context1000000 printed, invalid child response rejected before execution",
+      "binary": "/private/tmp/mini-agent-subagent127-install/bin/mini-agent",
+      "binary_sha256": "44c098f30e7a2971db1d1ffb7cca8b9fb0112005f9163fcc6964757b7a6638fa",
+      "requested_overrides": {
+        "context_window": 1000000,
+        "subagent_context_window": 262144,
+        "subagent_max_tokens": 32768,
+        "task_max_report_bytes": 262144,
+        "task_max_output_bytes": 1048576,
+        "task_max_cost_units": 2000000,
+        "task_report_repair_max_tokens": 4096,
+        "task_report_repair_max_cost_units": 65536
+      },
+      "positive_exit": 0,
+      "negative_exit": 1,
+      "output_path": "/private/tmp/mini-agent-settings127-smoke-2gfdm57b/stdout",
+      "limit": "print-config shows provenance for new fields; configured values/actual child request bounds covered by owning Rust/runtime tests",
+      "last_change": "settings help text and native-test-only correction; functional settings controls reused"
+    }
+  },
+  "selection": "code-indexer callers and owned source/test maps; new symbols followed physically where index not yet populated. Reused passing unchanged code; no full local suite, release build or repeated worker suite.",
+  "limits": [
+    "Context admission estimates normalized prepared request plus response reserve; provider tokenizers and actual model capacity remain authoritative.",
+    "Task weighted units are not USD. Already in-flight responses can overshoot; missing usage uses prepared-request estimate plus reserved response.",
+    "Saved sizing applies to next delegation only, respects higher layer/explicit parent response ceilings; active/background snapshots stay fixed.",
+    "Required code-indexer CLI personas fail before a child request when shell/MCP routes are absent; this does not grant children unrestricted shell or inherit MCP.",
+    "Screenshot does not establish historical effective mode or exact failure; confirmed source defects and new regressions are separate evidence.",
+    "Only final help strings and test-only native fixture edits followed strict lint checks; default debug install and native fixture rebuilt those edits."
+  ],
+  "changed_source_sha256": {
+    "src/agent/builder.rs": "482c0761061734ff128aca18601632ebda6b01d585c247905fa529c5b6c46fd9",
+    "src/agent/runner.rs": "1d3ad0f8d43e18a9150be887c6b4006a9842f2298b28e6d2bcd373b3d2026908",
+    "src/agent/tools/mod.rs": "f5677ff7ea70b9dae3fadcb04e3825b930bf0e9e76555ea0bc7b7c7ecc18552c",
+    "src/config/editor.rs": "7fd85b2ec639e8061a42bc4cbf4df1c798b9b258466d9571cdb5531ad8c88aaa",
+    "src/config/keys.rs": "4f109f7d68ca994821aeb5675273e181bb8a87b5969b0b0ad5ee44445eaaeec6",
+    "src/config/load.rs": "5160df50bdd346adcb85b8ae1a0bd4033080867d3586b2a251ae10f9cf908054",
+    "src/config/mod.rs": "89aec98420ee2c7dafd0ccd1f7a98a03d30644ae0906448a045344dde28e4d54",
+    "src/context/agents.rs": "4d8bd27722a70cdfc1358b69fe00bb31482bf700318e8aaa831fb4ac94b44689",
+    "src/extras/acp/mod.rs": "89491c505c8bd12973ad7a16566bc656ce3392866406ba8f1918b75cae75bd61",
+    "src/extras/hooks/mod.rs": "ffb97a4b6f83063e722354fffe3146aa05f7569e918169fed7a087ca7cf513b5",
+    "src/extras/js/tool.rs": "7b8aff341bbf422eaa05cf8aeb0e43f02974118ce4143a6a4a75ef224c9a3333",
+    "src/extras/js/types.rs": "bb2577be775a3dd7a61b33dd16c52cb14f336726e5a5f1425386500374e65f5c",
+    "src/extras/subagents/builder.rs": "def41d2fadbf673602c8d06ffd7cf9165a5e893dc90e980eb0c0362ab782ffa5",
+    "src/extras/subagents/mod.rs": "4eb256418c29af9d19f86cf4fa2219b47156def8973d659f0c0c6010538501cd",
+    "src/extras/subagents/task_tool.rs": "3e688578e6cdd0eef5a6d1cecf79128970d5585fd2151abe2933321deaa0a9b8",
+    "src/permission/ask.rs": "44155899d02ed2ec87fa941cbbdd8a378b1086cc75c24042e1bca403d6b3bb2b",
+    "src/permission/checker.rs": "0b068247f5b591305ea9c5a137cdfeb5308058458017153b2a03944fb49484ee",
+    "src/permission/mod.rs": "725dfa47966033501062c55d0e2658f709425e1be749281324b8858a1ce0754d",
+    "src/provider.rs": "f2f32f25b4f78ee3c0d47603e6e6e65c37a52f6a16c72fc031002fe4368cba5e",
+    "src/sandbox.rs": "874ad15d5dc42400a3dac285c6da77fa3c55250f50cc24ae46bd5efa2cf56dc0",
+    "src/sandbox/general_profile.rs": "0678ed6c55bfd05ecd4833de00c3788f93033d0f180dfe3795ceb4388aca5d0f",
+    "src/tests/checker_tests.rs": "1795410aefdb452f8f41b5233f705c0506f5c4e497664404093690b3823320f0",
+    "src/tests/hooks/decorator_tests.rs": "818fa2d0841e0970730c0d0a236612e20b57495be2d07301d47dce50d235640a",
+    "src/ui/app.rs": "895583a816c2553c27dae834461e9e9c99d9627c9427579ab728e83d74f34f25",
+    "src/ui/mcp_admin_app_tests.rs": "956a2c8f13733b2c53af94d9760f126a9cc0c018732614ed9f2ce60dbc07beb9",
+    "src/ui/permission_handler.rs": "fae8de5cfb31a7724b3f7f4693782c84fc6c40d95d31f7938e0157bf75196ffd",
+    "src/ui/pickers/config.rs": "5d1070e8f2f1ebb00459df8b326122ae39bc854d13184c29a1efec9e657adb15",
+    "src/ui/slash/config.rs": "d1225c75e7f602290a3898f8a7b71750c11f00c724bca99cd7ccc0afc0666d33",
+    "tests/headless_json.rs": "f20b6d3fe6b72a4d002a050cedbd2f98a149e2f4f43bdbdb282247e00d70da73"
+  }
+}

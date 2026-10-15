@@ -62,6 +62,26 @@ impl AgentTool {
             _ => None,
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Grep => "grep",
+            Self::FindFiles => "find_files",
+            Self::ListDir => "list_dir",
+            Self::Write => "write",
+            Self::Edit => "edit",
+            Self::Shell => "shell",
+            #[cfg(feature = "js")]
+            Self::Js => "js",
+            #[cfg(feature = "skills")]
+            Self::SkillsSearch => "skills_search",
+            #[cfg(feature = "memory")]
+            Self::MemoryRead => "memory_read",
+            #[cfg(feature = "memory")]
+            Self::MemorySearch => "memory_search",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +96,7 @@ struct AgentMetadata {
     mode: Option<String>,
     description: Option<String>,
     tools: Option<Vec<AgentTool>>,
+    required_tools: Vec<String>,
     tool_narrowing_notice: Option<String>,
     model: Option<String>,
     turn_budget: Option<AgentTurnBudget>,
@@ -184,6 +205,11 @@ fn normalize_agent_definition(
         Some((tools, notice)) => (Some(tools), notice),
         None => (None, None),
     };
+    let required_tools = mapping
+        .get(serde_yaml_ng::Value::String("required_tools".into()))
+        .map(parse_required_agent_tools)
+        .transpose()?
+        .unwrap_or_default();
     let model = mapping
         .get(serde_yaml_ng::Value::String("model".into()))
         .map(|value| {
@@ -233,6 +259,7 @@ fn normalize_agent_definition(
         "mode",
         "description",
         "tools",
+        "required_tools",
         "model",
         "turn_budget",
         "effort",
@@ -257,6 +284,7 @@ fn normalize_agent_definition(
                     mode,
                     description,
                     tools,
+                    required_tools,
                     tool_narrowing_notice,
                     model,
                     turn_budget,
@@ -266,6 +294,73 @@ fn normalize_agent_definition(
             )
         })
         .ok_or("prompt body is empty")
+}
+
+fn parse_required_agent_tools(value: &serde_yaml_ng::Value) -> Result<Vec<String>, &'static str> {
+    let names = if let Some(list) = value.as_sequence() {
+        list.iter()
+            .map(|name| {
+                name.as_str()
+                    .ok_or("required_tools entries must be strings")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if let Some(list) = value.as_str() {
+        list.split(',').collect()
+    } else {
+        return Err("required_tools must be a comma-separated string or string list");
+    };
+    if names.len() > MAX_DECLARED_TOOLS {
+        return Err("required_tools exceeds the 128 entry limit");
+    }
+    let mut required = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > MAX_TOOL_NAME_CHARS
+            || !name.is_ascii()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        {
+            return Err("required_tools names must be ASCII tool identifiers of at most 64 bytes");
+        }
+        let name =
+            AgentTool::parse(name).map_or_else(|| name.to_string(), |tool| tool.name().to_string());
+        if !required.contains(&name) {
+            required.push(name);
+        }
+    }
+    Ok(required)
+}
+
+/// Compatibility for the installed code-indexer persona, which predates
+/// required_tools metadata. Recognize its explicit Tools-section CLI contract,
+/// never a prose mention or an example elsewhere in a persona.
+#[cfg(any(test, feature = "subagents"))]
+fn requires_indexer_cli(prompt: &str) -> bool {
+    let normalized = prompt.replace("\r\n", "\n");
+    let Some(section) = normalized.strip_prefix("## Tools\n").or_else(|| {
+        normalized
+            .split_once("\n## Tools\n")
+            .map(|(_, section)| section)
+    }) else {
+        return false;
+    };
+    let section = section.split("\n## ").next().unwrap_or(section);
+    let Some(code) = section
+        .trim_start()
+        .strip_prefix("All queries use a single CLI script:\n\n```bash\n")
+    else {
+        return false;
+    };
+    let Some((code, _)) = code.split_once("\n```") else {
+        return false;
+    };
+    code.lines()
+        .any(|line| line.trim() == "CLI=\".claude/code-indexer_state/code_indexer_cli.py\"")
+        && code
+            .lines()
+            .any(|line| line.trim_start().starts_with("python3 $CLI batch "))
 }
 
 fn parse_agent_tools(
@@ -362,6 +457,7 @@ pub struct AgentDefinition {
     pub(crate) description: Option<String>,
     /// Optional narrowing of the read-only tools installed in specialist children.
     pub(crate) tools: Option<Vec<AgentTool>>,
+    pub(crate) required_tools: Vec<String>,
     /// Optional raw model id or configured quick-model alias for specialist children.
     pub(crate) model: Option<String>,
     /// Optional `turn_budget` tier (formerly `effort`) that narrows the global
@@ -387,6 +483,7 @@ fn merge_definitions(
                 mode: metadata.mode,
                 description: metadata.description,
                 tools: metadata.tools,
+                required_tools: metadata.required_tools,
                 model: metadata.model,
                 turn_budget: metadata.turn_budget,
                 source: source.clone(),
@@ -398,6 +495,15 @@ fn merge_definitions(
 }
 
 impl AgentDefinition {
+    #[cfg(any(test, feature = "subagents"))]
+    pub(crate) fn required_tool_names(&self) -> Vec<String> {
+        let mut tools = self.required_tools.clone();
+        if requires_indexer_cli(&self.prompt) && !tools.iter().any(|tool| tool == "shell") {
+            tools.push("shell".to_string());
+        }
+        tools
+    }
+
     pub(crate) fn list_entry(&self, name: &str) -> String {
         let notice = self
             .ignored_definition_notices
@@ -416,6 +522,7 @@ impl AgentDefinition {
             mode: mode.map(str::to_string),
             description: None,
             tools: None,
+            required_tools: Vec::new(),
             model: None,
             turn_budget: None,
             source: AgentDefinitionSource::Embedded,
@@ -675,6 +782,7 @@ fn merge_external_definitions(
                         mode: metadata.mode,
                         description: metadata.description,
                         tools: metadata.tools,
+                        required_tools: metadata.required_tools,
                         model: metadata.model,
                         turn_budget: metadata.turn_budget,
                         source: source.clone(),
@@ -825,7 +933,22 @@ pub(crate) fn available_schema_entries_for_workspace(
     };
     let mut entries = agents
         .into_iter()
-        .map(|(name, definition)| (name, definition.one_line_description()))
+        .map(|(name, definition)| {
+            let mut description = definition.one_line_description();
+            let required = definition.required_tool_names();
+            if !required.is_empty() {
+                description.push_str(&format!(
+                    " [requires installed child tools: {}]",
+                    required
+                        .iter()
+                        .take(MAX_NOTICE_NAMES)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            (name, description)
+        })
         .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     entries
@@ -883,7 +1006,7 @@ pub(crate) fn source_hint_for_workspace(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn isolated_paths(root: &Path) -> crate::paths::AppPaths {
@@ -895,6 +1018,64 @@ mod tests {
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
             project_dir: Some(root.join(".zerostack")),
+        }
+    }
+
+    // Exact Tools-section excerpt from code-indexer 0.1.6's
+    // agents/code-indexer-subcall.md; this is an executable requirement,
+    // not an incidental use of the words Bash, Agent, or code-indexer.
+    pub(crate) const INDEXER_CLI_PERSONA: &str = "# Code Indexer Exploration Agent\n\n\
+        ## Tools\n\nAll queries use a single CLI script:\n\n```bash\n\
+        CLI=\".claude/code-indexer_state/code_indexer_cli.py\"\n\
+        python3 $CLI batch --commands \"search symbol_name\"\n```\n\n\
+        ## Workflow\nReturn actual code extracts with file:line evidence.";
+
+    #[test]
+    fn persona_required_tools_are_explicit_bounded_and_separate_from_narrowing() {
+        let explicit = parse_for_test(
+            "review",
+            "---\ntools: [Read]\nrequired_tools: [Read, Bash, Agent, mcp__indexer__search]\n---\nReview source.",
+        );
+        assert_eq!(explicit.tools, Some(vec![AgentTool::Read]));
+        assert_eq!(
+            explicit.required_tool_names(),
+            ["read", "shell", "Agent", "mcp__indexer__search"]
+        );
+        assert_eq!(
+            parse_for_test("indexer", INDEXER_CLI_PERSONA).required_tool_names(),
+            ["shell"]
+        );
+        assert_eq!(
+            parse_for_test("indexer", &INDEXER_CLI_PERSONA.replace('\n', "\r\n"))
+                .required_tool_names(),
+            ["shell"]
+        );
+        for body in [
+            "Review Bash, Agent, and code-indexer usage. Do not run shell commands.",
+            "## Examples\nAll queries use a single CLI script:\n\n```bash\nCLI=\".claude/code-indexer_state/code_indexer_cli.py\"\npython3 $CLI batch --commands x\n```",
+            "## Tools\nUse Read and Grep. A CLI example is available in code-indexer docs.",
+        ] {
+            assert!(
+                parse_for_test("review", body)
+                    .required_tool_names()
+                    .is_empty()
+            );
+        }
+        for invalid in [
+            "[Read, 5]",
+            "true",
+            "['']",
+            "['bad name']",
+            "['Read\nBash']",
+        ] {
+            assert!(
+                normalize_agent_definition(
+                    "review".into(),
+                    format!("---\nrequired_tools: {invalid}\n---\nBODY")
+                )
+                .is_err(),
+                "{invalid}"
+            );
         }
     }
 
@@ -1465,6 +1646,7 @@ mod tests {
             mode: None,
             description: None,
             tools: None,
+            required_tools: Vec::new(),
             model: None,
             turn_budget: None,
             source: AgentDefinitionSource::Embedded,
@@ -1476,6 +1658,7 @@ mod tests {
             mode: None,
             description: None,
             tools: None,
+            required_tools: Vec::new(),
             model: None,
             turn_budget: None,
             source: AgentDefinitionSource::UserGlobal,
@@ -1493,6 +1676,7 @@ mod tests {
             mode: None,
             description: None,
             tools: None,
+            required_tools: Vec::new(),
             model: None,
             turn_budget: None,
             source: AgentDefinitionSource::Embedded,

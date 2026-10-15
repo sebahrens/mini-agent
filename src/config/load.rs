@@ -195,6 +195,8 @@ pub(crate) fn validate_responses_extra_body(
 /// OpenAI Responses API, stripping `previous_response_id` and warning about
 /// keys that would be dropped in silence.
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
+    #[cfg(feature = "subagents")]
+    cfg.validate_subagent_settings()?;
     let global_is_responses = cfg
         .provider
         .clone()
@@ -568,13 +570,23 @@ pub(super) fn rich_default_config() -> Config {
         #[cfg(feature = "subagents")]
         task_max_prompts: Some(8),
         #[cfg(feature = "subagents")]
+        subagent_context_window: Some(262_144),
+        #[cfg(feature = "subagents")]
+        subagent_max_tokens: Some(16_384),
+        #[cfg(feature = "subagents")]
+        task_max_report_bytes: Some(262_144),
+        #[cfg(feature = "subagents")]
+        task_report_repair_max_tokens: Some(4096),
+        #[cfg(feature = "subagents")]
+        task_report_repair_max_cost_units: Some(65_536),
+        #[cfg(feature = "subagents")]
         task_max_concurrency: Some(4),
         #[cfg(feature = "subagents")]
         subagents: None,
         #[cfg(feature = "subagents")]
-        task_max_output_bytes: Some(256 * 1024),
+        task_max_output_bytes: Some(1024 * 1024),
         #[cfg(feature = "subagents")]
-        task_max_cost_units: Some(500_000),
+        task_max_cost_units: Some(2_000_000),
         #[cfg(feature = "subagents")]
         task_timeout_secs: Some(300),
         #[cfg(feature = "advisor")]

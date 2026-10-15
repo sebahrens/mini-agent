@@ -305,6 +305,14 @@ async fn hook_approval_describes_the_rewritten_call_and_runs_only_when_approved(
             .into_permission();
             assert_eq!(request.tool, "bash");
             assert_eq!(request.input, r#"{"command":"echo rewritten"}"#);
+            assert_eq!(
+                request.diagnostic,
+                Some(crate::permission::ask::AskDiagnostic {
+                    effective_mode: mode,
+                    selected_mode: mode,
+                    cause: crate::permission::ask::AskCause::PreToolUseHook,
+                })
+            );
             request
                 .reply
                 .send(if approve {
@@ -440,6 +448,10 @@ async fn ask_verdict_escalates_to_deny_when_no_ask_tx_is_available() {
 
     let result = wrapped[0].call("ls -la".to_string()).await;
     let err = result.expect_err("ask with no ask_tx must escalate to deny");
+    assert!(
+        err.to_string()
+            .contains("effective mode: yolo; selected mode: yolo; cause: PreToolUse hook Ask")
+    );
     assert!(
         err.to_string().contains("non-interactive"),
         "unexpected error message: {err}"

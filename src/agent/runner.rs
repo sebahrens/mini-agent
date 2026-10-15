@@ -1631,10 +1631,93 @@ impl UsageLedger {
 #[derive(Clone, Default)]
 pub(crate) struct SharedUsageLedger {
     inner: std::sync::Arc<std::sync::Mutex<UsageLedger>>,
+    admission: Option<SubagentAdmission>,
+}
+
+/// Task-local weighted-unit admission is separate from the session USD account.
+#[cfg(feature = "subagents")]
+#[derive(Clone)]
+pub(crate) struct SubagentAdmission {
+    pub(crate) allowed: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    pub(crate) observe: std::sync::Arc<dyn Fn(Usage, u64) + Send + Sync>,
+    fallback: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "subagents")]
+impl SubagentAdmission {
+    pub(crate) fn new(
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+        observe: impl Fn(Usage, u64) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            allowed: std::sync::Arc::new(allowed),
+            observe: std::sync::Arc::new(observe),
+            fallback: Default::default(),
+        }
+    }
+}
+
+#[cfg(feature = "subagents")]
+impl<M: CompletionModel> rig::agent::AgentHook<M> for SharedUsageLedger {
+    async fn on_event(
+        &self,
+        _: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        use rig::agent::{Flow, StepEvent};
+        let Some(admission) = &self.admission else {
+            return Flow::cont();
+        };
+        match event {
+            StepEvent::CompletionCall { .. } | StepEvent::CompletionRequestPrepared { .. }
+                if !(admission.allowed)() =>
+            {
+                Flow::terminate("task cost-unit budget exhausted")
+            }
+            StepEvent::CompletionRequestPrepared { request, .. } => {
+                let estimate = serde_json::to_string(request)
+                    .ok()
+                    .map(|text| crate::session::Session::estimate_tokens(&text))
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(request.max_tokens.unwrap_or(0));
+                admission
+                    .fallback
+                    .store(estimate, std::sync::atomic::Ordering::Relaxed);
+                Flow::cont()
+            }
+            StepEvent::ModelTurnFinished { usage, .. } => {
+                (admission.observe)(
+                    usage,
+                    admission
+                        .fallback
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                Flow::cont()
+            }
+            StepEvent::ToolCall { .. } if !(admission.allowed)() => Flow::Skip {
+                reason: "task cost-unit budget exhausted".into(),
+            },
+            _ => Flow::cont(),
+        }
+    }
+    fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+        use rig::agent::StepEventKind;
+        matches!(
+            kind,
+            StepEventKind::CompletionCall
+                | StepEventKind::CompletionRequestPrepared
+                | StepEventKind::ModelTurnFinished
+                | StepEventKind::ToolCall
+        )
+    }
 }
 
 #[cfg(feature = "subagents")]
 impl SharedUsageLedger {
+    pub(crate) fn with_admission(mut self, admission: SubagentAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     pub(crate) fn record_completion(&self, usage: Usage) {
         let delta = self
             .inner
@@ -4684,10 +4767,12 @@ where
     let stream = crate::startup::heap_future(|| {
         retry::retry_stream_chat(retry_config, || {
             let p = prompt.to_string();
+            let admission = usage_ledger.clone();
             crate::startup::heap_future(|| async move {
                 agent
                     .stream_chat(p, Vec::<Message>::new())
                     .max_turns(max_turns)
+                    .add_hook(admission)
                     .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
                     .add_hook(crate::spend::run::AdmissionHook(
                         crate::spend::run::Run::current(),
@@ -4753,6 +4838,15 @@ where
                     response: Err(crate::spend::run::BUDGET_STOP.into()),
                     usage: usage_ledger.total(),
                 };
+            }
+            Err(_)
+                if usage_ledger
+                    .admission
+                    .as_ref()
+                    .is_some_and(|gate| !(gate.allowed)()) =>
+            {
+                full_response.push_str("\n[partial: task cost-unit budget exhausted]");
+                break;
             }
             Err(error) if is_subagent_turn_budget_error(&error) => {
                 append_subagent_turn_budget_partial(&mut full_response);
@@ -6554,6 +6648,79 @@ mod tests {
             run.response.unwrap(),
             "preliminary finding\n[partial: turn budget exhausted]"
         );
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn task124_live_units_stop_actual_child_before_next_request_and_effect() {
+        for missing_usage in [false, true] {
+            let used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let check = used.clone();
+            let charge = used.clone();
+            let admission = super::SubagentAdmission::new(
+                move || check.load(Ordering::SeqCst) < 50,
+                move |usage, fallback| {
+                    charge.fetch_add(
+                        if usage == Usage::default() {
+                            fallback
+                        } else {
+                            usage.total_tokens
+                        },
+                        Ordering::SeqCst,
+                    );
+                },
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model = MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::text("known finding"),
+                    MockStreamEvent::tool_call(
+                        "blocked-effect",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response(if missing_usage {
+                        Usage::default()
+                    } else {
+                        Usage {
+                            input_tokens: 50,
+                            output_tokens: 10,
+                            total_tokens: 60,
+                            ..Default::default()
+                        }
+                    }),
+                ],
+                vec![
+                    MockStreamEvent::text("NEVER_CONTINUE"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ]);
+            let agent = AgentBuilder::new(model.clone())
+                .max_tokens(100)
+                .tool(CountingTool(calls.clone()))
+                .build();
+            let run = super::run_subagent(
+                &agent,
+                "investigate",
+                20,
+                None,
+                &crate::retry::RetryConfig::default(),
+                super::SharedUsageLedger::default().with_admission(admission),
+            )
+            .await;
+            assert_eq!(model.requests().len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(used.load(Ordering::SeqCst) >= 50);
+            let response = run.response.unwrap();
+            assert!(response.contains("known finding"), "{response}");
+            assert!(
+                response.contains("task cost-unit budget exhausted"),
+                "{response}"
+            );
+            if !missing_usage {
+                assert_eq!(run.usage.total_tokens, 60);
+            }
+        }
     }
 
     #[tokio::test]

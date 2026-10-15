@@ -2731,6 +2731,10 @@ async fn drive_permission_bridge(
             Some(name) => format!("[subagent: {name}] {title}"),
             None => title,
         };
+        let title = match ask.diagnostic {
+            Some(diagnostic) => format!("{title} [{diagnostic}]"),
+            None => title,
+        };
         let tool_call_id = ToolCallId::new(
             ask.tool_call_id
                 .clone()
@@ -6154,6 +6158,11 @@ mod protocol_tests {
                     ask_tx
                         .send(
                             AskRequest {
+                                diagnostic: Some(crate::permission::ask::AskDiagnostic {
+                                    effective_mode: SecurityMode::Guarded,
+                                    selected_mode: SecurityMode::Yolo,
+                                    cause: crate::permission::ask::AskCause::ConfiguredAskRule,
+                                }),
                                 #[cfg(feature = "subagents")]
                                 background: None,
                                 tool: "write".into(),
@@ -6169,6 +6178,10 @@ mod protocol_tests {
                         .await
                         .unwrap();
                     let (request, responder) = incoming.recv().await.unwrap();
+                    let wire = serde_json::to_value(&request).unwrap();
+                    assert_eq!(wire.pointer("/toolCall/title").and_then(serde_json::Value::as_str),
+                        Some("write [effective mode: guarded; selected mode: yolo; cause: configured Ask rule; prompt mode narrowed the selected mode]"));
+                    assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "current");
                     assert!(
                         request
                             .options
@@ -6265,6 +6278,7 @@ mod protocol_tests {
                 ask_tx
                     .send(
                         AskRequest {
+                            diagnostic: None,
                             #[cfg(feature = "subagents")]
                             background: None,
                             agent_name: None,
@@ -6326,6 +6340,7 @@ mod protocol_tests {
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let (descendants, exact) = crate::permission::pattern::search_root_allow_scope("/repo");
         let ask = crate::permission::ask::AskRequest {
+            diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
             agent_name: None,
@@ -6349,6 +6364,7 @@ mod protocol_tests {
 
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let shell = crate::permission::ask::AskRequest {
+            diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
             agent_name: None,
@@ -6429,6 +6445,7 @@ mod protocol_tests {
                         let send_ask = |name: &str| {
                             let (reply, receiver) = tokio::sync::oneshot::channel();
                             let ask = AskRequest {
+                                diagnostic: None,
                                 #[cfg(feature = "subagents")]
                                 background: None,
                                 agent_name: None,

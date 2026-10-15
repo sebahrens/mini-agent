@@ -1,0 +1,38 @@
+{
+  "result": "PASS full Rust/npm/three-native Corresponding Source proof",
+  "source_commit": "53d0656d69325fe9c07cd997a1ef6e3b608b0b97",
+  "archive": "/private/tmp/mini-agent-three-target-source-assembly/output/mini-agent-v1.9.4-native-source-proof-ci-source.tar.gz",
+  "archive_sha256": "ef9d49c92fe4947c69fabadc80ed4af8596293d653f79100c3b6b21db860c34f",
+  "archive_bytes": 669154877,
+  "members": 47229,
+  "cargo_vendored_crates": 658,
+  "npm_unique_tarballs": 370,
+  "native_targets": [
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "record_sha256": "b0dec39b530010090c80ec4a2139665c4e79284010c2dd885978877a20c6da86",
+      "bundle_manifest_sha256": "d7e719cf32747b0f95eb99f9cc2ea2dacf7d1cd2dbba458f81ad73bbe669e6a9",
+      "components": 12
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "record_sha256": "6e49262d728374ca8faf69ad203adc10b0fcf8cb83ea597176bc7249ee1bcc15",
+      "bundle_manifest_sha256": "67e5b55a225a8e3e1f94a99facd0039de2352793c8d2a05b0a60ed38166230fc",
+      "components": 12
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "record_sha256": "944e7d54e92b6d0f0b6ec5052a1acd6d9fe3e24329ad53096664174e1907ca3b",
+      "bundle_manifest_sha256": "f7ec51412351cb8c3ac40fb1b191125f550718cb5bd5aa048b162a387a3cbd6f",
+      "components": 11
+    }
+  ],
+  "validation": [
+    "actual full packager exit0: locked offline Cargo vendor/metadata +npm integrity/offline extension rebuild +normalized tar",
+    "all archived native record bytes exact +every source/notice asset SHA256",
+    "all370 archived npm tarballs SHA512 match existing lockverified inputs",
+    "tracked source/lock/license/Gitpolicy/module bytes exact53d0656d",
+    "temporaryremote diagnosticref deleted under exact0f02lease andabsenceverified"
+  ],
+  "limits": "Integration source53d0656d proof; unrelated later MCP Rust correction not included. No releasepublish/tag/settings changes. Native3 Windows Git service acceptance separate; source native crypto success exact38697126140."
+}

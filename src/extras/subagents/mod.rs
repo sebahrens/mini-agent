@@ -170,6 +170,173 @@ pub(crate) fn resolve_config(
     }
 }
 
+/// Only resource sizing can be updated without rebuilding provider or policy
+/// authority. Each delegation already clones this configuration at admission.
+pub(crate) const LIVE_SETTING_KEYS: &[&str] = &[
+    "subagent_context_window",
+    "subagent_max_tokens",
+    "task_max_report_bytes",
+    "task_report_repair_max_tokens",
+    "task_report_repair_max_cost_units",
+    "task_max_turns",
+    "task_max_prompts",
+    "task_max_concurrency",
+    "task_max_output_bytes",
+    "task_max_cost_units",
+    "task_timeout_secs",
+];
+
+fn apply_limit_setting(
+    config: &mut SubagentConfig,
+    key: &str,
+    literal: &str,
+) -> Result<(), &'static str> {
+    let value: toml::Table = toml::from_str(&format!("value={literal}"))
+        .map_err(|_| "Invalid subagent setting (value omitted)")?;
+    let value = value
+        .get("value")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or("Subagent setting must be a nonnegative integer")?;
+    let mut next = config.config.clone();
+    macro_rules! assign {
+        ($($name:ident),* $(,)?) => {
+            match key {
+                $(stringify!($name) => next.$name = Some(value.try_into()
+                    .map_err(|_| "Subagent setting exceeds this platform's limit")?),)*
+                _ => return Err("Setting requires restart"),
+            }
+        };
+    }
+    assign!(
+        subagent_context_window,
+        subagent_max_tokens,
+        task_max_report_bytes,
+        task_report_repair_max_tokens,
+        task_report_repair_max_cost_units,
+        task_max_turns,
+        task_max_prompts,
+        task_max_concurrency,
+        task_max_output_bytes,
+        task_max_cost_units,
+        task_timeout_secs
+    );
+    next.validate_subagent_settings()
+        .map_err(|_| "Invalid subagent limit (value omitted)")?;
+    config.max_turns = next.task_max_turns.unwrap_or(20);
+    config.config = next;
+    Ok(())
+}
+
+fn apply_limit_setting_at(
+    config: &mut SubagentConfig,
+    key: &str,
+    literal: &str,
+    layer: crate::config::ConfigLayer,
+) -> Result<bool, &'static str> {
+    fn rank(layer: &crate::config::ConfigLayer) -> u8 {
+        match layer {
+            crate::config::ConfigLayer::Global => 0,
+            crate::config::ConfigLayer::Project => 1,
+            crate::config::ConfigLayer::Local => 2,
+            crate::config::ConfigLayer::Cli => 3,
+        }
+    }
+    if config
+        .config
+        .provenance
+        .sources
+        .get(key)
+        .is_some_and(|sources| sources.iter().any(|source| rank(source) > rank(&layer)))
+    {
+        return Ok(false);
+    }
+    let key = LIVE_SETTING_KEYS
+        .iter()
+        .copied()
+        .find(|known| *known == key)
+        .ok_or("Setting requires restart")?;
+    apply_limit_setting(config, key, literal)?;
+    config
+        .config
+        .provenance
+        .sources
+        .entry(key)
+        .or_default()
+        .insert(layer);
+    Ok(true)
+}
+
+pub(crate) fn apply_saved_limit(
+    key: &str,
+    literal: &str,
+    layer: crate::config::ConfigLayer,
+) -> Result<bool, &'static str> {
+    let mut guard = CONFIG.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(config) = guard.as_mut() else {
+        return Ok(false);
+    };
+    apply_limit_setting_at(config, key, literal, layer)
+}
+
+/// Presentation-only effective limit overlay. Never contains provider keys,
+/// credentials, tool grants, or a mutable reference to an active child.
+pub(crate) fn live_limit_values() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let guard = CONFIG.lock().unwrap_or_else(|error| error.into_inner());
+    let config = guard.as_ref()?;
+    let mut values = serde_json::to_value(&config.config)
+        .ok()?
+        .as_object()?
+        .clone();
+    values.retain(|key, _| LIVE_SETTING_KEYS.contains(&key.as_str()));
+    for (key, value) in [
+        (
+            "subagent_context_window",
+            config.config.subagent_context_window.unwrap_or(262_144),
+        ),
+        (
+            "subagent_max_tokens",
+            config.config.resolve_subagent_max_tokens(),
+        ),
+        (
+            "task_max_report_bytes",
+            config.config.resolve_task_max_report_bytes() as u64,
+        ),
+        (
+            "task_max_output_bytes",
+            config.config.resolve_task_max_output_bytes() as u64,
+        ),
+        (
+            "task_report_repair_max_tokens",
+            config.config.resolve_task_report_repair_max_tokens(),
+        ),
+        (
+            "task_report_repair_max_cost_units",
+            config.config.resolve_task_report_repair_max_cost_units(),
+        ),
+        ("task_max_turns", config.max_turns as u64),
+        (
+            "task_max_prompts",
+            config.config.resolve_task_max_prompts() as u64,
+        ),
+        (
+            "task_max_concurrency",
+            config.config.resolve_task_max_concurrency() as u64,
+        ),
+        (
+            "task_max_cost_units",
+            config.config.resolve_task_max_cost_units(),
+        ),
+        (
+            "task_timeout_secs",
+            config.config.resolve_task_timeout_secs(),
+        ),
+    ] {
+        values.insert(key.into(), value.into());
+    }
+    Some(values)
+}
+
 /// Install a resolved configuration as the process-wide subagent config.
 pub(crate) fn install(config: SubagentConfig) {
     if let Some(notice) = &config.fallback_notice {
@@ -232,5 +399,61 @@ mod tests {
     fn with_config_without_init_returns_error() {
         let result = with_config_value(None, |_| ());
         assert!(matches!(result, Err(ConfigNotInitialized)));
+    }
+}
+
+#[cfg(test)]
+mod settings127_tests {
+    use super::*;
+    #[test]
+    fn subagent127_next_delegation_updates_only_limits_and_keeps_active_snapshot() {
+        let cfg = crate::config::Config::default();
+        let main = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let mut installed = resolve_config(
+            &cfg,
+            Some("unused-test-key"),
+            "openrouter",
+            "test-model",
+            &main,
+        );
+        let active_child = installed.clone();
+        use crate::config::ConfigLayer;
+        assert!(
+            apply_limit_setting_at(
+                &mut installed,
+                "subagent_max_tokens",
+                "32768",
+                ConfigLayer::Project
+            )
+            .unwrap()
+        );
+        assert!(
+            !apply_limit_setting_at(
+                &mut installed,
+                "subagent_max_tokens",
+                "4096",
+                ConfigLayer::Global
+            )
+            .unwrap()
+        );
+        apply_limit_setting(&mut installed, "task_max_turns", "31").unwrap();
+        apply_limit_setting(&mut installed, "task_max_report_bytes", "524288").unwrap();
+        assert_eq!(installed.config.resolve_subagent_max_tokens(), 32768);
+        assert_eq!(installed.max_turns, 31);
+        assert_eq!(active_child.config.resolve_subagent_max_tokens(), 16384);
+        assert_eq!(active_child.max_turns, 20);
+        assert_eq!(installed.provider_name, active_child.provider_name);
+        assert_eq!(installed.model_name, active_child.model_name);
+        assert_eq!(installed.api_key, active_child.api_key);
+        assert!(apply_limit_setting(&mut installed, "subagent_model", "32768").is_err());
+        let before = installed.config.resolve_subagent_max_tokens();
+        assert!(apply_limit_setting(&mut installed, "subagent_max_tokens", "0").is_err());
+        assert_eq!(installed.config.resolve_subagent_max_tokens(), before);
     }
 }

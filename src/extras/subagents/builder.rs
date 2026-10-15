@@ -34,6 +34,38 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for ReportRepairGuard {
     }
 }
 
+/// A local estimate/admission bound, not a provider tokenizer or an override
+/// of model capacity. Observe the complete normalized request after patches;
+/// never trim signed history or rewrite the request to make it fit.
+#[derive(Clone, Copy)]
+struct ChildContextGuard {
+    window: u64,
+}
+impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
+    async fn on_event(
+        &self,
+        _: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        if let rig::agent::StepEvent::CompletionRequestPrepared { request, .. } = event {
+            let estimated = serde_json::to_string(request)
+                .ok()
+                .map(|text| crate::session::Session::estimate_tokens(&text));
+            if estimated.is_none_or(|input| {
+                input.saturating_add(request.max_tokens.unwrap_or(0)) > self.window
+            }) {
+                return rig::agent::Flow::terminate(
+                    "task: child context estimate exceeds its configured/model window; use a narrower brief or raise subagent_context_window for a supported model",
+                );
+            }
+        }
+        rig::agent::Flow::cont()
+    }
+    fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+        kind == rig::agent::StepEventKind::CompletionRequestPrepared
+    }
+}
+
 /// The parent session's authorization context inherited by a subagent.
 ///
 /// Keeping the checker and approval channel together makes it impossible to
@@ -334,63 +366,18 @@ pub(crate) fn subagent_memory_tools(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_explore_agent_inner<M: CompletionModel + 'static>(
-    model: M,
-    protocol: crate::context::instructions::InstructionProtocol,
-    max_turns: usize,
-    max_tokens: u64,
+pub(crate) fn persona_tools(
+    authorization: &SubagentAuthorization,
+    persona: &PersonaExecution,
     max_text_file_size: u64,
     max_read_lines: u64,
     max_grep_results: u64,
     max_find_results: u64,
     max_list_dir_entries: Option<u64>,
-    authorization: &SubagentAuthorization,
-    // Inherited provider request params (see `subagent_provider_params`);
-    // persona params are merged on top.
-    additional_params: Option<serde_json::Value>,
-    #[cfg(feature = "archmd")] architecture: Option<&str>,
-    // Optional specialization prompt prepended before the base explore prompt.
-    specialization: Option<&str>,
-    persona: &PersonaExecution,
     #[cfg(feature = "skills")] skill_services: Option<
         &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
-) -> Agent<M> {
-    let suffix = crate::session::storage::load_suffix();
-    let mut preamble = build_explore_preamble(
-        #[cfg(feature = "archmd")]
-        architecture,
-        specialization,
-        suffix.as_deref(),
-    );
-    if persona.write_mode {
-        // Only the host's own read-only rules are replaced; authored persona
-        // text is retained verbatim and never supplies execution authority.
-        let policy_start = preamble
-            .rfind(prompt::NON_OVERRIDABLE_EXPLORE_RULES)
-            .expect("host policy is always appended");
-        preamble.truncate(policy_start);
-        preamble.push_str(&prompt::write_rules());
-        preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
-    }
-
-    #[cfg(feature = "agent-skills")]
-    preamble.push_str(crate::extras::skills::selection::POLICY);
-
-    let mut captured = authorization.clone();
-    if !persona.write_mode {
-        captured.write_tools = None;
-    }
-    captured.instructions = authorization
-        .instructions
-        .as_ref()
-        .map(|service| service.for_protocol(protocol));
-    let authorization = &captured;
-    if let Some(service) = &authorization.instructions {
-        preamble.push_str(crate::context::instructions::POLICY);
-        preamble.push_str(&service.initial_overlay());
-    }
-
+) -> Vec<Box<dyn rig::tool::ToolDyn>> {
     let tools = authorization.filesystem_tools(
         max_text_file_size,
         max_read_lines,
@@ -452,6 +439,79 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         }
         tools
     };
+    tools
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_explore_agent_inner<M: CompletionModel + 'static>(
+    model: M,
+    protocol: crate::context::instructions::InstructionProtocol,
+    max_turns: usize,
+    max_tokens: u64,
+    context_window: u64,
+    max_text_file_size: u64,
+    max_read_lines: u64,
+    max_grep_results: u64,
+    max_find_results: u64,
+    max_list_dir_entries: Option<u64>,
+    authorization: &SubagentAuthorization,
+    // Inherited provider request params (see `subagent_provider_params`);
+    // persona params are merged on top.
+    additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "archmd")] architecture: Option<&str>,
+    // Optional specialization prompt prepended before the base explore prompt.
+    specialization: Option<&str>,
+    persona: &PersonaExecution,
+    #[cfg(feature = "skills")] skill_services: Option<
+        &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
+) -> Agent<M> {
+    let suffix = crate::session::storage::load_suffix();
+    let mut preamble = build_explore_preamble(
+        #[cfg(feature = "archmd")]
+        architecture,
+        specialization,
+        suffix.as_deref(),
+    );
+    if persona.write_mode {
+        // Only the host's own read-only rules are replaced; authored persona
+        // text is retained verbatim and never supplies execution authority.
+        let policy_start = preamble
+            .rfind(prompt::NON_OVERRIDABLE_EXPLORE_RULES)
+            .expect("host policy is always appended");
+        preamble.truncate(policy_start);
+        preamble.push_str(&prompt::write_rules());
+        preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
+    }
+
+    #[cfg(feature = "agent-skills")]
+    preamble.push_str(crate::extras::skills::selection::POLICY);
+
+    let mut captured = authorization.clone();
+    if !persona.write_mode {
+        captured.write_tools = None;
+    }
+    captured.instructions = authorization
+        .instructions
+        .as_ref()
+        .map(|service| service.for_protocol(protocol));
+    let authorization = &captured;
+    if let Some(service) = &authorization.instructions {
+        preamble.push_str(crate::context::instructions::POLICY);
+        preamble.push_str(&service.initial_overlay());
+    }
+
+    let tools = persona_tools(
+        authorization,
+        persona,
+        max_text_file_size,
+        max_read_lines,
+        max_grep_results,
+        max_find_results,
+        max_list_dir_entries,
+        #[cfg(feature = "skills")]
+        skill_services,
+    );
     let tools = tools::memoize::definitions(tools);
 
     #[cfg(feature = "hooks")]
@@ -468,7 +528,10 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         .default_max_turns(max_turns)
         .max_tokens(max_tokens)
         .tools(tools)
-        .add_hook(crate::agent::runner::ToolLoopGuard);
+        .add_hook(crate::agent::runner::ToolLoopGuard)
+        .add_hook(ChildContextGuard {
+            window: context_window,
+        });
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         uuid::Uuid::new_v4().to_string(),
         None,
@@ -529,7 +592,10 @@ pub(crate) async fn build_explore_agent(
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> AnyAgent {
-    let max_tokens = crate::cli::Cli::default().resolve_max_tokens(cfg);
+    let max_tokens = cfg
+        .max_tokens
+        .unwrap_or_else(|| cfg.resolve_subagent_max_tokens());
+    let context_window = cfg.subagent_context_window.unwrap_or(262_144);
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
     let max_grep_results = cfg.resolve_subagent_max_grep_results();
@@ -572,6 +638,7 @@ pub(crate) async fn build_explore_agent(
             crate::context::instructions::InstructionProtocol::Chat,
             max_turns,
             max_tokens,
+            context_window,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -592,6 +659,7 @@ pub(crate) async fn build_explore_agent(
                 crate::context::instructions::InstructionProtocol::Responses,
                 max_turns,
                 max_tokens,
+                context_window,
                 max_text_file_size,
                 max_read_lines,
                 max_grep_results,
@@ -611,6 +679,7 @@ pub(crate) async fn build_explore_agent(
                 crate::context::instructions::InstructionProtocol::Chat,
                 max_turns,
                 max_tokens,
+                context_window,
                 max_text_file_size,
                 max_read_lines,
                 max_grep_results,
@@ -631,6 +700,7 @@ pub(crate) async fn build_explore_agent(
             crate::context::instructions::InstructionProtocol::Anthropic,
             max_turns,
             max_tokens,
+            context_window,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -650,6 +720,7 @@ pub(crate) async fn build_explore_agent(
             crate::context::instructions::InstructionProtocol::Gemini,
             max_turns,
             max_tokens,
+            context_window,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -669,6 +740,7 @@ pub(crate) async fn build_explore_agent(
             crate::context::instructions::InstructionProtocol::Ollama,
             max_turns,
             max_tokens,
+            context_window,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -688,6 +760,7 @@ pub(crate) async fn build_explore_agent(
             crate::provider::copilot::instruction_protocol(&m),
             max_turns,
             max_tokens,
+            context_window,
             max_text_file_size,
             max_read_lines,
             max_grep_results,
@@ -749,6 +822,7 @@ mod js_isolation_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -787,6 +861,7 @@ mod js_isolation_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -826,6 +901,7 @@ mod js_isolation_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -891,6 +967,7 @@ mod js_isolation_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -928,6 +1005,7 @@ mod js_isolation_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -1005,6 +1083,7 @@ mod tests {
                 crate::context::instructions::InstructionProtocol::Unverified,
                 2,
                 16_384,
+                262_144,
                 1024 * 1024,
                 100,
                 100,
@@ -1016,7 +1095,7 @@ mod tests {
                 None,
                 Some(&persona.prompt),
                 &super::PersonaExecution {
-                    tools: persona.tools,
+                    tools: persona.tools.clone(),
                     ..Default::default()
                 },
                 #[cfg(feature = "skills")]
@@ -1031,6 +1110,28 @@ mod tests {
                 .map(|tool| tool.name.to_string())
                 .collect::<Vec<_>>();
             names.sort_unstable();
+            let mut preflight_names = super::persona_tools(
+                &authorization,
+                &super::PersonaExecution {
+                    tools: persona.tools.clone(),
+                    ..Default::default()
+                },
+                1024 * 1024,
+                100,
+                100,
+                100,
+                Some(100),
+                #[cfg(feature = "skills")]
+                None,
+            )
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+            preflight_names.sort_unstable();
+            assert_eq!(
+                preflight_names, names,
+                "preflight must use actual builder definitions"
+            );
             assert_eq!(names, expected, "declared: {declared}");
         }
     }
@@ -1640,6 +1741,7 @@ mod provider_param_tests {
             crate::context::instructions::InstructionProtocol::Unverified,
             2,
             16_384,
+            262_144,
             1024 * 1024,
             1_000,
             1_000,
@@ -1737,5 +1839,60 @@ mod provider_param_tests {
             params["provider"]["order"],
             serde_json::json!(["Anthropic"])
         );
+    }
+}
+
+#[cfg(test)]
+mod settings127_context_tests {
+    use super::ChildContextGuard;
+    use futures::StreamExt;
+    use rig::agent::AgentBuilder;
+    use rig::streaming::StreamingChat;
+    use rig::test_utils::{MockCompletionModel, MockExtensionsProbeTool, MockStreamEvent};
+
+    #[tokio::test]
+    async fn subagent127_prepared_context_counts_history_tools_and_reserved_output_before_dispatch()
+    {
+        for (window, max_tokens, preamble, history, expected_calls) in [
+            (4096, 1024, "small".to_string(), "small".to_string(), 1),
+            (4096, 4096, "small".to_string(), "small".to_string(), 0),
+            (
+                4096,
+                1024,
+                "LARGE_CONTEXT ".repeat(3000),
+                "small".to_string(),
+                0,
+            ),
+            (
+                4096,
+                1024,
+                "small".to_string(),
+                "LARGE_HISTORY ".repeat(3000),
+                0,
+            ),
+        ] {
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::text("ok"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            let agent = AgentBuilder::new(model.clone())
+                .preamble(&preamble)
+                .max_tokens(max_tokens)
+                .tool(MockExtensionsProbeTool::default())
+                .add_hook(ChildContextGuard { window })
+                .build();
+            let mut stream = agent
+                .stream_chat("brief", vec![rig::completion::Message::user(history)])
+                .await;
+            let mut failed = false;
+            while let Some(item) = stream.next().await {
+                failed |= item.is_err();
+            }
+            assert_eq!(model.request_count(), expected_calls);
+            assert_eq!(failed, expected_calls == 0);
+            if expected_calls == 1 {
+                assert_eq!(model.requests()[0].tools.len(), 1);
+            }
+        }
     }
 }

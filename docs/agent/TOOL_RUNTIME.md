@@ -1545,3 +1545,18 @@ Independently configured MCP/LSP stdio and hook policies retain their own
 workspace/trust selection instead of inheriting a global host-full grant.
 Windows uses its existing AppContainer explicit root keys and rejects the two
 host-wide levels.
+
+
+## Permission prompt attribution
+
+Approval requests capture their effective permission mode, the user's selected
+mode, and a closed cause at the actual checker decision while holding its lock.
+The TUI and ACP show that snapshot; headless unanswered Ask denials include the
+same non-secret classification. A later mode change cannot relabel a queued Ask.
+When a prompt directive narrowed the selected mode, that difference is explicit.
+Configured Ask rules, PreToolUse hook Ask decisions, destructive shell detection,
+repeated-call policy, external-directory policy, and Git metadata protection remain
+authoritative. These labels grant no permission and do not expose rule text or
+hook output. Unmatched benign multiline shell/Python input sends no Ask in Yolo;
+Standard still asks. This does not establish the cause of an older photographed
+prompt without its matching runtime/version and policy evidence.

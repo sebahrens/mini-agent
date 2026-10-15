@@ -314,6 +314,21 @@ mode: review
   Declarations accept at most 128 entries with nonempty printable ASCII names
   of at most 64 characters; malformed lists or names still reject the definition.
   `mode: write` also accepts `Write`, `Edit`, and `Bash`/`Shell` under the explicit global opt-in.
+- `required_tools` declares necessary tools separately from the best-effort
+  `tools` narrowing. It accepts a list or comma-separated ASCII tool identifiers
+  (at most 128 entries, 64 bytes each), with the same supported aliases. Before
+  selecting a child model, starting hooks, or reserving a background job, `task`
+  compares these requirements with its actual child tool factory. A missing tool
+  returns a structured `not started: missing required subagent capability` report
+  with no child provider request. Requirements never grant tools or bypass the
+  parent's selection, permissions, workspace binding, or sandbox.
+  The legacy code-indexer 0.1.6 persona's explicit `## Tools` CLI-only contract is
+  recognized as requiring `shell`; incidental mentions and examples elsewhere
+  are not requirements. Read-only children have no shell, MCP, or nested `Agent`
+  route. Use the parent's authorized indexer tools or a compatible read-only
+  persona instead. New imported personas should declare `required_tools`.
+  Task schema descriptions display declared requirements alongside resolved
+  definitions; a requirement is not a promise that the tool is installed.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
@@ -326,7 +341,7 @@ mode: review
   rejects the definition.
 - `mode: write` selects an implementation child only with the global opt-in.
   Other `mode` values remain the prompt default used when the persona is selected for the
-  main loop through `/agent`. Child-only `tools`, `model`, and `turn_budget`
+  main loop through `/agent`. Child-only `tools`, `required_tools`, `model`, and `turn_budget`
   settings do not alter main-loop authority.
 
 The block is validated and removed before the prompt is installed. Malformed
@@ -459,8 +474,8 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_max_turns`            | `usize`  | `20`                     | Max agent turns per subagent |
 | `task_max_prompts`          | `usize`  | `8`                      | Max child prompts in one tool call |
 | `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
-| `task_max_output_bytes`     | `usize`  | `262144` (256 KiB)       | Hard cap on the complete returned tool output |
-| `task_max_cost_units`       | `u64`    | `500000`                 | Aggregate provider token/cost-unit budget |
+| `task_max_output_bytes`     | `usize`  | `1048576` (1 MiB)       | Hard cap on the complete returned tool output |
+| `task_max_cost_units`       | `u64`    | `2000000`                 | Aggregate provider token/cost-unit budget |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
@@ -523,8 +538,8 @@ Example `config.toml`:
 task_max_turns = 20
 task_max_prompts = 8
 task_max_concurrency = 4
-task_max_output_bytes = 262144
-task_max_cost_units = 500000
+task_max_output_bytes = 1048576
+task_max_cost_units = 2000000
 task_timeout_secs = 300
 task_enabled = true
 subagent_model = "deepseek-v4-flash"
@@ -659,3 +674,61 @@ Scheduling charges completed responses with their quotation prefixes and host
 markers, plus any specialist notice, before starting queued work. Task labels
 collapse prompt whitespace into a single line and keep at most 60 characters;
 the full execution prompt is preserved.
+
+### Editable child sizing
+
+The main session's `context_window` (including a 1,000,000-token pin) remains
+independent of a child's input capacity, response size, returned report, and
+cumulative work budget. The following settings are available in `/config` and
+through ordinary `--config key=value` overrides; changing them needs no recompile.
+
+| Setting | Default | Unit and effect |
+|---|---:|---|
+| `subagent_context_window` | `262144` | Estimated complete child request plus reserved response; capped by known selected-model capacity |
+| `subagent_max_tokens` | `16384` | Tokens in one child model response |
+| `task_max_report_bytes` | `262144` | Bytes retained from one child's report; also capped by the aggregate limit |
+| `task_max_output_bytes` | `1048576` | Bytes in all reports returned by one task call |
+| `task_max_cost_units` | `2000000` | Weighted usage units for the whole task, not dollars |
+| `task_report_repair_max_tokens` | `4096` | Tokens in one text-only report restatement |
+| `task_report_repair_max_cost_units` | `65536` | Separate weighted repair allocation, still charged to the same task total and USD account |
+
+Concurrency remains 4, prompt count 8, model turns 20 per child, and the whole
+call deadline 300 seconds. These are editable as `task_max_concurrency`,
+`task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Reports occupy a
+bounded fraction of a 1M-token parent context by default; a large child context
+is not permission to return an equally large report. Read/write authorization,
+write serialization, cancellation, and the session spend ceiling are unchanged.
+
+A successfully saved resource setting applies to the **next delegation**.
+Running and background children retain their admission snapshots. Saved project
+settings still require ordinary project trust, and higher local/CLI layers still
+win. The settings picker shows captured next-delegation values. Model/provider,
+tool permissions, and other restart-only settings retain their existing rules.
+For example, `/config subagent_context_window 1000000` can request a larger child
+window, while `/config subagent_max_tokens 32768` requests a larger response.
+The selected child's known capacity and an explicitly configured parent
+`max_tokens`/`--max-tokens` ceiling still constrain it; the implicit parent 16K
+fallback alone is not a ceiling on a separately configured child.
+
+Context admission uses the existing token estimator over the complete prepared
+request (including history, system text and tool schemas) and reserves the
+response. It refuses an oversized request locally without trimming signed
+history or silently compacting it. This estimate is not a provider tokenizer;
+the provider's actual context/output limits remain authoritative. Unknown model
+capacity uses the independent configured/default child window, not the main
+session's capacity. A failed format repair preserves the original findings in
+the existing bounded host report rather than granting another exploration turn.
+
+Task weighted-unit accounting runs at each accepted child model turn, before
+its tools execute. Reaching the shared cap prevents further child requests,
+forced continuations and report repair, and cancels owned siblings. Responses
+already in flight can overshoot the cap; cancellation reports include their
+known usage. If a provider omits usage entirely, admission conservatively
+charges the prepared request estimate plus its reserved response allowance.
+This does not replace the independent session USD accounting or ceiling.
+
+Fenced code in a report is data: bullets and section names inside it do not
+trigger format repair. Byte cuts retain a bounded host partial report with
+Findings, Unverified and Coverage sections whenever those sections fit; smaller
+allocations return an explicit partial/refusal. Aggregate truncation places its
+status outside the quoted, untrusted child text.

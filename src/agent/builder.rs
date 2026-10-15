@@ -1157,8 +1157,15 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 cfg.deny_repeated_reads.unwrap_or(true),
             )
             .with_workspace_binding(workspace.clone())
-            .with_workspace_instructions(instructions.clone())
-            .with_response_max_tokens(cli.resolve_max_tokens(cfg));
+            .with_workspace_instructions(instructions.clone());
+            // Only an explicitly configured parent response cap constrains a
+            // separately configured child; the implicit parent default is not
+            // a permanent 16K ceiling on child settings.
+            let task_tool = if let Some(ceiling) = cli.max_tokens.or(cfg.max_tokens) {
+                task_tool.with_response_max_tokens(ceiling)
+            } else {
+                task_tool
+            };
             let task_tool =
                 task_tool.with_write_tools(crate::extras::subagents::builder::WriteChildTools {
                     sandbox: sandbox.clone(),

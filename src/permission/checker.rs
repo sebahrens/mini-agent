@@ -1,3 +1,4 @@
+use super::ask::{AskCause, AskDiagnostic};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -418,6 +419,8 @@ pub struct PermissionChecker {
     consecutive_repeat_count: usize,
     mode: SecurityMode,
     user_mode: SecurityMode,
+    // Display-only scratch for the same-lock decision snapshot below.
+    ask_cause: AskCause,
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
     /// Runtime-only policy watcher. None is exhausted/unavailable, never an
@@ -772,6 +775,7 @@ impl PermissionChecker {
             consecutive_repeat_count: 0,
             mode,
             user_mode: mode,
+            ask_cause: AskCause::ModePolicy,
             permission_modes: resolved_modes,
             allow_all_mcp_calls: false,
             compatibility_revision: Some(0),
@@ -893,6 +897,7 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &deny_inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
+        self.ask_cause = AskCause::PreToolUseHook;
         CheckResult::Ask
     }
 
@@ -1143,6 +1148,7 @@ impl PermissionChecker {
                 }
                 if self.doom_loop_action == Action::Ask {
                     tracing::info!("perm doom-loop ask: tool={}", tool);
+                    self.ask_cause = AskCause::DoomLoop;
                     return CheckResult::Ask;
                 }
             }
@@ -1172,6 +1178,22 @@ impl PermissionChecker {
             tool
         );
         Some(CheckResult::Allowed)
+    }
+
+    /// Evaluate and capture attribution while the caller holds the same
+    /// checker lock. Nothing reads this scratch after releasing that lock.
+    pub(crate) fn check_diagnosed(
+        &mut self,
+        check: impl FnOnce(&mut Self) -> CheckResult,
+    ) -> (CheckResult, AskDiagnostic) {
+        self.ask_cause = AskCause::ModePolicy;
+        let result = check(self);
+        let diagnostic = AskDiagnostic {
+            effective_mode: self.mode,
+            selected_mode: self.user_mode,
+            cause: self.ask_cause,
+        };
+        (result, diagnostic)
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
@@ -1323,6 +1345,9 @@ impl PermissionChecker {
         let matched = self.matched_script_rules(tool, policy_input);
 
         let mut action = self.resolve_check_action(tool, &matched);
+        if Self::resolve_matched(&matched) == Some(Action::Ask) {
+            self.ask_cause = AskCause::ConfiguredAskRule;
+        }
         // Yolo allows unmatched scripts but still asks before a recognizably
         // destructive one; a configured rule for the script always decides.
         if self.mode == SecurityMode::Yolo
@@ -1332,6 +1357,7 @@ impl PermissionChecker {
             && crate::permission::is_destructive_shell_script(policy_input)
         {
             action = Action::Ask;
+            self.ask_cause = AskCause::DestructiveShell;
         }
         let result = self.doom_loop_check(tool, identity, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
@@ -1451,14 +1477,23 @@ impl PermissionChecker {
         let external_allow_needs_anchor = external && external_action != Some(Action::Allow);
         let matched = self.match_path_rules(tool, &inputs, external_allow_needs_anchor);
 
-        let action =
+        let initial_action =
             self.resolve_path_action(tool, &matched, abs_path, external, external_action, false);
         let action = self.ask_before_git_execution_metadata_write(
             tool,
             relative.as_deref(),
             !matched.is_empty(),
-            action,
+            initial_action,
         );
+        self.ask_cause = if Self::resolve_matched(&matched) == Some(Action::Ask) {
+            AskCause::ConfiguredAskRule
+        } else if external && external_action == Some(Action::Ask) {
+            AskCause::ExternalDirectory
+        } else if action == Action::Ask && action != initial_action {
+            AskCause::GitExecutionMetadata
+        } else {
+            AskCause::ModePolicy
+        };
         let result = self.doom_loop_check(tool, expanded, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]
@@ -1605,13 +1640,20 @@ impl PermissionChecker {
 
         let matched = self.match_path_rules(tool, &[&logical, &relative], false);
 
-        let action = self.resolve_path_action(tool, &matched, &logical, false, None, true);
+        let initial_action = self.resolve_path_action(tool, &matched, &logical, false, None, true);
         let action = self.ask_before_git_execution_metadata_write(
             tool,
             Some(&relative),
             !matched.is_empty(),
-            action,
+            initial_action,
         );
+        self.ask_cause = if Self::resolve_matched(&matched) == Some(Action::Ask) {
+            AskCause::ConfiguredAskRule
+        } else if action == Action::Ask && action != initial_action {
+            AskCause::GitExecutionMetadata
+        } else {
+            AskCause::ModePolicy
+        };
         let result = self.doom_loop_check(tool, &logical, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]

@@ -2109,7 +2109,10 @@ async fn check_perm_denies_non_interactively_when_ask_tx_is_none_and_verdict_is_
 
     match result {
         Err(crate::agent::tools::ToolError::Msg(msg)) => {
-            assert_eq!(msg, "Permission denied (non-interactive mode)");
+            assert_eq!(
+                msg,
+                "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: mode policy"
+            );
         }
         other => panic!("expected non-interactive Ask denial error, got {:?}", other),
     }

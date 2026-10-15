@@ -1,6 +1,7 @@
 //! Explicit operator edits of one known setting. Effective CLI/layer values
 //! never become the document being persisted, and saved policy stays inactive
-//! in the current session until an explicitly supported presentation update.
+//! in the current session except for explicitly supported presentation updates
+//! and finite subagent sizing applied to the next delegation.
 use super::{Config, ConfigLayer, keys, layers, load};
 use crate::paths::{AppPaths, WorkspaceBinding};
 use sha2::{Digest, Sha256};

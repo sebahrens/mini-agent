@@ -591,6 +591,21 @@ pub struct Config {
     pub task_max_turns: Option<usize>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_context_window: Option<u64>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_max_tokens: Option<u64>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_report_bytes: Option<usize>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_report_repair_max_tokens: Option<u64>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_report_repair_max_cost_units: Option<u64>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub task_max_prompts: Option<usize>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1039,6 +1054,114 @@ impl Config {
         self.subagent_max_list_dir_entries
     }
 
+    /// Independent child input capacity; the main session's context pin is not
+    /// evidence about another model. Explicit matching quick-model metadata
+    /// and the selected provider's catalogue can only narrow the requested cap.
+    #[cfg(feature = "subagents")]
+    pub fn resolve_subagent_context_window(
+        &self,
+        provider: &str,
+        model: &str,
+        alias: Option<&str>,
+    ) -> u64 {
+        let requested = self.subagent_context_window.unwrap_or(262_144);
+        let quick = quick_models_map(self);
+        let selected = alias
+            .and_then(|alias| quick.get(alias))
+            .filter(|entry| entry.provider == provider && entry.model == model)
+            .and_then(|entry| entry.context_window)
+            .or_else(|| {
+                quick
+                    .values()
+                    .filter(|entry| entry.provider == provider && entry.model == model)
+                    .filter_map(|entry| entry.context_window)
+                    .min()
+            });
+        let kind = self
+            .custom_providers
+            .as_ref()
+            .and_then(|providers| providers.get(provider))
+            .map(|entry| entry.provider_type.as_str())
+            .unwrap_or(provider);
+        let catalog_provider = if self.is_anthropic_native(provider) {
+            "anthropic"
+        } else {
+            kind
+        };
+        let catalog = Self::catalog_context_window(catalog_provider, model);
+        let known = match (selected, catalog) {
+            (Some(selected), Some(catalog)) => Some(selected.min(catalog)),
+            (selected, catalog) => selected.or(catalog),
+        };
+        known.map_or(requested, |capacity| requested.min(capacity))
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_subagent_max_tokens(&self) -> u64 {
+        self.subagent_max_tokens.unwrap_or(16_384)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_max_report_bytes(&self) -> usize {
+        self.task_max_report_bytes
+            .unwrap_or(262_144)
+            .min(self.resolve_task_max_output_bytes())
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_report_repair_max_tokens(&self) -> u64 {
+        self.task_report_repair_max_tokens
+            .unwrap_or(4096)
+            .min(self.resolve_subagent_max_tokens())
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_report_repair_max_cost_units(&self) -> u64 {
+        self.task_report_repair_max_cost_units.unwrap_or(65_536)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) fn validate_subagent_settings(&self) -> Result<(), String> {
+        for (name, invalid) in [
+            (
+                "subagent_context_window",
+                self.subagent_context_window
+                    .is_some_and(|value| value < 4096),
+            ),
+            ("subagent_max_tokens", self.subagent_max_tokens == Some(0)),
+            ("task_max_turns", self.task_max_turns == Some(0)),
+            ("task_max_prompts", self.task_max_prompts == Some(0)),
+            ("task_max_concurrency", self.task_max_concurrency == Some(0)),
+            (
+                "task_max_output_bytes",
+                self.task_max_output_bytes.is_some_and(|value| value < 256),
+            ),
+            (
+                "task_max_report_bytes",
+                self.task_max_report_bytes.is_some_and(|value| value < 256),
+            ),
+            ("task_max_cost_units", self.task_max_cost_units == Some(0)),
+            (
+                "task_report_repair_max_tokens",
+                self.task_report_repair_max_tokens == Some(0),
+            ),
+            (
+                "task_report_repair_max_cost_units",
+                self.task_report_repair_max_cost_units == Some(0),
+            ),
+            (
+                "task_timeout_secs",
+                self.task_timeout_secs
+                    .is_some_and(|value| value == 0 || value > 86_400),
+            ),
+        ] {
+            if invalid {
+                return Err(format!("Invalid {name} (value omitted)"));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_prompts(&self) -> usize {
         self.task_max_prompts.unwrap_or(8)
@@ -1051,12 +1174,12 @@ impl Config {
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_output_bytes(&self) -> usize {
-        self.task_max_output_bytes.unwrap_or(256 * 1024)
+        self.task_max_output_bytes.unwrap_or(1024 * 1024)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_task_max_cost_units(&self) -> u64 {
-        self.task_max_cost_units.unwrap_or(500_000)
+        self.task_max_cost_units.unwrap_or(2_000_000)
     }
 
     #[cfg(feature = "subagents")]
@@ -1642,5 +1765,82 @@ js-fetch-allow-http = true
             ])
         );
         assert_eq!(cfg.js_fetch_allow_http, Some(true));
+    }
+}
+
+#[cfg(all(test, feature = "subagents"))]
+mod subagent_settings127_tests {
+    use super::*;
+
+    #[test]
+    fn subagent127_defaults_and_roundtrip_keep_context_response_and_reports_distinct() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.resolve_subagent_context_window("custom", "unknown", None),
+            262_144
+        );
+        assert_eq!(cfg.resolve_subagent_max_tokens(), 16_384);
+        assert_eq!(cfg.resolve_task_max_report_bytes(), 262_144);
+        assert_eq!(cfg.resolve_task_max_output_bytes(), 1_048_576);
+        assert_eq!(cfg.resolve_task_max_cost_units(), 2_000_000);
+        assert_eq!(cfg.resolve_task_report_repair_max_tokens(), 4096);
+        assert_eq!(cfg.resolve_task_report_repair_max_cost_units(), 65_536);
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "context_window": 1_000_000, "subagent_context_window": 1_000_000,
+            "subagent_max_tokens": 32768, "task_max_report_bytes": 524288,
+            "task_max_output_bytes": 1048576, "task_report_repair_max_tokens": 8192,
+            "task_report_repair_max_cost_units": 100000,
+            "quick_models": {"child":{"provider":"custom", "model":"small", "context_window":32768}}
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_subagent_context_window("custom", "small", Some("child")),
+            32768
+        );
+        assert_eq!(
+            cfg.resolve_subagent_context_window("foreign", "small", Some("child")),
+            1_000_000
+        );
+        assert_eq!(cfg.context_window, Some(1_000_000));
+        let again: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(again.resolve_subagent_max_tokens(), 32768);
+        assert_eq!(again.resolve_task_max_report_bytes(), 524288);
+        assert_eq!(again.resolve_task_report_repair_max_tokens(), 8192);
+        assert_eq!(again.resolve_task_report_repair_max_cost_units(), 100000);
+    }
+
+    #[test]
+    fn subagent127_invalid_settings_are_rejected_before_save_and_effects() {
+        for (key, value) in [
+            ("subagent_context_window", 4095),
+            ("subagent_max_tokens", 0),
+            ("task_max_report_bytes", 255),
+            ("task_max_turns", 0),
+            ("task_max_prompts", 0),
+            ("task_max_concurrency", 0),
+            ("task_max_output_bytes", 255),
+            ("task_max_cost_units", 0),
+            ("task_report_repair_max_tokens", 0),
+            ("task_report_repair_max_cost_units", 0),
+            ("task_timeout_secs", 86401),
+        ] {
+            let mut cfg = load::parse_config_content(
+                std::path::Path::new("config.toml"),
+                &format!("{key}={value}\n"),
+            )
+            .unwrap();
+            let error = load::validate_extra_body(&mut cfg)
+                .expect_err("invalid sizing must fail validation");
+            assert!(error.contains(key), "{error}");
+        }
+        let cfg = Config {
+            task_max_report_bytes: Some(9999),
+            task_max_output_bytes: Some(1024),
+            subagent_max_tokens: Some(1024),
+            task_report_repair_max_tokens: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_task_max_report_bytes(), 1024);
+        assert_eq!(cfg.resolve_task_report_repair_max_tokens(), 1024);
     }
 }

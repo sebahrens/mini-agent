@@ -1,0 +1,117 @@
+{
+  "bead": "mini-agent-i7ro6.57.1",
+  "acceptance": "actual native Windows original9 + affected private initializer1 PASS; no repeats of primitive13 or full matrix",
+  "commit_ready_source": "fd061405eb44ff6ebf8bf4d9d6c576e1ccf524cd",
+  "source_commit_chain": [
+    "66327928",
+    "7589bd4d9f7daf95f82605fa85bd729d03b935f2",
+    "8658ab63d1cc74d004a49b8f2f00f3719aa962e8",
+    "6293c48de20f3ec2344d9af924a027debdcb5ced",
+    "fd061405eb44ff6ebf8bf4d9d6c576e1ccf524cd"
+  ],
+  "source_worktree": "/private/tmp/mini-agent-mcp571-txf-current",
+  "source_equivalence": "6293\u2192fd061405 adds only .write(true) in new test fixture; production and original9 test bodies unchanged",
+  "runs": [
+    {
+      "run_id": 38698086432,
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/38698086432",
+      "source_sha": "6293c48de20f3ec2344d9af924a027debdcb5ced",
+      "observer_tip": "40e5d1008b8353cf44e91f0e94ddd6fea7487323",
+      "full_run_conclusion": "failure",
+      "native_result": "9 passed;1 failed;0 ignored;1.04s",
+      "passed_exact_names": [
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_actual_snapshot_keeps_reader_and_private_candidate",
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_preheld_parent_and_root_metadata_writers_refuse_without_change",
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_root_replacement_never_targets_new_namespace",
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_error_before_commit_rolls_back_and_keeps_directory_exclusion",
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_cancelled_waiter_retains_blocking_transaction_until_rollback",
+        "paths::windows_mcp_publication::tests::windows_mcp_txf_parent_reparent_after_capture_preserves_both_namespaces",
+        "extras::mcp::project::publication_tests::structural_json_edit_preserves_unknown_fields_and_private_publication_refuses_stale_snapshots",
+        "config::load::mcp_delta_tests::mcp_add_remove_preserves_unavailable_fields_unknown_nested_keys_and_no_project_copy",
+        "ui::app::mcp_admin_app::tests::actual_app_global_add_catalogue_status_and_remove_are_owned_and_never_call_provider"
+      ],
+      "rustflags": "",
+      "git_bundle_selected": true,
+      "skip_output": false,
+      "artifact_sha256": {
+        "/private/tmp/mini-agent-mcp571-consumers-run38698086432-artifacts/windows-mcp571-consumers-38698086432-1/discovery.log": "2c6b4df0228e92b3655132c060f11f53aac89ddbce67028fc2d6d726db05b624",
+        "/private/tmp/mini-agent-mcp571-consumers-run38698086432-artifacts/windows-mcp571-consumers-38698086432-1/native-consumers.log": "06b8b317f1dc2c220a29d8a97a06037e4825ebacda358e3fd4b206067c308943",
+        "/private/tmp/mini-agent-mcp571-consumers-run38698086432-artifacts/windows-mcp571-consumers-38698086432-1/native-consumer-evidence.json": "524c94bf5ddcd8eb6a102bb00a806c6c7fb9b55c911a96d779b43849c5176d23",
+        "/private/tmp/mini-agent-mcp571-consumers-run38698086432.log": "92b288c02ade37c092759d6eea25a7cd354dd52766212caba019a1833cf69986"
+      }
+    },
+    {
+      "run_id": 38699893243,
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/38699893243",
+      "source_sha": "fd061405eb44ff6ebf8bf4d9d6c576e1ccf524cd",
+      "observer_tip": "1382fd275d6f42f9a860f6b4adf41c7d8467c12f",
+      "full_run_conclusion": "success",
+      "native_result": "1 passed;0 failed;0 ignored;0.04s",
+      "passed_exact_names": [
+        "fs::private::windows::mcp_native_windows_new_temp_is_user_owned_private_and_nonempty_or_linked_files_are_unchanged"
+      ],
+      "rustflags": "",
+      "git_bundle_selected": true,
+      "skip_output": false,
+      "artifact_sha256": {
+        "/private/tmp/mini-agent-mcp571-helper-run38699893243-artifacts/windows-mcp571-consumers-38699893243-1/discovery.log": "5fab35f6edf0ef22db90f50c4488e6b8f20037ea721b6418cadb01f4cf7cf5de",
+        "/private/tmp/mini-agent-mcp571-helper-run38699893243-artifacts/windows-mcp571-consumers-38699893243-1/native-consumers.log": "0b160d644392a14124a9294fa6bc52b59128aeb9bb2c0d9bacf0ce37748b0772",
+        "/private/tmp/mini-agent-mcp571-helper-run38699893243-artifacts/windows-mcp571-consumers-38699893243-1/native-consumer-evidence.json": "ab9b5e1862ade6aad4b8c3736bb56088c6a483e93303349afa65e27492dc0000",
+        "/private/tmp/mini-agent-mcp571-helper-run38699893243.log": "aa280ae6242be01376bf94d8f7896d81b577f9c794ee326a017f8240732b5286"
+      }
+    }
+  ],
+  "all_exact_pass_names": [
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_actual_snapshot_keeps_reader_and_private_candidate",
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_preheld_parent_and_root_metadata_writers_refuse_without_change",
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_root_replacement_never_targets_new_namespace",
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_error_before_commit_rolls_back_and_keeps_directory_exclusion",
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_cancelled_waiter_retains_blocking_transaction_until_rollback",
+    "paths::windows_mcp_publication::tests::windows_mcp_txf_parent_reparent_after_capture_preserves_both_namespaces",
+    "extras::mcp::project::publication_tests::structural_json_edit_preserves_unknown_fields_and_private_publication_refuses_stale_snapshots",
+    "config::load::mcp_delta_tests::mcp_add_remove_preserves_unavailable_fields_unknown_nested_keys_and_no_project_copy",
+    "ui::app::mcp_admin_app::tests::actual_app_global_add_catalogue_status_and_remove_are_owned_and_never_call_provider",
+    "fs::private::windows::mcp_native_windows_new_temp_is_user_owned_private_and_nonempty_or_linked_files_are_unchanged"
+  ],
+  "source_file_sha256": {
+    "src/paths/windows_mcp_publication.rs": "dba81c0d28ec569fd141dfdd5a15fb013b1e8a4ea321e320f5699c7d555de040",
+    "src/fs/private.rs": "e43c7f904d8cb8dcee34410fa1976e21ee75f83ccd1e2b385d4f6df86c47a0f1",
+    "src/fs.rs": "3974e24814f8102dbd4582f311461b3a6ff0fda141bd9daee6d92e705b7f7d1d",
+    "src/config/load.rs": "15ab2b48ec80b943f6e06942878b54ee875e1b5a1f924ca608deda66b75af7d9",
+    "src/extras/mcp/project.rs": "341f1c62a4b63a8d7fb1cb305fc74b6e9750413c12554ef7fc966bcc277d508a",
+    "src/paths.rs": "e4494750916dc39e0dd9f66281e45278adbe29b6511965183b907a6390c00768",
+    "docs/agent/TOOL_RUNTIME.md": "2809d27e65bde3d738cf8de1e4d71d6d94ead9d98f4c6ec6f3220961305f7819"
+  },
+  "contract_map": {
+    "exact_target_identity_and_original_bytes": "positive actual snapshot survivor + project stale snapshot refusal",
+    "private_current_user_candidate": "actual transacted publication plus affected ordinary/direct helper1; nonempty/hardlink unchanged",
+    "root_parent_metadata_exclusion": "preheld WRITE_DAC/WRITE_OWNER refuse then clean positive",
+    "namespace": "existing root/parent no-delete-share pins retained; R1 relative namespace rewalk remains, pin-refusal fixtures unchanged files/no candidate",
+    "atomic_commit_rollback": "actual retained read sees old; path sees complete new; injected precommit error leaves old and no candidate",
+    "awaiter_cancellation": "blocking transaction stays retained through cancellation until controlled rollback and exact scope settlement",
+    "real_consumers": "actual project structural save, global TOML/JSON/YAML add/remove and App catalogue/status/remove with zero provider calls"
+  },
+  "boundaries": [
+    "generic Windows workspace CAS remains Unsupported",
+    "TxF local supported filesystem only; unavailable/conflict fail closed with no path fallback",
+    "no broad ACL grants or generic security repair",
+    "native results cover hosted Windows account/filesystem, not every privilege/filesystem",
+    "Main acceptance/status closure owned by Root after push; diagnostic workflows must not merge Main"
+  ],
+  "prior_red_evidence": [
+    "/private/tmp/mini-agent-mcp571-consumers-first-native-failure.json",
+    "/private/tmp/mini-agent-mcp571-consumers-r2-native-failure.json",
+    "/private/tmp/mini-agent-mcp571-consumers-r3-native-acceptance.json"
+  ],
+  "cleanup": {
+    "diag/native-mcp-consumers-20261015": "exact9897 conditional delete verified absent",
+    "diag/native-mcp-consumers-r2-20261015": "exact3bcd conditional delete verified absent",
+    "diag/native-mcp-consumers-r3-20261015": "exact40e5 conditional delete verified absent",
+    "diag/native-mcp-helper-20261015": "exact1382 conditional delete verified absent"
+  },
+  "new_executions": "none beyond existing9+1; no local Cargo",
+  "coherent_final_patch": "/private/tmp/mini-agent-mcp571-final-owned.patch",
+  "coherent_final_patch_sha256": "65e71b56262482a307cfe72c77a6f9fef05d3f4c5cf63f6815e90cf609181ed8",
+  "coherent_final_patch_base": "c1667803844f6904ce869a36142d1db2f6839699",
+  "coherent_final_patch_note": "all owned source/test/docs only; diagnostic workflow commits excluded"
+}

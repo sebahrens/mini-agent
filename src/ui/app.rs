@@ -8552,6 +8552,7 @@ mod permission_loop_tests {
         let (reply, receiver) = oneshot::channel();
         (
             AskRequest {
+                diagnostic: None,
                 #[cfg(feature = "subagents")]
                 background: None,
                 agent_name: None,
@@ -8646,10 +8647,26 @@ mod permission_loop_tests {
         let (task, retired, agent_events) = runner(&mut app).await;
         let (asks, receiver) = mpsc::channel(4);
         app.ask_rx = Some(receiver);
-        let (ask, mut decision) = request("printf permission-reviewed");
+        let (mut ask, mut decision) = request("printf permission-reviewed");
+        ask.diagnostic = Some(crate::permission::ask::AskDiagnostic {
+            effective_mode: crate::permission::SecurityMode::Standard,
+            selected_mode: crate::permission::SecurityMode::Yolo,
+            cause: crate::permission::ask::AskCause::ConfiguredAskRule,
+        });
         sent(&asks, ask.into()).await;
         drain(&mut app).await;
         assert!(app.permission_prompt.is_some());
+        let header = &app.renderer.permission_prompt.as_ref().unwrap().tool;
+        assert!(
+            header.contains(
+                "effective mode: standard; selected mode: yolo; cause: configured Ask rule"
+            ),
+            "{header}"
+        );
+        assert!(
+            header.contains("prompt mode narrowed the selected mode"),
+            "{header}"
+        );
         let id = app
             .btw_pricing
             .start(crate::print::HeadlessPricing::from_session(
@@ -10907,6 +10924,7 @@ mod workspace_session_picker_tests {
                         let mut decision = if pending_permission {
                             let (reply, decision) = tokio::sync::oneshot::channel();
                             app.begin_permission_request(crate::permission::ask::AskRequest {
+                                diagnostic: None,
                                 #[cfg(feature = "subagents")]
                                 background: None,
                                 agent_name: None,
