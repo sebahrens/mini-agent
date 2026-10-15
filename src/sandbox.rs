@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
@@ -603,6 +603,9 @@ struct BackgroundJobRecord {
 struct BackgroundJobsInner {
     next_sequence: AtomicU64,
     jobs: Mutex<HashMap<String, BackgroundJobRecord>>,
+    /// Records in `jobs` without a terminal state. Updated only while `jobs`
+    /// is locked, so the redraw path can read it without the lock.
+    running: AtomicUsize,
 }
 
 struct OutputCommandOptions {
@@ -3457,7 +3460,7 @@ impl Sandbox {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             prune_background_jobs(&mut jobs);
-            if jobs.values().filter(|job| job.terminal.is_none()).count()
+            if self.background_jobs.running.load(Ordering::Acquire)
                 >= MAX_CONCURRENT_BACKGROUND_JOBS
             {
                 return Err(std::io::Error::other(
@@ -3476,6 +3479,7 @@ impl Sandbox {
                     changed,
                 },
             );
+            self.background_jobs.running.fetch_add(1, Ordering::Release);
         }
 
         let owner = Arc::downgrade(&self.background_jobs);
@@ -3626,14 +3630,10 @@ impl Sandbox {
         summaries.into_iter().map(|(_, summary)| summary).collect()
     }
 
+    /// Lock-free count of jobs without a terminal state; the TUI reads it on
+    /// every redraw.
     pub(crate) fn running_background_job_count(&self) -> usize {
-        self.background_jobs
-            .jobs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-            .filter(|job| job.terminal.is_none())
-            .count()
+        self.background_jobs.running.load(Ordering::Acquire)
     }
 
     fn detached_background_sandbox(&self) -> Self {
@@ -4477,7 +4477,9 @@ fn finish_background_job(
             return;
         };
         job.capture = None;
-        job.terminal = Some(terminal);
+        if job.terminal.replace(terminal).is_none() {
+            owner.running.fetch_sub(1, Ordering::Release);
+        }
         job.changed.clone()
     };
     changed.notify_waiters();

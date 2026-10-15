@@ -3,7 +3,7 @@ use rig::tool::Tool;
 use crate::agent::tools::{
     AskSender, BashArgs, JobAction, JobStatusArgs, PermCheck, ToolError, check_perm,
 };
-use crate::extras::truncate::head_lines;
+use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
     BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus,
     DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS, MAX_BACKGROUND_JOB_WAIT_MILLIS,
@@ -216,12 +216,7 @@ impl ShellTool {
             status: output.status,
             exit_code: output.exit_status.and_then(|status| status.code()),
             descendants_escaped: output.descendants_escaped,
-            stdout: output
-                .stdout
-                .iter()
-                .copied()
-                .take(METADATA_STDOUT_BYTES)
-                .collect(),
+            stdout: output.stdout[..output.stdout.len().min(METADATA_STDOUT_BYTES)].to_vec(),
             stdout_complete: output.stdout.len() <= METADATA_STDOUT_BYTES,
         });
         #[cfg(not(any(feature = "git-worktree", test)))]
@@ -378,7 +373,7 @@ pub type BashTool = ShellTool;
 fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
-    let mut result = String::new();
+    let mut result = String::with_capacity(stdout.len() + stderr.len() + 20);
     if !stdout.is_empty() {
         result.push_str("[stdout]\n");
         result.push_str(&stdout);
@@ -452,26 +447,14 @@ fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
     // Keep roughly 80 % of the budget for the head and 20 % for the tail.
     let tail = (cap / 5).max(1);
     let head = cap - tail;
-    let (mut bounded, total) = head_lines(&text, head);
-    if total <= cap {
-        return text;
-    }
-    let omitted = total - head - tail;
-    bounded.push_str(&format!(
-        "\n\n[... {omitted} lines omitted — showing the first {head} and last {tail} of {total} lines; \
-         re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest ...]\n"
-    ));
-    if tail > 0 {
-        bounded.push('\n');
-        bounded.push_str(
-            &text
-                .lines()
-                .skip(total - tail)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    }
-    bounded
+    head_tail_lines(&text, head, tail, |total| {
+        let omitted = total - head - tail;
+        format!(
+            "\n\n[... {omitted} lines omitted — showing the first {head} and last {tail} of {total} lines; \
+             re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest ...]\n"
+        )
+    })
+    .unwrap_or(text)
 }
 
 fn resource_limit_error(
