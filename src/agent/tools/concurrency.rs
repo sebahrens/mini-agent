@@ -67,15 +67,20 @@ struct ConcurrencyBoundTool {
     inner: Box<dyn ToolDyn>,
     lane: Arc<RwLock<()>>,
     access: ToolAccess,
+    /// Foreground `shell` calls claim their announced internal call id so
+    /// their live output preview is labelled like the transcript.
+    is_shell: bool,
 }
 
 impl ConcurrencyBoundTool {
     fn new(inner: Box<dyn ToolDyn>, lane: Arc<RwLock<()>>) -> Self {
-        let access = access_for(&inner.name());
+        let name = inner.name();
+        let access = access_for(&name);
         Self {
             inner,
             lane,
             access,
+            is_shell: name == "shell",
         }
     }
 
@@ -156,6 +161,12 @@ impl ToolDyn for ConcurrencyBoundTool {
             .get::<crate::spend::run::Run>()
             .cloned()
             .or_else(crate::spend::run::Run::current);
+        // Claimed synchronously, right after the SDK announced this call.
+        let call_id = if self.is_shell {
+            crate::agent::tools::bash::claim_shell_call_id(extensions, &args)
+        } else {
+            None
+        };
         let future = async move {
             let _lease = self.lease(&args).await;
             if let Err(error) = crate::spend::run::admit_current_effect().await {
@@ -166,6 +177,7 @@ impl ToolDyn for ConcurrencyBoundTool {
             }
             self.inner.call_structured(args, extensions).await
         };
+        let future = crate::agent::tools::bash::scope_shell_call_id(call_id, future);
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
         #[cfg(feature = "acp")]

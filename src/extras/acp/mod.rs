@@ -4208,6 +4208,10 @@ async fn relay_prompt_events(
                 // Display-only provenance; the outer task call remains the
                 // canonical ACP tool lifecycle.
             }
+            AgentEvent::ToolProgress { .. } => {
+                // Display-only live output preview for the TUI. The tool
+                // result update below remains the canonical ACP content.
+            }
             AgentEvent::FileMutation { id, name, diff } => {
                 // A distinct historical preview survives the subsequent tool
                 // result update; it never asserts current filesystem contents.

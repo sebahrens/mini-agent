@@ -1848,6 +1848,18 @@ pub(crate) async fn scope_events<F: std::future::Future>(
         .await
 }
 
+/// The interactive event sender scoped around the current agent run, if any.
+/// Headless observers have no live event stream and yield `None`.
+pub(crate) fn scoped_event_sender() -> Option<tokio::sync::mpsc::Sender<crate::event::AgentEvent>> {
+    MUTATION_EVENTS
+        .try_with(|sink| match sink {
+            MutationSink::Events(sender) => Some(sender.clone()),
+            MutationSink::Observer(_) => None,
+        })
+        .ok()
+        .flatten()
+}
+
 /// Headless callers supply the same output-policy observer that owns their
 /// normal event sinks. It receives one bounded typed snapshot with exact IDs;
 /// the caller retains output failure/cancellation policy and owns its cleanup.

@@ -116,6 +116,14 @@ pub enum AgentEvent {
         #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         is_error: bool,
     },
+    /// Display-only, throttled preview of a running foreground tool call's
+    /// output (currently `shell`), bound to the call's internal id. It is
+    /// never persisted or shown to the model: the call's `ToolResult` stays
+    /// the only record. Clients without a live view ignore it.
+    ToolProgress {
+        id: CompactString,
+        text: CompactString,
+    },
     /// Native successful mutation metadata, bound by the SDK hook to the
     /// exact internal call. Never reconstructed from model-visible text.
     FileMutation {

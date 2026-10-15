@@ -316,9 +316,27 @@ pub async fn handle_agent_event(
                 save_session_if_settled(ui.session,ui.cli,run,renderer)?;
             }
         }
+        AgentEvent::ToolProgress { id, text } => {
+            // Display only: never added to the session or the model context.
+            let preview = sanitize_output(&text)
+                .lines()
+                .map(|line| format!("  │ {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if renderer.feed_mut().set_anchor_progress(
+                &id,
+                crate::ui::feed::BlockStyle::ToolResult,
+                preview,
+            ) {
+                renderer.invalidate();
+                renderer.render_viewport()?;
+            }
+        }
         AgentEvent::ToolResult {
             id, name, output, images, ..
         } => {
+            // The final result replaces any live output preview of this call.
+            renderer.feed_mut().clear_anchor_progress(&id);
             let (_, artifact) = ui
                 .session
                 .add_tool_result_with_images(&id, &name, &output, images);

@@ -735,6 +735,86 @@ struct OutputCommandOptions {
     audit: Option<OwnedExplicitShellAudit>,
     input: Option<Vec<u8>>,
     capture: Option<SharedCommandCapture>,
+    progress: Option<CommandProgress>,
+}
+
+/// Bytes of recent output a [`CommandProgress`] keeps for display.
+const COMMAND_PROGRESS_TAIL_BYTES: usize = 16 * 1024;
+
+/// Display-only live view of a running command's output: the most recent
+/// bytes of stdout and stderr in arrival order plus a change counter. It never
+/// feeds the command's result, which is still assembled from the bounded
+/// capture after the child exits.
+#[derive(Clone, Debug)]
+pub(crate) struct CommandProgress {
+    inner: Arc<CommandProgressInner>,
+}
+
+#[derive(Debug)]
+struct CommandProgressInner {
+    tail: Mutex<VecDeque<u8>>,
+    /// Number of chunks observed; receivers wake on every change.
+    version: watch::Sender<u64>,
+}
+
+impl CommandProgress {
+    pub(crate) fn new() -> Self {
+        let (version, _) = watch::channel(0);
+        Self {
+            inner: Arc::new(CommandProgressInner {
+                tail: Mutex::new(VecDeque::new()),
+                version,
+            }),
+        }
+    }
+
+    /// A receiver that observes each new chunk of output.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.version.subscribe()
+    }
+
+    fn record(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        {
+            let mut tail = self
+                .inner
+                .tail
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let keep = bytes.len().min(COMMAND_PROGRESS_TAIL_BYTES);
+            tail.extend(&bytes[bytes.len() - keep..]);
+            let overflow = tail.len().saturating_sub(COMMAND_PROGRESS_TAIL_BYTES);
+            if overflow > 0 {
+                tail.drain(..overflow);
+            }
+        }
+        self.inner
+            .version
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// The last `max_lines` complete or partial lines seen so far, decoded
+    /// lossily. A line cut by the retained-byte window is dropped.
+    pub(crate) fn tail_lines(&self, max_lines: usize) -> String {
+        let bytes: Vec<u8> = {
+            let tail = self
+                .inner
+                .tail
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tail.iter().copied().collect()
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let text = text.trim_end_matches(['\n', '\r']);
+        let mut lines: Vec<&str> = text.lines().collect();
+        if bytes.len() >= COMMAND_PROGRESS_TAIL_BYTES && lines.len() > 1 {
+            lines.remove(0);
+        }
+        let start = lines.len().saturating_sub(max_lines);
+        lines[start..].join("\n")
+    }
 }
 
 impl Drop for BackgroundJobsInner {
@@ -3542,6 +3622,19 @@ impl Sandbox {
         limits: CommandLimits,
         cancellation: Option<&CommandCancellation>,
     ) -> std::io::Result<ExplicitShellRun> {
+        self.run_explicit_shell_with_progress(interaction, limits, cancellation, None)
+            .await
+    }
+
+    /// [`Self::run_explicit_shell`] that also publishes display-only output
+    /// progress while the command runs.
+    pub(crate) async fn run_explicit_shell_with_progress(
+        &self,
+        interaction: &str,
+        limits: CommandLimits,
+        cancellation: Option<&CommandCancellation>,
+        progress: Option<CommandProgress>,
+    ) -> std::io::Result<ExplicitShellRun> {
         let command = interaction.strip_prefix('!').ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3581,6 +3674,7 @@ impl Sandbox {
                     self.explicit_shell_audit_receipts.clone(),
                 )),
                 None,
+                progress,
             )
             .await?;
         Ok(ExplicitShellRun { audit, output })
@@ -3865,6 +3959,7 @@ impl Sandbox {
                 audit: None,
                 input: None,
                 capture: Some(capture),
+                progress: None,
             },
             response_tx,
         )
@@ -3893,6 +3988,29 @@ impl Sandbox {
             .await
     }
 
+    /// [`Self::output_command_with_limits`] that also publishes display-only
+    /// output progress. The returned output is identical to the variant
+    /// without progress.
+    pub(crate) async fn output_command_with_limits_and_progress(
+        &self,
+        command: &str,
+        limits: CommandLimits,
+        progress: Option<CommandProgress>,
+    ) -> std::io::Result<CommandOutput> {
+        self.output_pending_command_scoped(
+            PendingCommand::Shell {
+                command: command.to_string(),
+                cwd: None,
+            },
+            limits,
+            None,
+            None,
+            None,
+            progress,
+        )
+        .await
+    }
+
     async fn output_command_with_limits_scoped(
         &self,
         command: &str,
@@ -3906,6 +4024,7 @@ impl Sandbox {
             },
             limits,
             cancellation,
+            None,
             None,
             None,
         )
@@ -3992,6 +4111,7 @@ impl Sandbox {
             cancellation,
             audit,
             input,
+            None,
         )
         .await
     }
@@ -4003,6 +4123,7 @@ impl Sandbox {
         cancellation: Option<watch::Receiver<bool>>,
         audit: Option<OwnedExplicitShellAudit>,
         input: Option<Vec<u8>>,
+        progress: Option<CommandProgress>,
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
@@ -4017,6 +4138,7 @@ impl Sandbox {
                             audit,
                             input,
                             capture: None,
+                            progress,
                         },
                         response_tx,
                     )
@@ -4120,6 +4242,7 @@ impl Sandbox {
             audit,
             input,
             capture,
+            progress,
         } = options;
         let settle_early = |output: CommandOutput, response_tx: oneshot::Sender<CommandOutput>| {
             if let Some(audit) = &audit {
@@ -4232,6 +4355,7 @@ impl Sandbox {
             captured.clone(),
             limits,
             reader_error_tx.clone(),
+            progress.clone(),
         );
         let stderr_handle = spawn_bounded_pipe_reader(
             child.stderr.take(),
@@ -4239,6 +4363,7 @@ impl Sandbox {
             captured.clone(),
             limits,
             reader_error_tx,
+            progress,
         );
 
         let termination = tokio::select! {
@@ -4934,6 +5059,7 @@ fn spawn_bounded_pipe_reader<R>(
     captured: SharedCommandCapture,
     limits: CommandLimits,
     error_tx: mpsc::UnboundedSender<CommandRunError>,
+    progress: Option<CommandProgress>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -4956,6 +5082,9 @@ where
             if let Err(limit) = result {
                 let _ = error_tx.send(CommandRunError::OutputLimit(limit));
                 return;
+            }
+            if let Some(progress) = &progress {
+                progress.record(&buffer[..read]);
             }
         }
     })

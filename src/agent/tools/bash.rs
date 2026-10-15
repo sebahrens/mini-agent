@@ -5,10 +5,174 @@ use crate::agent::tools::{
 };
 use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
-    BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus,
-    DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS, MAX_BACKGROUND_JOB_WAIT_MILLIS,
-    Sandbox,
+    BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
+    CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
+    MAX_BACKGROUND_JOB_WAIT_MILLIS, Sandbox,
 };
+use compact_str::CompactString;
+
+/// Minimum spacing of live progress previews for one foreground shell call.
+const SHELL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Trailing output lines a live progress preview shows.
+pub(crate) const SHELL_PROGRESS_LINES: usize = 5;
+/// Bound on announced-but-unclaimed shell calls kept in a run's scratchpad.
+const MAX_PENDING_SHELL_CALLS: usize = 64;
+
+tokio::task_local! {
+    /// Internal id of the shell call executing in this task, when known.
+    static SHELL_CALL_ID: Option<CompactString>;
+}
+
+/// Run one tool invocation with the internal call id it was announced under.
+pub(crate) async fn scope_shell_call_id<F: std::future::Future>(
+    id: Option<CompactString>,
+    future: F,
+) -> F::Output {
+    SHELL_CALL_ID.scope(id, future).await
+}
+
+/// Shell calls announced by [`ShellCallIdHook`] whose execution has not yet
+/// claimed their id, keyed by their exact argument text. This only labels a
+/// display-only preview; identical concurrent commands may swap previews.
+#[derive(Clone, Default)]
+struct PendingShellCalls(
+    std::collections::HashMap<String, std::collections::VecDeque<CompactString>>,
+);
+
+impl PendingShellCalls {
+    fn len(&self) -> usize {
+        self.0.values().map(std::collections::VecDeque::len).sum()
+    }
+
+    fn push(&mut self, args: &str, id: &str) {
+        if self.len() >= MAX_PENDING_SHELL_CALLS {
+            self.0.clear();
+        }
+        self.0
+            .entry(args.to_owned())
+            .or_default()
+            .push_back(CompactString::from(id));
+    }
+
+    fn take(&mut self, args: &str) -> Option<CompactString> {
+        let queue = self.0.get_mut(args)?;
+        let id = queue.pop_front();
+        if queue.is_empty() {
+            self.0.remove(args);
+        }
+        id
+    }
+
+    fn forget(&mut self, args: &str, id: &str) {
+        if let Some(queue) = self.0.get_mut(args) {
+            queue.retain(|pending| pending != id);
+            if queue.is_empty() {
+                self.0.remove(args);
+            }
+        }
+    }
+}
+
+/// Claim the internal id announced for the shell call about to run with the
+/// exact argument text `args`.
+pub(crate) fn claim_shell_call_id(
+    extensions: &rig::tool::ToolCallExtensions,
+    args: &str,
+) -> Option<CompactString> {
+    extensions
+        .get::<rig::agent::Scratchpad>()?
+        .update(|pending: &mut PendingShellCalls| pending.take(args))
+}
+
+/// Records each `shell` call's internal id in the run scratchpad so the tool
+/// can label its live progress with the id the transcript uses. Calls that
+/// never execute (skipped by another hook) are forgotten on their result.
+#[derive(Clone, Copy)]
+pub(crate) struct ShellCallIdHook;
+
+impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for ShellCallIdHook {
+    async fn on_event(
+        &self,
+        context: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        match event {
+            rig::agent::StepEvent::ToolCall {
+                tool_name: "shell",
+                internal_call_id,
+                args,
+                ..
+            } => context
+                .scratchpad()
+                .update(|pending: &mut PendingShellCalls| pending.push(args, internal_call_id)),
+            rig::agent::StepEvent::ToolResult {
+                tool_name: "shell",
+                internal_call_id,
+                args,
+                ..
+            } => context
+                .scratchpad()
+                .update(|pending: &mut PendingShellCalls| pending.forget(args, internal_call_id)),
+            _ => {}
+        }
+        rig::agent::Flow::cont()
+    }
+
+    fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+        matches!(
+            kind,
+            rig::agent::StepEventKind::ToolCall | rig::agent::StepEventKind::ToolResult
+        )
+    }
+}
+
+/// Run a foreground command, forwarding a throttled display-only preview of
+/// its output as [`crate::event::AgentEvent::ToolProgress`]. The output
+/// future wins every race, so no preview is sent once the command finished;
+/// a full event channel drops the preview instead of slowing the command.
+async fn output_with_progress(
+    sandbox: &Sandbox,
+    command: &str,
+    limits: CommandLimits,
+    id: CompactString,
+    events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
+) -> std::io::Result<CommandOutput> {
+    let progress = CommandProgress::new();
+    let mut changes = progress.subscribe();
+    let output =
+        sandbox.output_command_with_limits_and_progress(command, limits, Some(progress.clone()));
+    tokio::pin!(output);
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    let mut pending = false;
+    loop {
+        let due = last_sent.map(|sent| sent + SHELL_PROGRESS_INTERVAL);
+        tokio::select! {
+            biased;
+            result = &mut output => return result,
+            changed = changes.changed(), if !pending => {
+                if changed.is_ok() {
+                    pending = true;
+                }
+            }
+            _ = async {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => {}
+                }
+            }, if pending => {
+                pending = false;
+                last_sent = Some(tokio::time::Instant::now());
+                let text = progress.tail_lines(SHELL_PROGRESS_LINES);
+                if !text.is_empty() {
+                    let _ = events.try_send(crate::event::AgentEvent::ToolProgress {
+                        id: id.clone(),
+                        text: CompactString::from(text),
+                    });
+                }
+            }
+        }
+    }
+}
 
 /// Immutable observation of the actual foreground child, before display limits,
 /// permission coaching or hooks rewrite model-visible text. Payload is bounded;
@@ -199,10 +363,21 @@ impl ShellTool {
         if let Some(timeout_ms) = args.timeout {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
-        let output = self
-            .sandbox
-            .output_command_with_limits(&args.command, limits)
-            .await?;
+        let live = SHELL_CALL_ID
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
+        let output = match live {
+            Some((id, events)) => {
+                output_with_progress(&self.sandbox, &args.command, limits, id, events).await?
+            }
+            None => {
+                self.sandbox
+                    .output_command_with_limits(&args.command, limits)
+                    .await?
+            }
+        };
 
         if output.status != CommandStatus::Completed {
             tracing::warn!("tool shell stopped before completion: {:?}", output.status);
@@ -502,6 +677,137 @@ mod tests {
 
     fn test_tool() -> BashTool {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_progress_streams_before_completion_and_keeps_the_result() {
+        let command = "echo a; sleep 1; echo b";
+        let tool = test_tool();
+        let args = || BashArgs {
+            command: command.to_string(),
+            timeout: None,
+            background: false,
+        };
+        let plain = tool.execute(args()).await.unwrap().0;
+
+        let (events, mut received) = tokio::sync::mpsc::channel(64);
+        let streamed = crate::agent::tools::mutation_diff::scope_events(
+            events,
+            scope_shell_call_id(Some(CompactString::from("call-1")), tool.execute(args())),
+        );
+        tokio::pin!(streamed);
+        let first = tokio::select! {
+            result = &mut streamed => panic!("command finished before any progress: {result:?}"),
+            event = received.recv() => event.unwrap(),
+        };
+        match first {
+            crate::event::AgentEvent::ToolProgress { id, text } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(text, "a");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let streamed = streamed.await.unwrap().0;
+        assert_eq!(streamed, plain, "the model-visible result is unchanged");
+        while let Ok(event) = received.try_recv() {
+            assert!(matches!(
+                event,
+                crate::event::AgentEvent::ToolProgress { ref id, .. } if id == "call-1"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_shell_progress_is_labelled_with_the_announced_internal_call_id() {
+        use futures::StreamExt;
+        use rig::agent::{AgentBuilder, MultiTurnStreamItem};
+        use rig::streaming::{StreamedAssistantContent, StreamingChat};
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "provider-shell",
+                    "shell",
+                    serde_json::json!({"command": "echo a; sleep 1; echo b"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let tools = crate::agent::tools::concurrency::bind(vec![
+            Box::new(test_tool()) as Box<dyn rig::tool::ToolDyn>
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tools(tools)
+            .add_hook(ShellCallIdHook)
+            .build();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let mut announced = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::agent::tools::mutation_diff::scope_events(sender, async {
+                let mut stream = agent
+                    .stream_chat("run", Vec::<rig::completion::Message>::new())
+                    .max_turns(2)
+                    .await;
+                while let Some(item) = stream.next().await {
+                    if let MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::ToolCall {
+                            internal_call_id, ..
+                        },
+                    ) = item.unwrap()
+                    {
+                        announced.push(internal_call_id);
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(announced.len(), 1);
+        let mut previews = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let crate::event::AgentEvent::ToolProgress { id, text } = event {
+                previews.push((id.to_string(), text.to_string()));
+            }
+        }
+        assert!(
+            previews
+                .iter()
+                .any(|(id, text)| *id == announced[0] && text == "a"),
+            "expected an early preview labelled {}: {previews:?}",
+            announced[0]
+        );
+        assert!(previews.iter().all(|(id, _)| *id == announced[0]));
+    }
+
+    #[tokio::test]
+    async fn shell_call_ids_are_claimed_by_exact_arguments_in_announcement_order() {
+        let pad = rig::agent::Scratchpad::default();
+        pad.update(|pending: &mut PendingShellCalls| {
+            pending.push(r#"{"command":"ls"}"#, "first");
+            pending.push(r#"{"command":"pwd"}"#, "other");
+            pending.push(r#"{"command":"ls"}"#, "second");
+            pending.push(r#"{"command":"ls"}"#, "skipped");
+            pending.forget(r#"{"command":"ls"}"#, "skipped");
+        });
+        let mut extensions = rig::tool::ToolCallExtensions::new();
+        extensions.insert(pad);
+        let claim = |args| claim_shell_call_id(&extensions, args);
+        assert_eq!(claim(r#"{"command":"ls"}"#).as_deref(), Some("first"));
+        assert_eq!(claim(r#"{"command":"ls"}"#).as_deref(), Some("second"));
+        assert_eq!(claim(r#"{"command":"ls"}"#), None);
+        assert_eq!(claim(r#"{"command":"pwd"}"#).as_deref(), Some("other"));
+        assert_eq!(
+            claim_shell_call_id(&rig::tool::ToolCallExtensions::new(), "{}"),
+            None
+        );
     }
 
     #[cfg(unix)]

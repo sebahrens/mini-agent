@@ -54,6 +54,18 @@ commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.
 
+While a foreground shell call runs in an interactive turn, the tool forwards a
+throttled (at most every 100 ms) display-only `AgentEvent::ToolProgress` with
+the last five lines of combined output. `ShellCallIdHook` records each shell
+call's internal id in the run scratchpad and the concurrency wrapper claims it
+by exact argument text, so the TUI renders the sanitized preview under the
+matching call line and removes it when the `ToolResult` arrives. The preview is
+never persisted or model-visible; the final result is byte-identical to a run
+without progress, previews are dropped rather than delaying the command when
+the event channel is full, and headless/ACP consumers ignore the event.
+`!` commands render the same kind of live tail under their echoed command
+while they run, then save the session before writing the final output.
+
 The TUI records tool calls and results as they stream. Both successful and failed
 turns adopt provider call IDs and reasoning metadata from the runner's canonical
 transcript before terminal presentation or cleanup. This preserves continuation
