@@ -2130,12 +2130,12 @@ mod settings127_context_tests {
         let requests = model.requests();
         let fallbacks = observed.lock().unwrap().clone();
         assert_eq!(fallbacks.len(), 2);
-        for ((input, output), request) in fallbacks.into_iter().zip(requests.iter()) {
+        for ((input, reserved), request) in fallbacks.into_iter().zip(requests.iter()) {
             assert_eq!(
                 input,
                 crate::session::Session::estimate_tokens(&serde_json::to_string(request).unwrap())
             );
-            assert_eq!(output, 1024);
+            assert_eq!(reserved, 1024);
         }
     }
 
