@@ -431,12 +431,46 @@ impl FixtureBuild {
     }
 
     pub(crate) fn cleanup(self) {
+        // Skill discovery may extract read-only package trees into the
+        // fixture cache; make the fixture's own tree writable before removal.
+        if fs::remove_dir_all(&self.root).is_err() {
+            make_tree_writable(&self.root);
+        }
+        if !self.root.exists() {
+            return;
+        }
         fs::remove_dir_all(&self.root).unwrap_or_else(|error| {
             panic!(
                 "fixture directory could not be removed; a child may still be running ({}): {error}",
                 self.root.display()
             )
         });
+    }
+}
+
+fn make_tree_writable(root: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o700);
+    }
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    let _ = fs::set_permissions(root, permissions);
+    if metadata.is_dir()
+        && let Ok(entries) = fs::read_dir(root)
+    {
+        for entry in entries.flatten() {
+            make_tree_writable(&entry.path());
+        }
     }
 }
 
