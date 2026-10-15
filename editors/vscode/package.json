@@ -107,7 +107,7 @@
     "dev": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext ts",
-    "test": "vitest run",
+    "test": "vitest run --exclude test/chat-ui-keys.test.mjs && node --test test/chat-ui-keys.test.mjs",
     "test:integration": "node ./scripts/run-integration-tests.mjs",
     "package": "vsce package",
     "package:win32-x64": "node ./scripts/package-target.mjs win32-x64",

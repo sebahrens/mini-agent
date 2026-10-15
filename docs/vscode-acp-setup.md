@@ -289,6 +289,10 @@ python3 test/chat-ui-platform.test.py
 node --test test/chat-ui-keys.test.mjs
 ```
 
+`npm test` runs the Vitest extension suites and then these Node key checks.
+The Node test file is excluded from Vitest discovery because it uses `node:test`.
+
+
 Only the separately recorded native run can establish success on an additional
 platform. Source identity, binary/VSIX hashes, screenshots, provider requests,
 normal exit, and descendant/listener retirement must all be retained together.

@@ -101,3 +101,33 @@ names, trailing dots/spaces and other ambiguous Win32 spellings. NTFS protection
 remains enabled. Native origin records must match the exact translated mirror
 paths supplied to Git; arbitrary returned paths are never canonicalized into
 source authority.
+
+## Scoped native Windows acceptance (2026-10-15)
+
+The enforced Git boundary now satisfies its remaining Windows runtime controls.
+The final production path correction is `a66c2947`; `d0c66726` changes only the
+HTTP fixture's credential-store filename to the checked equivalent spelling.
+
+| Control | Native evidence | Result |
+| --- | --- | --- |
+| Real HTTP credentials, shell and store-shorthand modes, cmd-only PATH and spaces | [run 38728057227, job 116398700712](https://github.com/sebahrens/mini-agent/actions/runs/38728057227/job/116398700712) | Complete owning loop: 1 passed, 0 failed, 0 ignored; 0.95 s |
+| Same-object Windows path conversion and ambiguous/device-name refusal; missing-shell refusal only for selected services | [run 38725998347, job 116391890600](https://github.com/sebahrens/mini-agent/actions/runs/38725998347/job/116391890600) | Two unchanged passing controls reused |
+| Exclusive private-directory creation; shell overlap, later grants and replacement refusal | [run 38714148392, job 116352605112](https://github.com/sebahrens/mini-agent/actions/runs/38714148392/job/116352605112) | Two unchanged passing controls reused |
+
+These are five controls across scoped runs. The earlier three-test run's HTTP
+store fixture failed on an unsupported verbatim filename; the corrected full
+HTTP loop passes above. The production path conversion retains canonical Rust
+authority, checks file identity, and keeps NTFS protection enabled. Its separate
+[20-observation diagnosis](../reviews/2026-10-15-windows-git-parser-path-diagnosis.json)
+records the preceding direct C experiments and their limits.
+
+Root verified the final native output and full log hashes, exact named test,
+zero-ignore summary, successful job steps and source blobs. Final output SHA-256:
+`650da585a4d7376e29d39a1f1349472ba7bfb3e20247ee8d946501e08405c07b`.
+The native observer was a workflow-only child of `d0c66726`; its exact head was
+`4c55a98131fab8dc3b69335550a2818c32e20190`. The matching earlier path-identity
+and missing-shell output SHA-256 was
+`59b36179a955ede574a4fa3e61e9195237e762578b9c860d52912d1055a0a5a8`.
+
+This acceptance reuses the prior Linux attack-refusal and credential-service
+evidence. It does not claim a fresh all-platform suite or green aggregate CI.
