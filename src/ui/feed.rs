@@ -163,6 +163,10 @@ pub struct Block {
     highlight_budget: Cell<Option<super::highlight::BudgetScan>>,
     revision: u64,
     render_cache: RefCell<Option<BlockRenderCache>>,
+    /// Wrapped rows of a plain-text body's completed lines (reasoning bodies
+    /// and running non-agent blocks), so a streamed chunk wraps only the lines
+    /// it completed plus the unfinished tail.
+    plain_cache: RefCell<Option<PlainCache>>,
     /// Producer key (a tool-call id) that later blocks can be placed after,
     /// so a tool result lands under its own call rather than at the end.
     anchor: Option<CompactString>,
@@ -178,6 +182,14 @@ struct ReasoningBlock {
     started: Option<Instant>,
     elapsed_secs: Option<u64>,
     expanded: Option<bool>,
+}
+
+/// Wrapped rows for `text[..completed_len]` (whole lines) at `width`.
+#[derive(Clone, Debug)]
+struct PlainCache {
+    width: usize,
+    completed_len: usize,
+    segments: Vec<Arc<Vec<LineEntry>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +304,7 @@ impl Block {
             highlight_budget: Cell::new(None),
             revision: 0,
             render_cache: RefCell::new(None),
+            plain_cache: RefCell::new(None),
             anchor: None,
             attached_to: None,
             reasoning,
@@ -387,6 +400,10 @@ pub struct Feed {
     /// only the block receiving tokens.
     #[cfg(test)]
     block_renders: std::cell::Cell<usize>,
+    /// Bytes word-wrapped for incrementally laid-out plain bodies (test-only
+    /// proof that streaming reasoning re-wraps only new text).
+    #[cfg(test)]
+    wrap_bytes: std::cell::Cell<usize>,
 }
 
 /// Memoized layout of the whole feed at a viewport width and generation.
@@ -415,6 +432,8 @@ impl Feed {
             markdown_bytes_parsed: std::cell::Cell::new(0),
             #[cfg(test)]
             block_renders: std::cell::Cell::new(0),
+            #[cfg(test)]
+            wrap_bytes: std::cell::Cell::new(0),
         }
     }
 
@@ -428,6 +447,7 @@ impl Feed {
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
             *block.md_cache.borrow_mut() = None;
+            *block.plain_cache.borrow_mut() = None;
             block.syntax_cache.borrow_mut().clear();
         }
     }
@@ -442,6 +462,7 @@ impl Feed {
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
             *block.md_cache.borrow_mut() = None;
+            *block.plain_cache.borrow_mut() = None;
             block.syntax_cache.borrow_mut().clear();
         }
     }
@@ -786,6 +807,7 @@ impl Feed {
             *block.render_cache.borrow_mut() = None;
             if compacted {
                 block.highlight_budget.set(None);
+                *block.plain_cache.borrow_mut() = None;
                 *block.md_cache.borrow_mut() = None;
                 block.syntax_cache.borrow_mut().clear();
                 self.retention_generation = self.retention_generation.wrapping_add(1);
@@ -816,6 +838,7 @@ impl Feed {
             last.running = false;
             last.revision = last.revision.wrapping_add(1);
             last.highlight_budget.set(None);
+            *last.plain_cache.borrow_mut() = None;
             *last.md_cache.borrow_mut() = None;
             last.syntax_cache.borrow_mut().clear();
             *last.render_cache.borrow_mut() = None;
@@ -888,6 +911,11 @@ impl Feed {
     #[cfg(test)]
     pub(crate) fn block_renders(&self) -> usize {
         self.block_renders.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wrap_bytes(&self) -> usize {
+        self.wrap_bytes.get()
     }
 
     /// Lay out every block at `width`. Called by `lines` on a cache miss.
@@ -1110,7 +1138,8 @@ fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineE
     feed.block_renders.set(feed.block_renders.get() + 1);
     let segments = match block.style {
         BlockStyle::Agent => agent_block_segments(feed, block, width),
-        BlockStyle::Reasoning => vec![Arc::new(reasoning_block_lines(feed, block, width))],
+        BlockStyle::Reasoning => reasoning_block_segments(feed, block, width),
+        _ if block.running => plain_body_segments(feed, block, width),
         _ => vec![Arc::new(plain_block_lines(block, width, feed.palette))],
     };
     *block.render_cache.borrow_mut() = Some(BlockRenderCache {
@@ -1121,12 +1150,14 @@ fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineE
     segments
 }
 
-fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry> {
+/// A reasoning block as a one-row header segment followed, when expanded, by
+/// the incrementally wrapped body. The live clock rebuilds only the header.
+fn reasoning_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
     if feed.reasoning_display == ReasoningDisplay::Off {
         return Vec::new();
     }
     let Some(reasoning) = &block.reasoning else {
-        return plain_block_lines(block, width, feed.palette);
+        return plain_body_segments(feed, block, width);
     };
     let expanded = reasoning
         .expanded
@@ -1155,21 +1186,69 @@ fn reasoning_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEn
             (*columns <= width).then_some(ch)
         })
         .collect();
-    let mut lines = vec![LineEntry {
+    let mut segments = vec![Arc::new(vec![LineEntry {
         syntax_spans: None,
         text: CompactString::from(clipped),
         color: feed.palette.reasoning,
-    }];
+    }])];
     if expanded {
-        lines.extend(plain_block_lines(block, width, feed.palette));
+        segments.extend(plain_body_segments(feed, block, width));
     }
-    lines
+    segments
+}
+
+/// `plain_block_lines` split into shared segments for the completed lines
+/// and a fresh segment for the unfinished tail line. Rows for completed lines
+/// are memoized per width; an append wraps only the lines it completed.
+fn plain_body_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
+    let color = feed.palette.block_color(block.style);
+    let completed_len = block.text.rfind('\n').map_or(0, |idx| idx + 1);
+    let mut cache = block.plain_cache.borrow_mut();
+    // Text only grows between the mutators that clear this cache, so a cache
+    // with a shorter prefix at this width is an append-only extension.
+    let (mut segments, start) = match cache.take() {
+        Some(cached) if cached.width == width && cached.completed_len <= completed_len => {
+            (cached.segments, cached.completed_len)
+        }
+        _ => (Vec::new(), 0),
+    };
+    if completed_len > start {
+        // Whole lines start..completed_len, without the final newline.
+        let region = &block.text[start..completed_len - 1];
+        #[cfg(test)]
+        feed.wrap_bytes.set(feed.wrap_bytes.get() + region.len());
+        let mut rows = Vec::new();
+        push_plain_rows(region, width, color, &mut rows);
+        push_stable_segment(&mut segments, rows);
+    }
+    *cache = Some(PlainCache {
+        width,
+        completed_len,
+        segments: segments.clone(),
+    });
+    let tail = &block.text[completed_len..];
+    #[cfg(test)]
+    feed.wrap_bytes.set(feed.wrap_bytes.get() + tail.len());
+    let mut rows = Vec::new();
+    push_plain_rows(tail, width, color, &mut rows);
+    segments.push(Arc::new(rows));
+    segments
 }
 
 fn plain_block_lines(block: &Block, width: usize, palette: ForegroundPalette) -> Vec<LineEntry> {
     let mut result = Vec::new();
-    let color = palette.block_color(block.style);
-    for line in block.text.split('\n') {
+    push_plain_rows(
+        &block.text,
+        width,
+        palette.block_color(block.style),
+        &mut result,
+    );
+    result
+}
+
+/// One row per empty line and word-wrapped rows per non-empty line of `text`.
+fn push_plain_rows(text: &str, width: usize, color: Color, result: &mut Vec<LineEntry>) {
+    for line in text.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             result.push(LineEntry {
@@ -1187,7 +1266,6 @@ fn plain_block_lines(block: &Block, width: usize, palette: ForegroundPalette) ->
             }
         }
     }
-    result
 }
 
 /// Split a completed line into a fence delimiter run, if it is one.

@@ -1338,3 +1338,73 @@ fn growing_past_the_highlight_budget_drops_highlighting_like_a_fresh_layout() {
         );
     }
 }
+
+// --- cttyn.17: streaming reasoning wraps only new text ---
+
+#[test]
+fn streaming_full_reasoning_wraps_each_byte_a_bounded_number_of_times() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    feed.set_reasoning_display(ReasoningDisplay::Full);
+    let mut total = 0usize;
+    for para in 0..20 {
+        let text =
+            format!("thinking about step {para} in some detail\nand its consequence {para}\n\n");
+        total += text.len();
+        feed.append_reasoning(&text);
+        let _ = feed.lines(80);
+        // A partial line costs only its own bytes.
+        feed.append_reasoning("partial ");
+        total += "partial ".len();
+        let _ = feed.lines(80);
+        feed.append_reasoning("line\n");
+        total += "line\n".len();
+        let _ = feed.lines(80);
+    }
+    assert!(
+        feed.wrap_bytes() <= total * 3,
+        "wrapped {} bytes for {total} source bytes",
+        feed.wrap_bytes()
+    );
+
+    // Same rows as a from-scratch layout of the finished text.
+    let mut fresh = Feed::new();
+    fresh.set_reasoning_display(ReasoningDisplay::Full);
+    let text = feed.block_text(0).unwrap().to_string();
+    fresh.append_reasoning(&text);
+    let streamed = feed.lines(80);
+    let expected = fresh.lines(80);
+    assert_eq!(streamed.len(), expected.len());
+    // Row 0 is the live header (its elapsed clock may differ).
+    for index in 1..expected.len() {
+        assert_eq!(streamed[index].text, expected[index].text, "row {index}");
+        assert_eq!(streamed[index].color, expected[index].color, "row {index}");
+    }
+    // A narrower width re-wraps from scratch and still agrees; neither feed
+    // has ticked its clock, so the headers match too.
+    assert_same_rows(&feed.lines(17), &fresh.lines(17));
+}
+
+#[test]
+fn the_reasoning_clock_tick_rebuilds_only_the_header_row() {
+    use crate::config::ReasoningDisplay;
+    let mut feed = Feed::new();
+    feed.set_reasoning_display(ReasoningDisplay::Full);
+    feed.append_reasoning(&"a long line of private reasoning text\n".repeat(50));
+    let before = feed.lines(80);
+    let wrapped = feed.wrap_bytes();
+    feed.tick_reasoning_at(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let after = feed.lines(80);
+    assert_ne!(before[0].text, after[0].text, "header shows the new clock");
+    assert_eq!(feed.wrap_bytes(), wrapped, "the body is not re-wrapped");
+    let (before_ptrs, after_ptrs) = (
+        before.segment_ptrs_for_test(),
+        after.segment_ptrs_for_test(),
+    );
+    assert_eq!(before_ptrs.len(), after_ptrs.len());
+    assert_ne!(before_ptrs[0], after_ptrs[0]);
+    assert_eq!(
+        before_ptrs[1..before_ptrs.len() - 1],
+        after_ptrs[1..after_ptrs.len() - 1]
+    );
+}
