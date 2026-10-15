@@ -880,13 +880,12 @@ mod launch_prep_tests {
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &moved));
         assert_eq!(moved.project_dir, other.path().canonicalize().unwrap());
-        assert!(matches!(
-            policy.launch_prep("/definitely/missing/hook/project"),
-            Err(HookOutput {
-                status: HookStatus::PolicyDenied,
-                started: false,
-                ..
-            })
-        ));
+        let denied = policy
+            .launch_prep("/definitely/missing/hook/project")
+            .err()
+            .unwrap();
+        let denied_status = denied.status;
+        assert_eq!(denied_status, HookStatus::PolicyDenied);
+        assert!(!denied.started);
     }
 }

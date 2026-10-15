@@ -139,16 +139,16 @@ async fn output_with_progress(
 ) -> std::io::Result<CommandOutput> {
     let progress = CommandProgress::new();
     let mut changes = progress.subscribe();
-    let output =
+    let command_run =
         sandbox.output_command_with_limits_and_progress(command, limits, Some(progress.clone()));
-    tokio::pin!(output);
+    tokio::pin!(command_run);
     let mut last_sent: Option<tokio::time::Instant> = None;
     let mut pending = false;
     loop {
         let due = last_sent.map(|sent| sent + SHELL_PROGRESS_INTERVAL);
         tokio::select! {
             biased;
-            result = &mut output => return result,
+            result = &mut command_run => return result,
             changed = changes.changed(), if !pending => {
                 if changed.is_ok() {
                     pending = true;
