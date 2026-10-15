@@ -316,6 +316,14 @@ impl Block {
     }
 }
 
+/// `attached_to` key of the live progress block under an anchor. The control
+/// character cannot occur in an anchor id, so it never matches a result.
+fn progress_attachment(anchor: &str) -> CompactString {
+    let mut key = CompactString::from("\u{1}progress:");
+    key.push_str(anchor);
+    key
+}
+
 /// Immutable, segmented visual rows. Indexing stays O(log blocks), while a
 /// feed mutation shares every unchanged block's row allocation.
 #[derive(Clone, Debug, Default)]
@@ -744,6 +752,83 @@ impl Feed {
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.insert(position, block);
         self.prune_completed_prefix();
+        true
+    }
+
+    /// Show `text` as the live progress block under `anchor` (a running tool
+    /// call's output preview), replacing the previous preview in place. The
+    /// first preview is placed like [`Feed::place_after_anchor`]; nothing is
+    /// shown when the anchor is no longer retained. Results placed under the
+    /// anchor later go above the preview, which
+    /// [`Feed::clear_anchor_progress`] removes.
+    pub fn set_anchor_progress(
+        &mut self,
+        anchor: &str,
+        style: BlockStyle,
+        text: impl Into<String>,
+    ) -> bool {
+        if anchor.is_empty() {
+            return false;
+        }
+        let key = progress_attachment(anchor);
+        if let Some(block) = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|block| block.anchor.is_none() && block.attached_to.as_deref() == Some(&*key))
+        {
+            self.generation += 1;
+            let old_len = block.text.len();
+            block.style = style;
+            block.text = terminal_safe(text.into());
+            compact_oversized_block(&mut block.text);
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(old_len)
+                .saturating_add(block.text.len());
+            block.revision = block.revision.wrapping_add(1);
+            *block.md_cache.borrow_mut() = None;
+            block.syntax_cache.borrow_mut().clear();
+            *block.render_cache.borrow_mut() = None;
+            return true;
+        }
+        let Some(position) = self.anchor_insert_position(anchor) else {
+            return false;
+        };
+        let mut block = Block::new(style, text);
+        block.attached_to = Some(key);
+        self.generation += 1;
+        self.total_bytes = self.total_bytes.saturating_add(block.text.len());
+        self.blocks.insert(position, block);
+        self.prune_completed_prefix();
+        true
+    }
+
+    /// Remove the live progress block under `anchor`. It is kept (stale but
+    /// harmless) when removing it would shift a still-running block whose
+    /// index a producer tracks. Returns whether a block was removed.
+    pub fn clear_anchor_progress(&mut self, anchor: &str) -> bool {
+        if anchor.is_empty() {
+            return false;
+        }
+        let key = progress_attachment(anchor);
+        let Some(index) = self.blocks.iter().rposition(|block| {
+            block.anchor.is_none() && block.attached_to.as_deref() == Some(&*key)
+        }) else {
+            return false;
+        };
+        if self
+            .blocks
+            .iter()
+            .skip(index + 1)
+            .any(|block| block.running)
+        {
+            return false;
+        }
+        if let Some(block) = self.blocks.remove(index) {
+            self.generation += 1;
+            self.total_bytes = self.total_bytes.saturating_sub(block.text.len());
+        }
         true
     }
 
@@ -2217,5 +2302,48 @@ fn cached_agent_lines(
         Some(cache.segments())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn texts(feed: &Feed) -> Vec<String> {
+        (0..feed.block_count())
+            .map(|index| feed.block_text(index).unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn anchor_progress_replaces_in_place_and_yields_to_the_result() {
+        let mut feed = Feed::new();
+        feed.push_anchored_block("call-1", BlockStyle::Tool, "◈ shell");
+        feed.push_block(BlockStyle::Agent, "after");
+        assert!(feed.set_anchor_progress("call-1", BlockStyle::ToolResult, "a"));
+        assert!(feed.set_anchor_progress("call-1", BlockStyle::ToolResult, "a\nb"));
+        assert_eq!(texts(&feed), ["◈ shell", "a\nb", "after"]);
+
+        // A result goes directly under its call, above the preview.
+        assert!(feed.place_after_anchor("call-1", BlockStyle::ToolResult, "result"));
+        assert_eq!(texts(&feed), ["◈ shell", "result", "a\nb", "after"]);
+        let before = feed.generation();
+        assert!(feed.clear_anchor_progress("call-1"));
+        assert!(feed.generation() > before);
+        assert_eq!(texts(&feed), ["◈ shell", "result", "after"]);
+        assert!(!feed.clear_anchor_progress("call-1"));
+        assert!(!feed.set_anchor_progress("missing", BlockStyle::ToolResult, "x"));
+        assert!(!feed.set_anchor_progress("", BlockStyle::ToolResult, "x"));
+    }
+
+    #[test]
+    fn anchor_progress_never_shifts_a_running_block() {
+        let mut feed = Feed::new();
+        feed.push_anchored_block("call-1", BlockStyle::Tool, "◈ shell");
+        assert!(feed.set_anchor_progress("call-1", BlockStyle::ToolResult, "a"));
+        feed.push_streaming_block(BlockStyle::Agent);
+        assert!(!feed.clear_anchor_progress("call-1"));
+        assert_eq!(feed.block_count(), 3);
+        assert!(feed.is_streaming(2));
     }
 }
