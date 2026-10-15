@@ -107,6 +107,10 @@ const MAX_GUARDIAN_WORKER_ARGUMENT_BYTES: usize = 4 * 1024;
 const MAX_PROBE_DESCRIPTOR_BOUND: RawFd = 1_048_576;
 
 static STATUS: OnceLock<WorkerContainmentStatus> = OnceLock::new();
+// Retention is admitted only after the complete same-digest native matrix and cleanup.
+const RETAINED_SOURCE_ENABLED: bool = true;
+static RETAINED_SOURCE: OnceLock<one_time_image::RetainedWorkerSource> = OnceLock::new();
+const PARENT_DEATH_RECORD_MAX_BYTES: usize = 192;
 
 struct HostedProbePaths {
     workspace: PathBuf,
@@ -442,7 +446,17 @@ fn probe_containment() -> WorkerContainmentStatus {
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
-    launch_executable(worker_executable()?, production_worker_args())
+    let executable = if RETAINED_SOURCE_ENABLED {
+        RETAINED_SOURCE
+            .get()
+            .map(|source| source.selection().to_owned())
+    } else {
+        None
+    };
+    launch_executable(
+        executable.map(Ok).unwrap_or_else(worker_executable)?,
+        production_worker_args(),
+    )
 }
 
 #[cfg(test)]
@@ -607,9 +621,24 @@ fn launch_executable(
         }
     }
 
-    launch_executable_unchecked(executable, worker_args)
+    let retained = if RETAINED_SOURCE_ENABLED {
+        RETAINED_SOURCE.get()
+    } else {
+        None
+    };
+    if retained.is_some_and(|source| source.selection() != executable) {
+        return Err(WorkerLaunchError::Io {
+            backend: BACKEND,
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker executable selection changed",
+            ),
+        });
+    }
+    launch_executable_with_source(executable, worker_args, None, retained, false)
 }
 
+#[cfg(test)]
 fn launch_executable_unchecked(
     executable: PathBuf,
     worker_args: &[&str],
@@ -621,6 +650,16 @@ fn launch_executable_unchecked_with_probe(
     executable: PathBuf,
     worker_args: &[&str],
     probe: Option<&HostedProbePaths>,
+) -> Result<WorkerProcess, WorkerLaunchError> {
+    launch_executable_with_source(executable, worker_args, probe, None, false)
+}
+
+fn launch_executable_with_source(
+    executable: PathBuf,
+    worker_args: &[&str],
+    probe: Option<&HostedProbePaths>,
+    retained: Option<&one_time_image::RetainedWorkerSource>,
+    retain_candidate: bool,
 ) -> Result<WorkerProcess, WorkerLaunchError> {
     let mut launch_profile = WorkerLaunchProfile::default();
     let root = publication_root()?;
@@ -634,25 +673,32 @@ fn launch_executable_unchecked_with_probe(
     })?;
     launch_profile.publication_sweep_us = elapsed_micros(sweep_started);
     let image_started = Instant::now();
-    let (image, guardian) = one_time_image::OneTimeWorkerImage::prepare_from_and_start(
-        &executable,
-        &root,
-        |image_path| {
-            start_pending_guardian(
-                &executable,
-                image_path,
-                worker_args,
-                probe,
-                &mut launch_profile,
-            )
-        },
-    )
-    .map_err(|source| WorkerLaunchError::Io {
+    let start = |image_path: &Path| {
+        start_pending_guardian(
+            &executable,
+            image_path,
+            worker_args,
+            probe,
+            &mut launch_profile,
+        )
+    };
+    let prepared = match retained {
+        Some(source) => one_time_image::OneTimeWorkerImage::prepare_from_retained_and_start(
+            source, &root, start,
+        ),
+        None => one_time_image::OneTimeWorkerImage::prepare_from_and_start_retaining(
+            &executable,
+            &root,
+            retain_candidate,
+            start,
+        ),
+    };
+    let (image, guardian) = prepared.map_err(|source| WorkerLaunchError::Io {
         backend: BACKEND,
         source,
     })?;
-    // The callback's render/spawn costs have their own fields. Image hashing
-    // overlaps child startup, but all proof work finishes before IPC escapes.
+    // The callback's render/spawn costs have their own fields. The fresh image
+    // digest now finishes before guardian exec; Ready retains its independent rehash.
     launch_profile.image_preparation_us = elapsed_micros(image_started)
         .saturating_sub(launch_profile.profile_render_us)
         .saturating_sub(launch_profile.guardian_spawn_us);
@@ -719,6 +765,7 @@ impl PendingGuardian {
             process: WorkerChild {
                 child: self.child.take().expect("verified guardian owns its child"),
                 image: Some(image),
+                retained_candidate: None,
                 heartbeat: self.heartbeat.take(),
                 #[cfg(test)]
                 unconfined_test_child: false,
@@ -759,7 +806,9 @@ fn start_pending_guardian(
     let spawn_started = Instant::now();
     let (heartbeat_parent, heartbeat_guardian) = UnixStream::pair()?;
     let guardian_descriptor = heartbeat_guardian.as_raw_fd();
-    let mut command = Command::new(executable);
+    // This exact generation has completed its independent image byte proof.
+    // The mutable original selection is used only by the denial canary below.
+    let mut command = Command::new(image_path);
     command
         .env_clear()
         .env(super::MACOS_GUARDIAN_MARKER, GUARDIAN_MARKER_VALUE)
@@ -943,15 +992,35 @@ impl PreflightStage {
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
-    run_containment_preflight(executable, preflight_worker_args())
+    if let Some(candidate) =
+        run_containment_preflight(executable, preflight_worker_args(), RETAINED_SOURCE_ENABLED)?
+    {
+        RETAINED_SOURCE
+            .set(candidate)
+            .map_err(|_| io::Error::other("worker executable selection already committed"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 fn run_installed_containment_preflight(executable: PathBuf) -> io::Result<()> {
-    run_containment_preflight(executable, &[])
+    run_containment_preflight(executable, &[], false).map(|_| ())
 }
 
-fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::Result<()> {
+fn run_containment_preflight(
+    executable: PathBuf,
+    worker_args: &[&str],
+    retain_candidate: bool,
+) -> io::Result<Option<one_time_image::RetainedWorkerSource>> {
+    run_containment_preflight_with_proof_hook(executable, worker_args, retain_candidate, || Ok(()))
+}
+
+fn run_containment_preflight_with_proof_hook(
+    executable: PathBuf,
+    worker_args: &[&str],
+    retain_candidate: bool,
+    after_first_proof: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Option<one_time_image::RetainedWorkerSource>> {
     if !trusted_system_executable(Path::new("/usr/bin/true")) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -964,11 +1033,14 @@ fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::R
         .verify_unchanged()
         .map_err(|error| PreflightStage::SentinelPrecheck.fail(error))?;
     let result = (|| {
-        let mut process =
-            launch_executable_unchecked_with_probe(executable.clone(), worker_args, Some(&probes))
-                .map_err(|error| {
-                    PreflightStage::Launch.fail(io::Error::other(error.to_string()))
-                })?;
+        let mut process = launch_executable_with_source(
+            executable.clone(),
+            worker_args,
+            Some(&probes),
+            None,
+            retain_candidate,
+        )
+        .map_err(|error| PreflightStage::Launch.fail(io::Error::other(error.to_string())))?;
         let diagnostic_drain = spawn_closed_probe_diagnostic_drain(&process.stderr)?;
         let authentication = authenticate_ready_and_probe(&mut process, true);
         if authentication.is_err() {
@@ -987,15 +1059,22 @@ fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::R
         probes
             .verify_unchanged()
             .map_err(|error| PreflightStage::SentinelPostcheck.fail(error))?;
-        probe_guardian_parent_death(&executable, &probes)
-            .map_err(|error| PreflightStage::ParentDeath.fail(error))?;
-        probes.verify_unchanged()
+        let candidate = process.process.retained_candidate.take();
+        after_first_proof()?;
+        probe_guardian_parent_death(
+            &executable,
+            &probes,
+            candidate.as_ref().map(|source| source.digest()),
+        )
+        .map_err(|error| PreflightStage::ParentDeath.fail(error))?;
+        probes.verify_unchanged()?;
+        Ok(candidate)
     })();
     let cleanup = probes.cleanup();
     match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(candidate), Ok(())) => Ok(candidate),
         (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 
@@ -1058,7 +1137,11 @@ fn run_hosted_containment_matrix() -> io::Result<()> {
 }
 
 #[allow(unsafe_code)]
-fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> io::Result<()> {
+fn probe_guardian_parent_death(
+    executable: &Path,
+    probes: &HostedProbePaths,
+    expected_digest: Option<[u8; 32]>,
+) -> io::Result<()> {
     let publication_root =
         publication_root().map_err(|error| io::Error::other(error.to_string()))?;
     let process_paths =
@@ -1068,14 +1151,15 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
     let output = command
         .output()
         .inspect_err(|_error| report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;
-    if !output.status.success() || output.stdout.len() > 96 {
+    if !output.status.success() || output.stdout.len() > PARENT_DEATH_RECORD_MAX_BYTES {
         report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_status");
         return Err(io::Error::other("macOS parent-death canary child failed"));
     }
-    let (guardian, orphan) = parse_parent_death_record(&output.stdout).ok_or_else(|| {
-        report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_record");
-        io::Error::other("macOS parent-death canary record was invalid")
-    })?;
+    let (guardian, orphan, digest) =
+        parse_parent_death_record(&output.stdout).ok_or_else(|| {
+            report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_record");
+            io::Error::other("macOS parent-death canary record was invalid")
+        })?;
     let orphan_path = publication_root.join(&orphan);
     let orphan_identity = match std::fs::symlink_metadata(&orphan_path) {
         Ok(metadata)
@@ -1118,11 +1202,19 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
                     "macOS parent-death publication identity survived recovery",
                 ));
             }
+            // Check generation equality after exact cleanup so rejection cannot strand
+            // the child publication or the parent-death probe's workspace sentinel.
             probes
                 .restore_workspace_after_parent_death()
                 .inspect_err(|_error| {
                     report_preflight_token("MACOS_PARENT_DEATH_FAILED=workspace_cleanup")
                 })?;
+            if expected_digest.is_some_and(|expected| expected != digest) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "worker executable changed between containment cases",
+                ));
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1255,7 +1347,10 @@ fn retry_busy_sweep(
     }
 }
 
-fn parse_parent_death_record(bytes: &[u8]) -> Option<(libc::pid_t, std::ffi::OsString)> {
+fn parse_parent_death_record(bytes: &[u8]) -> Option<(libc::pid_t, std::ffi::OsString, [u8; 32])> {
+    if bytes.len() > PARENT_DEATH_RECORD_MAX_BYTES {
+        return None;
+    }
     let text = std::str::from_utf8(bytes).ok()?;
     let mut fields = text.split_ascii_whitespace();
     let guardian = fields
@@ -1264,6 +1359,18 @@ fn parse_parent_death_record(bytes: &[u8]) -> Option<(libc::pid_t, std::ffi::OsS
         .ok()
         .filter(|value| *value > 0)?;
     let orphan = std::ffi::OsString::from(fields.next()?);
+    let encoded = fields.next()?;
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
+    }
     if fields.next().is_some()
         || !orphan
             .to_str()
@@ -1271,7 +1378,7 @@ fn parse_parent_death_record(bytes: &[u8]) -> Option<(libc::pid_t, std::ffi::OsS
     {
         return None;
     }
-    Some((guardian, orphan))
+    Some((guardian, orphan, digest))
 }
 
 #[allow(unsafe_code)]
@@ -1293,7 +1400,12 @@ fn run_parent_death_canary_child() -> ! {
             .publication_directory_name()?
             .to_str()
             .ok_or_else(|| io::Error::other("macOS parent-death publication name was not UTF-8"))?;
-        println!("{guardian} {publication}");
+        let digest = process.process.proven_image_digest()?;
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        println!("{guardian} {publication} {digest}");
         std::io::stdout().flush()?;
         std::mem::forget(process);
         Ok::<(), io::Error>(())
@@ -2138,6 +2250,7 @@ fn parse_macos_major(version: &[u8]) -> Result<u32, String> {
 pub(super) struct WorkerChild {
     child: Child,
     image: Option<one_time_image::OneTimeWorkerImage>,
+    retained_candidate: Option<one_time_image::RetainedWorkerSource>,
     heartbeat: Option<UnixStream>,
     #[cfg(test)]
     unconfined_test_child: bool,
@@ -2149,6 +2262,7 @@ impl WorkerChild {
         Self {
             child,
             image: None,
+            retained_candidate: None,
             heartbeat: None,
             unconfined_test_child: true,
         }
@@ -2165,6 +2279,13 @@ impl WorkerChild {
             .ok_or_else(|| io::Error::other("macOS worker has no owned publication"))
     }
 
+    fn proven_image_digest(&self) -> io::Result<[u8; 32]> {
+        self.image
+            .as_ref()
+            .map(|image| image.digest())
+            .ok_or_else(|| io::Error::other("macOS worker has no proven image"))
+    }
+
     pub(super) fn finalize_authenticated_ready(&mut self) -> io::Result<()> {
         #[cfg(test)]
         if self.unconfined_test_child {
@@ -2174,7 +2295,9 @@ impl WorkerChild {
             .image
             .as_mut()
             .ok_or_else(|| io::Error::other("macOS worker has no authenticated publication"))?;
-        image.unlink_after_exec()
+        image.unlink_after_exec()?;
+        self.retained_candidate = image.retained_candidate.take();
+        Ok(())
     }
 
     pub(super) fn retire_after_reap(&mut self) -> io::Result<()> {
@@ -2699,6 +2822,52 @@ mod one_time_image {
         MacCodeIdentity::from_pinned_path(path, &mut file, &expected)
     }
 
+    const MAX_RETAINED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+    /// Only constructed by transferring a completely proven, unlinked image.
+    /// No pathname, writable handle or deserialization can adopt a candidate.
+    pub(super) struct RetainedWorkerSource {
+        selection: PathBuf,
+        file: std::fs::File,
+        identity: FileIdentity,
+    }
+    impl std::fmt::Debug for RetainedWorkerSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RetainedWorkerSource([PRIVATE])")
+        }
+    }
+    impl RetainedWorkerSource {
+        pub(super) fn selection(&self) -> &Path {
+            &self.selection
+        }
+        pub(super) fn digest(&self) -> [u8; 32] {
+            self.identity.sha256
+        }
+        fn validate(&self) -> io::Result<std::fs::Metadata> {
+            let metadata = self.file.metadata()?;
+            if !self.identity.matches_metadata(&metadata)
+                || !metadata.is_file()
+                || metadata.nlink() != 0
+                || metadata.uid() != current_uid()
+                || metadata.mode() & 0o7777 != 0o500
+                || metadata.len() > MAX_RETAINED_IMAGE_BYTES
+                || !descriptor_has_close_on_exec(self.file.as_raw_fd())?
+                || !descriptor_is_read_only(self.file.as_raw_fd())?
+            {
+                return Err(permission_denied(
+                    "retained worker executable identity changed",
+                ));
+            }
+            ensure_no_extended_acl(&self.file, "retained worker executable")?;
+            Ok(metadata)
+        }
+    }
+
+    enum ImageSource<'a> {
+        Path(&'a Path),
+        Retained(&'a RetainedWorkerSource),
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct WorkerImageProof {
         source: FileIdentity,
@@ -2723,6 +2892,8 @@ mod one_time_image {
         lease: Option<std::fs::File>,
         image: Option<std::fs::File>,
         proof: WorkerImageProof,
+        candidate_selection: Option<PathBuf>,
+        pub(super) retained_candidate: Option<RetainedWorkerSource>,
         linked: bool,
         lease_linked: bool,
         directory_linked: bool,
@@ -2964,6 +3135,7 @@ mod one_time_image {
             Self::prepare_from_with_fault(source, private_root, |_, _| Ok(()))
         }
 
+        #[cfg(test)]
         pub(super) fn prepare_from_and_start<T>(
             source: &Path,
             private_root: &Path,
@@ -2982,9 +3154,55 @@ mod one_time_image {
                 .map(|(image, ())| image)
         }
 
+        #[cfg(test)]
         fn prepare_from_with_fault_and_start<T>(
             source: &Path,
             private_root: &Path,
+            fault: impl FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
+            Self::prepare_source_with_fault_and_start(
+                ImageSource::Path(source),
+                private_root,
+                false,
+                fault,
+                start,
+            )
+        }
+
+        pub(super) fn prepare_from_and_start_retaining<T>(
+            source: &Path,
+            private_root: &Path,
+            retain_candidate: bool,
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
+            Self::prepare_source_with_fault_and_start(
+                ImageSource::Path(source),
+                private_root,
+                retain_candidate,
+                |_, _| Ok(()),
+                start,
+            )
+        }
+
+        pub(super) fn prepare_from_retained_and_start<T>(
+            source: &RetainedWorkerSource,
+            private_root: &Path,
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
+            Self::prepare_source_with_fault_and_start(
+                ImageSource::Retained(source),
+                private_root,
+                false,
+                |_, _| Ok(()),
+                start,
+            )
+        }
+
+        fn prepare_source_with_fault_and_start<T>(
+            source: ImageSource<'_>,
+            private_root: &Path,
+            retain_candidate: bool,
             mut fault: impl FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
             start: impl FnOnce(&Path) -> io::Result<T>,
         ) -> io::Result<(Self, T)> {
@@ -3006,17 +3224,37 @@ mod one_time_image {
             ensure_same_identity(&root_opened, &root_after, "one-time image root changed")?;
             let _root_publication_lock = RootPublicationLock::acquire(&root)?;
 
-            let source_before = std::fs::symlink_metadata(source)?;
-            validate_source_image(&source_before)?;
-            let mut source_file = open_read_only(source)?;
-            let source_opened = source_file.metadata()?;
-            validate_source_image(&source_opened)?;
-            ensure_stable_source_metadata(
-                &source_before,
-                &source_opened,
-                "worker source changed before copy",
-            )?;
-            ensure_no_extended_acl(&source_file, "worker source")?;
+            let (mut source_file, source_opened, cached_digest, selected_path) = match source {
+                ImageSource::Path(path) => {
+                    let before = std::fs::symlink_metadata(path)?;
+                    validate_source_image(&before)?;
+                    let file = open_read_only(path)?;
+                    let opened = file.metadata()?;
+                    validate_source_image(&opened)?;
+                    ensure_stable_source_metadata(
+                        &before,
+                        &opened,
+                        "worker source changed before copy",
+                    )?;
+                    ensure_no_extended_acl(&file, "worker source")?;
+                    (file, opened, None, Some(path))
+                }
+                ImageSource::Retained(snapshot) => {
+                    let opened = snapshot.validate()?;
+                    (
+                        snapshot.file.try_clone()?,
+                        opened,
+                        Some(snapshot.digest()),
+                        None,
+                    )
+                }
+            };
+
+            if !descriptor_has_close_on_exec(source_file.as_raw_fd())?
+                || !descriptor_is_read_only(source_file.as_raw_fd())?
+            {
+                return Err(permission_denied("worker source descriptor flags changed"));
+            }
 
             let (directory_name, directory_path) =
                 create_unique_private_directory(&root, &private_root)?;
@@ -3064,15 +3302,17 @@ mod one_time_image {
                 publication.adopt_created_image(image)?;
                 fault(PreparationFaultStage::Created, &image_path)?;
                 ensure_no_extended_acl(publication.image()?, "writable one-time worker image")?;
-                // APFS supplies an atomic copy-on-write snapshot with its own inode. Hashing both
-                // pinned descriptors below retains the original byte-for-byte proof without the
-                // full executable rewrite and durable data flush on every worker generation.
-                // Deliberately not memoized across launches: the publisher's contract is to
-                // independently hash both pinned descriptors on every
-                // publication (docs/specs/phase-6-brokered-js-runtime.md).
-                let source_digest_started = std::time::Instant::now();
-                let source_sha256 = hash_file(&mut source_file)?;
-                timing.source_digest_us = super::elapsed_micros(source_digest_started);
+                // Mutable sources are independently hashed on every publication. The sole
+                // exception is an already-proven privately constructed anonymous snapshot;
+                // its metadata is only a rejection check, never a content-cache key.
+                let source_sha256 = if let Some(digest) = cached_digest {
+                    digest
+                } else {
+                    let started = std::time::Instant::now();
+                    let digest = hash_file(&mut source_file)?;
+                    timing.source_digest_us = super::elapsed_micros(started);
+                    digest
+                };
                 fault(PreparationFaultStage::Copied, &image_path)?;
                 publication.image()?.sync_all()?;
                 fault(PreparationFaultStage::Synced, &image_path)?;
@@ -3083,20 +3323,24 @@ mod one_time_image {
                 fault(PreparationFaultStage::PermissionsSealed, &image_path)?;
 
                 let source_after_handle = source_file.metadata()?;
-                validate_source_image(&source_after_handle)?;
+                if selected_path.is_some() {
+                    validate_source_image(&source_after_handle)?;
+                }
                 ensure_stable_source_metadata(
                     &source_opened,
                     &source_after_handle,
                     "worker source mutated during copy",
                 )?;
                 ensure_no_extended_acl(&source_file, "worker source")?;
-                let source_after_path = std::fs::symlink_metadata(source)?;
-                validate_source_image(&source_after_path)?;
-                ensure_stable_source_metadata(
-                    &source_opened,
-                    &source_after_path,
-                    "worker source path changed during copy",
-                )?;
+                if let Some(path) = selected_path {
+                    let source_after_path = std::fs::symlink_metadata(path)?;
+                    validate_source_image(&source_after_path)?;
+                    ensure_stable_source_metadata(
+                        &source_opened,
+                        &source_after_path,
+                        "worker source path changed during copy",
+                    )?;
+                }
 
                 fault(PreparationFaultStage::BeforeReopen, &image_path)?;
                 let image = open_at(
@@ -3117,11 +3361,8 @@ mod one_time_image {
                     ));
                 }
                 ensure_no_extended_acl(publication.image()?, "sealed one-time worker image")?;
-                // All writable descriptors are closed and source/ownership/ACL
-                // checks have passed. Keep the started process's cleanup guard
-                // local: any later proof error drops it before publication.
-                let started = start(&image_path)?;
-                fault(PreparationFaultStage::Started, &image_path)?;
+                // Independently prove the newly created executable before running it
+                // as the unconfined guardian. Ready still rehashes this generation.
                 let image_digest_started = std::time::Instant::now();
                 let image_sha256 = hash_file(publication.image_mut()?)?;
                 timing.image_digest_us = super::elapsed_micros(image_digest_started);
@@ -3131,6 +3372,30 @@ mod one_time_image {
                         "one-time worker image did not match its source",
                     ));
                 }
+                let before_start = publication.image()?.metadata()?;
+                validate_published_image(&before_start)?;
+                ensure_stable_metadata(
+                    &image_opened,
+                    &before_start,
+                    "worker image changed before guardian start",
+                )?;
+                let path_before_start = std::fs::symlink_metadata(&image_path)?;
+                ensure_stable_metadata(
+                    &before_start,
+                    &path_before_start,
+                    "worker image path changed before guardian start",
+                )?;
+                ensure_no_extended_acl(publication.image()?, "proven guardian image")?;
+                ensure_no_extended_acl(&directory, "proven guardian image directory")?;
+                ensure_exact_directory_entries(
+                    &directory,
+                    &[
+                        OsStr::new(ONE_TIME_LEASE_NAME),
+                        OsStr::new(ONE_TIME_IMAGE_NAME),
+                    ],
+                )?;
+                let started = start(&image_path)?;
+                fault(PreparationFaultStage::Started, &image_path)?;
                 let image_after = std::fs::symlink_metadata(&image_path)?;
                 ensure_stable_metadata(
                     &image_opened,
@@ -3167,6 +3432,12 @@ mod one_time_image {
                         lease: Some(lease),
                         image: Some(image),
                         proof,
+                        candidate_selection: if retain_candidate {
+                            selected_path.map(Path::to_owned)
+                        } else {
+                            None
+                        },
+                        retained_candidate: None,
                         linked: true,
                         lease_linked: true,
                         directory_linked: true,
@@ -3229,6 +3500,10 @@ mod one_time_image {
         #[cfg(test)]
         fn root_descriptor_has_close_on_exec(&self) -> io::Result<bool> {
             descriptor_has_close_on_exec(self.root.as_raw_fd())
+        }
+
+        pub(super) fn digest(&self) -> [u8; 32] {
+            self.proof.image.sha256
         }
 
         /// Remove the sole executable pathname after the child has acknowledged successful exec.
@@ -3296,8 +3571,23 @@ mod one_time_image {
                 ));
             }
             self.directory.sync_all()?;
-            self.image.take();
             self.linked = false;
+            if let Some(selection) = self.candidate_selection.take()
+                && unlinked.len() <= MAX_RETAINED_IMAGE_BYTES
+            {
+                let candidate = RetainedWorkerSource {
+                    selection,
+                    file: self.image.take().expect("validated retained image"),
+                    identity: FileIdentity::from_metadata_and_digest(
+                        &unlinked,
+                        self.proof.image.sha256,
+                    ),
+                };
+                candidate.validate()?;
+                self.retained_candidate = Some(candidate);
+            } else {
+                self.image.take();
+            }
             Ok(())
         }
 
@@ -3931,19 +4221,7 @@ mod one_time_image {
                 OPEN_READ_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
                 0o600,
             )?;
-            let copy_result = (|| {
-                let mut source = source.try_clone()?;
-                source.seek(std::io::SeekFrom::Start(0))?;
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let read = source.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    image.write_all(&buffer[..read])?;
-                }
-                Ok(())
-            })();
+            let copy_result = copy_file_positionally(source, &mut image);
             if let Err(copy_error) = copy_result {
                 return match unlink_at(directory, name, 0) {
                     Ok(()) => Err(copy_error),
@@ -3957,12 +4235,32 @@ mod one_time_image {
             }
             return Ok(image);
         }
-        match open_at(
-            directory,
-            name,
-            OPEN_READ_WRITE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
-            0,
-        ) {
+        let opened_clone = (|| {
+            // APFS preserves source mode, including the retained source's 0500.
+            // Clones need no content writes; ownership permits later fchmod/fsync
+            // through this read-only descriptor without ever widening image mode.
+            let pinned = open_at(
+                directory,
+                name,
+                OPEN_READ_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+                0,
+            )?;
+            let metadata = pinned.metadata()?;
+            let source_metadata = source.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != current_uid()
+                || metadata.nlink() != 1
+                || (metadata.dev(), metadata.ino())
+                    == (source_metadata.dev(), source_metadata.ino())
+            {
+                return Err(permission_denied(
+                    "cloned image was not a distinct private inode",
+                ));
+            }
+            ensure_no_extended_acl(&pinned, "cloned worker image")?;
+            Ok(pinned)
+        })();
+        match opened_clone {
             Ok(image) => Ok(image),
             Err(open_error) => match unlink_at(directory, name, 0) {
                 Ok(()) => Err(open_error),
@@ -3974,6 +4272,32 @@ mod one_time_image {
                 )),
             },
         }
+    }
+
+    fn copy_file_positionally(source: &std::fs::File, image: &mut std::fs::File) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read_at(&mut buffer, offset)?;
+            if read == 0 {
+                return Ok(());
+            }
+            image.write_all(&buffer[..read])?;
+            offset = offset
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("worker image copy offset exhausted"))?;
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn descriptor_is_read_only(descriptor: RawFd) -> io::Result<bool> {
+        // SAFETY: F_GETFL observes flags of a retained live descriptor.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(flags & libc::O_ACCMODE == libc::O_RDONLY)
     }
 
     fn hash_file(file: &mut std::fs::File) -> io::Result<[u8; 32]> {
@@ -4056,6 +4380,274 @@ mod one_time_image {
         impl Drop for TestRoot {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        fn retained_fixture(root: &TestRoot, source: &Path) -> RetainedWorkerSource {
+            let (mut image, ()) = OneTimeWorkerImage::prepare_from_and_start_retaining(
+                source,
+                &root.path,
+                true,
+                |_| Ok(()),
+            )
+            .unwrap();
+            image.unlink_after_exec().unwrap();
+            let retained = image
+                .retained_candidate
+                .take()
+                .expect("bounded proven candidate");
+            image.retire_after_reap().unwrap();
+            retained
+        }
+
+        #[test]
+        fn retained_image86_is_anonymous_read_only_and_survives_original_changes() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"original worker bytes");
+            let original = std::fs::metadata(&source).unwrap();
+            let retained = retained_fixture(&root, &source);
+            assert_eq!(retained.selection(), source);
+            let metadata = retained.validate().unwrap();
+            assert_eq!(metadata.nlink(), 0);
+            assert_ne!(metadata.ino(), original.ino());
+            assert!(descriptor_is_read_only(retained.file.as_raw_fd()).unwrap());
+            assert!(descriptor_has_close_on_exec(retained.file.as_raw_fd()).unwrap());
+            assert_eq!(metadata.mode() & 0o7777, 0o500);
+
+            std::fs::write(&source, b"modified worker bytes").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap()))
+                .unwrap();
+            assert_eq!(std::fs::metadata(&source).unwrap().len(), original.len());
+            assert_eq!(
+                std::fs::metadata(&source).unwrap().modified().unwrap(),
+                original.modified().unwrap()
+            );
+            let mut identities = std::collections::HashSet::new();
+            for generation in 0..3 {
+                if generation == 1 {
+                    std::fs::rename(&source, root.path.join("replaced-source")).unwrap();
+                    root.source("source-worker", b"different new version");
+                } else if generation == 2 {
+                    std::fs::remove_file(&source).unwrap();
+                }
+                let (mut image, ()) = OneTimeWorkerImage::prepare_from_retained_and_start(
+                    &retained,
+                    &root.path,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert!(identities.insert(image.proof.image.inode));
+                assert_ne!(image.proof.image.inode, metadata.ino());
+                assert_eq!(image.proof.source.sha256, retained.digest());
+                assert_eq!(image.proof.image.sha256, retained.digest());
+                assert_eq!(
+                    std::fs::read(image.image_path()).unwrap(),
+                    b"original worker bytes"
+                );
+                image.unlink_after_exec().unwrap();
+                assert!(
+                    image.retained_candidate.is_none(),
+                    "warm generations do not grow the cache"
+                );
+                image.retire_after_reap().unwrap();
+                retained.validate().unwrap();
+            }
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn retained_image86_rejects_changed_descriptor_identity_flags_and_mode() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let mut retained = retained_fixture(&root, &source);
+            let original = retained.file.try_clone().unwrap();
+            retained.file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&source)
+                .unwrap();
+            assert_eq!(
+                retained.validate().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            retained.file = original;
+            retained
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            assert_eq!(
+                retained.validate().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            let result = OneTimeWorkerImage::prepare_from_retained_and_start(
+                &retained,
+                &root.path,
+                |_| -> io::Result<()> { panic!("invalid source must never execute") },
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn retained_image86_refuses_linked_or_oversized_sources() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let file = open_read_only(&source).unwrap();
+            let identity =
+                FileIdentity::from_metadata_and_digest(&file.metadata().unwrap(), [0; 32]);
+            let linked = RetainedWorkerSource {
+                selection: source.clone(),
+                file,
+                identity,
+            };
+            assert_eq!(
+                linked.validate().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            let large = root.source("oversized-worker", b"");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&large)
+                .unwrap()
+                .set_len(MAX_RETAINED_IMAGE_BYTES + 1)
+                .unwrap();
+            std::fs::set_permissions(&large, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let file = open_read_only(&large).unwrap();
+            std::fs::remove_file(&large).unwrap();
+            let identity =
+                FileIdentity::from_metadata_and_digest(&file.metadata().unwrap(), [0; 32]);
+            let oversized = RetainedWorkerSource {
+                selection: large,
+                file,
+                identity,
+            };
+            assert_eq!(
+                oversized.validate().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        #[test]
+        #[allow(unsafe_code)]
+        fn retained_image86_rejects_identical_anonymous_descriptor_without_cloexec() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let mut retained = retained_fixture(&root, &source);
+            // SAFETY: dup borrows a live fixture descriptor. On success, the new
+            // descriptor is adopted exactly once and File Drop owns its cleanup.
+            let duplicate = unsafe { libc::dup(retained.file.as_raw_fd()) };
+            assert!(duplicate >= 0);
+            // SAFETY: duplicate is the newly owned valid descriptor from dup above.
+            retained.file = unsafe { std::fs::File::from_raw_fd(duplicate) };
+            assert!(!descriptor_has_close_on_exec(retained.file.as_raw_fd()).unwrap());
+            assert!(descriptor_is_read_only(retained.file.as_raw_fd()).unwrap());
+            assert_eq!(
+                retained.validate().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            let result = OneTimeWorkerImage::prepare_from_retained_and_start(
+                &retained,
+                &root.path,
+                |_| -> io::Result<()> { panic!("inheritable source must never execute") },
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn retained_image86_concurrent_generations_and_fallback_have_independent_offsets() {
+            use std::io::Seek;
+            let root = TestRoot::new();
+            let payload = (0..170_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let source = root.source("source-worker", &payload);
+            let retained = retained_fixture(&root, &source);
+            std::fs::remove_file(&source).unwrap();
+            let mut shared_offset = retained.file.try_clone().unwrap();
+            shared_offset.seek(std::io::SeekFrom::Start(97)).unwrap();
+            let results = std::thread::scope(|scope| {
+                let handles = (0..3)
+                    .map(|index| {
+                        let root = &root;
+                        let retained = &retained;
+                        scope.spawn(move || -> io::Result<_> {
+                            let path = root.path.join(format!("copy-{index}"));
+                            let mut copy = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)?;
+                            copy_file_positionally(&retained.file.try_clone()?, &mut copy)?;
+                            let publication_root = root.path.join(format!("publication-{index}"));
+                            std::fs::DirBuilder::new()
+                                .mode(0o700)
+                                .create(&publication_root)?;
+                            let (image, ()) = OneTimeWorkerImage::prepare_from_retained_and_start(
+                                retained,
+                                &publication_root,
+                                |_| Ok(()),
+                            )?;
+                            Ok((image, path, publication_root))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                // Hold every completed publication until all three writers retire;
+                // no barrier can strand another thread when an operation fails.
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut identities = std::collections::HashSet::new();
+            for result in results {
+                let (mut image, path, publication_root) = result.unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), payload);
+                assert_eq!(std::fs::read(image.image_path()).unwrap(), payload);
+                assert!(identities.insert(image.proof.image.inode));
+                image.unlink_after_exec().unwrap();
+                image.retire_after_reap().unwrap();
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_dir(publication_root).unwrap();
+            }
+            assert_eq!(shared_offset.stream_position().unwrap(), 97);
+            assert_eq!(identities.len(), 3);
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn retained_image86_rejects_tampering_before_guardian_start() {
+            for stage in [
+                PreparationFaultStage::Reopened,
+                PreparationFaultStage::Hashed,
+            ] {
+                let root = TestRoot::new();
+                let source = root.source("source-worker", b"worker");
+                let result = OneTimeWorkerImage::prepare_from_with_fault_and_start(
+                    &source,
+                    &root.path,
+                    |observed, image| {
+                        if observed == stage {
+                            std::fs::set_permissions(
+                                image,
+                                std::fs::Permissions::from_mode(0o700),
+                            )?;
+                            std::fs::write(image, b"tamper")?;
+                            std::fs::set_permissions(
+                                image,
+                                std::fs::Permissions::from_mode(0o500),
+                            )?;
+                        }
+                        Ok(())
+                    },
+                    |_| -> io::Result<()> {
+                        panic!("unproven changed image must never start the guardian")
+                    },
+                );
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
             }
         }
 
@@ -4426,9 +5018,7 @@ mod one_time_image {
 
                 let after_start = matches!(
                     injected_stage,
-                    PreparationFaultStage::Started
-                        | PreparationFaultStage::Hashed
-                        | PreparationFaultStage::MetadataValidated
+                    PreparationFaultStage::Started | PreparationFaultStage::MetadataValidated
                 );
                 assert_eq!(started.get(), after_start, "{injected_stage:?}");
                 assert_eq!(
@@ -4475,7 +5065,7 @@ mod one_time_image {
         }
 
         #[test]
-        fn image_digest_mismatch_reaps_started_child_and_removes_publication() {
+        fn image_change_after_start_reaps_started_child_and_removes_publication() {
             let root = TestRoot::new();
             let source = root.source("source-worker", b"worker");
             let pid = std::cell::Cell::new(0);
@@ -4500,7 +5090,7 @@ mod one_time_image {
                 .err()
                 .expect("tampered image must fail its byte proof");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert!(error.to_string().contains("did not match its source"));
+            assert!(error.to_string().contains("changed after publication"));
             assert_child_reaped(pid.get());
             assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
             assert_eq!(std::fs::read(source).unwrap(), b"worker");
@@ -5069,18 +5659,169 @@ mod tests {
         );
     }
 
+    /// Runs only with an explicitly supplied, same-source installed production binary
+    /// and isolated ZS_* roots. No libtest worker substitutes for the native matrix.
+    #[test]
+    #[ignore = "requires same-source installed binary and isolated native macOS fixture roots"]
+    fn retained_image86_installed_matrix_generations_and_mixed_source_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let installed = PathBuf::from(
+            std::env::var_os("MINI_AGENT_SNAPSHOT86_BINARY")
+                .expect("explicit same-source installed binary required"),
+        )
+        .canonicalize()
+        .unwrap();
+        for name in [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ] {
+            assert!(
+                std::env::var_os(name).is_some(),
+                "isolated native fixture roots required: {name}"
+            );
+        }
+        assert!(
+            availability_error().is_none(),
+            "native containment host required"
+        );
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-snapshot86-native-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let root = Fixture(path.canonicalize().unwrap());
+        let clone_source = |name: &str| {
+            let path = root.0.join(name);
+            std::fs::copy(&installed, &path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"A").unwrap();
+            file.sync_all().unwrap();
+            path
+        };
+        let rewrite_marker = |path: &Path| -> io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            let metadata = std::fs::metadata(path)?;
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            file.write_all_at(b"B", metadata.len() - 1)?;
+            file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+            file.sync_all()?;
+            let after = file.metadata()?;
+            assert_eq!(after.len(), metadata.len());
+            assert_eq!(after.modified()?, metadata.modified()?);
+            Ok(())
+        };
+        let source = clone_source("retained-worker");
+        let retained = run_containment_preflight(source.clone(), &[], true)
+            .expect("complete first-generation native matrix must pass")
+            .expect("bounded fully proven native snapshot must be retained");
+        assert!(
+            RETAINED_SOURCE.get().is_none(),
+            "private probe must not publish global availability/cache"
+        );
+        rewrite_marker(&source).unwrap();
+        let mut generation_paths = std::collections::HashSet::new();
+        let mut generation_inodes = std::collections::HashSet::new();
+        for generation in 0..2 {
+            let probes = HostedProbePaths::create().unwrap();
+            let mut process = launch_executable_with_source(
+                source.clone(),
+                &[],
+                Some(&probes),
+                Some(&retained),
+                false,
+            )
+            .expect("warm native generation must publish from retained descriptor");
+            let image = process.process.image.as_ref().unwrap();
+            assert!(generation_paths.insert(image.image_path().to_owned()));
+            assert!(generation_inodes.insert(std::fs::metadata(image.image_path()).unwrap().ino()));
+            assert_eq!(image.digest(), retained.digest());
+            let profile = last_launch_profile().unwrap();
+            assert_eq!(
+                profile.source_digest_us, 0,
+                "warm source digest is reused only from proven snapshot"
+            );
+            if generation == 0 {
+                authenticate_ready_and_probe(&mut process, false).unwrap();
+                probes.verify_unchanged().unwrap();
+                process.terminate_and_reap(PREFLIGHT_TIMEOUT).unwrap();
+            } else {
+                authenticate_ready_and_probe(&mut process, true).unwrap();
+                probes.verify_unchanged().unwrap();
+            }
+            probes.cleanup().unwrap();
+        }
+        let changed = clone_source("mixed-generation-worker");
+        let mut mutated = false;
+        let error = run_containment_preflight_with_proof_hook(changed.clone(), &[], true, || {
+            rewrite_marker(&changed)?;
+            mutated = true;
+            Ok(())
+        })
+        .expect_err(
+            "passing matrix cases from different full image digests must refuse cache admission",
+        );
+        assert!(
+            mutated,
+            "negative must reach the real between-case mutation point"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("worker executable changed between containment cases"),
+            "{error}"
+        );
+        assert!(
+            RETAINED_SOURCE.get().is_none(),
+            "failed native matrix must not publish a candidate"
+        );
+        let publication = publication_root().unwrap();
+        assert!(
+            std::fs::read_dir(publication).unwrap().all(|entry| {
+                !is_canonical_publication_directory_name(
+                    &entry.unwrap().file_name().to_string_lossy(),
+                )
+            }),
+            "every native generation and parent-death publication must retire"
+        );
+    }
+
     #[test]
     fn parent_death_record_is_exact_and_concurrency_safe() {
         let name = ".mini-agent-js-worker-550e8400-e29b-41d4-a716-446655440000";
+        let digest = "ab".repeat(32);
         assert_eq!(
-            parse_parent_death_record(format!("1234 {name}\n").as_bytes()),
-            Some((1234, std::ffi::OsString::from(name)))
+            parse_parent_death_record(format!("1234 {name} {digest}\n").as_bytes()),
+            Some((1234, std::ffi::OsString::from(name), [0xab; 32]))
         );
         for rejected in [
-            format!("0 {name}"),
-            "1234 not-canonical".into(),
-            format!("1234 {name} unexpected"),
-            format!("1234 {}", name.to_uppercase()),
+            format!("0 {name} {digest}"),
+            format!("1234 not-canonical {digest}"),
+            format!("1234 {name}"),
+            format!("1234 {name} {digest} {digest}"),
+            format!("1234 {} {digest}", name.to_uppercase()),
+            format!("1234 {name} {}", digest.to_uppercase()),
+            format!("1234 {name} {}", "ab".repeat(31)),
+            format!("1234 {name} {}", "gg".repeat(32)),
+            format!(
+                "1234 {name} {digest}{}",
+                " ".repeat(PARENT_DEATH_RECORD_MAX_BYTES)
+            ),
         ] {
             assert_eq!(parse_parent_death_record(rejected.as_bytes()), None);
         }

@@ -1355,8 +1355,21 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(executable);",
-        2,
+        1,
         "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(image_path);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    // Concurrent anonymous-source image fixture uses joined Rust scope threads.
+    (
+        "src/sandbox/worker/macos.rs",
+        "scope.spawn(move || -> io::Result<_> {",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/sandbox/worker/macos.rs",

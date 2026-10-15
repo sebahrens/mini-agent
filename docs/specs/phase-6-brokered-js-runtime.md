@@ -748,8 +748,9 @@ atomically creates a distinct single-link image from the pinned trusted source w
 `fclonefileat(..., CLONE_NOOWNERCOPY)`. The APFS copy-on-write path avoids rewriting and durably
 flushing the complete executable for every worker generation. If the pinned executable is on a
 different or non-cloning volume, only `EXDEV` or `ENOTSUP` selects the descriptor-relative,
-exclusive private-copy path; every other clone error fails closed. The publisher still independently
-hashes both pinned descriptors, verifies source and destination metadata and distinct inodes,
+exclusive private-copy path; every other clone error fails closed. Mutable-source publication independently
+hashes both pinned descriptors; a previously admitted anonymous source follows the retained selection
+contract below. The publisher verifies source and destination metadata and distinct inodes,
 changes the image to `0500`, and retains close-on-exec descriptors so cleanup and unlink remain
 bound to the proven directory and inode. The destination must not exist, and a clone, reopen, ACL,
 metadata, permission, synchronization, or hash failure cleans up or fails closed. Under the
@@ -767,23 +768,24 @@ validation failure.
 
 After source proof and metadata validation, the publisher seals the destination to `0500`,
 closes its writable descriptor, reopens it read-only, and validates ownership, ACLs, single-link
-identity and distinct inode before starting the trusted guardian. Sealed-image hashing and the
-remaining publication checks then overlap contained process startup. A pending guardian guard
-owns the child and heartbeat inside the publication operation: any subsequent proof failure
+identity and distinct inode. The full destination hash and final pre-exec identity checks finish
+before that image starts as the trusted guardian. This supersedes the 2026-09-09 hash/startup overlap:
+source proof alone cannot authorize executing a new clone as the unconfined guardian. A pending guardian
+guard owns the child and heartbeat inside the publication operation: any subsequent proof failure
 kills the process group and reaps the guardian before publication cleanup. Only a successful full proof hands
 the child and protocol pipes to the supervisor, so no bootstrap challenge, authenticated Ready,
 request, or brokered effect can precede proof completion. Ready-time descriptor revalidation,
 rehashing and unlink remain unchanged.
 
-**Reviewed proposal — retained executable selection (`mini-agent-i7ro6.86`), not delivered.**
-The current independently hashed source/destination publication contract above remains in force.
-A future process-local optimization may retain the first generation's already-proven image only
-after its authenticated Ready rehash, identity-bound unlink, and complete successful native
-containment preflight, including parent-death cleanup and final sentinel checks. Every generation
-used by that matrix must prove the same full content digest; the trusted parent-death helper's
-bounded, exactly parsed record must carry its own post-Ready image digest. A source change between
-matrix cases must refuse cache commitment even if its size or timestamps match or it is later
-restored. Failed or incomplete preflight must drop the pending candidate.
+**Retained executable selection (`mini-agent-i7ro6.86`; amendment 2026-10-15).**
+A process retains the first generation's already-proven image only after its authenticated Ready
+rehash, identity-bound unlink, and complete successful native containment preflight, including
+parent-death cleanup and final sentinel checks. Every generation used by that matrix proves the
+same full content digest; the trusted parent-death helper's bounded, exactly parsed record carries
+its own post-Ready image digest. A source change between matrix cases refuses cache commitment
+even if its size or timestamps match or it is later restored. Failed or incomplete preflight drops
+the pending candidate. Mutable pathname sources and executables above the retention cap continue
+through independent source and destination hashing.
 
 Such selection fixes the executable bytes for the parent lifetime; executable updates require a
 parent restart. It is not transparent pathname refresh. The retained object must be an opaque,
@@ -802,7 +804,9 @@ group reaping and publication retirement remain required. Copy fallback must use
 or serialize shared descriptor offsets. No retained descriptor or cached availability may reach a
 worker, and no capability is advertised before this process's complete containment attestation.
 This optimization can save repeated source hashing within one parent, not cross-process cold
-startup. Implementation and native acceptance are still required before any content proof is reused.
+startup. The reviewed design and source/native acceptance are recorded in
+`docs/reviews/2026-10-15-retained-worker-image-proposal.json` and
+`docs/reviews/2026-10-15-retained-worker-image-integration.json`.
 
 Unit tests cover source/root rejection, exclusive copy-on-write cloning, secure cross-volume copy,
 source/image mutation independence, publication permissions and identity, descriptor flags,
@@ -813,8 +817,10 @@ exist but are ignored unless explicitly selected because macOS 26.5.2 on the dev
 returns `CSSMERR_TP_NOT_TRUSTED` for pristine Apple system binaries, including `/bin/ls`, even with
 an exact CDHash requirement. This is fail-closed evidence for that stricter test slice, not a
 production signature claim and not permission to weaken a future boundary that does claim
-Security.framework identity. The tests deliberately do not spawn `sandbox-exec` or claim
-real-backend evidence.
+Security.framework identity. The ordinary construction tests do not claim real-backend evidence. A separate explicitly
+selected installed-binary test exercises the complete native matrix, fresh retained-source
+generations, retirement/recovery, and a source-byte change between matrix cases; it requires a
+same-source production binary and isolated private fixture roots.
 
 A separate macOS-only module performs bounded crash-stale cleanup before publication. It validates
 a private root, serializes sweeps by applying

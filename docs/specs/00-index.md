@@ -190,7 +190,8 @@ Skill Gym, harness, and provider/session corrections from the same review are ow
 
 The 2026-09-08 release code review (epic `mini-agent-wldr`) landed as code. All 27 findings are
 closed with their regression coverage. No correction below changes the Phase 6 canonical checklist;
-the macOS publisher still independently hashes both pinned descriptors on every publication.
+the macOS publisher at that delivery independently hashed both pinned descriptors on every publication.
+The retained-source exception is explicitly amended below on 2026-10-15.
 
 | Correction | Owning spec | Bead |
 |------------|-------------|------|
@@ -222,10 +223,21 @@ the macOS publisher still independently hashes both pinned descriptors on every 
 | ACP retains a protocol-valid partial turn on failure or cancellation | — (ACP) | mini-agent-wldr.26 |
 | Skill utility statistics computed with grouped set queries | Phase 5 | mini-agent-wldr.27 |
 
+## Retained worker executable amendment (2026-10-15)
+
+`mini-agent-i7ro6.86` amends the owning [Phase 6 publisher contract](phase-6-brokered-js-runtime.md):
+one opaque, anonymous, read-only process-local snapshot may replace repeated source hashing only
+after complete same-content native attestation, parent-death verification and cleanup. Original
+pathname changes cannot refresh that selection; updates require parent restart. Every fresh
+image still receives its own full hash before guardian exec and its Ready-time rehash/unlink.
+This explicitly replaces the 2026-09-09 hash/startup overlap; the pending-child guard and all
+canonical containment invariants remain required. Larger images use the original uncached path.
+This does not remove cross-process cold-start cost or complete `.5` startup scheduling.
+
 ## Delivered startup follow-up (2026-09-09)
 
-`mini-agent-jnuz` overlaps contained macOS worker startup with the sealed-image
-byte proof. The complete proof still precedes protocol handoff; a pending
+`mini-agent-jnuz` originally overlapped contained macOS worker startup with the sealed-image
+byte proof. The 2026-10-15 amendment below supersedes that ordering for trusted guardian execution. The complete proof still precedes protocol handoff; a pending
 guardian guard kills the process group and reaps the guardian before failed
 publication cleanup. Ready-time revalidation and rehash remain mandatory.
 The owning [Phase 6 publisher contract](phase-6-brokered-js-runtime.md) and

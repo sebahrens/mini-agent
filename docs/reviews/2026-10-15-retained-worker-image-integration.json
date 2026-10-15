@@ -1,0 +1,323 @@
+{
+  "bead": "mini-agent-i7ro6.86",
+  "base": "2f2cc14ad73827a7e87432d490b9ed758806f8be",
+  "status": "implemented and accepted with scoped owning/native evidence; whole CI remains separate",
+  "decision": "One opaque anonymous first-proven image fixes executable selection for the parent lifetime; complete same-digest containment matrix and cleanup precede cache commitment. Original source metadata never authorizes replacement bytes.",
+  "source_sha256": {
+    "src/sandbox/worker/macos.rs": "1e88be43eafdb209fe33c815647803f4cd0f890d57638992e3b31bc63d45eeee",
+    "src/tests/subprocess_inventory_tests.rs": "fa20a8b53fb5fd0d4fa8cdbaf248294136578462f068981ebcd4b0cec96c3c9f",
+    "docs/specs/phase-6-brokered-js-runtime.md": "5a43eacdef1682080004545d2bbdd6e4f6f8d960a52c197581296c295837e8f3",
+    "docs/specs/00-index.md": "2bb07a7cfc7b1a347381c09eae9c9df4fbaa49a4d898506f7f189e14ad59e540"
+  },
+  "reviewed_proposal": "docs/reviews/2026-10-15-retained-worker-image-proposal.json",
+  "reviews": [
+    {
+      "reviewer": "adversarial",
+      "bead": "mini-agent-i7ro6.86",
+      "depth": "deep",
+      "status": "No concrete source blocker found in this bounded prototype review; not native acceptance or enablement approval",
+      "reviewed_sha256": {
+        "prototype": "b08478dc3ff4a23a8715fa58c650b06e6eae8799c640b166fb31c585867362e0",
+        "main_baseline": "4c698b06852b2962331503660cc587aa71dbe87890b13523da1ad3ee2f6dc986",
+        "proposal": "2fefef7947d52de471cf6c0636de323b1a5720509a888d09d2af5c4adc2bb6f9",
+        "exact_diff": "c2e898fb420c11aa40de66c63c16699a0f42b3f0000c12e097b5a3da668a19a2"
+      },
+      "findings": [],
+      "techniques": {
+        "assumption_violation": [
+          "Tracked source replacement/deletion and matching metadata: retained private anonymous inode is selected, source digest comes from its prior byte proof; original path is not reopened on warm publication.",
+          "Tracked shared-offset clones: warm fallback copies with FileExt::read_at; source hashing is skipped only for exact private retained source. Fresh destination and Ready hashes remain.",
+          "Checked private descriptor transfer: writable descriptor dropped by adopt_reopened_image; temporary path FD dropped before unlink; candidate requires owned0500/noACL/nlink0/RO/CLOEXEC and bounded size."
+        ],
+        "composition_failures": [
+          "Only production run_full_containment_preflight sets OnceLock; installed/test preflight cannot commit. Availability still derives from complete containment run.",
+          "Authenticated first worker graceful try_wait reaches WorkerProcess::try_wait -> retire_after_reap; candidate remains local through second-generation parent-death digest comparison, sentinel verification and cleanup. Any error drops it.",
+          "Fresh generation hash+identity/ACL/private directory checks complete before guardian starts from exact image_path. PendingGuardian still owns startup errors; IPC escapes only after preparation returns."
+        ],
+        "cascade_construction": [
+          "Mixed generation across first proof and parent-death child produces digest mismatch only after exact orphan recovery/workspace restoration; no candidate commit.",
+          "Post-start proof/finalization failure retains existing kill/reap-before-publication cleanup ownership. No cached status or cached digest can bypass the live matrix."
+        ],
+        "abuse_cases": [
+          "Repeated/concurrent warm generations use distinct UUID publications, independently hashed image inodes and fixed anonymous source; cache never refreshes from mutable path metadata.",
+          "Oversized source stays uncached; invalid source metadata/FD flags refuse rather than substitute a new executable."
+        ]
+      },
+      "evidence": [
+        {
+          "path": "/private/tmp/mini-agent-snapshot86-macos.rs",
+          "symbols": [
+            "run_full_containment_preflight",
+            "run_containment_preflight_with_proof_hook",
+            "probe_guardian_parent_death"
+          ],
+          "lines": [
+            994,
+            1017,
+            1139
+          ],
+          "contract": "Commit only after complete same-digest matrix and cleanup"
+        },
+        {
+          "path": "/private/tmp/mini-agent-snapshot86-macos.rs",
+          "symbols": [
+            "RetainedWorkerSource::validate",
+            "OneTimeWorkerImage::unlink_after_exec",
+            "prepare_source_with_fault_and_start"
+          ],
+          "lines": [
+            2845,
+            3509,
+            3201
+          ],
+          "contract": "Private retained FD and exact transfer, new destination proof before execution"
+        },
+        {
+          "path": "src/sandbox/worker.rs",
+          "symbols": [
+            "WorkerProcess::try_wait",
+            "WorkerProcess::Drop"
+          ],
+          "lines": [
+            352,
+            450
+          ],
+          "contract": "Retirement errors propagate on graceful success and Drop preserves bounded cleanup"
+        }
+      ],
+      "index": {
+        "state": "/private/tmp/mini-agent-118-index",
+        "artifact": "/private/tmp/mini-agent-snapshot86-indexed-callers.json",
+        "limit": "Immutable baseline navigation only; file-qualified physical prototype reads authoritative. Index returns incomplete cfg caller graph for run_full; physical probe_containment and hosted lifecycle calls independently checked."
+      },
+      "residual_risks": [
+        "CONST RETAINED_SOURCE_ENABLED is false and must stay false until owning/native controls pass.",
+        "No kernel write seal or loaded-image signature claim. Hostile same-UID peers/debuggers/parent compromise remain outside approved threat boundary.",
+        "Unchanged process lifecycle/FFI beyond cited composition edges was not exhaustively re-reviewed."
+      ],
+      "testing_gaps": [
+        "Actual installed full production containment matrix with retained cache enabled, followed by warm supervisor cancellation/recovery.",
+        "Controlled mixed original generation after first Ready and before later canary, including restore-before-final-path-check, must refuse commitment.",
+        "Native exact candidate/failed-matrix/failed-cleanup no-commit controls; independent warm identities/hash/Ready mutation and startup ownership controls.",
+        "Concurrent clone/fallback byte preservation and exact descriptor leak/RO/CLOEXEC controls. Lower unit retained_fixture is not authenticated production attestation."
+      ],
+      "next_action": "Run only owning new/native controls already planned; preserve exact source and false enablement flag until evidence. No additional source framework or broad review tranche requested."
+    },
+    {
+      "reviewer": "adversarial",
+      "scope": "Only new concurrent/native tests and extracted positional helper versus b08478dc3ff4a23a8715fa58c650b06e6eae8799c640b166fb31c585867362e0 prototype; prior retention review unchanged",
+      "source_sha256": "608670cf1ede4b442abfcfaf72f3075c81aba3b0157f5104592c3676540cf88b",
+      "delta_sha256": "8714092537ac21798aacbfadc1a7edc37562d09aaf9297b801c93d09771ad82b",
+      "findings": [
+        {
+          "title": "Concurrent fixture treats intentional publication contention refusal as a failure",
+          "severity": "medium",
+          "confidence": 0.99,
+          "path": "/private/tmp/mini-agent-snapshot86-macos.rs",
+          "symbol": "retained_image86_concurrent_generations_and_fallback_have_independent_offsets",
+          "evidence": [
+            "Three scope threads all call prepare_from_retained_and_start with the same root.path.",
+            "prepare_source_with_fault_and_start acquires RootPublicationLock, whose acquire uses lock_exclusive_nonblocking without retry.",
+            "When a second thread enters while first owns root publication, it legitimately returns WouldBlock. The collected result is unconditionally unwrapped, so the test fails under its intended overlap."
+          ],
+          "fix": "Use a different private publication root per generation thread, sharing the exact retained source FD. Preserve simultaneous positional-copy tests and hold all successful publications until assertions/retirement. Production contention policy stays unchanged.",
+          "autofix_class": "manual",
+          "owner": "downstream-resolver"
+        }
+      ],
+      "nonblocking_test_gap": {
+        "title": "Descriptor flag negative currently also changes inode; CLOEXEC alone is not exercised",
+        "suggestion": "Create a separate retained fixture; Unix dup of exact retained FD yields identical RO anonymous inode with CLOEXEC clear. Adopt dup as owned File under narrow test-only unsafe allowance and swap into retained.file. Require validation and prepare refusal before start. Owned File Drop handles all exits; do not mutate shared original descriptor.",
+        "reason": "Explicit approved private CLOEXEC invariant; isolate flag rejection from identity/mode."
+      },
+      "accepted_delta_observations": [
+        "copy_file_positionally extracts the same offset0 read_at/write_all/check_add loop without semantic change; tests also preserve shared source cursor97.",
+        "Scoped worker joins ensure no detached thread can race TestRoot cleanup; completed publication results remain retained until postjoin assertions.",
+        "Native warm process is WorkerProcess RAII and is declared after HostedProbePaths, so unwind kills/reaps before sentinel cleanup. Positive paths explicitly terminate/reap or graceful-retire before probes.cleanup.",
+        "Native mixed-generation control reaches explicit between-case hook, changes full-file trailing byte while preserving len+mtime, requires specific digest mismatch PermissionDenied, and confirms no returned/global candidate plus publication cleanup.",
+        "Private matrix test does not establish global production enablement; CONSTfalse and actual installed enablement gates remain separate."
+      ],
+      "testing_gaps": [
+        "Actual compilation/execution is Root-owned and pending.",
+        "CLOEXEC-only negative suggested above."
+      ],
+      "next_action": "Correct only concurrent fixture root topology, add tiny CLOEXEC control if desired, then run the already selected owning/native filters. No whole retention re-review required."
+    },
+    {
+      "reviewer": "adversarial",
+      "scope": "fclone success retained0500 image open EACCES repair only",
+      "finding": "CLONE_NOOWNERCOPY preserves source permission bits, so requesting RW on a retained0500 clone fails; no writable handle is needed after successful clone.",
+      "preferred_fix": "Open successful clone O_RDONLY|O_NOFOLLOW|O_CLOEXEC and return exact File. Preserve fallback RW0600 creation/copy. Validate regular/current-owner/singlelink/distinct source inode/noACL on exact cloned descriptor before sealing.",
+      "caller_audit": [
+        "PartialPublicationGuard::adopt_created_image records descriptor identity only.",
+        "After clone the caller only observes ACL/metadata, sync_all, set_permissions0500, sync_all, identity-bound RO reopen and hashing. No write_all on clone-success File.",
+        "Only copy_file_positionally fallback writes content; its distinct RW creation remains unchanged."
+      ],
+      "native_primitive": "/private/tmp/mini-agent-snapshot86-ro-descriptor-probe.json",
+      "primary_sources": {
+        "fchmod": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/chmod.2.html",
+        "fsync": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html"
+      },
+      "alternative": "Proposed RO\u2192fchmod0600\u2192RW reopen can be sound only with exact descriptor and inode validation, but adds mode widening and a pathname reopen that current callers do not require.",
+      "remaining_tests": "Existing clone COW positive and retained warm/native controls selected by Root; no additional application suite or Cargo run performed."
+    }
+  ],
+  "resolved_findings": [
+    "Every containment-matrix generation carries its own authenticated image digest; mixed digests refuse candidate commitment after exact cleanup.",
+    "Full fresh image hash and identity checks precede executing that image as the trusted unconfined guardian.",
+    "APFS successful clones open read-only because source0500 permissions are retained; fallback copy remains privateRW0600. No unnecessary permission widening.",
+    "Concurrent descriptor-copy test uses independent private publication roots, preserving intentional same-root nonblocking contention refusal.",
+    "CLOEXEC-only rejection uses an otherwise identical anonymous readonly descriptor; no global fd flags are mutated."
+  ],
+  "tests": {
+    "initial_platform_gate": "66 passed,2 observed new warm-clone permission failures,1 explicitly ignored installed test; unchanged passing controls reused",
+    "final_readonly_clone_cleanup_and_retention_gate": "10 passed,1 explicitly ignored native test in2.20s after23.27s warm compile",
+    "final_enabled_retention_and_parser_gate": "7 passed,1 explicitly ignored native test in0.49s after18.65s compile",
+    "source_inventory": "production subprocess classification passed after exact constructor/thread rows updated; Windows creation-boundary passed, no exemption widened",
+    "required_final_debug_install": "passed9.31s; no release build",
+    "strict_all_target_lint": "passed59.69s",
+    "format_and_whitespace": "passed",
+    "final_installed_native_matrix": {
+      "binary": "/private/tmp/mini-agent-snapshot86-final-install/bin/mini-agent",
+      "binary_sha256": "3fdb4536faa2190b2002def3c9a6cea8eeeaac3ffdfd6010893ab2744851cc2a",
+      "test_binary": "/Users/seb/projects/mini-agent/target/debug/deps/mini_agent-4793cdca0de8efa6",
+      "test_sha256": "4d12c8f4518f9dffd144dd833bf672804e2212fdba692b9936df2a5cb01d2923",
+      "pid": 98615,
+      "pgid": 98615,
+      "forced_cleanup": false,
+      "exit": 0,
+      "elapsed_seconds": 1.918242583051324,
+      "stdout": "\nrunning 1 test\ntest sandbox::worker::platform::tests::retained_image86_installed_matrix_generations_and_mixed_source_refusal ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4262 filtered out; finished in 1.91s\n\n",
+      "stderr": "",
+      "passed": true
+    },
+    "final_physical_one_mib_runtime": {
+      "binary": "/private/tmp/mini-agent-snapshot86-final-install/bin/mini-agent",
+      "sha256": "3fdb4536faa2190b2002def3c9a6cea8eeeaac3ffdfd6010893ab2744851cc2a",
+      "bytes": 160196880,
+      "stack_bytes": 1048576,
+      "pid": 98316,
+      "pgid": 98316,
+      "forced_cleanup": false,
+      "exit": 0,
+      "elapsed_ms": 2043.1637079454958,
+      "stdout": "JS runtime check: PASS (2)\n",
+      "stderr": "",
+      "passed": true
+    },
+    "final_physical_one_mib_supervisor_cancel_recovery": {
+      "binary": "/private/tmp/mini-agent-snapshot86-final-install/bin/mini-agent",
+      "sha256": "3fdb4536faa2190b2002def3c9a6cea8eeeaac3ffdfd6010893ab2744851cc2a",
+      "stack_bytes": 1048576,
+      "passed": true,
+      "forced_cleanup": false,
+      "owned_app_pid": 523,
+      "first_read": {
+        "effect_id": "effect-7599a0b101fae45dd86be2aef3467530afd31651ca00b435dc3871bf28bd8d9b",
+        "invocation_id": "tool:fb517f18-ef68-4f47-bc61-d3981999eb42",
+        "grant_id": "41d5ceb6-6893-42b5-b7eb-3fb90b6f7586",
+        "sequence": 1,
+        "timestamp_ms": 1792025296054,
+        "artifact_id": null,
+        "export": null,
+        "capability": "read_file",
+        "normalized_target": {
+          "kind": "file",
+          "key_version": 1,
+          "storage_class": "workspace",
+          "target_tag": "7fd478d2c51e21108dd415e9d05d279b0a7542b2c00711281694c607d25b04a4"
+        },
+        "state": "completed",
+        "decision": "authorized",
+        "result_code": "succeeded"
+      },
+      "first_generation_groups": [
+        530
+      ],
+      "cancel_seconds": 0.07331550004892051,
+      "second_read": {
+        "effect_id": "effect-4b45a20ca31cbb050567b6a400ffe3ebba55f3fd0e7a81d3323cbae4b7ec3d93",
+        "invocation_id": "tool:87f19396-f3c8-4291-875d-a3e9d75ca985",
+        "grant_id": "3705ea3b-759f-4435-9e3e-1903e5f0fae5",
+        "sequence": 1,
+        "timestamp_ms": 1792025296452,
+        "artifact_id": null,
+        "export": null,
+        "capability": "read_file",
+        "normalized_target": {
+          "kind": "file",
+          "key_version": 1,
+          "storage_class": "workspace",
+          "target_tag": "1e0b57425ce1532cf254505e5b9b75add0dad162685faebe5b0c6b9fec5b453c"
+        },
+        "state": "completed",
+        "decision": "authorized",
+        "result_code": "succeeded"
+      },
+      "recovery_generation_groups": [
+        534
+      ],
+      "saved_session": "/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-snapshot86-supervisor-ro11yy6h/ZS_STATE_DIR/sessions/9bd5b4f1-0ef8-46d5-a021-08181f629262.json",
+      "posts": 3,
+      "real_parent_reads": 2,
+      "normal_quit": 0,
+      "model_tool_result": "2",
+      "reaped_app_exit": 0,
+      "remaining_owned_workers": [],
+      "server_joined": true,
+      "errors": [],
+      "cleanup_errors": []
+    }
+  },
+  "native_matrix_assertions": [
+    "First full source/image/Ready proof, full denial/readback/parent-death/sentinel checks and cleanup yield pending anonymous candidate.",
+    "Two fresh warm generation paths/inodes keep full image digest and Ready proofs; source_digest_us is exactly0.",
+    "Forced worker-group termination is reaped/retired and a subsequent generation succeeds.",
+    "Actual runnable source changed by one trailing byte between matrix cases with identical size and restored mtime; later case completes but digest mismatch refuses candidate and leaves no publication.",
+    "Private test matrices do not publish process-global availability/cache."
+  ],
+  "benchmark_baseline": {
+    "commit": "3cc7b990",
+    "binary": "/private/tmp/mini-agent-vertex81-merged-install/bin/mini-agent",
+    "binary_bytes": 156816288,
+    "sha256": "555a96fecec4d33eb1c0979711e75dcea5b568d19f5e0542cb6e4c784efa31bf",
+    "profile": "required cargo install --debug; no release build",
+    "sample_count_per_operation": 1,
+    "scope": "isolated full CLI wall time, uncontrolled single sample; not source/image stage breakdown or portable speedup",
+    "measurements": [
+      {
+        "operation": "--print-config",
+        "wall_ms": 60.62,
+        "exit": 0,
+        "stdout_bytes": 11476,
+        "stderr_bytes": 0,
+        "passed_records": 0
+      },
+      {
+        "operation": "--js-runtime-check",
+        "wall_ms": 1911.06,
+        "exit": 0,
+        "stdout_bytes": 27,
+        "stderr_bytes": 0,
+        "passed_records": 1
+      }
+    ]
+  },
+  "benchmark_limits": [
+    "Existing baseline156816288B vs final160196880B required-debug artifacts; individual wall-time samples are uncontrolled and do not establish speedup.",
+    "Source hash elimination is asserted in same-process warm generation profile, not inferred from timestamps.",
+    "No release binaries built. Cross-process cold-start and .5 scheduling remain unfinished."
+  ],
+  "limits": [
+    "No cached availability or worker-owned retained descriptor.",
+    "Ownership under existing trusted-parent/OS model is not a Darwin kernel write seal; hostile same-UID peers remain outside the approved scope.",
+    "No Linux or Windows launcher changes or native coverage claim.",
+    "Current-source Copilot advisor/skills dispatch failure is separately reopened81.4, not claimed green by these runtime checks.",
+    "Exact-build collector omission of new auth/terminal path dependencies is tracked120."
+  ],
+  "reproduction": {
+    "installed_native_driver_sha256": "dcba2c51452c9cf141c2a2ff72d7c31f67cd4319188c9a24861cbab9443ece0f",
+    "supervisor_driver_sha256": "de8c88c8363e6cdee577a1d4c032c8a52be3bd01be5ad197bb41e6c9f45cad9c",
+    "supervisor_driver_source": "#!/usr/bin/env python3\n\"\"\"Owned macOS production JS supervisor cancel/recovery fixture; local fake LLM only.\"\"\"\nimport argparse\nimport errno\nimport fcntl\nimport hashlib\nimport http.server\nimport json\nimport os\nfrom pathlib import Path\nimport pty\nimport resource\nimport select\nimport signal\nimport struct\nimport subprocess\nimport tempfile\nimport termios\nimport threading\nimport time\n\nparser = argparse.ArgumentParser()\nparser.add_argument('--binary', required=True)\nargs = parser.parse_args()\nbinary = Path(args.binary).resolve()\nroot = Path(tempfile.mkdtemp(prefix='mini-agent-snapshot86-supervisor-', dir=os.environ['TMPDIR'])).resolve()\nworkspace = root / 'workspace'\nworkspace.mkdir(mode=0o700)\n(workspace / 'worker-entry.txt').write_text('OWNED86_ENTRY')\n(workspace / 'worker-recovery.txt').write_text('OWNED86_RECOVERY')\npaths = {}\nfor name in ['ZS_CONFIG_DIR', 'ZS_DATA_DIR', 'ZS_LOCAL_DATA_DIR', 'ZS_STATE_DIR', 'ZS_CACHE_DIR', 'ZS_CREDENTIALS_DIR']:\n    path = root / name\n    path.mkdir(mode=0o700)\n    paths[name] = path\nrequests, errors, observations = [], [], []\nrelease_final = threading.Event()\nstop = threading.Event()\nchild = None\nmaster = slave = None\npainted = bytearray()\nowned_groups = set()\nowned_workers = set()\nreport = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'stack_bytes': 1048576, 'passed': False, 'forced_cleanup': False}\n\n\ndef process_rows():\n    output = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,pgid=,stat=,pcpu=,command='], capture_output=True, text=True, timeout=3, check=True).stdout\n    rows = {}\n    for line in output.splitlines():\n        parts = line.split(None, 5)\n        if len(parts) == 6:\n            pid, ppid, pgid = map(int, parts[:3])\n            rows[pid] = {'pid': pid, 'ppid': ppid, 'pgid': pgid, 'state': parts[3], 'cpu': float(parts[4]), 'command': parts[5]}\n    return rows\n\n\ndef observe_workers():\n    rows = process_rows()\n    descendants = {child.pid}\n    while True:\n        additional = {pid for pid, row in rows.items() if row['ppid'] in descendants}\n        if additional <= descendants:\n            break\n        descendants |= additional\n    found = [row for pid, row in rows.items() if pid in descendants and pid != child.pid and '.mini-agent-js-worker-' in row['command'] and not row['state'].startswith('Z')]\n    for row in found:\n        assert row['pgid'] != child.pid, row\n        owned_groups.add(row['pgid'])\n        owned_workers.add(row['pid'])\n    if found:\n        observations.append({'time': time.monotonic(), 'workers': found})\n    return found\n\n\ndef completed_reads():\n    found = []\n    directory = paths['ZS_STATE_DIR'] / 'audit' / 'js-effects'\n    segments = sorted(directory.glob('segment-*.audit'))\n    for path in segments:\n        # Match the audit's u32BE length / JSON / u32BE framing. Bound the\n        # actual read; only the actively appended final segment may have a tail.\n        maximum = 4 * 1024 * 1024 + 2 * 64 * 1024\n        with path.open('rb') as file:\n            data = file.read(maximum + 1)\n        assert len(data) <= maximum, 'fixture audit segment exceeds bound'\n        offset = 0\n        while offset < len(data):\n            if len(data) - offset < 4:\n                assert path == segments[-1], 'truncated closed audit segment'\n                break\n            length = struct.unpack_from('>I', data, offset)[0]\n            assert 0 < length <= 64 * 1024, 'invalid audit record length'\n            body_end = offset + 4 + length\n            frame_end = body_end + 4\n            if frame_end > len(data):\n                assert path == segments[-1], 'truncated closed audit segment'\n                break\n            assert struct.unpack_from('>I', data, body_end)[0] == length, 'audit framing trailer mismatch'\n            record = json.loads(data[offset + 4:body_end])\n            assert record['version'] == 1\n            kind = record['kind']\n            if kind['kind'] == 'effect':\n                body = kind['data']\n                if body.get('capability') == 'read_file' and body.get('state') == 'completed' and body.get('result_code') == 'succeeded':\n                    found.append(body)\n            offset = frame_end\n    return found\n\n\nclass Handler(http.server.BaseHTTPRequestHandler):\n    def log_message(self, *items):\n        pass\n\n    def do_GET(self):\n        assert self.path == '/v1/models', self.path\n        data = json.dumps({'object': 'list', 'data': [{'id': 'owned-js86', 'object': 'model', 'context_length': 100000}]}).encode()\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.send_header('Content-Length', str(len(data)))\n        self.end_headers()\n        self.wfile.write(data)\n\n    def do_POST(self):\n        try:\n            self.connection.settimeout(5)\n            assert self.path == '/v1/chat/completions', self.path\n            assert self.headers.get('Authorization') == 'Bearer OWNED_JS86_ONLY'\n            size = int(self.headers['Content-Length'])\n            assert 0 < size < 2 * 1024 * 1024\n            request = json.loads(self.rfile.read(size))\n            index = len(requests)\n            requests.append(request)\n            assert index < 3, ('unexpected request after cancellation', index)\n            assert request['model'] == 'owned-js86'\n            assert any(tool.get('function', {}).get('name') == 'js' for tool in request.get('tools', [])), 'real JS tool must be registered after native preflight'\n            if index == 0:\n                assert request['messages'][-1]['content'] == 'OWNED86_CANCEL_LITERAL'\n                code = \"if (read_file('worker-entry.txt') !== 'OWNED86_ENTRY') throw new Error('fixture'); while (true) {}\"\n                call_id = 'call_owned86_cancel'\n            elif index == 1:\n                assert request['messages'][-1]['content'] == 'OWNED86_RECOVER_LITERAL', request['messages'][-1]\n                code = \"if (read_file('worker-recovery.txt') !== 'OWNED86_RECOVERY') throw new Error('fixture'); 1 + 1\"\n                call_id = 'call_owned86_recover'\n            else:\n                results = [message for message in request['messages'] if message.get('role') == 'tool' and message.get('tool_call_id') == 'call_owned86_recover']\n                assert len(results) == 1 and results[0]['content'] == '2', results\n                assert release_final.wait(15), 'fixture must observe actual recovery worker before final response'\n            if index < 2:\n                delta = {'role': 'assistant', 'tool_calls': [{'index': 0, 'id': call_id, 'type': 'function', 'function': {'name': 'js', 'arguments': json.dumps({'code': code})}}]}\n            else:\n                delta = {'role': 'assistant', 'content': 'OWNED86_RECOVERY_DONE'}\n            body = 'data: ' + json.dumps({'id': 'owned86-' + str(index), 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}) + '\\n\\n'\n            body += 'data: ' + json.dumps({'id': 'owned86-' + str(index), 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls' if index < 2 else 'stop'}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}}) + '\\n\\ndata: [DONE]\\n\\n'\n            encoded = body.encode()\n            self.send_response(200)\n            self.send_header('Content-Type', 'text/event-stream')\n            self.send_header('Content-Length', str(len(encoded)))\n            self.end_headers()\n            self.wfile.write(encoded)\n        except BaseException as error:\n            errors.append(repr(error))\n            raise\n\n\nserver = http.server.HTTPServer(('127.0.0.1', 0), Handler)\nserver.timeout = 0.2\n\n\ndef serve():\n    while not stop.is_set():\n        server.handle_request()\n\n\nthread = threading.Thread(target=serve, name='owned86-local-llm')\nthread.start()\nenv = os.environ.copy()\nfor key in tuple(env):\n    if key.startswith(('ZS_', 'OPENAI_', 'OPENROUTER_', 'ANTHROPIC_', 'COPILOT_', 'VERTEX_', 'AWS_')) or key.endswith(('_API_KEY', '_AUTH_TOKEN')) or key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'BASH_ENV', 'ENV'):\n        env.pop(key, None)\nenv.update({name: str(path) for name, path in paths.items()})\nfixture_home = root / 'home'\nfixture_home.mkdir(mode=0o700)\nenv.update(MINI_AGENT_HOME=str(fixture_home), TERM='xterm-256color', RUST_LOG='off', NO_PROXY='127.0.0.1', no_proxy='127.0.0.1', OPENAI_API_KEY='OWNED_JS86_ONLY')\nconfig = paths['ZS_CONFIG_DIR'] / 'config.toml'\nconfig.write_text(f'provider=\"js86-local\"\\nmodel=\"owned-js86\"\\nmax_tokens=256\\ncompact_enabled=false\\njs_read_roots=[\".\"]\\njs_read_unrestricted=false\\nsession_title_model=\"off\"\\nauto_update_prompts=false\\nauto_update_themes=false\\n[lsp]\\nenabled=false\\n[custom_providers.js86-local]\\nprovider_type=\"openai\"\\napi_style=\"completions\"\\napi_key_env=\"OPENAI_API_KEY\"\\nbase_url=\"http://127.0.0.1:{server.server_port}/v1\"\\n')\nconfig.chmod(0o600)\n\n\ndef terminate_driver(signum, frame):\n    raise KeyboardInterrupt('driver termination requested')\n\n\nsignal.signal(signal.SIGTERM, terminate_driver)\n\n\ndef drain():\n    if master is not None and select.select([master], [], [], 0.05)[0]:\n        try:\n            painted.extend(os.read(master, 65536))\n        except OSError as error:\n            if error.errno != errno.EIO:\n                raise\n    if master is not None and b'\\x1b]11;?\\x07' in painted and not getattr(drain, 'answered', False):\n        os.write(master, b'\\x1b]11;rgb:0000/0000/0000\\x07')\n        drain.answered = True\n\n\ndef wait(check, description, seconds=20):\n    deadline = time.monotonic() + seconds\n    while time.monotonic() < deadline:\n        assert child.poll() is None, ('early app exit', child.returncode, bytes(painted)[-3000:])\n        assert not errors, errors\n        drain()\n        if check():\n            return\n    raise AssertionError((description, errors, bytes(painted)[-4000:]))\n\n\ndef command(text):\n    os.write(master, b'\\x1b[200~' + text.encode() + b'\\x1b[201~\\r')\n\n\ntry:\n    master, slave = pty.openpty()\n    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 44, 200, 0, 0))\n\n    def setup():\n        os.setsid()\n        fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n        resource.setrlimit(resource.RLIMIT_STACK, (1048576, resource.getrlimit(resource.RLIMIT_STACK)[1]))\n\n    child = subprocess.Popen([str(binary), '--no-context-files', '--no-sandbox', '--tools', 'js', '--allow', 'read:*', '--load-prompt', 'code'], cwd=workspace, env=env, stdin=slave, stdout=slave, stderr=slave, preexec_fn=setup)\n    assert os.getpgid(child.pid) == child.pid\n    report['owned_app_pid'] = child.pid\n    os.close(slave)\n    slave = None\n    wait(lambda: b'code' in painted, 'real TUI readiness', 35)\n    assert not requests\n    command('OWNED86_CANCEL_LITERAL')\n    first_workers = []\n\n    def entered():\n        if len(completed_reads()) < 1:\n            return False\n        first_workers[:] = observe_workers()\n        return bool(first_workers)\n\n    wait(entered, 'actual parent-broker read completion and owned worker generation', 25)\n    first_read = completed_reads()[0]\n    old_groups = {row['pgid'] for row in first_workers}\n    report['first_read'] = first_read\n    report['first_generation_groups'] = sorted(old_groups)\n    assert len(requests) == 1, 'infinite JS must remain in first tool invocation'\n    cancelled_at = time.monotonic()\n    os.write(master, b'\\x03')\n    wait(lambda: b'interrupted (changes may be partial' in painted, 'actual App cancellation settlement', 10)\n\n    def first_retired():\n        rows = process_rows()\n        return not any(row['pgid'] in old_groups and not row['state'].startswith('Z') for row in rows.values())\n\n    wait(first_retired, 'first exact JS process group retirement', 8)\n    report['cancel_seconds'] = time.monotonic() - cancelled_at\n    assert report['cancel_seconds'] < 15, 'must demonstrate Ctrl-C retirement before the30s JS timeout'\n    assert len(requests) == 1\n    os.write(master, b'\\x15')  # Clear any literally restored interrupted draft; never another Ctrl-C.\n    command('OWNED86_RECOVER_LITERAL')\n    wait(lambda: len(requests) == 3 and len(completed_reads()) >= 2, 'real recovery tool result2 reaching next model request', 25)\n    recovery_workers = observe_workers()\n    assert recovery_workers, 'successful recovery generation must still be owned by supervisor'\n    new_groups = {row['pgid'] for row in recovery_workers}\n    assert not old_groups.intersection(new_groups), (old_groups, new_groups)\n    reads = completed_reads()\n    assert len(reads) == 2 and reads[0]['invocation_id'] != reads[1]['invocation_id'], reads\n    report['second_read'] = reads[1]\n    report['recovery_generation_groups'] = sorted(new_groups)\n    release_final.set()\n\n    def saved_final():\n        for path in (paths['ZS_STATE_DIR'] / 'sessions').glob('*.json'):\n            try:\n                value = json.loads(path.read_text())\n            except (ValueError, OSError):\n                continue\n            messages = value.get('messages', [])\n            if any(row.get('role') == 'assistant' and row.get('content') == 'OWNED86_RECOVERY_DONE' for row in messages):\n                assert any(row.get('tool', {}).get('kind') == 'result' and row['tool'].get('output') == '2' for row in messages if isinstance(row.get('tool'), dict)), messages\n                report['saved_session'] = str(path)\n                return True\n        return False\n\n    wait(saved_final, 'canonical recovery result2 and final actor settlement', 15)\n    command('/quit')\n    deadline = time.monotonic() + 15\n    while child.poll() is None and time.monotonic() < deadline:\n        drain()\n    assert child.poll() == 0, ('normal quit', child.poll(), bytes(painted)[-3000:])\n    report.update(passed=True, posts=3, real_parent_reads=2, normal_quit=0, model_tool_result='2')\nfinally:\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n    signal.signal(signal.SIGINT, signal.SIG_IGN)\n    release_final.set()\n    cleanup_errors = []\n    if slave is not None:\n        os.close(slave)\n    if master is not None:\n        os.close(master)\n    try:\n        if child is not None:\n            if child.poll() is None:\n                report['forced_cleanup'] = True\n                try:\n                    os.killpg(child.pid, signal.SIGTERM)\n                except ProcessLookupError:\n                    pass\n                try:\n                    child.wait(timeout=3)\n                except subprocess.TimeoutExpired:\n                    try:\n                        os.killpg(child.pid, signal.SIGKILL)\n                    except ProcessLookupError:\n                        pass\n                    child.wait(timeout=5)\n            report['reaped_app_exit'] = child.returncode\n            # Worker guardians create their own groups. Only groups observed as this\n            # exact app's descendants are eligible; the parent normally reaps them.\n            deadline = time.monotonic() + 3\n            live = []\n            while time.monotonic() < deadline:\n                live = [row for row in process_rows().values() if row['pgid'] in owned_groups and not row['state'].startswith('Z')]\n                if not live:\n                    break\n                time.sleep(0.05)\n            if live:\n                report['forced_cleanup'] = True\n                for pgid in {row['pgid'] for row in live}:\n                    try:\n                        os.killpg(pgid, signal.SIGKILL)\n                    except ProcessLookupError:\n                        pass\n                deadline = time.monotonic() + 3\n                while time.monotonic() < deadline:\n                    live = [row for row in process_rows().values() if row['pgid'] in owned_groups and not row['state'].startswith('Z')]\n                    if not live:\n                        break\n                    time.sleep(0.05)\n            report['remaining_owned_workers'] = live\n            if live:\n                cleanup_errors.append('observed worker group did not retire')\n    except BaseException as error:\n        cleanup_errors.append(repr(error))\n    finally:\n        stop.set()\n        thread.join(6)\n        server.server_close()\n        report['server_joined'] = not thread.is_alive()\n        report['errors'] = errors\n        report['cleanup_errors'] = cleanup_errors\n        (root / 'terminal.bin').write_bytes(painted)\n        (root / 'requests.json').write_text(json.dumps(requests, indent=2))\n        (root / 'worker-observations.json').write_text(json.dumps(observations, indent=2))\n        (root / 'report.json').write_text(json.dumps(report, indent=2))\n        print(root / 'report.json', flush=True)\n        assert not thread.is_alive() and not cleanup_errors\n        assert child is None or child.poll() is not None\n        if report['passed']:\n            assert not report['forced_cleanup'], report\n"
+  }
+}
