@@ -1,0 +1,272 @@
+{
+  "null_experiment": {
+    "run": 38723846558,
+    "job": 116384741701,
+    "head": "a100cc53",
+    "terminal": "success",
+    "duration": "4m39s",
+    "artifact": "/private/tmp/mini-agent-windows-git-null-direct-artifact/git-null-direct-proof.json",
+    "facts": "portable/lowercase/ownedempty list0+include1, uppercase128/Invalidargument; no timeouts",
+    "artifact_sha256": "a04cf3fc25f3c300096ef23b67aad27b9adf5856b6ee73fb428896eb4375af46",
+    "observations": {
+      "source_parent": "9ad8afc5653ec8fb8654d723f42db37fbc588afd",
+      "program_sha256": "6926ff8204b569581c5694b2ed003983ca8c98dab64070ee6ec00b0d3e6ab9be",
+      "records": [
+        {
+          "selector": "portable",
+          "query": "stdin_list",
+          "exit": 0,
+          "timed_out": false,
+          "expected_exit": 0,
+          "stdout_matches": true,
+          "stdout_bytes": 23,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "selector": "portable",
+          "query": "stdin_include_paths",
+          "exit": 1,
+          "timed_out": false,
+          "expected_exit": 1,
+          "stdout_matches": true,
+          "stdout_bytes": 0,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "selector": "lowercase",
+          "query": "stdin_list",
+          "exit": 0,
+          "timed_out": false,
+          "expected_exit": 0,
+          "stdout_matches": true,
+          "stdout_bytes": 23,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "selector": "lowercase",
+          "query": "stdin_include_paths",
+          "exit": 1,
+          "timed_out": false,
+          "expected_exit": 1,
+          "stdout_matches": true,
+          "stdout_bytes": 0,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "selector": "uppercase",
+          "query": "stdin_list",
+          "exit": 128,
+          "timed_out": false,
+          "expected_exit": 0,
+          "stdout_matches": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 48,
+          "stderr_capped": false,
+          "stderr": "fatal: unable to access 'NUL': Invalid argument\n"
+        },
+        {
+          "selector": "uppercase",
+          "query": "stdin_include_paths",
+          "exit": 128,
+          "timed_out": false,
+          "expected_exit": 1,
+          "stdout_matches": true,
+          "stdout_bytes": 0,
+          "stderr_bytes": 48,
+          "stderr_capped": false,
+          "stderr": "fatal: unable to access 'NUL': Invalid argument\n"
+        },
+        {
+          "selector": "owned_empty",
+          "query": "stdin_list",
+          "exit": 0,
+          "timed_out": false,
+          "expected_exit": 0,
+          "stdout_matches": true,
+          "stdout_bytes": 23,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "selector": "owned_empty",
+          "query": "stdin_include_paths",
+          "exit": 1,
+          "timed_out": false,
+          "expected_exit": 1,
+          "stdout_matches": true,
+          "stdout_bytes": 0,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        }
+      ],
+      "scope": "direct pinned C Git config only; no guarded-Rust acceptance claim"
+    }
+  },
+  "path_experiment": {
+    "run": 38724730048,
+    "job": 116387649551,
+    "head": "18418a8b",
+    "terminal": "success",
+    "duration": "4m32s",
+    "artifact": "/private/tmp/mini-agent-windows-git-path-direct-artifact/git-path-direct-proof.json",
+    "facts": "2stdinpass; ordinaryglobal/include2pass;6verbatimglobalorinclude fail128; ordinary/verbatimshell2pass; no timeouts",
+    "artifact_sha256": "a3cda3c1982d8f8cffb84853422931703161e185d47a145de679dfd86da4ec9b",
+    "observations": {
+      "source_parent": "9ad8afc5653ec8fb8654d723f42db37fbc588afd",
+      "program_sha256": "275ac7cfd3a2b04f8454769709351e703bff7cb1ba996250b4f642cd6e2e1490",
+      "records": [
+        {
+          "case": "stdin_actual_config_cwd_ordinary",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": true,
+          "stdout_bytes": 41,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "case": "stdin_actual_config_cwd_verbatim",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": true,
+          "stdout_bytes": 41,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "case": "select_include_ordinary_global_ordinary_cwd_ordinary",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": true,
+          "stdout_bytes": 233,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "case": "select_include_ordinary_global_ordinary_cwd_verbatim",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": true,
+          "stdout_bytes": 233,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "case": "select_include_ordinary_global_verbatim_cwd_ordinary",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 39,
+          "stderr_capped": false,
+          "stderr": "fatal: error processing config file(s)\n"
+        },
+        {
+          "case": "select_include_ordinary_global_verbatim_cwd_verbatim",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 39,
+          "stderr_capped": false,
+          "stderr": "fatal: error processing config file(s)\n"
+        },
+        {
+          "case": "select_include_verbatim_global_ordinary_cwd_ordinary",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 82,
+          "stderr_capped": false,
+          "stderr": "fatal: bad config line 2 in file D:\\a\\_temp\\mini-agent-fixed-mirror-jyxfla6i\\root\n"
+        },
+        {
+          "case": "select_include_verbatim_global_ordinary_cwd_verbatim",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 82,
+          "stderr_capped": false,
+          "stderr": "fatal: bad config line 2 in file D:\\a\\_temp\\mini-agent-fixed-mirror-jyxfla6i\\root\n"
+        },
+        {
+          "case": "select_include_verbatim_global_verbatim_cwd_ordinary",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 39,
+          "stderr_capped": false,
+          "stderr": "fatal: error processing config file(s)\n"
+        },
+        {
+          "case": "select_include_verbatim_global_verbatim_cwd_verbatim",
+          "exit": 128,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 39,
+          "stderr_capped": false,
+          "stderr": "fatal: error processing config file(s)\n"
+        },
+        {
+          "case": "shell_path_ordinary",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        },
+        {
+          "case": "shell_path_verbatim",
+          "exit": 0,
+          "timed_out": false,
+          "selected_helper": false,
+          "stdout_bytes": 0,
+          "stderr_bytes": 0,
+          "stderr_capped": false,
+          "stderr": ""
+        }
+      ],
+      "scope": "fixed owned C path representation experiment; no guarded-Rust acceptance claim"
+    }
+  },
+  "source_parent": "9ad8afc5653ec8fb8654d723f42db37fbc588afd",
+  "native_scope": "direct prepared C diagnostic, not guarded native2 acceptance",
+  "rust_native_failure": {
+    "run": 38721766100,
+    "job": 116377801596,
+    "result": "0PASS2FAIL0ignored/1.06s",
+    "attribution": "capture_roots succeeds; run(init) select mirrored config fails"
+  },
+  "candidate": "/private/tmp/mini-agent-windows-git-c-path-final-manifest.json",
+  "reused": "creator+overlap native2PASS38714148392 unchanged; not freshall4",
+  "cleanup": "Root reconciled and independentlydeleted retired40ca/295ebeac/00c641 refs; current directdiagnostic refsleft for exactlease cleanup",
+  "root_review": {
+    "comparative_artifact_hashes_and_20_records": "verified against retained actual observations; no timeouts",
+    "patch_sha256": "b0282dcd4e3aeeaf8a25a88c2bb65844e6208a343ef1d614eb4c23720e87e7d4",
+    "peer_review": "Accepted after raw-dotdot test construction and exact projected origin allowlist corrections",
+    "local_owning": "4 global_snapshot tests PASS/.35s; compile23.14s, fmt and diffcheck PASS",
+    "native_windows_rust_acceptance": "Pending corrected failed2 plus new identity/refusal unit; direct C observations do not substitute",
+    "payload_identity": "Two direct builds have distinct recorded executable hashes; same pinned source inputs, no bit-identity claim",
+    "scope": "C-facing config path representation only; canonical Rust authorities, C protectNTFS, working directory, shell fixture, source archive unchanged"
+  }
+}

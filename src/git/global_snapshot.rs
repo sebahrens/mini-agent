@@ -316,6 +316,13 @@ impl GlobalSources {
         }
         std::fs::write(&root, serialize(&entries)?)
             .map_err(|_| "guarded Git captured global root could not be written")?;
+        // Compare native origins to the exact spellings we supplied, rather
+        // than widening origin authority by canonicalizing arbitrary output.
+        #[cfg(windows)]
+        let c_origins = std::iter::once(&root)
+            .chain(names.values())
+            .map(|path| c_git_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
         let selected = runner
             .snapshot_probe(
                 repository,
@@ -357,7 +364,11 @@ impl GlobalSources {
                 .strip_prefix(b"file:")
                 .ok_or("guarded Git global selection has no file origin")?;
             let origin = PathBuf::from(os_string(origin.to_vec())?);
-            if origin != root && !names.values().any(|name| *name == origin) {
+            #[cfg(windows)]
+            let captured_origin = c_origins.contains(&origin);
+            #[cfg(not(windows))]
+            let captured_origin = origin == root || names.values().any(|name| *name == origin);
+            if !captured_origin {
                 return Err("guarded Git global selection escaped its captured sources".into());
             }
             if credential_helper(&entry.key)
@@ -494,16 +505,100 @@ fn rewrite_relative_condition(key: &mut Vec<u8>, original_parent: &Path) -> Resu
     }
     Ok(())
 }
+/// Translate only supported verbatim DOS/UNC spellings at the C Git boundary.
+/// Rust retains its canonical paths/handles; Git receives a checked same-object
+/// spelling, never a weaker path authority or a disabled NTFS validator.
+#[cfg(windows)]
+pub(super) fn c_git_path(path: &Path) -> Result<PathBuf, String> {
+    let unavailable =
+        || "guarded Git Windows path has no equivalent supported spelling".to_string();
+    let text = path.to_str().ok_or_else(unavailable)?;
+    if text.starts_with(r"\\.\") || text.starts_with(r"\??\") {
+        return Err(unavailable());
+    }
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return Ok(path.to_path_buf());
+    };
+    let translated = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        format!(r"\\{unc}")
+    } else if rest.as_bytes().get(1..3) == Some(b":\\") && rest.as_bytes()[0].is_ascii_alphabetic()
+    {
+        rest.to_string()
+    } else {
+        return Err(unavailable());
+    };
+    // Normal Win32 paths trim/interpret these names differently. Refuse rather
+    // than silently redirect an unusual verbatim filename or device namespace.
+    let tail = if translated.starts_with(r"\\") {
+        &translated[2..]
+    } else {
+        &translated[3..]
+    };
+    for component in tail.split('\\').filter(|_| !tail.is_empty()) {
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        let numbered_device = stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"));
+        if component.is_empty()
+            || component.ends_with(['.', ' '])
+            || component
+                .chars()
+                .any(|c| c < ' ' || "<>:\"/|?*".contains(c))
+            || matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || matches!(
+                numbered_device,
+                Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            )
+        {
+            return Err(unavailable());
+        }
+    }
+    let candidate = PathBuf::from(translated);
+    // Missing final include targets remain missing; check the exact existing
+    // parent in that case. All other uses have an existing file/directory.
+    let (original, converted) = match crate::fs::checked_path_metadata(path) {
+        Ok(before) => (
+            before,
+            crate::fs::checked_path_metadata(&candidate).map_err(|_| unavailable())?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !crate::fs::checked_path_metadata(&candidate)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(unavailable());
+            }
+            (
+                crate::fs::checked_path_metadata(path.parent().ok_or_else(unavailable)?)
+                    .map_err(|_| unavailable())?,
+                crate::fs::checked_path_metadata(candidate.parent().ok_or_else(unavailable)?)
+                    .map_err(|_| unavailable())?,
+            )
+        }
+        Err(_) => return Err(unavailable()),
+    };
+    crate::fs::ensure_same_file(path, &original, &converted).map_err(|_| unavailable())?;
+    Ok(candidate)
+}
+
 fn path_bytes(path: &Path) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
         Ok(path.as_os_str().as_bytes().to_vec())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        path.to_str()
-            .map(|s| s.as_bytes().to_vec())
+        c_git_path(path)?
+            .to_str()
+            .map(|s| s.replace('\\', "/").into_bytes())
             .ok_or("guarded Git path is not representable".into())
     }
 }
@@ -764,6 +859,52 @@ mod tests {
         )
         .unwrap();
         GitRunner::from_runtime(Arc::new(runtime)).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_c_git_paths_preserve_objects_and_refuse_ambiguous_names() {
+        let fixture = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let file = fixture.path().join("C boundary ü with spaces");
+        std::fs::write(&file, b"retained identity").unwrap();
+        assert!(file.to_str().unwrap().starts_with(r"\\?\"));
+        let converted = c_git_path(&file).unwrap();
+        assert!(!converted.to_str().unwrap().starts_with(r"\\?\"));
+        crate::fs::ensure_same_file(
+            &file,
+            &crate::fs::checked_path_metadata(&file).unwrap(),
+            &crate::fs::checked_path_metadata(&converted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&converted).unwrap(), b"retained identity");
+        let absent = fixture.path().join("absent-source");
+        assert!(!c_git_path(&absent).unwrap().exists());
+        for suffix in [
+            "trailing.",
+            "trailing ",
+            "NUL",
+            "con.txt",
+            "COM¹",
+            "LPT9.log",
+            "x:y",
+            "x?y",
+            "..",
+        ] {
+            // Path::join normalizes dot segments for verbatim prefixes. Feed
+            // the exact unnormalized spelling to exercise the rejection.
+            let mut raw = fixture.path().as_os_str().to_os_string();
+            raw.push("\\");
+            raw.push(suffix);
+            assert!(c_git_path(Path::new(&raw)).is_err(), "{suffix}");
+        }
+        for device in [
+            r"\\.\NUL",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+            r"\\?\Volume{inert}\x",
+        ] {
+            assert!(c_git_path(Path::new(device)).is_err());
+        }
+        assert!(c_git_path(&file.join("missing-parent").join("missing")).is_err());
     }
 
     #[tokio::test]

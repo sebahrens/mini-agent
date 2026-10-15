@@ -92,3 +92,12 @@ Sandbox-to-host-Git absent/late/nested tests pass. A default unprivileged local
 Linux container currently refuses user-namespace creation; no privileged or
 sysctl workaround is part of this change. Passing parser or macOS controls does
 not substitute for that Linux acceptance requirement.
+
+Windows C Git paths use an equivalent ordinary DOS/UNC spelling only at the
+parser/serialized-include boundary. Rust keeps its original canonical paths and
+identity checks. Conversion checks the existing object (or the same existing
+parent for a missing final include), and refuses device namespaces, reserved
+names, trailing dots/spaces and other ambiguous Win32 spellings. NTFS protection
+remains enabled. Native origin records must match the exact translated mirror
+paths supplied to Git; arbitrary returned paths are never canonicalized into
+source authority.

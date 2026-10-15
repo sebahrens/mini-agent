@@ -516,6 +516,8 @@ impl GitRunner {
         // Parsing explicit stdin does not read globals; selection uses solely
         // the startup-captured mirror, including native repository conditions.
         if let Some(global) = global {
+            #[cfg(windows)]
+            let global = super::global_snapshot::c_git_path(global)?;
             command.env("GIT_CONFIG_GLOBAL", global);
         } else {
             command.env("GIT_CONFIG_GLOBAL", NULL_GLOBAL_CONFIG);
