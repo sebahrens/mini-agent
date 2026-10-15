@@ -26,11 +26,16 @@ RELEASE_TAG_PATTERN = re.compile(
 FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 VERSION_COMMENT = re.compile(r"^v\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$")
 # Remote actions may only bypass immutable pins after an explicit, reviewed entry here.
-RELEASE_ACTION_PIN_ALLOWLIST: frozenset[str] = frozenset()
+RELEASE_ACTION_PIN_ALLOWLIST: frozenset[str] = frozenset({
+    # Same tagged source; nested remote action pin is checked by
+    # scripts.tests.test_git_runtime_ci. No other local action is exempt.
+    "./.github/actions/prepare-git-runtime",
+})
 CANONICAL_GPL3_LICENSE_SHA256 = (
     "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 )
 APPROVED_RELEASE_ACTIONS = {
+    ("docker/setup-qemu-action", "v3"): "c7c53464625b32c7a7e944ae62b3e17d2b600130",
     ("actions/checkout", "v7.0.1"): "3d3c42e5aac5ba805825da76410c181273ba90b1",
     (
         "actions-rust-lang/setup-rust-toolchain",

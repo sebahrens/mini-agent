@@ -24,6 +24,52 @@ sys.modules["corresponding_source"] = CORRESPONDING_SOURCE
 HELPER_SPEC.loader.exec_module(CORRESPONDING_SOURCE)
 SourceError = CORRESPONDING_SOURCE.SourceError
 
+
+class NativeSourceCaptureTests(unittest.TestCase):
+    def fixture(self, root):
+        assets = root / "inputs"
+        assets.mkdir()
+        (assets / "COPYING").write_bytes(b"verbatim upstream license")
+        (assets / "source.tar.xz").write_bytes(b"exact preferred source")
+        entries = lambda name: {"path": name, "sha256": hashlib.sha256((assets / name).read_bytes()).hexdigest()}
+        record = {"format": "mini-agent-native-components/1", "target": "x86_64-pc-windows-msvc", "bundle_manifest_sha256": "0" * 64, "components": [{"name": "dependency", "version": "1.0", "license": "MIT", "source_url": "https://example.invalid/exact-source", "bundled_files": [], "license_files": [entries("COPYING")], "source_files": [entries("source.tar.xz")]}]}
+        path = assets / "native-components.json"
+        path.write_text(json.dumps(record))
+        source = root / "source"
+        source.mkdir()
+        return source, path
+
+    def test_native_sources_and_notices_are_copied_exactly_and_revalidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, record = self.fixture(Path(temporary))
+            CORRESPONDING_SOURCE.capture_native_inputs(source, [record])
+            captured = source / "vendor-native/x86_64-pc-windows-msvc"
+            self.assertEqual((captured / "COPYING").read_bytes(), b"verbatim upstream license")
+            self.assertEqual((captured / "source.tar.xz").read_bytes(), b"exact preferred source")
+            self.assertEqual((captured / "native-components.json").read_bytes(), record.read_bytes())
+
+    def test_native_missing_tampered_or_duplicate_sources_never_publish_partial_tree(self):
+        for mode in ("missing", "tampered", "duplicate"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                source, record = self.fixture(Path(temporary))
+                if mode == "missing":
+                    (record.parent / "source.tar.xz").unlink()
+                elif mode == "tampered":
+                    (record.parent / "source.tar.xz").write_bytes(b"different")
+                with self.assertRaises(SourceError):
+                    CORRESPONDING_SOURCE.capture_native_inputs(source, [record, record] if mode == "duplicate" else [record])
+                self.assertFalse((source / "vendor-native").exists())
+
+    def test_existing_native_source_tree_is_not_repaired_or_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, record = self.fixture(Path(temporary))
+            existing = source / "vendor-native"
+            existing.mkdir()
+            (existing / "keep").write_bytes(b"keep")
+            with self.assertRaises(SourceError):
+                CORRESPONDING_SOURCE.capture_native_inputs(source, [record])
+            self.assertEqual((existing / "keep").read_bytes(), b"keep")
+
 FAKE_NPM = """#!/usr/bin/env python3
 import json, os, shutil, sys
 arguments = sys.argv[1:]

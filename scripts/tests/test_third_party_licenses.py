@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -80,6 +83,87 @@ class ThirdPartyInventoryTests(unittest.TestCase):
             texts_root=ROOT / "packaging/license-texts",
             **kwargs,
         )
+
+    def native_fixture(self, directory):
+        root = Path(directory)
+        (root / "COPYING").write_text("Exact upstream native notice\n")
+        (root / "source.tar.gz").write_bytes(b"preferred source fixture")
+        asset = lambda name: {"path": name, "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest()}
+        record = {"format": INVENTORY.NATIVE_FORMAT, "target": TARGET, "bundle_manifest_sha256": "0" * 64, "components": [{"name": "native-dep", "version": "1.2-r0", "license": "MIT", "source_url": "https://example.invalid/exact-source", "bundled_files": [], "license_files": [asset("COPYING")], "source_files": [asset("source.tar.gz")]}]}
+        path = root / "native-components.json"
+        path.write_text(json.dumps(record))
+        return path, record
+
+    def test_native_notices_extend_v1_without_changing_cargo_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InventoryFixture(directory)
+            fixture.crate("crate", "1.0", "MIT", {"LICENSE": "Cargo notice\n"})
+            path, _ = self.native_fixture(directory)
+            components = INVENTORY.load_native_record(path, TARGET)
+            native = [{**c, "notices": [(a["path"], INVENTORY._read_text(path.parent / a["path"])) for a in c["license_files"]]} for c in components]
+            document = self.render(fixture, native_components=native)
+            self.assertIn("Packages: 1\n", document)
+            self.assertIn(INVENTORY.FORMAT_LINE, document)
+            self.assertIn("Native-Component: native-dep 1.2-r0", document)
+            self.assertIn("Exact upstream native notice", document)
+            self.assertEqual({("native-dep", "1.2-r0")}, INVENTORY.parse_inventory(document)["native_components"])
+            self.assertEqual(1, INVENTORY.verify_inventory(document, fixture.metadata(), target=TARGET, no_default_features=False, native_components=native))
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "omits native"):
+                INVENTORY.verify_inventory(document.replace("Native-Component:", "Removed-Component:"), fixture.metadata(), target=TARGET, no_default_features=False, native_components=native)
+
+    def test_native_record_requires_real_sources_and_exact_bound_dll_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, record = self.native_fixture(directory)
+            bundle = Path(directory) / "bundle"
+            bundle.mkdir()
+            dll = bundle / "native.dll"
+            dll.write_bytes(b"actual DLL fixture")
+            h = hashlib.sha256(dll.read_bytes()).hexdigest()
+            manifest = f"mini-agent-git-runtime-v1\ntarget={TARGET}\nsource-sha256=s\npolicy-sha256=p\npolicy=policy\nfile=native.dll\t{h}\tr\n".encode()
+            (bundle / "bundle.manifest").write_bytes(manifest)
+            record["bundle_manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "omits or adds"):
+                INVENTORY.load_native_record(path, TARGET, bundle)
+            record["components"][0]["bundled_files"] = [{"name": "native.dll", "sha256": h}]
+            path.write_text(json.dumps(record))
+            INVENTORY.load_native_record(path, TARGET, bundle)
+            dll.write_bytes(b"modified")
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "hash mismatch"):
+                INVENTORY.load_native_record(path, TARGET, bundle)
+            (Path(directory) / "source.tar.gz").unlink()
+            with self.assertRaises(OSError):
+                INVENTORY.load_native_record(path, TARGET)
+
+    def test_native_record_unknown_duplicate_wrong_target_and_escape_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, record = self.native_fixture(directory)
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "target mismatch"):
+                INVENTORY.load_native_record(path, "wrong-target")
+            record["unknown"] = True
+            path.write_text(json.dumps(record))
+            with self.assertRaises(INVENTORY.InventoryError):
+                INVENTORY.load_native_record(path, TARGET)
+            record.pop("unknown")
+            record["components"][0]["source_files"][0]["path"] = "../escape"
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "contained path"):
+                INVENTORY.load_native_record(path, TARGET)
+            path.write_text('{"target":"a","target":"b"}')
+            with self.assertRaisesRegex(INVENTORY.InventoryError, "duplicate"):
+                INVENTORY.load_native_record(path, TARGET)
+
+    def test_missing_native_record_refuses_windows_and_musl_notice_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InventoryFixture(directory)
+            fixture.crate("crate", "1.0", "MIT", {"LICENSE": "notice"})
+            git = {"name": "git", "version": "2.56.0", "notices": []}
+            with patch.object(INVENTORY, 'cargo_metadata', return_value=fixture.metadata()), patch.object(INVENTORY, 'git_component', return_value=git), patch.dict(INVENTORY.os.environ, {}, clear=True):
+                for target in ('x86_64-pc-windows-msvc', 'aarch64-unknown-linux-musl'):
+                    output = Path(directory) / target
+                    with patch('sys.stderr'):
+                        self.assertEqual(INVENTORY.main(['generate', '--target', target, '--output', str(output)]), 1)
+                    self.assertFalse(output.exists())
 
     def test_inventory_names_every_package_with_its_verbatim_license_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

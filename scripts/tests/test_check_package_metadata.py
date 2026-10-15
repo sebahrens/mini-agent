@@ -157,6 +157,24 @@ class SecurityPolicyValidationTests(unittest.TestCase):
 
 
 class ReleaseWorkflowValidationTests(unittest.TestCase):
+    def test_only_reviewed_same_source_git_composite_is_allowlisted(self) -> None:
+        self.assertEqual(
+            CHECK_PACKAGE_METADATA.RELEASE_ACTION_PIN_ALLOWLIST,
+            frozenset({"./.github/actions/prepare-git-runtime"}),
+        )
+        self.assertEqual([], CHECK_PACKAGE_METADATA.validate_release_action_pins(
+            "steps:\n  - uses: ./.github/actions/prepare-git-runtime\n"
+        ))
+        for reference in (
+            "./.github/actions/prepare-git-runtime-other",
+            "./.github/actions/prepare-git-runtime/other",
+            "./.github/actions/unreviewed",
+        ):
+            with self.subTest(reference=reference):
+                self.assertTrue(CHECK_PACKAGE_METADATA.validate_release_action_pins(
+                    "steps:\n  - uses: " + reference + "\n"
+                ))
+
     def test_reviewed_current_release_action_pins_are_accepted(self) -> None:
         workflow = (
             "steps:\n"

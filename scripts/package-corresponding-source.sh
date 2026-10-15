@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: package-corresponding-source.sh <vX.Y.Z> <output-dir> [git-ref] [--allow-untagged-label] [--compliance-docs <dir>] [--npm-vendor-cache <dir>]" >&2
+    echo "Usage: package-corresponding-source.sh <vX.Y.Z> <output-dir> [git-ref] [--allow-untagged-label] [--compliance-docs <dir>] [--npm-vendor-cache <dir>] [--native-record <file>]..." >&2
     exit 2
 fi
 
@@ -17,6 +17,7 @@ SOURCE_REF=""
 ALLOW_UNTAGGED_LABEL=false
 COMPLIANCE_DOCS=""
 NPM_VENDOR_CACHE=""
+NATIVE_RECORDS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --allow-untagged-label)
@@ -37,6 +38,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             NPM_VENDOR_CACHE="$2"
+            shift 2
+            ;;
+        --native-record)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --native-record requires a target source/notice record" >&2
+                exit 2
+            fi
+            NATIVE_RECORDS+=(--native-record "$2")
             shift 2
             ;;
         --*)
@@ -121,6 +130,8 @@ if [[ ! -f "$STAGING_DIR/$SOURCE_ROOT/LICENSE" ]] \
     exit 2
 fi
 mkdir -p "$STAGING_DIR/$SOURCE_ROOT/.cargo"
+python3 "$SCRIPT_DIR/corresponding_source.py" native-inputs \
+    "$STAGING_DIR/$SOURCE_ROOT" "${NATIVE_RECORDS[@]}"
 (
     cd "$STAGING_DIR/$SOURCE_ROOT"
     cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml

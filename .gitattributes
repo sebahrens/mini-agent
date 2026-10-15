@@ -1,3 +1,6 @@
 LICENSE text eol=lf
 NOTICE text eol=lf
 SOURCE.md text eol=lf
+
+# Preserve the pinned patch bytes and its upstream diff context on every host.
+scripts/git-runtime/policy.patch -text -whitespace

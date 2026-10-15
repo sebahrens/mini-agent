@@ -93,11 +93,16 @@ pub(crate) enum AllowPolicyReason {
     InvalidTarget(FileAccess),
     AmbiguousSymlink(FileAccess),
     OutsideConfiguredRoots(FileAccess),
+    ProtectedGitAuthority,
 }
 
 impl std::fmt::Display for AllowPolicyReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (access, reason) = match self {
+            Self::ProtectedGitAuthority => (
+                &FileAccess::Write,
+                "the target is retained Git executable authority",
+            ),
             Self::NoConfiguredRoots(access) => (
                 access,
                 "no roots are configured; unrestricted access requires an explicit opt-in",
@@ -252,6 +257,9 @@ impl AllowConfig {
             Ok(path) => path,
             Err(reason) => return AuthorizationDecision::Denied(reason),
         };
+        if crate::git::runtime::check_model_write(&resolved).is_err() {
+            return AuthorizationDecision::Denied(AllowPolicyReason::ProtectedGitAuthority);
+        }
         authorize_resolved(&self.write, resolved, FileAccess::Write)
     }
 
@@ -277,6 +285,12 @@ impl AllowConfig {
     }
 
     fn authorize_bound_write(&self, relative: &Path) -> AuthorizationDecision {
+        if let Some(workspace) = self.workspace_binding()
+            && let Ok(target) = workspace.logical_relative_path(relative)
+            && crate::git::runtime::check_model_write(&target).is_err()
+        {
+            return AuthorizationDecision::Denied(AllowPolicyReason::ProtectedGitAuthority);
+        }
         self.authorize_bound(relative, FileAccess::Write)
     }
 }
@@ -1823,6 +1837,7 @@ fn file_policy_service_error(reason: AllowPolicyReason) -> EffectServiceError {
     match reason {
         AllowPolicyReason::NoConfiguredRoots(_) => EffectServiceError::FileNoConfiguredRoots,
         AllowPolicyReason::InvalidConfiguration(_) => EffectServiceError::FileInvalidConfiguration,
+        AllowPolicyReason::ProtectedGitAuthority => EffectServiceError::FileOutsideConfiguredRoots,
         AllowPolicyReason::OutsideConfiguredRoots(_) => {
             EffectServiceError::FileOutsideConfiguredRoots
         }

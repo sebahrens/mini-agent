@@ -1,0 +1,214 @@
+--- a/config.c
++++ b/config.c
+@@ -901,6 +901,107 @@
+ 	}
+ }
+ 
++/* PRIVATE RESEARCH ONLY: intentionally restrictive compatibility probe.
++ * This is not an upstream policy or a production mini-agent boundary.
++ * The caller owns a flattened global snapshot; scope is not proof of trust.
++ */
++static int research_executable_config_key(const char *key, const char *value)
++{
++	static const char * const exact[] = {
++		"core.sshcommand", "core.askpass", "core.gitproxy", "core.alternaterefscommand",
++		"core.hookspath", "core.editor", "core.pager", "sequence.editor",
++		"diff.external", "gpg.program", "gpg.ssh.defaultkeycommand",
++		"interactive.difffilter", "gc.recentobjectshook", "uploadpack.packobjectshook",
++		"pull.twohead", "pull.octopus", "rebase.instructionformat",
++		"instaweb.httpd", "sendemail.smtpserver", "sendemail.tocmd", "sendemail.cccmd",
++		"sendemail.annotate", "sendemail.confirmcommand"
++	};
++	static const struct { const char *prefix; const char *suffix; } families[] = {
++		{ "filter.", ".clean" }, { "filter.", ".smudge" }, { "filter.", ".process" },
++		{ "diff.", ".command" }, { "diff.", ".textconv" }, { "merge.", ".driver" },
++		{ "credential.", ".helper" }, { "remote.", ".uploadpack" },
++		{ "remote.", ".receivepack" }, { "remote.", ".vcs" },
++		{ "gpg.", ".program" }, { "hook.", ".command" },
++		{ "trailer.", ".cmd" }, { "trailer.", ".command" },
++		{ "tar.", ".command" }, { "branch.", ".mergeoptions" },
++		{ "difftool.", ".cmd" }, { "difftool.", ".path" },
++		{ "mergetool.", ".cmd" }, { "mergetool.", ".path" },
++		{ "browser.", ".cmd" }, { "browser.", ".path" },
++		{ "man.", ".cmd" }, { "man.", ".path" }, { "guitool.", ".cmd" }
++	};
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(exact); i++)
++		if (!strcmp(key, exact[i]))
++			return 1;
++	for (i = 0; i < ARRAY_SIZE(families); i++)
++		if (starts_with(key, families[i].prefix) && ends_with(key, families[i].suffix))
++			return 1;
++	if (starts_with(key, "alias."))
++		return 1;
++	if (!strcmp(key, "core.fsmonitor") || starts_with(key, "pager."))
++		return git_parse_maybe_bool(value) < 0;
++	if (starts_with(key, "submodule.") && ends_with(key, ".update"))
++		return value && value[0] == '!';
++	return 0;
++}
++
++static void research_repo_config_policy(const char *key, const char *value,
++                                       const struct key_value_info *kvi)
++{
++	const char *policy = getenv("GIT_REPO_CONFIG_POLICY");
++	const char *global;
++	static const char * const structural[] = {
++		"core.repositoryformatversion", "core.filemode", "core.bare",
++		"core.logallrefupdates", "core.ignorecase", "core.precomposeunicode",
++		"extensions.worktreeconfig"
++	};
++	size_t i;
++
++	if (!policy)
++		return;
++	if (strcmp(policy, "structural-only-v1") && strcmp(policy, "executable-scope-v2") &&
++	    strcmp(policy, "mini-agent-executable-scope-v3-env"))
++		die("research config policy: unsupported mode");
++	global = getenv("GIT_CONFIG_GLOBAL");
++	if (!strcmp(policy, "mini-agent-executable-scope-v3-env")) {
++		const char *text = getenv("MINI_AGENT_GIT_GLOBAL_SNAPSHOT");
++		if (!text || strlen(text) > 65536 || !git_env_bool("GIT_CONFIG_NOSYSTEM", 0))
++			die("guarded Git: bounded captured global snapshot and NOSYSTEM required");
++		global = "mini-agent-owned-global-env-v1";
++	} else if (!global || !is_absolute_path(global) || !git_env_bool("GIT_CONFIG_NOSYSTEM", 0)) {
++		die("research config policy: explicit global snapshot and NOSYSTEM required");
++	}
++	/* Refuse expansion even from a global file: the fixture is flattened. */
++	if (!strcmp(key, "include.path") || starts_with(key, "includeif."))
++		die("research config policy: includes are forbidden");
++	if (!strcmp(policy, "executable-scope-v2") ||
++	    !strcmp(policy, "mini-agent-executable-scope-v3-env")) {
++		/* Scope alone cannot bless an explicitly selected --file/blob input.
++		 * Only this exact caller-owned flattened global file supplies code.
++		 * Normal -c parameters are separate trusted caller input, not files.
++		 */
++		if (kvi->scope == CONFIG_SCOPE_GLOBAL && kvi->filename &&
++		    !strcmp(kvi->filename, global) &&
++		    ((!strcmp(policy, "executable-scope-v2") && kvi->origin_type == CONFIG_ORIGIN_FILE) ||
++		     (!strcmp(policy, "mini-agent-executable-scope-v3-env") && kvi->origin_type == CONFIG_ORIGIN_CMDLINE)))
++			return;
++		if (research_executable_config_key(key, value))
++			die("research config policy: rejected untrusted executable key '%s'", key);
++		return;
++	}
++	if (kvi->scope != CONFIG_SCOPE_LOCAL && kvi->scope != CONFIG_SCOPE_WORKTREE)
++		return;
++	for (i = 0; i < ARRAY_SIZE(structural); i++)
++		if (!strcmp(key, structural[i]))
++			return;
++	/* Fail before any consumer sees the value, including unknown key names.
++	 * This deliberately rejects benign local preferences; no compatibility
++	 * or complete bead-acceptance claim may be made from this prototype.
++	 */
++	die("research config policy: rejected repository key '%s'", key);
++}
++
+ static int get_value(struct config_source *cs, struct key_value_info *kvi,
+ 		     config_fn_t fn, void *data, struct strbuf *name)
+ {
+@@ -939,6 +1040,7 @@
+ 	 */
+ 	cs->linenr--;
+ 	kvi->linenr = cs->linenr;
++	research_repo_config_policy(name->buf, value, kvi);
+ 	ret = fn(name->buf, value, &ctx, data);
+ 	if (ret >= 0)
+ 		cs->linenr++;
+@@ -1580,6 +1682,21 @@
+ 		worktree_config = NULL;
+ 	}
+ 
++	/* The parent captures this value in the actual Command environment.
++	 * A file/blob cannot manufacture this CMDLINE-origin, GLOBAL-scope
++	 * marker. Do not reopen HOME, XDG, or system files under this policy.
++	 */
++	if (getenv("GIT_REPO_CONFIG_POLICY") &&
++	    !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")) {
++		const char *text = getenv("MINI_AGENT_GIT_GLOBAL_SNAPSHOT");
++		if (!text || strlen(text) > 65536 || !git_env_bool("GIT_CONFIG_NOSYSTEM", 0))
++			die("guarded Git: captured global snapshot is unavailable or too large");
++		ret += git_config_from_mem(fn, CONFIG_ORIGIN_CMDLINE,
++			"mini-agent-owned-global-env-v1", text, strlen(text), data,
++			CONFIG_SCOPE_GLOBAL, NULL);
++		goto repository_scopes;
++	}
++
+ 	if (git_config_system() && system_config &&
+ 	    !access_or_die(system_config, R_OK,
+ 			   opts->system_gently ? ACCESS_EACCES_OK : 0))
+@@ -1597,6 +1714,7 @@
+ 		ret += git_config_from_file_with_options(fn, user_config, data,
+ 							 CONFIG_SCOPE_GLOBAL, NULL);
+ 
++repository_scopes:
+ 	if (!opts->ignore_repo && repo_config &&
+ 	    !access_or_die(repo_config, R_OK, 0))
+ 		ret += git_config_from_file_with_options(fn, repo_config, data,
+--- a/hook.c
++++ b/hook.c
+@@ -29,6 +29,10 @@
+ 
+ 	int found_hook;
+ 
++	if (getenv("GIT_REPO_CONFIG_POLICY") &&
++	    (!strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "executable-scope-v2") ||
++	     !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")))
++		return NULL;
+ 	if (!r || !r->gitdir)
+ 		return NULL;
+ 
+@@ -543,6 +547,12 @@
+ 	CALLOC_ARRAY(hook_head, 1);
+ 	string_list_init_dup(hook_head);
+ 
++	/* Preserve mini-agent's existing no-hooks baseline, including configured hooks. */
++	if (getenv("GIT_REPO_CONFIG_POLICY") &&
++	    (!strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "executable-scope-v2") ||
++	     !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")))
++		return hook_head;
++
+ 	/* Add hooks from the config, e.g. hook.myhook.event = pre-commit */
+ 	list_hooks_add_configured(r, hookname, hook_head, options);
+ 
+--- a/transport.c
++++ b/transport.c
+@@ -1168,6 +1168,14 @@
+ 
+ int is_transport_allowed(const char *type, int from_user)
+ {
++	/* Closed native transports for the private host-Git policy, after rewrites. */
++	if (getenv("GIT_REPO_CONFIG_POLICY") &&
++	    (!strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "executable-scope-v2") ||
++	     !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")) &&
++	    strcmp(type, "file") && strcmp(type, "git") && strcmp(type, "ssh") &&
++	    strcmp(type, "http") && strcmp(type, "https"))
++		return 0;
++
+ 	const struct string_list *allow_list = protocol_allow_list();
+ 	if (allow_list)
+ 		return string_list_has_string(allow_list, type);
+@@ -1251,6 +1259,10 @@
+ 		helper = helper_to_free = xstrndup(url, p - url);
+ 
+ 	if (helper) {
++		if (getenv("GIT_REPO_CONFIG_POLICY") &&
++		    (!strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "executable-scope-v2") ||
++	     !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")))
++			die("research transport policy: forced/custom helper refused");
+ 		transport_helper_init(ret, helper);
+ 		free(helper_to_free);
+ 	} else if (starts_with(url, "rsync:")) {
+@@ -1286,6 +1298,11 @@
+ 		/* Unknown protocol in URL. Pass to external handler. */
+ 		int len = external_specification_len(url);
+ 		char *handler = xmemdupz(url, len);
++		if (getenv("GIT_REPO_CONFIG_POLICY") &&
++		    (!strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "executable-scope-v2") ||
++	     !strcmp(getenv("GIT_REPO_CONFIG_POLICY"), "mini-agent-executable-scope-v3-env")) &&
++		    strcmp(handler, "http") && strcmp(handler, "https"))
++			die("research transport policy: external protocol refused");
+ 		transport_helper_init(ret, handler);
+ 		free(handler);
+ 	}

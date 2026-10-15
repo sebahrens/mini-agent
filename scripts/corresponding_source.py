@@ -18,6 +18,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -400,6 +401,9 @@ def deterministic_tar(parent: Path, root: str, output: Path, mtime: int) -> None
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    native = commands.add_parser("native-inputs", help="verify pinned Git and capture target-native dependency sources/notices")
+    native.add_argument("source_root", type=Path)
+    native.add_argument("--native-record", action="append", type=Path, default=[])
 
     vendor = commands.add_parser("vendor-npm", help="vendor and verify locked npm tarballs")
     vendor.add_argument("lockfile", type=Path)
@@ -425,7 +429,9 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = parser.parse_args(argv)
     try:
-        if arguments.command == "vendor-npm":
+        if arguments.command == "native-inputs":
+            capture_native_inputs(arguments.source_root, arguments.native_record)
+        elif arguments.command == "vendor-npm":
             packages = vendor_npm(
                 arguments.lockfile,
                 arguments.destination,
@@ -443,6 +449,56 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def capture_native_inputs(source_root: Path, records: list[Path]) -> None:
+    # Reuse the same bounded notice/source validator as binary packaging.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("native_component_inventory", Path(__file__).with_name("third_party_licenses.py"))
+    if spec is None or spec.loader is None:
+        raise SourceError("native source inventory helper is missing")
+    native_inventory = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native_inventory)
+    destination = source_root / "vendor-native"
+    created = False
+    try:
+        native_inventory.git_component(source_root)
+        targets = set()
+        for record in records:
+            with record.open("rb") as stream:
+                raw = stream.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise SourceError("native source record exceeds bound")
+            target = json.loads(raw)["target"]
+            if not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", target) or target in targets:
+                raise SourceError("invalid or duplicate native source target")
+            components = native_inventory.load_native_record(record, target)
+            targets.add(target)
+            if not created:
+                destination.mkdir(mode=0o700)
+                created = True
+            target_root = destination / target
+            target_root.mkdir(mode=0o700)
+            # Keep exact relative paths so the copied record revalidates offline.
+            assets = {asset["path"]: asset for component in components for key in ("license_files", "source_files") for asset in component[key]}
+            for relative, asset in assets.items():
+                source = native_inventory.checked_native_asset(record.parent, asset, 256 * 1024 * 1024)
+                output = target_root / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with source.open("rb") as reader, output.open("xb") as writer:
+                    remaining = 256 * 1024 * 1024
+                    while block := reader.read(min(1024 * 1024, remaining + 1)):
+                        remaining -= len(block)
+                        if remaining < 0:
+                            raise SourceError("native source grew beyond bound during capture")
+                        writer.write(block)
+                native_inventory.checked_native_asset(target_root, asset, 256 * 1024 * 1024)
+            (target_root / "native-components.json").write_bytes(raw)
+            native_inventory.load_native_record(target_root / "native-components.json", target)
+    except (SourceError, native_inventory.InventoryError, OSError, ValueError, KeyError) as error:
+        if created:
+            shutil.rmtree(destination)
+        raise SourceError(f"native Corresponding Source inputs failed: {error}") from error
 
 
 if __name__ == "__main__":

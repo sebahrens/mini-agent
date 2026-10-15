@@ -1,0 +1,68 @@
+name: Prepare guarded Git runtime
+description: Build the pinned native Windows Git payload once before this job's Cargo commands
+inputs:
+  collect-sources:
+    description: Capture verified sources/notices for the actual redistributed DLL closure
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Capture the existing host HOME
+      if: runner.os == 'Windows'
+      id: home
+      shell: pwsh
+      run: |
+        $present = Test-Path Env:HOME
+        "present=$($present.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+        "value=$env:HOME" >> $env:GITHUB_OUTPUT
+
+    - name: Provision explicit UCRT64 build dependencies
+      if: runner.os == 'Windows'
+      # Official v2 ref verified with git ls-remote; immutable publisher pin.
+      uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+      with:
+        msystem: UCRT64
+        path-type: minimal
+        update: true
+        install: >-
+          make patch python zstd
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-curl-winssl
+          mingw-w64-ucrt-x86_64-zlib
+          mingw-w64-ucrt-x86_64-expat
+          mingw-w64-ucrt-x86_64-libiconv
+
+    - name: Build and select the pinned Windows payload
+      if: runner.os == 'Windows'
+      shell: msys2 {0}
+      env:
+        MINI_AGENT_BUILD_HOST_HOME: ${{ steps.home.outputs.value }}
+        MINI_AGENT_BUILD_HOME_PRESENT: ${{ steps.home.outputs.present }}
+        MINI_AGENT_GIT_COLLECT_SOURCES: ${{ inputs.collect-sources }}
+      run: |
+        set -euo pipefail
+        if [ "$MINI_AGENT_BUILD_HOME_PRESENT" = true ]; then
+          export HOME="$MINI_AGENT_BUILD_HOST_HOME"
+        else
+          unset HOME
+        fi
+        temp_root=$(/usr/bin/cygpath -u "$RUNNER_TEMP")
+        owned=$(/usr/bin/mktemp -d "$temp_root/mini-agent-git-runtime-XXXXXX")
+        /usr/bin/python3 scripts/build-git-runtime-windows.py \
+          --target x86_64-pc-windows-msvc --output "$owned/bundle"
+        test -s "$owned/bundle/bundle.manifest"
+        bundle=$(/usr/bin/cygpath -am "$owned/bundle")
+        github_env=$(/usr/bin/cygpath -u "$GITHUB_ENV")
+        printf 'MINI_AGENT_GIT_RUNTIME_BUNDLE=%s\n' "$bundle" >> "$github_env"
+        # This signed-package inventory is build provenance, not runtime approval.
+        /usr/bin/pacman -Q > "$owned/toolchain-packages.txt"
+        if [ "$MINI_AGENT_GIT_COLLECT_SOURCES" = true ]; then
+          /usr/bin/python3 scripts/collect-git-native-sources.py \
+            --distro msys2 --target x86_64-pc-windows-msvc \
+            --bundle "$owned/bundle" --output "$owned/native-sources"
+          test -s "$owned/native-sources/native-components.json"
+          source_root=$(/usr/bin/cygpath -am "$owned/native-sources")
+          printf 'MINI_AGENT_GIT_NATIVE_SOURCE_ROOT=%s\n' "$source_root" >> "$github_env"
+          printf 'MINI_AGENT_GIT_NATIVE_RECORD=%s/native-components.json\n' "$source_root" >> "$github_env"
+        fi

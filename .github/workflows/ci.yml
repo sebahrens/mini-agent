@@ -192,6 +192,9 @@ jobs:
             scripts.tests.test_smoke_package_compliance \
             scripts.tests.test_verify_release_ci
 
+      - name: Test guarded Git preparation CI policy
+        run: python3 -m unittest scripts.tests.test_git_runtime_ci scripts.tests.test_build_git_runtime_musl scripts.tests.test_build_git_runtime scripts.tests.test_build_git_runtime_windows scripts.tests.test_prepare_git_runtime
+
       - name: Test native Windows GH proof CI policy
         run: python3 -m unittest scripts.tests.test_windows_gh_ci
 
@@ -208,6 +211,7 @@ jobs:
           python3 -m unittest \
             scripts.tests.test_package_release_binary \
             scripts.tests.test_third_party_licenses \
+            scripts.tests.test_collect_git_native_sources \
             scripts.tests.test_package_corresponding_source \
             scripts.tests.test_install_script \
             scripts.tests.test_update_release_checksums
@@ -633,6 +637,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+        with:
+          collect-sources: "true"
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
@@ -644,6 +653,25 @@ jobs:
       - name: Compile the Windows default feature suite
         if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         run: cargo test --locked --no-run
+      - name: Test native Windows guarded Git shell services
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
+        shell: pwsh
+        run: |
+          $filter = 'git::runner::windows_runtime_tests::'
+          $listing = @(& cargo test --locked --bin mini-agent $filter -- --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows Git service discovery failed' }
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^git::runner::windows_runtime_tests::.*: test$' } | Sort-Object)
+          $expected = @(
+            'git::runner::windows_runtime_tests::windows_embedded_http_global_helpers_with_cmd_only_path_and_spaces: test'
+            'git::runner::windows_runtime_tests::windows_shell_service_rejects_overlap_later_grants_and_replacement: test'
+            'git::runner::windows_runtime_tests::windows_missing_shell_refuses_only_selected_shell_services: test'
+          ) | Sort-Object
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($actual.Count -ne 3 -or $difference.Count -ne 0) { throw 'Expected the exact three native Windows Git service controls' }
+          $result = @(& cargo test --locked --bin mini-agent $filter -- --nocapture --test-threads=1)
+          $exit = $LASTEXITCODE
+          $result | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0 -or -not ($result -match '^test result: ok\. 3 passed; 0 failed; 0 ignored;')) { throw 'Native Windows guarded Git service execution failed' }
       - name: Test native ledger lock and persistence contracts
         if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         shell: pwsh
@@ -769,6 +797,15 @@ jobs:
   # `Sandbox::wrap_direct_command` under hooks once compiled everywhere except
   # Windows. These rows compile the complete hooks test suites on Windows and
   # run the Windows-only trusted-hook tree termination test.
+      - name: Upload verified Windows Git sources
+        if: always() && env.MINI_AGENT_GIT_NATIVE_SOURCE_ROOT != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-git-sources-x86_64-pc-windows-msvc
+          path: ${{ env.MINI_AGENT_GIT_NATIVE_SOURCE_ROOT }}
+          if-no-files-found: error
+          retention-days: 7
+
   windows-hooks-compile:
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
@@ -784,6 +821,9 @@ jobs:
       RUST_MIN_STACK: 8388608
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
@@ -850,6 +890,15 @@ jobs:
           cargo test --locked \
             sandbox::sandbox_tests::workspace_gitfile_target_directory_cannot_be_renamed \
             -- --exact --ignored --nocapture
+          # Exercise the real Sandbox -> guarded host GitRunner boundary after
+          # absent/nested metadata is created, rather than a parser-only fixture.
+          native='git::runner::guarded_runtime_tests::native_sandbox_late_absent_and_nested_config_cannot_reach_host_git'
+          cargo test --locked --bin mini-agent "$native" -- --list \
+            | tee "$RUNNER_TEMP/guarded-git-native-list.txt"
+          rg --fixed-strings --line-regexp "$native: test" \
+            "$RUNNER_TEMP/guarded-git-native-list.txt"
+          cargo test --locked --bin mini-agent "$native" \
+            -- --exact --ignored --nocapture --test-threads=1
           # Hooks are not a default feature. script(1) gives the test process a
           # controlling terminal, so the hook's failing /dev/tty open is a real
           # proof that sandboxed hooks and workspace services start detached.
@@ -1265,6 +1314,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
@@ -1354,6 +1406,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1488,6 +1543,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1676,6 +1734,14 @@ jobs:
             throw "git archive failed with exit code $LASTEXITCODE"
           }
           Expand-Archive -LiteralPath $sourceArchive -DestinationPath $sourceRoot
+          # Transfer this job's already-built compiler input into the exact
+          # standard-user checkout before its existing ownership/ACL pass.
+          $gitRuntimeBundle = Join-Path $sourceRoot 'target\git-runtime-bundle'
+          New-Item -ItemType Directory -Path (Split-Path $gitRuntimeBundle) -Force | Out-Null
+          Copy-Item -LiteralPath $env:MINI_AGENT_GIT_RUNTIME_BUNDLE -Destination $gitRuntimeBundle -Recurse
+          if (-not (Test-Path -LiteralPath (Join-Path $gitRuntimeBundle 'bundle.manifest') -PathType Leaf)) {
+            throw 'standard-user Git compiler input was not copied'
+          }
 
           $toolchainCargo = (rustup which cargo).Trim()
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $toolchainCargo -PathType Leaf)) {
@@ -1826,6 +1892,7 @@ jobs:
             [Parameter(Mandatory)][string] $ProtectedExe,
             [Parameter(Mandatory)][string] $EvidenceRoot,
             [Parameter(Mandatory)][string] $BuildEnvironment,
+            [Parameter(Mandatory)][string] $GitRuntimeBundle,
             [Parameter(Mandatory)][string] $ExpectedAccount,
             [Parameter(Mandatory)][string] $UserHome,
             [Parameter(Mandatory)][string] $UserTemp
@@ -1891,6 +1958,14 @@ jobs:
           $env:PATH = "$ToolchainBin;$env:PATH"
           $env:CARGO_HOME = $CargoHome
           $env:CARGO_TARGET_DIR = Join-Path $SourceRoot 'target'
+          # This is an explicit bounded compiler input, restored only after
+          # the complete inherited-sensitive-environment rejection above.
+          $expectedGitBundle = Join-Path $SourceRoot 'target\git-runtime-bundle'
+          if ([System.IO.Path]::GetFullPath($GitRuntimeBundle) -ne [System.IO.Path]::GetFullPath($expectedGitBundle) -or
+              -not (Test-Path -LiteralPath (Join-Path $GitRuntimeBundle 'bundle.manifest') -PathType Leaf)) {
+            exit 14
+          }
+          $env:MINI_AGENT_GIT_RUNTIME_BUNDLE = $GitRuntimeBundle
           $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $CargoHome 'bin\mini-agent.exe'
           $env:MINI_AGENT_LPAC_PROTECTED_EXE = $ProtectedExe
           Set-Location $SourceRoot
@@ -2010,6 +2085,8 @@ jobs:
             (Quote-Argument $evidenceRoot),
             '-BuildEnvironment',
             (Quote-Argument $buildEnvironment),
+            '-GitRuntimeBundle',
+            (Quote-Argument $gitRuntimeBundle),
             '-ExpectedAccount',
             (Quote-Argument "$env:COMPUTERNAME\$userName"),
             '-UserHome',
@@ -2265,6 +2342,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prepare guarded Git runtime
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Use the durable macOS temporary root
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -2490,6 +2571,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prepare guarded Git runtime
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Use the durable macOS temporary root
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -2600,6 +2685,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prepare guarded Git runtime
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Use the durable macOS temporary root
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -2625,6 +2714,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/prepare-git-runtime
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0

@@ -214,6 +214,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
+    // Freeze operator Git source authority before hooks/MCP/project/model work.
+    // Git retains a closed diagnostic if capture fails; other modes can run.
+    startup::heap_future(|| git::global_snapshot::initialize(workspace.root())).await;
     if let Some(provider) = cli.login.as_deref() {
         if provider.eq_ignore_ascii_case("copilot") {
             anyhow::ensure!(

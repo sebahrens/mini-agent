@@ -89,6 +89,10 @@ fn repository_mutation_lock(repository_key: &Path) -> Arc<Mutex<()>> {
 pub(crate) struct GitRunner {
     program: Arc<PathBuf>,
     identity: Arc<crate::fs::CheckedMetadata>,
+    runtime: Option<Arc<super::runtime::GuardedRuntime>>,
+    captured_environment: Arc<Vec<(OsString, OsString)>>,
+    #[cfg(test)]
+    globals: Option<Arc<super::global_snapshot::GlobalSources>>,
     /// Whether internal commands also neutralise the executable
     /// configuration of repositories nested in the work tree (see
     /// [`GitRunner::probing_nested_repositories`]).
@@ -109,7 +113,9 @@ impl GitRunner {
     pub(crate) fn discover() -> Result<Self, String> {
         #[cfg(not(test))]
         {
-            Self::discover_cached(&CACHED_GIT_RUNNER)
+            CACHED_GIT_RUNNER
+                .get_or_init(Self::discover_guarded)
+                .clone()
         }
         #[cfg(test)]
         {
@@ -117,12 +123,57 @@ impl GitRunner {
         }
     }
 
+    pub(super) fn discover_guarded() -> Result<Self, String> {
+        let approval = super::runtime::bundled_approval()
+            .ok_or("publisher-approved Git runtime is unavailable in this build")?;
+        let paths = crate::paths::process_paths()
+            .map_err(|_| "guarded Git application paths are unavailable")?;
+        let mut roots = super::runtime::model_write_roots()?;
+        add_sandbox_cache_root(&mut roots, "runtime startup")?;
+        roots.push(
+            std::env::current_dir()
+                .map_err(|_| "guarded Git workspace is unavailable")?
+                .canonicalize()
+                .map_err(|_| "guarded Git workspace is unavailable")?,
+        );
+        let runtime = Arc::new(super::runtime::GuardedRuntime::materialize(
+            approval,
+            &paths.local_data_dir.join("git-runtime").join(approval.id),
+            &roots,
+        )?);
+        Self::from_runtime(runtime)
+    }
+
+    pub(super) fn from_runtime(
+        runtime: Arc<super::runtime::GuardedRuntime>,
+    ) -> Result<Self, String> {
+        let program = runtime.program().to_path_buf();
+        let identity = crate::fs::checked_path_metadata(&program)
+            .map_err(|_| "guarded Git executable identity is unavailable")?;
+        Ok(Self {
+            program: Arc::new(program),
+            identity: Arc::new(identity),
+            runtime: Some(runtime),
+            captured_environment: Arc::new(internal_git_environment(
+                InternalProfile::Network,
+                |name| std::env::var_os(name),
+            )),
+            nested_repositories: false,
+            #[cfg(all(test, unix))]
+            home_override: None,
+            #[cfg(test)]
+            globals: None,
+        })
+    }
+
+    #[cfg(test)]
     fn discover_cached(cache: &OnceLock<Result<Self, String>>) -> Result<Self, String> {
         cache
             .get_or_init(|| Self::discover_uncached(std::env::var_os("PATH").as_deref()))
             .clone()
     }
 
+    #[cfg(test)]
     fn discover_uncached(path: Option<&OsStr>) -> Result<Self, String> {
         let program = resolve_git_executable(path)
             .ok_or_else(|| "Git executable is unavailable or unsupported".to_string())?;
@@ -134,6 +185,10 @@ impl GitRunner {
         Ok(Self {
             program: Arc::new(program),
             identity: Arc::new(identity),
+            runtime: None,
+            captured_environment: Arc::new(Vec::new()),
+            #[cfg(test)]
+            globals: None,
             nested_repositories: false,
             #[cfg(all(test, unix))]
             home_override: None,
@@ -147,6 +202,10 @@ impl GitRunner {
         Ok(Self {
             program: Arc::new(PathBuf::new()),
             identity: Arc::new(identity),
+            runtime: None,
+            captured_environment: Arc::new(Vec::new()),
+            #[cfg(test)]
+            globals: None,
             nested_repositories: false,
             #[cfg(all(test, unix))]
             home_override: None,
@@ -186,6 +245,9 @@ impl GitRunner {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(runtime) = &self.runtime {
+            runtime.validate(&super::runtime::model_write_roots()?)?;
+        }
         if self.program.as_os_str().is_empty() {
             return Err("Git executable is unavailable or unsupported".to_string());
         }
@@ -245,6 +307,32 @@ impl GitRunner {
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
             .collect::<Vec<_>>();
+        if self.runtime.is_some() {
+            let mut roots = super::runtime::model_write_roots()?;
+            roots.push(
+                repo_path
+                    .canonicalize()
+                    .map_err(|_| "guarded Git repository root is unavailable")?,
+            );
+            let snapshot = {
+                #[cfg(test)]
+                if let Some(globals) = &self.globals {
+                    globals.select(self, repo_path, &roots).await?
+                } else {
+                    super::global_snapshot::capture(self, repo_path, &roots).await?
+                }
+                #[cfg(not(test))]
+                super::global_snapshot::capture(self, repo_path, &roots).await?
+            };
+            let mut command = self.build_internal_command(
+                repo_path,
+                args,
+                profile,
+                &hardened_config(profile, false),
+            );
+            self.configure_guarded_command(&mut command, &snapshot, &roots, profile)?;
+            return Ok(command);
+        }
         // `git init` must also work before there is a repository to ask for
         // its administration paths. Select this narrow case from the actual
         // argv, never from the caller's diagnostic operation label.
@@ -284,9 +372,26 @@ impl GitRunner {
         let mut command = Command::new(self.program.as_path());
         command.args(self.argv(repo_path, args));
         command.env_clear();
-        command.envs(internal_git_environment(profile, |name| {
-            std::env::var_os(name)
-        }));
+        if self.runtime.is_some() {
+            command.envs(internal_git_environment(profile, |name| {
+                self.captured_environment
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }));
+            command.env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+            command.env(
+                "GIT_EXEC_PATH",
+                self.guarded_runtime().expect("checked runtime").directory(),
+            );
+        } else {
+            command.envs(internal_git_environment(profile, |name| {
+                std::env::var_os(name)
+            }));
+        }
         #[cfg(all(test, unix))]
         if let Some(home) = self.home_override.as_ref() {
             command.env("HOME", home.as_path());
@@ -301,6 +406,227 @@ impl GitRunner {
         }
         configure_child_lifetime(&mut command);
         command
+    }
+
+    pub(super) async fn startup_untrusted_roots(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        self.untrusted_config_roots(workspace, "global source capture", true)
+            .await
+            .map_err(|_| {
+                "guarded Git startup repository/cache roots cannot be retained".to_string()
+            })
+    }
+
+    pub(super) fn guarded_runtime(&self) -> Result<&super::runtime::GuardedRuntime, String> {
+        self.runtime
+            .as_deref()
+            .ok_or_else(|| "publisher-approved Git runtime is unavailable".to_string())
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_globals(
+        mut self,
+        globals: super::global_snapshot::GlobalSources,
+    ) -> Self {
+        self.globals = Some(Arc::new(globals));
+        self
+    }
+
+    fn configure_guarded_command(
+        &self,
+        command: &mut Command,
+        snapshot: &super::global_snapshot::SelectedGlobals,
+        roots: &[PathBuf],
+        profile: InternalProfile,
+    ) -> Result<(), String> {
+        #[cfg(not(windows))]
+        let _ = profile;
+        let runtime = self.guarded_runtime()?;
+        runtime.validate(roots)?;
+        command
+            .env("GIT_REPO_CONFIG_POLICY", super::runtime::POLICY)
+            .env(super::global_snapshot::ENVIRONMENT, &snapshot.environment)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_EXEC_PATH", runtime.directory());
+        // Internal self/HTTP-helper dispatch resolves only the approved bundle.
+        // Trusted OS services may use PATH, excluding relative/model-write dirs.
+        let original = self
+            .captured_environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value);
+        let mut paths = vec![runtime.directory().to_path_buf()];
+        #[cfg(windows)]
+        if profile == InternalProfile::Network
+            && let Some(shell) = &snapshot.shell
+        {
+            let shell = shell.as_ref().map_err(Clone::clone)?;
+            shell.validate(roots)?;
+            // Pin shell lookup ahead of ambient PATH without replacing HOME or
+            // allowing the private Git program to choose an original Git binary.
+            paths.push(shell.directory().to_path_buf());
+        }
+        // The pinned UCRT64 build otherwise prepends HOME/bin before PATH when
+        // MSYSTEM is absent, defeating the retained shell's search priority.
+        #[cfg(windows)]
+        command.env("MSYSTEM", "UCRT64");
+        if let Some(original) = original {
+            for path in std::env::split_paths(original) {
+                if !path.is_absolute() {
+                    continue;
+                }
+                if let Ok(path) = path.canonicalize()
+                    && super::runtime::require_disjoint(&path, roots).is_ok()
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        command.env(
+            "PATH",
+            std::env::join_paths(paths)
+                .map_err(|_| "guarded Git service search path is unsupported")?,
+        );
+        super::global_snapshot::validate_environment(command)
+    }
+
+    /// Fixed, read-only parser query. It cannot execute a Git subcommand chosen
+    /// by project data; no model operation is dispatched through this seam.
+    pub(super) async fn snapshot_probe(
+        &self,
+        repository: &Path,
+        args: &[OsString],
+        input: Option<Vec<u8>>,
+        global: Option<&Path>,
+    ) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        if args.first().is_none_or(|arg| arg != "config") {
+            return Err("guarded Git parser operation is unsupported".into());
+        }
+        let mut command =
+            self.build_internal_command(repository, args, InternalProfile::Local, &[]);
+        command
+            .env_remove("GIT_REPO_CONFIG_POLICY")
+            .env_remove(super::global_snapshot::ENVIRONMENT)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0");
+        // Parsing explicit stdin does not read globals; selection uses solely
+        // the startup-captured mirror, including native repository conditions.
+        if let Some(global) = global {
+            command.env("GIT_CONFIG_GLOBAL", global);
+        } else {
+            command.env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        }
+        let sandbox = Sandbox::new(false, "git");
+        let output = match input {
+            Some(input) => {
+                sandbox
+                    .output_built_command_with_input_and_limits(command, input, QUERY_LIMITS)
+                    .await
+            }
+            None => {
+                sandbox
+                    .output_built_command_with_limits(command, QUERY_LIMITS)
+                    .await
+            }
+        }
+        .map_err(|_| "guarded Git parser process failed")?;
+        if output.status != CommandStatus::Completed
+            || !output.exit_status.is_some_and(|s| {
+                s.success() || (s.code() == Some(1) && args.iter().any(|arg| arg == "--get-regexp"))
+            })
+        {
+            return Err("guarded Git captured configuration could not be parsed".into());
+        }
+        Ok(output.stdout)
+    }
+
+    pub(super) async fn original_exec_path(&self, workspace: &Path) -> Result<PathBuf, String> {
+        let fallback = self.guarded_runtime()?.directory().to_path_buf();
+        let Some(program) = resolve_git_executable(std::env::var_os("PATH").as_deref()) else {
+            return Ok(fallback);
+        };
+        let mut roots = super::runtime::model_write_roots()?;
+        roots.push(workspace.to_path_buf());
+        super::runtime::require_disjoint(&program, &roots)?;
+        let before = crate::fs::checked_path_metadata(&program)
+            .map_err(|_| "original Git helper search authority is unavailable")?;
+        require_original_identity(&program, &before)?;
+        let mut command = Command::new(&program);
+        command
+            .arg("--exec-path")
+            .env_clear()
+            .envs(internal_git_environment(InternalProfile::Local, |name| {
+                std::env::var_os(name)
+            }));
+        configure_child_lifetime(&mut command);
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, QUERY_LIMITS)
+            .await
+            .map_err(|_| "original Git helper search query failed")?;
+        require_original_identity(&program, &before)?;
+        if output.status != CommandStatus::Completed
+            || !output.exit_status.is_some_and(|status| status.success())
+        {
+            return Err("original Git helper search query failed".into());
+        }
+        let path = output
+            .stdout
+            .strip_suffix(b"\n")
+            .filter(|path| !path.is_empty() && !path.contains(&b'\n'))
+            .ok_or("original Git helper search query is malformed")?;
+        Ok(output_path_bytes(path))
+    }
+
+    #[cfg(windows)]
+    pub(super) fn capture_original_shell(
+        &self,
+        roots: &[PathBuf],
+    ) -> Result<Arc<super::runtime::TrustedShell>, String> {
+        let path = self
+            .captured_environment
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_os_str());
+        let original = resolve_git_executable(path)
+            .ok_or("approved global Git services require an original Git-for-Windows shell")?;
+        super::runtime::require_disjoint(&original, roots)?;
+        let parent = original
+            .parent()
+            .ok_or("original Git installation is unsupported")?;
+        let name = parent
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        let root = if name.eq_ignore_ascii_case("cmd") {
+            parent.parent()
+        } else if name.eq_ignore_ascii_case("bin") {
+            let prefix = parent
+                .parent()
+                .ok_or("original Git installation is unsupported")?;
+            if prefix
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| {
+                    ["mingw32", "mingw64", "ucrt64"]
+                        .iter()
+                        .any(|expected| name.eq_ignore_ascii_case(expected))
+                })
+            {
+                prefix.parent()
+            } else {
+                Some(prefix)
+            }
+        } else {
+            None
+        }
+        .ok_or("approved global Git services require an original Git-for-Windows shell")?;
+        super::runtime::TrustedShell::capture(&root.join("usr/bin"), roots)
     }
 
     /// Lists every command-executing key the configuration sets, with its
@@ -1108,6 +1434,16 @@ fn output_path(bytes: &[u8]) -> PathBuf {
     {
         PathBuf::from(String::from_utf8_lossy(&bytes[..end]).into_owned())
     }
+}
+
+fn require_original_identity(
+    program: &Path,
+    before: &crate::fs::CheckedMetadata,
+) -> Result<(), String> {
+    let current = crate::fs::checked_path_metadata(program)
+        .map_err(|_| "original Git helper search executable changed")?;
+    crate::fs::ensure_same_file(program, before, &current)
+        .map_err(|_| "original Git helper search executable changed".to_string())
 }
 
 /// What a host-side Git command may reach beyond the local repository.
@@ -2604,5 +2940,291 @@ mod configuration_encoding_tests {
             !fixture.repo.join(".git/index").exists(),
             "refused add mutated the index"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+#[path = "windows_runtime_tests.rs"]
+mod windows_runtime_tests;
+
+#[cfg(all(test, unix))]
+mod guarded_runtime_tests {
+    use super::super::global_snapshot::{GlobalSources, SnapshotDirectory};
+    use super::*;
+
+    async fn fixture_runner(
+        root: &Path,
+        project: &Path,
+        global: Vec<PathBuf>,
+        helpers: Option<&Path>,
+    ) -> GitRunner {
+        let runtime = super::super::runtime::GuardedRuntime::materialize(
+            super::super::runtime::bundled_approval().expect("test requires approved bundle"),
+            &root.join("runtime"),
+            &[],
+        )
+        .unwrap();
+        let runner = GitRunner::from_runtime(Arc::new(runtime)).unwrap();
+        let sources = GlobalSources::capture_roots(&runner, project, global, helpers)
+            .await
+            .unwrap();
+        runner.with_test_globals(sources)
+    }
+
+    fn shell_path(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_original_execpath_shorthand_uses_actual_bundled_http_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let owned = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let root = owned.path();
+        let project = root.join("project");
+        let operator = root.join("operator");
+        let execpath = operator.join("original-execpath");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&execpath).unwrap();
+        let marker = operator.join("helper-invocations");
+        let helper = execpath.join("git-credential-inert-probe");
+        std::fs::write(&helper, format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nprintf 'username=probe\\npassword=fixture-only\\n'\n", shell_path(&marker))).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let global = operator.join("config");
+        std::fs::write(&global, "[credential]\nhelper = inert-probe\n[user]\nname = Approved\nemail = approved@example.invalid\n").unwrap();
+        let runner = fixture_runner(root, &project, vec![global], Some(&execpath)).await;
+        runner
+            .run(&project, "init", ["init", "--quiet"], QUERY_LIMITS)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/fixture.git",
+            listener.local_addr().unwrap().port()
+        );
+        runner
+            .run(
+                &project,
+                "config",
+                ["config", "remote.origin.url", &url],
+                QUERY_LIMITS,
+            )
+            .await
+            .unwrap();
+        let (done, mut retired) = tokio::sync::oneshot::channel::<()>();
+        let server = async {
+            let mut unauthenticated = 0;
+            let mut authorized = 0;
+            loop {
+                let accepted = tokio::select! { _ = &mut retired => break, accepted = listener.accept() => accepted };
+                let (mut stream, _) = accepted.unwrap();
+                let mut request = Vec::new();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192);
+                        let mut byte = [0];
+                        if stream.read(&mut byte).await.unwrap() == 0 {
+                            break;
+                        }
+                        request.push(byte[0]);
+                    }
+                })
+                .await
+                .unwrap();
+                let request = String::from_utf8(request).unwrap();
+                let auth = request
+                    .to_ascii_lowercase()
+                    .contains("authorization: basic chjvymu6zml4dhvyzs1vbmx5");
+                let response = if !auth {
+                    unauthenticated += 1;
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"inert-fixture\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    authorized += 1;
+                    let body = if request.lines().next().unwrap().contains("/HEAD ") {
+                        "ref: refs/heads/main\n"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            (unauthenticated, authorized)
+        };
+        let client = async {
+            let result = runner
+                .run_network(&project, "ls-remote", ["ls-remote", "origin"], QUERY_LIMITS)
+                .await;
+            let _ = done.send(());
+            result
+        };
+        let (result, (unauthenticated, authorized)) = tokio::join!(client, server);
+        result.unwrap();
+        assert!(
+            unauthenticated > 0 && authorized > 0,
+            "actual helper must answer the loopback HTTP challenge"
+        );
+        assert!(
+            std::fs::read_to_string(&marker)
+                .unwrap()
+                .lines()
+                .any(|line| line == "get")
+        );
+        // A later executable-transport selector remains rejected even though
+        // benign local remote.origin.url was used by the successful request.
+        runner
+            .run(
+                &project,
+                "config",
+                ["config", "remote.origin.vcs", "inert-probe"],
+                QUERY_LIMITS,
+            )
+            .await
+            .unwrap();
+        assert!(
+            runner
+                .run_network(&project, "ls-remote", ["ls-remote", "origin"], QUERY_LIMITS)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "requires the native general-process sandbox backend"]
+    async fn native_sandbox_late_absent_and_nested_config_cannot_reach_host_git() {
+        let owned = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let root = owned.path();
+        let operator = root.join("operator");
+        std::fs::create_dir(&operator).unwrap();
+        let global = operator.join("config");
+        std::fs::write(
+            &global,
+            "[user]\nname = Approved\nemail = approved@example.invalid\n",
+        )
+        .unwrap();
+        let project = root.join("absent");
+        std::fs::create_dir(&project).unwrap();
+        let runner = fixture_runner(root, &project, vec![global], None).await;
+        let backend = if cfg!(target_os = "linux") {
+            "bwrap"
+        } else {
+            "seatbelt"
+        };
+        for name in ["absent", "nested"] {
+            let outer = root.join(name);
+            if !outer.exists() {
+                std::fs::create_dir(&outer).unwrap();
+            }
+            let repository = if name == "nested" {
+                runner
+                    .run(&outer, "init", ["init", "--quiet"], QUERY_LIMITS)
+                    .await
+                    .unwrap();
+                let nested = outer.join("new-repository");
+                std::fs::create_dir(&nested).unwrap();
+                nested
+            } else {
+                outer.clone()
+            };
+            let marker = operator.join(format!("{name}-host-effect"));
+            // Prepare before the model creates metadata: this is the precise
+            // probe-to-launch race, with actual production guarded argv/env.
+            let command = runner
+                .internal_command(
+                    &repository,
+                    "add",
+                    ["add", "--", "payload"],
+                    InternalProfile::Local,
+                )
+                .await
+                .unwrap();
+            let clean = format!("touch {}; cat", shell_path(&marker));
+            let clean = format!("'{}'", clean.replace('\'', "'\\''"));
+            let script = format!(
+                "set -eu\ngit -C {} init -q\ngit -C {} config filter.late-arbitrary.clean {}\nprintf '* filter=late-arbitrary\\n' > {}/.gitattributes\nprintf 'untrusted payload\\n' > {}/payload\n",
+                shell_path(&repository),
+                shell_path(&repository),
+                clean,
+                shell_path(&repository),
+                shell_path(&repository)
+            );
+            let sandbox = Sandbox::new(true, backend).with_working_dir(&outer);
+            let output = sandbox
+                .output_command_with_limits(&script, LOCAL_MUTATION_LIMITS)
+                .await
+                .unwrap();
+            assert_eq!(
+                output.status,
+                CommandStatus::Completed,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.exit_status.is_some_and(|status| status.success()),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(repository.join(".git/config").is_file());
+            let output = Sandbox::new(false, "git")
+                .output_built_command_with_limits(command, LOCAL_MUTATION_LIMITS)
+                .await
+                .unwrap();
+            assert_eq!(output.status, CommandStatus::Completed);
+            assert!(output.exit_status.is_some_and(|status| !status.success()));
+            assert!(!marker.exists(), "repository command escaped to host Git");
+            assert!(
+                !repository.join(".git/index").exists(),
+                "denied host add modified index"
+            );
+        }
+        let ordinary = root.join("ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        runner
+            .run(&ordinary, "init", ["init", "--quiet"], QUERY_LIMITS)
+            .await
+            .unwrap();
+        let sandbox = Sandbox::new(true, backend).with_working_dir(&ordinary);
+        let output = sandbox
+            .output_command_with_limits("printf 'ordinary\\n' > payload", LOCAL_MUTATION_LIMITS)
+            .await
+            .unwrap();
+        assert!(output.exit_status.is_some_and(|status| status.success()));
+        runner
+            .run(
+                &ordinary,
+                "add",
+                ["add", "--", "payload"],
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .unwrap();
+        runner
+            .run(
+                &ordinary,
+                "commit",
+                ["commit", "-qm", "ordinary"],
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .unwrap();
+        runner
+            .run(
+                &ordinary,
+                "update-ref",
+                ["update-ref", "refs/heads/proof", "HEAD"],
+                QUERY_LIMITS,
+            )
+            .await
+            .unwrap();
+        let output = runner
+            .run(&ordinary, "show", ["show", "proof:payload"], QUERY_LIMITS)
+            .await
+            .unwrap();
+        assert_eq!(output.stdout, b"ordinary\n");
     }
 }

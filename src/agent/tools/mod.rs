@@ -805,6 +805,9 @@ pub(crate) async fn check_perm_path_with_suggestion(
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
 ) -> Result<Option<String>, ToolError> {
+    if matches!(tool, "write" | "edit" | "notebook_edit") {
+        crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
+    }
     let Some(perm) = permission else {
         return Ok(None);
     };
@@ -922,6 +925,9 @@ pub(crate) async fn check_perm_bound_path(
     let logical = logical
         .to_str()
         .ok_or_else(|| ToolError::Msg("bound workspace path is not valid UTF-8".to_string()))?;
+    if matches!(tool, "write" | "edit" | "notebook_edit") {
+        crate::git::runtime::check_model_write(Path::new(logical)).map_err(ToolError::Msg)?;
+    }
     let Some(perm) = permission else {
         return Ok(None);
     };

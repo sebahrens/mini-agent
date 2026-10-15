@@ -4,3 +4,6 @@
 pub(crate) mod runner;
 #[cfg(any(test, feature = "git-worktree"))]
 pub(crate) mod tool;
+
+pub(crate) mod global_snapshot;
+pub(crate) mod runtime;

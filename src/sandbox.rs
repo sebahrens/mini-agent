@@ -113,6 +113,8 @@ pub struct Sandbox {
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
     workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
+    /// Retained by cloned Sandbox owners through existing process retirement.
+    git_write_roots: Arc<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>,
     windows_appcontainer_read_roots: Vec<PathBuf>,
     windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
@@ -1518,6 +1520,56 @@ impl Sandbox {
         None
     }
 
+    /// Account for the actual grants before publishing a model command. The
+    /// Sandbox owner and its existing worker clone retain these capabilities;
+    /// runtime accounting itself holds only weak references.
+    fn retain_git_write_roots(&self, cwd: &Path) -> Result<(), String> {
+        crate::git::global_snapshot::mark_effects_started();
+        if !self.enabled {
+            return Ok(());
+        }
+        let mut paths = vec![
+            canonical_non_root(cwd, "sandbox write root")?,
+            self.get_cached_cache_dir()?.as_ref().clone(),
+        ];
+        #[cfg(windows)]
+        paths.extend(self.windows_appcontainer_write_roots.iter().cloned());
+        #[cfg(not(windows))]
+        let _ = &mut paths;
+        let mut retained = self
+            .git_write_roots
+            .lock()
+            .map_err(|_| "sandbox Git write-root authority is unavailable")?;
+        for path in paths {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| "sandbox Git write-root authority cannot be resolved")?;
+            if let Some(old) = retained.iter().find(|old| old.root() == canonical) {
+                old.validate()?;
+                crate::git::runtime::record_model_root(old)?;
+                continue;
+            }
+            if retained.len() >= 256 {
+                return Err("sandbox Git write-root count exceeds its bound".into());
+            }
+            let binding = if let Some(workspace) = self
+                .workspace_binding
+                .as_ref()
+                .filter(|root| root.root() == canonical)
+            {
+                workspace.clone()
+            } else {
+                Arc::new(
+                    crate::paths::WorkspaceBinding::capture(&canonical)
+                        .map_err(|_| "sandbox Git write-root authority cannot be retained")?,
+                )
+            };
+            crate::git::runtime::record_model_root(&binding)?;
+            retained.push(binding);
+        }
+        Ok(())
+    }
+
     /// Canonical workspace path for the Seatbelt profile's write grant and
     /// for discovering the workspace Git metadata that stays read-only.
     ///
@@ -1559,6 +1611,7 @@ impl Sandbox {
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             working_dir: None,
             workspace_binding: None,
+            git_write_roots: Arc::new(Mutex::new(Vec::new())),
             windows_appcontainer_read_roots: Vec::new(),
             windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
@@ -1588,6 +1641,7 @@ impl Sandbox {
         read_roots: Vec<PathBuf>,
         write_roots: Vec<PathBuf>,
     ) -> Self {
+        self.git_write_roots = Arc::new(Mutex::new(Vec::new()));
         self.windows_appcontainer_read_roots = read_roots;
         self.windows_appcontainer_write_roots = write_roots;
         self
@@ -1928,6 +1982,7 @@ impl Sandbox {
     /// Set the workspace used as the child CWD and sandbox write root.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.git_write_roots = Arc::new(Mutex::new(Vec::new()));
         self.working_dir = Some(working_dir.into());
         self
     }
@@ -1945,6 +2000,15 @@ impl Sandbox {
         mut self,
         workspace: Arc<crate::paths::WorkspaceBinding>,
     ) -> Self {
+        if self
+            .workspace_binding
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, &workspace))
+        {
+            // Older worker/service clones retain the old grant set. The new
+            // context must release it once those actual owners have retired.
+            self.git_write_roots = Arc::new(Mutex::new(Vec::new()));
+        }
         self.working_dir = Some(workspace.root().to_path_buf());
         self.workspace_binding = Some(workspace);
         self
@@ -2101,6 +2165,7 @@ impl Sandbox {
             .map(Ok)
             .unwrap_or_else(|| canonical_non_root(&requested_cwd, "working directory"))?;
         let workspace_root = self.canonical_workspace_root(&requested_cwd)?;
+        self.retain_git_write_roots(&requested_cwd)?;
         let cache_dir = self.get_cached_cache_dir()?;
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
@@ -2143,6 +2208,7 @@ impl Sandbox {
             .map(Ok)
             .unwrap_or_else(std::env::current_dir)
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
+        self.retain_git_write_roots(&requested_cwd)?;
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
@@ -2326,6 +2392,7 @@ impl Sandbox {
             return Ok(cmd);
         }
 
+        self.retain_git_write_roots(&cwd)?;
         let cache_dir = self.get_cached_cache_dir()?;
 
         if self.backend == "seatbelt" {
@@ -2484,6 +2551,7 @@ impl Sandbox {
 
         let cwd = canonical_non_root(cwd, "workspace-service working directory")?;
         let cache_dir = self.get_cached_cache_dir()?;
+        self.retain_git_write_roots(&cwd)?;
 
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
@@ -2702,6 +2770,7 @@ impl Sandbox {
             "working directory",
         )?;
         let cache_dir = self.get_cached_cache_dir()?;
+        self.retain_git_write_roots(&cwd)?;
         windows::build_direct_helper(
             program,
             arguments,
@@ -3301,7 +3370,6 @@ impl Sandbox {
         })
     }
 
-    #[cfg(any(feature = "git-worktree", test))]
     pub(crate) async fn output_built_command_with_input_and_limits(
         &self,
         cmd: impl Into<ExecutionCommand>,
@@ -4877,6 +4945,50 @@ fn validate_macos_runtime_cache(
 
 #[cfg(test)]
 mod sandbox_tests {
+    #[test]
+    fn git_write_root_rebind_retains_old_owner_then_releases_directory() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let owned = Owned(
+            std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("git-owner-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&owned.0).unwrap();
+        let first = owned.0.join("first");
+        let second = owned.0.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let first_binding = Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap());
+        let first_sandbox =
+            Sandbox::new(true, "bwrap").with_workspace_binding(first_binding.clone());
+        first_sandbox.retain_git_write_roots(&first).unwrap();
+        let old_owner = first_sandbox.clone();
+        let second_binding = Arc::new(crate::paths::WorkspaceBinding::capture(&second).unwrap());
+        let current = first_sandbox.with_workspace_binding(second_binding);
+        current.retain_git_write_roots(&second).unwrap();
+        assert!(
+            crate::git::runtime::model_write_roots()
+                .unwrap()
+                .contains(&first)
+        );
+        drop(first_binding);
+        drop(old_owner);
+        std::fs::rename(&first, owned.0.join("retired")).unwrap();
+        let roots = crate::git::runtime::model_write_roots().unwrap();
+        assert!(
+            !roots.contains(&first),
+            "retired context must not retain an obsolete grant"
+        );
+        assert!(roots.contains(&second));
+        drop(current);
+    }
+
     use super::*;
 
     #[cfg(unix)]

@@ -1,0 +1,6 @@
+FROM alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+RUN apk add --no-cache build-base linux-headers python3 patch xz pkgconf ca-certificates mbedtls-dev mbedtls-static zlib-dev zlib-static brotli-dev brotli-static libidn2-dev libidn2-static libpsl-dev libpsl-static nghttp2-dev nghttp2-static zstd-dev zstd-static libunistring-dev libunistring-static
+COPY curl-8.23.0.tar.xz /tmp/curl-8.23.0.tar.xz
+RUN echo '8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5  /tmp/curl-8.23.0.tar.xz' | sha256sum -c - && tar -xJf /tmp/curl-8.23.0.tar.xz -C /tmp && cd /tmp/curl-8.23.0 && ./configure --prefix=/opt/mini-agent-curl --disable-shared --enable-static --without-openssl --with-mbedtls --disable-ldap --disable-ldaps --without-libssh2 --without-libssh --without-librtmp --without-gssapi --without-gsasl --disable-manual --disable-docs --disable-dependency-tracking --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --without-ca-path --with-libidn2 --with-brotli --with-zstd --with-nghttp2 --with-libpsl && make -j8 && make install && rm -rf /tmp/curl-8.23.0 /tmp/curl-8.23.0.tar.xz
+ENV PATH=/opt/mini-agent-curl/bin:$PATH
+ENV PKG_CONFIG_PATH=/opt/mini-agent-curl/lib/pkgconfig

@@ -21,9 +21,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import stat
 import re
 import subprocess
 import sys
+import tarfile
+import io
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -47,6 +51,153 @@ PACKAGE_LINE = re.compile(r"^Package: (?P<name>\S+) (?P<version>\S+)$")
 SPDX_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
 SPDX_OPERATORS = frozenset({"AND", "OR", "WITH"})
 MAX_LICENSE_FILE_BYTES = 1024 * 1024
+GIT_SOURCE_SHA256 = "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3"
+GIT_POLICY_SHA256 = "3138c02584ea00a7234eef01366b0ca5757c0b5e4f28b4878381544b0b0e97b2"
+NATIVE_FORMAT = "mini-agent-native-components/1"
+NATIVE_LINE = re.compile(r"^Native-Component: (?P<name>\S+) (?P<version>\S+)$")
+
+
+def checked_native_asset(root: Path, item: Mapping[str, Any], limit: int) -> Path:
+    if not isinstance(item, dict) or set(item) != {"path", "sha256"} or not isinstance(item["path"], str) or "\\" in item["path"]:
+        raise InventoryError("invalid native source/notice asset")
+    path = Path(item["path"])
+    if path.is_absolute() or not path.parts or any(part in {".", ".."} for part in path.parts):
+        raise InventoryError("native asset must use a relative contained path")
+    current = root
+    for part in path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise InventoryError("native assets cannot traverse symlinks")
+    if not re.fullmatch(r"[a-f0-9]{64}", str(item["sha256"])):
+        raise InventoryError("native asset has an invalid SHA-256")
+    if not stat.S_ISREG(current.stat().st_mode):
+        raise InventoryError("native asset must be a regular file")
+    with current.open("rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise InventoryError("native asset is not a bounded regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while block := stream.read(1024 * 1024):
+            total += len(block)
+            if total > limit:
+                raise InventoryError("native asset exceeds size bound")
+            digest.update(block)
+    if digest.hexdigest() != item["sha256"]:
+        raise InventoryError("native source/notice hash mismatch")
+    return current
+
+
+def load_native_record(path: Path, target: str, bundle: Path | None = None) -> list[dict[str, Any]]:
+    if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > 1024 * 1024:
+        raise InventoryError("native component record is not bounded regular input")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise InventoryError("duplicate native component record key")
+            result[key] = value
+        return result
+    with path.open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise InventoryError("native component record exceeds bound")
+    record = json.loads(raw, object_pairs_hook=unique)
+    if not isinstance(record, dict) or set(record) != {"format", "target", "bundle_manifest_sha256", "components"} or record["format"] != NATIVE_FORMAT or record["target"] != target:
+        raise InventoryError("native component record format/target mismatch")
+    if not re.fullmatch(r"[a-f0-9]{64}", str(record["bundle_manifest_sha256"])):
+        raise InventoryError("native component record lacks bundle binding")
+    components = record["components"]
+    if not isinstance(components, list) or not 1 <= len(components) <= 128:
+        raise InventoryError("native component count is invalid")
+    seen, covered = set(), {}
+    total_source_bytes = 0
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {"name", "version", "license", "source_url", "bundled_files", "license_files", "source_files"}:
+            raise InventoryError("invalid native component fields")
+        for key in ("name", "version"):
+            if not isinstance(component[key], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+:-]{0,127}", component[key]):
+                raise InventoryError("invalid native component identity")
+        identity = component["name"], component["version"]
+        if identity in seen:
+            raise InventoryError("duplicate native component identity")
+        seen.add(identity)
+        if not isinstance(component["license"], str) or not 1 <= len(component["license"]) <= 512 or any(c in component["license"] for c in "\r\n"):
+            raise InventoryError("invalid native component license declaration")
+        if not isinstance(component["source_url"], str) or not component["source_url"].startswith("https://") or any(c in component["source_url"] for c in "\r\n"):
+            raise InventoryError("native component requires an HTTPS source origin")
+        for key, limit in (("license_files", MAX_LICENSE_FILE_BYTES), ("source_files", 256 * 1024 * 1024)):
+            assets = component[key]
+            if not isinstance(assets, list) or not 1 <= len(assets) <= 128:
+                raise InventoryError("native component requires bounded notices and actual source files")
+            for asset in assets:
+                checked = checked_native_asset(path.parent, asset, limit)
+                total_source_bytes += checked.stat().st_size
+                if total_source_bytes > 2 * 1024 * 1024 * 1024:
+                    raise InventoryError("native source/notice set exceeds total size bound")
+        if not isinstance(component["bundled_files"], list) or len(component["bundled_files"]) > 125:
+            raise InventoryError("invalid native DLL coverage list")
+        for item in component["bundled_files"]:
+            if not isinstance(item, dict) or set(item) != {"name", "sha256"} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}", str(item["name"])) or not re.fullmatch(r"[a-f0-9]{64}", str(item["sha256"])) or item["name"].lower() in covered:
+                raise InventoryError("invalid/duplicate native file coverage")
+            covered[item["name"].lower()] = item["sha256"]
+    if bundle is not None:
+        with (bundle / "bundle.manifest").open("rb") as stream:
+            manifest = stream.read(64 * 1024 + 1)
+        if len(manifest) > 64 * 1024 or hashlib.sha256(manifest).hexdigest() != record["bundle_manifest_sha256"]:
+            raise InventoryError("native record does not bind this runtime bundle")
+        lines = manifest.decode().splitlines()
+        if f"target={target}" not in lines[:5]:
+            raise InventoryError("runtime bundle target mismatch")
+        libraries = {}
+        for line in lines[5:]:
+            fields = line.split("\t")
+            if len(fields) != 3 or not fields[0].startswith("file="):
+                raise InventoryError("invalid runtime bundle inventory")
+            if fields[2] == "r":
+                name = fields[0][5:]
+                if name.lower() in libraries:
+                    raise InventoryError("duplicate runtime library inventory")
+                checked_native_asset(bundle, {"path": name, "sha256": fields[1]}, 64 * 1024 * 1024)
+                libraries[name.lower()] = fields[1]
+        if libraries != covered:
+            raise InventoryError("native source/notice record omits or adds runtime DLLs")
+    return components
+
+
+def git_component(root: Path) -> dict[str, Any] | None:
+    archive = root / "scripts/git-runtime/git-2.56.0.tar.xz"
+    if not archive.exists():
+        if (root / "scripts/build-git-runtime.py").exists():
+            raise InventoryError("pinned Git archive is missing")
+        return None  # Legacy source trees without the embedded Git producer.
+    with archive.open("rb") as source:
+        raw = source.read(32 * 1024 * 1024 + 1)
+    policy = root / "scripts/git-runtime/policy.patch"
+    with policy.open("rb") as source:
+        policy_bytes = source.read(1024 * 1024 + 1)
+    if len(raw) > 32 * 1024 * 1024 or len(policy_bytes) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != GIT_SOURCE_SHA256 or hashlib.sha256(policy_bytes).hexdigest() != GIT_POLICY_SHA256:
+        raise InventoryError("pinned Git source/policy bytes do not match")
+    notices = []
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:xz") as source:
+        members = source.getmembers()
+        if len(members) > 10000:
+            raise InventoryError("Git source archive exceeds member bound")
+        for member in members:
+            if member.isfile() and LICENSE_FILE.match(Path(member.name).name):
+                if member.size > MAX_LICENSE_FILE_BYTES or len(notices) >= 128:
+                    raise InventoryError("Git notice files exceed bounds")
+                text = source.extractfile(member).read().decode("utf-8", errors="replace")
+                notices.append((member.name, text.replace("\r\n", "\n").replace("\r", "\n").strip("\n") + "\n"))
+    return {"name": "git", "version": "2.56.0", "license": "GPL-2.0-only (additional component licenses reproduced below)", "source_url": "https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz", "notices": notices}
+
+
+def metadata_native_root(metadata: Mapping[str, Any]) -> Path | None:
+    identifier = metadata.get("resolve", {}).get("root")
+    for package in metadata.get("packages", []):
+        if package.get("id") == identifier:
+            return Path(package["manifest_path"]).parent
+    return None
 
 
 class InventoryError(ValueError):
@@ -208,6 +359,7 @@ def render(
     target: str,
     no_default_features: bool,
     texts_root: Path = CANONICAL_TEXTS,
+    native_components: list[dict[str, Any]] | None = None,
 ) -> str:
     packages = resolved_packages(metadata)
     if not packages:
@@ -250,6 +402,28 @@ def render(
         lines.extend(references)
         entries.append("\n".join(lines))
 
+    if native_components is None:
+        native_root = metadata_native_root(metadata)
+        git = git_component(native_root) if native_root is not None else None
+        native_components = [git] if git else []
+    native_entries = []
+    for component in native_components:
+        references = []
+        for name, text in component["notices"]:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            identifier = text_ids.get(digest)
+            if identifier is None:
+                identifier = f"T{len(texts) + 1:04d}"
+                text_ids[digest] = identifier
+                texts.append((identifier, text))
+            references.append(f"  {name}: [{identifier}]")
+        native_entries.append("\n".join([
+            f"Native-Component: {component['name']} {component['version']}",
+            f"License: {component['license']}",
+            f"Source: {component['source_url']}",
+            "License files:", *references,
+        ]))
+
     features = "--no-default-features" if no_default_features else "default"
     header = [
         HEADER,
@@ -262,7 +436,8 @@ def render(
         "",
         "mini-agent itself is licensed under GPL-3.0-only (see LICENSE); NOTICE",
         "records its provenance and the non-Cargo components embedded in the",
-        "executable (QuickJS through rquickjs-sys, and AJV).",
+        "executable (QuickJS through rquickjs-sys, and AJV). Native Git and",
+        "redistributed native-library notices are listed separately below.",
         "",
         "This file lists every package of the locked Cargo dependency resolution",
         "for the target and feature set above, including build-time tools and",
@@ -275,6 +450,8 @@ def render(
     ]
     body = ["Packages", "--------", ""]
     body.append("\n\n".join(entries))
+    if native_entries:
+        body += ["", "", "Native components (not Cargo packages)", "--------------------------------------", "", "\n\n".join(native_entries)]
     body += ["", "", "License texts", "-------------", ""]
     for identifier, text in texts:
         body.append(f"===== [{identifier}] =====")
@@ -293,10 +470,14 @@ def parse_inventory(text: str) -> dict[str, Any]:
             raise InventoryError(f"malformed THIRD_PARTY_LICENSES header line {line!r}")
         fields[key] = value
     packages: set[tuple[str, str]] = set()
+    native: set[tuple[str, str]] = set()
     for line in lines:
         match = PACKAGE_LINE.fullmatch(line)
         if match:
             packages.add((match.group("name"), match.group("version")))
+        match = NATIVE_LINE.fullmatch(line)
+        if match:
+            native.add((match.group("name"), match.group("version")))
     if not packages:
         raise InventoryError("THIRD_PARTY_LICENSES names no packages")
     if fields.get("Packages") != str(len(packages)):
@@ -307,6 +488,7 @@ def parse_inventory(text: str) -> dict[str, Any]:
         "target": fields.get("Target"),
         "features": fields.get("Features"),
         "packages": packages,
+        "native_components": native,
     }
 
 
@@ -316,6 +498,7 @@ def verify_inventory(
     *,
     target: str,
     no_default_features: bool,
+    native_components: list[dict[str, Any]] | None = None,
 ) -> int:
     """Require the inventory to name every package of the target's resolution."""
 
@@ -337,6 +520,13 @@ def verify_inventory(
         raise InventoryError(
             f"THIRD_PARTY_LICENSES omits {len(missing)} resolved package(s): {shown}"
         )
+    if native_components is None:
+        root = metadata_native_root(metadata)
+        git = git_component(root) if root is not None else None
+        native_components = [git] if git else []
+    missing_native = {(item["name"], item["version"]) for item in native_components} - inventory["native_components"]
+    if missing_native:
+        raise InventoryError(f"THIRD_PARTY_LICENSES omits native component(s): {sorted(missing_native)}")
     return len(expected)
 
 
@@ -348,6 +538,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         command.add_argument("--root", type=Path, default=ROOT)
         command.add_argument("--target", required=True)
         command.add_argument("--no-default-features", action="store_true")
+        command.add_argument("--native-record", type=Path, default=Path(os.environ["MINI_AGENT_GIT_NATIVE_RECORD"]) if os.environ.get("MINI_AGENT_GIT_NATIVE_RECORD") else None, help="verified source/notice record for this target's actual redistributed native dependencies")
+        command.add_argument("--git-runtime-bundle", type=Path, default=Path(os.environ["MINI_AGENT_GIT_RUNTIME_BUNDLE"]) if os.environ.get("MINI_AGENT_GIT_RUNTIME_BUNDLE") else None, help="bind native DLL coverage to this actual runtime bundle")
         if name == "generate":
             command.add_argument("--output", type=Path, required=True)
         else:
@@ -363,17 +555,28 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             no_default_features=args.no_default_features,
         )
+        native = []
+        git = git_component(args.root)
+        if git:
+            native.append(git)
+        if args.native_record:
+            for component in load_native_record(args.native_record, args.target, args.git_runtime_bundle):
+                native.append({**component, "notices": [(asset["path"], _read_text(checked_native_asset(args.native_record.parent, asset, MAX_LICENSE_FILE_BYTES))) for asset in component["license_files"]]})
+        elif git and ("musl" in args.target or "windows" in args.target) and args.command == "generate":
+            raise InventoryError("Windows/static-musl native dependencies require an actual --native-record; Cargo metadata is insufficient")
         if args.command == "generate":
             document = render(
                 metadata,
                 target=args.target,
                 no_default_features=args.no_default_features,
+                native_components=native,
             )
             verify_inventory(
                 document,
                 metadata,
                 target=args.target,
                 no_default_features=args.no_default_features,
+                native_components=native,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(document, encoding="utf-8", newline="\n")
@@ -386,9 +589,10 @@ def main(argv: list[str] | None = None) -> int:
                 metadata,
                 target=args.target,
                 no_default_features=args.no_default_features,
+                native_components=native,
             )
             print(f"{args.inventory} names all {count} resolved packages")
-    except (InventoryError, OSError, UnicodeDecodeError) as error:
+    except (InventoryError, OSError, UnicodeDecodeError, json.JSONDecodeError, tarfile.TarError) as error:
         print(f"third-party license inventory failed: {error}", file=sys.stderr)
         return 1
     return 0
