@@ -232,6 +232,14 @@ sha2 = "0.11"
 opt-level = 0
 debug = false
 
+# Dependencies carry the TUI's per-frame text, terminal and serialization work
+# (pulldown-cmark, unicode-width, regex, crossterm, serde_json, tokio). The
+# installed development binary runs them optimized; mini-agent itself stays at
+# opt-level 0 so incremental rebuilds and debugging are unchanged. Explicit
+# per-package entries below still take precedence.
+[profile.dev.package."*"]
+opt-level = 1
+
 # Rig 0.40 aggregates run-level Usage with unchecked arithmetic before it
 # yields each CompletionCall. Let that private aggregate wrap in debug builds;
 # mini-agent accounts from the exact per-call events with saturating arithmetic.
@@ -257,8 +265,10 @@ opt-level = 3
 [profile.dev.package.anndists]
 opt-level = 3
 
+# Speed over size: the release binary runs the same text-heavy render path on
+# every frame; thin LTO and one codegen unit keep the size increase modest.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
