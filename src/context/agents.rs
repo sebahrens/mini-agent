@@ -63,7 +63,7 @@ impl AgentTool {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Read => "read",
             Self::Grep => "grep",
@@ -430,6 +430,15 @@ pub(crate) fn parse_for_test(name: &str, content: &str) -> AgentDefinition {
         AgentDefinitionSource::Embedded,
     );
     definitions.remove(name).unwrap()
+}
+
+/// Tool narrowings declared by the compiled-in personas.
+#[cfg(test)]
+pub(crate) fn embedded_tool_narrowings_for_test() -> Vec<Option<Vec<AgentTool>>> {
+    normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md"))
+        .into_iter()
+        .map(|(_, _, metadata)| metadata.tools)
+        .collect()
 }
 
 fn normalize_agent_definitions(
@@ -841,7 +850,7 @@ pub fn load() -> HashMap<String, AgentDefinition> {
     if let Some(root) = paths.project_dir.as_deref().and_then(Path::parent)
         && let Ok(workspace) = crate::paths::WorkspaceBinding::capture(root)
     {
-        return load_for_paths_and_workspace(&paths, &workspace);
+        return (*load_for_paths_and_workspace(&paths, &workspace)).clone();
     }
     load_base(&paths)
 }
@@ -853,19 +862,268 @@ pub fn load() -> HashMap<String, AgentDefinition> {
 pub(crate) fn load_for_workspace_binding(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> HashMap<String, AgentDefinition> {
+    (*shared_for_workspace_binding(workspace)).clone()
+}
+
+/// The cached persona map for `workspace`, shared without cloning prompts.
+fn shared_for_workspace_binding(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> std::sync::Arc<HashMap<String, AgentDefinition>> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     load_for_paths_and_workspace(&paths, workspace)
 }
 
+/// Bounded number of (agents directory, workspace root) pairs kept.
+const MAX_PERSONA_CACHE_ENTRIES: usize = 16;
+
+type PersonaCacheKey = (PathBuf, PathBuf);
+type PersonaCacheEntry = (
+    PersonaFingerprint,
+    std::sync::Arc<HashMap<String, AgentDefinition>>,
+);
+
+static PERSONA_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PersonaCacheKey, PersonaCacheEntry>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Stat identity of one directory or entry. Unix records device, inode, link
+/// count, mode, size and nanosecond mtime/ctime, so an in-place edit that
+/// keeps the size still changes ctime; Windows records attributes, size,
+/// creation and last-write times.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatStamp {
+    kind: u8,
+    words: [i64; 9],
+}
+
+macro_rules! stat_stamp {
+    ($metadata:expr, $ext:path) => {{
+        #[allow(unused_imports)]
+        use $ext;
+        let metadata = $metadata;
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            3
+        } else if file_type.is_dir() {
+            2
+        } else if file_type.is_file() {
+            1
+        } else {
+            0
+        };
+        #[cfg(unix)]
+        let words = [
+            metadata.dev() as i64,
+            metadata.ino() as i64,
+            metadata.nlink() as i64,
+            i64::from(metadata.mode()),
+            metadata.size() as i64,
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ];
+        #[cfg(windows)]
+        let words = [
+            i64::from(metadata.file_attributes()),
+            metadata.file_size() as i64,
+            metadata.creation_time() as i64,
+            metadata.last_write_time() as i64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        #[cfg(not(any(unix, windows)))]
+        let words = [metadata.len() as i64, 0, 0, 0, 0, 0, 0, 0, 0];
+        StatStamp { kind, words }
+    }};
+}
+
+fn std_stamp(metadata: &std::fs::Metadata) -> StatStamp {
+    #[cfg(unix)]
+    {
+        stat_stamp!(metadata, std::os::unix::fs::MetadataExt)
+    }
+    #[cfg(windows)]
+    {
+        stat_stamp!(metadata, std::os::windows::fs::MetadataExt)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        stat_stamp!(metadata, std::fs::Metadata)
+    }
+}
+
+fn cap_stamp(metadata: &cap_std::fs::Metadata) -> StatStamp {
+    #[cfg(any(unix, windows))]
+    {
+        stat_stamp!(metadata, cap_std::fs::MetadataExt)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        stat_stamp!(metadata, cap_std::fs::Metadata)
+    }
+}
+
+/// One persona layer's identity as seen through the same path discipline as
+/// its loader. A layer that cannot be stamped reliably makes the whole
+/// fingerprint uncacheable (`None`), which always reloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayerStamp {
+    /// The loader ignores this layer (missing or not openable through the
+    /// checked no-follow path); the error kind distinguishes the cases.
+    Unavailable(std::io::ErrorKind),
+    /// Over the entry limit: the loader fails the whole layer closed.
+    Overflow(StatStamp),
+    Listed {
+        directory: StatStamp,
+        entries: Vec<(std::ffi::OsString, StatStamp)>,
+    },
+}
+
+/// Everything `load_uncached` reads: project trust (re-evaluated on every
+/// call) and, for every persona layer, the directory identity plus each
+/// definition entry's name and stat identity. Embedded personas are static.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersonaFingerprint {
+    trusted: bool,
+    user: LayerStamp,
+    project: Vec<LayerStamp>,
+}
+
+fn user_layer_stamp(dir: &Path) -> Option<LayerStamp> {
+    // Mirrors `load_dir_files_bounded_status`, which follows links.
+    let directory = match std::fs::metadata(dir) {
+        Ok(metadata) => std_stamp(&metadata),
+        Err(error) => return Some(LayerStamp::Unavailable(error.kind())),
+    };
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        let name = path.file_name()?.to_os_string();
+        // The loader opens through links, so stamp the link and its target.
+        let link = std_stamp(&std::fs::symlink_metadata(&path).ok()?);
+        let target = std_stamp(&std::fs::metadata(&path).ok()?);
+        entries.push((name.clone(), link));
+        entries.push((name, target));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Some(LayerStamp::Listed { directory, entries })
+}
+
+fn project_layer_stamp(
+    workspace: &crate::paths::WorkspaceBinding,
+    layer: &str,
+) -> Option<LayerStamp> {
+    // Opened through the same checked, no-follow capability path as
+    // `read_relative_definition_layer`; a swapped-in link fails here too.
+    let directory = match workspace.open_dir_relative(Path::new(layer)) {
+        Ok(directory) => directory,
+        Err(error) => return Some(LayerStamp::Unavailable(error.kind())),
+    };
+    let stamp = cap_stamp(&directory.dir_metadata().ok()?);
+    let mut entries = Vec::new();
+    for (index, entry) in directory.read_dir(".").ok()?.enumerate() {
+        if index >= MAX_PROJECT_AGENT_ENTRIES {
+            return Some(LayerStamp::Overflow(stamp));
+        }
+        let name = entry.ok()?.file_name();
+        if Path::new(&name).extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        let metadata = directory.symlink_metadata(&name).ok()?;
+        entries.push((name, cap_stamp(&metadata)));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Some(LayerStamp::Listed {
+        directory: stamp,
+        entries,
+    })
+}
+
+fn persona_fingerprint(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    trusted: bool,
+) -> Option<PersonaFingerprint> {
+    let user = user_layer_stamp(&paths.agents_dir())?;
+    let project = if trusted {
+        PROJECT_AGENT_LAYERS
+            .into_iter()
+            .map(|layer| project_layer_stamp(workspace, layer))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    Some(PersonaFingerprint {
+        trusted,
+        user,
+        project,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNCACHED_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Load (or reuse) the persona map for `workspace`. Trust is re-evaluated on
+/// every call; the cached map is reused only when the trust state and the
+/// stat identity of every layer directory and definition entry equal those
+/// captured before the cached load. Any mismatch, or a layer that cannot be
+/// stamped, reloads through the checked loader.
 fn load_for_paths_and_workspace(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
-) -> HashMap<String, AgentDefinition> {
-    let mut agents = load_base(paths);
+) -> std::sync::Arc<HashMap<String, AgentDefinition>> {
     let trusted = paths
         .with_workspace_root(workspace.root())
         .map(|paths| project_definitions_trusted(&paths, workspace))
         .unwrap_or(false);
+    // Stamp before loading: an edit racing the load changes the stamp the
+    // next call sees, so it can never be masked by the stored fingerprint.
+    let fingerprint = persona_fingerprint(paths, workspace, trusted);
+    let key = (paths.agents_dir(), workspace.root().to_path_buf());
+    if let Some(fingerprint) = &fingerprint
+        && let Some((cached, agents)) = PERSONA_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        && cached == fingerprint
+    {
+        return std::sync::Arc::clone(agents);
+    }
+    let agents = std::sync::Arc::new(load_uncached(paths, workspace, trusted));
+    let mut cache = PERSONA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match fingerprint {
+        Some(fingerprint) => {
+            if cache.len() >= MAX_PERSONA_CACHE_ENTRIES && !cache.contains_key(&key) {
+                cache.clear();
+            }
+            cache.insert(key, (fingerprint, std::sync::Arc::clone(&agents)));
+        }
+        None => {
+            cache.remove(&key);
+        }
+    }
+    agents
+}
+
+fn load_uncached(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    trusted: bool,
+) -> HashMap<String, AgentDefinition> {
+    #[cfg(test)]
+    UNCACHED_LOADS.with(|loads| loads.set(loads.get() + 1));
+    let mut agents = load_base(paths);
     if trusted {
         for layer in PROJECT_AGENT_LAYERS {
             let definitions = workspace.read_relative_definition_layer(
@@ -914,11 +1172,12 @@ pub(crate) fn available_names_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> Vec<String> {
     let mut names: Vec<_> = match workspace {
-        Some(workspace) => load_for_workspace_binding(workspace),
-        None => load(),
-    }
-    .into_keys()
-    .collect();
+        Some(workspace) => shared_for_workspace_binding(workspace)
+            .keys()
+            .cloned()
+            .collect(),
+        None => load().into_keys().collect(),
+    };
     names.sort_unstable();
     names
 }
@@ -928,12 +1187,13 @@ pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> Vec<(String, String)> {
     let agents = match workspace {
-        Some(workspace) => load_for_workspace_binding(workspace),
-        None => load(),
+        Some(workspace) => shared_for_workspace_binding(workspace),
+        None => std::sync::Arc::new(load()),
     };
     let mut entries = agents
-        .into_iter()
+        .iter()
         .map(|(name, definition)| {
+            let name = name.clone();
             let mut description = definition.one_line_description();
             let required = definition.required_tool_names();
             if !required.is_empty() {
@@ -960,7 +1220,7 @@ pub(crate) fn lookup_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> Option<AgentDefinition> {
     match workspace {
-        Some(workspace) => load_for_workspace_binding(workspace).remove(name),
+        Some(workspace) => shared_for_workspace_binding(workspace).get(name).cloned(),
         None => lookup(name),
     }
 }
@@ -1077,6 +1337,103 @@ pub(crate) mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    fn uncached_loads() -> usize {
+        UNCACHED_LOADS.with(std::cell::Cell::get)
+    }
+
+    /// Overwrite `path` in place (same inode, no truncation) with `content`.
+    fn rewrite_in_place(path: &Path, content: &str) {
+        use std::io::{Seek, Write};
+        let before = std::fs::metadata(path).unwrap().len();
+        assert_eq!(before, content.len() as u64, "edit must keep the size");
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn persona_cache_reuses_unchanged_layers_and_reloads_on_edit_or_trust_change() {
+        let fixture = crate::tests::OwnedTestDirectory::new("persona-cache");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(paths.agents_dir()).unwrap();
+        let user = paths.agents_dir().join("helper.md");
+        std::fs::write(&user, "user helper alpha").unwrap();
+        let project = root.join(".zerostack/agents/editor.md");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "---\nmode: write\n---\nproject editor").unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+
+        // Two delegations with unchanged files parse once.
+        let start = uncached_loads();
+        let first = load_for_paths_and_workspace(&paths, &workspace);
+        let second = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(
+            uncached_loads(),
+            start + 1,
+            "unchanged layers must not reparse"
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first["editor"].mode.as_deref(), Some("write"));
+
+        // A same-size in-place edit of a project persona invalidates.
+        rewrite_in_place(&project, "---\nmode: reads\n---\nproject editor");
+        let edited = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(uncached_loads(), start + 2);
+        assert_eq!(edited["editor"].mode.as_deref(), Some("reads"));
+        load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(uncached_loads(), start + 2);
+
+        // So does a same-size in-place edit of a user-global persona.
+        rewrite_in_place(&user, "user helper omega");
+        let user_edited = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(uncached_loads(), start + 3);
+        assert_eq!(user_edited["helper"].prompt, "user helper omega");
+
+        // Adding a persona file invalidates.
+        std::fs::write(root.join(".zerostack/agents/added.md"), "added").unwrap();
+        assert!(load_for_paths_and_workspace(&paths, &workspace).contains_key("added"));
+        assert_eq!(uncached_loads(), start + 4);
+
+        // Trust revocation (the trusted config bytes change) invalidates and
+        // drops every project persona; nothing project-owned stays cached.
+        std::fs::write(&config, "default_prompt = \"review\"\n").unwrap();
+        let revoked = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(uncached_loads(), start + 5);
+        assert!(!revoked.contains_key("editor"));
+        assert!(!revoked.contains_key("added"));
+        assert_eq!(revoked["helper"].prompt, "user helper omega");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persona_cache_reloads_when_a_layer_component_becomes_a_link() {
+        let fixture = crate::tests::OwnedTestDirectory::new("persona-cache-link");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::write(root.join(".claude/agents/linked.md"), "linked persona").unwrap();
+        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        assert!(load_for_paths_and_workspace(&paths, &workspace).contains_key("linked"));
+        // Same directory inode and entries, now reached through a link: the
+        // checked loader refuses it, so the cache must not serve it.
+        std::fs::rename(root.join(".claude"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(root.join("moved"), root.join(".claude")).unwrap();
+        assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("linked"));
     }
 
     #[test]

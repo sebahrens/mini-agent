@@ -532,25 +532,24 @@ impl TaskTool {
         } else {
             authorization
         };
-        let installed = builder::persona_tools(
+        // Same eligibility decision as the child builder, without
+        // instantiating the child tool set (cttyn.46).
+        #[cfg(not(feature = "js"))]
+        let _ = config;
+        let installed = builder::persona_tool_names(
             &authorization,
             &builder::PersonaExecution {
                 write_mode: persona.write_mode,
                 tools: persona.tools.clone(),
                 ..Default::default()
             },
-            config.max_text_file_size.unwrap_or(10 * 1024 * 1024),
-            config.resolve_subagent_max_read_lines(),
-            config.resolve_subagent_max_grep_results(),
-            config.resolve_subagent_max_find_results(),
-            config.resolve_subagent_max_list_dir_entries(),
             #[cfg(feature = "skills")]
-            self.skill_services.as_ref(),
+            self.skill_services.is_some(),
         );
         let missing = persona
             .required_tools
             .iter()
-            .filter(|required| !installed.iter().any(|tool| tool.name() == **required))
+            .filter(|required| !installed.contains(&required.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         if missing.is_empty() {

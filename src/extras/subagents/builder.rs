@@ -208,6 +208,19 @@ impl SubagentAuthorization {
         self
     }
 
+    /// The JS containment condition shared by tool instantiation and the
+    /// required-tool preflight: a read-only JS authorization exists and its
+    /// worker containment is not `Unavailable`.
+    #[cfg(feature = "js")]
+    fn read_only_js_available(&self) -> bool {
+        self.read_only_js.as_ref().is_some_and(|authorization| {
+            !matches!(
+                authorization.containment_status,
+                crate::sandbox::worker::WorkerContainmentStatus::Unavailable { .. }
+            )
+        })
+    }
+
     #[cfg(feature = "js")]
     fn read_only_js_tool(
         &self,
@@ -215,13 +228,10 @@ impl SubagentAuthorization {
             &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
         >,
     ) -> Option<Box<dyn rig::tool::ToolDyn>> {
-        let authorization = self.read_only_js.as_ref()?;
-        if matches!(
-            authorization.containment_status,
-            crate::sandbox::worker::WorkerContainmentStatus::Unavailable { .. }
-        ) {
+        if !self.read_only_js_available() {
             return None;
         }
+        let authorization = self.read_only_js.as_ref()?;
         let tool = crate::extras::js::tool::JsTool::new_read_only(
             authorization.sandbox.clone(),
             self.permission.clone(),
@@ -234,6 +244,35 @@ impl SubagentAuthorization {
             None => tool,
         };
         Some(Box::new(tool))
+    }
+
+    /// The filesystem tool kinds this authorization installs, in installation
+    /// order: the read-only set narrowed by `selected`, then the parent's
+    /// eligible write tools when write tools and a workspace are captured.
+    /// [`Self::filesystem_tools`] instantiates exactly this list.
+    pub(crate) fn filesystem_tool_kinds(&self, selected: Option<&[AgentTool]>) -> Vec<AgentTool> {
+        let enabled = |tool| selected.is_none_or(|selected| selected.contains(&tool));
+        let mut kinds = [
+            AgentTool::Read,
+            AgentTool::Grep,
+            AgentTool::FindFiles,
+            AgentTool::ListDir,
+        ]
+        .into_iter()
+        .filter(|tool| enabled(*tool))
+        .collect::<Vec<_>>();
+        if let (Some(parent), Some(_)) = (&self.write_tools, &self.workspace) {
+            if parent.write_enabled && enabled(AgentTool::Write) {
+                kinds.push(AgentTool::Write);
+            }
+            if parent.edit_enabled && enabled(AgentTool::Edit) {
+                kinds.push(AgentTool::Edit);
+            }
+            if parent.shell_enabled && enabled(AgentTool::Shell) {
+                kinds.push(AgentTool::Shell);
+            }
+        }
+        kinds
     }
 
     pub(crate) fn filesystem_tools(
@@ -283,7 +322,8 @@ impl SubagentAuthorization {
         } else {
             (read, grep, find, list)
         };
-        let enabled = |tool| selected.is_none_or(|selected| selected.contains(&tool));
+        let kinds = self.filesystem_tool_kinds(selected);
+        let enabled = |tool| kinds.contains(&tool);
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
         if enabled(AgentTool::Read) {
             tools.push(Box::new(read));
@@ -298,7 +338,7 @@ impl SubagentAuthorization {
             tools.push(Box::new(list));
         }
         if let (Some(parent), Some(workspace)) = (&self.write_tools, &self.workspace) {
-            if parent.write_enabled && enabled(AgentTool::Write) {
+            if enabled(AgentTool::Write) {
                 let tool = tools::WriteTool::new_with_tracker(
                     self.permission.clone(),
                     self.ask_tx.clone(),
@@ -312,7 +352,7 @@ impl SubagentAuthorization {
                 let tool = tool.with_lsp(parent.lsp.clone());
                 tools.push(Box::new(tool));
             }
-            if parent.edit_enabled && enabled(AgentTool::Edit) {
+            if enabled(AgentTool::Edit) {
                 let tool = tools::EditTool::new_with_tracker(
                     self.permission.clone(),
                     self.ask_tx.clone(),
@@ -326,7 +366,7 @@ impl SubagentAuthorization {
                 let tool = tool.with_lsp(parent.lsp.clone());
                 tools.push(Box::new(tool));
             }
-            if parent.shell_enabled && enabled(AgentTool::Shell) {
+            if enabled(AgentTool::Shell) {
                 tools.push(Box::new(
                     tools::ShellTool::new(
                         self.permission.clone(),
@@ -364,6 +404,54 @@ pub(crate) fn subagent_memory_tools(
     ]
 }
 
+/// The tool kinds a persona child receives, in installation order. This is the
+/// single eligibility decision: [`persona_tools`] instantiates exactly these
+/// kinds, and the task preflight compares `required_tools` against their names
+/// without instantiating the child tool set.
+pub(crate) fn persona_tool_kinds(
+    authorization: &SubagentAuthorization,
+    persona: &PersonaExecution,
+    #[cfg(feature = "skills")] skill_services_available: bool,
+) -> Vec<AgentTool> {
+    let selected = persona.tools.as_deref();
+    #[allow(unused_variables)]
+    let enabled = |tool| selected.is_none_or(|selected: &[AgentTool]| selected.contains(&tool));
+    #[allow(unused_mut)]
+    let mut kinds = authorization.filesystem_tool_kinds(selected);
+    #[cfg(feature = "memory")]
+    kinds.extend(
+        [AgentTool::MemoryRead, AgentTool::MemorySearch]
+            .into_iter()
+            .filter(|tool| enabled(*tool)),
+    );
+    #[cfg(feature = "skills")]
+    if skill_services_available && enabled(AgentTool::SkillsSearch) {
+        kinds.push(AgentTool::SkillsSearch);
+    }
+    #[cfg(feature = "js")]
+    if enabled(AgentTool::Js) && authorization.read_only_js_available() {
+        kinds.push(AgentTool::Js);
+    }
+    kinds
+}
+
+/// Names of the tools [`persona_tools`] would install, without building them.
+pub(crate) fn persona_tool_names(
+    authorization: &SubagentAuthorization,
+    persona: &PersonaExecution,
+    #[cfg(feature = "skills")] skill_services_available: bool,
+) -> Vec<&'static str> {
+    persona_tool_kinds(
+        authorization,
+        persona,
+        #[cfg(feature = "skills")]
+        skill_services_available,
+    )
+    .into_iter()
+    .map(AgentTool::name)
+    .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persona_tools(
     authorization: &SubagentAuthorization,
@@ -377,7 +465,15 @@ pub(crate) fn persona_tools(
         &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
-    let tools = authorization.filesystem_tools(
+    #[allow(unused_variables)]
+    let kinds = persona_tool_kinds(
+        authorization,
+        persona,
+        #[cfg(feature = "skills")]
+        skill_services.is_some(),
+    );
+    #[allow(unused_mut)]
+    let mut tools = authorization.filesystem_tools(
         max_text_file_size,
         max_read_lines,
         max_grep_results,
@@ -386,58 +482,36 @@ pub(crate) fn persona_tools(
         persona.tools.as_deref(),
     );
     #[cfg(feature = "memory")]
-    let tools = {
-        let mut tools = tools;
-        if persona.tools.as_ref().is_none_or(|selected| {
-            selected.contains(&AgentTool::MemoryRead) || selected.contains(&AgentTool::MemorySearch)
-        }) {
-            let selected = persona.tools.as_deref();
-            tools.extend(
-                subagent_memory_tools(authorization)
-                    .into_iter()
-                    .zip([AgentTool::MemoryRead, AgentTool::MemorySearch])
-                    .filter_map(|(tool, kind)| {
-                        selected
-                            .is_none_or(|selected| selected.contains(&kind))
-                            .then_some(tool)
-                    }),
-            );
-        }
-        tools
-    };
+    if kinds
+        .iter()
+        .any(|kind| matches!(kind, AgentTool::MemoryRead | AgentTool::MemorySearch))
+    {
+        tools.extend(
+            subagent_memory_tools(authorization)
+                .into_iter()
+                .zip([AgentTool::MemoryRead, AgentTool::MemorySearch])
+                .filter_map(|(tool, kind)| kinds.contains(&kind).then_some(tool)),
+        );
+    }
     #[cfg(feature = "skills")]
-    let tools = {
-        let mut tools = tools;
-        if persona
-            .tools
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&AgentTool::SkillsSearch))
-            && let Some(services) = skill_services
-        {
-            tools.push(Box::new(
-                crate::extras::js::skills::search_tool::SkillsSearchTool::new(
-                    std::sync::Arc::clone(services),
-                ),
-            ));
-        }
-        tools
-    };
+    if kinds.contains(&AgentTool::SkillsSearch)
+        && let Some(services) = skill_services
+    {
+        tools.push(Box::new(
+            crate::extras::js::skills::search_tool::SkillsSearchTool::new(std::sync::Arc::clone(
+                services,
+            )),
+        ));
+    }
     #[cfg(feature = "js")]
-    let tools = {
-        let mut tools = tools;
-        if persona
-            .tools
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&AgentTool::Js))
-            && let Some(tool) = authorization.read_only_js_tool(
-                #[cfg(feature = "skills")]
-                skill_services,
-            )
-        {
-            tools.push(tool);
-        }
-        tools
-    };
+    if kinds.contains(&AgentTool::Js)
+        && let Some(tool) = authorization.read_only_js_tool(
+            #[cfg(feature = "skills")]
+            skill_services,
+        )
+    {
+        tools.push(tool);
+    }
     tools
 }
 
@@ -1425,6 +1499,150 @@ mod tests {
 
         let none = authorization.filesystem_tools(1024 * 1024, 100, 100, 100, Some(100), Some(&[]));
         assert!(none.is_empty());
+    }
+
+    /// cttyn.46: the required-tool preflight derives names from the same
+    /// eligibility function the builder instantiates, so the name list must
+    /// equal the instantiated tool names for every persona narrowing,
+    /// authorization shape (read-only, write-capable, no workspace, JS
+    /// available/unavailable) and optional service in this feature row.
+    #[tokio::test]
+    async fn persona_tool_names_equal_the_instantiated_child_tool_set() {
+        use crate::context::agents::AgentTool;
+
+        let all_kinds = vec![
+            AgentTool::Read,
+            AgentTool::Grep,
+            AgentTool::FindFiles,
+            AgentTool::ListDir,
+            AgentTool::Write,
+            AgentTool::Edit,
+            AgentTool::Shell,
+            #[cfg(feature = "js")]
+            AgentTool::Js,
+            #[cfg(feature = "skills")]
+            AgentTool::SkillsSearch,
+            #[cfg(feature = "memory")]
+            AgentTool::MemoryRead,
+            #[cfg(feature = "memory")]
+            AgentTool::MemorySearch,
+        ];
+        let mut narrowings: Vec<Option<Vec<AgentTool>>> =
+            vec![None, Some(Vec::new()), Some(all_kinds.clone())];
+        for kind in &all_kinds {
+            narrowings.push(Some(vec![*kind]));
+            narrowings.push(Some(
+                all_kinds
+                    .iter()
+                    .copied()
+                    .filter(|other| other != kind)
+                    .collect(),
+            ));
+        }
+        // Embedded personas narrow through their real parsed metadata too.
+        narrowings.extend(crate::context::agents::embedded_tool_narrowings_for_test());
+
+        let root = TempDir::new("tool-name-equivalence");
+        let mut authorizations = vec![
+            ("no workspace", SubagentAuthorization::new(None, None, true)),
+            ("read-only", parent_authorization(root.path(), None)),
+            ("write-capable", writable_parent(root.path(), None)),
+        ];
+        #[cfg(feature = "js")]
+        {
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let sandbox = crate::sandbox::Sandbox::new(false, "bwrap")
+                .with_workspace_binding(workspace.clone());
+            let available = crate::sandbox::worker::WorkerContainmentStatus::Available {
+                backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            };
+            let base = SubagentAuthorization::new(None, None, true)
+                .with_workspace_binding(Some(workspace));
+            authorizations.push((
+                "js available",
+                base.clone().with_read_only_js(
+                    sandbox.clone(),
+                    available,
+                    &crate::config::Config::default(),
+                ),
+            ));
+            authorizations.push((
+                "js unavailable",
+                base.with_read_only_js(
+                    sandbox,
+                    crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                        backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                        assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                        reason: "test: containment unavailable".to_string(),
+                    },
+                    &crate::config::Config::default(),
+                ),
+            ));
+        }
+
+        #[cfg(feature = "skills")]
+        let services = {
+            let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
+                platform: if cfg!(target_os = "macos") {
+                    crate::paths::PathPlatform::MacOs
+                } else if cfg!(target_os = "windows") {
+                    crate::paths::PathPlatform::Windows
+                } else {
+                    crate::paths::PathPlatform::Linux
+                },
+                home_dir: None,
+                config_base: Some(root.path().join("config")),
+                data_base: Some(root.path().join("data")),
+                local_data_base: Some(root.path().join("local")),
+                state_base: Some(root.path().join("state")),
+                cache_base: Some(root.path().join("cache")),
+                workspace_root: None,
+                overrides: Default::default(),
+            })
+            .unwrap();
+            crate::extras::js::skills::session::SkillSessionServices::for_test(&paths)
+        };
+        #[cfg(feature = "skills")]
+        let service_rows = [None, Some(&services)];
+        #[cfg(not(feature = "skills"))]
+        let service_rows = [()];
+
+        #[allow(unused_variables)]
+        for service in service_rows {
+            for (label, authorization) in &authorizations {
+                for tools in &narrowings {
+                    let persona = super::PersonaExecution {
+                        tools: tools.clone(),
+                        ..Default::default()
+                    };
+                    let names = super::persona_tool_names(
+                        authorization,
+                        &persona,
+                        #[cfg(feature = "skills")]
+                        service.is_some(),
+                    );
+                    let instantiated = super::persona_tools(
+                        authorization,
+                        &persona,
+                        1024 * 1024,
+                        100,
+                        100,
+                        100,
+                        Some(100),
+                        #[cfg(feature = "skills")]
+                        service,
+                    )
+                    .iter()
+                    .map(|tool| tool.name())
+                    .collect::<Vec<_>>();
+                    assert_eq!(
+                        names, instantiated,
+                        "authorization {label}, narrowing {tools:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
