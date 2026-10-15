@@ -37,6 +37,74 @@ struct FileSource {
     baseline: Box<[u8]>,
     kind: SourceKind,
     trust_store: Option<std::path::PathBuf>,
+    verified: VerifiedCache,
+}
+
+/// Change-detection metadata for one physical file. A content change through
+/// the retained identity always moves `ctime` (and normally `len`/`mtime`);
+/// `ctime` cannot be set back from user space, so an in-place rewrite that
+/// restores size and mtime is still detected. Platforms without these fields
+/// yield `None`, which forces the full read on every check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+}
+
+impl FileStamp {
+    #[cfg(unix)]
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            nlink: metadata.nlink(),
+        })
+    }
+    #[cfg(not(unix))]
+    fn of(_metadata: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
+/// Metadata observed for a source file and its private trust store around the
+/// last full verification that succeeded. The trust-store entry retains its
+/// open handle so its identity cannot be recycled by a replacement.
+struct Verified {
+    name: String,
+    file: FileStamp,
+    trust: Option<(crate::fs::CheckedMetadata, FileStamp)>,
+}
+
+/// Per-source cache of the last successful full verification. Cloning a source
+/// (when an authority is extended) starts from an empty cache.
+#[derive(Default)]
+struct VerifiedCache(std::sync::Mutex<Option<Verified>>);
+
+impl Clone for VerifiedCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full (read + hash + parse) source verifications on this thread.
+    static FULL_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn full_source_reads() -> usize {
+    FULL_SOURCE_READS.with(std::cell::Cell::get)
 }
 
 /// Runtime authority is never deserialized and never rendered as source data.
@@ -138,6 +206,7 @@ impl OriginAuthority {
             baseline,
             kind,
             trust_store: trust_store.map(Path::to_path_buf),
+            verified: VerifiedCache::default(),
         });
         Ok(std::sync::Arc::new(Self {
             files,
@@ -153,6 +222,8 @@ impl OriginAuthority {
         })
     }
 
+    /// Only `server_source_is_current` calls this, after validating `workspace`
+    /// once for the whole check; each source root is validated once below.
     fn current(&self, workspace: &crate::paths::WorkspaceBinding, name: &str) -> bool {
         if self.files.is_empty() {
             return self.cli;
@@ -169,83 +240,24 @@ impl OriginAuthority {
                     return false;
                 }
             }
-            let Ok(snapshot) = (if source.kind == SourceKind::GlobalConfig {
-                FileSnapshot::read_private(&source.root, &source.relative)
-            } else {
-                FileSnapshot::read(&source.root, &source.relative)
-            }) else {
-                return false;
-            };
-            let Some(identity) = &snapshot.identity else {
-                return false;
-            };
-            if crate::fs::ensure_same_file(&source.relative, &source.identity, identity).is_err()
-                || digest(&snapshot.content) != source.expected
-            {
+            // Metadata-first: an unchanged physical file and trust store keep
+            // the last full verification. Any metadata change, or metadata
+            // that cannot be obtained, falls back to the full read below.
+            if source.unchanged_since_verified(name) {
+                return source.root.validate().is_ok();
+            }
+            let before = source.observe();
+            if !source.verify_full(name) {
                 return false;
             }
-            let baseline = match source.kind {
-                SourceKind::GlobalConfig => {
-                    let Ok(cfg) = crate::config::parse_config_content(
-                        &source.root.root().join(&source.relative),
-                        &snapshot.content,
-                    ) else {
-                        return false;
-                    };
-                    let Some(server) = cfg
-                        .mcp_servers
-                        .as_ref()
-                        .and_then(|servers| servers.get(name))
-                    else {
-                        return false;
-                    };
-                    bounded_baseline(server)
-                }
-                SourceKind::ProjectConfig => {
-                    if !source.trust_store.as_ref().is_some_and(|trust| {
-                        crate::config::project_config_relative_is_trusted_at_readonly(
-                            trust,
-                            &source.root,
-                            &source.relative,
-                        )
-                    }) {
-                        return false;
-                    }
-                    let Ok(value) = crate::config::parse_project_toml(&snapshot.content) else {
-                        return false;
-                    };
-                    let Some(server) = value
-                        .get("mcp_servers")
-                        .and_then(|servers| servers.get(name))
-                    else {
-                        return false;
-                    };
-                    bounded_baseline(server)
-                }
-                SourceKind::ProjectMcp => {
-                    if !source.trust_store.as_ref().is_some_and(|trust| {
-                        crate::config::project_mcp_is_trusted_at(
-                            trust,
-                            &source.root,
-                            &snapshot.content,
-                        )
-                    }) {
-                        return false;
-                    }
-                    let Ok(value) = raw_definitions(&snapshot.content) else {
-                        return false;
-                    };
-                    let Some(server) = value.get(name) else {
-                        return false;
-                    };
-                    bounded_baseline(server)
-                }
-            };
-            baseline.is_ok_and(|baseline| baseline == source.baseline)
-                && source.root.validate().is_ok()
-        }) && workspace.validate().is_ok()
+            if let Some(before) = before
+                && source.observe().is_some_and(|after| after.same(&before))
+            {
+                source.remember(name, before);
+            }
+            source.root.validate().is_ok()
+        })
     }
-
     fn commitment(&self) -> Vec<(&Path, &Path, &str, SourceKind)> {
         self.files
             .iter()
@@ -258,6 +270,161 @@ impl OriginAuthority {
                 )
             })
             .collect()
+    }
+}
+
+struct Observation {
+    file: FileStamp,
+    trust: Option<(crate::fs::CheckedMetadata, FileStamp)>,
+}
+
+impl Observation {
+    fn same(&self, other: &Self) -> bool {
+        self.file == other.file
+            && match (&self.trust, &other.trust) {
+                (None, None) => true,
+                (Some((a, a_stamp)), Some((b, b_stamp))) => {
+                    a_stamp == b_stamp && crate::fs::ensure_same_file(Path::new(""), a, b).is_ok()
+                }
+                _ => false,
+            }
+    }
+}
+
+impl FileSource {
+    /// Metadata of the retained source object and its trust store, or `None`
+    /// when any of it is unavailable (which forces a full verification).
+    fn observe(&self) -> Option<Observation> {
+        let file = self.root.open_regular_relative(&self.relative).ok()?;
+        let metadata = crate::fs::checked_file_metadata(&file).ok()?;
+        crate::fs::ensure_same_file(&self.relative, &self.identity, &metadata).ok()?;
+        let file = FileStamp::of(&metadata)?;
+        let trust = match &self.trust_store {
+            None => None,
+            Some(path) => {
+                let parent = path.parent()?;
+                if std::fs::symlink_metadata(parent)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
+                let metadata = crate::fs::checked_path_metadata(path).ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                let stamp = FileStamp::of(&metadata)?;
+                Some((metadata, stamp))
+            }
+        };
+        Some(Observation { file, trust })
+    }
+
+    fn unchanged_since_verified(&self, name: &str) -> bool {
+        let cache = self.verified.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(verified) = cache.as_ref() else {
+            return false;
+        };
+        if verified.name != name {
+            return false;
+        }
+        let Some(now) = self.observe() else {
+            return false;
+        };
+        now.file == verified.file
+            && match (&now.trust, &verified.trust) {
+                (None, None) => true,
+                (Some((current, stamp)), Some((retained, retained_stamp))) => {
+                    stamp == retained_stamp
+                        && crate::fs::ensure_same_file(Path::new(""), retained, current).is_ok()
+                }
+                _ => false,
+            }
+    }
+
+    fn remember(&self, name: &str, observed: Observation) {
+        *self.verified.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Verified {
+            name: name.to_owned(),
+            file: observed.file,
+            trust: observed.trust,
+        });
+    }
+
+    /// Full verification: read, hash and parse the source and its trust.
+    fn verify_full(&self, name: &str) -> bool {
+        #[cfg(test)]
+        FULL_SOURCE_READS.with(|reads| reads.set(reads.get() + 1));
+        let source = self;
+        let Ok(snapshot) = (if source.kind == SourceKind::GlobalConfig {
+            FileSnapshot::read_private(&source.root, &source.relative)
+        } else {
+            FileSnapshot::read(&source.root, &source.relative)
+        }) else {
+            return false;
+        };
+        let Some(identity) = &snapshot.identity else {
+            return false;
+        };
+        if crate::fs::ensure_same_file(&source.relative, &source.identity, identity).is_err()
+            || digest(&snapshot.content) != source.expected
+        {
+            return false;
+        }
+        let baseline = match source.kind {
+            SourceKind::GlobalConfig => {
+                let Ok(cfg) = crate::config::parse_config_content(
+                    &source.root.root().join(&source.relative),
+                    &snapshot.content,
+                ) else {
+                    return false;
+                };
+                let Some(server) = cfg
+                    .mcp_servers
+                    .as_ref()
+                    .and_then(|servers| servers.get(name))
+                else {
+                    return false;
+                };
+                bounded_baseline(server)
+            }
+            SourceKind::ProjectConfig => {
+                if !source.trust_store.as_ref().is_some_and(|trust| {
+                    crate::config::project_config_relative_is_trusted_at_readonly(
+                        trust,
+                        &source.root,
+                        &source.relative,
+                    )
+                }) {
+                    return false;
+                }
+                let Ok(value) = crate::config::parse_project_toml(&snapshot.content) else {
+                    return false;
+                };
+                let Some(server) = value
+                    .get("mcp_servers")
+                    .and_then(|servers| servers.get(name))
+                else {
+                    return false;
+                };
+                bounded_baseline(server)
+            }
+            SourceKind::ProjectMcp => {
+                if !source.trust_store.as_ref().is_some_and(|trust| {
+                    crate::config::project_mcp_is_trusted_at(trust, &source.root, &snapshot.content)
+                }) {
+                    return false;
+                }
+                let Ok(value) = raw_definitions(&snapshot.content) else {
+                    return false;
+                };
+                let Some(server) = value.get(name) else {
+                    return false;
+                };
+                bounded_baseline(server)
+            }
+        };
+        baseline.is_ok_and(|baseline| baseline == source.baseline)
     }
 }
 
@@ -1212,6 +1379,84 @@ mod trust_tests {
         load_in_workspace(&mut declined, &workspace, &trust, true, &|_| false).unwrap();
         assert!(declined.mcp_servers.as_ref().unwrap().is_empty());
     }
+    #[test]
+    fn source_revalidation_is_metadata_first_and_rereads_only_after_a_change() {
+        let root = crate::tests::OwnedTestDirectory::new("project-mcp-metadata-first");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let trust = root.path().join("private").join("project-trust.json");
+        let config = root.path().join(".mcp.json");
+        let content = r#"{"mcpServers":{"owned":{"command":"owned-runner"}}}"#;
+        std::fs::write(&config, content).unwrap();
+        let mut cfg = crate::config::Config::default();
+        load_in_workspace(&mut cfg, &workspace, &trust, true, &|_| true).unwrap();
+        let origin = cfg.mcp_origins["owned"]
+            .iter()
+            .find(|origin| origin.selected)
+            .cloned()
+            .unwrap();
+        let check = || server_source_is_current(&workspace, "owned", None, Some(&origin));
+
+        // The first check verifies fully; unchanged later checks never re-read.
+        let reads = full_source_reads();
+        assert!(check());
+        assert_eq!(full_source_reads() - reads, 1);
+        for _ in 0..3 {
+            assert!(check());
+        }
+        assert_eq!(full_source_reads() - reads, 1);
+
+        // An in-place rewrite that keeps the size and restores the mtime is
+        // still detected (ctime moves), re-read once and refused.
+        let mtime = std::fs::metadata(&config).unwrap().modified().unwrap();
+        let forged = content.replace("owned-runner", "ownex-runner");
+        assert_eq!(forged.len(), content.len());
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&config)
+                .unwrap();
+            file.write_all(forged.as_bytes()).unwrap();
+            file.set_modified(mtime).unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().len() as usize,
+            content.len()
+        );
+        let reads = full_source_reads();
+        assert!(!check());
+        assert_eq!(full_source_reads() - reads, 1);
+        // A failed verification is never cached.
+        assert!(!check());
+        assert_eq!(full_source_reads() - reads, 2);
+
+        // Restoring the approved bytes in place re-verifies once, then the
+        // cache serves again; editing the config between calls refuses.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()))
+            .unwrap();
+        let reads = full_source_reads();
+        assert!(check());
+        assert!(check());
+        assert_eq!(full_source_reads() - reads, 1);
+        std::fs::write(&config, content.replace("owned-runner", "changed-runner")).unwrap();
+        assert!(!check());
+        std::fs::write(&config, content).unwrap();
+        assert!(check());
+
+        // Revoking private trust is a trust-store metadata change and refuses
+        // even though the source file itself is unchanged.
+        assert!(check());
+        let reads = full_source_reads();
+        crate::fs::private_atomic_write_sync(&trust, br#"{"schema":1,"bindings":[]}"#).unwrap();
+        assert!(!check());
+        assert_eq!(full_source_reads() - reads, 1);
+        std::fs::remove_file(&trust).unwrap();
+        assert!(!check());
+    }
+
     #[test]
     fn trusted_missing_environment_stays_inactive_and_total_substitution_is_bounded() {
         let value = serde_json::json!({"command":"runner","args":vec!["${BIG}";32]});

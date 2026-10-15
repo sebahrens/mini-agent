@@ -115,7 +115,11 @@ impl Handler {
             asking: AtomicBool::new(false),
         });
         let mut leases = self.leases.lock().unwrap_or_else(|e| e.into_inner());
-        leases.retain(|lease| lease.upgrade().is_some_and(|lease| lease.current()));
+        // Only prune dropped leases here: `current()` revalidates the MCP
+        // source, and running it for every other live call on each entry made
+        // concurrent calls quadratic. `unique()` still filters by `current()`
+        // before any elicitation can be routed.
+        leases.retain(|lease| lease.strong_count() > 0);
         leases.push(Arc::downgrade(&inner));
         Lease(inner)
     }
