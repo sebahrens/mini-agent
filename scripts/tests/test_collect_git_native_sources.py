@@ -34,7 +34,7 @@ class NativeSourceCollectorTests(unittest.TestCase):
         self.root = Path(owner.name).resolve()
 
     def test_msys_signature_failure_reports_bounded_reason_and_exact_files(self):
-        command = ["pacman-key", "--verify", "/owned/package.pkg.tar.zst.sig", "/var/cache/pacman/pkg/package.pkg.tar.zst"]
+        command = ["/usr/bin/gpg", "--status-fd", "1", "--verify", "/owned/package.pkg.tar.zst.sig", "/var/cache/pacman/pkg/package.pkg.tar.zst"]
         reason = b"gpg: Can't check signature: No public key\n\x1b[31m" + b"x" * 5000
         def fail(argv, **options):
             self.assertEqual(argv, command)
@@ -59,6 +59,38 @@ class NativeSourceCollectorTests(unittest.TestCase):
         with patch.object(COLLECT.subprocess, "run", side_effect=fail), self.assertRaises(COLLECT.CollectionError) as raised:
             COLLECT.capture(["pacman", "-Q", "package"])
         self.assertEqual(str(raised.exception), "required distro metadata/signature command failed: pacman")
+
+    def test_msys_verification_requires_valid_signature_and_same_signature_full_trust(self):
+        valid = "[GNUPG:] VALIDSIG " + "A" * 40 + " 2026-10-15 1 0 4 0 1 10 00 " + "A" * 40 + "\n"
+        cases = [
+            (valid + "[GNUPG:] TRUST_FULLY 0 pgp\n", True),
+            (valid + "[GNUPG:] TRUST_ULTIMATE 0 pgp\n", True),
+            (valid + "[GNUPG:] TRUST_MARGINAL 0 pgp\n", False),
+            (valid, False),
+            ("[GNUPG:] TRUST_FULLY 0 pgp\n", False),
+            ("[GNUPG:] TRUST_FULLY 0 pgp\n" + valid, False),
+            (valid + "[GNUPG:] NEWSIG\n[GNUPG:] TRUST_FULLY 0 pgp\n", False),
+        ]
+        for status, accepted in cases:
+            calls = []
+            def capture(command):
+                calls.append(command)
+                return "/exact/configured/pacman-keyring\n" if command == ["pacman-conf", "GPGDir"] else status
+            with self.subTest(status=status), patch.object(COLLECT, "capture", side_effect=capture):
+                if accepted:
+                    COLLECT.verify_msys2_signature(Path("exact.sig"), Path("exact.pkg.tar.zst"))
+                else:
+                    with self.assertRaisesRegex(COLLECT.CollectionError, "valid fully/ultimately trusted"):
+                        COLLECT.verify_msys2_signature(Path("exact.sig"), Path("exact.pkg.tar.zst"))
+            self.assertEqual(calls[0], ["pacman-conf", "GPGDir"])
+            self.assertEqual(calls[1], [
+                "/usr/bin/gpg", "--homedir", "/exact/configured/pacman-keyring", "--batch",
+                "--no-auto-key-retrieve", "--no-auto-key-import", "--auto-key-locate", "clear",
+                "--no-auto-check-trustdb", "--lock-never", "--no-random-seed-file",
+                "--status-fd", "1", "--verify", "exact.sig", "exact.pkg.tar.zst",
+            ])
+        with patch.object(COLLECT, "capture", return_value="relative/keyring"), self.assertRaisesRegex(COLLECT.CollectionError, "one absolute"):
+            COLLECT.verify_msys2_signature(Path("exact.sig"), Path("exact.pkg.tar.zst"))
 
     def test_alpine_installed_origin_commit_and_literal_checksums(self):
         database = self.root / "installed"
@@ -133,14 +165,18 @@ class NativeSourceCollectorTests(unittest.TestCase):
         calls = []
         def capture(command):
             calls.append(command)
-            return name + " " + version if command[:2] == ["pacman", "-Q"] else "signature verified"
+            if command[:2] == ["pacman", "-Q"]:
+                return name + " " + version
+            if command == ["pacman-conf", "GPGDir"]:
+                return "/configured/keyring"
+            return "[GNUPG:] VALIDSIG " + "A" * 40 + "\n[GNUPG:] TRUST_FULLY 0 pgp\n"
         def fetch(url, destination, expected=None):
             self.assertTrue(url.endswith("mingw-w64-native-1.2-3.src.tar.zst"))
             destination.write_bytes(package)
         with patch.object(COLLECT, "capture", side_effect=capture), patch.object(COLLECT, "fetch", side_effect=fetch), patch.object(COLLECT, "archive", side_effect=self.fixture_archive):
             result = COLLECT.collect_msys2(name, directory, self.root)
         self.assertEqual(result[:2], (version, "MIT"))
-        self.assertIn(["pacman-key", "--verify", str(binary) + ".sig", str(binary)], calls)
+        self.assertEqual(calls[-1][-3:], ["--verify", str(binary) + ".sig", str(binary)])
         self.assertIn("BUILDINFO", {p.name for p in result[3]})
         self.assertEqual([p.read_bytes() for p in result[4]], [b"Verbatim MSYS2 upstream notice"])
 
@@ -149,7 +185,14 @@ class NativeSourceCollectorTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 self.root = Path(temporary)
                 name, version, _, package, directory = self.msys_fixture(bad_recipe, missing_source)
-                with patch.object(COLLECT, "capture", return_value=name + " " + version), patch.object(COLLECT, "fetch", side_effect=lambda url, destination, expected=None: destination.write_bytes(package)), patch.object(COLLECT, "archive", side_effect=self.fixture_archive), self.assertRaises(COLLECT.CollectionError):
+                def capture(command):
+                    if command[:2] == ["pacman", "-Q"]:
+                        return name + " " + version
+                    if command == ["pacman-conf", "GPGDir"]:
+                        return "/configured/keyring"
+                    return "[GNUPG:] VALIDSIG " + "A" * 40 + "\n[GNUPG:] TRUST_FULLY 0 pgp\n"
+                expected = "recipe does not match" if bad_recipe else "omits checksum-pinned"
+                with patch.object(COLLECT, "capture", side_effect=capture), patch.object(COLLECT, "fetch", side_effect=lambda url, destination, expected=None: destination.write_bytes(package)), patch.object(COLLECT, "archive", side_effect=self.fixture_archive), self.assertRaisesRegex(COLLECT.CollectionError, expected):
                     COLLECT.collect_msys2(name, directory, self.root)
 
     def test_static_closure_captures_actual_archive_owners_and_compiler_defaults(self):

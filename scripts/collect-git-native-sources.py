@@ -47,13 +47,15 @@ def capture(command: list[str]) -> str:
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         result = subprocess.run(command, stdout=output, stderr=errors, timeout=120, check=False)
         if result.returncode:
-            if len(command) == 4 and Path(command[0]).name == "pacman-key" and command[1] == "--verify":
+            if (len(command) == 4 and Path(command[0]).name == "pacman-key" and command[1] == "--verify") or (
+                command[0] == "/usr/bin/gpg" and len(command) >= 4 and command[-3] == "--verify"
+            ):
                 # Fixed publisher-only signature verification has no credential
                 # arguments. Retain bounded, escaped GPG/keyring diagnostics;
                 # other metadata commands keep their closed error category.
                 errors.seek(0)
                 reason = errors.read(4096).decode("utf-8", errors="replace")
-                names = [Path(argument).name for argument in command[2:]]
+                names = [Path(argument).name for argument in command[-2:]]
                 raise CollectionError(
                     "MSYS2 package signature verification failed: "
                     + json.dumps({"exit": result.returncode, "files": names, "diagnostic": reason}, ensure_ascii=True)
@@ -323,6 +325,30 @@ def assignments(text: str) -> dict[str, str]:
     return values
 
 
+def verify_msys2_signature(signature: Path, binary: Path) -> None:
+    keyring = capture(["pacman-conf", "GPGDir"]).strip()
+    if not keyring or not Path(keyring).is_absolute() or "\n" in keyring or "\r" in keyring:
+        raise CollectionError("configured pacman GPGDir is not one absolute directory")
+    # Match pacman-key's cryptographic/trust test without its lock-never
+    # configuration precheck. Verification does not import keys, refresh the
+    # trustdb, save random state or acquire locks in the configured keyring.
+    status = capture([
+        "/usr/bin/gpg", "--homedir", keyring, "--batch",
+        "--no-auto-key-retrieve", "--no-auto-key-import", "--auto-key-locate", "clear",
+        "--no-auto-check-trustdb", "--lock-never", "--no-random-seed-file",
+        "--status-fd", "1", "--verify", str(signature), str(binary),
+    ])
+    valid = False
+    for line in status.splitlines():
+        if line.startswith("[GNUPG:] NEWSIG"):
+            valid = False
+        elif line.startswith("[GNUPG:] VALIDSIG "):
+            valid = True
+        elif valid and re.fullmatch(r"\[GNUPG:\] TRUST_(FULLY|ULTIMATE)(?: .*)?", line):
+            return
+    raise CollectionError("MSYS2 package signature lacks a valid fully/ultimately trusted signature: " + safe(binary.name))
+
+
 def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, list[Path], list[Path]]:
     identity = capture(["pacman", "-Q", name]).strip().split()
     if len(identity) != 2 or identity[0] != name:
@@ -336,7 +362,7 @@ def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, 
     if not signature.is_file():
         fetch("https://repo.msys2.org/mingw/ucrt64/" + binary.name + ".sig", output / "binary.sig")
         signature = output / "binary.sig"
-    capture(["pacman-key", "--verify", str(signature), str(binary)])
+    verify_msys2_signature(signature, binary)
     with archive(binary) as (source, members):
         by_name = {m.name.lstrip("./"): m for m in members}
         build = member_bytes(source, by_name["BUILDINFO"] if "BUILDINFO" in by_name else next(m for m in members if m.name == ".BUILDINFO"))
