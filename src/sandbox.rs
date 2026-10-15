@@ -19,6 +19,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
+mod general_profile;
 mod git_metadata;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod linux_workspace_tests;
@@ -40,6 +41,54 @@ type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
 type SeatbeltProfileKey = (String, String, String, String, bool);
 type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
+
+/// Filesystem reach of ordinary contained commands; permission and network
+/// decisions remain independent, and the broker-only JS worker never uses it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxProfile {
+    #[default]
+    Workspace,
+    HostRead,
+    HostFull,
+}
+
+impl SandboxProfile {
+    pub const NAMES: &'static [&'static str] = &["workspace", "host-read", "host-full"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::HostRead => "host-read",
+            Self::HostFull => "host-full",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Workspace => "Workspace writes and restricted host reads",
+            Self::HostRead => "Host reads; writes limited to workspace, cache and explicit roots",
+            Self::HostFull => "Host reads and writes, except private data and protected Git paths",
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
 #[cfg(windows)]
 type GeneralOwnerMap = Arc<Mutex<HashMap<u32, Arc<windows::general_owner::GeneralOwner>>>>;
 
@@ -50,6 +99,7 @@ type GeneralOwnerMap = Arc<Mutex<HashMap<u32, Arc<windows::general_owner::Genera
 pub struct ExecutionCommand {
     command: Command,
     boundary: ExecutionBoundary,
+    _root_lease: Option<Arc<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +114,7 @@ impl From<Command> for ExecutionCommand {
         Self {
             command,
             boundary: ExecutionBoundary::General,
+            _root_lease: None,
         }
     }
 }
@@ -82,11 +133,20 @@ impl std::ops::DerefMut for ExecutionCommand {
 }
 
 impl ExecutionCommand {
+    fn retaining_roots(
+        mut self,
+        roots: &Arc<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>,
+    ) -> Self {
+        self._root_lease = Some(roots.clone());
+        self
+    }
+
     #[cfg(windows)]
     fn appcontainer_helper(command: Command) -> Self {
         Self {
             command,
             boundary: ExecutionBoundary::AppContainerHelper,
+            _root_lease: None,
         }
     }
 
@@ -103,6 +163,9 @@ impl ExecutionCommand {
 pub struct Sandbox {
     enabled: bool,
     backend: String,
+    profile: SandboxProfile,
+    read_roots: Vec<PathBuf>,
+    write_roots: Vec<PathBuf>,
     shell: String,
     shell_command_arg: String,
     /// Resolved executable retained across workspace probes so a failed bound
@@ -1542,8 +1605,11 @@ impl Sandbox {
         ];
         #[cfg(windows)]
         paths.extend(self.windows_appcontainer_write_roots.iter().cloned());
-        #[cfg(not(windows))]
-        let _ = &mut paths;
+        paths.extend(
+            general_profile::roots(&self.write_roots, cwd)?
+                .iter()
+                .map(|root| root.root().to_path_buf()),
+        );
         let mut retained = self
             .git_write_roots
             .lock()
@@ -1575,6 +1641,16 @@ impl Sandbox {
             crate::git::runtime::record_model_root(&binding)?;
             retained.push(binding);
         }
+        if self.profile == SandboxProfile::HostFull {
+            let owner = retained
+                .first()
+                .ok_or("sandbox host-write authority is unavailable")?;
+            crate::git::runtime::record_host_writes(
+                &self.git_write_roots,
+                owner,
+                &general_profile::protected_host_paths()?,
+            )?;
+        }
         Ok(())
     }
 
@@ -1601,6 +1677,85 @@ impl Sandbox {
         Ok(())
     }
 
+    pub fn with_general_profile(
+        mut self,
+        profile: SandboxProfile,
+        read_roots: Vec<PathBuf>,
+        write_roots: Vec<PathBuf>,
+    ) -> Self {
+        self.profile = profile;
+        self.read_roots = read_roots;
+        self.write_roots = write_roots;
+        self
+    }
+
+    pub fn profile(&self) -> SandboxProfile {
+        self.profile
+    }
+
+    pub(crate) fn set_profile(&mut self, profile: SandboxProfile) -> Result<(), String> {
+        if self.running_background_job_count() != 0
+            || !self
+                .active_groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            return Err(
+                "finish or stop active commands before changing the sandbox profile".into(),
+            );
+        }
+        let mut candidate = self.clone();
+        candidate.profile = profile;
+        // Admitted commands retain the old lease independently. An idle
+        // session switch must not keep a retired host-full domain alive.
+        candidate.git_write_roots = Arc::new(Mutex::new(Vec::new()));
+        if !candidate.profile_supported() {
+            return Err("this backend cannot enforce the selected filesystem profile".into());
+        }
+        if candidate.enabled {
+            let cwd = candidate
+                .workspace_binding
+                .as_ref()
+                .map(|root| root.root().to_path_buf())
+                .or_else(|| candidate.working_dir.clone())
+                .ok_or("sandbox profile: captured workspace is unavailable")?;
+            let cache = candidate.get_cached_cache_dir()?;
+            if candidate.backend == "bwrap" {
+                candidate.expanded_filesystem(&cwd, &cache)?;
+            } else if candidate.backend == "seatbelt" {
+                candidate.get_seatbelt_profile(&cwd, &cache, true)?;
+            }
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn profile_supported(&self) -> bool {
+        (self.profile == SandboxProfile::Workspace
+            && self.read_roots.is_empty()
+            && self.write_roots.is_empty())
+            || matches!(self.backend.as_str(), "bwrap" | "seatbelt")
+            || (self.backend == "appcontainer" && self.profile == SandboxProfile::Workspace)
+    }
+
+    fn expanded_filesystem(
+        &self,
+        cwd: &Path,
+        cache: &Path,
+    ) -> Result<Option<general_profile::HostFilesystem>, String> {
+        if self.profile == SandboxProfile::Workspace
+            && self.read_roots.is_empty()
+            && self.write_roots.is_empty()
+        {
+            return Ok(None);
+        }
+        if !matches!(self.backend.as_str(), "bwrap" | "seatbelt") {
+            return Err("sandbox profile unavailable on this backend; Windows uses explicit AppContainer root keys".into());
+        }
+        general_profile::HostFilesystem::capture(self, cwd, cache).map(Some)
+    }
+
     pub fn new(enabled: bool, backend: &str) -> Self {
         let backend = if backend == "restricted-token" {
             "appcontainer"
@@ -1610,6 +1765,9 @@ impl Sandbox {
         Sandbox {
             enabled,
             backend: backend.to_string(),
+            profile: SandboxProfile::Workspace,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
             shell_candidate: None,
@@ -1646,9 +1804,11 @@ impl Sandbox {
 
     pub fn with_windows_appcontainer_roots(
         mut self,
-        read_roots: Vec<PathBuf>,
-        write_roots: Vec<PathBuf>,
+        mut read_roots: Vec<PathBuf>,
+        mut write_roots: Vec<PathBuf>,
     ) -> Self {
+        read_roots.extend(self.read_roots.iter().cloned());
+        write_roots.extend(self.write_roots.iter().cloned());
         self.git_write_roots = Arc::new(Mutex::new(Vec::new()));
         self.windows_appcontainer_read_roots = read_roots;
         self.windows_appcontainer_write_roots = write_roots;
@@ -1660,6 +1820,9 @@ impl Sandbox {
     pub fn policy(&self) -> SandboxPolicy {
         if !self.enabled {
             return SandboxPolicy::Disabled;
+        }
+        if !self.profile_supported() {
+            return SandboxPolicy::RequiredButUnavailable;
         }
         let available = match self.backend.as_str() {
             "bwrap" => bwrap_exists(),
@@ -1674,6 +1837,11 @@ impl Sandbox {
 
     /// Closed, operator-actionable reason this backend's preflight failed, when known.
     pub(crate) fn unavailable_diagnostic(&self) -> Option<&'static str> {
+        if !self.profile_supported() {
+            return Some(
+                "selected filesystem profile is unavailable on this backend; Windows uses explicit AppContainer root keys",
+            );
+        }
         match self.backend.as_str() {
             "bwrap" => bwrap_unavailable_diagnostic(),
             _ => None,
@@ -1689,6 +1857,9 @@ impl Sandbox {
     fn policy_from_backend_availability(&self, available: bool) -> SandboxPolicy {
         if !self.enabled {
             return SandboxPolicy::Disabled;
+        }
+        if !self.profile_supported() {
+            return SandboxPolicy::RequiredButUnavailable;
         }
         if available {
             SandboxPolicy::RequiredAndAvailable
@@ -1745,7 +1916,7 @@ impl Sandbox {
     }
 
     fn capability_matrix_for_policy(&self, policy: SandboxPolicy) -> SandboxCapabilityMatrix {
-        match policy {
+        let mut matrix = match policy {
             SandboxPolicy::Disabled => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "disabled",
@@ -1822,7 +1993,32 @@ impl Sandbox {
                 network: "backend-defined; mini-agent makes no network-isolation claim",
                 requested_network_policy: "backend-defined; mini-agent makes no network-isolation claim",
             },
+        };
+        if policy == SandboxPolicy::RequiredAndAvailable
+            && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
+        {
+            matrix.filesystem_reads = match self.profile {
+                SandboxProfile::Workspace if self.backend == "seatbelt" => {
+                    "workspace, command cache, explicit roots and system runtime files; private application/secret paths denied"
+                }
+                SandboxProfile::Workspace => matrix.filesystem_reads,
+                _ => {
+                    "host-readable files except private application/secret paths; fresh Linux proc/dev/tmp"
+                }
+            };
+            if self.profile != SandboxProfile::Workspace || !self.write_roots.is_empty() {
+                matrix.filesystem_writes = if self.profile == SandboxProfile::HostFull {
+                    "host writes except private application/secret paths, protected Git metadata/runtime and their namespace ancestors"
+                } else {
+                    "workspace, command cache and explicit write roots; private data, protected Git paths and namespace ancestors remain protected"
+                };
+            }
+            if self.backend == "seatbelt" && self.profile == SandboxProfile::HostFull {
+                matrix.devices =
+                    "host device access subject to host permissions; no device isolation claimed";
+            }
         }
+        matrix
     }
 
     /// Whether this sandbox owns the complete descendant lifetime independently of process-group
@@ -2111,21 +2307,57 @@ impl Sandbox {
         git_metadata::validate_workspace_aliases(workspace)?;
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
-        let app_paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
+        let app_paths = crate::paths::process_paths().map_err(|error| {
             format!("sandbox: failed to resolve private application paths: {error}")
         })?;
-        let private_read_denies = seatbelt_private_read_denies(&[
-            (app_paths.credentials_dir.as_path(), "credential directory"),
-            (app_paths.config_dir.as_path(), "configuration directory"),
-        ])?;
+        let private_paths = general_profile::private_paths()?;
+        let private_refs = private_paths
+            .iter()
+            .map(|path| (path.as_path(), "private/secret directory"))
+            .collect::<Vec<_>>();
+        let private_read_denies = seatbelt_private_read_denies(&private_refs)?;
         // Recomputed per launch: the workspace may gain or relink a `.git`.
         let git_write_denies = git_metadata::seatbelt_write_denies(workspace);
+        let mut protected = crate::git::runtime::protected_runtime_paths()?;
+        protected.push(app_paths.cache_dir);
+        let protected_storage = seatbelt_private_read_denies(
+            &protected
+                .iter()
+                .map(|path| (path.as_path(), "protected Git storage"))
+                .collect::<Vec<_>>(),
+        )?;
+        let read_roots = general_profile::roots(&self.read_roots, workspace)?;
+        let write_roots = general_profile::roots(&self.write_roots, workspace)?;
+        let extra_reads = seatbelt_private_read_denies(
+            &read_roots
+                .iter()
+                .chain(write_roots.iter())
+                .map(|root| (root.root(), "explicit filesystem root"))
+                .collect::<Vec<_>>(),
+        )?;
+        let extra_writes = seatbelt_private_read_denies(
+            &write_roots
+                .iter()
+                .map(|root| (root.root(), "explicit write root"))
+                .collect::<Vec<_>>(),
+        )?;
+        let namespace_denies = seatbelt_namespace_denies(
+            &private_paths
+                .iter()
+                .chain(protected.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
+        let cache_read_identity = format!(
+            "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}",
+            self.profile
+        );
 
         let cache_key = (
             workspace_str.clone(),
             cache_str.clone(),
-            private_read_denies.clone(),
-            git_write_denies.clone(),
+            cache_read_identity,
+            format!("{git_write_denies}|storage={protected_storage}|namespace={namespace_denies}"),
             deny_network,
         );
         let mut profiles = self
@@ -2137,11 +2369,16 @@ impl Sandbox {
             return Ok(profile.clone());
         }
 
-        let profile = seatbelt_shell_profile(
+        let profile = seatbelt_profile_ladder(
+            self.profile,
             &workspace_str,
             &cache_str,
             &private_read_denies,
             &git_write_denies,
+            &protected_storage,
+            &extra_reads,
+            &extra_writes,
+            &namespace_denies,
             deny_network,
         );
         let profile: Arc<str> = Arc::from(profile);
@@ -2151,6 +2388,7 @@ impl Sandbox {
 
     pub fn wrap_command(&self, command: &str) -> Result<ExecutionCommand, String> {
         self.wrap_command_inner(command)
+            .map(|command| command.retaining_roots(&self.git_write_roots))
     }
 
     #[cfg(feature = "js")]
@@ -2183,7 +2421,7 @@ impl Sandbox {
         let mut command =
             self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata)?;
         self.bind_workspace_cwd(&mut command)?;
-        Ok(command.into())
+        Ok(ExecutionCommand::from(command).retaining_roots(&self.git_write_roots))
     }
 
     #[cfg(feature = "js")]
@@ -2438,7 +2676,7 @@ impl Sandbox {
         })?;
         let readiness_shell = hook_readiness_shell()?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
-        Ok(self.build_hook_bwrap_command(
+        self.build_hook_bwrap_command(
             bwrap,
             &readiness_shell,
             program,
@@ -2447,7 +2685,7 @@ impl Sandbox {
             &cache_dir,
             explicit_env,
             git_metadata,
-        ))
+        )
     }
 
     /// Builds the bubblewrap arm of [`Self::wrap_hook_command`] from already
@@ -2464,19 +2702,32 @@ impl Sandbox {
         cache_dir: &Path,
         explicit_env: &std::collections::BTreeMap<String, String>,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
-    ) -> Command {
+    ) -> Result<Command, String> {
+        let expanded = self.expanded_filesystem(cwd, cache_dir)?;
         let mut cmd = Command::new(bwrap);
         cmd.current_dir(cwd).env_clear();
         for (key, value) in self.get_essential_env() {
             cmd.env(key, value);
         }
         cmd.envs(explicit_env).env("TMPDIR", "/tmp");
-        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
-            cmd.args(["--ro-bind-try", path, path]);
-        }
-        cmd.args(["--dir", "/etc"]);
-        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
-            cmd.args(["--ro-bind-try", path, path]);
+        if self.profile != SandboxProfile::Workspace {
+            cmd.args([
+                if self.profile == SandboxProfile::HostFull {
+                    "--bind"
+                } else {
+                    "--ro-bind"
+                },
+                "/",
+                "/",
+            ]);
+        } else {
+            for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
+            cmd.args(["--dir", "/etc"]);
+            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
             .arg("--bind")
@@ -2485,9 +2736,15 @@ impl Sandbox {
             .arg("--bind")
             .arg(cache_dir)
             .arg(cache_dir);
+        if let Some(expanded) = &expanded {
+            expanded.append_roots(&mut cmd)?;
+        }
         // After the writable workspace bind, so the read-only Git metadata
         // binds cover it.
         git_metadata.apply(&mut cmd, cwd);
+        if let Some(expanded) = &expanded {
+            expanded.append_denies(&mut cmd);
+        }
         cmd.args([
             "--unshare-user",
             "--unshare-ipc",
@@ -2495,21 +2752,22 @@ impl Sandbox {
             "--unshare-net",
             "--unshare-uts",
             "--unshare-cgroup",
-            "--remount-ro",
-            "/",
-            "--chdir",
-        ])
-        .arg(cwd)
-        // `--dev` exposes a /dev/tty node; a fresh session (here and in
-        // the pre-exec lifetime) leaves the hook no controlling terminal.
-        .args(["--new-session", "--die-with-parent", "--"])
-        .arg(readiness_shell)
-        .arg("-c")
-        .arg(HOOK_SANDBOX_READY_SCRIPT)
-        .arg(program)
-        .args(args);
+        ]);
+        if self.profile != SandboxProfile::HostFull {
+            cmd.args(["--remount-ro", "/"]);
+        }
+        cmd.arg("--chdir")
+            .arg(cwd)
+            // `--dev` exposes a /dev/tty node; a fresh session (here and in
+            // the pre-exec lifetime) leaves the hook no controlling terminal.
+            .args(["--new-session", "--die-with-parent", "--"])
+            .arg(readiness_shell)
+            .arg("-c")
+            .arg(HOOK_SANDBOX_READY_SCRIPT)
+            .arg(program)
+            .args(args);
         configure_new_session_child_lifetime(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     /// Build a direct-exec workspace service boundary.
@@ -2538,6 +2796,19 @@ impl Sandbox {
 
     #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
     pub(crate) fn wrap_workspace_service_for_execution(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        deny_network: bool,
+    ) -> Result<ExecutionCommand, String> {
+        self.wrap_workspace_service_execution_inner(program, args, cwd, env, deny_network)
+            .map(|command| command.retaining_roots(&self.git_write_roots))
+    }
+
+    #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
+    fn wrap_workspace_service_execution_inner(
         &self,
         program: &Path,
         args: &[String],
@@ -2647,17 +2918,18 @@ impl Sandbox {
                 .to_string()
         })?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
-        Ok(Self::build_workspace_service_bwrap_command(
-            bwrap,
-            program,
-            args,
-            &cwd,
-            &cache_dir,
-            env,
-            deny_network,
-            git_metadata,
-        )
-        .into())
+        Ok(self
+            .build_workspace_service_bwrap_command(
+                bwrap,
+                program,
+                args,
+                &cwd,
+                &cache_dir,
+                env,
+                deny_network,
+                git_metadata,
+            )?
+            .into())
     }
 
     /// Builds the bubblewrap arm of [`Self::wrap_workspace_service`] from an
@@ -2665,6 +2937,7 @@ impl Sandbox {
     #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
     #[allow(clippy::too_many_arguments)]
     fn build_workspace_service_bwrap_command(
+        &self,
         bwrap: &Path,
         program: &Path,
         args: &[String],
@@ -2673,28 +2946,47 @@ impl Sandbox {
         env: &[(OsString, OsString)],
         deny_network: bool,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
-    ) -> Command {
+    ) -> Result<Command, String> {
+        let expanded = self.expanded_filesystem(cwd, cache_dir)?;
         let mut cmd = Command::new(bwrap);
         cmd.env_clear();
         cmd.arg("--clearenv");
         for (key, value) in env {
             cmd.arg("--setenv").arg(key).arg(value);
         }
-        for path in [
-            "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix", "/opt",
-        ] {
-            cmd.args(["--ro-bind-try", path, path]);
-        }
-        cmd.args(["--dir", "/etc"]);
-        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
-            cmd.args(["--ro-bind-try", path, path]);
+        if self.profile != SandboxProfile::Workspace {
+            cmd.args([
+                if self.profile == SandboxProfile::HostFull {
+                    "--bind"
+                } else {
+                    "--ro-bind"
+                },
+                "/",
+                "/",
+            ]);
+        } else {
+            for path in [
+                "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix", "/opt",
+            ] {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
+            cmd.args(["--dir", "/etc"]);
+            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         cmd.arg("--bind").arg(cwd).arg(cwd);
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
+        if let Some(expanded) = &expanded {
+            expanded.append_roots(&mut cmd)?;
+        }
         // After the writable workspace bind, so the read-only Git metadata
         // binds cover it.
         git_metadata.apply(&mut cmd, cwd);
+        if let Some(expanded) = &expanded {
+            expanded.append_denies(&mut cmd);
+        }
         cmd.args([
             "--unshare-user",
             "--unshare-ipc",
@@ -2705,9 +2997,10 @@ impl Sandbox {
         if deny_network {
             cmd.arg("--unshare-net");
         }
-        cmd.arg("--remount-ro")
-            .arg("/")
-            .arg("--chdir")
+        if self.profile != SandboxProfile::HostFull {
+            cmd.args(["--remount-ro", "/"]);
+        }
+        cmd.arg("--chdir")
             .arg(cwd)
             // `--dev` exposes a /dev/tty node; a fresh session (here and in
             // the pre-exec lifetime) leaves the service no controlling
@@ -2718,7 +3011,7 @@ impl Sandbox {
             .arg(program)
             .args(args);
         configure_new_session_child_lifetime(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     /// Validate that a direct executable can cross the exact bound workspace
@@ -2832,7 +3125,11 @@ impl Sandbox {
     ) -> Result<Command, String> {
         let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
-        append_bwrap_isolation(&mut cmd, &sandbox_cwd);
+        append_bwrap_isolation(
+            &mut cmd,
+            &sandbox_cwd,
+            self.profile != SandboxProfile::HostFull,
+        );
         cmd.args(["--new-session", "--die-with-parent", "--"]);
         if self.workspace_binding.is_some() {
             // bwrap needs fd 197 while constructing the workspace bind, but
@@ -2865,25 +3162,23 @@ impl Sandbox {
         git_metadata: git_metadata::BwrapGitMetadataBinds,
     ) -> Result<Command, String> {
         let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
-        cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
+        let executable = if self.profile == SandboxProfile::Workspace {
+            cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
+            SNAPSHOT_EXECUTABLE_PATH
+        } else {
+            "/dev/mini-agent-spawn-executable"
+        };
         // fd 3 is consumed by bubblewrap while constructing this read-only executable file.
         // It is deliberately not listed under `--preserve-fds`, so neither the target nor any
         // descendant can inherit the snapshot descriptor.
-        cmd.args([
-            "--perms",
-            "0500",
-            "--ro-bind-data",
-            "3",
-            SNAPSHOT_EXECUTABLE_PATH,
-        ]);
+        cmd.args(["--perms", "0500", "--ro-bind-data", "3", executable]);
         let sandbox_cwd = self.sandbox_cwd(cwd);
-        append_bwrap_isolation(&mut cmd, &sandbox_cwd);
-        cmd.args([
-            "--new-session",
-            "--die-with-parent",
-            "--",
-            SNAPSHOT_EXECUTABLE_PATH,
-        ]);
+        append_bwrap_isolation(
+            &mut cmd,
+            &sandbox_cwd,
+            self.profile != SandboxProfile::HostFull,
+        );
+        cmd.args(["--new-session", "--die-with-parent", "--", executable]);
         cmd.args(arguments);
         configure_new_session_child_lifetime(&mut cmd);
         Ok(cmd)
@@ -2898,28 +3193,55 @@ impl Sandbox {
     ) -> Result<Command, String> {
         let layout =
             workspace_layout::WorkspaceLayout::new(self.workspace_binding.as_deref(), cwd)?;
+        let expanded = self.expanded_filesystem(&layout.destination, cache_dir)?;
+        let host = self.profile != SandboxProfile::Workspace;
+        if host
+            && workspace_layout::forbidden_destination(
+                self.workspace_binding
+                    .as_ref()
+                    .map_or(cwd, |root| root.root()),
+            )
+        {
+            return Err(
+                "sandbox profile unavailable: workspace overlaps a host namespace/control path"
+                    .into(),
+            );
+        }
         let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
         for (key, value) in self.get_essential_env() {
             cmd.arg("--setenv").arg(key).arg(value);
         }
         cmd.args(["--setenv", "TMPDIR", "/tmp"]);
-        for (source, destination) in &layout.runtime_ro {
-            cmd.arg("--ro-bind-try").arg(source).arg(destination);
-        }
-        cmd.args(["--dir", "/etc"]);
-        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
-            cmd.args(["--ro-bind-try", path, path]);
-        }
-        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs"])
-            .arg(&layout.temporary_root);
-        // Empty-root layout only: never create aliases or directories after
-        // a writable workspace/cache bind, where setup could mutate the host.
-        for directory in &layout.alias_directories {
-            cmd.arg("--dir").arg(directory);
-        }
-        for (path, target) in &layout.aliases {
-            cmd.arg("--symlink").arg(target).arg(path);
+        if host {
+            cmd.args([
+                if self.profile == SandboxProfile::HostFull {
+                    "--bind"
+                } else {
+                    "--ro-bind"
+                },
+                "/",
+                "/",
+            ]);
+            cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+        } else {
+            for (source, destination) in &layout.runtime_ro {
+                cmd.arg("--ro-bind-try").arg(source).arg(destination);
+            }
+            cmd.args(["--dir", "/etc"]);
+            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
+            cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs"])
+                .arg(&layout.temporary_root);
+            // Empty-root layout only: never create aliases or directories after
+            // a writable workspace/cache bind, where setup could mutate the host.
+            for directory in &layout.alias_directories {
+                cmd.arg("--dir").arg(directory);
+            }
+            for (path, target) in &layout.aliases {
+                cmd.arg("--symlink").arg(target).arg(path);
+            }
         }
         if self.workspace_binding.is_some() && cfg!(unix) {
             // --bind-fd additionally checks the mounted dev/inode against
@@ -2932,9 +3254,15 @@ impl Sandbox {
             cmd.arg("--bind").arg(cwd).arg(&layout.destination);
         }
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
+        if let Some(expanded) = &expanded {
+            expanded.append_roots(&mut cmd)?;
+        }
         // After the writable workspace bind, so the read-only Git metadata
         // binds cover it.
         git_metadata.apply(&mut cmd, &layout.destination);
+        if let Some(expanded) = &expanded {
+            expanded.append_denies(&mut cmd);
+        }
         Ok(cmd)
     }
 
@@ -4808,7 +5136,7 @@ fn essential_env() -> Vec<(&'static str, String)> {
     vars
 }
 
-fn append_bwrap_isolation(command: &mut Command, cwd: &Path) {
+fn append_bwrap_isolation(command: &mut Command, cwd: &Path, readonly_root: bool) {
     command.args([
         "--unshare-user",
         "--unshare-ipc",
@@ -4816,11 +5144,11 @@ fn append_bwrap_isolation(command: &mut Command, cwd: &Path) {
         "--unshare-net",
         "--unshare-uts",
         "--unshare-cgroup",
-        "--remount-ro",
-        "/",
-        "--chdir",
     ]);
-    command.arg(cwd);
+    if readonly_root {
+        command.args(["--remount-ro", "/"]);
+    }
+    command.arg("--chdir").arg(cwd);
 }
 
 fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -4844,6 +5172,67 @@ fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
 /// [`git_metadata::seatbelt_write_denies`] (empty without a repository). The
 /// Git deny follows the workspace write grant because, between two filtered
 /// rules for the same operation, Seatbelt applies the later one.
+#[allow(clippy::too_many_arguments)]
+fn seatbelt_profile_ladder(
+    profile: SandboxProfile,
+    workspace: &str,
+    cache: &str,
+    private: &str,
+    protected_git: &str,
+    protected_storage: &str,
+    extra_reads: &str,
+    extra_writes: &str,
+    namespace_denies: &str,
+    deny_network: bool,
+) -> String {
+    let reads = if profile == SandboxProfile::Workspace {
+        format!(
+            "(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/dev\"){extra_reads})"
+        )
+    } else {
+        "(allow file-read*)".to_owned()
+    };
+    let writes = if profile == SandboxProfile::HostFull {
+        "(allow file-write*)".to_owned()
+    } else {
+        format!(
+            "(allow file-write* (subpath \"{workspace}\") (subpath \"{cache}\") (literal \"/dev/null\"){extra_writes})"
+        )
+    };
+    let network = if deny_network {
+        "(deny network*)"
+    } else {
+        "(allow network*)"
+    };
+    let git_rule = if protected_git.is_empty() {
+        String::new()
+    } else {
+        format!("(deny file-write*{protected_git})\n")
+    };
+    format!(
+        "(version 1)\n(deny default)\n(allow process*)\n{reads}\n{writes}\n(deny file-read*{private})\n(deny file-write*{protected_storage})\n(allow file-write* (subpath \"{cache}\"))\n{git_rule}(deny file-write*{private})\n(deny file-write-unlink{namespace_denies})\n{network}"
+    )
+}
+
+fn seatbelt_namespace_denies(paths: &[PathBuf]) -> Result<String, String> {
+    let mut names = Vec::new();
+    for path in paths {
+        for spelling in std::iter::once(path.clone()).chain(seatbelt_resolved_spelling(path)) {
+            for ancestor in spelling.ancestors().filter(|path| path.parent().is_some()) {
+                let literal = seatbelt_string_literal(ancestor, "protected namespace ancestor")?;
+                if !names.contains(&literal) {
+                    names.push(literal);
+                }
+            }
+        }
+    }
+    Ok(names
+        .iter()
+        .map(|path| format!("\n    (literal \"{path}\")"))
+        .collect())
+}
+
+#[cfg(test)]
 pub(crate) fn seatbelt_shell_profile(
     workspace_str: &str,
     cache_str: &str,
@@ -5039,6 +5428,38 @@ mod sandbox_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn profile100_admitted_carrier_keeps_write_authority_after_sandbox_drop() {
+        let owned = crate::tests::OwnedTestDirectory::new("profile100-command-lease");
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "ZS_CACHE_DIR",
+            Some(owned.path().join("cache").into_os_string()),
+        )]);
+        let root = owned.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let sandbox = Sandbox::new(true, "__missing_profile100_backend").with_workspace_binding(
+            Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap()),
+        );
+        sandbox.retain_git_write_roots(&root).unwrap();
+        let weak = Arc::downgrade(sandbox.git_write_roots.lock().unwrap().first().unwrap());
+        let carrier = disabled()
+            .wrap_command("inert")
+            .unwrap()
+            .retaining_roots(&sandbox.git_write_roots);
+        drop(sandbox);
+        assert!(weak.upgrade().is_some());
+        assert!(
+            crate::git::runtime::model_write_roots()
+                .unwrap()
+                .contains(&root)
+        );
+        drop(carrier);
+        assert!(
+            weak.upgrade().is_none(),
+            "unspawned carrier retirement releases exactly its lease"
+        );
+    }
 
     #[cfg(unix)]
     const PATHLESS_KILLPG_CHILD: &str = "MINI_AGENT_PATHLESS_KILLPG_CHILD";
@@ -6626,16 +7047,18 @@ mod sandbox_tests {
     #[test]
     fn hook_command_argv_requests_new_session() {
         let sandbox = Sandbox::new(true, "bwrap");
-        let command = sandbox.build_hook_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/bin/sh"),
-            "/usr/bin/hook",
-            &["--flag".to_string()],
-            Path::new("/workspace"),
-            Path::new("/cache/mini-agent"),
-            &std::collections::BTreeMap::new(),
-            git_metadata::BwrapGitMetadataBinds::none(),
-        );
+        let command = sandbox
+            .build_hook_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/bin/sh"),
+                "/usr/bin/hook",
+                &["--flag".to_string()],
+                Path::new("/workspace"),
+                Path::new("/cache/mini-agent"),
+                &std::collections::BTreeMap::new(),
+                git_metadata::BwrapGitMetadataBinds::none(),
+            )
+            .unwrap();
         let args = command_argv(&command);
         assert_new_session_before_separator(&args);
         for flag in ["--dev", "--die-with-parent", "--unshare-pid"] {
@@ -6667,16 +7090,18 @@ mod sandbox_tests {
     #[test]
     fn workspace_service_argv_requests_new_session() {
         for deny_network in [true, false] {
-            let command = Sandbox::build_workspace_service_bwrap_command(
-                Path::new("/usr/bin/bwrap"),
-                Path::new("/usr/bin/service"),
-                &["--stdio".to_string()],
-                Path::new("/workspace"),
-                Path::new("/cache/mini-agent"),
-                &[(OsString::from("PATH"), OsString::from("/usr/bin"))],
-                deny_network,
-                git_metadata::BwrapGitMetadataBinds::none(),
-            );
+            let command = Sandbox::new(true, "bwrap")
+                .build_workspace_service_bwrap_command(
+                    Path::new("/usr/bin/bwrap"),
+                    Path::new("/usr/bin/service"),
+                    &["--stdio".to_string()],
+                    Path::new("/workspace"),
+                    Path::new("/cache/mini-agent"),
+                    &[(OsString::from("PATH"), OsString::from("/usr/bin"))],
+                    deny_network,
+                    git_metadata::BwrapGitMetadataBinds::none(),
+                )
+                .unwrap();
             let args = command_argv(&command);
             assert_new_session_before_separator(&args);
             assert_eq!(args.iter().any(|arg| arg == "--unshare-net"), deny_network);
@@ -6861,16 +7286,18 @@ mod sandbox_tests {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "bwrap");
-        let command = sandbox.build_hook_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/bin/sh"),
-            "/usr/bin/hook",
-            &[],
-            &workspace,
-            Path::new("/cache/mini-agent"),
-            &std::collections::BTreeMap::new(),
-            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
-        );
+        let command = sandbox
+            .build_hook_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/bin/sh"),
+                "/usr/bin/hook",
+                &[],
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                &std::collections::BTreeMap::new(),
+                git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+            )
+            .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
 
@@ -6879,16 +7306,18 @@ mod sandbox_tests {
     fn bwrap_workspace_service_binds_git_metadata_read_only_after_workspace() {
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
-        let command = Sandbox::build_workspace_service_bwrap_command(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/usr/bin/service"),
-            &[],
-            &workspace,
-            Path::new("/cache/mini-agent"),
-            &[],
-            true,
-            git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
-        );
+        let command = Sandbox::new(true, "bwrap")
+            .build_workspace_service_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/usr/bin/service"),
+                &[],
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                &[],
+                true,
+                git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+            )
+            .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
     }
 
@@ -7599,6 +8028,73 @@ echo COMMITTED"#;
     }
 
     #[test]
+    fn profile100_seatbelt_ladder_keeps_private_git_network_and_namespace_denies_last() {
+        let private = "\n (subpath \"/home/operator/.ssh\")";
+        let git = "\n (literal \"/work/.git\")";
+        let storage = "\n (subpath \"/cache/publisher\")";
+        let ancestors = "\n (literal \"/home/operator\")";
+        for profile in [
+            SandboxProfile::Workspace,
+            SandboxProfile::HostRead,
+            SandboxProfile::HostFull,
+        ] {
+            let rendered = seatbelt_profile_ladder(
+                profile,
+                "/work",
+                "/cache/scratch",
+                private,
+                git,
+                storage,
+                "\n (subpath \"/read\")",
+                "\n (subpath \"/write\")",
+                ancestors,
+                true,
+            );
+            assert_eq!(
+                rendered.contains("(allow file-read*)"),
+                profile != SandboxProfile::Workspace
+            );
+            assert_eq!(
+                rendered.contains("(allow file-write*)"),
+                profile == SandboxProfile::HostFull
+            );
+            let grant = rendered.find("(allow file-write*").unwrap();
+            for rule in [
+                "(deny file-read*",
+                "(deny file-write*",
+                "(deny file-write-unlink",
+            ] {
+                assert!(rendered.find(rule).unwrap() > grant);
+            }
+            assert!(rendered.ends_with("(deny network*)"));
+            assert!(rendered.contains("(literal \"/home/operator\")"));
+            assert!(
+                !rendered.contains("(deny file-write*)"),
+                "empty filters must never become universal denies"
+            );
+        }
+        let open_network = seatbelt_profile_ladder(
+            SandboxProfile::HostFull,
+            "/work",
+            "/cache/scratch",
+            private,
+            "",
+            storage,
+            "",
+            "",
+            ancestors,
+            false,
+        );
+        assert!(open_network.ends_with("(allow network*)"));
+        assert!(!open_network.contains("(deny file-write*)"));
+        assert!(
+            !Sandbox::new(true, "appcontainer")
+                .with_general_profile(SandboxProfile::HostFull, Vec::new(), Vec::new())
+                .profile_supported()
+        );
+    }
+
+    #[test]
     fn seatbelt_profile_escapes_paths_and_rejects_controls() {
         assert_eq!(
             seatbelt_string_literal(Path::new(r#"/tmp/a\"b"#), "probe").unwrap(),
@@ -8237,21 +8733,47 @@ echo PRIVATE_TEMP_PASS"#,
             .get_seatbelt_profile(&workspace, &cache_dir, true)
             .unwrap();
 
-        // Build the same profile manually (simulating what would happen without caching)
         let workspace_str = seatbelt_string_literal(&workspace, "working directory").unwrap();
         let cache_str = seatbelt_string_literal(&cache_dir, "application cache").unwrap();
-        let app_paths = crate::paths::AppPaths::from_process(None).unwrap();
+        let private_paths = general_profile::private_paths().unwrap();
+        let private_refs = private_paths
+            .iter()
+            .map(|path| (path.as_path(), "private"))
+            .collect::<Vec<_>>();
+        let private_read_denies = seatbelt_private_read_denies(&private_refs).unwrap();
+        let app_paths = crate::paths::process_paths().unwrap();
         let credentials_str =
             seatbelt_string_literal(&app_paths.credentials_dir, "credential directory").unwrap();
         let config_str =
             seatbelt_string_literal(&app_paths.config_dir, "configuration directory").unwrap();
-        let private_read_denies = seatbelt_private_read_denies(&[
-            (app_paths.credentials_dir.as_path(), "credential directory"),
-            (app_paths.config_dir.as_path(), "configuration directory"),
-        ])
+        let mut protected = crate::git::runtime::protected_runtime_paths().unwrap();
+        protected.push(app_paths.cache_dir);
+        let storage = seatbelt_private_read_denies(
+            &protected
+                .iter()
+                .map(|path| (path.as_path(), "storage"))
+                .collect::<Vec<_>>(),
+        )
         .unwrap();
-        let uncached_profile =
-            seatbelt_shell_profile(&workspace_str, &cache_str, &private_read_denies, "", true);
+        let namespace = seatbelt_namespace_denies(
+            &private_paths
+                .into_iter()
+                .chain(protected)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let uncached_profile = seatbelt_profile_ladder(
+            SandboxProfile::Workspace,
+            &workspace_str,
+            &cache_str,
+            &private_read_denies,
+            "",
+            &storage,
+            "",
+            "",
+            &namespace,
+            true,
+        );
 
         // The cached result must be byte-identical to the uncached result
         assert_eq!(

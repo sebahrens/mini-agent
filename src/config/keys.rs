@@ -201,6 +201,10 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("Enable process containment")
         .shaped(ConfigShape::Bool),
     aliased("sandbox-backend", &["sandbox_backend"]).shaped(ConfigShape::String),
+    aliased("sandbox-profile", &["sandbox_profile"])
+        .shaped(ConfigShape::Enum(crate::sandbox::SandboxProfile::NAMES)),
+    aliased("sandbox-read-roots", &["sandbox_read_roots"]).shaped(ConfigShape::Strings),
+    aliased("sandbox-write-roots", &["sandbox_write_roots"]).shaped(ConfigShape::Strings),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],

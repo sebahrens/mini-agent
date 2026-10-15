@@ -75,6 +75,13 @@ pub const SANDBOX_OFF_LABEL: &str = "sandbox:off";
 /// The persistent sandbox indicator for `sandbox`, or `None` when the session
 /// is contained or the operator disabled sandboxing deliberately.
 pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'static str> {
+    if sandbox.policy() != crate::sandbox::SandboxPolicy::Disabled {
+        match sandbox.profile() {
+            crate::sandbox::SandboxProfile::HostFull => return Some("sandbox:host-full"),
+            crate::sandbox::SandboxProfile::HostRead => return Some("sandbox:host-read"),
+            crate::sandbox::SandboxProfile::Workspace => {}
+        }
+    }
     matches!(
         sandbox.explicit_shell_boundary(),
         crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { .. }

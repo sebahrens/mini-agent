@@ -3251,6 +3251,34 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn profile100_project_filesystem_grants_require_current_project_approval() {
+        let root = crate::tests::OwnedTestDirectory::new("profile100-project-trust");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root.path().join("state/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "sandbox-profile = 'host-full'\nsandbox-read-roots = ['/read']\nsandbox-write-roots = ['/write']\nchat_left_margin = 7\n").unwrap();
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                panic!("no headless prompt")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert!(cfg.sandbox_profile.is_none());
+        assert!(cfg.sandbox_read_roots.is_empty() && cfg.sandbox_write_roots.is_empty());
+        assert_eq!(cfg.chat_left_margin, Some(7));
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(
+            cfg.sandbox_profile,
+            Some(crate::sandbox::SandboxProfile::HostFull)
+        );
+        assert_eq!(
+            cfg.sandbox_write_roots,
+            [std::path::PathBuf::from("/write")]
+        );
+    }
+
+    #[test]
     fn project_update_check_cannot_opt_in_to_network_without_trust() {
         let root = crate::tests::OwnedTestDirectory::new("project-update-check-trust");
         let path = root.path().join("project/.zerostack/config.toml");

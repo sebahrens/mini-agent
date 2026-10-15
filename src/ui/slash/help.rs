@@ -206,6 +206,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /mode <mode>           set mode (standard|restrictive|readonly|planwrite|guarded|yolo)",
     );
+    emit(
+        false,
+        "  /sandbox [profile]     inspect or select workspace|host-read|host-full",
+    );
     emit(false, "  /toggle                show toggleable features");
     emit(false, "  /toggle todo [on|off]  toggle todo-list tools");
     #[cfg(feature = "mcp")]

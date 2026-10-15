@@ -2049,6 +2049,13 @@ pub(crate) fn print_sessions(
     Ok(())
 }
 
+fn sandbox_profile_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str, String) {
+    (
+        "sandbox-profile",
+        cli.resolve_sandbox_profile(cfg).to_string(),
+    )
+}
+
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
     let rules_cfg =
         crate::permission::cli_rules::report_config(cli, cfg).map_err(io::Error::other)?;
@@ -2079,6 +2086,11 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let sandbox_capabilities = Sandbox::new(
         sandbox && cli.general_sandbox_is_eligible(cfg),
         &sandbox_backend,
+    )
+    .with_general_profile(
+        cli.resolve_sandbox_profile(cfg),
+        cfg.sandbox_read_roots.clone(),
+        cfg.sandbox_write_roots.clone(),
     )
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
@@ -2228,6 +2240,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("shell", shell.to_string()),
             ("edit-system", edit_system.to_string()),
             ("sandbox", sandbox.to_string()),
+            sandbox_profile_entry(cli, cfg),
             ("no-tools", no_tools.to_string()),
             ("tools", tools_allowlist),
             ("no-context-files", no_context_files.to_string()),
@@ -2322,6 +2335,7 @@ fn config_source_entries(cli: &cli::Cli, cfg: &config::Config) -> Vec<(&'static 
         ("default_prompt", cli.load_prompt.is_some()),
         ("sandbox", cli.sandbox || cli.no_sandbox),
         ("sandbox-backend", cli.sandbox_backend.is_some()),
+        ("sandbox-profile", cli.sandbox_profile.is_some()),
         ("shell", cli.shell.is_some()),
         ("edit_system", cli.edit_system.is_some()),
         (
@@ -2532,6 +2546,26 @@ mod tests {
         chat_history_path_policy_entry, emit_headless, installed_build_entry,
         javascript_worker_compiled_entry, parse_git_status, render_headless_json, write_output,
     };
+
+    #[test]
+    fn profile100_print_config_entry_reports_the_effective_profile() {
+        let cfg = crate::config::Config {
+            sandbox_profile: Some(crate::sandbox::SandboxProfile::HostRead),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::sandbox_profile_entry(&crate::cli::Cli::default(), &cfg),
+            ("sandbox-profile", "host-read".into())
+        );
+        let cli = crate::cli::Cli {
+            sandbox_profile: Some(crate::sandbox::SandboxProfile::HostFull),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::sandbox_profile_entry(&cli, &cfg),
+            ("sandbox-profile", "host-full".into())
+        );
+    }
 
     #[test]
     fn cli_seed_rule_inventory_reports_effective_maps_without_plaintext() {

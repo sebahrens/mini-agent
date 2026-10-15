@@ -852,6 +852,13 @@ pub struct Cli {
     pub sandbox_backend: Option<String>,
 
     #[arg(
+        long = "sandbox-profile",
+        value_enum,
+        help = "Filesystem profile for contained commands; does not change permission mode or network policy"
+    )]
+    pub sandbox_profile: Option<crate::sandbox::SandboxProfile>,
+
+    #[arg(
         long = "windows-appcontainer-read-root",
         value_name = "PATH",
         help = "Add an explicit Windows AppContainer read/execute root (repeatable; relative paths resolve from the workspace)"
@@ -1364,7 +1371,11 @@ impl Cli {
             && (self.sandbox
                 || cfg.sandbox == Some(true)
                 || self.sandbox_backend.is_some()
-                || cfg.sandbox_backend.is_some())
+                || cfg.sandbox_backend.is_some()
+                || self.sandbox_profile.is_some()
+                || cfg.sandbox_profile.is_some()
+                || !cfg.sandbox_read_roots.is_empty()
+                || !cfg.sandbox_write_roots.is_empty())
     }
 
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
@@ -1372,6 +1383,12 @@ impl Cli {
             .clone()
             .or_else(|| cfg.sandbox_backend.clone())
             .unwrap_or_else(default_sandbox_backend)
+    }
+
+    pub fn resolve_sandbox_profile(&self, cfg: &config::Config) -> crate::sandbox::SandboxProfile {
+        self.sandbox_profile
+            .or(cfg.sandbox_profile)
+            .unwrap_or_default()
     }
 
     pub fn resolve_windows_appcontainer_read_roots(

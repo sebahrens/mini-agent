@@ -861,3 +861,25 @@ fn busy67_numeric_progress_is_sticky_and_invalidates_cached_status() {
     assert_ne!(before, statusline::cache_key(&session, &live));
     assert!(!line_text(&statusline::build_lines(&spec, &session, &live)[0]).contains("queue:"));
 }
+
+#[test]
+fn profile100_host_full_is_a_persistent_red_status_segment() {
+    let sandbox = crate::sandbox::Sandbox::new(true, "bwrap").with_general_profile(
+        crate::sandbox::SandboxProfile::HostFull,
+        Vec::new(),
+        Vec::new(),
+    );
+    let label = statusline::sandbox_label(&sandbox);
+    assert_eq!(label, Some("sandbox:host-full"));
+    let session = Session::new("openai", "fixture", 128_000, "");
+    let mut current = ctx();
+    current.sandbox_label = label;
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("model")],
+        }],
+    };
+    let spans = &statusline::build_lines(&spec, &session, &current)[0];
+    assert!(spans.iter().any(|span| matches!(span, StatusSpan::Text {text, fg:Some(crossterm::style::Color::Red), ..} if text == "sandbox:host-full")));
+    assert_eq!(line_text(spans).matches("sandbox:host-full").count(), 1);
+}

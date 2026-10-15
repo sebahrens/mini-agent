@@ -45,6 +45,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/retry",
     "/review",
     "/rewind",
+    "/sandbox",
     "/sessions",
     "/steer",
     "/theme",

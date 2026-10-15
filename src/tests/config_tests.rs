@@ -1348,3 +1348,34 @@ fn quick_model_price_presence_actual_config_save_does_not_invent_free_rates() {
     );
     assert_eq!(quick["free"].resolved_prices(), Some((0.0, 0.0)));
 }
+
+#[test]
+fn profile100_typed_config_cli_and_explicit_request_precedence() {
+    use crate::sandbox::SandboxProfile;
+    use clap::Parser;
+    let cfg: Config = toml::from_str("sandbox-profile = 'host-read'\nsandbox-read-roots = ['/read']\nsandbox-write-roots = ['/write']").unwrap();
+    assert_eq!(cfg.sandbox_profile, Some(SandboxProfile::HostRead));
+    assert_eq!(cfg.sandbox_read_roots, [std::path::PathBuf::from("/read")]);
+    let cli =
+        crate::cli::Cli::try_parse_from(["mini-agent", "--sandbox-profile", "host-full"]).unwrap();
+    assert_eq!(cli.resolve_sandbox_profile(&cfg), SandboxProfile::HostFull);
+    assert!(cli.sandbox_explicitly_requested(&cfg));
+    let off = crate::cli::Cli::try_parse_from([
+        "mini-agent",
+        "--no-sandbox",
+        "--sandbox-profile",
+        "host-full",
+    ])
+    .unwrap();
+    assert!(!off.resolve_sandbox(&cfg));
+    assert!(!off.sandbox_explicitly_requested(&cfg));
+    assert_eq!(
+        crate::cli::Cli::default().resolve_sandbox_profile(&Config::default()),
+        SandboxProfile::Workspace
+    );
+    assert!(toml::from_str::<Config>("sandbox-profile = 'full'").is_err());
+    assert!(crate::cli::Cli::try_parse_from(["mini-agent", "--sandbox-profile", "full"]).is_err());
+    let saved = toml::to_string(&cfg).unwrap();
+    assert!(saved.contains("sandbox-profile = \"host-read\""));
+    assert!(!saved.contains("sandbox_profile"));
+}

@@ -232,6 +232,11 @@ pub(crate) fn resolve_configured_execution_authority(
 ) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
     let backend = cli.resolve_sandbox_backend(cfg);
     let configured = crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend)
+        .with_general_profile(
+            cli.resolve_sandbox_profile(cfg),
+            cfg.sandbox_read_roots.clone(),
+            cfg.sandbox_write_roots.clone(),
+        )
         .with_windows_appcontainer_roots(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
@@ -249,6 +254,12 @@ pub(crate) fn resolve_configured_execution_authority(
         configured
     };
 
+    if authority.sandbox == SandboxResolution::Enforced
+        && sandbox.profile() == crate::sandbox::SandboxProfile::HostFull
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(b"warning: explicit host-full filesystem access; private data and Git protections remain, permission mode and network policy unchanged\n");
+    }
     Ok((authority, sandbox))
 }
 
@@ -643,6 +654,11 @@ pub(crate) fn degraded_sandbox_notice_with(backend: &str, diagnostic: Option<&st
 /// The degraded-sandbox notice for a materialized session sandbox, or `None`
 /// when it is contained or was disabled deliberately (`--no-sandbox`).
 pub(crate) fn degraded_sandbox_notice_for(sandbox: &crate::sandbox::Sandbox) -> Option<String> {
+    if sandbox.profile() == crate::sandbox::SandboxProfile::HostFull
+        && sandbox.policy() == crate::sandbox::SandboxPolicy::RequiredAndAvailable
+    {
+        return Some("Explicit host-full filesystem profile: contained commands may write host files except private data and protected Git paths. Permission mode and network policy are unchanged.".into());
+    }
     match sandbox.explicit_shell_boundary() {
         crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { backend } => Some(
             degraded_sandbox_notice_with(&backend, sandbox.unavailable_diagnostic()),

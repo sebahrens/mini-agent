@@ -517,3 +517,25 @@ but is not made interruptible by these diagnostics. A timeout remains closed.
 The two source-free native diagnostic controls, existing real timeout/tree-reap
 control and installed three-probe gate establish the owning validation scope;
 new behavior requires actual Windows execution, not a compiled-out macOS test.
+
+## Ordinary filesystem profile ladder
+
+The typed `SandboxProfile` and `src/sandbox/general_profile.rs` implement the
+ordinary-command workspace/host-read/host-full selection described in
+[CONFIG.md](../agent/CONFIG.md). Permission mode and per-caller network policy
+remain orthogonal. Linux workspace without additional roots must retain its
+prior argv; command, immutable-script, hook and direct service launchers share
+the same expanded-profile plan. macOS workspace restricts reads, host-read
+allows host reads, and host-full allows host writes subject to the same private
+and Git exclusions. Windows rejects host levels and maps explicit roots into
+its existing AppContainer root roles. No profile alters the Phase 6 worker.
+
+Private mountpoint setup is an explicit, bounded no-follow operation that only
+creates missing empty private directories. Existing entries/permissions must
+remain byte/metadata unchanged. Retained directory identities cover explicit
+roots and Linux ancestor mounts; the target must not inherit their descriptors.
+Late Git executable approval must reject any active model write domain,
+including custom roots and host-full outside retained readonly exceptions.
+Native acceptance must exercise actual ordinary reads/writes, private read
+refusal, ancestor rename refusal, and host-full outside-workspace writes; unit
+argv/render tests alone do not attest OS enforcement.

@@ -327,6 +327,11 @@ fn configured_sandbox_validation_probe<'a>(
         }
         let backend = cli.resolve_sandbox_backend(cfg);
         let sandbox = Sandbox::new(cli.resolve_sandbox(cfg), &backend)
+            .with_general_profile(
+                cli.resolve_sandbox_profile(cfg),
+                cfg.sandbox_read_roots.clone(),
+                cfg.sandbox_write_roots.clone(),
+            )
             .with_windows_appcontainer_roots(
                 cli.resolve_windows_appcontainer_read_roots(cfg),
                 cli.resolve_windows_appcontainer_write_roots(cfg),

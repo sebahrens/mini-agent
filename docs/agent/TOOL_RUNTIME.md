@@ -1514,8 +1514,30 @@ An absent destination still uses the existing create-only operation.
 Publication remains inside the existing MCP scoped blocking job; dropping its
 awaiter does not retire that job or release its transaction early. The owning
 Windows controls cover the actual retained reader/private candidate, parent and
-root metadata conflicts, root replacement, rollback, and cancellation with a
-held blocking writer. The separate native TxF diagnostic establishes commit,
+root metadata conflicts, pinned namespace rename refusal, a nested replacement
+before publisher capture, rollback, and cancellation with a held blocking writer.
+The separate native TxF diagnostic establishes commit,
 rollback, stale-data refusal and transaction-lock survival on the recorded
 Windows host; it is not a replacement for these consumer controls or evidence
 for every filesystem or account privilege level.
+
+## Ordinary command filesystem profiles
+
+`--sandbox-profile workspace|host-read|host-full` and the trusted
+`sandbox-profile` key select ordinary command filesystem reach; `/sandbox`
+shows or changes the idle session selection. `sandbox-read-roots` and
+`sandbox-write-roots` add explicit directory grants. Permission decisions and
+per-caller network isolation remain independent. Host-full is explicit and
+shows a persistent red indicator plus a startup warning. Private application
+and common secret paths, retained Git executables/cache and Git metadata
+remain protected; unsafe mask topologies refuse launch. Linux may prepare
+missing empty private mountpoint directories as documented in
+[CONFIG.md](CONFIG.md); existing entries/permissions are never repaired.
+
+Host-read can read a home rustup/toolchain while Cargo's writable cache/target
+stays in the workspace, dedicated command cache or an explicit write root.
+The broker-only JavaScript worker retains its separate mandatory profile.
+Independently configured MCP/LSP stdio and hook policies retain their own
+workspace/trust selection instead of inheriting a global host-full grant.
+Windows uses its existing AppContainer explicit root keys and rejects the two
+host-wide levels.

@@ -345,6 +345,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--dangerously-skip-permissions` | Disable permission checks entirely. This is strictly broader than `--yolo`. |
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
 | `--no-sandbox` | Disable the default-on general-process sandbox |
+| `--sandbox-profile workspace\|host-read\|host-full` | Select ordinary command filesystem reach; does not change permission mode or network policy. Unix host-full is explicit and warns; Windows uses workspace plus AppContainer root keys. |
 | `--shell <path>` | Select Bash/sh, or PowerShell/pwsh on Windows, for explicit shell execution and the compatibility tool. |
 | `--no-color` | Disable colored TUI output. |
 | `--tutor` | Print the getting-started guide through the pager and exit. |
@@ -646,3 +647,11 @@ Use `/skills` to inspect authorized instruction skills or choose one in the comm
 `/reviewer inspect the error handling` pins a discovered `reviewer` skill for that user turn;
 automatic retrieval can still select other relevant skills within the same budget. The skill is
 instruction context, and its bundled scripts and permission metadata do not grant effects.
+
+Use `/sandbox` to list filesystem profiles and `/sandbox host-read` to change an
+idle interactive session. The change is session-local; active turns, background
+tasks and commands must settle first. Host-read supports ordinary home-based
+read dependencies while keeping writes within the workspace/cache/explicit
+roots. Host-full grants broad host writes with private-data and protected-Git
+exceptions; read [CONFIG.md](CONFIG.md) for mountpoint preparation and refused
+mask topologies before selecting it. These profiles never widen the JS worker.

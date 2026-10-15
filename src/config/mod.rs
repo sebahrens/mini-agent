@@ -359,6 +359,26 @@ pub struct Config {
     )]
     pub sandbox_backend: Option<String>,
     #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-profile",
+        alias = "sandbox_profile"
+    )]
+    pub sandbox_profile: Option<crate::sandbox::SandboxProfile>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-read-roots",
+        alias = "sandbox_read_roots"
+    )]
+    pub sandbox_read_roots: Vec<std::path::PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-write-roots",
+        alias = "sandbox_write_roots"
+    )]
+    pub sandbox_write_roots: Vec<std::path::PathBuf>,
+    #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         rename = "windows-appcontainer-read-roots",

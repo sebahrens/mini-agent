@@ -744,6 +744,9 @@ Accepted top-level keys:
 | `permission-modes`        | array   | List of mode names that apply configured `allow` and `ask` rules. Default: `["guarded", "standard", "yolo"]`. Configured `deny` and `external_directory` deny rules are security baselines and remain active in every mode. |
 | `permission_mode_cycle` | array | Global-only Shift+Tab ring; defaults to `["standard", "guarded", "yolo"]`. One to six unique names from `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`; empty, duplicate, and unknown modes are rejected when loading config, even with tools disabled. Project overrides are ignored, including trusted projects. This changes neither startup mode nor which modes apply rules. |
 | `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `true`. Precedence is `--no-sandbox` (disable) > `--sandbox` (explicitly require) > this config value > the default. On non-Windows hosts, an unavailable backend inherited only from the default warns and runs unsandboxed. While sandboxing remains enabled, `--sandbox`, `sandbox = true`, or selecting a backend through the CLI/config fails closed if that backend is unavailable. This setting never disables the mandatory broker-only JS worker containment. |
+| `sandbox-profile` | string | `workspace` (default), `host-read`, or explicit `host-full`. CLI `--sandbox-profile` wins. Profiles affect ordinary command filesystem reach, not permission mode/network or the JS worker. `/sandbox` lists; `/sandbox NAME` switches this idle session and rebuilds its agent without saving config. Unix host-full displays a red indicator and startup warning. Windows rejects host levels; use workspace with explicit AppContainer roots. |
+| `sandbox-read-roots` | array | At most 32 existing directories readable by contained commands, relative to the captured workspace or absolute. Trusted project approval is required. Windows includes these in its explicit AppContainer read roots. |
+| `sandbox-write-roots` | array | At most 32 existing directories writable by contained commands, subject to private/Git protections. Filesystem-root grants require explicit host-full instead. Trusted project approval is required. Windows includes these in its explicit AppContainer write roots. |
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight. Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by interrupted earlier preflights. The new run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
@@ -808,15 +811,38 @@ one-hour tier defaults to twice the selected native input price; changing an
 explicit five-minute price does not change that fallback. Missing required write
 tiers remain unpriced, rather than being relabeled five-minute writes.
 
-The macOS general-command Seatbelt profile permits reads from ordinary
-host-readable paths needed by developer tools, but explicitly denies the
-resolved mini-agent configuration and credential directories. Each is denied
-under both its configured spelling and its symlink-resolved spelling (for
-example `/tmp` versus `/private/tmp`, or a symlinked `~/.mini-agent`), because
-Seatbelt matches only resolved paths. It therefore
-protects mini-agent's own stored API keys and MCP OAuth tokens, but does not
-claim universal filesystem confidentiality. Linux and macOS expose only the dedicated
-`<cache_dir>/sandbox-runtime` subtree to general sandboxed commands.
+Ordinary filesystem profiles use the module `src/sandbox/general_profile.rs` on
+Linux and the shared Seatbelt renderer on macOS. `workspace` retains the Linux
+empty-root layout and limits macOS reads to the workspace, command cache,
+explicit roots and system runtime files. `host-read` permits host reads and
+workspace/cache/explicit-root writes. Explicit `host-full` permits host reads
+and writes. Private application config, credentials, state and data, plus
+`~/.ssh`, `.aws`, `.gnupg`, `.kube`, `.azure`, `.config/gcloud` and `.config/gh`,
+remain hidden. Protected Git metadata, retained executables and publisher-cache
+storage remain unwritable; only dedicated command scratch is writable there.
+These are path-based sandbox boundaries, not a claim to hide arbitrary
+pre-existing secret copies elsewhere on the host.
+
+Linux host profiles retain fresh proc/dev/tmp namespaces. Missing secret mask
+mountpoints outside all write grants are skipped by host-read, because the
+command cannot create them. When a command could create them (including
+host-full), explicit profile preparation creates only missing empty private
+0700 directories through retained, no-follow parents. Those empty directories
+persist after command exit. Existing entries and permissions are never repaired.
+Changed parents, symlinked mask spellings, namespace/control overlap and
+private/runtime overlap refuse the profile with a diagnostic; use canonical,
+disjoint application paths/cache overrides. Bubblewrap must not create host
+mountpoints implicitly. Ancestors of protected paths in writable domains are
+pinned as directory mounts. Seatbelt denies unlink/rename of the corresponding
+ancestors. Ordinary entries beneath those directories retain their selected
+read/write reach.
+
+Custom write roots participate in retained Git executable disjointness. Active
+host-full owners also prevent later trusted Git helpers outside their captured
+readonly exceptions from being approved. Retired owners release that restriction;
+imported paths/metadata never grant executable authority. Network policy remains
+owned by the caller (ordinary shell and hooks deny it); permission modes remain
+independent, and the mandatory broker-only JS worker profile is unchanged.
 
 Skill Gym has no `gym.toml` key or production configuration namespace. Its scripts use command-line
 arguments and task JSON, set `MINI_AGENT_GYM=1`, and override `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`,

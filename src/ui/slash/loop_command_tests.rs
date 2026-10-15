@@ -108,7 +108,7 @@ async fn run_loop_parts_with_state(
             .build()
             .unwrap(),
     );
-    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -137,7 +137,7 @@ async fn run_loop_parts_with_state(
         permission: &None,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,

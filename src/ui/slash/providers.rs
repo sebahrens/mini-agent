@@ -1347,7 +1347,7 @@ mod model_pricing_tests {
         let mut reasoning_enabled = false;
         let mut is_running = false;
         let mut todo_tools_enabled = false;
-        let sandbox =
+        let mut sandbox =
             crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
         #[cfg(feature = "skills")]
         let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
@@ -1368,7 +1368,7 @@ mod model_pricing_tests {
             permission: &None,
             ask_tx: &None,
             todo_tools_enabled: &mut todo_tools_enabled,
-            sandbox: &sandbox,
+            sandbox: &mut sandbox,
             terminal_guard: &mut terminal_guard,
             #[cfg(feature = "skills")]
             skill_services: &skill_services,

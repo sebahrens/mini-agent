@@ -947,6 +947,23 @@ jobs:
             -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$evidence/headless.log"
           grep -F 'test result: ok. 1 passed;' "$evidence/headless.log"
 
+      - name: Test explicit host filesystem profiles on native Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=target/native-workspace-evidence
+          cargo test --locked --bin mini-agent profile100_native -- --list > "$evidence/profile100-list.txt"
+          test "$(grep -c ': test$' "$evidence/profile100-list.txt")" -eq 2
+          for name in \
+            'sandbox::general_profile::tests::profile100_native_host_profiles_preserve_masks_and_real_operations' \
+            'sandbox::general_profile::tests::profile100_native_host_read_runs_cargo_test_from_home_rustup'; do
+            test "$(grep -Fxc "$name: test" "$evidence/profile100-list.txt")" -eq 1
+            log="$evidence/${name//::/_}.log"
+            cargo test --locked --bin mini-agent "$name" \
+              -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F 'test result: ok. 1 passed;' "$log"
+          done
+
       - name: Archive native Linux workspace proof
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

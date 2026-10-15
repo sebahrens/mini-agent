@@ -69,6 +69,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         "/reasoning" | "/thinking" => handle_reasoning(parts, ctx).await,
         "/mode" => handle_mode(parts, ctx).await,
+        "/sandbox" => handle_sandbox(parts, ctx).await,
         "/toggle" => handle_toggle(parts, ctx).await,
         "/editsys" => handle_editsys(parts, ctx).await,
         "/advisor" => {
@@ -301,6 +302,61 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
             );
         }
     }
+    Ok(())
+}
+
+async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    use crate::sandbox::SandboxProfile;
+    if parts.len() == 1 {
+        write_ok(
+            ctx.renderer,
+            format!("sandbox profile: {}", ctx.sandbox.profile()),
+        );
+        for profile in [
+            SandboxProfile::Workspace,
+            SandboxProfile::HostRead,
+            SandboxProfile::HostFull,
+        ] {
+            write_result(
+                ctx.renderer,
+                format!("  /sandbox {profile}: {}", profile.description()),
+            );
+        }
+        return Ok(());
+    }
+    if parts.len() != 2 {
+        write_error(
+            ctx.renderer,
+            "usage: /sandbox [workspace|host-read|host-full]",
+        );
+        return Ok(());
+    }
+    let Ok(profile) = <SandboxProfile as clap::ValueEnum>::from_str(parts[1], false) else {
+        write_error(ctx.renderer, "expected workspace, host-read or host-full");
+        return Ok(());
+    };
+    #[cfg(feature = "subagents")]
+    let background_active = ctx.session.background_task_counts().0 != 0;
+    #[cfg(not(feature = "subagents"))]
+    let background_active = false;
+    if *ctx.is_running || background_active {
+        write_error(
+            ctx.renderer,
+            "finish or cancel active turns/tasks before changing the sandbox profile",
+        );
+        return Ok(());
+    }
+    if let Err(error) = ctx.sandbox.set_profile(profile) {
+        write_error(ctx.renderer, error);
+        return Ok(());
+    }
+    ctx.rebuild_agent().await;
+    write_ok(
+        ctx.renderer,
+        format!(
+            "sandbox profile: {profile} (this session; permission mode and network policy unchanged)"
+        ),
+    );
     Ok(())
 }
 
@@ -986,5 +1042,124 @@ mod default_runtime44_tests {
         }
         #[cfg(not(feature = "lsp"))]
         let _ = &mut cfg;
+    }
+}
+
+#[cfg(test)]
+mod profile100_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn profile100_actual_slash_listing_switch_and_busy_refusal_are_session_only() {
+        let root = crate::tests::OwnedTestDirectory::new("profile100-slash");
+        let _env = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        let mut session = crate::session::Session::new("openrouter", "fixture", 128_000, "");
+        let session_id = session.id.clone();
+        let mut client = crate::provider::AnyClient::OpenRouter(
+            rig::providers::openrouter::Client::builder()
+                .api_key("unused-test-key")
+                .base_url("http://127.0.0.1:9")
+                .http_client(crate::provider_http::ProviderHttpClient::default())
+                .build()
+                .unwrap(),
+        );
+        let mut agent = None;
+        let mut input = crate::ui::input::InputEditor::new();
+        let invalidated = AtomicBool::new(false);
+        let mut show_reasoning = false;
+        let mut reasoning_enabled = false;
+        let mut is_running = false;
+        let mut todo_tools_enabled = false;
+        // Selection/UI control only; actual OS effects are proved separately.
+        let mut sandbox = crate::sandbox::Sandbox::new(false, "seatbelt")
+            .with_workspace_binding(workspace.clone());
+        let mut terminal_guard = crate::ui::terminal::TerminalGuard::detached_for_test();
+        #[cfg(feature = "skills")]
+        let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+        let mut ctx = SlashCtx {
+            prebuild_invalidated: &invalidated,
+            agent: &mut agent,
+            client: &mut client,
+            renderer: &mut renderer,
+            session: &mut session,
+            cli: &cli,
+            cfg: &cfg,
+            context: &mut context,
+            workspace: &workspace,
+            show_reasoning: &mut show_reasoning,
+            reasoning_enabled: &mut reasoning_enabled,
+            is_running: &mut is_running,
+            input: &mut input,
+            permission: &None,
+            ask_tx: &None,
+            todo_tools_enabled: &mut todo_tools_enabled,
+            sandbox: &mut sandbox,
+            terminal_guard: &mut terminal_guard,
+            #[cfg(feature = "skills")]
+            skill_services: &skill_services,
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        handle(&["/sandbox"], &mut ctx).await.unwrap();
+        assert!(!invalidated.load(Ordering::Relaxed));
+        assert!(ctx.agent.is_none());
+        handle(&["/sandbox", "typo"], &mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.sandbox.profile(),
+            crate::sandbox::SandboxProfile::Workspace
+        );
+        *ctx.is_running = true;
+        handle(&["/sandbox", "host-full"], &mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.sandbox.profile(),
+            crate::sandbox::SandboxProfile::Workspace
+        );
+        assert!(!invalidated.load(Ordering::Relaxed));
+        *ctx.is_running = false;
+        handle(&["/sandbox", "host-full"], &mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.sandbox.profile(),
+            crate::sandbox::SandboxProfile::HostFull
+        );
+        assert!(invalidated.load(Ordering::Relaxed));
+        assert!(ctx.agent.is_some());
+        assert_eq!(
+            ctx.sandbox.policy(),
+            crate::sandbox::SandboxPolicy::Disabled,
+            "selection must not turn --no-sandbox into a new grant"
+        );
+        assert_eq!(ctx.session.id, session_id);
+        assert!(ctx.permission.is_none());
+        assert!(cfg.sandbox_profile.is_none(), "no config persistence");
+        assert!(crate::ui::pickers::list::reserved_command("sandbox"));
     }
 }

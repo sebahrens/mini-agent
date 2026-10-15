@@ -74,7 +74,7 @@ pub struct SlashCtx<'a> {
     pub permission: &'a Option<PermCheck>,
     pub ask_tx: &'a Option<AskSender>,
     pub todo_tools_enabled: &'a mut bool,
-    pub sandbox: &'a Sandbox,
+    pub sandbox: &'a mut Sandbox,
     #[cfg(feature = "skills")]
     pub skill_services: &'a std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     pub terminal_guard: &'a mut TerminalGuard,
@@ -732,6 +732,7 @@ pub(crate) fn is_readonly_view(text: &str) -> bool {
         ["/help"]
             | ["/help", "keys"]
             | ["/keys"]
+            | ["/sandbox"]
             | ["/model"]
             | ["/sessions"]
             | ["/sessions", "--all"]
@@ -888,7 +889,7 @@ pub(crate) async fn handle_slash(
         permission: &ui.permission,
         ask_tx: &ui.ask_tx,
         todo_tools_enabled: &mut slash.todo_tools_enabled,
-        sandbox: &ui.sandbox,
+        sandbox: &mut ui.sandbox,
         #[cfg(feature = "skills")]
         skill_services: &ui.skill_services,
         terminal_guard,
@@ -927,8 +928,8 @@ pub(crate) async fn handle_slash(
         "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
-        "/cost" | "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys"
-        | "/advisor" | "/keys" | "/vim" => settings::handle(&parts, &mut ctx).await,
+        "/cost" | "/reasoning" | "/thinking" | "/mode" | "/sandbox" | "/toggle" | "/mcp"
+        | "/editsys" | "/advisor" | "/keys" | "/vim" => settings::handle(&parts, &mut ctx).await,
         "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"
         | "/retry" | "/quit" | "/exit" | "/history" => {
             crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await

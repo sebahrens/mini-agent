@@ -297,9 +297,15 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
         .unwrap();
     let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     #[cfg(unix)]
-    let sandbox = sandbox.with_resolved_shell(Some(
+    let mut sandbox = sandbox.with_resolved_shell(Some(
         crate::sandbox::ShellCapability::resolve("/bin/sh", workspace.root(), None).unwrap(),
     ));
+    #[cfg(unix)]
+    let expected_shell = sandbox
+        .shell_capability()
+        .unwrap()
+        .executable()
+        .to_path_buf();
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -328,7 +334,7 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
         permission: &permission,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,
@@ -440,7 +446,7 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
     {
         assert_eq!(
             ctx.sandbox.shell_capability().unwrap().executable(),
-            sandbox.shell_capability().unwrap().executable()
+            expected_shell
         );
         assert!(tool_result(&after, "shell").contains(workspace.root().to_str().unwrap()));
     }
@@ -575,7 +581,7 @@ async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent(
     let mut session = Session::new("openrouter", "current-model", 128_000, "prompt-model");
     session.input_token_cost = 1.0;
     session.output_token_cost = 2.0;
-    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -604,7 +610,7 @@ async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent(
         permission: &None,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,
@@ -682,7 +688,7 @@ async fn share_requires_confirmation_before_uploading() {
     session.add_message(MessageRole::User, "show me the env file");
     session.add_tool_call_with_id("read-env", "read", &json!({"path": ".env"}));
     let _ = session.add_tool_result_with_id("read-env", "read", "API_KEY=secret");
-    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -711,7 +717,7 @@ async fn share_requires_confirmation_before_uploading() {
         permission: &None,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,
@@ -824,7 +830,7 @@ async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
     let mut containing = Session::new("openrouter", "current-model", 128_000, "homework");
     containing.working_dir = session.working_dir.clone();
     crate::session::storage::save_session(&containing).unwrap();
-    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -853,7 +859,7 @@ async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
         permission: &None,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,
@@ -972,7 +978,7 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
     );
     let mut session = Session::new("openrouter", "current-model", 128_000, "prompt-model");
     session.add_message(MessageRole::User, "exported conversation");
-    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
     let mut agent = None;
     let mut renderer = Renderer::new().unwrap();
     let mut input = InputEditor::new();
@@ -1001,7 +1007,7 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
         permission: &None,
         ask_tx: &None,
         todo_tools_enabled: &mut todo_tools_enabled,
-        sandbox: &sandbox,
+        sandbox: &mut sandbox,
         terminal_guard: &mut terminal_guard,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,

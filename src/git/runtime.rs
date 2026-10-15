@@ -35,7 +35,91 @@ struct ModelRoots {
     roots: Vec<Weak<crate::paths::WorkspaceBinding>>,
     runtimes: Vec<Weak<crate::paths::WorkspaceBinding>>,
     programs: Vec<Weak<TrustedProgram>>,
+    host_writes: Vec<HostWrites>,
     refused: bool,
+}
+
+/// An active host-full command can write every host path except its mounted
+/// readonly exceptions. Reuse the Sandbox's retained root as the lifetime
+/// anchor; this record never grants an executable or keeps a command alive.
+struct HostWrites {
+    owner: Weak<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>,
+    binding: Weak<crate::paths::WorkspaceBinding>,
+    readonly: Vec<(PathBuf, crate::fs::CheckedMetadata)>,
+}
+
+pub(crate) fn record_host_writes(
+    owner: &Arc<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>,
+    binding: &Arc<crate::paths::WorkspaceBinding>,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    let readonly = paths
+        .iter()
+        .map(|path| {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| "host-full readonly authority changed")?;
+            let identity = crate::fs::checked_path_metadata(&canonical)
+                .map_err(|_| "host-full readonly authority changed")?;
+            Ok((canonical, identity))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut state = MODEL_ROOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| "guarded Git host-write authority is unavailable")?;
+    binding.validate()?;
+    state
+        .host_writes
+        .retain(|grant| grant.owner.strong_count() > 0);
+    if state.refused {
+        return Err("guarded Git host-write authority changed".into());
+    }
+    if state.host_writes.iter().any(|grant| {
+        grant.owner.ptr_eq(&Arc::downgrade(owner))
+            && grant
+                .readonly
+                .iter()
+                .map(|(p, _)| p)
+                .eq(readonly.iter().map(|(p, _)| p))
+    }) {
+        return Ok(());
+    }
+    if state.host_writes.len() >= MAX_ROOTS {
+        return Err("guarded Git host-write count exceeds its bound".into());
+    }
+    state.host_writes.push(HostWrites {
+        owner: Arc::downgrade(owner),
+        binding: Arc::downgrade(binding),
+        readonly,
+    });
+    Ok(())
+}
+
+fn require_outside_host_writes(state: &ModelRoots, path: &Path) -> Result<(), String> {
+    for grant in &state.host_writes {
+        if let Some(_owner) = grant.owner.upgrade() {
+            grant
+                .binding
+                .upgrade()
+                .ok_or("guarded Git host-write owner changed")?
+                .validate()?;
+            for (root, identity) in &grant.readonly {
+                let current = crate::fs::checked_path_metadata(root)
+                    .map_err(|_| "host-full readonly authority changed")?;
+                crate::fs::ensure_same_file(root, identity, &current)
+                    .map_err(|_| "host-full readonly authority changed")?;
+            }
+            if !grant.readonly.iter().any(|(root, identity)| {
+                path == root || (identity.is_dir() && path.starts_with(root))
+            }) {
+                return Err(
+                    "approved Git executable overlaps an active host-full write domain".into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 static MODEL_ROOTS: OnceLock<Mutex<ModelRoots>> = OnceLock::new();
@@ -99,6 +183,31 @@ pub(crate) fn model_write_roots() -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
+/// Current retained executable authority is a read-only exception to explicit
+/// host-wide filesystem writes, never a grant inferred from bundle metadata.
+pub(crate) fn protected_runtime_paths() -> Result<Vec<PathBuf>, String> {
+    let state = MODEL_ROOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| "guarded Git runtime protection is unavailable")?;
+    if state.refused {
+        return Err("guarded Git runtime protection is unavailable".into());
+    }
+    let mut paths = Vec::new();
+    for root in state.runtimes.iter().filter_map(Weak::upgrade) {
+        root.validate()?;
+        paths.push(root.root().to_path_buf());
+    }
+    for program in state.programs.iter().filter_map(Weak::upgrade) {
+        program.validate()?;
+        paths.push(program.path.clone());
+        paths.push(program.target.clone());
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn protect_runtime(root: &Arc<crate::paths::WorkspaceBinding>) -> Result<(), String> {
     let mut state = MODEL_ROOTS
         .get_or_init(Mutex::default)
@@ -107,6 +216,7 @@ fn protect_runtime(root: &Arc<crate::paths::WorkspaceBinding>) -> Result<(), Str
     if state.refused {
         return Err("guarded Git model-root authority is unavailable".into());
     }
+    require_outside_host_writes(&state, root.root())?;
     state.runtimes.retain(|root| root.strong_count() > 0);
     for model in state.roots.iter().filter_map(Weak::upgrade) {
         model.validate()?;
@@ -145,9 +255,28 @@ impl TrustedProgram {
             .get_or_init(Mutex::default)
             .lock()
             .map_err(|_| "guarded Git model-root authority is unavailable")?;
+        Self::capture_in_state(program, roots, &mut state)
+    }
+
+    fn capture_in_state(
+        program: Arc<Self>,
+        roots: &[PathBuf],
+        state: &mut ModelRoots,
+    ) -> Result<Arc<Self>, String> {
+        let path = &program.path;
+        require_disjoint(path, roots)?;
+        require_disjoint(&program.target, roots)?;
+        for old in state.programs.iter().filter_map(Weak::upgrade) {
+            old.validate()?;
+        }
+        for old in state.runtimes.iter().filter_map(Weak::upgrade) {
+            old.validate()?;
+        }
         if state.refused {
             return Err("guarded Git model-root authority is unavailable".into());
         }
+        require_outside_host_writes(state, &program.path)?;
+        require_outside_host_writes(state, &program.target)?;
         state.programs.retain(|program| program.strong_count() > 0);
         if state.programs.len() >= MAX_ROOTS {
             return Err("approved Git service count exceeds its bound".into());
@@ -555,6 +684,115 @@ mod tests {
         std::fs::remove_file(&helper).unwrap();
         std::fs::write(&helper, b"replacement").unwrap();
         assert!(runtime.validate(&[]).is_err());
+    }
+
+    fn capture_local(path: &Path, state: &mut ModelRoots) -> Result<Arc<TrustedProgram>, String> {
+        let target = path.canonicalize().map_err(|_| "fixture target")?;
+        let program = Arc::new(TrustedProgram {
+            path: path.to_path_buf(),
+            identity: crate::fs::checked_path_metadata(&target).map_err(|_| "fixture metadata")?,
+            target,
+        });
+        TrustedProgram::capture_in_state(program, &[], state)
+    }
+
+    #[test]
+    fn profile100_host_full_refuses_late_helpers_and_replaced_readonly_exceptions() {
+        let fixture = crate::tests::OwnedTestDirectory::new("profile100-host-authority");
+        let workspace = fixture.path().join("workspace");
+        let cache = fixture.path().join("publisher-cache");
+        let outside = fixture.path().join("later-helper");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(&outside, b"inert helper").unwrap();
+        let owner = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+        let lease = Arc::new(Mutex::new(vec![owner.clone()]));
+        let mut state = ModelRoots::default();
+        state.host_writes.push(HostWrites {
+            owner: Arc::downgrade(&lease),
+            binding: Arc::downgrade(&owner),
+            readonly: vec![(
+                cache.clone(),
+                crate::fs::checked_path_metadata(&cache).unwrap(),
+            )],
+        });
+        assert!(
+            capture_local(&outside, &mut state)
+                .err()
+                .unwrap()
+                .contains("host-full write domain")
+        );
+        let inside = cache.join("later-helper");
+        std::fs::write(&inside, b"inert helper").unwrap();
+        let accepted = capture_local(&inside, &mut state).unwrap();
+        accepted.validate().unwrap();
+        drop(accepted);
+        std::fs::rename(&cache, fixture.path().join("retired-cache")).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(&inside, b"substituted helper").unwrap();
+        assert!(
+            capture_local(&inside, &mut state).is_err(),
+            "a readonly spelling cannot authorize a replacement generation"
+        );
+        drop(lease);
+        assert!(
+            owner.validate().is_ok(),
+            "UI may still retain its workspace after the command lease retires"
+        );
+        assert!(
+            capture_local(&outside, &mut state).is_ok(),
+            "retired host-write owner must not impose a permanent process-wide restriction"
+        );
+    }
+
+    #[test]
+    fn profile100_custom_write_root_refuses_late_and_preapproved_helpers() {
+        let fixture = crate::tests::OwnedTestDirectory::new("profile100-custom-authority");
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "ZS_CACHE_DIR",
+            Some(fixture.path().join("cache").into_os_string()),
+        )]);
+        let workspace = fixture.path().join("workspace");
+        let writable = fixture.path().join("custom-writable");
+        for path in [&workspace, &writable] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let helper = writable.join("helper");
+        std::fs::write(&helper, b"inert helper").unwrap();
+        let sandbox = crate::sandbox::Sandbox::new(true, "__missing_profile100_backend")
+            .with_workspace_binding(Arc::new(
+                crate::paths::WorkspaceBinding::capture(&workspace).unwrap(),
+            ))
+            .with_general_profile(
+                crate::sandbox::SandboxProfile::HostRead,
+                Vec::new(),
+                vec![writable.clone()],
+            );
+        assert!(sandbox.wrap_command("inert").is_err());
+        assert!(model_write_roots().unwrap().contains(&writable));
+        assert!(
+            TrustedProgram::capture(&helper, &[]).is_err(),
+            "late selection in a custom write root must refuse"
+        );
+        drop(sandbox);
+        let approved = TrustedProgram::capture(&helper, &[]).unwrap();
+        let sandbox = crate::sandbox::Sandbox::new(true, "__missing_profile100_backend")
+            .with_workspace_binding(Arc::new(
+                crate::paths::WorkspaceBinding::capture(&workspace).unwrap(),
+            ))
+            .with_general_profile(
+                crate::sandbox::SandboxProfile::HostRead,
+                Vec::new(),
+                vec![writable],
+            );
+        assert!(
+            sandbox
+                .wrap_command("inert")
+                .unwrap_err()
+                .contains("overlap"),
+            "preapproved helpers must not acquire a writable alias"
+        );
+        approved.validate().unwrap();
     }
 
     #[test]
