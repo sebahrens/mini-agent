@@ -1527,7 +1527,8 @@ for every filesystem or account privilege level.
 `sandbox-profile` key select ordinary command filesystem reach; `/sandbox`
 shows or changes the idle session selection. `sandbox-read-roots` and
 `sandbox-write-roots` add explicit directory grants. Permission decisions and
-per-caller network isolation remain independent. Host-full is explicit and
+per-caller IP-network isolation remain independent; it does not block filesystem
+Unix sockets made visible by broader host binds. Host-full is explicit and
 shows a persistent red indicator plus a startup warning. Private application
 and common secret paths, retained Git executables/cache and Git metadata
 remain protected; unsafe mask topologies refuse launch. Linux may prepare

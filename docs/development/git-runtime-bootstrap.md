@@ -138,6 +138,14 @@ not alter the package keyring or require pacman-key's unrelated `lock-never`
 configuration precheck. Failure stops collection and reports exact package/signature
 basenames, exit status and at most 4 KiB of escaped GPG diagnostics. No missing
 key is imported and no unverified package is accepted.
+Upstream recipe `SKIP` entries are accepted only for detached `.sig`/`.asc`
+files paired with an already checksum-verified payload. The recipe's literal
+`validpgpkeys` fingerprints select HTTPS-acquired public keys (OpenPGP directory,
+with Ubuntu keyserver fallback); each primary fingerprint is checked before
+dearmoring into a separate owned temporary keyring. `gpgv` must verify the exact
+pair and report an allowed primary signing fingerprint. No keys are imported,
+no recipe code runs, and every build-source/patch checksum remains mandatory.
+`--pgp-key-cache` reuses public keys only after the same fingerprint checks.
 The pinned MinGW configuration enables PCRE2; provision its UCRT64 headers and
 libraries rather than disabling that feature. Before allocating build staging,
 the helper checks the required header with the exact native compiler using a

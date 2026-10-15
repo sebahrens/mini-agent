@@ -60,6 +60,75 @@ class NativeSourceCollectorTests(unittest.TestCase):
             COLLECT.capture(["pacman", "-Q", "package"])
         self.assertEqual(str(raised.exception), "required distro metadata/signature command failed: pacman")
 
+    def test_upstream_auxiliary_uses_only_literal_recipe_keys_in_owned_keyring(self):
+        key = "A" * 40
+        signature, payload = self.root / "source.asc", self.root / "source.tar.gz"
+        signature.write_bytes(b"signature"); payload.write_bytes(b"source")
+        cache = self.root / "keys"; cache.mkdir(); (cache / (key + ".asc")).write_bytes(b"public-key")
+        for wrong_key, wrong_signer, bad_crypto in [(False, False, False), (True, False, False), (False, True, False), (False, False, True)]:
+            with tempfile.TemporaryDirectory(dir=self.root) as destination:
+                output = Path(destination); calls = []
+                def capture(command):
+                    calls.append(command)
+                    if "--show-keys" in command:
+                        return "pub:::::::::\nfpr:::::::::" + ("B" * 40 if wrong_key else key) + ":\n"
+                    if "--dearmor" in command:
+                        Path(command[command.index("--output") + 1]).write_bytes(b"checked-public-key-packets")
+                        return ""
+                    if bad_crypto:
+                        raise COLLECT.CollectionError("controlled invalid cryptographic signature")
+                    primary = "B" * 40 if wrong_signer else key
+                    return "[GNUPG:] VALIDSIG " + "C" * 40 + " 2026-10-15 1 0 4 0 1 10 00 " + primary + "\n"
+                with self.subTest(wrong_key=wrong_key, wrong_signer=wrong_signer, bad_crypto=bad_crypto), patch.object(COLLECT, "PGP_KEY_CACHE", cache), patch.object(COLLECT, "capture", side_effect=capture):
+                    if wrong_key or wrong_signer or bad_crypto:
+                        with self.assertRaises(COLLECT.CollectionError):
+                            COLLECT.verify_msys2_auxiliary(signature, payload, "validpgpkeys=('" + key + "')", output)
+                    else:
+                        result = COLLECT.verify_msys2_auxiliary(signature, payload, "validpgpkeys=('" + key + "')", output)
+                        self.assertEqual([p.read_bytes() for p in result], [b"public-key"])
+                self.assertTrue(all("--import" not in c and "--recv-keys" not in c for c in calls))
+                for command in calls:
+                    self.assertIn("--homedir", command)
+                    self.assertNotEqual(command[command.index("--homedir") + 1], "/etc/pacman.d/gnupg")
+        with self.assertRaisesRegex(COLLECT.CollectionError, "literal validpgpkeys"):
+            COLLECT.verify_msys2_auxiliary(signature, payload, "validpgpkeys=($dynamic)", self.root)
+
+    def test_msys_skip_rejects_unpaired_or_non_signature_inputs(self):
+        for extra in ["unverified.sh", "missing-payload.tar.gz.sig"]:
+            with tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                saved = self.root; self.root = Path(temporary)
+                name, version, binary, _, output = self.msys_fixture()
+                upstream = tar_bytes({"native/LICENSE": b"Native license"})
+                recipe = ("sha256sums=('" + hashlib.sha256(upstream).hexdigest() + "' 'SKIP')\n").encode()
+                with tarfile.open(binary, "w:gz") as t:
+                    for leaf, data in {".BUILDINFO": ("pkgbase = mingw-w64-native\npkgbuild_sha256sum = " + hashlib.sha256(recipe).hexdigest() + "\n").encode(), ".PKGINFO": f"pkgname = {name}\npkgver = {version}\n".encode()}.items():
+                        member = tarfile.TarInfo(leaf); member.size = len(data); t.addfile(member, io.BytesIO(data))
+                package = tar_bytes({"native/PKGBUILD": recipe, "native/source.tar.gz": upstream, "native/" + extra: b"unverified"})
+                with patch.object(COLLECT, "capture", return_value=name + " " + version), patch.object(COLLECT, "verify_msys2_signature"), patch.object(COLLECT, "fetch", side_effect=lambda url, destination: destination.write_bytes(package)), patch.object(COLLECT, "archive", side_effect=self.fixture_archive), self.assertRaisesRegex(COLLECT.CollectionError, "not a detached signature"):
+                    COLLECT.collect_msys2(name, output, self.root)
+                self.root = saved
+
+    def test_upstream_key_https_fallback_still_requires_exact_fingerprint(self):
+        key = "A" * 40; requests = []
+        def fetch(url, destination, **options):
+            requests.append((url, options))
+            if len(requests) == 1:
+                raise urllib.error.URLError("controlled unavailable primary")
+            destination.write_bytes(b"public-key")
+        def capture(command):
+            if "--show-keys" in command:
+                return "pub:::::::::\nfpr:::::::::" + key + ":\n"
+            if "--dearmor" in command:
+                Path(command[command.index("--output") + 1]).write_bytes(b"public-packets")
+                return ""
+            return "[GNUPG:] VALIDSIG " + key + "\n"
+        with patch.object(COLLECT, "PGP_KEY_CACHE", None), patch.object(COLLECT, "fetch", side_effect=fetch), patch.object(COLLECT, "capture", side_effect=capture):
+            COLLECT.verify_msys2_auxiliary(Path("source.sig"), Path("source.tar.gz"), "validpgpkeys=('" + key + "')", self.root)
+        self.assertEqual(requests, [
+            ("https://keys.openpgp.org/vks/v1/by-fingerprint/" + key, {"limit": 1024 * 1024}),
+            ("https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x" + key, {"limit": 1024 * 1024}),
+        ])
+
     def test_msys_verification_requires_valid_signature_and_same_signature_full_trust(self):
         valid = "[GNUPG:] VALIDSIG " + "A" * 40 + " 2026-10-15 1 0 4 0 1 10 00 " + "A" * 40 + "\n"
         cases = [

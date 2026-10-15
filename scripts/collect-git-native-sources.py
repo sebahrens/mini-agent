@@ -31,6 +31,8 @@ CURL_SHA256 = "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
 SAFE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,160}")
 NOTICE = re.compile(r"^(?:licen[cs]e|copying|copyright|notice|unlicense)(?:[-._].*)?$", re.I)
 SOURCE_CACHE: Path | None = None
+PGP_KEY_CACHE: Path | None = None
+MSYS_GPG = "/usr/bin/gpg"
 
 
 class CollectionError(ValueError):
@@ -48,7 +50,7 @@ def capture(command: list[str]) -> str:
         result = subprocess.run(command, stdout=output, stderr=errors, timeout=120, check=False)
         if result.returncode:
             if (len(command) == 4 and Path(command[0]).name == "pacman-key" and command[1] == "--verify") or (
-                command[0] == "/usr/bin/gpg" and len(command) >= 4 and command[-3] == "--verify"
+                command[0] in {"/usr/bin/gpg", MSYS_GPG, str(Path(MSYS_GPG).with_name("gpgv"))}
             ):
                 # Fixed publisher-only signature verification has no credential
                 # arguments. Retain bounded, escaped GPG/keyring diagnostics;
@@ -85,7 +87,7 @@ def copy_bounded(source: Path, destination: Path) -> None:
         raise
 
 
-def fetch(url: str, destination: Path, expected: str | None = None, algorithm: str = "sha512") -> None:
+def fetch(url: str, destination: Path, expected: str | None = None, algorithm: str = "sha512", limit: int = MAX_SOURCE) -> None:
     if urllib.parse.urlsplit(url).scheme != "https":
         raise CollectionError("source downloads require HTTPS")
     digest = hashlib.new(algorithm)
@@ -112,7 +114,7 @@ def fetch(url: str, destination: Path, expected: str | None = None, algorithm: s
             total = 0
             while block := response.read(1024 * 1024):
                 total += len(block)
-                if total > MAX_SOURCE:
+                if total > limit:
                     raise CollectionError("native source download exceeds bound")
                 digest.update(block)
                 output.write(block)
@@ -349,6 +351,62 @@ def verify_msys2_signature(signature: Path, binary: Path) -> None:
     raise CollectionError("MSYS2 package signature lacks a valid fully/ultimately trusted signature: " + safe(binary.name))
 
 
+def verify_msys2_auxiliary(signature: Path, payload: Path, recipe: str, output: Path) -> list[Path]:
+    blocks = re.findall(r"(?ms)^validpgpkeys\s*=\s*\((.*?)\)", recipe)
+    keys = shlex.split(blocks[0], comments=True) if len(blocks) == 1 else []
+    if not 1 <= len(keys) <= 32 or any(not re.fullmatch(r"[A-Fa-f0-9]{40}", key) for key in keys):
+        raise CollectionError("detached upstream signature requires literal validpgpkeys fingerprints")
+    allowed = {key.upper() for key in keys}
+    retained = []
+    with tempfile.TemporaryDirectory(prefix="mini-agent-upstream-public-keyring-") as temporary:
+        home = Path(temporary)
+        for key in sorted(allowed):
+            public = output / ("pgp-key-" + key + ".asc")
+            if PGP_KEY_CACHE is not None and (PGP_KEY_CACHE / (key + ".asc")).is_file():
+                copy_bounded(PGP_KEY_CACHE / (key + ".asc"), public)
+            else:
+                try:
+                    fetch("https://keys.openpgp.org/vks/v1/by-fingerprint/" + key, public, limit=1024 * 1024)
+                except urllib.error.URLError:
+                    fetch("https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x" + key, public, limit=1024 * 1024)
+            if public.stat().st_size > 1024 * 1024:
+                raise CollectionError("upstream public key exceeds bound")
+            shown = capture([MSYS_GPG, "--no-options", "--homedir", str(home), "--batch", "--no-autostart", "--with-colons", "--show-keys", str(public)])
+            primary, expecting = set(), False
+            for line in shown.splitlines():
+                fields = line.split(":")
+                if fields[0] == "pub":
+                    expecting = True
+                elif fields[0] == "sub":
+                    expecting = False
+                elif fields[0] == "fpr" and expecting:
+                    if len(fields) <= 9:
+                        raise CollectionError("upstream public key fingerprint metadata is malformed")
+                    primary.add(fields[9].upper())
+                    expecting = False
+            if primary != {key}:
+                raise CollectionError("retrieved upstream public key fingerprint mismatch")
+            dearmored = home / (key + ".gpg")
+            capture([MSYS_GPG, "--no-options", "--homedir", str(home), "--batch", "--no-autostart", "--dearmor", "--output", str(dearmored), str(public)])
+            retained.append(public)
+        keyring = home / "allowed-public-keys.gpg"
+        with keyring.open("xb") as writer:
+            for key in sorted(allowed):
+                writer.write((home / (key + ".gpg")).read_bytes())
+        status = capture([
+            str(Path(MSYS_GPG).with_name("gpgv")), "--homedir", str(home),
+            "--keyring", str(keyring), "--status-fd", "1",
+            str(signature), str(payload),
+        ])
+        for line in status.splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+                primary = fields[11] if len(fields) >= 12 else fields[2]
+                if primary.upper() in allowed:
+                    return retained
+        raise CollectionError("upstream detached signature does not match signed-recipe validpgpkeys")
+
+
 def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, list[Path], list[Path]]:
     identity = capture(["pacman", "-Q", name]).strip().split()
     if len(identity) != 2 or identity[0] != name:
@@ -389,32 +447,51 @@ def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, 
         recipe_text = recipe_bytes.decode()
         checksum_blocks = re.findall(r"(?ms)^(sha256sums|sha512sums)\s*=\s*\((.*?)\)", recipe_text)
         expected = set()
+        skipped = 0
         for algorithm, block in checksum_blocks:
             words = shlex.split(block, comments=True)
             size = 64 if algorithm == "sha256sums" else 128
-            if not words or any(not re.fullmatch("[a-f0-9]{" + str(size) + "}", word) for word in words):
+            if not words or any(word != "SKIP" and not re.fullmatch("[a-f0-9]{" + str(size) + "}", word) for word in words):
                 raise CollectionError("MSYS2 checksum inputs require unsupported recipe evaluation")
-            expected.update((algorithm.replace("sums", ""), word) for word in words)
+            skipped += words.count("SKIP")
+            expected.update((algorithm.replace("sums", ""), word) for word in words if word != "SKIP")
         if not expected:
             raise CollectionError("MSYS2 source checksums require unsupported recipe evaluation")
         found = set()
+        matched, auxiliary, seen = {}, [], set()
         for member in members:
             if not member.isfile() or Path(member.name).name in {"PKGBUILD", ".SRCINFO"}:
                 continue
             data = member_bytes(source, member, MAX_SOURCE)
+            if member.name in seen:
+                raise CollectionError("duplicate MSYS2 source member")
+            seen.add(member.name)
             matches = {(algorithm, value) for algorithm, value in expected if hashlib.new(algorithm, data).hexdigest() == value}
             found |= matches
+            captured = output / ("verified-" + safe(Path(member.name).name))
+            if captured.exists():
+                raise CollectionError("colliding MSYS2 source member names")
+            captured.write_bytes(data)
             if matches:
-                captured = output / ("verified-" + safe(Path(member.name).name))
-                captured.write_bytes(data)
+                matched[member.name] = captured
                 if tarfile.is_tarfile(captured):
                     directory = output / (captured.name + "-notices")
                     directory.mkdir()
                     notices += notices_from_archive(captured, directory)
                 elif NOTICE.fullmatch(Path(member.name).name):
                     notices.append(captured)
+            else:
+                auxiliary.append((member.name, captured))
         if expected != found:
             raise CollectionError("MSYS2 full-source archive omits checksum-pinned recipe inputs")
+        if len(auxiliary) != skipped:
+            raise CollectionError("MSYS2 SKIP entries must correspond only to paired detached signatures")
+        for name, signature in auxiliary:
+            suffix = ".asc" if name.endswith(".asc") else ".sig" if name.endswith(".sig") else None
+            payload = matched.get(name[:-len(suffix)]) if suffix else None
+            if payload is None:
+                raise CollectionError("MSYS2 SKIP entry is not a detached signature for a checksum-verified payload")
+            sources.extend(verify_msys2_auxiliary(signature, payload, recipe_text, output))
     if not notices:
         raise CollectionError("MSYS2 source archive supplies no verbatim license notices")
     return version, package_fields.get("license", "see verbatim upstream notices"), source_url, sources, notices
@@ -434,11 +511,13 @@ def main():
     parser.add_argument("--toolchain-prefix", type=Path, default=Path("/ucrt64"))
     parser.add_argument("--curl-source", type=Path)
     parser.add_argument("--source-cache", type=Path, help="reuse only checksum-verified source files across collection retries")
+    parser.add_argument("--pgp-key-cache", type=Path, help="reuse upstream public keys only after matching signed-recipe fingerprints")
     args = parser.parse_args()
     created = False
     successful = False
     try:
-        global SOURCE_CACHE
+        global SOURCE_CACHE, PGP_KEY_CACHE
+        PGP_KEY_CACHE = args.pgp_key_cache
         if args.source_cache:
             args.source_cache.mkdir(mode=0o700, parents=True, exist_ok=True)
             if args.source_cache.is_symlink() or not args.source_cache.is_dir():
@@ -492,7 +571,10 @@ def main():
                 version, _, url, sources, notices = origins[identity]
                 license = fields["L"]
             else:
-                version, license, url, sources, notices = collect_msys2(name, directory, args.pacman_cache)
+                try:
+                    version, license, url, sources, notices = collect_msys2(name, directory, args.pacman_cache)
+                except CollectionError as error:
+                    raise CollectionError(f"MSYS2 component {safe(name)}: {error}") from error
             components.append({"name": name, "version": version, "license": license, "source_url": url, "bundled_files": files.get(name, []), "license_files": [asset(p, args.output) for p in notices], "source_files": [asset(p, args.output) for p in sources]})
         if args.curl_source:
             with args.curl_source.open("rb") as stream:
