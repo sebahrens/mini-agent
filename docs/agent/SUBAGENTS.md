@@ -489,6 +489,15 @@ normal TOML/YAML/JSON mini-agent configuration described in
 All integer task limits must be greater than zero.
 `task_max_output_bytes` must be at least 256, leaving room for an explicit
 partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
+
+Session background batches share one lane of `task_max_concurrency` children;
+the parent turn's own (foreground) task call uses a separate lane of the same
+size, so running background jobs cannot serialize it. Write children of every
+batch still share the session's single write lane. While every in-flight child
+of a call is waiting for a lane, its `task_timeout_secs` deadline is paused,
+with that credit capped at one further timeout; when the deadline stops a call
+whose started children are still waiting, the partial-status header reports
+them as `queued=N`.
 ### Model-aware task work accounting
 
 `task_max_cost_units` remains **4,000,000** per task call. These are normalized

@@ -976,6 +976,11 @@ editing in a known location, grepping for a literal you will act on immediately.
         };
         let lane_workspace = self.workspace.clone();
         let pool_weak = task_pool.as_ref().map(Arc::downgrade);
+        let lane = if admission.is_some() {
+            ChildLane::Shared
+        } else {
+            ChildLane::Foreground
+        };
         let background_run = parent_run.clone();
         let live_budget = LiveTaskBudget::new(limits.max_cost_units);
         let executor_budget = live_budget.clone();
@@ -1189,9 +1194,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
                 child_name, write_mode, future,
             ));
-            let future = shared_child_lane(
+            let future = child_lane(
                 future,
                 pool_weak.clone(),
+                lane,
                 write_mode,
                 lane_workspace,
                 admission_run,
@@ -1248,9 +1254,39 @@ fn merge_forced_continuation_run(
 }
 
 type ChildFuture = Pin<Box<dyn Future<Output = ChildExecution> + Send>>;
+
+/// Which pool concurrency lane a child occupies. The write lane is always the
+/// session's single shared one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildLane {
+    /// Background batches share `Pool::concurrency`.
+    Shared,
+    /// The parent turn's own task call uses `Pool::foreground`.
+    Foreground,
+}
+
+#[cfg(test)]
 fn shared_child_lane(
     child: ChildFuture,
     pool: Option<std::sync::Weak<super::background::Pool>>,
+    write_mode: bool,
+    workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    admission_run: Option<crate::spend::run::Run>,
+) -> ChildFuture {
+    child_lane(
+        child,
+        pool,
+        ChildLane::Shared,
+        write_mode,
+        workspace,
+        admission_run,
+    )
+}
+
+fn child_lane(
+    child: ChildFuture,
+    pool: Option<std::sync::Weak<super::background::Pool>>,
+    lane: ChildLane,
     write_mode: bool,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
     admission_run: Option<crate::spend::run::Run>,
@@ -1264,14 +1300,22 @@ fn shared_child_lane(
                 let pool = pool
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("background session closed"))?;
-                (pool.concurrency.clone(), pool.write_lane.clone())
+                let concurrency = match lane {
+                    ChildLane::Shared => pool.concurrency.clone(),
+                    ChildLane::Foreground => pool.foreground.clone(),
+                };
+                (concurrency, pool.write_lane.clone())
             };
+            // Time spent here waiting for lanes is not charged to the batch's
+            // wall-clock deadline (see `BatchClock`).
+            let queued = BatchSlot::enter_queue();
             let concurrency = concurrency.acquire_owned().await?;
             let write = if write_mode {
                 Some(write_lane.acquire_owned().await?)
             } else {
                 None
             };
+            drop(queued);
             let scope = crate::agent::runner::AgentWorkScope::new();
             let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary_child(
                 scope.clone(),
@@ -1324,8 +1368,132 @@ struct ChildExecution {
     cost_units: u64,
 }
 
-fn indexed_child_future(index: usize, prompt: String, child: ChildFuture) -> IndexedChildFuture {
+/// Queue-wait accounting for one batch's wall-clock deadline.
+///
+/// A child that waits for a pool lane (behind background jobs, a parallel
+/// task call or the shared write lane) has not started work. While every
+/// in-flight child of the batch is waiting, the batch makes no progress and
+/// its deadline is paused; the deadline is the configured timeout plus the
+/// total paused time, with that credit capped at one further timeout so a
+/// lane held indefinitely still ends the batch (reporting its queued
+/// children). Children that never wait for a lane leave the deadline exactly
+/// `start + timeout`.
+struct BatchClock {
+    state: std::sync::Mutex<BatchClockState>,
+    changed: tokio::sync::Notify,
+    max_pause: Duration,
+}
+
+#[derive(Default)]
+struct BatchClockState {
+    in_flight: usize,
+    queued: std::collections::BTreeSet<usize>,
+    paused_since: Option<Instant>,
+    paused: Duration,
+}
+
+impl BatchClock {
+    fn new(max_pause: Duration) -> Self {
+        Self {
+            state: Default::default(),
+            changed: tokio::sync::Notify::new(),
+            max_pause,
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut BatchClockState)) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        change(&mut state);
+        let all_queued = state.in_flight > 0 && state.queued.len() >= state.in_flight;
+        match (all_queued, state.paused_since) {
+            (true, None) => state.paused_since = Some(Instant::now()),
+            (false, Some(since)) => {
+                state.paused = state.paused.saturating_add(since.elapsed());
+                state.paused_since = None;
+            }
+            _ => {}
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// The effective deadline for the unpaused deadline `base`. While paused,
+    /// only the capped credit can still elapse.
+    fn deadline(&self, base: Instant) -> Instant {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let credit = if state.paused_since.is_some() {
+            self.max_pause
+        } else {
+            state.paused.min(self.max_pause)
+        };
+        base + credit
+    }
+
+    fn expired(&self, base: Instant) -> bool {
+        Instant::now() >= self.deadline(base)
+    }
+
+    fn queued(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queued
+            .len()
+    }
+}
+
+tokio::task_local! {
+    static BATCH_SLOT: BatchSlot;
+}
+
+/// The batch clock and prompt index of the child future being polled.
+#[derive(Clone)]
+struct BatchSlot {
+    clock: Arc<BatchClock>,
+    index: usize,
+}
+
+/// Marks the current child as waiting for a lane until dropped.
+struct QueuedChild(BatchSlot);
+
+impl BatchSlot {
+    fn enter_queue() -> Option<QueuedChild> {
+        let slot = BATCH_SLOT.try_with(Clone::clone).ok()?;
+        slot.clock.update(|state| {
+            state.queued.insert(slot.index);
+        });
+        Some(QueuedChild(slot))
+    }
+}
+
+impl Drop for QueuedChild {
+    fn drop(&mut self) {
+        let index = self.0.index;
+        self.0.clock.update(|state| {
+            state.queued.remove(&index);
+        });
+    }
+}
+
+fn indexed_child_future(
+    index: usize,
+    prompt: String,
+    child: ChildFuture,
+    clock: &Arc<BatchClock>,
+) -> IndexedChildFuture {
+    struct InFlight(Arc<BatchClock>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.update(|state| state.in_flight -= 1);
+        }
+    }
+    let clock = clock.clone();
+    clock.update(|state| state.in_flight += 1);
+    // Owned by the future, so an unpolled or cancelled child also leaves.
+    let in_flight = InFlight(clock.clone());
     Box::pin(async move {
+        let _in_flight = in_flight;
+        let child = BATCH_SLOT.scope(BatchSlot { clock, index }, child);
         let child = match AssertUnwindSafe(child).catch_unwind().await {
             Ok(child) => child,
             Err(_) => {
@@ -1411,6 +1579,8 @@ struct TaskReport {
     outcomes: Vec<TaskOutcome>,
     started: usize,
     completed: usize,
+    /// Started children still waiting for a pool lane when the batch stopped.
+    queued: usize,
     cost_units: u64,
     stop_reason: Option<StopReason>,
     limits: TaskLimits,
@@ -1425,8 +1595,15 @@ impl TaskReport {
             preamble.push('\n');
         }
         if let Some(reason) = &self.stop_reason {
+            // `queued` appears only when lane waits were cut short, so the
+            // status is otherwise unchanged.
+            let queued = if self.queued > 0 {
+                format!("; queued={}", self.queued)
+            } else {
+                String::new()
+            };
             preamble.push_str(&format!(
-                "[partial: {}; started={}; completed={}; cost_units={}/{}]\n",
+                "[partial: {}; started={}; completed={}{queued}; cost_units={}/{}]\n",
                 reason.description(self.limits),
                 self.started,
                 self.completed,
@@ -1639,13 +1816,14 @@ async fn execute_tasks_with_budget(
     let mut cancellation_costs: Vec<Option<CancellationCost>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
     let deadline = Instant::now() + limits.timeout;
+    let clock = Arc::new(BatchClock::new(limits.timeout));
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
 
     while stop_reason.is_none()
         && next_index < task_count
         && in_flight.len() < limits.max_concurrency
     {
-        if Instant::now() >= deadline {
+        if clock.expired(deadline) {
             stop_reason = Some(StopReason::Deadline);
             break;
         }
@@ -1655,26 +1833,34 @@ async fn execute_tasks_with_budget(
         let prompt = prompts[index].clone();
         let child = executor(index, prompt.clone());
         cancellation_costs[index] = Some(child.cancellation_cost);
-        in_flight.push(indexed_child_future(index, prompt, child.future));
+        in_flight.push(indexed_child_future(index, prompt, child.future, &clock));
     }
 
     while stop_reason.is_none() && !in_flight.is_empty() {
+        // Registered before reading the deadline so a pause or resume that
+        // happens while waiting re-evaluates it.
+        let changed = clock.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let effective_deadline = clock.deadline(deadline);
         let next = tokio::select! {
             biased;
-            result = tokio::time::timeout_at(deadline, in_flight.next()) => result,
+            // A ready result is retained even after expiry, as with timeout_at.
+            result = in_flight.next() => result,
+            () = tokio::time::sleep_until(effective_deadline) => {
+                if clock.expired(deadline) {
+                    stop_reason = Some(StopReason::Deadline);
+                    break;
+                }
+                continue;
+            }
             () = async { match &live_budget {
                 Some(budget) => budget.stopped().await,
                 None => std::future::pending::<()>().await,
             } } => { stop_reason = Some(StopReason::CostLimit); break; }
+            () = &mut changed => continue,
         };
-        let next_result = match next {
-            Ok(result) => result,
-            Err(_) => {
-                stop_reason = Some(StopReason::Deadline);
-                break;
-            }
-        };
-        let Some((index, child)) = next_result else {
+        let Some((index, child)) = next else {
             break;
         };
 
@@ -1738,7 +1924,7 @@ async fn execute_tasks_with_budget(
                 stop_reason = Some(StopReason::CostLimit);
                 break;
             }
-            if Instant::now() >= deadline {
+            if clock.expired(deadline) {
                 stop_reason = Some(StopReason::Deadline);
                 break;
             }
@@ -1748,12 +1934,17 @@ async fn execute_tasks_with_budget(
             let prompt = prompts[index].clone();
             let child = executor(index, prompt.clone());
             cancellation_costs[index] = Some(child.cancellation_cost);
-            in_flight.push(indexed_child_future(index, prompt, child.future));
+            in_flight.push(indexed_child_future(index, prompt, child.future, &clock));
         }
     }
 
     // Dropping the futures cancels every in-flight child before we construct
     // the report. Executors must not detach work into untracked tasks.
+    let queued = if stop_reason.is_some() {
+        clock.queued()
+    } else {
+        0
+    };
     drop(in_flight);
 
     for index in 0..task_count {
@@ -1794,6 +1985,7 @@ async fn execute_tasks_with_budget(
             .collect(),
         started: started.into_iter().filter(|started| *started).count(),
         completed,
+        queued,
         cost_units,
         stop_reason,
         limits,
@@ -3364,6 +3556,7 @@ mod tests {
             outcomes: vec![partial],
             started: 1,
             completed: 1,
+            queued: 0,
             cost_units: 1,
             stop_reason: None,
             limits: TaskLimits {
@@ -3685,6 +3878,7 @@ mod tests {
             ],
             started: 1,
             completed: 1,
+            queued: 0,
             cost_units: 1,
             stop_reason: Some(StopReason::OutputLimit),
             limits,
@@ -3856,6 +4050,125 @@ mod tests {
         assert!(rendered.contains("[not started: aggregate cost limit"));
         assert_eq!(counters.started.load(Ordering::SeqCst), 2);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
+    }
+
+    fn lane_fixture(
+        name: &str,
+        concurrency: usize,
+    ) -> (
+        crate::tests::OwnedTestDirectory,
+        crate::session::Session,
+        Arc<super::super::background::Pool>,
+    ) {
+        let root = crate::tests::OwnedTestDirectory::new(name);
+        let mut session =
+            crate::session::Session::new("openai", "fixture", 32000, root.path().to_str().unwrap());
+        let pool = super::super::background::Pool::for_session(&mut session, concurrency).unwrap();
+        (root, session, pool)
+    }
+
+    #[tokio::test]
+    async fn foreground_children_use_their_own_lane_beside_background_jobs() {
+        let (_root, _session, pool) = lane_fixture("foreground-lane", 1);
+        let held = pool.concurrency.clone().acquire_owned().await.unwrap();
+        let parent = crate::agent::runner::AgentWorkScope::new();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(parent.clone());
+        let child = |text: &'static str| -> ChildFuture {
+            Box::pin(async move {
+                ChildExecution {
+                    output: Ok(text.into()),
+                    cost_units: 0,
+                }
+            })
+        };
+        parent
+            .run(async {
+                let foreground = child_lane(
+                    child("foreground"),
+                    Some(Arc::downgrade(&pool)),
+                    ChildLane::Foreground,
+                    false,
+                    None,
+                    None,
+                );
+                let foreground = tokio::time::timeout(Duration::from_secs(5), foreground)
+                    .await
+                    .expect("a busy background lane must not hold the parent's own task call");
+                assert_eq!(foreground.output.unwrap(), "foreground");
+                assert_eq!(pool.concurrency.available_permits(), 0);
+                // Background batches still share their own bounded lane.
+                let background = shared_child_lane(
+                    child("background"),
+                    Some(Arc::downgrade(&pool)),
+                    false,
+                    None,
+                    None,
+                );
+                tokio::pin!(background);
+                assert!(futures::poll!(&mut background).is_pending());
+                drop(held);
+                assert_eq!(background.await.output.unwrap(), "background");
+            })
+            .await;
+        cleanup.settle().await;
+        assert_eq!(pool.foreground.available_permits(), 1);
+        assert_eq!(pool.concurrency.available_permits(), 1);
+        pool.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lane_wait_is_not_charged_to_the_batch_deadline_and_stays_bounded() {
+        // limits().timeout is 1 s; lane-wait credit is capped at one more.
+        for (hold_ms, completes) in [(1_500, true), (10_000, false)] {
+            let (_root, _session, pool) = lane_fixture("lane-deadline", 1);
+            let held = pool.concurrency.clone().acquire_owned().await.unwrap();
+            let weak = Arc::downgrade(&pool);
+            let executor: TaskExecutor = Arc::new(move |index, _prompt| ScheduledChild {
+                future: shared_child_lane(
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        ChildExecution {
+                            output: Ok(format!("result {index}")),
+                            cost_units: 1,
+                        }
+                    }),
+                    Some(weak.clone()),
+                    false,
+                    None,
+                    None,
+                ),
+                cancellation_cost: Arc::new(|| 0),
+            });
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                drop(held);
+            });
+            let parent = crate::agent::runner::AgentWorkScope::new();
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(parent.clone());
+            let started = Instant::now();
+            let report = parent
+                .run(execute_tasks(prompts(1), limits(), executor, None))
+                .await;
+            let rendered = report.render();
+            if completes {
+                assert!(report.stop_reason.is_none(), "{rendered}");
+                assert_eq!(report.completed, 1);
+                assert!(rendered.contains("result 0"));
+            } else {
+                assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+                assert_eq!(started.elapsed(), Duration::from_secs(2));
+                assert!(
+                    rendered.starts_with(
+                        "[partial: wall-clock deadline of 1s reached; started=1; completed=0; queued=1; cost_units=0/1000]\n"
+                    ),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("[cancelled: wall-clock deadline"));
+            }
+            release.await.unwrap();
+            cleanup.settle().await;
+            pool.close().await;
+        }
     }
 
     #[tokio::test]

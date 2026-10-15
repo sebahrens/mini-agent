@@ -243,7 +243,11 @@ pub(crate) struct Pool {
     changed: tokio::sync::Notify,
     scope: OnceLock<Arc<AgentWorkScope>>,
     cleanup: Mutex<Option<AgentRunCleanupGuard>>,
+    /// Shared by background batches (sized by `task_max_concurrency`).
     pub(crate) concurrency: Arc<tokio::sync::Semaphore>,
+    /// Foreground children use their own lane of the same size, so session
+    /// background jobs cannot serialize the parent turn's own task call.
+    pub(crate) foreground: Arc<tokio::sync::Semaphore>,
     pub(crate) write_lane: Arc<tokio::sync::Semaphore>,
 }
 
@@ -396,6 +400,7 @@ impl Pool {
             scope: OnceLock::new(),
             cleanup: Mutex::new(None),
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
+            foreground: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         session.background_pool = Some(pool.clone());
