@@ -14,7 +14,6 @@ use regex::Regex;
 
 use super::events::sanitize_output;
 use super::feed::{BlockStyle, Feed, FeedLines, ForegroundPalette, style_from_color};
-use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
 use super::utils::{char_display_width, display_width, resolve_color};
 
@@ -167,8 +166,6 @@ struct ChatSnapshot {
     selection_active: bool,
     selection_start: Option<SelectionPoint>,
     selection_end: Option<SelectionPoint>,
-    partial: CompactString,
-    partial_style: BlockStyle,
     chat_bg: Option<Color>,
     monochrome: bool,
 }
@@ -704,8 +701,6 @@ pub struct Renderer {
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
-    partial: CompactString,
-    partial_style: BlockStyle,
     scroll_offset: usize,
     input_vscroll_offset: usize,
     input_max_vscroll: usize,
@@ -857,8 +852,6 @@ impl Renderer {
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
-            partial: CompactString::new(""),
-            partial_style: BlockStyle::Plain,
             scroll_offset: 0,
             input_vscroll_offset: 0,
             input_max_vscroll: 0,
@@ -1323,25 +1316,14 @@ impl Renderer {
         self.max_line_width()
     }
 
+    /// The laid-out chat rows at `width` (shared with the feed's layout
+    /// cache, so this is a cheap `Arc` clone when nothing changed).
     fn chat_lines(&self, width: usize) -> Arc<FeedLines> {
-        let lines = self.feed.lines(width);
-        if !self.partial.is_empty() {
-            let color = self.palette.block_color(self.partial_style);
-            let mut partial = Vec::new();
-            for chunk in word_wrap(&self.partial, width) {
-                partial.push(LineEntry {
-                    syntax_spans: None,
-                    text: chunk,
-                    color,
-                });
-            }
-            return Arc::new(lines.with_segment(Arc::new(partial)));
-        }
-        lines
+        self.feed.lines(width)
     }
 
     pub fn buffer_len(&self) -> usize {
-        self.chat_lines(self.max_line_width()).len()
+        self.feed.lines(self.max_line_width()).len()
     }
 
     /// Access the underlying feed for callers that want to push semantic blocks
@@ -1364,8 +1346,6 @@ impl Renderer {
             selection_active: self.selection_active,
             selection_start: self.selection_start,
             selection_end: self.selection_end,
-            partial: self.partial.clone(),
-            partial_style: self.partial_style,
             chat_bg: self.chat_bg,
             monochrome: self.monochrome,
         }
@@ -1627,15 +1607,6 @@ impl Renderer {
         (!result.is_empty()).then_some(result)
     }
 
-    fn commit_partial(&mut self) {
-        if !self.partial.is_empty() {
-            self.feed
-                .push_block(self.partial_style, self.partial.as_str());
-            self.partial.clear();
-            self.chat_dirty = true;
-        }
-    }
-
     pub fn is_scrolling(&self) -> bool {
         self.scroll_offset > 0
     }
@@ -1748,7 +1719,6 @@ impl Renderer {
     }
 
     fn sync_to_buffer(&mut self) -> io::Result<()> {
-        self.commit_partial();
         self.render_viewport()
     }
 
@@ -1884,7 +1854,6 @@ impl Renderer {
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
-        self.commit_partial();
         let style = style_from_color(color);
         self.feed.push_block(style, text);
         self.chat_dirty = true;
@@ -1902,7 +1871,6 @@ impl Renderer {
         text: &str,
         color: Color,
     ) -> io::Result<()> {
-        self.commit_partial();
         self.feed
             .push_anchored_block(anchor, style_from_color(color), text);
         self.chat_dirty = true;
@@ -1915,7 +1883,6 @@ impl Renderer {
     /// Place a line directly under the line written with `anchor` (a tool
     /// result under its own call), or at the end when that line is gone.
     pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {
-        self.commit_partial();
         let style = style_from_color(color);
         self.feed.place_after_anchor(anchor, style, text);
         self.chat_dirty = true;
@@ -1932,7 +1899,6 @@ impl Renderer {
     fn clear_content_in_frame(&mut self) -> io::Result<()> {
         self.chat_dirty = true;
         self.feed.clear();
-        self.partial.clear();
         self.scroll_offset = 0;
         self.clear_selection();
         let mut stdout = frame_out!(self);
