@@ -13,7 +13,9 @@ use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchron
 use regex::Regex;
 
 use super::events::sanitize_output;
-use super::feed::{BlockStyle, Feed, FeedLines, ForegroundPalette, style_from_color};
+#[cfg(test)]
+use super::feed::BlockStyle;
+use super::feed::{Feed, FeedLines, ForegroundPalette, style_from_color};
 use super::statusline::StatusSpan;
 use super::utils::{char_display_width, display_width, resolve_color};
 
