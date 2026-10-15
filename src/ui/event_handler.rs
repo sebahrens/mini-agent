@@ -207,8 +207,8 @@ pub async fn handle_agent_event(
             if !slash.show_reasoning {
                 renderer.feed_mut().set_reasoning_display(crate::config::ReasoningDisplay::Off);
             }
-            let safe = sanitize_output(&text);
-            renderer.feed_mut().append_reasoning(&safe);
+            let safe = crate::ui::events::sanitize_delta(&text);
+            renderer.feed_mut().append_reasoning_sanitized(&safe);
             run.was_reasoning = true;
             let now = std::time::Instant::now();
             renderer.feed_mut().tick_reasoning_at(now);
@@ -224,7 +224,7 @@ pub async fn handle_agent_event(
                 run.was_reasoning = false;
                 run.response_start_block = None;
             }
-            let safe = sanitize_output(&text);
+            let safe = crate::ui::events::sanitize_delta(&text);
             run.response_buf.push_str(&safe);
 
             if run.response_buf.is_empty() {
@@ -244,7 +244,7 @@ pub async fn handle_agent_event(
                     idx
                 }
             };
-            renderer.feed_mut().append_to(idx, &safe);
+            renderer.feed_mut().append_sanitized(idx, &safe);
 
             // Throttle repaints by time only, never by size or newlines: a
             // long paragraph keeps appearing and code-heavy answers do not
