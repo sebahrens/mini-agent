@@ -5035,8 +5035,20 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(executable);",
-        2,
+        1,
         "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(image_path);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "scope.spawn(move || -> io::Result<_> {",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/sandbox/worker/macos.rs",
@@ -6190,6 +6202,31 @@ fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_cl
         error.contains("cannot own"),
         "unexpected rejection: {error}"
     );
+
+    for (source, wrong_class) in [
+        (
+            "let mut command = Command::new(image_path);",
+            "TC-INTERNAL-VERIFICATION",
+        ),
+        (
+            "scope.spawn(move || -> io::Result<_> {",
+            "TC-BROKER-JS-WORKER",
+        ),
+    ] {
+        let mut relabeled = checked_inventory();
+        let site = (
+            "src/sandbox/worker/macos.rs".to_owned(),
+            source.to_owned(),
+            1,
+        );
+        assert!(relabeled.insert(site, wrong_class).is_some());
+        let error = validate_class_assignments(&relabeled)
+            .expect_err("retained-image sites must preserve their exact ownership");
+        assert!(
+            error.contains("cannot own"),
+            "unexpected rejection: {error}"
+        );
+    }
 }
 
 #[test]
