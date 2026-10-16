@@ -458,6 +458,13 @@ FIFO replacement fails instead of hanging. Global prompt/specialist aliases
 and global theme loading keep their existing compatibility policy; this change
 does not claim to harden every definition loader.
 
+Completion (the `/` picker on an empty buffer and slash completion) reads
+custom templates through a cache kept by the App. It is stamped with the
+config directory, workspace root, project trust (re-evaluated on every
+lookup) and each layer directory's metadata plus its entries' names, sizes
+and mtimes; only a changed stamp reloads through the full checked loader.
+Executing a custom command always uses the uncached loader.
+
 
 ## Session catalogue and owned title work
 
@@ -475,7 +482,22 @@ workspace with a fresh ID, no old permission grants, and no hidden redo.
 [`src/ui/pickers/sessions.rs`](../../src/ui/pickers/sessions.rs) owns the key and
 filter state for the startup and in-app pickers. In-app drawing uses the
 renderer-owned writer and checked geometry; the startup picker owns and restores
-its terminal attachment before any provider is constructed.
+its terminal attachment before any provider is constructed. The in-app picker
+(`/sessions` and its Tab reload) opens immediately in a `loading sessions…`
+state while the catalogue is read on the blocking pool; a query typed meanwhile
+filters the rows when they arrive, and a listing error is shown in the picker
+instead of failing the command. The startup selector and the busy read-only
+listing still read synchronously.
+
+Turn-end saves (turn end, error, a parked question, a generated title) are
+validated and serialized on the UI task, then written by a per-session
+single-flight writer on the blocking pool; when several snapshots queue, the
+latest wins. The write is the same lock-owned, fsynced atomic publication as
+any other save. A synchronous save drops a queued snapshot and joins an
+in-flight one first, so an older deferred write can never land after it;
+releasing a session and exiting join its writer. A failed deferred write is
+reported as a warning on the next save (or at exit) rather than immediately.
+Native-bearing sessions and runs without a Tokio runtime save synchronously.
 
 [`src/session/title.rs`](../../src/session/title.rs) captures title model prices
 and usage independently of conversation context calibration. Its provider
@@ -1411,6 +1433,8 @@ The focused native stdio fixture proves same-process/restart prefix retention an
 closed refusal using inert signatures; it does not assert live-provider signature
 acceptance.
 
+### TUI frame scheduling and responsiveness
+
 Event-loop frame scheduling: streamed answer tokens and reasoning repaint by
 time only (`event_handler::stream_repaint_due`, at most every 40 ms after the
 first delta), and a persistent `RunningTick` deadline (not a fresh sleep per
@@ -1426,6 +1450,44 @@ reader polls every 50 ms for a second after input and every 250 ms when
 quiet, peeks for pasted newlines only when the previous key arrived within
 the 10 ms paste window, and signals its exit so a pause waits for it without
 a sleep loop.
+
+Painting: every renderer frame is written into one buffer and emitted with a
+single write and flush, wrapped in a DEC 2026 synchronized update so
+supporting terminals show it atomically. Chat rows are keyed by content and
+style; only changed rows are repainted, and content that moved is shifted with
+a scroll region confined to the chat rows. Geometry, margin, background or
+monochrome changes, a resize, a failed write and resuming from a suspended
+terminal force a full repaint. An
+open picker repaints only its band above the input rather than the whole chat.
+Multi-line output written synchronously (slash listings, `/context`, submission
+echoes, `!` output, `/btw` answers) is painted once when its frame closes, and
+every frame closes before the code waits for the user or a turn. After
+resuming a long session (`--continue`, `--resume` or `/sessions`), the first frame lays out only the
+blocks the viewport shows; until the rest of the layout completes in idle
+steps, the history marker at the top reads ` ↑ earlier ` instead of a row
+count. The pipeline and measured frame costs are recorded in
+[the frame-cost benchmark](../benchmarks/2026-10-15-tui-frame-cost.md); set
+`RUST_LOG=ui::frame=trace` to trace frame regions, bytes and timings.
+
+Deferred startup work: the first interactive frame no longer waits for
+`SessionStart` hooks, the native startup join, the `/` picker's skill
+discovery or the opt-in update check. The run
+loop applies each result when it lands (the update notice is printed then).
+Plain typing, paste, scrolling and resizing stay responsive meanwhile; any
+other event (a submission, slash command, keybound action or quit) and
+teardown first join the outstanding `SessionStart` hook and native startup,
+so every turn observes the same state as before. A startup auto-trigger turn
+still waits for them before it starts. A valid `COLORFGBG` skips the OSC 11
+query; otherwise the query is written early and its reply is collected within
+the original 150 ms deadline after the renderer and editor are built, so the
+round trip overlaps their construction.
+
+Exit: teardown cancels side questions, the main run and the agent prebuild
+together and joins them concurrently, each within the 5 s teardown timeout;
+MCP servers are closed concurrently; the background `task` pool is closed
+within the same bound (see [SUBAGENTS.md](SUBAGENTS.md)); and a startup worker
+probe still queued on the blocking pool is skipped instead of being run to
+completion.
 
 The App event loop constructs measured large agent-event, key-handler, and
 slash-command futures through the existing short `heap_future` factory. This

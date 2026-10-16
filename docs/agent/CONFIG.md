@@ -774,6 +774,7 @@ Accepted top-level keys:
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees (default: parent of the repository toplevel; targets inside a checkout are rejected); requires `git-worktree`. |
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
+| `running_input`           | string  | What Enter does while an interactive turn runs: `"queue"` (default) queues the input; `"steer"` delivers it at the next settled tool boundary. `/steer <message>` steers regardless. See [Mid-turn steering](TOOL_RUNTIME.md#mid-turn-steering). |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. This also holds for an entry that shadows a built-in name (`custom`, `openai`, `google`, ...); see Custom provider credentials below. |
 | `cache_ttl` | string | Owner global setting: `"5m"` (default) or `"1h"` for Anthropic-native routes. Project layers cannot change it. Other protocols retain their existing caching behavior. One-hour writes require a reported TTL usage breakdown for known cost. |
@@ -887,7 +888,8 @@ The private `<state>/update/latest.json` cache retains the last valid version
 and attempt timestamp. A nonblocking cross-process lock admits one check at a
 time; the timestamp is saved before network work so offline failures and
 cancellation also consume the 24-hour attempt interval. A cached newer version
-can be shown on later startups. Invalid or linked cache state disables the
+can be shown on later startups. The check runs in the background and never
+delays the first frame; its notice is printed when it arrives. Invalid or linked cache state disables the
 optional check for that startup. HTTP headers and body share a two-second
 deadline and a 128 KiB body cap. Headless, loop, and ACP modes neither check nor
 create update-cache state. Unset or `update_check = false` disables the feature;
@@ -1122,7 +1124,10 @@ registration, never inferred from an alias or rewritten input.
 
 Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting
-the first user or automatic turn. Print and loop modes still join the hook
+the first user or automatic turn. The first frame does not wait for it: plain
+typing, paste, scrolling and resizing work meanwhile, and a submission, slash
+command, keybound action or quit first waits for the hook (and the native
+startup join) to finish. Print and loop modes still join the hook
 before constructing their first request.
 `SessionEnd` (`"exit"`) runs whenever a print-mode run ends, including a
 failed turn, a persistence failure, and a goal that exits with its own code.
@@ -1897,7 +1902,10 @@ then a detected terminal background, then the final ANSI background index in
 foreground roles override those defaults.
 
 On Unix interactive terminals, startup sends one OSC 11 background query before
-the input thread starts. The query uses crossterm's existing event decoder with
+the input thread starts, unless `COLORFGBG` holds a valid hint: then no query
+is written and its final index selects the fallback directly. The query is
+written early and its reply collected after the renderer and input editor are
+built, within what remains of the deadline. The query uses crossterm's existing event decoder with
 one 150 ms deadline and a 128-event limit. Complete bounded RGB replies select
 the default palette; unrelated input, bracketed paste, malformed replies and
 incomplete replies at the deadline replay unchanged through the input thread.

@@ -15,7 +15,7 @@ binary's completion script and exits. See [installation instructions](GET_STARTE
 All slash commands are available from the TUI input prompt.
 
 While the main agent is running, `/help` (including `/help keys`), bare `/model`,
-`/sessions`, `/sessions --all`, and `/jobs` remain available as views. Busy session
+`/sessions`, `/sessions --all`, bare `/sandbox`, `/jobs` and `/tasks` remain available as views. Busy session
 listing is a bounded text catalogue; it does not open a resume picker, create storage,
 or repair file permissions. Model switches and session load/delete selectors wait until
 the active turn settles. These views do not warm a model, save the session, or advance a
@@ -38,7 +38,7 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/retry` | Load the last user message into the input editor for editing. |
 | `/quit` | Exit mini-agent. |
 | `/exit` | Alias for `/quit`. |
-| `/sessions` | Open the recent-session picker, filtered to the captured current workspace. Type to filter; rows show title, relative time, workspace, and message count. Tab toggles All workspaces; Enter resumes the exact selected record after a fresh private reload, and Esc cancels. Up to 100 rows are shown within bounded directory/file budgets. Names win over generated titles and first-user-message fallback. |
+| `/sessions` | Open the recent-session picker, filtered to the captured current workspace. The picker opens at once showing `loading sessions…` while the catalogue is read off the UI task; a query typed meanwhile filters the rows when they arrive, and a listing error is shown inside the picker. Type to filter; rows show title, relative time, workspace, and message count. Tab toggles All workspaces; Enter resumes the exact selected record after a fresh private reload, and Esc cancels. Up to 100 rows are shown within bounded directory/file budgets. Names win over generated titles and first-user-message fallback. |
 | `/sessions --all` | Open the picker with All workspaces explicitly selected. Choosing foreign history creates a fresh session in the current workspace; foreign approvals and hidden redo are removed. |
 | `/sessions <id-or-name>` | Load a session: an exact ID or exact case-insensitive name wins, otherwise a unique ID prefix or name substring. A same-workspace session another process owns is forked under a new ID. Foreign history always forks into the current workspace without foreign approvals or hidden redo. |
 | `/sessions delete <id-or-name>` | Delete a saved session using the same selection rules. The active session cannot be deleted; load another session first. |
@@ -96,6 +96,9 @@ build does not know parks it.
 | `/models refresh` | Re-fetch the provider's model list (also retries a listing that failed recently). |
 | `/models <name>` | Same as `/model <name>`, kept for compatibility. |
 | `/models-add <name> <provider> <model>` | Save a new quick model to the config file. |
+| `/login openai [new\|<number>]` | Sign in to a ChatGPT subscription in the browser. `new` registers another account or workspace; a number reauthorizes a registration listed by `/provider`. See [PROVIDERS.md](PROVIDERS.md). |
+| `/login copilot` | Run the GitHub Copilot device authorization (one account per GitHub host). `/login anthropic` explains why no Anthropic subscription login exists. A running turn must finish first. |
+| `/logout openai\|copilot` | Revoke (where supported) and clear the saved login for that provider. |
 
 ## Context Files
 
@@ -138,6 +141,8 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
+| `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |
+| `/sandbox <profile>` | Switch this idle session's profile and rebuild its agent, without saving config. Active turns, background tasks and commands must settle first. Profiles never widen the JS worker; see [CONFIG.md](CONFIG.md) (`sandbox-profile`). |
 
 Prompts can set the security mode automatically via `%%mode=<mode>` on
 the first line. When a prompt with `%%mode=last_user_mode` is activated,
@@ -215,6 +220,7 @@ files are skipped with a warning containing their path and read error.
 | `/effort [low\|medium\|high\|xhigh\|max\|default]` | Inspect or set main-session effort. Changes persist with the session, affect the next request and leave reasoning display preferences unchanged. Stop the active turn first; unsupported backend/model levels are refused. `default` clears the session effort override. |
 | `/reasoning [on\|off]` | Set actual thinking on supported native Claude routes; unsupported off requests explain the restriction. `default` clears an explicit native mode. On other routes this retains the existing prompt preference. |
 | `/thinking` | Alias for `/reasoning`. |
+| `/steer <message>` | While a turn runs, hold one text message (up to 64 KiB) for the next settled tool batch instead of queueing it; it does not interrupt tools. A second steer stays in the draft. See [mid-turn steering](TOOL_RUNTIME.md#mid-turn-steering) and `running_input` in [CONFIG.md](CONFIG.md). |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
 | `/toggle todo [on\|off]` | Enable or disable todo-list tools. |
@@ -331,6 +337,9 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 | `/subagent-model <name>` | Switch the subagent model. |
 | `/subagent-models` | List quick models available for subagents. |
 | `/subagent-models <name>` | Switch subagents to a named quick model. |
+| `/tasks` | List this session's background `task` jobs (`run_in_background: true`) with their status. Works while the agent runs. |
+| `/tasks result <id>` | Show the retained report of that task. |
+| `/tasks cancel <id>` | Request cancellation; the task reports `cancelling` until its model, approvals and effects settle. |
 
 `/model-subagent` and `/models-subagent` remain accepted as hidden aliases
 for `/subagent-model` and `/subagent-models`. Without the `subagents` feature,
@@ -472,6 +481,9 @@ block), so the model sees the output as something you shared, never as its own
 reply. `/undo` removes that message, and `/retry` reloads the original `!cmd`.
 After process cleanup, the command and captured result are saved immediately unless
 `--no-session` is set. In the TUI, a save failure shows a warning and retains the live transcript.
+While the command runs, the TUI shows a live tail of its output (the last 12
+lines, refreshed at most every 100 ms) under the echoed command; when it exits
+the tail is replaced by the saved final output.
 Works in both TUI and `--print` mode.
 In `--print` mode, a failed command or empty `!` exits nonzero. Captured output is still
 rendered and saved before reporting a command failure; `--output json` marks that result
@@ -774,6 +786,8 @@ Automatic matching remains lexical on the deterministic backend; semantic rankin
 explicitly configured semantic embedder in learned-skills builds. `--no-context-files` suppresses
 automatic directory discovery; explicit `/skills` and skill commands still apply normal trust and
 read checks. While a turn is busy `/skills` displays only its already captured catalogue.
+At startup the picker's skill entries are discovered in the background and appear in the `/`
+picker once discovery finishes; the first frame does not wait for them.
 
 For the actual native Anthropic adapter, the initial selected instruction/learned block stays fixed
 for the captured turn. Later successful `skills_search` calls carry new bounded guidance in their
