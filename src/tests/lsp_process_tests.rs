@@ -1601,7 +1601,17 @@ fn lsp_pipe_peer_closed_witness_requires_last_reader_departure() {
     assert!(!pipe_reader_closed_for_test(&writer).unwrap());
     writer.write_all(b"document").unwrap();
     drop(inherited_reader);
-    assert!(pipe_reader_closed_for_test(&writer).unwrap());
+    // A concurrent test thread's fork can briefly inherit the read end until
+    // its exec closes it (the descriptor is close-on-exec), so the hangup may
+    // become observable a moment after the last local reader is dropped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pipe_reader_closed_for_test(&writer).unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never observed the last reader's departure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(
         writer.write_all(b"document").unwrap_err().kind(),
         std::io::ErrorKind::BrokenPipe
