@@ -206,13 +206,25 @@ def broker(control, report, argv):
     finally:
         if not handed_off or confirmed:
             if submitted:
-                subprocess.run(["/bin/launchctl", "remove", label], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                remove_job(label)
             Path(path).unlink(missing_ok=True)
             Path(directory).rmdir()
     if not confirmed:
         raise RuntimeError("Gym coalition cleanup not acknowledged")
 
+
+def remove_job(label):
+    """Unload the submitted job. A job that already exited may have been
+    unloaded before this runs; accept a failed remove only when launchd
+    confirms the label is no longer loaded, and fail closed otherwise."""
+    removed = subprocess.run(["/bin/launchctl", "remove", label],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    if removed.returncode == 0:
+        return
+    loaded = subprocess.run(["/bin/launchctl", "list", label],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    if loaded.returncode == 0:
+        raise subprocess.CalledProcessError(removed.returncode, removed.args)
 
 if __name__ == "__main__":
     if sys.argv[1] == "--job":
