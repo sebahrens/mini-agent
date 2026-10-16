@@ -5833,6 +5833,9 @@ fn validate_macos_runtime_cache(
 mod sandbox_tests {
     #[test]
     fn git_write_root_rebind_retains_old_owner_then_releases_directory() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         struct Owned(PathBuf);
         impl Drop for Owned {
             fn drop(&mut self) {
@@ -5991,6 +5994,9 @@ mod sandbox_tests {
 
     #[test]
     fn failed_backend_preflight_is_folded_into_required_policy() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "bwrap");
         assert_eq!(
             sandbox.policy_from_backend_availability(false),
@@ -7152,6 +7158,9 @@ mod sandbox_tests {
 
     #[test]
     fn windows_capability_copy_reports_explicit_roots_and_default_network_denial() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let matrix = Sandbox::new(true, "appcontainer")
             .capability_matrix_for_policy(SandboxPolicy::RequiredAndAvailable);
 
@@ -7354,6 +7363,9 @@ mod sandbox_tests {
 
     #[test]
     fn linux_sandbox_policy_command_matches_capability_matrix() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "bwrap");
         let cmd = sandbox
             .build_bwrap_command(
@@ -7419,6 +7431,9 @@ mod sandbox_tests {
 
     #[test]
     fn bound_bwrap_command_closes_workspace_authority_before_model_shell() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let binding = Arc::new(
             crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
         );
@@ -7468,6 +7483,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bound_bwrap_real_path_overlay_follows_runtime_and_tmpfs_without_rewriting() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let owned = crate::tests::OwnedTestDirectory::new("bwrap-real-path");
         let binding = Arc::new(crate::paths::WorkspaceBinding::capture(owned.path()).unwrap());
         let root = binding.root().to_path_buf();
@@ -7524,6 +7542,9 @@ mod sandbox_tests {
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend"]
     async fn bound_bwrap_model_process_has_no_authority_fd_or_terminal_stdin() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let binding = Arc::new(
             crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
         );
@@ -7579,6 +7600,9 @@ mod sandbox_tests {
     #[cfg(feature = "hooks")]
     #[test]
     fn hook_command_argv_requests_new_session() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "bwrap");
         let command = sandbox
             .build_hook_bwrap_command(
@@ -7622,6 +7646,9 @@ mod sandbox_tests {
 
     #[test]
     fn workspace_service_argv_requests_new_session() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         for deny_network in [true, false] {
             let command = Sandbox::new(true, "bwrap")
                 .build_workspace_service_bwrap_command(
@@ -7733,6 +7760,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bwrap_supported_descriptor_binds_preserve_git_metadata_protection() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let binds = bwrap_git_metadata_binds_with_capability(&workspace, true).unwrap();
@@ -7751,6 +7781,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bwrap_model_command_binds_git_metadata_read_only_after_workspace() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "bwrap");
@@ -7769,6 +7802,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bound_bwrap_model_command_binds_git_metadata_under_the_real_workspace() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
@@ -7792,6 +7828,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bwrap_linked_worktree_binds_its_gitfile_read_only() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let (_main, worktree) = git_metadata::fixtures::linked_worktree(&root, &root);
         let sandbox = Sandbox::new(true, "bwrap");
@@ -7816,6 +7855,9 @@ mod sandbox_tests {
     #[cfg(all(unix, feature = "hooks"))]
     #[test]
     fn bwrap_hook_command_binds_git_metadata_read_only_after_workspace() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let sandbox = Sandbox::new(true, "bwrap");
@@ -7837,6 +7879,9 @@ mod sandbox_tests {
     #[cfg(unix)]
     #[test]
     fn bwrap_workspace_service_binds_git_metadata_read_only_after_workspace() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let (_scratch, root) = canonical_scratch();
         let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
         let command = Sandbox::new(true, "bwrap")
@@ -8047,6 +8092,9 @@ echo COMMITTED"#;
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
     async fn bwrap_workspace_git_metadata_is_read_only() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(bwrap_exists(), "bubblewrap is unavailable");
         assert!(
             bwrap_supports_bind_fd(bwrap_path().unwrap()),
@@ -8108,6 +8156,9 @@ echo COMMITTED"#;
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
     async fn bwrap_workspace_git_metadata_rejects_existing_aliases() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(bwrap_exists(), "bubblewrap is unavailable");
         let scratch = ScratchDir::new();
         let workspace = host_git_repository(scratch.path());
@@ -8148,6 +8199,9 @@ echo COMMITTED"#;
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later) and git"]
     async fn bwrap_workspace_git_metadata_rejects_nested_aliases() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(bwrap_exists(), "bubblewrap is unavailable");
         let scratch = ScratchDir::new();
         let workspace = host_git_repository(scratch.path());
@@ -8219,6 +8273,9 @@ echo COMMITTED"#;
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_workspace_git_metadata_is_read_only() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !seatbelt_exists() {
             eprintln!("skipping: Seatbelt is unusable on this host");
             return;
@@ -8431,6 +8488,9 @@ echo COMMITTED"#;
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend and a controlling terminal (run under script(1))"]
     async fn bwrap_hook_has_no_controlling_terminal() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(
             test_process_has_controlling_terminal(),
             "run this test under script(1) so the negative /dev/tty probe is meaningful"
@@ -8470,6 +8530,9 @@ echo COMMITTED"#;
     #[cfg(all(target_os = "macos", feature = "hooks"))]
     #[tokio::test]
     async fn seatbelt_hook_has_no_controlling_terminal() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !seatbelt_exists() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
@@ -8577,6 +8640,9 @@ echo COMMITTED"#;
 
     #[test]
     fn profile100_seatbelt_ladder_keeps_private_git_network_and_namespace_denies_last() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let private = "\n (subpath \"/home/operator/.ssh\")";
         let git = "\n (literal \"/work/.git\")";
         let storage = "\n (subpath \"/cache/publisher\")";
@@ -8838,6 +8904,9 @@ echo COMMITTED"#;
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_sandbox_policy_enforces_real_backend() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !bwrap_exists() {
             eprintln!("skipping real Linux sandbox probe because bwrap is not installed");
             return;
@@ -8907,6 +8976,9 @@ printf LINUX_SANDBOX_POLICY_PASS
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_sandbox_policy_backend_setup_failure_is_fail_closed() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !bwrap_exists() {
             eprintln!("skipping real Linux sandbox probe because bwrap is not installed");
             return;
@@ -8951,6 +9023,9 @@ printf LINUX_SANDBOX_POLICY_PASS
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_policy_enforces_real_backend() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if seatbelt_path().is_none() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
@@ -9070,6 +9145,9 @@ printf {pass_token}
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_workspace_binding_grants_real_workspace_writes() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !seatbelt_exists() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
@@ -9137,6 +9215,9 @@ printf {pass_token}
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_workspace_service_grants_real_workspace_writes() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !seatbelt_exists() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
@@ -9191,6 +9272,9 @@ printf {pass_token}
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_workspace_service_environment_names_cannot_replace_the_program() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(seatbelt_exists(), "Seatbelt is unavailable");
         let scratch = ScratchDir::new();
         let workspace = std::fs::canonicalize(scratch.path()).unwrap();
@@ -9337,6 +9421,9 @@ echo PRIVATE_TEMP_PASS"#,
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_setup_failure_is_fail_closed() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         if !seatbelt_exists() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
@@ -9812,6 +9899,9 @@ echo PRIVATE_TEMP_PASS"#,
     #[cfg(unix)]
     #[test]
     fn zerobox_shell_command_clears_ambient_environment() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "zerobox");
         let cwd = std::env::temp_dir();
         let command = sandbox.build_zerobox_shell_command(
