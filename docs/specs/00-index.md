@@ -234,6 +234,21 @@ This explicitly replaces the 2026-09-09 hash/startup overlap; the pending-child 
 canonical containment invariants remain required. Larger images use the original uncached path.
 This does not remove cross-process cold-start cost or complete `.5` startup scheduling.
 
+## Delivered performance follow-up (2026-10-16)
+
+The 2026-10-15 TUI performance review (epic `mini-agent-cttyn`, label `tui-perf-2026-10-15`)
+landed as code; all 66 children are closed. Most changes are owned by the UI, session, MCP,
+subagent and spend documentation in `../agent/`. The rows below touch this corpus. None changes
+the Phase 6 canonical checklist, and the epic's security caveats hold: `.git` alias/identity
+validation and MCP source-revocation checks are made cheaper or moved off the UI task, never
+cached as authority.
+
+| Change | Owning spec | Bead |
+|--------|-------------|------|
+| Explicit sandbox roots captured once per configuration and re-validated before every launch; Seatbelt reuses only fixed inputs, with alias inspection, `.git` denials and root validation still per launch | Phase 2 | mini-agent-cttyn.49, mini-agent-cttyn.50 |
+| Shell launches wrapped by their output worker on the blocking pool (validate, wrap, spawn order unchanged) | Phase 2 | mini-agent-cttyn.51 |
+| A startup worker probe still queued at exit is cancelled before it runs; a running native preflight is joined through its cleanup | Phase 6 (startup probe lifecycle) | mini-agent-cttyn.64 |
+
 ## Delivered startup follow-up (2026-09-09)
 
 `mini-agent-jnuz` originally overlapped contained macOS worker startup with the sealed-image

@@ -319,6 +319,34 @@ Notable changes to mini-agent are documented in this file. The format follows
   `package-lock.json` hash. `package-corresponding-source.sh --npm-vendor-cache <dir>` reuses a cached
   tarball only when it matches the lockfile integrity, producing a byte-identical archive; release
   builds do not use the cache.
+- The terminal UI is faster to type into, stream into and start. Each frame is written once,
+  inside a synchronized-output update, and only changed chat rows are repainted (moved content is
+  scrolled). Streamed text repaints at most every 40 ms. Queued keys, wheel and drag events are
+  applied together before one paint. An open picker repaints only its own band. A resumed long
+  session paints its tail first and shows ` ↑ earlier ` until the full layout is ready.
+- The first frame no longer waits for `SessionStart` hooks, `/` skill discovery or the opt-in
+  update check. The OSC 11 background query is skipped when `COLORFGBG` is valid and otherwise
+  overlaps the rest of startup. Turn-end session saves are written off the UI task, and a failed
+  write is reported on the next save.
+  Exit retires its owners concurrently, closes MCP servers concurrently and bounds the background
+  task close at 5 s.
+- `!` commands show their output live while they run, and foreground model `shell` calls show a
+  throttled preview of their last output lines under the tool call. The preview is display-only
+  and is not saved.
+- The statusline `git_status`/`git_changes` refresh adapts to activity: right after tool results,
+  turn end and commands, otherwise every 10 s. It skips Git when the repository metadata is
+  unchanged and still runs a full status at least every 30 s.
+- A foreground `task` call has its own subagent concurrency lane, separate from background task
+  batches. Time spent waiting for a lane is not charged to `task_timeout_secs` (up to one further
+  timeout), and partial
+  headers report waiting children as `queued=N`. `job_status` `poll`, `wait` and `list` no longer
+  block parallel read-only tools.
+- Startup spend reconciliation reads a private `<state_dir>/usage.checkpoint` and scans only the
+  ledger rows appended since the last startup. MCP prompt and resource discovery no longer delays
+  a server's connection, and each connection caches its `tools/list` result. The `/sessions`
+  picker loads in the background.
+- Development builds compile dependencies at opt-level 1. Release builds use opt-level 3
+  (previously `z`), with thin LTO and one codegen unit.
 
 ## [1.9.4] - 2026-09-29
 

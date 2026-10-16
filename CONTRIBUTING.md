@@ -24,6 +24,10 @@ cargo install --path . --debug # the development build/install command
 
 - The `--debug` install is the contributor build: faster to compile and keeps `debug_assert!`
   checks on. The README's `cargo install --path . --locked` is the end-user source install.
+  In the dev profile mini-agent itself stays at opt-level 0 while dependencies build at
+  opt-level 1 (a few hashing and retrieval crates at 3), so the TUI's text and terminal work runs
+  optimized. The release profile uses opt-level 3 with thin LTO and one codegen unit, favouring
+  speed over binary size.
 - **Never** run `cargo build` or `cargo check`; `cargo test` catches type errors and runs the tests.
 - **Never** use `--release` during development.
 - CI also runs `cargo clippy --locked --all-targets -- -D warnings` across a matrix of feature rows

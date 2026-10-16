@@ -24,6 +24,11 @@ or attribute every remaining millisecond to the containment probe.
 
 ## Controlled source and builds
 
+These builds predate `mini-agent-cttyn.1` (commit `115265dd`), which changed the
+profiles: dev dependencies now build at opt-level 1 instead of 0 and release uses
+opt-level 3 instead of `z`. The numbers below describe the earlier profiles and
+were not re-measured.
+
 Both binaries have the exact tracked source tree of delivered commit
 `c79475ddcf9744eeff3e6f221c17369f32ee5e5d`, including startup `0941b05f` and
 the persistent expected-digest semantics. The private source pin is
