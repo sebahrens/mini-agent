@@ -703,6 +703,19 @@ jobs:
           if ($actual.Count -ne 3 -or $difference.Count -ne 0) { throw 'Expected the exact three ledger contract controls' }
           & cargo test --locked --bin mini-agent -- @filters --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native ledger lock or persistence contract failed' }
+      - name: Test native Windows read-only session import DACL refusal
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
+        shell: pwsh
+        run: |
+          $test = 'fs::private::windows::readonly_session_import_refuses_broadened_file_and_root_dacl_without_repair'
+          $listing = @(& cargo test --locked --bin mini-agent -- $test --exact --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only session import DACL test discovery failed' }
+          $actual = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -eq "${test}: test" })
+          if ($actual.Count -ne 1) { throw 'Expected exactly the native read-only session import DACL control' }
+          $result = @(& cargo test --locked --bin mini-agent -- $test --exact --nocapture --test-threads=1 2>&1)
+          $exit = $LASTEXITCODE
+          $result | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0 -or -not ($result -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) { throw 'Native read-only session import DACL refusal failed' }
       - name: Test native one MiB App event loops
         if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-session-storage'
         shell: pwsh
