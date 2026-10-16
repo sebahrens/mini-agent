@@ -53,11 +53,15 @@ Set `run_in_background: true` on an ordinary `task` call to return a task ID
 immediately. The same persona, tools, permission checks, deadlines, captured
 prices and session cost cap apply. The session keeps at most 32 tasks, including
 finished reports; start a new session when that bounded history is full.
-Foreground and background children share the configured concurrency ceiling,
-and write-enabled children across batches share one write lane. Both permits stay
-owned through actual child-effect retirement, including cancellation, so a queued
-child cannot overlap a still-retiring write. Admission checks
-captured spend and workspace identity again after waiting for that lane.
+Background batches share one lane of `task_max_concurrency` children, while the
+parent turn's own foreground `task` call uses a separate lane of the same size,
+so running background jobs cannot serialize it. Write-enabled children across
+all batches share one write lane. These permits stay owned through actual
+child-effect retirement, including cancellation, so a queued child cannot
+overlap a still-retiring write. Admission checks captured spend and workspace
+identity again after waiting for that lane. Time a call's children spend
+waiting for a lane is not charged to its deadline (see
+[Configuration](#configuration)).
 
 Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
 agent, or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
@@ -255,6 +259,12 @@ live under `.claude` or `.mini-agent`; those directories do not create an
 independent trust grant. Project notes use the same gate and remain supported
 only at `.zerostack/agents/.notes.md`. Persona files themselves are not part of
 the config fingerprint: an approved checkout may change its persona content.
+Resolved persona maps are cached per user agents directory and workspace root.
+Every lookup re-evaluates project trust and re-stamps each layer through the
+same path discipline as the loader (directory identity plus each `.md` entry's
+name, type, size, mtime, ctime, inode, device and link count); any change, a
+layer that cannot be stamped, or a trust change reloads through the checked
+loader, so an edited persona applies on the next `task` call.
 Project reads use the session's captured workspace capability and refuse
 symlinks (including linked directory components), reparse points, and nonregular
 files. Each layer is enumerated before reading, with at most 1,024 directory
@@ -498,6 +508,7 @@ of a call is waiting for a lane, its `task_timeout_secs` deadline is paused,
 with that credit capped at one further timeout; when the deadline stops a call
 whose started children are still waiting, the partial-status header reports
 them as `queued=N`.
+
 ### Model-aware task work accounting
 
 `task_max_cost_units` remains **4,000,000** per task call. These are normalized
@@ -762,6 +773,19 @@ markers, plus any specialist notice, before starting queued work. Task labels
 collapse prompt whitespace into a single line and keep at most 60 characters;
 the full execution prompt is preserved.
 
+Children report their nested tool calls on the parent run's event channel.
+Runs started while delegation is installed use a 512-slot channel instead of
+the ordinary 32 slots, so several children plus the parent's token stream do
+not stall child tool execution while the TUI repaints. It stays one bounded,
+lossless, ordered channel; no subagent event is dropped or reordered.
+
+A cancelled child's directory walk (`grep`, `find_files`) stops at the next
+entry and the tool returns an error rather than a partial result that looks
+complete. At TUI exit, closing background tasks cancels every job at once and
+waits at most the teardown timeout (5 s) for their retirement; on expiry it
+warns and exits, and a job that did not retire keeps a non-terminal saved
+status. Session switches still wait for the full close.
+
 ### Editable child sizing
 
 The main session's `context_window` (including a 1,000,000-token pin) remains
@@ -782,8 +806,9 @@ through ordinary `--config key=value` overrides; changing them needs no recompil
 Concurrency remains 4, prompt count 8, model turns 20 per child, and the whole
 call deadline 300 seconds. These are editable as `task_max_concurrency`,
 `task_max_prompts`, `task_max_turns`, and `task_timeout_secs`. Concurrency is
-editable without recompilation but requires restart: the session owns a fixed
-semaphore shared by foreground and background children. The other listed sizing
+editable without recompilation but requires restart: the session owns fixed
+semaphores of that size, one shared by background batches and one for the
+foreground task call. The other listed sizing
 limits apply to the next delegation. The cost policy keys `task_cost_weighting`,
 `task_cost_weights`, and `task_cost_overrides` also apply at that boundary;
 `/config task_cost_weighting "fixed"` and
