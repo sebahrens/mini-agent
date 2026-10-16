@@ -12,6 +12,12 @@ zero-visible completion additionally needs the current provider end_turn witness
 and valid opaque content; tool counts or empty display text do not attest an
 actor's completion.
 
+Retained native replay is bounded (`src/session/native_replay.rs`): at most 128
+frames, 4 MiB for the whole serialized replay, and 2 MiB for the base history
+and for each frame. A replay over any bound is never truncated: it is treated
+as non-replayable, reported as "native thinking context exceeds its finite
+bounds".
+
 Workspace compatibility uses a bounded borrowed path and retained physical root
 identity, validated before and after projection. Same-path replacement is refused.
 This digest is compatibility data, never a directory capability or approval.
