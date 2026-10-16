@@ -2687,6 +2687,137 @@ mod windows {
         assert_eq!(file.metadata().unwrap().len(), 0);
     }
 
+    /// Exercise the real importer, not just the shared private ACL matcher.
+    #[test]
+    fn readonly_session_import_refuses_broadened_file_and_root_dacl_without_repair() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        let root = crate::tests::OwnedTestDirectory::new("readonly-import-native-dacl");
+        let state = root.path().join("state");
+        ensure_directory(&state).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let sessions = crate::paths::WorkspaceBinding::capture(&state).unwrap();
+        sessions.validate_private_root().unwrap();
+        let mut original = crate::session::Session::new("saved-label", "data-model", 32_000, "");
+        original.working_dir = workspace.root().to_string_lossy().into();
+        original.add_message(crate::session::MessageRole::User, "inert saved history");
+        let path = state.join(format!("{}.json", original.id));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        atomic_create(&path, &bytes).unwrap();
+        let file_dacl = dacl_sddl(&path, false).unwrap();
+        let root_dacl = dacl_sddl(&state, true).unwrap();
+        let load = || {
+            crate::session::storage::load_session_exact_read_only(
+                &sessions,
+                &original.id,
+                &workspace,
+            )
+        };
+        let positive = load().unwrap().unwrap();
+        assert_eq!(positive.messages[0].content, "inert saved history");
+        assert!(positive.permission_allowlist.is_empty());
+        let user = current_user_sid_string().unwrap();
+        let text = wide(OsStr::new(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{user})(A;;FR;;;WD)"
+        )));
+        let mut raw = null_mut();
+        // SAFETY: owned NUL-terminated SDDL and initialized out pointer remain
+        // live through conversion; SecurityDescriptor retires LocalAlloc data.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = SecurityDescriptor(raw);
+        for (target, directory) in [(&path, false), (&state, true)] {
+            let handle = open_handle(
+                target,
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        FILE_ATTRIBUTE_NORMAL
+                    },
+                None,
+            )
+            .unwrap();
+            // SAFETY: successful CreateFileW returned the unique owned handle;
+            // File closes it before the retained directories/root on every exit.
+            let metadata = unsafe { std::fs::File::from_raw_handle(handle) };
+            ensure_current_owner(handle).unwrap();
+            let identity = crate::fs::checked_file_metadata(&metadata).unwrap();
+            // SAFETY: only this test-owned inert object is modified. The live
+            // descriptor owns its ACL, null owner/group preserve identity, and
+            // the held metadata handle has WRITE_DAC. No production repair.
+            assert_eq!(
+                unsafe {
+                    SetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        descriptor.dacl().unwrap(),
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                validate_checked_object(&metadata, directory)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied,
+            );
+            let broadened = dacl_sddl(target, directory).unwrap();
+            let healthy = if directory { &root_dacl } else { &file_dacl };
+            assert!(
+                broadened != *healthy,
+                "controlled DACL must actually change"
+            );
+            let denied = load().unwrap_err();
+            assert_eq!(
+                denied
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "actual readonly importer must refuse this invalid private policy",
+            );
+            assert!(
+                dacl_sddl(target, directory).unwrap() == broadened,
+                "readonly import must leave the broadened DACL unchanged",
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
+            ensure_current_owner(metadata.as_raw_handle()).unwrap();
+            crate::fs::ensure_same_file(
+                target,
+                &identity,
+                &crate::fs::checked_path_metadata(target).unwrap(),
+            )
+            .unwrap();
+            // Restore only this deliberately modified owned inert image; a
+            // healthy import after each refusal rules out fixture/API vacuity.
+            apply_private_dacl(handle, directory).unwrap();
+            validate_checked_object(&metadata, directory).unwrap();
+            assert!(dacl_sddl(&path, false).unwrap() == file_dacl);
+            assert!(dacl_sddl(&state, true).unwrap() == root_dacl);
+            let restored = load().unwrap().unwrap();
+            assert_eq!(restored.id, original.id);
+            assert_eq!(restored.messages[0].content, "inert saved history");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            drop(metadata);
+        }
+    }
+
     #[test]
     fn usd_budget_native_windows_checked_open_refuses_public_dacl_and_hardlinks_without_repair() {
         use std::os::windows::io::FromRawHandle;
