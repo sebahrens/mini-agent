@@ -2187,6 +2187,66 @@ async fn effort46_untracked_opaque_initial_history_refuses_before_native_http() 
 }
 
 #[tokio::test]
+async fn effort46_native_prepared_capture_refuses_raw_binding_overrides_before_connection() {
+    use crate::session::native_replay::RestartReason;
+    for key in ["system", "messages", "tools", "model"] {
+        let wire = Wire::new(Vec::new());
+        let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+            unreachable!()
+        };
+        let capture =
+            crate::agent::native_capture::NativeCapture::for_replay(model.clone(), true).unwrap();
+        let mut raw = serde_json::Map::new();
+        raw.insert(key.to_string(), json!("untrusted raw replacement"));
+        let inner = rig::agent::AgentBuilder::new(model)
+            .preamble("Stable native probe system")
+            .max_tokens(1000)
+            .default_max_turns(1)
+            .additional_params(Value::Object(raw))
+            .build();
+        let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(inner))
+            .with_native_capture(capture.clone());
+        let turn = agent
+            .run_print_with_output(
+                "literal initial user",
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                &RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+                Vec::<Message>::new(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await;
+        assert_eq!(
+            capture.replay_failure(),
+            Some(RestartReason::UnsupportedOverride),
+            "raw {key} override must be refused as unsupported"
+        );
+        assert!(
+            turn.failure.is_some(),
+            "raw {key} override must fail the turn"
+        );
+        let (frames, unavailable) = capture.snapshot();
+        assert!(frames.is_empty(), "raw {key} override captured frames");
+        assert!(unavailable.is_none());
+        assert_eq!(
+            capture.persisted_history().err(),
+            Some(RestartReason::UnsupportedOverride),
+            "raw {key} override must not yield a persisted base"
+        );
+        assert_eq!(turn.usage.input_tokens, 0);
+        assert_eq!(turn.usage.output_tokens, 0);
+        assert_eq!(turn.usage.total_tokens, 0);
+        assert!(
+            wire.finish().is_empty(),
+            "raw binding refusal attempted TCP/HTTP for {key}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn effort46_completed_native_capture_limit_preserves_accepted_denial_and_usage() {
     use crate::session::native_replay::{ReplayBoundary, RestartReason};
     let opaque = "x".repeat(2 * 1024 * 1024 + 1);
