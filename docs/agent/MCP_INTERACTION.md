@@ -3,8 +3,8 @@
 The `mcp` feature discovers each server's advertised prompts and resources in a
 detached task once its accepted connection is established, so discovery never
 delays the connection or its tools. Until it finishes, `/mcp` and the pickers
-show the server with an empty catalogue. Each catalogue has at most128 entries,
-32 pages and256KiB of serialized metadata, with a three-second budget per kind.
+show the server with an empty catalogue. Each catalogue has at most 128 entries,
+32 pages and 256 KiB of serialized metadata, with a three-second budget per kind.
 A failed or bounded auxiliary catalogue is marked incomplete and does not remove
 an otherwise connected tool server. `/mcp` reports these cached counts without
 another RPC. Command and file pickers also use the cached, current-source catalogue.

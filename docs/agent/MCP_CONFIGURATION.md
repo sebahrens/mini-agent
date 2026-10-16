@@ -154,6 +154,21 @@ approved definition. These checks confer no permission grants and do not repair
 private files. Explicit manually constructed originless clients retain their
 existing behavior.
 
+Each check is metadata-first: an origin file and the private trust store whose
+retained identity, length, mtime, ctime, mode, owner and link count are
+unchanged since their last successful full verification reuse that result.
+Any metadata change, unavailable metadata, or a non-Unix platform forces the
+full read, hash and parse, and a failed verification is never cached. Pending
+MCP permission and question prompts revalidate their source once per second
+instead of on every event-loop pass; prompt creation, key handling and the
+reply paths keep the full check.
+
+A connection keeps its first successful `tools/list` result, so agent rebuilds do
+not page `tools/list` again; a reconnect is a
+new connection, failures are not cached, and mini-agent does not subscribe to
+`tools/list_changed`. Shutdown closes all servers concurrently, and a worktree
+switch closes the previous binding's servers while the new binding connects.
+
 ## Deferred tool schemas
 
 A server accepts `defer: true`, `defer: false`, or `defer: "auto"` (the default).
