@@ -5399,11 +5399,15 @@ impl<'a> App<'a> {
 
     /// Already projected literal input: no slash, bang, directives, MCP
     /// references or operator-approval reclassification occurs here.
+    ///
+    /// Consumes `run.next_turn_directive` on every call, including refused
+    /// starts, so a host directive applies to exactly one start attempt.
     async fn start_main_run_prepared(
         &mut self,
         text: &str,
         question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
+        let turn_directive = self.run.next_turn_directive.take();
         #[cfg(feature = "multimodal")]
         if let Err(error) =
             super::clipboard_image::user_message(&self.ui.session.pending_media, text)
@@ -5507,8 +5511,9 @@ impl<'a> App<'a> {
         // The echo is already on screen; show the spinner and Working
         // activity before memory refresh, prebuild adoption and agent build.
         self.paint_submission_started()?;
-        start_main_run(
+        super::start_main_run_with_directive(
             text,
+            turn_directive,
             true,
             question_origin,
             &mut self.run,
@@ -14861,6 +14866,154 @@ mod plan_approval_tests {
         })
         .await
         .unwrap()
+    }
+
+    /// mini-agent-5eoy7.3: the host directive reaches only the request of the
+    /// turn it was set for; the transcript, rewind targets, the saved session
+    /// and the next turn's replayed history only ever carry the literal text.
+    #[tokio::test]
+    async fn turn_directive53_reaches_one_request_and_never_the_transcript() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["FIRST_DONE53", "SECOND_DONE53"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_context_files: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        app.run.next_turn_directive = Some("ROUTE_MARK53: delegate to persona reviewer".into());
+        crate::startup::heap_future(|| {
+            app.start_main_run(
+                "LITERAL_MARK53 please review",
+                crate::question::QuestionOrigin::NewUserTurn,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(app.run.next_turn_directive.is_none());
+        assert!(finish_turn(&mut app).await);
+        crate::startup::heap_future(|| {
+            app.start_main_run(
+                "second literal turn",
+                crate::question::QuestionOrigin::NewUserTurn,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(finish_turn(&mut app).await);
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        let first = calls[0]["messages"].as_array().unwrap();
+        let last = first.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().expect("multi-part user content");
+        assert_eq!(parts[0]["text"], "LITERAL_MARK53 please review");
+        let directive = parts.last().unwrap()["text"].as_str().unwrap();
+        assert!(directive.starts_with(crate::agent::input::TURN_DIRECTIVE_LABEL));
+        assert!(directive.ends_with("ROUTE_MARK53: delegate to persona reviewer"));
+        // The next request replays the saved literal turn, never the directive.
+        let second = serde_json::to_string(&calls[1]["messages"]).unwrap();
+        assert!(second.contains("LITERAL_MARK53 please review"));
+        assert!(!second.contains("ROUTE_MARK53"), "{second}");
+
+        let users: Vec<_> = app
+            .ui
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .map(|m| m.content.to_string())
+            .collect();
+        assert_eq!(
+            users,
+            vec![
+                "LITERAL_MARK53 please review".to_owned(),
+                "second literal turn".to_owned()
+            ]
+        );
+        assert!(
+            super::super::rewind_targets(app.ui.session)
+                .iter()
+                .all(|(_, text)| !text.contains("ROUTE_MARK53"))
+        );
+        // A saved session (what --continue/--resume reload) carries no
+        // directive text, so neither does its replayed history.
+        let saved = serde_json::to_vec(app.ui.session).unwrap();
+        assert!(!String::from_utf8_lossy(&saved).contains("ROUTE_MARK53"));
+        let restored: Session = serde_json::from_slice(&saved).unwrap();
+        let replay =
+            serde_json::to_string(&crate::agent::runner::convert_history(&restored)).unwrap();
+        assert!(replay.contains("LITERAL_MARK53 please review"));
+        assert!(!replay.contains("ROUTE_MARK53"));
+        drop(app);
+        provider.finish().await;
+    }
+
+    /// A refused start still consumes the directive so it cannot attach to a
+    /// later, unrelated turn.
+    #[tokio::test]
+    async fn turn_directive53_is_consumed_by_a_refused_start() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_context_files: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        // A tiny window makes the local size preflight refuse the start.
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            1_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        app.run.next_turn_directive = Some("ROUTE_MARK53".into());
+        let too_large = "word ".repeat(20_000);
+        crate::startup::heap_future(|| {
+            app.start_main_run(&too_large, crate::question::QuestionOrigin::NewUserTurn)
+        })
+        .await
+        .unwrap();
+        assert!(!app.run.is_running);
+        assert!(app.ui.session.messages.is_empty());
+        assert!(app.run.next_turn_directive.is_none());
+        assert!(provider.calls().is_empty());
+        drop(app);
+        provider.finish().await;
     }
 
     #[cfg(feature = "agent-skills")]

@@ -1353,6 +1353,25 @@ continuations retain it in history. Existing String entrypoints remain text-only
 wrappers. A prompt hook that rewrites typed media text is declined visibly
 instead of flattening images or changing their order.
 
+`PromptInput::with_turn_directive` attaches an optional non-persisted host
+directive to one request (mini-agent-5eoy7.3). `to_message` renders it as a final
+text block of the current User turn, after the user's own content and prefixed by
+`TURN_DIRECTIVE_LABEL`, so the Anthropic Messages and OpenAI Completions/Responses
+builders all honour it without touching the system prefix. It is excluded from
+`literal_text()` and `persisted_user()`: UserPromptSubmit receives only the
+literal text, and `PendingMainTurn`, the saved user message, titles, rewind
+targets, compaction and `--continue` canonical replay never see it. Retries and
+in-run continuations reuse the same rendered message; a later turn does not. The
+directive budget is `TURN_DIRECTIVE_MAX_BYTES` (1 KiB, UTF-8): longer text is
+truncated at a character boundary and blank text is dropped. Directives are
+host-authored routing hints that may name personas but never carry persona
+bodies or other data. In the TUI, `AgentRunState::next_turn_directive` is taken by
+`App::start_main_run_prepared` on every call (including refused starts) and
+passed to `ui::start_main_run_with_directive`. Exception: an Anthropic native
+thinking-replay chain must replay each prior request byte-exactly, so its opaque
+`native_history` frames retain the directive block as sent; that compatibility
+data is never projected into the transcript or any hook payload.
+
 `extras::acp::sessions` exposes bounded, read-only saved-session metadata without
 creating or repairing storage. It uses the shared private catalogue predicate
 and an explicitly owned blocking task. List cursors are bounded offsets, never
