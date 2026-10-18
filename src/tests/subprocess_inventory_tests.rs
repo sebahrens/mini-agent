@@ -870,7 +870,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -1151,6 +1151,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
+    // The ACP /cron driver is a connection task on the ACP executor, not a process.
+    (
+        "src/extras/acp/cron.rs",
+        "&& let Err(error) = cx.spawn(drive(",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/export.rs",
         "if !response.status().is_success() {",
@@ -1939,6 +1946,67 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Wakeup tool and App /cron assertions inspect returned or rendered strings.
+    (
+        "src/agent/tools/schedule_wakeup.rs",
+        "assert!(output.contains(\"in 60s (clamped from 5s)\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/schedule_wakeup.rs",
+        "output.contains(\"in 3600s (clamped from 99999s)\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "output.contains(\"⟳ cron c2 (every 1m): check the deploy\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "assert!(!output.contains(\"> check the deploy\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "output.matches(\"schedule(s) suspended and kept\").count(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "assert!(output.contains(\"cron: USD budget reached; 2 schedule(s)\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "assert!(output.contains(\"⟳ cron c1 (self-paced): watch ci\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "output.contains(\"⟳ cron c1: next wakeup in 1m · owned reason\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "assert!(output.contains(\"⟳ cron c1 (every 1m): /jobs\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        "output.contains(\"no background jobs in this session\"),",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact native-result and compact-status assertion identifiers are data.
     (
         "src/sandbox/general_profile.rs",
@@ -1949,24 +2017,36 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/general_profile.rs",
         "output.exit_status.is_some_and(|status| status.success()),",
-        2,
+        4,
         "NON-PROCESS",
     ),
     (
         "src/sandbox/general_profile.rs",
         "output.exit_status,",
-        1,
+        3,
         "NON-PROCESS",
     ),
     (
         "src/sandbox/general_profile.rs",
         "String::from_utf8_lossy(&output.stderr)",
-        2,
+        4,
         "NON-PROCESS",
     ),
     (
         "src/sandbox/general_profile.rs",
         "assert_eq!(output.stdout, b\"PROFILE100_NATIVE_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "assert_eq!(output.stdout, b\"HOME24W5S_WORKSPACE\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/general_profile.rs",
+        "assert_eq!(output.stdout, b\"HOME24W5S_HOST_READ\");",
         1,
         "NON-PROCESS",
     ),
@@ -3516,6 +3596,58 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Wakeup tool and App /cron assertions inspect a returned tool-result
+    // String or captured renderer output; no process is constructed.
+    (
+        "src/agent/tools/schedule_wakeup.rs",
+        &[
+            (
+                "8a00b380f75a6750685c58871c8d064e5b88b12996d737e027364a236e8b7920",
+                1,
+            ),
+            (
+                "a402f8fe5898ef7e0de64639f5b86a9fc7f91e1e879f1af8d0dbd54305f5aa4e",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/ui/cron_app_tests.rs",
+        &[
+            (
+                "758af48af924ad28a84b646c2433d075a0d65181ee21cadce1e0ff2955bbc3c9",
+                1,
+            ),
+            (
+                "89ba83d4c92446a819b58ff4eef0c727a54f876b162abcbeb55a600777f2b804",
+                1,
+            ),
+            (
+                "0b48e1286279a92a4905c350cf613b75864d0306aa006ba6b88cd760b7da9c54",
+                1,
+            ),
+            (
+                "042e0c05dc704e21e6a385254d81f90b42a6eaf1e3ab38fb10911a01709f8d23",
+                1,
+            ),
+            (
+                "de30b951c6508aa1812cbb3a503897d9ed3b8cf01663ca72ab6ad26536f091e3",
+                1,
+            ),
+            (
+                "a2d0a9ddd1879d8cf019a1fc514e624ff5dc6e683477e1d4339120cd40b78053",
+                1,
+            ),
+            (
+                "47312379504646023c28a2b95f17664e8eb6c0acd929a0aa99473b7b007b2328",
+                1,
+            ),
+            (
+                "f996bb0e5beb8471d050536b0bf5244b593ae3b5abf6bb1a5acf3da8366f710f",
+                1,
+            ),
+        ],
+    ),
     // Task cost weight assertions compare a struct whose field is named
     // `output`; the token tree constructs or executes no process.
     (
@@ -3562,6 +3694,22 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
+                1,
+            ),
+            (
+                "a781cb34bac9aa98ce22ff1576f9747f9d69c6d3bc397d604b96c22fc5fdaae8",
+                1,
+            ),
+            (
+                "17ea34486aa6cfe26d922516674b3c269d41f3655cdc7dd42ce97a20bbcc329e",
+                1,
+            ),
+            (
+                "fc2f87349d1b149637c15e59d7e67bb6674a883b2940b8bb9dcc325afc429e08",
+                1,
+            ),
+            (
+                "78ba56e010a879238db1f067274c2c546b7c47cf0dedd133747351e9496c3eb4",
                 1,
             ),
         ],
@@ -5112,7 +5260,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -5614,6 +5762,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
+    // The ACP /cron driver is a connection task on the ACP executor, not a process.
+    (
+        "src/extras/acp/cron.rs",
+        "&& let Err(error) = cx.spawn(drive(",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/export.rs",
         "if !response.status().is_success() {",
