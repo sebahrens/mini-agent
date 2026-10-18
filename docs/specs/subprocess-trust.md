@@ -832,3 +832,19 @@ the JS host to this shared module with its full token fingerprint unchanged.
 The native persisted-result test's `output.as_str()` assertion is CompactString
 payload data and has a separate exact macro-context classification. No process
 constructor, arbitrary macro or directory receives an exemption.
+
+### ACP and App /cron, wakeup tool and home-path fixtures (mini-agent-5eoy7)
+
+The ACP `/cron` driver started with `cx.spawn(drive(...))` in
+`src/extras/acp/cron.rs` is a task on the ACP connection executor, like the
+existing `cx.spawn({` site in `src/extras/acp/mod.rs`; the additional
+multi-line `AvailableCommand::new(` in `src/extras/acp/commands.rs` builds a
+protocol command description. Both are `NON-PROCESS` in both checked
+catalogues. The `output` identifiers in the `schedule_wakeup` tool tests and
+the App `/cron` tests (`src/ui/cron_app_tests.rs`) are a returned tool-result
+`String` and captured renderer output; the native home-path (`HOME24W5S`)
+sandbox fixture in `src/sandbox/general_profile.rs` inspects `CommandOutput`
+fields after the existing sandboxed `output_built_command_with_limits` call.
+Their exact source lines, occurrence counts and complete macro-token digests
+are `NON-PROCESS`. No scanner, creation-boundary rule or negative control
+changes, and no process launcher is added.
