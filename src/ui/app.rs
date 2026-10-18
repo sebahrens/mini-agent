@@ -1711,6 +1711,15 @@ impl<'a> App<'a> {
         });
         #[cfg(not(feature = "agent-skills"))]
         let skill_commands: Option<PendingSkillCommands> = None;
+        // The /agent sub-picker and the `@agent:` rows read the same trusted
+        // persona source as the task tool's enum.
+        #[cfg(feature = "subagents")]
+        {
+            let names = crate::context::agents::available_names_for_workspace(Some(&ui.workspace));
+            input.set_agent_mentions(names.clone());
+            input.set_agent_names(names);
+        }
+        #[cfg(not(feature = "subagents"))]
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
         input.set_theme_names(ui.context.themes.keys().cloned().collect());
         if let Some(editor) = &ui.cfg.editor {
@@ -3951,10 +3960,10 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if key.code == KeyCode::Char('/') && self.input.buffer.is_empty() && !self.run.is_running {
+        if key.code == KeyCode::Char('/') && self.input.cursor == 0 && !self.run.is_running {
             self.refresh_custom_commands();
         }
-        #[cfg(feature = "mcp")]
+        #[cfg(any(feature = "mcp", feature = "subagents"))]
         if key.code == KeyCode::Char('@') && !self.run.is_running {
             self.refresh_custom_commands();
         }
@@ -6388,6 +6397,13 @@ impl<'a> App<'a> {
             self.input.set_mcp_resources(resources);
             commands
         };
+        #[cfg(feature = "subagents")]
+        {
+            let names =
+                crate::context::agents::available_names_for_workspace(Some(&self.ui.workspace));
+            self.input.set_agent_mentions(names.clone());
+            self.input.set_agent_names(names);
+        }
         self.input.set_custom_commands(commands);
     }
 

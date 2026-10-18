@@ -1182,6 +1182,21 @@ pub(crate) fn available_names_for_workspace(
     names
 }
 
+/// [`available_names_for_workspace`] against explicit application paths, so
+/// tests can change project trust without touching the process paths.
+#[cfg(test)]
+pub(crate) fn available_names_for_paths_and_workspace(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Vec<String> {
+    let mut names: Vec<_> = load_for_paths_and_workspace(paths, workspace)
+        .keys()
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 #[cfg(feature = "subagents")]
 pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
