@@ -536,6 +536,11 @@ pub(crate) struct AgentRunState {
     /// When streamed tokens last repainted the chat (repaint throttling).
     pub last_stream_paint: Option<std::time::Instant>,
     pub pending_turn: Option<PendingMainTurn>,
+    /// Non-persisted host directive for the next user-submitted main turn
+    /// (see `PromptInput::with_turn_directive`). `App::start_main_run_prepared`
+    /// always `take()`s it, so it applies to exactly one start attempt and
+    /// never leaks into a later turn, the transcript or any hook payload.
+    pub(crate) next_turn_directive: Option<String>,
     /// Clarification identity of the logical main user turn. Automatic
     /// phases, retries and context relief preserve this exact slot.
     pub question_turn: Option<crate::question::QuestionTurn>,

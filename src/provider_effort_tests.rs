@@ -838,6 +838,104 @@ async fn hooks60_actual_paused_gate_keeps_media_and_canonical_notice_before_star
     assert_eq!(parts[1]["type"], "image");
 }
 
+/// mini-agent-5eoy7.3: the Anthropic wire carries the host directive as the
+/// last block of the current user turn, while UserPromptSubmit sees only the
+/// literal text and the turn's committed interactions omit the prompt.
+#[cfg(all(feature = "hooks", unix))]
+#[tokio::test]
+async fn turn_directive53_anthropic_wire_last_user_block_and_literal_hook_payload() {
+    let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("turn-directive53");
+    hooks60_install_context_dispatcher(
+        root.path(),
+        Some(
+            "payload=$(cat); case \"$payload\" in *ROUTE_MARK53*) printf '%s' '{\"additionalContext\":\"HOOK_SAW_DIRECTIVE53\"}';; *LITERAL_MARK53*) printf '%s' '{\"additionalContext\":\"HOOK_SAW_LITERAL53\"}';; esac"
+                .into(),
+        ),
+    );
+    let wire = Wire::new(vec![(true, start() + &text(0, "routed") + &finish())]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(
+        rig::agent::AgentBuilder::new(model)
+            .preamble("Stable root policy")
+            .max_tokens(100)
+            .build(),
+    ));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let prompt = crate::agent::input::PromptInput::text("LITERAL_MARK53 question".into())
+        .with_turn_directive(Some("ROUTE_MARK53 persona reviewer".into()));
+    let mut paused = crate::startup::heap_future(|| {
+        agent.spawn_runner_paused_input_in_scope(
+            prompt,
+            Vec::<Message>::new(),
+            RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            None,
+            scope.clone(),
+        )
+    })
+    .await;
+    let notices = paused.take_hook_context();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("HOOK_SAW_LITERAL53"), "{notices:?}");
+    let mut runner = paused.start_interactive();
+    let interactions = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { interactions, .. } => return interactions,
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => {
+                    runner
+                        .compaction_decision_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        panic!("runner closed without Done");
+    })
+    .await
+    .expect("actual paused runner did not retire");
+    cleanup.settle().await;
+    assert!(
+        !serde_json::to_string(&interactions)
+            .unwrap()
+            .contains("ROUTE_MARK53")
+    );
+    let requests = wire.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0]["system"].to_string().contains("ROUTE_MARK53"));
+    let messages = requests[0]["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last["role"], "user");
+    let parts = last["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["text"], "LITERAL_MARK53 question");
+    let directive = parts[1]["text"].as_str().unwrap();
+    assert!(directive.starts_with(crate::agent::input::TURN_DIRECTIVE_LABEL));
+    assert!(directive.ends_with("ROUTE_MARK53 persona reviewer"));
+    // Persisting the turn uses only the literal projection.
+    let mut session = crate::session::Session::new("directive53", "fixture", 32_000, "");
+    session.add_message(crate::session::MessageRole::User, "LITERAL_MARK53 question");
+    assert!(
+        !serde_json::to_string(&crate::agent::runner::convert_history(&session))
+            .unwrap()
+            .contains("ROUTE_MARK53")
+    );
+}
+
 #[cfg(all(feature = "hooks", unix))]
 #[tokio::test]
 async fn hooks60_actual_headless_gate_commits_system_notices_and_native_feed() {

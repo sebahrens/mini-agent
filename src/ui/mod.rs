@@ -1196,6 +1196,35 @@ pub(crate) async fn start_main_run(
     slash: &SlashState,
     prebuild: &mut Option<prebuild::AgentPrebuild>,
 ) -> anyhow::Result<()> {
+    start_main_run_with_directive(
+        text,
+        None,
+        record_chat_history,
+        question_origin,
+        run,
+        ui,
+        slash,
+        prebuild,
+    )
+    .await
+}
+
+/// [`start_main_run`] with an optional non-persisted host directive for this
+/// request only. `text` alone is captured by `PendingMainTurn`, saved as the
+/// user message and passed to the UserPromptSubmit hook; the directive is
+/// attached only to the runner's `PromptInput` (see
+/// `PromptInput::with_turn_directive`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_main_run_with_directive(
+    text: &str,
+    turn_directive: Option<String>,
+    record_chat_history: bool,
+    question_origin: crate::question::QuestionOrigin,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    slash: &SlashState,
+    prebuild: &mut Option<prebuild::AgentPrebuild>,
+) -> anyhow::Result<()> {
     #[cfg(feature = "multimodal")]
     let user = clipboard_image::user_message(&ui.session.pending_media, text)?;
     anyhow::ensure!(
@@ -1375,7 +1404,11 @@ pub(crate) async fn start_main_run(
         let scope = owner.scope.clone();
         let paused = crate::startup::heap_future(|| {
             agent.spawn_runner_paused_input_in_scope(
-                pending_turn.as_ref().unwrap().input(),
+                pending_turn
+                    .as_ref()
+                    .unwrap()
+                    .input()
+                    .with_turn_directive(turn_directive),
                 history,
                 ui.cfg.retry.clone(),
                 #[cfg(feature = "hooks")]
@@ -1405,7 +1438,11 @@ pub(crate) async fn start_main_run(
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
                 .with_question_turn(question_turn)
                 .spawn_runner_paused_input(
-                    pending_turn.as_ref().unwrap().input(),
+                    pending_turn
+                        .as_ref()
+                        .unwrap()
+                        .input()
+                        .with_turn_directive(turn_directive),
                     history,
                     ui.cfg.retry.clone(),
                     #[cfg(feature = "hooks")]
