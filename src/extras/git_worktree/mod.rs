@@ -550,9 +550,15 @@ async fn create_with_limits(
         _repository_guard: guard,
     };
     let (response_tx, response_rx) = oneshot::channel();
-    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
-        supervise_create(state, ref_limits, add_limits, response_tx).await;
-    }));
+    // Box the supervisor before it moves through the scope wrappers and
+    // `tokio::spawn`: each by-value move of the unboxed future reserves its
+    // full size on the caller's stack (the `/worktree` slash path runs within
+    // the 1 MiB-stack budget).
+    std::mem::drop(crate::agent::runner::spawn_async_scoped(
+        crate::startup::heap_future(move || {
+            supervise_create(state, ref_limits, add_limits, response_tx)
+        }),
+    ));
     response_rx.await.unwrap_or_else(|_| {
         Err("worktree-create supervisor stopped before returning a result".into())
     })
