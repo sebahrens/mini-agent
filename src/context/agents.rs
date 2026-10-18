@@ -107,7 +107,7 @@ struct AgentMetadata {
 
 type NormalizedAgentDefinition = (String, String, AgentMetadata);
 
-fn valid_agent_name(name: &str) -> bool {
+pub(crate) fn valid_agent_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && !name.starts_with('-')
         && !name.ends_with('-')

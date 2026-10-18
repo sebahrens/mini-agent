@@ -10,6 +10,8 @@ use crate::session::storage;
 pub mod agents;
 pub(crate) mod commands;
 pub(crate) mod instructions;
+#[cfg(any(test, feature = "subagents"))]
+pub(crate) mod mentions;
 pub mod prompts;
 pub mod themes;
 
