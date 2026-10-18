@@ -12,6 +12,37 @@ Notable changes to mini-agent are documented in this file. The format follows
   automatically selects available installed servers without starting or installing
   them; explicit off and the lite archive feature recipe remain supported. `/toggle`
   lists their captured runtime availability.
+- `@agent:<name>` in a TUI message asks the model to delegate that request to the named
+  specialist persona through `task`. The `@` picker lists the trusted personas first, with each
+  persona's description dimmed after its name. Claude Code's `@agent-<name>` form is rewritten to
+  the canonical token only when the name resolves; an unknown canonical name is refused with the
+  valid names listed and the draft restored. The routing note is a non-persisted addition to that
+  one request and names personas only: the saved transcript, rewind, compaction, titles and
+  `UserPromptSubmit` see the typed text. The one exception is an Anthropic native thinking-replay
+  chain, whose opaque replay frames keep the request as sent and are never shown in the
+  transcript or hook payloads. Headless `-p` and ACP prompts resolve mentions only with the opt-in
+  `headless_agent_mentions = true`; an unknown name then fails `-p` before any provider request
+  and an ACP prompt with `-32602`. The opt-in `agent_mention_tool_choice = "force"` also forces the
+  first model request of a TUI mention turn to call `task`, falling back to the routing note on
+  providers and Claude models that cannot carry a forced `tool_choice`.
+- `/cron <interval> <prompt>` repeats a plain prompt in the current session (`1m` to `24h`, at most
+  16 schedules, each removed after `cron_max_fires` fires, default 24), and `/cron <prompt>` arms a
+  self-paced schedule whose fired turns choose the next fire (60 s to 1 h) through a
+  `schedule_wakeup` tool offered only during those turns; a turn without the call stops the
+  schedule. `/cron list`, `stop <id>|all` and `run <id>` work while busy. A fire starts only when
+  the TUI is idle; deadlines missed while busy park one fire, with no catch-up. Payloads starting
+  with `!`, and slash commands other than `/goal status`, `/tasks`, `/jobs` and `/cost`, are
+  refused. A fired turn is echoed with a `⟳ cron` marker, reaches `UserPromptSubmit` hooks with
+  `"origin": "scheduled"` and is recorded as request kind `scheduled`; reaching the USD budget
+  suspends every schedule, and arming without `max_budget_usd` warns once. Schedules are saved
+  disarmed with the session and re-armed only by `/cron resume`. The statusline `cron` item shows
+  the armed count and the next fire, or a parked, waiting, running or suspended state. A `/loop`
+  whose first argument is an interval is refused with a `/cron` hint instead of starting a round.
+- `sandbox-home-mounts` exposes chosen HOME dot files and folders to contained commands (read-only,
+  or a writable directory with `:rw`), and `sandbox-home-masks` hides further HOME dot paths in
+  every profile in addition to the built-in masks. Entries are validated at startup and fail
+  closed; the Windows AppContainer backend refuses mounts and any mask an explicit root would
+  expose.
 
 ### Security
 
@@ -179,6 +210,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 ### Fixed
 
 - Four Unix-only Seatbelt/cache tests are correctly gated, restoring Windows test compilation.
+- The scheduled harness-evaluation and JS worker stdout jobs provision the guarded Git runtime
+  before Cargo again; since 2026-10-16 every nightly run had failed in the build script.
 - The embedded catalog includes current Claude 5.5 and GPT-6 models, and Anthropic defaults to
   Sonnet 5.5. Startup and `/provider` share default model selection.
 - Bounded read, shell, search and JavaScript results retain their own output limits in live and

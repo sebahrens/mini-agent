@@ -249,6 +249,31 @@ cached as authority.
 | Shell launches wrapped by their output worker on the blocking pool (validate, wrap, spawn order unchanged) | Phase 2 | mini-agent-cttyn.51 |
 | A startup worker probe still queued at exit is cancelled before it runs; a running native preflight is joined through its cleanup | Phase 6 (startup probe lifecycle) | mini-agent-cttyn.64 |
 
+## Delivered features: `@agent` mentions and `/cron` (2026-10-18)
+
+Epic `mini-agent-5eoy7` (label `feature-2026-10-18`) added `@agent:<name>` mentions and the
+`/cron` scheduler for Claude Code parity. Their behaviour is owned by the operator documentation
+in `../agent/` ([COMMANDS](../agent/COMMANDS.md#cron),
+[SUBAGENTS](../agent/SUBAGENTS.md#referencing-a-specialist-with-agent),
+[CONFIG](../agent/CONFIG.md), [TOOL_RUNTIME](../agent/TOOL_RUNTIME.md#turn-scoped-cron-tool));
+no normative spec in this corpus changes. The Phase 6 canonical checklist is untouched: a `/cron`
+payload is a plain prompt or exactly one of the read-only slash commands `/goal status`, `/tasks`,
+`/jobs` and `/cost`, never a `!` line or any other slash command, so a fire never runs a shell line
+or a command that starts a model run, edits the session or touches a running turn. A fired prompt runs as an ordinary turn
+under the session's existing permission mode and budget gate, and its permission prompts are never
+auto-approved. A mention's routing note carries persona names only (no persona body, data or
+authority); persona resolution uses the existing trust-gated loader, so an untrusted project's
+personas never resolve.
+
+| Change | Owning spec | Bead |
+|--------|-------------|------|
+| `@agent:<name>` parser with trust-gated resolution; `@` picker persona rows with dimmed descriptions | SUBAGENTS, COMMANDS | mini-agent-5eoy7.1, mini-agent-5eoy7.2, mini-agent-5eoy7.5 |
+| Non-persisted per-request `PromptInput.turn_directive`, excluded from the saved transcript, rewind, compaction, titles and hooks; an Anthropic native thinking-replay chain keeps it in its opaque replay frames only | TOOL_RUNTIME | mini-agent-5eoy7.3, mini-agent-5eoy7.4 |
+| Opt-in `headless_agent_mentions` for `-p` and ACP, and opt-in `agent_mention_tool_choice = "force"` with provider fallbacks to the hint | SUBAGENTS, CONFIG | mini-agent-5eoy7.5 |
+| `/cron` store, verbs and payload refusals; idle-only fire path with one parked fire, budget suspension and the `scheduled` origin and request kind; statusline item | COMMANDS, CONFIG, COST_TRACKING | mini-agent-5eoy7.6, mini-agent-5eoy7.7, mini-agent-5eoy7.8 |
+| Schedules saved disarmed with the session and `/cron resume`; self-paced `/cron <prompt>` through the turn-scoped `schedule_wakeup` tool; read-only slash allowlist | COMMANDS, TOOL_RUNTIME | mini-agent-5eoy7.9 |
+| `sandbox-home-mounts` and `sandbox-home-masks` for general contained commands; the JS worker launcher is unchanged | Phase 2, CONFIG | mini-agent-24w5s |
+
 ## Delivered startup follow-up (2026-09-09)
 
 `mini-agent-jnuz` originally overlapped contained macOS worker startup with the sealed-image

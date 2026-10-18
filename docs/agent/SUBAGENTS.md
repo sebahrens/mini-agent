@@ -254,7 +254,8 @@ responds (an accepted turn, a tool call or a rejected call), so the request
 carrying the `task` result and every later step or continuation in the same
 turn use the baseline `auto` choice and the model can answer. A retried first
 attempt that produced no model output stays forced. Non-mention turns are never
-forced.
+forced. Forcing is armed only by the TUI submit path: headless `-p` and ACP
+mention turns carry the routing note alone.
 
 Forcing falls back to the hint silently (debug log, never an error) when the
 request path cannot carry it: Copilot and Ollama (rig sends or honours no
