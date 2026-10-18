@@ -150,7 +150,6 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_agent_turns").shaped(ConfigShape::Integer),
     key("cron_max_fires")
         .described("Fires each /cron entry may start before it is removed (default 24)")
-        .live()
         .shaped(ConfigShape::Integer),
     key("verify_command").described("Trusted operator command run before a tool-using turn may complete. Project-local values require the existing sensitive-config approval.").shaped(ConfigShape::String),
     key("format")
