@@ -57,6 +57,8 @@ struct GeneralRoots {
     base: PathBuf,
     reads: Vec<Arc<crate::paths::WorkspaceBinding>>,
     writes: Vec<Arc<crate::paths::WorkspaceBinding>>,
+    /// Read-only regular files from `sandbox-home-mounts`.
+    files: Vec<Arc<general_profile::HomeFile>>,
     /// Seatbelt grants derived only from these validated roots and the
     /// escaped (workspace, cache) literals.
     seatbelt: Mutex<HashMap<(String, String), Arc<SeatbeltRootInputs>>>,
@@ -67,6 +69,9 @@ impl GeneralRoots {
         for root in self.reads.iter().chain(self.writes.iter()) {
             root.validate()
                 .map_err(|_| "sandbox profile: an explicit root is unavailable or changed")?;
+        }
+        for file in &self.files {
+            file.validate()?;
         }
         Ok(())
     }
@@ -269,6 +274,11 @@ pub struct Sandbox {
     profile: SandboxProfile,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
+    home_mounts: Vec<String>,
+    /// Raw HOME-relative `sandbox-home-masks` entries, added to the built-in
+    /// private masks and validated at capture.
+    home_masks: Vec<String>,
     shell: String,
     shell_command_arg: String,
     /// Resolved executable retained across workspace probes so a failed bound
@@ -1897,10 +1907,12 @@ impl Sandbox {
             }
             cache.swap_remove(index);
         }
+        let captured = general_profile::capture_roots(self, base)?;
         let roots = Arc::new(GeneralRoots {
             base: base.to_path_buf(),
-            reads: general_profile::roots(&self.read_roots, base)?,
-            writes: general_profile::roots(&self.write_roots, base)?,
+            reads: captured.reads,
+            writes: captured.writes,
+            files: captured.files,
             seatbelt: Mutex::new(HashMap::new()),
         });
         if cache.len() < MAX_CACHED_GENERAL_ROOT_BASES {
@@ -1917,7 +1929,7 @@ impl Sandbox {
         if let Some(inputs) = cached.as_ref() {
             return Ok(inputs.clone());
         }
-        let private_paths = general_profile::private_paths()?;
+        let private_paths = general_profile::configured_private_paths(&self.home_masks)?;
         let private_refs = private_paths
             .iter()
             .map(|path| (path.as_path(), "private/secret directory"))
@@ -1992,6 +2004,82 @@ impl Sandbox {
         self
     }
 
+    /// HOME-relative `sandbox-home-mounts` (read-only, or writable with a
+    /// `:rw` suffix) and `sandbox-home-masks` (added to the built-in private
+    /// masks). Entries are validated, fail closed, when roots are captured.
+    pub fn with_home_paths(mut self, mounts: Vec<String>, masks: Vec<String>) -> Self {
+        self.home_mounts = mounts;
+        self.home_masks = masks;
+        self.cached_general_roots = Arc::new(Mutex::new(Vec::new()));
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(HashMap::new()));
+        self.cached_seatbelt_private = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Whether no explicit filesystem grant beyond the workspace is configured.
+    fn no_explicit_roots(&self) -> bool {
+        self.read_roots.is_empty() && self.write_roots.is_empty() && self.home_mounts.is_empty()
+    }
+
+    /// AppContainer exposes only its explicit roots, so a configured home
+    /// mask is honoured exactly when no explicit root equals, contains or
+    /// lies inside it. Otherwise the mask cannot be enforced and the profile
+    /// is refused rather than silently widened.
+    fn appcontainer_honours_home_masks(&self) -> bool {
+        if self.home_masks.is_empty() {
+            return true;
+        }
+        let Some(home) = crate::paths::process_home_dir() else {
+            return false;
+        };
+        let mut masks = Vec::new();
+        for raw in &self.home_masks {
+            let Ok((relative, _)) =
+                general_profile::parse_home_entry(raw, "sandbox-home-masks", false)
+            else {
+                return false;
+            };
+            masks.push(home.join(relative));
+        }
+        let base = self
+            .working_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let spellings = |path: &Path| {
+            let absolute = match (&base, path.is_absolute()) {
+                (Some(base), false) => base.join(path),
+                _ => path.to_path_buf(),
+            };
+            let canonical = absolute.canonicalize().ok();
+            std::iter::once(absolute)
+                .chain(canonical)
+                .map(|path| {
+                    if cfg!(windows) {
+                        PathBuf::from(path.to_string_lossy().to_lowercase())
+                    } else {
+                        path
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let masks = masks
+            .iter()
+            .flat_map(|mask| spellings(mask))
+            .collect::<Vec<_>>();
+        !self
+            .read_roots
+            .iter()
+            .chain(&self.write_roots)
+            .chain(&self.windows_appcontainer_read_roots)
+            .chain(&self.windows_appcontainer_write_roots)
+            .flat_map(|root| spellings(root))
+            .any(|root| {
+                masks
+                    .iter()
+                    .any(|mask| general_profile::overlaps(&root, mask))
+            })
+    }
+
     pub fn profile(&self) -> SandboxProfile {
         self.profile
     }
@@ -2035,11 +2123,15 @@ impl Sandbox {
     }
 
     fn profile_supported(&self) -> bool {
-        (self.profile == SandboxProfile::Workspace
-            && self.read_roots.is_empty()
-            && self.write_roots.is_empty())
+        if self.backend == "appcontainer" {
+            // AppContainer has no HOME-relative mount mechanism beyond its
+            // explicit root keys: home mounts are refused, never widened.
+            return self.profile == SandboxProfile::Workspace
+                && self.home_mounts.is_empty()
+                && self.appcontainer_honours_home_masks();
+        }
+        (self.profile == SandboxProfile::Workspace && self.no_explicit_roots())
             || matches!(self.backend.as_str(), "bwrap" | "seatbelt")
-            || (self.backend == "appcontainer" && self.profile == SandboxProfile::Workspace)
     }
 
     fn expanded_filesystem(
@@ -2047,10 +2139,7 @@ impl Sandbox {
         cwd: &Path,
         cache: &Path,
     ) -> Result<Option<general_profile::HostFilesystem>, String> {
-        if self.profile == SandboxProfile::Workspace
-            && self.read_roots.is_empty()
-            && self.write_roots.is_empty()
-        {
+        if self.profile == SandboxProfile::Workspace && self.no_explicit_roots() {
             return Ok(None);
         }
         if !matches!(self.backend.as_str(), "bwrap" | "seatbelt") {
@@ -2071,6 +2160,8 @@ impl Sandbox {
             profile: SandboxProfile::Workspace,
             read_roots: Vec::new(),
             write_roots: Vec::new(),
+            home_mounts: Vec::new(),
+            home_masks: Vec::new(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
             shell_candidate: None,
@@ -2143,6 +2234,16 @@ impl Sandbox {
     /// Closed, operator-actionable reason this backend's preflight failed, when known.
     pub(crate) fn unavailable_diagnostic(&self) -> Option<&'static str> {
         if !self.profile_supported() {
+            if self.backend == "appcontainer" && !self.home_mounts.is_empty() {
+                return Some(
+                    "sandbox-home-mounts is unsupported by the Windows AppContainer backend; use windows-appcontainer-read-roots",
+                );
+            }
+            if self.backend == "appcontainer" && self.profile == SandboxProfile::Workspace {
+                return Some(
+                    "an AppContainer root exposes a sandbox-home-masks path (or a mask is invalid); AppContainer cannot hide a path inside a granted root",
+                );
+            }
             return Some(
                 "selected filesystem profile is unavailable on this backend; Windows uses explicit AppContainer root keys",
             );
@@ -2311,7 +2412,10 @@ impl Sandbox {
                     "host-readable files except private application/secret paths; fresh Linux proc/dev/tmp"
                 }
             };
-            if self.profile != SandboxProfile::Workspace || !self.write_roots.is_empty() {
+            if self.profile != SandboxProfile::Workspace
+                || !self.write_roots.is_empty()
+                || self.home_mounts.iter().any(|entry| entry.ends_with(":rw"))
+            {
                 matrix.filesystem_writes = if self.profile == SandboxProfile::HostFull {
                     "host writes except private application/secret paths, protected Git metadata/runtime and their namespace ancestors"
                 } else {
@@ -5641,6 +5745,12 @@ fn seatbelt_root_inputs(
             .iter()
             .chain(roots.writes.iter())
             .map(|root| (root.root(), "explicit filesystem root"))
+            .chain(
+                roots
+                    .files
+                    .iter()
+                    .map(|file| (file.root(), "home file mount")),
+            )
             .collect::<Vec<_>>(),
     )?;
     let extra_writes = seatbelt_private_read_denies(
@@ -5661,7 +5771,8 @@ fn seatbelt_root_inputs(
                     .reads
                     .iter()
                     .chain(roots.writes.iter())
-                    .map(|root| root.root().to_path_buf()),
+                    .map(|root| root.root().to_path_buf())
+                    .chain(roots.files.iter().map(|file| file.root().to_path_buf())),
             )
             .collect::<Vec<_>>(),
     )?;

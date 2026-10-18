@@ -385,6 +385,25 @@ pub struct Config {
         alias = "sandbox_write_roots"
     )]
     pub sandbox_write_roots: Vec<std::path::PathBuf>,
+    /// HOME-relative dot files/folders exposed to contained commands
+    /// (read-only, or writable with a `:rw` suffix). Sensitive in project
+    /// layers: adding mounts there requires project-config approval.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-home-mounts",
+        alias = "sandbox_home_mounts"
+    )]
+    pub sandbox_home_mounts: Vec<String>,
+    /// HOME-relative paths hidden in every profile, added to the built-in
+    /// private masks. Project layers may only add to this list.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-home-masks",
+        alias = "sandbox_home_masks"
+    )]
+    pub sandbox_home_masks: Vec<String>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

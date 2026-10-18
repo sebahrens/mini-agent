@@ -209,6 +209,12 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .shaped(ConfigShape::Enum(crate::sandbox::SandboxProfile::NAMES)),
     aliased("sandbox-read-roots", &["sandbox_read_roots"]).shaped(ConfigShape::Strings),
     aliased("sandbox-write-roots", &["sandbox_write_roots"]).shaped(ConfigShape::Strings),
+    aliased("sandbox-home-mounts", &["sandbox_home_mounts"])
+        .described("HOME-relative dot paths exposed to contained commands; `:rw` suffix for writable directories")
+        .shaped(ConfigShape::Strings),
+    aliased("sandbox-home-masks", &["sandbox_home_masks"])
+        .described("HOME-relative dot paths hidden in every sandbox profile, added to the built-in masks")
+        .shaped(ConfigShape::Strings),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],

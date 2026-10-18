@@ -9,6 +9,8 @@ pub(super) struct HostFilesystem {
     masks: Vec<(PathBuf, bool)>,
     #[cfg(unix)]
     mounts: Vec<(Arc<crate::paths::WorkspaceBinding>, bool)>,
+    #[cfg(unix)]
+    files: Vec<Arc<HomeFile>>,
     protected: Vec<PathBuf>,
     scratch: PathBuf,
 }
@@ -41,11 +43,263 @@ pub(super) fn private_paths() -> Result<Vec<PathBuf>, String> {
     Ok(denied)
 }
 
+/// Explicit roots per direction, shared by `sandbox-read-roots`,
+/// `sandbox-write-roots` and `sandbox-home-mounts`.
+pub(super) const MAX_EXPLICIT_ROOTS: usize = 32;
+
+/// Parse one HOME-relative `sandbox-home-mounts` / `sandbox-home-masks`
+/// entry. Mount entries may carry a `:rw` suffix; nothing else is accepted.
+/// The entry must name a dot file or dot folder directly under HOME (or a
+/// path below one) using plain `/`-separated components.
+pub(crate) fn parse_home_entry(
+    raw: &str,
+    key: &'static str,
+    allow_writable: bool,
+) -> Result<(PathBuf, bool), String> {
+    let (body, writable) = match raw.strip_suffix(":rw") {
+        Some(body) if allow_writable => (body, true),
+        _ => (raw, false),
+    };
+    let invalid = |why: &str| Err(format!("{key}: entry `{}` {why}", raw.escape_debug()));
+    if body.is_empty() || body.len() > 1024 {
+        return invalid("is empty or too long");
+    }
+    if body
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\\' | ':'))
+    {
+        return invalid(if allow_writable {
+            "contains a control character, backslash or colon (only a trailing `:rw` is accepted)"
+        } else {
+            "contains a control character, backslash or colon"
+        });
+    }
+    if body.starts_with('/') || Path::new(body).is_absolute() {
+        return invalid("must be relative to HOME, not absolute");
+    }
+    let segments = body.split('/').collect::<Vec<_>>();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
+    {
+        return invalid("must not contain empty, `.` or `..` components");
+    }
+    if !segments[0].starts_with('.') {
+        return invalid("must start with a dot file or dot folder directly under HOME");
+    }
+    Ok((PathBuf::from(body), writable))
+}
+
+/// Built-in private paths plus the configured `sandbox-home-masks`. The
+/// configured entries can only add masks; the built-in list is fixed.
+pub(super) fn configured_private_paths(masks: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut denied = private_paths()?;
+    if masks.is_empty() {
+        return Ok(denied);
+    }
+    if masks.len() > MAX_EXPLICIT_ROOTS {
+        return Err(format!(
+            "sandbox-home-masks: at most {MAX_EXPLICIT_ROOTS} entries are supported"
+        ));
+    }
+    let home =
+        crate::paths::process_home_dir().ok_or("sandbox profile: home directory is unavailable")?;
+    for raw in masks {
+        let (relative, _) = parse_home_entry(raw, "sandbox-home-masks", false)?;
+        denied.push(home.join(relative));
+    }
+    denied.sort();
+    denied.dedup();
+    Ok(denied)
+}
+
+pub(super) fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+/// Canonical `sandbox-home-mounts` grants that the selected profile does not
+/// already provide: workspace receives read and `:rw` grants, host-read only
+/// `:rw` grants, host-full none (every entry is still validated).
+#[derive(Debug, Default)]
+pub(super) struct HomeGrants {
+    pub(super) dir_reads: Vec<PathBuf>,
+    pub(super) dir_writes: Vec<PathBuf>,
+    pub(super) file_reads: Vec<PathBuf>,
+}
+
+pub(super) fn home_grants(sandbox: &Sandbox, private: &[PathBuf]) -> Result<HomeGrants, String> {
+    let mut grants = HomeGrants::default();
+    if sandbox.home_mounts.is_empty() {
+        return Ok(grants);
+    }
+    if sandbox.home_mounts.len() > MAX_EXPLICIT_ROOTS {
+        return Err(format!(
+            "sandbox-home-mounts: at most {MAX_EXPLICIT_ROOTS} entries are supported"
+        ));
+    }
+    let home =
+        crate::paths::process_home_dir().ok_or("sandbox profile: home directory is unavailable")?;
+    let canonical_home = home
+        .canonicalize()
+        .map_err(|_| "sandbox-home-mounts: the home directory cannot be resolved")?;
+    let masked = private
+        .iter()
+        .flat_map(|path| std::iter::once(path.clone()).chain(seatbelt_resolved_spelling(path)))
+        .collect::<Vec<_>>();
+    for raw in &sandbox.home_mounts {
+        let (relative, writable) = parse_home_entry(raw, "sandbox-home-mounts", true)?;
+        let entry = raw.escape_debug().to_string();
+        let masked_error = || {
+            Err(format!(
+                "sandbox-home-mounts: entry `{entry}` names, contains or lies inside a masked private path; built-in and configured masks cannot be mounted"
+            ))
+        };
+        let spelled = home.join(&relative);
+        if masked.iter().any(|mask| overlaps(&spelled, mask)) {
+            return masked_error();
+        }
+        let canonical = match spelled.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(entry = %entry, "sandbox-home-mounts: skipping missing path");
+                continue;
+            }
+            Err(_) => {
+                return Err(format!(
+                    "sandbox-home-mounts: entry `{entry}` cannot be resolved"
+                ));
+            }
+        };
+        if !canonical.starts_with(&canonical_home) || canonical == canonical_home {
+            return Err(format!(
+                "sandbox-home-mounts: entry `{entry}` resolves outside HOME (symlink escape)"
+            ));
+        }
+        if masked.iter().any(|mask| overlaps(&canonical, mask)) {
+            return masked_error();
+        }
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|_| format!("sandbox-home-mounts: entry `{entry}` metadata is unavailable"))?;
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(format!(
+                "sandbox-home-mounts: entry `{entry}` must be a regular file or directory"
+            ));
+        }
+        if writable && !metadata.is_dir() {
+            // Writable roots are retained and reported to guarded Git as
+            // model-writable directories; a lone writable file (for example
+            // ~/.gitconfig) cannot be tracked that way.
+            return Err(format!(
+                "sandbox-home-mounts: `:rw` entry `{entry}` must be a directory"
+            ));
+        }
+        match (sandbox.profile, writable, metadata.is_dir()) {
+            (SandboxProfile::HostFull, _, _) | (SandboxProfile::HostRead, false, _) => {}
+            (_, true, _) => grants.dir_writes.push(canonical),
+            (_, false, true) => grants.dir_reads.push(canonical),
+            (_, false, false) => grants.file_reads.push(canonical),
+        }
+    }
+    Ok(grants)
+}
+
+/// A read-only regular-file grant from `sandbox-home-mounts`, retained by
+/// identity and re-validated before every launch like directory roots.
+pub(crate) struct HomeFile {
+    path: PathBuf,
+    checked: crate::fs::CheckedMetadata,
+}
+
+impl std::fmt::Debug for HomeFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HomeFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HomeFile {
+    fn capture(canonical: &Path) -> Result<Self, String> {
+        let checked = crate::fs::checked_path_metadata(canonical)
+            .map_err(|_| "sandbox profile: a home file mount is unavailable or changed")?;
+        if !checked.is_file() {
+            return Err("sandbox profile: a home file mount is no longer a regular file".into());
+        }
+        Ok(Self {
+            path: canonical.to_path_buf(),
+            checked,
+        })
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn validate(&self) -> Result<(), String> {
+        let changed = || "sandbox profile: a home file mount is unavailable or changed".to_string();
+        if std::fs::canonicalize(&self.path).map_err(|_| changed())? != self.path {
+            return Err(changed());
+        }
+        let current = crate::fs::checked_path_metadata(&self.path).map_err(|_| changed())?;
+        if !current.is_file() {
+            return Err(changed());
+        }
+        crate::fs::ensure_same_file(&self.path, &self.checked, &current).map_err(|_| changed())?;
+        let held =
+            crate::fs::checked_file_metadata(self.checked.handle()).map_err(|_| changed())?;
+        crate::fs::ensure_same_file(&self.path, &self.checked, &held).map_err(|_| changed())
+    }
+
+    #[cfg(unix)]
+    fn handle(&self) -> &std::fs::File {
+        self.checked.handle()
+    }
+}
+
+/// Explicit roots plus validated home mounts, resolved against `base`.
+pub(super) struct CapturedRoots {
+    pub(super) reads: Vec<Arc<crate::paths::WorkspaceBinding>>,
+    pub(super) writes: Vec<Arc<crate::paths::WorkspaceBinding>>,
+    pub(super) files: Vec<Arc<HomeFile>>,
+}
+
+pub(super) fn capture_roots(sandbox: &Sandbox, base: &Path) -> Result<CapturedRoots, String> {
+    if sandbox.home_mounts.is_empty() {
+        return Ok(CapturedRoots {
+            reads: roots(&sandbox.read_roots, base)?,
+            writes: roots(&sandbox.write_roots, base)?,
+            files: Vec::new(),
+        });
+    }
+    let private = configured_private_paths(&sandbox.home_masks)?;
+    let home = home_grants(sandbox, &private)?;
+    let mut reads = sandbox.read_roots.clone();
+    reads.extend(home.dir_reads);
+    let mut writes = sandbox.write_roots.clone();
+    writes.extend(home.dir_writes);
+    if reads.len() + home.file_reads.len() > MAX_EXPLICIT_ROOTS || writes.len() > MAX_EXPLICIT_ROOTS
+    {
+        return Err(format!(
+            "sandbox profile: at most {MAX_EXPLICIT_ROOTS} explicit roots are supported per direction, including sandbox-home-mounts"
+        ));
+    }
+    Ok(CapturedRoots {
+        reads: roots(&reads, base)?,
+        writes: roots(&writes, base)?,
+        files: home
+            .file_reads
+            .iter()
+            .map(|path| HomeFile::capture(path).map(Arc::new))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
 pub(super) fn roots(
     paths: &[PathBuf],
     cwd: &Path,
 ) -> Result<Vec<Arc<crate::paths::WorkspaceBinding>>, String> {
-    if paths.len() > 32 {
+    if paths.len() > MAX_EXPLICIT_ROOTS {
         return Err("sandbox profile: at most 32 explicit roots are supported".into());
     }
     paths
@@ -88,10 +342,15 @@ pub(super) fn protected_host_paths() -> Result<Vec<PathBuf>, String> {
 
 impl HostFilesystem {
     pub(super) fn capture(sandbox: &Sandbox, cwd: &Path, cache: &Path) -> Result<Self, String> {
-        let reads = roots(&sandbox.read_roots, cwd)?;
-        let writes = roots(&sandbox.write_roots, cwd)?;
+        let CapturedRoots {
+            reads,
+            writes,
+            files,
+        } = capture_roots(sandbox, cwd)?;
+        #[cfg(not(unix))]
+        drop(files);
         let mut masks = Vec::new();
-        for path in private_paths()? {
+        for path in configured_private_paths(&sandbox.home_masks)? {
             let canonical = match path.canonicalize() {
                 Ok(path) => path,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -233,6 +492,8 @@ impl HostFilesystem {
             masks: covered,
             #[cfg(unix)]
             mounts,
+            #[cfg(unix)]
+            files,
             protected,
             scratch: cache.to_path_buf(),
         })
@@ -264,6 +525,26 @@ impl HostFilesystem {
                 .arg(if *write { "--bind-fd" } else { "--ro-bind-fd" })
                 .arg(fd.to_string())
                 .arg(root.root());
+            retained.push(file);
+        }
+        // Home file mounts are leaves: bind them after every directory grant
+        // so no broader directory mount can cover them. Masks follow later.
+        for home_file in &self.files {
+            home_file.validate()?;
+            // SAFETY: as above, a new owned high CLOEXEC descriptor.
+            let fd =
+                unsafe { libc::fcntl(home_file.handle().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 512) };
+            if fd == -1 {
+                return Err(
+                    "sandbox profile unavailable: cannot retain home file descriptors".into(),
+                );
+            }
+            // SAFETY: fcntl returned one new descriptor owned by this File.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            command
+                .arg("--ro-bind-fd")
+                .arg(fd.to_string())
+                .arg(home_file.root());
             retained.push(file);
         }
         // SAFETY: the child closure performs only descriptor syscalls on
@@ -435,6 +716,359 @@ mod tests {
         fn sandbox(&self, profile: SandboxProfile) -> Sandbox {
             Sandbox::new(true, "bwrap").with_general_profile(profile, Vec::new(), Vec::new())
         }
+        fn home_sandbox(
+            &self,
+            profile: SandboxProfile,
+            mounts: &[&str],
+            masks: &[&str],
+        ) -> Sandbox {
+            self.sandbox(profile).with_home_paths(
+                mounts.iter().map(|entry| entry.to_string()).collect(),
+                masks.iter().map(|entry| entry.to_string()).collect(),
+            )
+        }
+    }
+
+    fn bwrap_args(sandbox: &Sandbox, cwd: &Path, cache: &Path) -> Vec<String> {
+        sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "inert",
+                cwd,
+                cache,
+                git_metadata::BwrapGitMetadataBinds::none(),
+            )
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn home24w5s_entry_syntax_is_relative_dot_paths_only() {
+        let parse = |raw| parse_home_entry(raw, "sandbox-home-mounts", true);
+        assert_eq!(
+            parse(".gitconfig").unwrap(),
+            (PathBuf::from(".gitconfig"), false)
+        );
+        assert_eq!(parse(".cargo:rw").unwrap(), (PathBuf::from(".cargo"), true));
+        assert_eq!(
+            parse(".config/git").unwrap(),
+            (PathBuf::from(".config/git"), false)
+        );
+        for invalid in [
+            "",
+            ":rw",
+            "/home/user/.gitconfig",
+            "gitconfig",
+            "projects/.env",
+            ".config/../.ssh",
+            "..",
+            ".",
+            "./.gitconfig",
+            ".config//git",
+            ".config/",
+            ".cargo:ro",
+            ".a\\b",
+            ".a\nb",
+        ] {
+            assert!(parse(invalid).is_err(), "`{invalid}` must be rejected");
+        }
+        // Masks have no writable form.
+        assert!(parse_home_entry(".netrc:rw", "sandbox-home-masks", false).is_err());
+        assert!(parse_home_entry(".netrc", "sandbox-home-masks", false).is_ok());
+    }
+
+    #[test]
+    fn home24w5s_mounts_validate_masks_escape_cap_and_missing_paths() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.home.join(".gitconfig"), b"[user]\n").unwrap();
+        std::fs::create_dir_all(fixture.home.join(".cargo")).unwrap();
+        std::fs::create_dir_all(fixture.home.join(".config/gh")).unwrap();
+        std::fs::create_dir_all(fixture.home.join(".vault")).unwrap();
+        let outside = fixture.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.home.join(".escape")).unwrap();
+        std::os::unix::fs::symlink(fixture.home.join(".ssh"), fixture.home.join(".alias")).unwrap();
+        std::fs::create_dir(fixture.home.join(".ssh")).unwrap();
+        let grants = |profile, mounts: &[&str], masks: &[&str]| {
+            let sandbox = fixture.home_sandbox(profile, mounts, masks);
+            let private = configured_private_paths(&sandbox.home_masks)?;
+            home_grants(&sandbox, &private)
+        };
+        let canonical_home = fixture.home.canonicalize().unwrap();
+        let ok = grants(
+            SandboxProfile::Workspace,
+            &[".gitconfig", ".cargo:rw", ".npmrc"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ok.file_reads, [canonical_home.join(".gitconfig")]);
+        assert_eq!(ok.dir_writes, [canonical_home.join(".cargo")]);
+        assert!(
+            ok.dir_reads.is_empty(),
+            "missing .npmrc is skipped, not created"
+        );
+        assert!(!fixture.home.join(".npmrc").exists());
+
+        for (mounts, masks, needle) in [
+            (&[".ssh"][..], &[][..], "masked"),
+            (&[".ssh/config"][..], &[][..], "masked"),
+            (&[".config/gh"][..], &[][..], "masked"),
+            (&[".config"][..], &[][..], "masked"),
+            (&[".vault"][..], &[".vault"][..], "masked"),
+            (&[".alias"][..], &[][..], "masked"),
+            (&[".escape"][..], &[][..], "outside HOME"),
+            (&[".gitconfig:rw"][..], &[][..], "must be a directory"),
+            (&["/etc/passwd"][..], &[][..], "absolute"),
+            (&[".config/../.ssh"][..], &[][..], "components"),
+            (&["Documents"][..], &[][..], "dot"),
+        ] {
+            let error = grants(SandboxProfile::Workspace, mounts, masks).unwrap_err();
+            assert!(error.contains(needle), "{mounts:?}: {error}");
+        }
+        let many = (0..33)
+            .map(|index| format!(".m{index}"))
+            .collect::<Vec<_>>();
+        let many = many.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(grants(SandboxProfile::Workspace, &many, &[]).is_err());
+        // Home mounts count toward the existing 32-root cap.
+        let explicit = (0..31)
+            .map(|index| {
+                let path = fixture.root.path().join(format!("root{index}"));
+                std::fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let capped = fixture
+            .sandbox(SandboxProfile::Workspace)
+            .with_general_profile(SandboxProfile::Workspace, explicit, Vec::new())
+            .with_home_paths(vec![".gitconfig".into(), ".cargo".into()], Vec::new());
+        assert!(
+            capture_roots(&capped, &fixture.cwd)
+                .err()
+                .unwrap()
+                .contains("32")
+        );
+        // Host profiles already read HOME; only writes are added by host-read.
+        let host_read =
+            grants(SandboxProfile::HostRead, &[".gitconfig", ".cargo:rw"], &[]).unwrap();
+        assert!(host_read.file_reads.is_empty() && host_read.dir_reads.is_empty());
+        assert_eq!(host_read.dir_writes, [canonical_home.join(".cargo")]);
+        let host_full =
+            grants(SandboxProfile::HostFull, &[".gitconfig", ".cargo:rw"], &[]).unwrap();
+        assert!(host_full.dir_writes.is_empty() && host_full.file_reads.is_empty());
+        assert!(grants(SandboxProfile::HostFull, &[".ssh"], &[]).is_err());
+    }
+
+    #[test]
+    fn home24w5s_bwrap_workspace_mounts_only_configured_home_entries() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.home.join(".gitconfig"), b"[user]\n").unwrap();
+        std::fs::write(fixture.home.join(".npmrc"), b"token\n").unwrap();
+        std::fs::create_dir_all(fixture.home.join(".cargo")).unwrap();
+        let canonical_home = fixture.home.canonicalize().unwrap();
+        let sandbox =
+            fixture.home_sandbox(SandboxProfile::Workspace, &[".gitconfig", ".cargo:rw"], &[]);
+        assert!(sandbox.profile_supported());
+        let args = bwrap_args(&sandbox, &fixture.cwd, &fixture.cache);
+        let bound = |flag: &str, path: &Path| {
+            args.windows(3)
+                .any(|values| values[0] == flag && Path::new(&values[2]) == path)
+        };
+        assert!(bound("--ro-bind-fd", &canonical_home.join(".gitconfig")));
+        assert!(bound("--bind-fd", &canonical_home.join(".cargo")));
+        assert!(
+            !args.iter().any(|value| value.contains(".npmrc")),
+            "an unconfigured dotfile is never mounted"
+        );
+        // The file grant follows every directory grant.
+        let file = args
+            .windows(3)
+            .position(|values| Path::new(&values[2]) == canonical_home.join(".gitconfig"))
+            .unwrap();
+        let cargo = args
+            .windows(3)
+            .position(|values| Path::new(&values[2]) == canonical_home.join(".cargo"))
+            .unwrap();
+        assert!(file > cargo);
+        // No home configuration keeps the workspace profile's empty root.
+        let plain = bwrap_args(
+            &fixture.sandbox(SandboxProfile::Workspace),
+            &fixture.cwd,
+            &fixture.cache,
+        );
+        assert!(!plain.iter().any(|value| value.contains(".gitconfig")));
+    }
+
+    #[test]
+    fn home24w5s_extra_masks_hide_paths_in_host_read() {
+        let fixture = Fixture::new();
+        let vault = fixture.home.join(".vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(fixture.home.join(".netrc"), b"machine x").unwrap();
+        let sandbox = fixture.home_sandbox(SandboxProfile::HostRead, &[], &[".vault", ".netrc"]);
+        let plan = HostFilesystem::capture(&sandbox, &fixture.cwd, &fixture.cache).unwrap();
+        assert!(plan.masks.iter().any(|(path, dir)| *path == vault && *dir));
+        assert!(
+            plan.masks
+                .iter()
+                .any(|(path, dir)| *path == fixture.home.join(".netrc") && !*dir)
+        );
+        let args = bwrap_args(&sandbox, &fixture.cwd, &fixture.cache);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--tmpfs" && Path::new(&pair[1]) == vault)
+        );
+        // Built-in masks remain regardless of the configured list.
+        let ssh = fixture.home.join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let plan = HostFilesystem::capture(&sandbox, &fixture.cwd, &fixture.cache).unwrap();
+        assert!(plan.masks.iter().any(|(path, _)| *path == ssh));
+        assert!(
+            fixture
+                .home_sandbox(SandboxProfile::HostRead, &[], &["/abs"])
+                .expanded_filesystem(&fixture.cwd, &fixture.cache)
+                .is_err(),
+            "an invalid mask fails closed at capture"
+        );
+    }
+
+    #[test]
+    fn home24w5s_seatbelt_profile_reads_mounts_and_denies_extra_masks() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.home.join(".gitconfig"), b"[user]\n").unwrap();
+        std::fs::create_dir(fixture.home.join(".vault")).unwrap();
+        let canonical_home = fixture.home.canonicalize().unwrap();
+        let literal = |path: &Path| super::super::seatbelt_string_literal(path, "test").unwrap();
+        let sandbox = Sandbox::new(true, "seatbelt").with_home_paths(
+            vec![".gitconfig".into(), ".cargo:rw".into()],
+            vec![".vault".into()],
+        );
+        let profile = sandbox
+            .get_seatbelt_profile(&fixture.cwd, &fixture.cache, true)
+            .unwrap();
+        assert!(profile.contains(&format!(
+            "(subpath \"{}\")",
+            literal(&canonical_home.join(".gitconfig"))
+        )));
+        assert!(profile.contains(&format!(
+            "(subpath \"{}\")",
+            literal(&canonical_home.join(".vault"))
+        )));
+        assert!(!profile.contains(".npmrc"));
+        let plain = Sandbox::new(true, "seatbelt")
+            .get_seatbelt_profile(&fixture.cwd, &fixture.cache, true)
+            .unwrap();
+        assert!(!plain.contains(".gitconfig") && !plain.contains(".vault"));
+    }
+
+    #[test]
+    fn home24w5s_appcontainer_refuses_mounts_and_unenforceable_masks() {
+        let fixture = Fixture::new();
+        let appcontainer = || Sandbox::new(true, "appcontainer");
+        assert!(appcontainer().profile_supported());
+        assert!(
+            !appcontainer()
+                .with_home_paths(vec![".gitconfig".into()], Vec::new())
+                .profile_supported()
+        );
+        let masked = appcontainer().with_home_paths(Vec::new(), vec![".vault".into()]);
+        assert!(masked.profile_supported(), "nothing from HOME is granted");
+        let widened = masked
+            .clone()
+            .with_windows_appcontainer_roots(vec![fixture.home.clone()], Vec::new());
+        assert!(!widened.profile_supported());
+        assert!(
+            widened
+                .unavailable_diagnostic()
+                .unwrap()
+                .contains("sandbox-home-masks")
+        );
+        let inside = masked
+            .with_windows_appcontainer_roots(vec![fixture.home.join(".vault/sub")], Vec::new());
+        assert!(!inside.profile_supported());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "requires the actual ordinary-command OS sandbox"]
+    async fn home24w5s_native_home_mounts_and_masks_are_enforced() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.home.join(".gitconfig"), b"configured").unwrap();
+        std::fs::write(fixture.home.join(".npmrc"), b"unconfigured").unwrap();
+        std::fs::create_dir(fixture.home.join(".cargo")).unwrap();
+        std::fs::create_dir(fixture.home.join(".vault")).unwrap();
+        std::fs::write(fixture.home.join(".vault/secret"), b"hidden").unwrap();
+        std::fs::write(fixture.home.join(".bashrc"), b"ordinary").unwrap();
+        let backend = if cfg!(target_os = "linux") {
+            "bwrap"
+        } else {
+            "seatbelt"
+        };
+        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        let home = fixture.home.canonicalize().unwrap();
+        let run = |profile: SandboxProfile, script: String| {
+            let sandbox = Sandbox::new(true, backend)
+                .with_workspace_binding(Arc::new(
+                    crate::paths::WorkspaceBinding::capture(&fixture.cwd).unwrap(),
+                ))
+                .with_general_profile(profile, Vec::new(), Vec::new())
+                .with_home_paths(
+                    vec![".gitconfig".into(), ".cargo:rw".into()],
+                    vec![".vault".into()],
+                );
+            assert_eq!(sandbox.policy(), SandboxPolicy::RequiredAndAvailable);
+            let command = sandbox.wrap_command(&script).unwrap();
+            async move {
+                Sandbox::new(false, "none")
+                    .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+                    .await
+                    .unwrap()
+            }
+        };
+        let workspace = format!(
+            "set -e; test \"$(cat {git})\" = configured; if cat {npm} >/dev/null 2>&1; then exit 13; fi; printf cargo > {cargo}/written; if printf x > {git} 2>/dev/null; then exit 14; fi; if cat {secret} >/dev/null 2>&1; then exit 15; fi; printf HOME24W5S_WORKSPACE",
+            git = quote(&home.join(".gitconfig")),
+            npm = quote(&home.join(".npmrc")),
+            cargo = quote(&home.join(".cargo")),
+            secret = quote(&home.join(".vault/secret")),
+        );
+        let output = run(SandboxProfile::Workspace, workspace).await;
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "workspace: exit={:?}: {}",
+            output.exit_status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"HOME24W5S_WORKSPACE");
+        assert_eq!(
+            std::fs::read(fixture.home.join(".cargo/written")).unwrap(),
+            b"cargo"
+        );
+        assert_eq!(
+            std::fs::read(fixture.home.join(".gitconfig")).unwrap(),
+            b"configured"
+        );
+        let host_read = format!(
+            "set -e; test \"$(cat {bashrc})\" = ordinary; if cat {secret} >/dev/null 2>&1; then exit 13; fi; printf again > {cargo}/host-read; printf HOME24W5S_HOST_READ",
+            bashrc = quote(&home.join(".bashrc")),
+            secret = quote(&home.join(".vault/secret")),
+            cargo = quote(&home.join(".cargo")),
+        );
+        let output = run(SandboxProfile::HostRead, host_read).await;
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "host-read: exit={:?}: {}",
+            output.exit_status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"HOME24W5S_HOST_READ");
+        assert_eq!(
+            std::fs::read(fixture.home.join(".vault/secret")).unwrap(),
+            b"hidden"
+        );
     }
 
     #[test]

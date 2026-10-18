@@ -1375,7 +1375,8 @@ impl Cli {
                 || self.sandbox_profile.is_some()
                 || cfg.sandbox_profile.is_some()
                 || !cfg.sandbox_read_roots.is_empty()
-                || !cfg.sandbox_write_roots.is_empty())
+                || !cfg.sandbox_write_roots.is_empty()
+                || !cfg.sandbox_home_mounts.is_empty())
     }
 
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
