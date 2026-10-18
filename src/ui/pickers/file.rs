@@ -57,15 +57,35 @@ pub(crate) struct CacheEntry {
     path: PathBuf,
     lower: String,
     is_dir: bool,
+    kind: EntryKind,
+}
+
+/// Where a cache entry came from. Virtual entries are completion strings
+/// (they keep their own `@` marker) and never depend on the walk root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    /// A walked filesystem path.
+    Path,
+    /// An opaque operand such as `@mcp:<server>:<uri>`, inserted verbatim.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    Opaque,
+    /// A mention such as `@agent:<name>`, inserted with a trailing space.
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
+    Mention,
 }
 
 impl CacheEntry {
     fn new(path: PathBuf, is_dir: bool) -> Self {
+        Self::with_kind(path, is_dir, EntryKind::Path)
+    }
+
+    fn with_kind(path: PathBuf, is_dir: bool, kind: EntryKind) -> Self {
         let lower = path.to_string_lossy().to_lowercase();
         CacheEntry {
             path,
             lower,
             is_dir,
+            kind,
         }
     }
 }
@@ -96,9 +116,14 @@ pub struct FilePicker {
     pub matches: Vec<PathBuf>,
     /// Whether each entry of `matches` is a directory (drawn with a `/`).
     match_dirs: Vec<bool>,
+    /// The [`EntryKind`] of each entry of `matches`.
+    match_kinds: Vec<EntryKind>,
     pub selected: usize,
     pub(crate) argument_start: Option<usize>,
     file_cache: Vec<CacheEntry>,
+    /// Number of virtual entries at the front of `file_cache`. They precede
+    /// every walked path, so they fill the first window for a short query.
+    virtual_len: usize,
     /// Lowercase query the current `matches` were computed for.
     query_lower: String,
     monochrome: bool,
@@ -116,9 +141,11 @@ impl FilePicker {
             cursor: 0,
             matches: Vec::new(),
             match_dirs: Vec::new(),
+            match_kinds: Vec::new(),
             selected: 0,
             argument_start: None,
             file_cache: Vec::new(),
+            virtual_len: 0,
             query_lower: String::new(),
             monochrome: false,
             loading: false,
@@ -142,9 +169,31 @@ impl FilePicker {
     /// Opaque MCP operands are completion strings, never filesystem walk roots.
     #[cfg(feature = "mcp")]
     pub(crate) fn append_virtual_items(&mut self, items: impl Iterator<Item = PathBuf>) {
-        self.file_cache
-            .extend(items.map(|path| CacheEntry::new(path, false)));
+        self.insert_virtual(items, EntryKind::Opaque);
+    }
+
+    /// `@agent:<name>` mention rows, inserted with a trailing space.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn append_virtual_mentions(&mut self, items: impl Iterator<Item = PathBuf>) {
+        self.insert_virtual(items, EntryKind::Mention);
+    }
+
+    /// Insert virtual rows after earlier virtual rows and before every walked
+    /// path (a synchronous walk may already have filled the cache).
+    #[cfg(any(feature = "mcp", feature = "subagents"))]
+    fn insert_virtual(&mut self, items: impl Iterator<Item = PathBuf>, kind: EntryKind) {
+        let at = self.virtual_len;
+        let entries: Vec<_> = items
+            .map(|path| CacheEntry::with_kind(path, false, kind))
+            .collect();
+        self.virtual_len += entries.len();
+        self.file_cache.splice(at..at, entries);
         self.filter();
+    }
+
+    /// Whether the highlighted row is a mention that completes with a space.
+    pub(crate) fn selected_is_mention(&self) -> bool {
+        self.match_kinds.get(self.selected) == Some(&EntryKind::Mention)
     }
 
     pub fn activate(&mut self) {
@@ -174,8 +223,10 @@ impl FilePicker {
         self.cursor = 0;
         self.matches.clear();
         self.match_dirs.clear();
+        self.match_kinds.clear();
         self.selected = 0;
         self.file_cache.clear();
+        self.virtual_len = 0;
         self.loading = false;
         self.walk_workspace = workspace.clone();
         if require_binding
@@ -219,7 +270,8 @@ impl FilePicker {
                 true
             });
             if workspace.validate().is_ok() {
-                self.file_cache = files;
+                self.file_cache.truncate(self.virtual_len);
+                self.file_cache.extend(files);
             }
         } else {
             walk_entries_streaming(Path::new("."), &AtomicBool::new(false), |batch| {
@@ -257,8 +309,10 @@ impl FilePicker {
                 || !self.file_cache.is_empty()
                 || !self.matches.is_empty();
             self.file_cache.clear();
+            self.virtual_len = 0;
             self.matches.clear();
             self.match_dirs.clear();
+            self.match_kinds.clear();
             self.deactivate();
             return changed;
         }
@@ -327,6 +381,7 @@ impl FilePicker {
         self.query_lower = self.query.to_lowercase();
         self.matches.clear();
         self.match_dirs.clear();
+        self.match_kinds.clear();
         self.selected = 0;
         #[cfg(test)]
         count_filter(0, true);
@@ -347,6 +402,7 @@ impl FilePicker {
             if entry.lower.contains(query) {
                 self.matches.push(entry.path.clone());
                 self.match_dirs.push(entry.is_dir);
+                self.match_kinds.push(entry.kind);
                 if self.matches.len() >= MAX_MATCHES {
                     break;
                 }
@@ -371,6 +427,15 @@ impl FilePicker {
     }
 
     pub fn selected_path(&self) -> Option<&PathBuf> {
+        // Virtual rows are completion strings, not paths under the walk root,
+        // so a stale workspace never hides them.
+        if self
+            .match_kinds
+            .get(self.selected)
+            .is_some_and(|kind| *kind != EntryKind::Path)
+        {
+            return self.matches.get(self.selected);
+        }
         if self
             .walk_workspace
             .as_ref()
@@ -386,16 +451,14 @@ impl FilePicker {
     #[cfg(test)]
     pub fn test_set_cache(&mut self, files: Vec<PathBuf>) {
         let workspace = self.walk_workspace.clone();
-        self.file_cache = files
-            .into_iter()
-            .map(|path| {
-                let is_dir = match &workspace {
-                    Some(workspace) => workspace.root().join(&path).is_dir(),
-                    None => path.is_dir(),
-                };
-                CacheEntry::new(path, is_dir)
-            })
-            .collect();
+        self.file_cache.truncate(self.virtual_len);
+        self.file_cache.extend(files.into_iter().map(|path| {
+            let is_dir = match &workspace {
+                Some(workspace) => workspace.root().join(&path).is_dir(),
+                None => path.is_dir(),
+            };
+            CacheEntry::new(path, is_dir)
+        }));
         self.loading = false;
     }
 

@@ -173,6 +173,10 @@ pub fn handle_file_key(
                         return true;
                     };
                     format!("{path} ")
+                } else if picker.selected_is_mention() {
+                    // A mention keeps its own `@` and ends the token so the
+                    // prompt text can follow directly.
+                    format!("{} ", path.to_string_lossy())
                 } else {
                     path.to_string_lossy().to_string()
                 };

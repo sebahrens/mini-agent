@@ -329,6 +329,9 @@ pub struct InputEditor {
     custom_commands: Vec<(String, String)>,
     #[cfg(feature = "mcp")]
     mcp_resources: Vec<String>,
+    /// Persona names offered as `@agent:<name>` rows by the `@` picker.
+    #[cfg(feature = "subagents")]
+    agent_mentions: Vec<String>,
 
     #[cfg(feature = "agent-skills")]
     skill_commands: Vec<(String, String)>,
@@ -382,6 +385,8 @@ impl InputEditor {
             custom_commands: Vec::new(),
             #[cfg(feature = "mcp")]
             mcp_resources: Vec::new(),
+            #[cfg(feature = "subagents")]
+            agent_mentions: Vec::new(),
 
             #[cfg(feature = "agent-skills")]
             skill_commands: Vec::new(),
@@ -507,6 +512,13 @@ impl InputEditor {
         self.mcp_resources = resources;
     }
 
+    /// Persona names for the `@agent:<name>` rows; the caller passes the
+    /// same trusted list it gives [`Self::set_agent_names`].
+    #[cfg(feature = "subagents")]
+    pub(crate) fn set_agent_mentions(&mut self, names: Vec<String>) {
+        self.agent_mentions = names;
+    }
+
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
         self.quick_model_names = names;
     }
@@ -625,6 +637,14 @@ impl InputEditor {
         let mut picker = FilePicker::new();
         picker.set_monochrome(self.monochrome);
         picker.activate();
+        // Persona mentions come first so an empty or short query shows them
+        // in the first window, ahead of MCP operands and walked files.
+        #[cfg(feature = "subagents")]
+        picker.append_virtual_mentions(
+            self.agent_mentions
+                .iter()
+                .map(|name| std::path::PathBuf::from(format!("@agent:{name}"))),
+        );
         #[cfg(feature = "mcp")]
         // Ordinary file completion removes its opening '@'. An MCP operand
         // retains the explicit resource marker instead of becoming a path.

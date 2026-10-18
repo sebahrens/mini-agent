@@ -865,6 +865,151 @@ mod slash_picker_contract {
         }
     }
 
+    /// mini-agent-5eoy7.2: the highlighted `@agent:<name>` row keeps its
+    /// `@` and ends with a space so the prompt text can follow.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn tab_inserts_the_highlighted_agent_mention_keeping_the_at_and_a_space() {
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            let mut input = InputEditor::new();
+            input.set_agent_mentions(vec!["general".into(), "review".into()]);
+            typed(&mut input, "ask @");
+            let Some(Picker::File(picker)) = input.picker.as_mut() else {
+                panic!("@ after a space opens the file picker");
+            };
+            picker.test_set_cache(vec![PathBuf::from("review-notes.md")]);
+            typed(&mut input, "rev");
+            let Some(Picker::File(picker)) = input.picker.as_ref() else {
+                panic!("the file picker stays open while typing");
+            };
+            assert_eq!(
+                picker.selected_path(),
+                Some(&PathBuf::from("@agent:review"))
+            );
+            assert_eq!(press(&mut input, code, KeyModifiers::NONE), None);
+            assert_eq!(input.buffer, "ask @agent:review ", "{code:?}");
+            assert_eq!(input.cursor, input.buffer.len());
+            assert!(!input.picker.as_ref().is_some_and(Picker::active));
+        }
+    }
+
+    /// mini-agent-5eoy7.2: persona rows fill the first window for an empty
+    /// or short query, ahead of MCP operands and walked files.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn agent_rows_precede_file_rows_for_an_empty_query() {
+        let mut input = InputEditor::new();
+        input.set_agent_mentions(vec!["general".into(), "review".into()]);
+        #[cfg(feature = "mcp")]
+        input.set_mcp_resources(vec!["mcp:srv:notes".into()]);
+        typed(&mut input, "@");
+        let Some(Picker::File(picker)) = input.picker.as_mut() else {
+            panic!("@ opens the file picker");
+        };
+        picker.test_set_cache(vec![PathBuf::from("a.txt"), PathBuf::from("agent.md")]);
+        typed(&mut input, "a");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "@");
+        let Some(Picker::File(picker)) = input.picker.as_ref() else {
+            panic!("backspacing the query keeps the picker open");
+        };
+        let mut expected = vec![
+            PathBuf::from("@agent:general"),
+            PathBuf::from("@agent:review"),
+        ];
+        #[cfg(feature = "mcp")]
+        expected.push(PathBuf::from("@mcp:srv:notes"));
+        expected.extend([PathBuf::from("a.txt"), PathBuf::from("agent.md")]);
+        assert_eq!(picker.matches, expected);
+        assert_eq!(picker.selected_path(), Some(&expected[0]));
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 80, 20).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("@agent:general"), "{rendered:?}");
+    }
+
+    /// mini-agent-5eoy7.2: the `@agent:` rows and the `/agent` sub-picker
+    /// read one trusted persona source: an untrusted project persona is
+    /// absent from both, and both pick it up after a refresh once trusted.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn agent_rows_follow_the_trusted_persona_source() {
+        let fixture = crate::tests::OwnedTestDirectory::new("agent-mention-trust");
+        let root = fixture.path();
+        let paths = crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: Some(root.join(".zerostack")),
+        };
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.join(".zerostack/agents")).unwrap();
+        std::fs::write(
+            root.join(".zerostack/agents/projectonly.md"),
+            "project persona",
+        )
+        .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+
+        // What App::refresh_custom_commands does on `@` and `/`.
+        let refresh = |input: &mut InputEditor| {
+            let names =
+                crate::context::agents::available_names_for_paths_and_workspace(&paths, &workspace);
+            input.set_agent_mentions(names.clone());
+            input.set_agent_names(names);
+        };
+        let rows = |input: &mut InputEditor| -> (Vec<String>, Vec<String>) {
+            typed(input, "@");
+            let Some(Picker::File(picker)) = input.picker.as_mut() else {
+                panic!("@ opens the file picker");
+            };
+            picker.test_set_cache(Vec::new());
+            let mentions = picker
+                .matches
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .filter(|row| row.starts_with("@agent:"))
+                .collect();
+            press(input, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(input.buffer, "");
+            typed(input, "/agent");
+            press(input, KeyCode::Tab, KeyModifiers::NONE);
+            let Some(Picker::Prefixed(picker, "/agent ")) = input.picker.as_ref() else {
+                panic!("/agent opens its persona picker");
+            };
+            let names = picker.matches.clone();
+            input.load_text("");
+            input.picker = None;
+            (mentions, names)
+        };
+
+        let mut input = InputEditor::new();
+        refresh(&mut input);
+        let (mentions, names) = rows(&mut input);
+        assert!(!names.is_empty(), "compiled-in personas are listed");
+        assert!(!names.iter().any(|name| name == "projectonly"));
+        assert_eq!(
+            mentions,
+            names
+                .iter()
+                .map(|name| format!("@agent:{name}"))
+                .collect::<Vec<_>>()
+        );
+
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        refresh(&mut input);
+        let (mentions, names) = rows(&mut input);
+        assert!(names.iter().any(|name| name == "projectonly"));
+        assert!(mentions.iter().any(|row| row == "@agent:projectonly"));
+        drop(workspace);
+    }
+
     /// mini-agent-o6zkz: backing out of an argument picker returns to slash
     /// completion for the command instead of leaving a dead `/command `.
     #[test]
