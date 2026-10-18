@@ -144,6 +144,17 @@ impl App<'_> {
         crate::ui::statusline::cron_label(self.cron.summary(Instant::now()), waiting)
     }
 
+    /// When the statusline countdown next changes on its own; the event loop
+    /// repaints then so an untouched idle TUI never shows a stale `in Nm`.
+    pub(super) fn cron_label_repaint_at(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let waiting = self.cron_turn.is_some()
+            && self.run.is_running
+            && (self.permission_prompt.is_some() || self.question_prompt.is_some());
+        crate::ui::statusline::cron_label_repaint_in(self.cron.summary(now), waiting)
+            .map(|delay| now + delay)
+    }
+
     /// Park every expired deadline and, when idle, start the earliest due
     /// fire as an ordinary turn with the scheduler origin.
     pub(super) async fn fire_due_cron(&mut self) -> anyhow::Result<()> {

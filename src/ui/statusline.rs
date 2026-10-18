@@ -106,6 +106,34 @@ pub(crate) fn cron_label(summary: crate::ui::cron::CronSummary, waiting: bool) -
     Some(format!("\u{27f3} {} {state}", summary.armed))
 }
 
+/// How long until [`cron_label`]'s countdown text changes on its own, so an
+/// otherwise idle TUI repaints exactly when the minute bucket rolls over.
+/// `None` when no countdown is shown or it cannot change before the fire
+/// (`in <1m` holds until the deadline, which wakes the loop anyway).
+pub(crate) fn cron_label_repaint_in(
+    summary: crate::ui::cron::CronSummary,
+    waiting: bool,
+) -> Option<std::time::Duration> {
+    if summary.armed == 0
+        || summary.suspended
+        || waiting
+        || summary.parked > 0
+        || summary.running > 0
+    {
+        return None;
+    }
+    let left = summary.next_in?;
+    if left < std::time::Duration::from_secs(60) {
+        return None;
+    }
+    // The label shows ceil(left / 60) minutes; it drops one bucket when
+    // `left` reaches the next lower whole minute.
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    let shown = secs.div_ceil(60);
+    let boundary = std::time::Duration::from_secs((shown - 1) * 60);
+    Some(left.saturating_sub(boundary))
+}
+
 /// Status segment text for a degraded (unavailable-default) sandbox.
 pub const SANDBOX_OFF_LABEL: &str = "sandbox:off";
 

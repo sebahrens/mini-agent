@@ -1005,3 +1005,37 @@ fn the_default_layout_places_the_cron_item() {
     assert!(text.contains("⟳ 1 in 5m"), "{text}");
     assert_eq!(statusline::item_icon("cron"), Some("\u{f073}"));
 }
+
+#[test]
+fn the_cron_countdown_repaints_exactly_when_its_minute_bucket_rolls_over() {
+    use std::time::Duration;
+    let repaint = |left: u64| statusline::cron_label_repaint_in(cron_summary(1, Some(left)), false);
+    // 4m30s shows "in 5m" until 4m00s left, so it repaints in 30s.
+    assert_eq!(repaint(270), Some(Duration::from_secs(30)));
+    // Exactly on a boundary the next change is a full minute away.
+    assert_eq!(repaint(240), Some(Duration::from_secs(60)));
+    // After the repaint the label really changed bucket.
+    let label = |left: u64| statusline::cron_label(cron_summary(1, Some(left)), false);
+    assert_ne!(label(270), label(240));
+    // Under a minute the label stays "in <1m" until the deadline fires.
+    assert_eq!(repaint(59), None);
+    // No countdown shown: no repaint timer.
+    assert_eq!(
+        statusline::cron_label_repaint_in(cron_summary(0, None), false),
+        None
+    );
+    assert_eq!(
+        statusline::cron_label_repaint_in(cron_summary(1, Some(600)), true),
+        None
+    );
+    let parked = crate::ui::cron::CronSummary {
+        parked: 1,
+        ..cron_summary(1, Some(600))
+    };
+    assert_eq!(statusline::cron_label_repaint_in(parked, false), None);
+    let suspended = crate::ui::cron::CronSummary {
+        suspended: true,
+        ..cron_summary(1, Some(600))
+    };
+    assert_eq!(statusline::cron_label_repaint_in(suspended, false), None);
+}

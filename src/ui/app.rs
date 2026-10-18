@@ -2465,6 +2465,7 @@ impl<'a> App<'a> {
                 .forced_deadline()
                 .filter(|_| !self.git_status_in_flight);
             let cron_wakeup = self.cron_wakeup();
+            let cron_repaint = self.cron_label_repaint_at();
 
             #[cfg(feature = "subagents")]
             let background_pool = self.ui.session.background_pool.clone();
@@ -2591,6 +2592,12 @@ impl<'a> App<'a> {
                     cron_wakeup.unwrap_or_else(tokio::time::Instant::now)
                 ), if cron_wakeup.is_some() => {
                     crate::startup::heap_future(|| self.fire_due_cron()).await?;
+                }
+                // The `/cron` statusline countdown rolled to its next minute.
+                _ = tokio::time::sleep_until(
+                    cron_repaint.unwrap_or_else(tokio::time::Instant::now)
+                ), if cron_repaint.is_some() => {
+                    self.refresh()?;
                 }
                 // A persistent deadline (not a fresh sleep per iteration):
                 // it fires even while other events arrive faster than its
