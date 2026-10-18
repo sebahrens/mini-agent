@@ -699,6 +699,7 @@ Accepted top-level keys:
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
 | `session_title_model` | string | Defaults to the session provider/model. Set `"off"` (or an empty string) to keep first-message titles without a title request; a `quick_models` alias selects a trusted override. After the first completed exchange, a no-tools request receives at most 2,000 bytes of the first user message and 1,000 bytes of the first reply, with a 64-token output cap and a 20-second deadline. Interactive generation runs as owned background work; headless saves title afterward. Names always win. Observed title usage is charged once at captured title-model prices, including on failure or cancellation; it does not change conversation context calibration. `--no-session` skips titles. Model/provider overrides remain sensitive project configuration. |
 | `goal`                    | object  | Goal defaults: `judge` (`"auto"`, `"off"`, `"session"`, or a `quick_models` name), `continuation` (`"continue"` or `"restart"`), `max_rounds` (50), `max_tokens`, `max_active_secs`, `no_progress_rounds` (3), `blocked_rounds` (3), `wrap_up_max_agent_turns` (4), `reinject_every` (6), `judge_every` (5), `check_every_round` (false: run checks only on a completion claim; true also runs them every round as feedback). Benign: every field bounds how long the harness keeps working or who reviews a claim, and none of them widens what may run. |
+| `headless_agent_mentions` | boolean | Opt-in `@agent:<name>` routing for headless `-p` and ACP `session/prompt` prompts. Default: `false` (prompts pass through literally). When `true`, resolved mentions are normalised and routed through a non-persisted note; an unknown name fails `-p` with a nonzero exit before any provider request and fails an ACP prompt with JSON-RPC `-32602`. Accepted but inert without the `subagents` feature. Read at startup; a saved change applies after a restart. See [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent). |
 | `cron_max_fires`          | integer | Fires each `/cron` schedule may start before it is removed. Default: `24`; values below `1` count as `1`. Read at startup; a saved change applies after a restart. See [COMMANDS.md](COMMANDS.md#cron). |
 | `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt. Default: `300`; clamped to `1..=3600`. |
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
@@ -2685,7 +2686,11 @@ deployments configure MCP on the agent host.
 A turn that fails internally (provider or runner error, unusable workspace,
 missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
 carrying the failure message, rather than a `refusal` stop reason; any tool
-work the turn completed is still committed to the session history. Tool calls
+work the turn completed is still committed to the session history. With the
+opt-in `headless_agent_mentions` key, an unknown `@agent:<name>` in a prompt's
+text blocks is refused with `-32602` before the turn starts and resolved
+mentions are routed for that request only (see
+[SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent)). Tool calls
 that fail, are denied, or whose outcome is unknown are reported with tool-call
 status `failed` instead of `completed`.
 

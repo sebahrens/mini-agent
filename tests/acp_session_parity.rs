@@ -826,3 +826,84 @@ fn acp53_stdio_native_turns_publish_restore_and_refuse_prefix_rewrite() {
         assert_eq!(rows[0]["tool_call_id"], "acp53-native-read");
     }
 }
+
+/// Opt-in `headless_agent_mentions` over the real ACP wire: an unknown
+/// canonical name is a -32602 invalid-params error before any provider
+/// request; a resolved alias is normalised, sends the routing note as a final
+/// block of that request only, and persists only the literal text.
+#[test]
+#[cfg(feature = "subagents")]
+fn acp_agent_mentions_refuse_unknown_and_route_resolved_without_persisting() {
+    let roots = Roots::new();
+    let mut provider = Provider::start(&roots);
+    let config = roots.0.join("config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("headless_agent_mentions=true\n{base}")).unwrap();
+    let mut peer = Peer::start(&roots);
+    peer.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let id = peer.request(
+        2,
+        "session/new",
+        serde_json::json!({"cwd":roots.0,"mcpServers":[]}),
+    )["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let refused = peer.exchange(
+        3,
+        "session/prompt",
+        serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"run @agent:no-such-persona now"}]}),
+    );
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("unknown agent '@agent:no-such-persona'")
+            && message.contains("rust-maintainer"),
+        "{message}"
+    );
+    assert_eq!(
+        peer.request(
+            4,
+            "session/prompt",
+            serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"ask @agent-rust-maintainer to review"}]})
+        )["stopReason"],
+        "end_turn"
+    );
+    peer.request(5, "session/close", serde_json::json!({"sessionId":id}));
+    peer.finish();
+    let requests = provider.finish();
+    // The refusal made no request; the routed prompt's first attempt is the
+    // fixture's controlled 500 and its retry must carry identical input.
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["messages"], requests[1]["messages"]);
+    let user = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|row| row["role"] == "user")
+        .unwrap();
+    let texts: Vec<&str> = user["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("routed content is a block list: {user}"))
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert_eq!(texts[0], "ask @agent:rust-maintainer to review");
+    assert!(
+        texts[1].contains("Host routing note") && texts[1].contains("\"rust-maintainer\""),
+        "{texts:?}"
+    );
+    let saved =
+        std::fs::read_to_string(roots.0.join("sessions").join(format!("{id}.json"))).unwrap();
+    assert!(
+        saved.contains("ask @agent:rust-maintainer to review"),
+        "{saved}"
+    );
+    assert!(!saved.contains("Host routing note"), "{saved}");
+}
