@@ -4269,8 +4269,9 @@ impl AnyAgent {
                 #[cfg(feature = "hooks")]
                 let rewritten = match work_scope
                     .run(crate::startup::heap_future(|| {
-                        crate::extras::hooks::dispatch_user_prompt_submit(
+                        crate::extras::hooks::dispatch_user_prompt_submit_from(
                             prompt.literal_text().to_owned(),
+                            crate::extras::hooks::PromptOrigin::of_current_run(),
                         )
                     }))
                     .await

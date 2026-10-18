@@ -97,10 +97,14 @@ later usage chunk. That path persists incomplete tracking without inventing toke
 or a zero-dollar receipt. The original SDK hook and tool-ID behavior is retained.
 
 `src/spend/ledger.rs` writes new receipts to `<state_dir>/usage.jsonl`. Rows include
-UTC timestamp, receipt and session IDs, requested provider/model, request kind,
+UTC timestamp, receipt and session IDs, requested provider/model, request kind
+(`turn`, `scheduled` for a `/cron` fire, `title`, `repair`, `btw`, `subagent`,
+`advisor`, `judge`, `compaction`, `git_proposal`),
 normalized usage, whether metrics were reported, captured effective prices and an
 optional cost. No prompt, answer, tool arguments, source text or credential is
-recorded. This is local accounting; it sends no analytics request.
+recorded. Readers fail closed on an unknown request kind, so a build older than
+a kind it finds in the ledger (for example `scheduled`) reports the ledger as
+invalid rather than guessing. This is local accounting; it sends no analytics request.
 
 Receipt charging is synchronous memory work; bounded scans, serialization locks,
 appends and fsync run in blocking children owned by the request's work scope.

@@ -184,6 +184,16 @@ pub(crate) enum RequestKind {
     Judge,
     Compaction,
     GitProposal,
+    /// A main turn started by the `/cron` scheduler rather than typed input.
+    /// Older readers of the ledger reject the row; this build reads both.
+    Scheduled,
+}
+
+impl RequestKind {
+    /// A main conversation turn, typed or scheduled.
+    pub(crate) fn is_main_turn(self) -> bool {
+        matches!(self, Self::Turn | Self::Scheduled)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1387,6 +1397,23 @@ mod model_call_count_tests {
             .unwrap();
         assert_eq!(restored.model_call_count(), Some((4, false)));
         assert!(restored.admit_effect().is_ok());
+    }
+    #[test]
+    fn scheduled_request_kind_round_trips_through_a_ledger_row() {
+        let receipt = receipt(RequestKind::Scheduled, 1.0, true);
+        let wire = serde_json::to_value(&*receipt.row).unwrap();
+        assert_eq!(wire["kind"], "scheduled");
+        assert_eq!(wire["version"], 2);
+        let row: Row = serde_json::from_value(wire).unwrap();
+        assert_eq!(row.kind, RequestKind::Scheduled);
+        assert_eq!(row, *receipt.row);
+        row.validate().unwrap();
+        assert!(RequestKind::Scheduled.is_main_turn() && RequestKind::Turn.is_main_turn());
+        assert!(!RequestKind::Title.is_main_turn());
+        // A scheduled turn counts as a model call like any other request.
+        let account = Account::new("s", None, 0.0).unwrap();
+        assert!(account.observe(&receipt).unwrap());
+        assert_eq!(account.model_call_count(), Some((1, true)));
     }
     #[test]
     fn model_call_count_old_checkpoints_missing_reports_and_saturation_are_honest() {

@@ -21,6 +21,8 @@ pub(crate) enum EventFields {
     },
     UserPromptSubmit {
         prompt: String,
+        /// `"user"` or `"scheduled"` (a `/cron` fire).
+        origin: &'static str,
     },
     Stop {
         stop_hook_active: bool,
@@ -99,7 +101,9 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
             "tool_input": tool_input,
             "error": error,
         }),
-        EventFields::UserPromptSubmit { prompt } => json!({ "prompt": prompt }),
+        EventFields::UserPromptSubmit { prompt, origin } => {
+            json!({ "prompt": prompt, "origin": origin })
+        }
         EventFields::Stop {
             stop_hook_active,
             loop_iteration,

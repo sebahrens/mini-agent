@@ -317,12 +317,50 @@ pub(crate) enum PromptGate {
     Blocked(String),
 }
 
+/// Who submitted a prompt, as the `UserPromptSubmit` envelope's `origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptOrigin {
+    /// Typed (or queued, or steered) by the human.
+    User,
+    /// Fired by the session `/cron` scheduler.
+    Scheduled,
+}
+
+impl PromptOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Scheduled => "scheduled",
+        }
+    }
+
+    /// The origin of the run whose spend profile is in scope: a scheduled main
+    /// turn carries [`crate::spend::RequestKind::Scheduled`].
+    pub(crate) fn of_current_run() -> Self {
+        match crate::spend::run::Run::current().map(|run| run.kind()) {
+            Some(crate::spend::RequestKind::Scheduled) => Self::Scheduled,
+            _ => Self::User,
+        }
+    }
+}
+
 /// Testable core: dispatches `UserPromptSubmit` against an explicit
 /// dispatcher/context and decides whether the prompt proceeds.
+#[cfg(test)]
 pub(crate) async fn gate_user_prompt(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
     prompt: String,
+) -> PromptGate {
+    gate_user_prompt_from(dispatcher, ctx, prompt, PromptOrigin::User).await
+}
+
+/// [`gate_user_prompt`] for an explicit prompt origin.
+pub(crate) async fn gate_user_prompt_from(
+    dispatcher: &dispatcher::HookDispatcher,
+    ctx: &HookCtx,
+    prompt: String,
+    origin: PromptOrigin,
 ) -> PromptGate {
     if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
         return PromptGate::Proceed(prompt);
@@ -334,6 +372,7 @@ pub(crate) async fn gate_user_prompt(
             ctx,
             envelope::EventFields::UserPromptSubmit {
                 prompt: prompt.clone(),
+                origin: origin.as_str(),
             },
         )
     })
@@ -368,10 +407,18 @@ pub(crate) fn best_effort_ctx() -> HookCtx {
 /// `prompt` through `UserPromptSubmit` hooks. A prompt passes through
 /// unchanged when no dispatcher is installed.
 pub(crate) async fn dispatch_user_prompt_submit(prompt: String) -> PromptGate {
+    dispatch_user_prompt_submit_from(prompt, PromptOrigin::User).await
+}
+
+/// [`dispatch_user_prompt_submit`] for an explicit prompt origin.
+pub(crate) async fn dispatch_user_prompt_submit_from(
+    prompt: String,
+    origin: PromptOrigin,
+) -> PromptGate {
     let Some(dispatcher) = get_dispatcher() else {
         return PromptGate::Proceed(prompt);
     };
-    gate_user_prompt(&dispatcher, &best_effort_ctx(), prompt).await
+    gate_user_prompt_from(&dispatcher, &best_effort_ctx(), prompt, origin).await
 }
 
 /// The active goal, as a `Stop` hook sees it.

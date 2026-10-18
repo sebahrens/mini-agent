@@ -12,10 +12,6 @@
 //! fires once at the next idle point. There is no catch-up: however many
 //! deadlines were missed, an entry holds at most one parked fire.
 
-// The idle fire path and the statusline item consume the parking, firing and
-// summary half of this API (mini-agent-5eoy7.7 and .8).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -173,6 +169,8 @@ pub(crate) struct CronFire {
 }
 
 /// Aggregate view for the statusline.
+// Consumed by the statusline item (mini-agent-5eoy7.8).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CronSummary {
     pub armed: usize,
@@ -207,6 +205,7 @@ impl CronStore {
         self.entries.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get(&self, id: &str) -> Option<&CronEntry> {
         self.entries.iter().find(|entry| entry.id == id)
     }
@@ -345,6 +344,7 @@ impl CronStore {
         self.suspended = true;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resume(&mut self) {
         self.suspended = false;
     }
@@ -359,6 +359,8 @@ impl CronStore {
         !std::mem::replace(&mut self.budget_warned, true)
     }
 
+    // Consumed by the statusline item (mini-agent-5eoy7.8).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn summary(&self, now: Instant) -> CronSummary {
         CronSummary {
             armed: self.entries.len(),
