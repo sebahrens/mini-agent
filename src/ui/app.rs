@@ -1824,6 +1824,7 @@ impl<'a> App<'a> {
             &run,
             &chain,
             BtwStats::default(),
+            None,
         )?;
 
         {
@@ -2838,6 +2839,7 @@ impl<'a> App<'a> {
         }
         self.input.set_file_workspace(self.ui.workspace.clone());
         self.sync_live_model_names(false);
+        let cron_label = self.cron_status_label();
         refresh_display(
             &mut self.renderer,
             &mut self.input,
@@ -2849,6 +2851,7 @@ impl<'a> App<'a> {
                 input: self.btw_total_in,
                 output: self.btw_total_out,
             },
+            cron_label.as_deref(),
         )
     }
 

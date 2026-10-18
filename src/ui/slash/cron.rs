@@ -153,6 +153,13 @@ fn arm(
             cron::format_until(now + interval.duration, now)
         ),
     );
+    renderer.show_notice(
+        &format!(
+            "cron {id} armed: first fire {}",
+            cron::format_until(now + interval.duration, now)
+        ),
+        crossterm::style::Color::Cyan,
+    );
     if !budget_capped && store.take_budget_warning() {
         write_result(
             renderer,

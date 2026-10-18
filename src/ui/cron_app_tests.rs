@@ -389,3 +389,47 @@ async fn cron_teardown_drops_every_entry() {
     drop(app);
     provider.finish().await;
 }
+
+/// mini-agent-5eoy7.8: arming and parking each raise a transient notice, and
+/// the statusline item follows the store (countdown, then `parked`).
+#[tokio::test]
+async fn cron_arm_and_park_show_notices_and_the_statusline_item() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["USER_DONE"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    assert_eq!(app.cron_status_label(), None, "no entries hide the item");
+    user(&mut app, UserEvent::Paste("typed first".into())).await;
+    key(&mut app, KeyCode::Enter).await;
+    assert!(app.run.is_running);
+    arm_expired(&mut app, "scheduled ping", 1);
+    fire(&mut app).await;
+    let notice = app.renderer.notice_text().unwrap_or_default().to_owned();
+    assert!(notice.contains("parked until idle"), "{notice}");
+    assert_eq!(app.cron_status_label().as_deref(), Some("⟳ 1 parked"));
+    // A second check while still busy parks nothing new and stays quiet.
+    app.renderer.show_notice("other", Color::White);
+    fire(&mut app).await;
+    assert_eq!(app.renderer.notice_text(), Some("other"));
+    assert!(settle(&mut app).await);
+    app.cron.stop_all();
+    assert_eq!(app.cron_status_label(), None);
+
+    // Arm through the real slash dispatch. It runs after the provider served
+    // its only response, because every slash command warms the model list.
+    crate::startup::heap_future(|| app.run_slash_command("/cron 5m check the deploy"))
+        .await
+        .unwrap();
+    assert_eq!(app.cron.len(), 1);
+    let notice = app.renderer.notice_text().unwrap_or_default().to_owned();
+    assert!(notice.contains("armed: first fire in 5m"), "{notice}");
+    assert_eq!(app.cron_status_label().as_deref(), Some("⟳ 1 in 5m"));
+    drop(app);
+    provider.finish().await;
+}

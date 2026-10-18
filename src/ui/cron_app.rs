@@ -93,11 +93,29 @@ impl App<'_> {
         self.cron.next_deadline()
     }
 
+    /// The `cron` statusline item: `waiting` while the running scheduled
+    /// turn holds a permission or question prompt.
+    pub(super) fn cron_status_label(&self) -> Option<String> {
+        let waiting = self.cron_turn.is_some()
+            && self.run.is_running
+            && (self.permission_prompt.is_some() || self.question_prompt.is_some());
+        crate::ui::statusline::cron_label(self.cron.summary(Instant::now()), waiting)
+    }
+
     /// Park every expired deadline and, when idle, start the earliest due
     /// fire as an ordinary turn with the scheduler origin.
     pub(super) async fn fire_due_cron(&mut self) -> anyhow::Result<()> {
-        self.cron.mark_expired_due(Instant::now());
-        if !self.cron_idle() || !self.cron.has_due() {
+        let parked = self.cron.mark_expired_due(Instant::now());
+        if !self.cron_idle() {
+            if parked > 0 && !self.cron.is_suspended() {
+                // Transient only: the feed records the fire when it runs.
+                self.renderer
+                    .show_notice("cron: fire parked until idle", Color::Cyan);
+                self.refresh()?;
+            }
+            return Ok(());
+        }
+        if !self.cron.has_due() {
             return Ok(());
         }
         if self.startup_work_pending() {

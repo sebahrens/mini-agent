@@ -1733,7 +1733,7 @@ When the terminal narrows, whole items fold instead of silently losing their
 last letters. Icons, caps, and decorative separators go first; the combined
 `context` item can shorten to `ctx 1%`, and paths can shorten to a basename or
 `…`. Lower-priority token/call/cache totals, then cost, then Git/path items drop
-before model and context. Prompt, mode, sandbox, and goal/loop state remain last.
+before model and context. Prompt, mode, sandbox, and goal/loop/cron state remain last.
 A remaining item too wide for the row gets a visible trailing `…`. The renderer
 reserves the last terminal cell on every platform to avoid eager console
 wrapping; resizing relayouts the retained spans at the new cell width.
@@ -1785,13 +1785,13 @@ Each segment has:
 | `right` | Powerline cap glyph drawn after the item. Optional. |
 | `icon`  | Glyph shown before the value. `true` uses the item's built-in icon; a string sets a custom one (a named icon or a literal glyph). Optional. Needs a Nerd Font. |
 | `priority` | Optional retention priority (0–239): larger values drop later. Safety state and prompt have protected higher priorities. |
-| `min` | Optional literal compact form used before dropping an item; sanitized, never evaluated; mode/sandbox/goal/loop retain their actual value. |
+| `min` | Optional literal compact form used before dropping an item; sanitized, never evaluated; mode/sandbox/goal/loop/cron retain their actual value. |
 | `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`, `todos`, `queue`, `background_jobs`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
 
 Items with a built-in icon (used by `icon = true`): `git_branch`, `git_changes`,
 `git_status`, `cwd`, `model`, `cost`, `context_used`/`context_max`/
 `context_percentage`, `session_name`/`session_id`, `prompt`, `mode`, `loop`,
-`goal`, `btw`, `compaction`. Named custom icons for `icon = "<name>"`: `branch`,
+`goal`, `cron`, `btw`, `compaction`. Named custom icons for `icon = "<name>"`: `branch`,
 `folder`, `chip`, `dollar`, `database`, `hash`, `terminal`, `lock`, `pencil`,
 `sync`. Any other value is used literally, so a raw codepoint works too.
 
@@ -1847,6 +1847,7 @@ Available items:
 | `sandbox`             | Red `sandbox:off` while shell commands run unsandboxed because the default sandbox backend was unavailable (hidden otherwise, including under an explicit `--no-sandbox`). In the default layout; a custom layout that omits it still gets it appended to the first line while degraded. |
 | `loop`                | Active loop label. |
 | `goal`                | Active goal: its round and status, in brackets. Hidden when there is no goal or it has finished. |
+| `cron`                | Session `/cron` schedules: the armed count and one state, e.g. `⟳ 2 in 4m` (next fire, relative and rounded up to the minute; `in <1m` below a minute), `⟳ 2 parked` (a fire waits for idle), `⟳ 2 waiting` (a scheduled turn holds a permission or question prompt), or `⟳ 2 suspended` (the USD budget was reached). Hidden when nothing is armed. Times are relative only, because the deadlines are monotonic and shift across a host suspend; the countdown advances when the status bar next repaints. In the default layout; keeps its value when the row narrows. See [COMMANDS.md](COMMANDS.md#cron). |
 | `chain`               | Chain-of-prompts label. |
 | `todos`               | Shared todo progress (`todo:<done>/<total>`), counting completed and cancelled items as done. Hidden when empty; a temporarily locked store shows `todo:?`. |
 | `queue`               | Actual inputs waiting behind the active main run (`queue:<n>`; hidden at zero). |

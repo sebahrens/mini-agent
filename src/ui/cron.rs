@@ -169,8 +169,6 @@ pub(crate) struct CronFire {
 }
 
 /// Aggregate view for the statusline.
-// Consumed by the statusline item (mini-agent-5eoy7.8).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CronSummary {
     pub armed: usize,
@@ -359,8 +357,6 @@ impl CronStore {
         !std::mem::replace(&mut self.budget_warned, true)
     }
 
-    // Consumed by the statusline item (mini-agent-5eoy7.8).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn summary(&self, now: Instant) -> CronSummary {
         CronSummary {
             armed: self.entries.len(),

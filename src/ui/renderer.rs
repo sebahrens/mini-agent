@@ -3827,6 +3827,7 @@ mod statusline_layout_tests {
         let context = StatusContext {
             workspace: std::path::Path::new("."),
             loop_label: None,
+            cron_label: None,
             goal_label: None,
             prompt_name: None,
             reasoning_effort: None,
@@ -3917,6 +3918,7 @@ mod statusline_layout_tests {
         let context = StatusContext {
             workspace: std::path::Path::new("/workspace"),
             loop_label: None,
+            cron_label: None,
             goal_label: None,
             prompt_name: Some("界界界界界界界界"),
             reasoning_effort: None,

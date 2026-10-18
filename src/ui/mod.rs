@@ -214,12 +214,13 @@ pub(crate) fn refresh_display(
     run: &AgentRunState,
     chain: &ChainState,
     btw: BtwStats,
+    cron_label: Option<&str>,
 ) -> io::Result<()> {
     // The chat and bottom regions go out as one synchronized frame: one
     // write and flush per refresh instead of one per painted row. The frame
     // closes before a picker draws, because pickers write their overlay
     // directly and must land on top of it.
-    renderer.frame(|renderer| draw_main_frame(renderer, input, ui, run, chain, btw))?;
+    renderer.frame(|renderer| draw_main_frame(renderer, input, ui, run, chain, btw, cron_label))?;
     if let Some(ref mut picker) = input.picker {
         let was_active = picker.active();
         picker.draw_with_renderer(renderer)?;
@@ -244,6 +245,7 @@ fn draw_main_frame(
     run: &AgentRunState,
     chain: &ChainState,
     btw: BtwStats,
+    cron_label: Option<&str>,
 ) -> io::Result<()> {
     // Reconcile the input height first so the chat viewport is drawn against
     // the size the input is about to occupy (avoids a stale separator when the
@@ -282,6 +284,7 @@ fn draw_main_frame(
         goal_label: goal_label.as_deref(),
         #[cfg(not(feature = "goal"))]
         goal_label: None,
+        cron_label,
         prompt_name: ui.context.current_prompt_name.as_deref(),
         reasoning_effort: ui
             .session
