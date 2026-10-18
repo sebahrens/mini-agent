@@ -21,12 +21,21 @@ const SHORT_LIMITS: CommandLimits = CommandLimits {
     combined_bytes: 6144,
 };
 
+/// For controls that expect the command to finish: they prove output and
+/// status handling, not a 300 ms launch deadline, so hosted-runner shell
+/// startup gets the same bounded slack as the credential-isolation control.
+#[cfg(unix)]
+const SUCCESS_LIMITS: CommandLimits = CommandLimits {
+    timeout: Duration::from_secs(5),
+    ..SHORT_LIMITS
+};
+
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_preserves_exact_authored_script_and_reports_bypass() {
     let sandbox = Sandbox::new(false, "bwrap");
     let run = sandbox
-        .run_explicit_shell("!  printf exact  ", SHORT_LIMITS, None)
+        .run_explicit_shell("!  printf exact  ", SUCCESS_LIMITS, None)
         .await
         .unwrap();
 
@@ -151,11 +160,11 @@ async fn explicit_shell_under_no_sandbox_env_policy_matches_spec() {
 async fn explicit_shell_success_and_nonzero_share_one_status_policy() {
     let sandbox = Sandbox::new(false, "bwrap");
     let success = sandbox
-        .run_explicit_shell("!printf ok", SHORT_LIMITS, None)
+        .run_explicit_shell("!printf ok", SUCCESS_LIMITS, None)
         .await
         .unwrap();
     let nonzero = sandbox
-        .run_explicit_shell("!printf bad >&2; exit 42", SHORT_LIMITS, None)
+        .run_explicit_shell("!printf bad >&2; exit 42", SUCCESS_LIMITS, None)
         .await
         .unwrap();
 
@@ -174,7 +183,7 @@ async fn explicit_shell_success_and_nonzero_share_one_status_policy() {
 async fn explicit_shell_lossily_renders_invalid_utf8_without_panicking() {
     let sandbox = Sandbox::new(false, "bwrap");
     let run = sandbox
-        .run_explicit_shell("!printf '\\377x'", SHORT_LIMITS, None)
+        .run_explicit_shell("!printf '\\377x'", SUCCESS_LIMITS, None)
         .await
         .unwrap();
 
@@ -186,7 +195,7 @@ async fn explicit_shell_lossily_renders_invalid_utf8_without_panicking() {
 async fn explicit_shell_captures_exact_cwd_and_inherited_bypass_environment() {
     let sandbox = Sandbox::new(false, "bwrap");
     let run = sandbox
-        .run_explicit_shell("!printf '%s\\n%s' \"$PWD\" \"$PATH\"", SHORT_LIMITS, None)
+        .run_explicit_shell("!printf '%s\\n%s' \"$PWD\" \"$PATH\"", SUCCESS_LIMITS, None)
         .await
         .unwrap();
     let expected_cwd = std::env::current_dir().unwrap();
@@ -318,7 +327,7 @@ async fn explicit_shell_timeout_kills_term_ignoring_descendant_and_recovers() {
     assert_eq!(sandbox.active_group_count(), 0);
 
     let next = sandbox
-        .run_explicit_shell("!printf recovered", SHORT_LIMITS, None)
+        .run_explicit_shell("!printf recovered", SUCCESS_LIMITS, None)
         .await
         .unwrap();
     assert_eq!(next.rendered_output(), "recovered");
