@@ -343,6 +343,16 @@ impl Run {
                 PriceSnapshot::capture(None, Default::default(), self.prices.anthropic_native);
         }
     }
+    /// The same account, ledger and captured profile recording `kind`. ACP
+    /// scopes a `/cron` fire's turn with [`RequestKind::Scheduled`] this way,
+    /// so its receipts and its `UserPromptSubmit` origin say "scheduled".
+    #[cfg(feature = "acp")]
+    pub(crate) fn with_kind(&self, kind: RequestKind) -> Self {
+        Self {
+            kind,
+            ..self.clone()
+        }
+    }
     /// The accounting kind every request of this run records.
     pub(crate) fn kind(&self) -> RequestKind {
         self.kind

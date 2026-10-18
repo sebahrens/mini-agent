@@ -264,6 +264,9 @@ impl Peer {
         Self::start_with_read(roots, false)
     }
     fn start_with_read(roots: &Roots, read: bool) -> Self {
+        Self::start_with_args(roots, read, &[])
+    }
+    fn start_with_args(roots: &Roots, read: bool, extra: &[&str]) -> Self {
         let tool_args: &[&str] = if read {
             &["--tools", "read", "--allow", "read:*"]
         } else {
@@ -281,6 +284,7 @@ impl Peer {
                 "--model",
                 "test",
             ])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -906,4 +910,96 @@ fn acp_agent_mentions_refuse_unknown_and_route_resolved_without_persisting() {
         "{saved}"
     );
     assert!(!saved.contains("Host routing note"), "{saved}");
+}
+
+/// `/cron` over real stdio: v1 refusals, arming, and `--idle-exit` waiting
+/// while a schedule is armed and exiting once it is stopped and the session
+/// closed. (A fire needs the 1m minimum interval to elapse, so the scheduled
+/// turn itself is covered by the in-process protocol test
+/// `acp_cron_fire_runs_a_scheduled_turn_and_refuses_a_concurrent_prompt`.)
+#[test]
+fn acp_cron_stdio_refuses_v1_verbs_and_idle_exit_waits_for_the_armed_schedule() {
+    let roots = Roots::new();
+    let mut provider = Provider::start(&roots);
+    let mut peer = Peer::start_with_args(&roots, false, &["--idle-exit", "1"]);
+    peer.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let id = peer.request(
+        2,
+        "session/new",
+        serde_json::json!({"cwd":roots.0,"mcpServers":[]}),
+    )["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let prompt =
+        |text: &str| serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":text}]});
+    for (request, text, expected) in [
+        (3, "/cron run c1", "/cron run is not available over ACP"),
+        (4, "/cron resume", "/cron resume is not available over ACP"),
+        (
+            5,
+            "/cron check the build",
+            "self-paced /cron <prompt> is not available over ACP",
+        ),
+        (
+            6,
+            "/cron 5m /cost",
+            "slash commands and shell (!) lines cannot be scheduled",
+        ),
+        (
+            7,
+            "/cron 5m !ls",
+            "slash commands and shell (!) lines cannot be scheduled",
+        ),
+    ] {
+        let refused = peer.exchange(request, "session/prompt", prompt(text));
+        assert_eq!(refused["error"]["code"], -32602, "{text}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{text}: {message}");
+    }
+    assert_eq!(
+        peer.request(8, "session/prompt", prompt("/cron 5m check the build"))["stopReason"],
+        "end_turn"
+    );
+    let armed = peer.notifications.iter().any(|message| {
+        message["method"] == "session/update"
+            && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && message["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("cron c1: every 5m, first fire in 5m"))
+    });
+    assert!(armed, "{:?}", peer.notifications);
+    // Several idle-exit intervals pass with the schedule armed.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        peer.child.try_wait().unwrap().is_none(),
+        "idle-exit must wait while a /cron schedule is armed"
+    );
+    assert_eq!(
+        peer.request(9, "session/prompt", prompt("/cron list"))["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        peer.request(10, "session/prompt", prompt("/cron stop all"))["stopReason"],
+        "end_turn"
+    );
+    peer.request(11, "session/close", serde_json::json!({"sessionId":id}));
+    // No EOF: only the idle timer can end the process now.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = peer.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle-exit did not fire after /cron stop all and session/close"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "ACP process: {status}");
+    assert!(provider.finish().is_empty(), "no model request was made");
 }

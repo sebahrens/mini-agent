@@ -55,6 +55,19 @@ pub(super) fn classify(
     })
 }
 
+/// The arguments of a `/cron` command in the original sole text block, or
+/// `None` for any other prompt. `/cron` only edits the session's schedule
+/// store (see `super::cron`); it is answered without registering a turn, so
+/// it is kept out of [`Command`], whose variants all run inside one.
+pub(super) fn cron_arguments(blocks: &[ContentBlock]) -> Option<String> {
+    let [ContentBlock::Text(text)] = blocks else {
+        return None;
+    };
+    let text = text.text.trim();
+    let (name, arguments) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    (name == "/cron").then(|| arguments.trim().to_owned())
+}
+
 pub(super) fn announce(
     id: &SessionId,
     cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
@@ -66,6 +79,10 @@ pub(super) fn announce(
             "Remove the last conversation turn; files and billed usage remain",
         ),
         AvailableCommand::new("rename", "Rename this saved session"),
+        AvailableCommand::new(
+            "cron",
+            "Repeat a prompt on an interval while this session is idle: /cron <interval> <prompt>, /cron list, /cron stop <id>|all",
+        ),
     ];
     #[cfg(feature = "goal")]
     commands.push(AvailableCommand::new(
@@ -122,5 +139,26 @@ mod tests {
             classify(&[ContentBlock::Text(TextContent::new("/unknown"))]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn cron_arguments_come_only_from_the_original_sole_text_block() {
+        let text = |value: &str| ContentBlock::Text(TextContent::new(value));
+        assert_eq!(
+            cron_arguments(&[text("  /cron 5m  check CI ")]),
+            Some("5m  check CI".into())
+        );
+        assert_eq!(cron_arguments(&[text("/cron")]), Some(String::new()));
+        assert_eq!(cron_arguments(&[text("/cronjob")]), None);
+        assert_eq!(cron_arguments(&[text("please /cron 5m x")]), None);
+        assert_eq!(cron_arguments(&[text("/cron 5m x"), text("more")]), None);
+        assert_eq!(
+            cron_arguments(&[ContentBlock::ResourceLink(ResourceLink::new(
+                "/cron 5m x",
+                "file:///data"
+            ))]),
+            None
+        );
+        assert_eq!(classify(&[text("/cron 5m x")]).unwrap(), None);
     }
 }
