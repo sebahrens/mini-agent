@@ -148,6 +148,10 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("keep_recent_tokens").shaped(ConfigShape::Integer),
     key("keep_recent_tool_results").described("Number of newest historical tool results kept verbatim in the live model context.").shaped(ConfigShape::Integer),
     key("max_agent_turns").shaped(ConfigShape::Integer),
+    key("cron_max_fires")
+        .described("Fires each /cron entry may start before it is removed (default 24)")
+        .live()
+        .shaped(ConfigShape::Integer),
     key("verify_command").described("Trusted operator command run before a tool-using turn may complete. Project-local values require the existing sensitive-config approval.").shaped(ConfigShape::String),
     key("format")
         .described("Formatter command templates by extension")

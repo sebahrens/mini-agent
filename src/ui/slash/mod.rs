@@ -2,6 +2,7 @@ pub(crate) mod add;
 pub(crate) mod config;
 mod content;
 pub(crate) mod context;
+mod cron;
 mod doctor;
 mod features;
 #[cfg(feature = "git-worktree")]
@@ -743,6 +744,12 @@ pub(crate) fn is_tasks_control(text: &str) -> bool {
     cfg!(feature = "subagents") && split_command(text).first().copied() == Some("/tasks")
 }
 
+/// Every `/cron` verb only edits the schedule store (a fire waits for idle),
+/// so all of them are safe while a run is active.
+pub(crate) fn is_cron_control(text: &str) -> bool {
+    split_command(text).first().copied() == Some("/cron")
+}
+
 pub(crate) fn is_jobs_control(text: &str) -> bool {
     matches!(split_command(text).as_slice(), ["/jobs"])
         || matches!(split_command(text).as_slice(), ["/jobs", "stop", id] if !id.contains(char::is_whitespace))
@@ -871,6 +878,7 @@ pub(crate) async fn handle_slash(
     slash: &mut SlashState,
     _chain: &mut ChainState,
     terminal_guard: &mut TerminalGuard,
+    cron_store: &mut crate::ui::cron::CronStore,
 ) -> anyhow::Result<()> {
     let parts = split_command(text);
     let path_args: Vec<String> = if takes_path_args(parts[0]) {
@@ -982,6 +990,18 @@ pub(crate) async fn handle_slash(
         // `/memory write <target> <content>` and `/memory read daily <date>`
         // need more than the three fields the generic split above yields.
         "/memory" => memory::handle(&memory::split_command(text), &mut ctx).await,
+        "/cron" => {
+            let budget_capped = ctx.cli.resolve_max_budget_usd(ctx.cfg)?.is_some();
+            cron::handle(
+                &parts,
+                cron_store,
+                ctx.renderer,
+                ctx.cfg.resolve_cron_max_fires(),
+                budget_capped,
+                tokio::time::Instant::now(),
+            );
+            Ok(())
+        }
         "/loop" => {
             features::handle(&parts, &mut ctx).await?;
             #[cfg(feature = "loop")]

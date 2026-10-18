@@ -207,6 +207,7 @@ reproducing code; focus on structure, relationships, and rationale.
 - `src/startup.rs` — resolved workspace, session, permission and provider setup
 - `src/ui/app.rs` — interactive application loop
 - `src/ui/slash/` — slash command handlers
+- `src/ui/cron.rs` — session-local `/cron` schedule store (`CronStore`), interval grammar and limits; owned by the TUI `App`, edited by `src/ui/slash/cron.rs`
 ```
 
 ## Comparison with AGENTS.md

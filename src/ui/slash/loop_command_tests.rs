@@ -319,3 +319,43 @@ async fn loop_with_an_empty_prompt_prints_usage_and_sets_no_goal() {
         assert!(session.goal_store.snapshot().is_none(), "{blank:?}");
     }
 }
+
+/// `/loop` starts round 1 at once, so an interval-first argument (a `/cron`
+/// typo) is refused with a hint instead of burning a goal round; a prompt
+/// whose first word merely starts like an interval still starts a loop.
+#[tokio::test]
+async fn loop_refuses_an_interval_first_argument_with_a_cron_hint() {
+    let root = fixture_root("loop-cron-hint");
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+    let mut context = context_for(workspace.root());
+    let mut session = Session::new("openrouter", "loop-model", 128_000, "loop-cron-hint");
+
+    let lines = run_loop_command("/loop 5m check CI", &mut session, &mut context, &workspace).await;
+    assert_eq!(
+        lines,
+        ["/loop takes a prompt, not an interval; did you mean /cron 5m check CI?"]
+    );
+    assert!(session.goal_store.snapshot().is_none());
+    let lines = run_loop_command("/loop 30s", &mut session, &mut context, &workspace).await;
+    assert_eq!(
+        lines,
+        ["/loop takes a prompt, not an interval; did you mean /cron 30s?"]
+    );
+    assert!(session.goal_store.snapshot().is_none());
+
+    let lines = run_loop_command(
+        "/loop 5minute-plan the release",
+        &mut session,
+        &mut context,
+        &workspace,
+    )
+    .await;
+    assert!(
+        lines.iter().any(|line| line.starts_with("loop started")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        session.goal_store.snapshot().unwrap().objective,
+        "5minute-plan the release"
+    );
+}

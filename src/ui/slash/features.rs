@@ -87,6 +87,24 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         return Ok(());
     }
 
+    // `/loop` starts round 1 at once, so `/loop 5m check CI` meant as a
+    // schedule would burn a goal round on "5m check CI". The whole first
+    // token must match the interval grammar, so `5minute-plan` still passes.
+    if crate::ui::cron::is_interval_token(parts[1]) {
+        let rest = parts
+            .get(2)
+            .map(|rest| format!(" {rest}"))
+            .unwrap_or_default();
+        write_error(
+            ctx.renderer,
+            format!(
+                "/loop takes a prompt, not an interval; did you mean /cron {}{rest}?",
+                parts[1]
+            ),
+        );
+        return Ok(());
+    }
+
     let prompt = parts[1..].join(" ");
     if prompt.trim().is_empty() {
         write_error(ctx.renderer, "usage: /loop <prompt>");
