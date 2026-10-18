@@ -314,6 +314,7 @@ Here is some keybindings to speed up your coding experience:
 | `Shift+Enter` / `Alt+Enter` | Insert a newline |
 | `/` | Open the command picker; Tab inserts the highlight, Enter runs a command or argument typed in full |
 | `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path, a space closes it |
+| `@agent:<name>` | Ask the model to delegate the request to that specialist persona through `task` (see [SUBAGENTS.md](SUBAGENTS.md)); unknown names are refused |
 | `Tab` | Insert two spaces when no picker is active |
 
 ## 5. CLI flags

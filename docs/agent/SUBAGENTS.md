@@ -207,6 +207,26 @@ sorted valid personas, and untrusted-project personas never resolve.
 The `task` schema describes specialists as read-only by default and documents
 the explicit opt-in for implementation personas.
 
+### Referencing a specialist with `@agent:`
+
+In the TUI, a submitted message that contains `@agent:<name>` (the `@` picker
+inserts it) is a routing hint, not a dispatch, matching Claude Code. The
+message is sent as typed, with resolved `@agent-<name>` aliases rewritten to
+`@agent:<name>`; that normalised text is what the echo line, the saved
+transcript, rewind, hooks and the session title see. For that one request the
+model also receives a non-persisted host routing note (the
+`PromptInput.turn_directive` block) asking it to delegate through `task` with
+`agent_type` set to each named persona and to write the brief itself; several
+names may become parallel briefs. The note carries no persona content or
+authority, and the `task` tool prompt describes the same convention.
+
+An unknown canonical name is refused before anything is echoed or sent: the
+error lists the valid personas and the draft returns to the editor. The same
+resolution applies to queued input replayed after a turn and to input queued
+behind a Git proposal. A message with `@mcp:` mentions takes the MCP resource
+path first. Without the `subagents` feature the text is sent literally.
+Headless `-p` and ACP prompts do not resolve `@agent:` yet.
+
 ### Opt-in implementation personas
 
 Enable workspace-writing children explicitly in the parent configuration:

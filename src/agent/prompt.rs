@@ -83,7 +83,7 @@ pub const FIND_FILES_TOOL_PROMPT: &str =
 pub const LIST_DIR_TOOL_PROMPT: &str =
     "\n- **list_dir** lists a directory; do not re-list unchanged directories.";
 pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's persistent task list; use it for work with at least three dependent steps or progress that must survive compaction. Keep at most one item in progress and update milestones. The list holds at most 50 short items (500 characters each). **todo_read** recalls the list after compaction or an agent rebuild.";
-pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates read-only investigation to fresh-context subagents. Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema.";
+pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates read-only investigation to fresh-context subagents. Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself.";
 
 /// Appended to the preamble when LSP integration is active (`[lsp]
 /// enabled = true`) and its query tool is registered.
@@ -189,6 +189,7 @@ mod tests {
         assert!(TODO_TOOL_PROMPT.contains("at least three dependent steps"));
         assert!(TASK_TOOL_PROMPT.contains("two or more independent"));
         assert!(TASK_TOOL_PROMPT.contains("expected evidence"));
+        assert!(TASK_TOOL_PROMPT.contains("`@agent:<name>`"));
         assert!(JS_TOOL_PROMPT.contains("repository toolchains"));
         assert!(JS_TOOL_PROMPT.contains("direct file lookup"));
     }

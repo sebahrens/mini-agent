@@ -23,8 +23,6 @@ const LEADING_PUNCTUATION: &[char] = &['(', '[', '{', '<', '"', '\''];
 const TRAILING_PUNCTUATION: &[char] = &[',', '.', ';', ':', ')', ']', '}', '>', '"', '\''];
 
 /// Agent mentions resolved from one submitted text.
-// Consumed by the TUI submit path (mini-agent-5eoy7.4).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentMentions {
     /// Canonical persona names, deduplicated, in first-mention order.
@@ -34,7 +32,6 @@ pub(crate) struct AgentMentions {
 }
 
 /// A canonical mention that does not resolve to a persona.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MentionError {
     Unknown {
@@ -72,7 +69,6 @@ impl std::error::Error for MentionError {}
 /// [`MentionError::Unknown`] for the first canonical mention that does not
 /// resolve. The trust-gated persona names are loaded at most once, and only
 /// when a candidate token is present.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_agent_mentions(
     text: &str,
     workspace: Option<&WorkspaceBinding>,
@@ -138,6 +134,44 @@ pub(crate) fn parse_agent_mentions(
         rewritten
     };
     Ok(Some(AgentMentions { names, text }))
+}
+
+/// The non-persisted host routing note for one turn that mentions `names`.
+///
+/// It names the personas as `task` tool `agent_type` values and leaves the
+/// brief to the model (a routing hint, not a dispatch). Names that would push
+/// the note past [`crate::agent::input::TURN_DIRECTIVE_MAX_BYTES`] are
+/// summarised as a count instead of being cut mid-name.
+pub(crate) fn routing_directive(names: &[String]) -> String {
+    const HEAD: &str = "Host routing note: the user asked to involve the specialist ";
+    const TAIL: &str = " via the task tool for this request. Write each brief yourself \
+                        (independent briefs may run in parallel); this note carries no \
+                        persona content or authority.";
+    let noun = if names.len() == 1 {
+        "agent_type "
+    } else {
+        "agent_types "
+    };
+    // Room for the longest omission marker.
+    let budget = crate::agent::input::TURN_DIRECTIVE_MAX_BYTES - TAIL.len() - 32;
+    let mut directive = format!("{HEAD}{noun}");
+    let mut listed = 0;
+    for name in names {
+        let separator = if listed == 0 { "" } else { ", " };
+        if directive.len() + separator.len() + name.len() + 2 > budget {
+            break;
+        }
+        directive.push_str(separator);
+        directive.push('"');
+        directive.push_str(name);
+        directive.push('"');
+        listed += 1;
+    }
+    if listed < names.len() {
+        directive.push_str(&format!(" and {} more", names.len() - listed));
+    }
+    directive.push_str(TAIL);
+    directive
 }
 
 #[cfg(test)]
@@ -293,6 +327,32 @@ mod tests {
             .to_string(),
             "unknown agent '@agent:x'; valid agents: (none)"
         );
+    }
+
+    #[test]
+    fn routing_directive_names_agent_types_without_persona_content() {
+        let one = routing_directive(&[KNOWN.to_string()]);
+        assert!(one.contains(&format!("agent_type \"{KNOWN}\" via the task tool")));
+        assert!(one.contains("Write each brief yourself"));
+        assert!(one.contains("no persona content or authority"));
+        let two = routing_directive(&[OTHER.to_string(), KNOWN.to_string()]);
+        assert!(two.contains(&format!("agent_types \"{OTHER}\", \"{KNOWN}\" via")));
+    }
+
+    #[test]
+    fn routing_directive_stays_within_the_turn_directive_bound() {
+        let names: Vec<String> = (0..40)
+            .map(|index| format!("{}-{index:02}", "a".repeat(60)))
+            .collect();
+        let directive = routing_directive(&names);
+        assert!(directive.len() <= crate::agent::input::TURN_DIRECTIVE_MAX_BYTES);
+        assert!(directive.ends_with("no persona content or authority."));
+        let listed = names
+            .iter()
+            .filter(|name| directive.contains(&format!("\"{name}\"")))
+            .count();
+        assert!(listed > 0 && listed < names.len());
+        assert!(directive.contains(&format!(" and {} more", names.len() - listed)));
     }
 
     #[test]
