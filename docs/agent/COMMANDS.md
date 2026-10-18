@@ -433,20 +433,50 @@ starting a round.
 
 ## Cron
 
-`/cron` repeats a plain prompt in the current session on a fixed interval. It
-is available in every build and every verb works while the agent is running;
-arming, listing and stopping only edit the schedule.
+`/cron` repeats a plain prompt in the current session, either on a fixed
+interval or self-paced (the model chooses each next fire). It is available in
+every build and every verb works while the agent is running; arming, listing
+and stopping only edit the schedule.
 
 | Command | Description |
 | ------- | ----------- |
 | `/cron <interval> <prompt>` | Arm a schedule. The interval is digits plus `s`, `m` or `h` (`90s`, `5m`, `2h`). The minimum is `1m` (a shorter interval is raised to it with a notice) and the maximum is `24h`. The first fire is one interval from now. |
-| `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), interval, time until the next fire, fires so far out of `cron_max_fires`, and the prompt. |
+| `/cron <prompt>` | Arm a self-paced schedule (see below). Any first word that is not an interval and not `list`, `stop` or `run` starts the prompt. The first fire runs at the next idle point. |
+| `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), `every <interval>` or `self-paced`, time until the next fire (`running` while a self-paced fire's turn has not chosen one yet), fires so far out of `cron_max_fires`, and the prompt. |
 | `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
 | `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
 
-- **Prompts only.** A payload starting with `/` or `!` is refused with a
-  one-line reason, so a schedule never runs slash commands or shell lines (and
-  cannot re-arm itself with `/cron`).
+- **Prompts, plus a read-only slash allowlist.** A payload starting with `!`
+  is always refused with a one-line reason. A payload starting with `/` is
+  refused unless it is exactly one of `/goal status`, `/tasks`, `/jobs` or
+  `/cost` (interval schedules only). Those commands only read and print: they
+  never start a model run, edit the session or touch a running turn. Such a
+  fire runs the command through the normal slash dispatcher at the idle point
+  instead of starting a turn, so it needs no model request and no budget.
+  Everything else (`/steer`, `/btw`, `/queue`, `/loop`, `/cron`, any other
+  command or argument form) stays refused, so a schedule can never re-arm
+  itself or steer a turn.
+- **Self-paced schedules.** A `/cron <prompt>` schedule has no interval.
+  Only during the turn of one of its fires, the model is offered the
+  `schedule_wakeup` tool (`delay_secs` integer, `reason` string, `noop`
+  boolean; see [TOOL_RUNTIME.md](TOOL_RUNTIME.md#turn-scoped-cron-tool)). The
+  delay is clamped to `60..=3600` seconds (`5` becomes 60, `99999` becomes
+  3600) and the next fire is set that long after the turn ends; the last call
+  of a turn wins. A turn that ends (or is interrupted) without a call stops the
+  schedule with a notice, so a self-paced schedule cannot run away. The next
+  delay is never read from the response text. The chat shows
+  `⟳ cron c1 (self-paced): <prompt>` for each fire and
+  `⟳ cron c1: next wakeup in 5m · <reason>` after it. A self-paced prompt
+  cannot be a slash command, and one whose second word is an interval
+  (`/cron every 5m x`) is refused with a hint to put the interval first.
+  `cron_max_fires` applies as for interval schedules.
+- **Noop collapse.** A self-paced fire whose call sets `noop: true` ends with
+  one line `⟳ cron c1: no change · next in 10m · <reason>`. When the next fire
+  of the same schedule is also a noop and nothing else was written to the
+  chat in between, that fire's marker and output are removed from the chat
+  view and the line is rewritten as `⟳ cron c1: no change ×2 ...` (`×3`, ...).
+  This is display-only: every fired prompt and response stays in the session
+  as ordinary messages.
 - **Idle-only firing.** A schedule fires only when no run, live goal
   (running, paused or waiting), permission or question prompt, unanswered
   model question, chain or plan prompt, pending Git proposal or Git command,
@@ -465,9 +495,12 @@ arming, listing and stopping only edit the schedule.
   waits for your answer like any other; it is never auto-approved, and no
   other schedule fires until it is answered.
 - **Interrupting.** Ctrl-C stops a running fire's turn but keeps its
-  schedule (the prompt is not loaded into the editor). Esc at an idle, empty
-  editor clears parked fires without removing schedules. Quitting drops every
-  schedule.
+  schedule (the prompt is not loaded into the editor); a self-paced schedule
+  is kept only when the interrupted turn had already called
+  `schedule_wakeup`. Esc at an idle, empty editor clears parked fires without
+  removing interval schedules, and clears the pending wakeup of every
+  self-paced schedule, which stops it (it has no interval to fall back to).
+  Quitting drops every schedule.
 - **Bounded.** At most 16 schedules per session, and each is removed after
   `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
 - **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a

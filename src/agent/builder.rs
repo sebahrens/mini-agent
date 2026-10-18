@@ -68,6 +68,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "skills_search"
             | "ask_user_question"
             | "mcp_search"
+            | "schedule_wakeup"
     )
 }
 
@@ -2484,6 +2485,7 @@ mod mcp_tests {
             "advisor",
             "lsp_diagnostics",
             "skills_search",
+            <crate::agent::tools::schedule_wakeup::ScheduleWakeup as rig::tool::Tool>::NAME,
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }

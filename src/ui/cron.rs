@@ -148,6 +148,12 @@ pub(crate) struct CronEntry {
     pub fires: u32,
     /// The plain prompt submitted on each fire.
     pub payload: String,
+    /// Self-paced: the model picks each next fire with `schedule_wakeup`
+    /// during the fire's turn; `interval` is unused (zero).
+    pub dynamic: bool,
+    /// A dynamic entry's fire is running and its next deadline is not chosen
+    /// yet; it neither parks nor drives the wakeup until the turn settles.
+    pub in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +172,8 @@ pub(crate) struct CronFire {
     pub fire: u32,
     /// This fire reached `cron_max_fires` and the entry was removed.
     pub retired: bool,
+    /// The entry is self-paced; its turn is offered `schedule_wakeup`.
+    pub dynamic: bool,
 }
 
 /// Aggregate view for the statusline.
@@ -228,8 +236,70 @@ impl CronStore {
             due: false,
             fires: 0,
             payload,
+            dynamic: false,
+            in_flight: false,
         });
         Ok(self.entries.last().expect("just pushed"))
+    }
+
+    /// Arm a self-paced entry. Its first fire is parked for the next idle
+    /// point; each later deadline comes from that fire's `schedule_wakeup`.
+    pub(crate) fn arm_dynamic(
+        &mut self,
+        payload: String,
+        now: Instant,
+    ) -> Result<&CronEntry, ArmError> {
+        if self.entries.len() >= CRON_MAX_ENTRIES {
+            return Err(ArmError::Full);
+        }
+        self.last_id += 1;
+        self.entries.push(CronEntry {
+            id: format!("c{}", self.last_id),
+            interval: Duration::ZERO,
+            next_at: now,
+            due: true,
+            fires: 0,
+            payload,
+            dynamic: true,
+            in_flight: false,
+        });
+        Ok(self.entries.last().expect("just pushed"))
+    }
+
+    /// Apply a dynamic fire's `schedule_wakeup`: the next deadline is
+    /// `now + delay`. `false` when the entry is gone (stopped or retired).
+    pub(crate) fn schedule_wakeup(&mut self, id: &str, delay: Duration, now: Instant) -> bool {
+        match self.entries.iter_mut().find(|entry| entry.id == id) {
+            Some(entry) => {
+                entry.in_flight = false;
+                entry.due = false;
+                entry.next_at = now + delay;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove every dynamic entry that is waiting for its next wakeup (Esc at
+    /// idle), returning their ids. A dynamic entry has no interval to fall
+    /// back to, so clearing its wakeup ends it.
+    pub(crate) fn clear_dynamic_wakeups(&mut self) -> Vec<String> {
+        let mut cleared = Vec::new();
+        self.entries.retain(|entry| {
+            let clear = entry.dynamic && !entry.in_flight;
+            if clear {
+                cleared.push(entry.id.clone());
+            }
+            !clear
+        });
+        cleared
+    }
+
+    /// Whether any dynamic entry is waiting for its next wakeup.
+    pub(crate) fn has_dynamic_wakeup(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.dynamic && !entry.in_flight)
     }
 
     /// Remove one entry; `false` when no entry has that id.
@@ -263,7 +333,7 @@ impl CronStore {
     pub(crate) fn mark_expired_due(&mut self, now: Instant) -> usize {
         let mut newly = 0;
         for entry in &mut self.entries {
-            if !entry.due && entry.next_at <= now {
+            if !entry.due && !entry.in_flight && entry.next_at <= now {
                 entry.due = true;
                 newly += 1;
             }
@@ -307,14 +377,16 @@ impl CronStore {
         }
         self.entries
             .iter()
-            .filter(|entry| !entry.due)
+            .filter(|entry| !entry.due && !entry.in_flight)
             .map(|entry| entry.next_at)
             .min()
     }
 
     /// Start a fire for `id`: clear its parked flag, move its deadline to
     /// `now + interval` before the turn runs (so a long turn cannot double
-    /// fire), count it, and remove the entry once it reaches `max_fires`.
+    /// fire), count it, and remove the entry once it reaches `max_fires`. A
+    /// dynamic entry instead goes in flight until its turn's
+    /// `schedule_wakeup` (or its absence) settles it.
     pub(crate) fn begin_fire(
         &mut self,
         id: &str,
@@ -325,6 +397,7 @@ impl CronStore {
         let entry = &mut self.entries[index];
         entry.due = false;
         entry.next_at = now + entry.interval;
+        entry.in_flight = entry.dynamic;
         entry.fires = entry.fires.saturating_add(1);
         let fire = CronFire {
             id: entry.id.clone(),
@@ -332,6 +405,7 @@ impl CronStore {
             payload: entry.payload.clone(),
             fire: entry.fires,
             retired: entry.fires >= max_fires.max(1),
+            dynamic: entry.dynamic,
         };
         if fire.retired {
             self.entries.remove(index);
@@ -554,6 +628,45 @@ mod tests {
         assert!(!store.has_due());
         assert!(store.take_budget_warning());
         assert!(!store.take_budget_warning());
+    }
+
+    #[test]
+    fn dynamic_entries_fire_first_at_idle_and_reschedule_from_the_wakeup() {
+        let now = Instant::now();
+        let mut store = CronStore::default();
+        let entry = store.arm_dynamic("watch ci".into(), now).unwrap();
+        assert!(entry.dynamic && entry.due && entry.id == "c1");
+        assert_eq!(store.next_due_id(), Some("c1"));
+
+        let fire = store.begin_fire("c1", now, 24).unwrap();
+        assert!(fire.dynamic && !fire.retired);
+        let entry = store.get("c1").unwrap();
+        assert!(entry.in_flight && !entry.due);
+        // In flight: never parked again and never drives the wakeup.
+        assert_eq!(store.mark_expired_due(now + secs(7200)), 0);
+        assert_eq!(store.next_deadline(), None);
+        assert!(!store.has_dynamic_wakeup());
+        assert!(store.clear_dynamic_wakeups().is_empty());
+
+        assert!(store.schedule_wakeup("c1", secs(300), now + secs(10)));
+        let entry = store.get("c1").unwrap();
+        assert!(!entry.in_flight && !entry.due);
+        assert_eq!(store.next_deadline(), Some(now + secs(310)));
+        assert!(store.has_dynamic_wakeup());
+        assert!(!store.schedule_wakeup("c9", secs(60), now));
+    }
+
+    #[test]
+    fn clearing_dynamic_wakeups_keeps_interval_entries() {
+        let now = Instant::now();
+        let mut store = CronStore::default();
+        store.arm(secs(60), "tick".into(), now).unwrap();
+        store.arm_dynamic("watch".into(), now).unwrap();
+        store.arm_dynamic("busy".into(), now).unwrap();
+        store.begin_fire("c3", now, 24).unwrap();
+        assert_eq!(store.clear_dynamic_wakeups(), ["c2"]);
+        let ids: Vec<_> = store.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c3"], "the in-flight fire settles on its own");
     }
 
     #[test]

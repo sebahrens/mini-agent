@@ -389,3 +389,326 @@ async fn cron_teardown_drops_every_entry() {
     drop(app);
     provider.finish().await;
 }
+
+// mini-agent-5eoy7.9: self-paced entries, the turn-scoped `schedule_wakeup`
+// tool, noop collapse and the read-only slash allowlist.
+
+fn offers_wakeup(request: &serde_json::Value) -> bool {
+    request["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "schedule_wakeup")
+    })
+}
+
+fn feed_blocks(app: &App<'_>) -> Vec<String> {
+    let feed = app.renderer.feed();
+    (0..feed.block_count())
+        .map(|index| feed.block_text(index).unwrap().to_string())
+        .collect()
+}
+
+fn arm_dynamic(app: &mut App<'_>, payload: &str) -> String {
+    app.cron
+        .arm_dynamic(payload.to_owned(), Instant::now())
+        .unwrap()
+        .id
+        .clone()
+}
+
+#[tokio::test]
+async fn cron_dynamic_fire_reschedules_from_its_clamped_tool_call_and_only_it_sees_the_tool() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["wakeup:5:false", "WOKE_DONE", "USER_DONE"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let id = arm_dynamic(&mut app, "watch ci");
+    // The first fire is parked for the next idle point.
+    assert!(app.cron_wakeup().is_some_and(|at| at <= Instant::now()));
+    fire(&mut app).await;
+    assert!(app.run.is_running);
+    let entry = app.cron.get(&id).unwrap();
+    assert!(entry.in_flight && entry.fires == 1);
+    assert_eq!(app.cron_wakeup(), None, "an in-flight entry never wakes");
+    assert!(settle(&mut app).await);
+    assert!(!app.run.is_running);
+
+    let before = Instant::now();
+    let entry = app.cron.get(&id).unwrap();
+    assert!(!entry.in_flight && !entry.due);
+    // 5 s was clamped to the 60 s minimum, measured from the turn's end.
+    assert!(
+        entry.next_at > before + Duration::from_secs(55)
+            && entry.next_at <= before + Duration::from_secs(60),
+        "{:?}",
+        entry.next_at - before
+    );
+    let output = app.renderer.captured_output();
+    assert!(output.contains("⟳ cron c1 (self-paced): watch ci"), "{output}");
+    assert!(
+        output.contains("⟳ cron c1: next wakeup in 1m · owned reason"),
+        "{output}"
+    );
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(offers_wakeup), "both cron requests offer it");
+
+    // An ordinary turn afterwards never sees the tool.
+    user(&mut app, UserEvent::Paste("plain question".into())).await;
+    key(&mut app, KeyCode::Enter).await;
+    assert!(settle(&mut app).await);
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(!offers_wakeup(&calls[2]), "{}", calls[2]["tools"]);
+    assert_eq!(user_rows(&app), ["watch ci", "plain question"]);
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_interval_fires_never_offer_the_wakeup_tool() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["TICK_DONE"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+    arm_expired(&mut app, "tick", 1);
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(!offers_wakeup(&calls[0]));
+    assert_eq!(app.cron.len(), 1, "an interval entry needs no wakeup");
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_dynamic_turn_without_a_wakeup_call_retires_the_entry() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["NO_CALL"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    arm_dynamic(&mut app, "watch ci");
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    assert!(app.cron.is_empty(), "no call, no runaway");
+    assert!(app.run.cron_wakeup.is_none());
+    assert!(
+        app.renderer.captured_output().contains(
+            "cron c1: the turn ended without schedule_wakeup; self-paced schedule stopped"
+        )
+    );
+    assert_eq!(app.cron_wakeup(), None);
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_interrupted_dynamic_fire_without_a_wakeup_retires_the_entry() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["hold"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    arm_dynamic(&mut app, "long watch");
+    fire(&mut app).await;
+    assert!(app.run.is_running);
+    user(
+        &mut app,
+        UserEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    )
+    .await;
+    assert!(!app.run.is_running);
+    assert!(app.cron.is_empty());
+    assert!(app.input.buffer.is_empty());
+    drop(app);
+    provider.cancel().await;
+}
+
+#[tokio::test]
+async fn cron_consecutive_noop_fires_collapse_into_one_updated_line() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec![
+        "wakeup:600:true",
+        "QUIET_ONE",
+        "wakeup:600:true",
+        "QUIET_TWO",
+        "wakeup:600:true",
+        "QUIET_THREE",
+        "wakeup:120:false",
+        "CHANGED_FOUR",
+    ])
+    .await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let id = arm_dynamic(&mut app, "poll status");
+    for _ in 0..3 {
+        if !app.cron.get(&id).unwrap().due {
+            assert!(app.cron.mark_due(&id));
+        }
+        fire(&mut app).await;
+        assert!(settle(&mut app).await);
+    }
+    let blocks = feed_blocks(&app);
+    let noop: Vec<_> = blocks.iter().filter(|b| b.contains("no change")).collect();
+    assert_eq!(
+        noop,
+        ["⟳ cron c1: no change ×3 · next in 10m · owned reason"],
+        "{blocks:#?}"
+    );
+    assert_eq!(
+        blocks.last().map(String::as_str),
+        Some("⟳ cron c1: no change ×3 · next in 10m · owned reason")
+    );
+    // The first fire's echo and output stay; the repeats were retracted.
+    let echoes = blocks
+        .iter()
+        .filter(|b| b.starts_with("⟳ cron c1 (self-paced)"))
+        .count();
+    assert_eq!(echoes, 1, "{blocks:#?}");
+    assert!(blocks.iter().any(|b| b.contains("QUIET_ONE")));
+    assert!(
+        !blocks
+            .iter()
+            .any(|b| b.contains("QUIET_TWO") || b.contains("QUIET_THREE"))
+    );
+    // The session keeps every fired prompt.
+    assert_eq!(user_rows(&app), ["poll status"; 3]);
+
+    // A changed fire ends the streak with its own lines.
+    assert!(app.cron.mark_due(&id));
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    let blocks = feed_blocks(&app);
+    assert!(blocks.iter().any(|b| b.contains("CHANGED_FOUR")));
+    assert_eq!(
+        blocks.last().map(String::as_str),
+        Some("⟳ cron c1: next wakeup in 2m · owned reason")
+    );
+    assert_eq!(app.cron.get(&id).unwrap().fires, 4);
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_noop_streak_breaks_when_other_output_intervenes() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec![
+        "wakeup:600:true",
+        "QUIET_ONE",
+        "wakeup:600:true",
+        "QUIET_TWO",
+    ])
+    .await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let id = arm_dynamic(&mut app, "poll status");
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    app.renderer.write_line("unrelated notice", C_TOOL).unwrap();
+    assert!(app.cron.mark_due(&id));
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    let blocks = feed_blocks(&app);
+    let noop = blocks.iter().filter(|b| b.contains("no change")).count();
+    assert_eq!(noop, 2, "{blocks:#?}");
+    assert!(blocks.iter().any(|b| b.contains("QUIET_TWO")));
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_escape_clears_a_pending_wakeup_and_keeps_interval_schedules() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec![]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let now = Instant::now();
+    app.cron
+        .arm(Duration::from_secs(600), "tick".into(), now)
+        .unwrap();
+    let id = arm_dynamic(&mut app, "watch");
+    app.cron.begin_fire(&id, now, 24).unwrap();
+    assert!(app.cron.schedule_wakeup(&id, Duration::from_secs(300), now));
+    key(&mut app, KeyCode::Esc).await;
+    assert_eq!(app.cron.len(), 1);
+    assert!(app.cron.get("c1").is_some() && app.cron.get(&id).is_none());
+    assert!(
+        app.renderer
+            .captured_output()
+            .contains("cron: cleared the pending wakeup of c2; self-paced schedule(s) stopped")
+    );
+    // Nothing left to clear: Escape keeps its ordinary meaning.
+    assert!(!app.clear_parked_cron_fires().unwrap());
+    assert!(provider.calls().is_empty());
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_allowlisted_slash_payload_fires_without_a_model_request() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec![]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let id = arm_expired(&mut app, "/jobs", 1);
+    fire(&mut app).await;
+    assert!(!app.run.is_running && provider.calls().is_empty());
+    let output = app.renderer.captured_output();
+    assert!(output.contains("⟳ cron c1 (every 1m): /jobs"), "{output}");
+    assert!(
+        output.contains("no background jobs in this session"),
+        "{output}"
+    );
+    assert!(user_rows(&app).is_empty() && app.input.buffer.is_empty());
+    let entry = app.cron.get(&id).unwrap();
+    assert!(!entry.due && entry.fires == 1 && entry.next_at > Instant::now());
+    drop(app);
+    provider.finish().await;
+}

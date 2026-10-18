@@ -3560,7 +3560,13 @@ impl AnyAgent {
     pub(crate) async fn context_tool_definitions(
         &self,
     ) -> anyhow::Result<Vec<rig::completion::ToolDefinition>> {
-        let handle = match &self.inner {
+        Ok(self.tool_server().get_tool_defs(None).await?)
+    }
+
+    /// The tool server every clone and per-turn preparation of this agent
+    /// shares, so a registration here is visible to the next request.
+    fn tool_server(&self) -> &rig::tool::server::ToolServerHandle {
+        match &self.inner {
             AnyAgentInner::OpenRouter(a) => &a.tool_server_handle,
             AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &a.tool_server_handle,
             AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &a.tool_server_handle,
@@ -3568,8 +3574,23 @@ impl AnyAgent {
             AnyAgentInner::Gemini(a) => &a.tool_server_handle,
             AnyAgentInner::Ollama(a) => &a.tool_server_handle,
             AnyAgentInner::Copilot(a) => &a.tool_server_handle,
-        };
-        Ok(handle.get_tool_defs(None).await?)
+        }
+    }
+
+    /// Register a harness control tool for one turn only (the dynamic
+    /// `/cron` `schedule_wakeup`). The caller removes it with
+    /// [`Self::remove_turn_tool`] when that turn ends.
+    pub(crate) async fn add_turn_tool(
+        &self,
+        tool: impl rig::tool::ToolDyn + 'static,
+    ) -> anyhow::Result<()> {
+        Ok(self.tool_server().add_tool(tool).await?)
+    }
+
+    /// Remove a tool registered by [`Self::add_turn_tool`]; a no-op when it
+    /// is not registered.
+    pub(crate) async fn remove_turn_tool(&self, name: &str) -> anyhow::Result<()> {
+        Ok(self.tool_server().remove_tool(name).await?)
     }
 
     pub(crate) fn with_turn_token_budget(mut self, budget: Option<u64>) -> Self {

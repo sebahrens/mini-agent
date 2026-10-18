@@ -1218,6 +1218,21 @@ pub(crate) async fn start_main_run(
     .await
 }
 
+/// Register the turn-scoped `schedule_wakeup` tool when the scheduler armed
+/// [`AgentRunState::cron_wakeup`] for this turn; a no-op otherwise.
+async fn register_cron_wakeup(run: &mut AgentRunState) -> anyhow::Result<()> {
+    if let Some(slot) = run.cron_wakeup.as_ref()
+        && let Some(agent) = run.agent.as_ref()
+    {
+        agent
+            .add_turn_tool(crate::agent::tools::schedule_wakeup::ScheduleWakeup::new(
+                slot.clone(),
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
 /// [`start_main_run`] with an optional non-persisted host directive for this
 /// request only. `text` alone is captured by `PendingMainTurn`, saved as the
 /// user message and passed to the UserPromptSubmit hook; the directive is
@@ -1295,6 +1310,11 @@ pub(crate) async fn start_main_run_with_directive(
     resolve_prebuild(&mut run.agent, ui, prebuild, slash.reasoning_enabled).await;
 
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
+    // A self-paced `/cron` fire offers `schedule_wakeup` on the exact agent
+    // this turn runs (after any rebuild above), before its first request.
+    if matches!(question_origin, crate::question::QuestionOrigin::Scheduled) {
+        register_cron_wakeup(run).await?;
+    }
     run.request_tool_results_cleared = ui
         .session
         .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
@@ -1738,6 +1758,9 @@ pub(crate) async fn mid_turn_compact_and_respawn(
 
     // 4. Respawn on the compacted history with the continuation prompt.
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
+    // Context relief may have rebuilt the agent; a self-paced `/cron` turn
+    // keeps its `schedule_wakeup` across the respawn.
+    register_cron_wakeup(run).await?;
     run.request_tool_results_cleared = ui
         .session
         .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());

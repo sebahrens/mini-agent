@@ -324,6 +324,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(
         false,
+        "  /cron <prompt>         self-paced: the model picks each next fire (1m..1h)",
+    );
+    emit(
+        false,
         "  /cron [list]           list schedules: id, interval, next fire, fires",
     );
     emit(

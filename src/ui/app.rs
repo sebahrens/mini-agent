@@ -155,6 +155,8 @@ pub(super) mod test_support {
             },
             cron: Default::default(),
             cron_turn: None,
+            cron_dynamic: None,
+            cron_noop: None,
             renderer: Renderer::for_app_test().unwrap(),
             input,
             loop_state: EventLoopState::default(),
@@ -1271,6 +1273,12 @@ pub(crate) struct App<'a> {
     /// Payload of the scheduler fire whose turn is running, so an interrupt
     /// does not load it into the user's editor.
     cron_turn: Option<String>,
+    /// The self-paced `/cron` fire whose turn is running; settled (tool
+    /// removed, next wakeup applied or entry retired) when that turn ends.
+    cron_dynamic: Option<cron_app::DynamicCronTurn>,
+    /// The latest collapsed noop line, which the next consecutive noop fire
+    /// of the same entry updates in place.
+    cron_noop: Option<cron_app::NoopLine>,
 
     renderer: Renderer,
     input: InputEditor,
@@ -2156,6 +2164,8 @@ impl<'a> App<'a> {
             slash,
             cron: Default::default(),
             cron_turn: None,
+            cron_dynamic: None,
+            cron_noop: None,
             renderer,
             input,
             loop_state: EventLoopState::default(),
@@ -4542,6 +4552,11 @@ impl<'a> App<'a> {
     }
 
     async fn finalize_turn(&mut self) -> anyhow::Result<()> {
+        // A self-paced cron turn settles before anything below can start the
+        // next turn (queued input), so its tool never leaks into that turn.
+        if !self.run.is_running {
+            self.settle_dynamic_cron_turn().await?;
+        }
         #[cfg(feature = "git-worktree")]
         if self.chain.git.pending.is_some() {
             return Ok(());
@@ -4781,8 +4796,10 @@ impl<'a> App<'a> {
             self.chain.loop_label = None;
         }
         // An interrupted scheduler fire keeps its schedule; its payload is not
-        // the user's draft.
+        // the user's draft. A self-paced fire keeps it only when its turn
+        // already chose a wakeup.
         let scheduled = self.cron_turn.take();
+        self.settle_dynamic_cron_turn().await?;
         if let Some(text) = failed_prompt
             && scheduled.as_deref() != Some(text.as_str())
         {
@@ -14065,9 +14082,13 @@ mod plan_approval_tests {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-cost-compact","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
                             } else if text == "ask-read" {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"read-plan80","type":"function","function":{"name":"read","arguments":"{\"path\":\"held.txt\"}"}}]})
+                            } else if let Some(spec) = text.strip_prefix("wakeup:") {
+                                // `wakeup:<delay_secs>:<noop>` calls the turn-scoped cron tool.
+                                let (delay, noop) = spec.split_once(':').unwrap();
+                                serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":format!("wakeup-{delay}-{noop}"),"type":"function","function":{"name":"schedule_wakeup","arguments":serde_json::json!({"delay_secs":delay.parse::<i64>().unwrap(),"reason":"owned reason","noop":noop == "true"}).to_string()}}]})
                             } else { serde_json::json!({"role":"assistant","content":text}) };
                             let first = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
-                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again"|"skills-search"|"todo-progress67") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
+                            let last = serde_json::json!({"id":"owned-plan80","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":if matches!(text,"ask-read"|"cap-write"|"unknown-tool"|"pressure-read"|"question-batch"|"question-again"|"skills-search"|"todo-progress67") || text.starts_with("wakeup:") {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":if text=="pressure-read" {100000} else {9},"completion_tokens":4,"total_tokens":if text=="pressure-read" {100004} else {13}}});
                             ("200 OK",format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),"text/event-stream")
                         };
                         let wire = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());

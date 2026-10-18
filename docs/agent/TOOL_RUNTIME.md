@@ -363,6 +363,28 @@ expressions remain limited to strings, finite scalars, or plain JSON and use the
 smaller 64 KiB result channel.
 
 
+## Turn-scoped cron tool
+
+`schedule_wakeup` (`src/agent/tools/schedule_wakeup.rs`) is the one tool that
+is registered per turn rather than at agent build. When a self-paced `/cron`
+schedule fires, the TUI arms `AgentRunState::cron_wakeup`, and the
+`QuestionOrigin::Scheduled` start (`start_main_run_with_directive`) adds the
+tool to the agent's shared tool server (`AnyAgent::add_turn_tool`) after the
+agent is resolved and before the first request; a mid-turn context-relief
+respawn adds it again. `App::settle_dynamic_cron_turn` removes it
+(`AnyAgent::remove_turn_tool`) when that turn ends, is interrupted, or fails to
+start, before any queued input can start the next turn. Ordinary turns, interval
+fires, subagents and side questions (their own tool servers), headless `-p` and
+ACP never register it; the name is reserved against MCP shadowing and counts
+as non-mutating. Its parameters are `delay_secs` (integer, clamped to
+60..=3600), `reason` (string, kept as one line of at most 200 characters) and
+`noop` (boolean); unknown fields and non-integer delays are rejected. The call
+only records the request in a slot the scheduler reads after the turn; it has
+no other effect and needs no permission. Adding the definition for that turn
+changes the request's tool list, so a self-paced fire's requests do not share
+the provider prompt cache prefix with ordinary turns. See
+[COMMANDS.md](COMMANDS.md#cron).
+
 ## Native mutation result metadata
 
 [`src/agent/tools/mutation_diff.rs`](../../src/agent/tools/mutation_diff.rs) owns

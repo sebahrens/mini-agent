@@ -17,6 +17,7 @@ pub(crate) mod normalize;
 pub(crate) mod notebook;
 pub(crate) mod read;
 pub(crate) mod read_image;
+pub(crate) mod schedule_wakeup;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
 pub(crate) mod todo;
