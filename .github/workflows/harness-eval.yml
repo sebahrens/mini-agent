@@ -21,6 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # build.rs embeds the guarded Git runtime, which needs the native Git
+      # build prerequisites (curl-config and friends) before any Cargo step.
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
@@ -108,6 +113,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # build.rs embeds the guarded Git runtime, which needs the native Git
+      # build prerequisites (curl-config and friends) before any Cargo step.
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
