@@ -1000,7 +1000,9 @@ impl Feed {
         self.prune_completed_prefix();
     }
 
-    #[cfg(test)]
+    /// Drop every block from index `len` on (a collapsed `/cron` noop fire
+    /// retracts its own echo and output). Anchors live on the blocks
+    /// themselves, so nothing else refers to the removed indices.
     pub fn truncate_blocks(&mut self, len: usize) {
         self.touch(len);
         self.total_bytes = self

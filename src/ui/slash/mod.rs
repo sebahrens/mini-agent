@@ -2,7 +2,7 @@ pub(crate) mod add;
 pub(crate) mod config;
 mod content;
 pub(crate) mod context;
-mod cron;
+pub(crate) mod cron;
 mod doctor;
 mod features;
 #[cfg(feature = "git-worktree")]

@@ -649,6 +649,7 @@ pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
             | "skill_list"
             | "todo_read"
             | "ask_user_question"
+            | "schedule_wakeup"
     )
 }
 

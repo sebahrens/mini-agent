@@ -1650,6 +1650,7 @@ fn saved_cron_schedules_round_trip_and_unknown_fields_are_ignored() {
                 payload: "check the deploy".into(),
                 fires: 2,
                 next_fire_at: "2026-10-18T12:05:00Z".into(),
+                dynamic: false,
             },
             crate::session::SavedCronEntry {
                 id: "c3".into(),
@@ -1657,12 +1658,26 @@ fn saved_cron_schedules_round_trip_and_unknown_fields_are_ignored() {
                 payload: "summarise CI".into(),
                 fires: 0,
                 next_fire_at: "2026-10-18T13:00:00Z".into(),
+                dynamic: false,
+            },
+            crate::session::SavedCronEntry {
+                id: "c2".into(),
+                interval_secs: 0,
+                payload: "watch the queue".into(),
+                fires: 5,
+                next_fire_at: "2026-10-18T12:01:00Z".into(),
+                dynamic: true,
             },
         ],
     };
     save_session(&s).unwrap();
     let loaded = load_session_exact(&s.id).unwrap().unwrap();
     assert_eq!(loaded.cron_schedule, s.cron_schedule);
+    // `dynamic` is written only for self-paced entries, so interval entries
+    // (and files written before self-paced schedules) keep their exact shape.
+    let entries = serde_json::to_value(&s).unwrap()["cron_schedule"]["entries"].clone();
+    assert!(entries[0].get("dynamic").is_none() && entries[1].get("dynamic").is_none());
+    assert_eq!(entries[2]["dynamic"], true);
 
     // The session deserializer does not deny unknown fields, which is what
     // lets an older build load a file carrying `cron_schedule`.

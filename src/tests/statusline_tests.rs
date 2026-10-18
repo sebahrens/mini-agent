@@ -889,6 +889,7 @@ fn cron_summary(armed: usize, next_in: Option<u64>) -> crate::ui::cron::CronSumm
     crate::ui::cron::CronSummary {
         armed,
         next_in: next_in.map(std::time::Duration::from_secs),
+        running: 0,
         parked: 0,
         suspended: false,
     }
@@ -943,6 +944,39 @@ fn the_cron_item_shows_the_countdown_and_each_held_state() {
     let suspended = statusline::cron_label(suspended, true);
     assert_eq!(suspended.as_deref(), Some("⟳ 2 suspended"));
     assert_eq!(render(suspended.as_deref()), "⟳ 2 suspended");
+}
+
+#[test]
+fn the_cron_item_shows_a_running_self_paced_fire_and_then_its_wakeup_countdown() {
+    // In flight: the entry has no deadline until its turn calls
+    // `schedule_wakeup`, so the item says `running` rather than `armed`.
+    let running = crate::ui::cron::CronSummary {
+        running: 1,
+        ..cron_summary(1, None)
+    };
+    assert_eq!(
+        statusline::cron_label(running, false).as_deref(),
+        Some("⟳ 1 running")
+    );
+    // A prompt held by that turn still reads `waiting`.
+    assert_eq!(
+        statusline::cron_label(running, true).as_deref(),
+        Some("⟳ 1 waiting")
+    );
+    // Once the wakeup is chosen it is an ordinary countdown.
+    let mut store = crate::ui::cron::CronStore::default();
+    let now = tokio::time::Instant::now();
+    store.arm_dynamic("watch".into(), now).unwrap();
+    store.begin_fire("c1", now, 24).unwrap();
+    assert_eq!(
+        statusline::cron_label(store.summary(now), false).as_deref(),
+        Some("⟳ 1 running")
+    );
+    store.schedule_wakeup("c1", std::time::Duration::from_secs(300), now);
+    assert_eq!(
+        statusline::cron_label(store.summary(now), false).as_deref(),
+        Some("⟳ 1 in 5m")
+    );
 }
 
 #[test]

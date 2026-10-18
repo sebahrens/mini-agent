@@ -87,6 +87,8 @@ pub(crate) fn cron_label(summary: crate::ui::cron::CronSummary, waiting: bool) -
         "waiting".to_owned()
     } else if summary.parked > 0 {
         "parked".to_owned()
+    } else if summary.running > 0 {
+        "running".to_owned()
     } else {
         match summary.next_in {
             Some(left) if left < std::time::Duration::from_secs(60) => "in <1m".to_owned(),

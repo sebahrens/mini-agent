@@ -859,6 +859,11 @@ pub(crate) struct SavedCronEntry {
     /// Wall-clock RFC 3339 time the next fire was expected when saved. Display
     /// only: re-arming always schedules `now + interval` and never catches up.
     pub next_fire_at: CompactString,
+    /// Self-paced (`/cron <prompt>`): `interval_secs` is 0 and `/cron resume`
+    /// parks its first fire for the next idle point. Omitted when false, so
+    /// interval entries save exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic: bool,
 }
 
 /// The `/cron` schedule persisted with a session.

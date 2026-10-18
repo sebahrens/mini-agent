@@ -1496,6 +1496,18 @@ impl Renderer {
         &mut self.feed
     }
 
+    /// Remove the chat blocks from index `len` on and repaint the whole chat
+    /// on the next frame. Only for retracting lines this session just wrote
+    /// (a collapsed `/cron` noop fire); a selection over them is dropped.
+    pub(crate) fn retract_feed_to(&mut self, len: usize) {
+        if len >= self.feed.block_count() {
+            return;
+        }
+        self.feed.truncate_blocks(len);
+        self.clear_selection();
+        self.invalidate();
+    }
+
     /// Snapshot of everything the chat viewport currently paints.
     fn chat_snapshot(&self) -> ChatSnapshot {
         ChatSnapshot {

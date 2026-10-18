@@ -541,6 +541,11 @@ pub(crate) struct AgentRunState {
     /// always `take()`s it, so it applies to exactly one start attempt and
     /// never leaks into a later turn, the transcript or any hook payload.
     pub(crate) next_turn_directive: Option<String>,
+    /// Set by the `/cron` scheduler for exactly one self-paced fire: a
+    /// [`crate::question::QuestionOrigin::Scheduled`] start registers the
+    /// turn-scoped `schedule_wakeup` tool bound to this slot on the agent it
+    /// runs, and the scheduler removes the tool when that turn ends.
+    pub(crate) cron_wakeup: Option<crate::agent::tools::schedule_wakeup::WakeupSlot>,
     /// Typed marker armed with `next_turn_directive` for an `@agent` mention
     /// turn when `agent_mention_tool_choice = "force"`: the tool the turn's
     /// first model request must call. Taken by the same start attempt.
