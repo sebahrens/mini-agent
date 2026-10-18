@@ -19,13 +19,18 @@ src/
   fs.rs                    Stable filesystem access and atomic publication
   permission/              Permission modes, target checks and approval bridge
   context/                 AGENTS/CLAUDE context, prompts, themes and personas
+    mentions.rs            @agent:<name> mention parsing and routing note
   agent/
     builder.rs             Tool registration and system-prompt assembly
     runner.rs              Streaming runs, work scopes, cancellation and usage
+    first_tool.rs          Opt-in first-request tool_choice forcing for mentions
     tools/                 Native file, shell, task-list and diagnostic tools
+      schedule_wakeup.rs   Turn-scoped tool of a self-paced /cron fire
   session/                 Transcript projection, persistence and input history
   ui/
     app.rs                 Interactive application loop and input dispatch
+    cron.rs                /cron schedule store, interval grammar and limits
+    cron_app.rs            /cron idle predicate and fire path on App
     event_handler.rs       Agent events, rendering and transcript updates
     events.rs              Session replay and welcome output
     feed.rs                Bounded conversation blocks and rendered-row cache
@@ -35,7 +40,7 @@ src/
     pickers/               Command, file, model, shell-history and rewind pickers
     prebuild.rs            Background agent preparation
     renderer.rs            Feed rendering, viewport and selection
-    slash/                 Slash command dispatch and handlers
+    slash/                 Slash command dispatch and handlers (cron.rs: /cron)
     state.rs               Shared application and turn state
     statusline.rs          Status-line presentation
     terminal.rs            Transactional terminal attach, suspend and restore

@@ -441,8 +441,8 @@ and stopping only edit the schedule.
 | Command | Description |
 | ------- | ----------- |
 | `/cron <interval> <prompt>` | Arm a schedule. The interval is digits plus `s`, `m` or `h` (`90s`, `5m`, `2h`). The minimum is `1m` (a shorter interval is raised to it with a notice) and the maximum is `24h`. The first fire is one interval from now. |
-| `/cron <prompt>` | Arm a self-paced schedule (see below). Any first word that is not an interval and not `list`, `stop` or `run` starts the prompt. The first fire runs at the next idle point. |
-| `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), `every <interval>` or `self-paced`, time until the next fire (`running` while a self-paced fire's turn has not chosen one yet), fires so far out of `cron_max_fires`, and the prompt. |
+| `/cron <prompt>` | Arm a self-paced schedule (see below). Any first word that is not an interval and not `list`, `stop` or `run` starts the prompt; `resume` is a verb only on its own. The first fire runs at the next idle point. |
+| `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), `every <interval>` or `self-paced`, time until the next fire (`due at next idle` for a parked fire, `running` while a self-paced fire's turn has not chosen one yet, `suspended` after the USD budget refused a fire, `disarmed` for a schedule restored with a resumed session), fires so far out of `cron_max_fires`, and the prompt. |
 | `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
 | `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
 | `/cron resume` | Re-arm the schedules saved with a resumed session. Each keeps its id and fire count and gets a fresh deadline one interval from now; missed fires are never caught up. With nothing saved it prints a one-line notice. |
@@ -481,7 +481,7 @@ and stopping only edit the schedule.
 - **Idle-only firing.** A schedule fires only when no run, live goal
   (running, paused or waiting), permission or question prompt, unanswered
   model question, chain or plan prompt, pending Git proposal or Git command,
-  MCP admin operation, attached image or queued input is active. A deadline
+  MCP admin operation, background-task permission or question request, attached image, or queued or deferred input is active. A deadline
   that passes while busy parks **one** fire that runs at the next idle point,
   after any queued input; there is no catch-up, however many deadlines were
   missed. Each fire restarts the interval from the moment it starts, so a long
