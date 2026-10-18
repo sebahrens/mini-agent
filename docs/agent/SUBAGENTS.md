@@ -196,6 +196,14 @@ data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
+`src/context/mentions.rs` parses agent mentions in submitted text against the
+same trust-gated resolution. The canonical token is `@agent:<name>`; Claude
+Code's `@agent-<name>` alias is rewritten to it only when the name resolves and
+otherwise stays plain text. Tokens are whitespace-delimited and must start with
+`@` (so `x@agent:8080` and e-mail addresses are prose); surrounding punctuation
+is trimmed. An unresolvable canonical mention fails with an error naming the
+sorted valid personas, and untrusted-project personas never resolve.
+
 The `task` schema describes specialists as read-only by default and documents
 the explicit opt-in for implementation personas.
 
