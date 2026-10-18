@@ -4176,7 +4176,13 @@ impl<'a> App<'a> {
                 if crate::startup::heap_future(|| self.start_mcp_mentions(&text)).await? {
                     return Ok(());
                 }
+                #[cfg(feature = "subagents")]
+                let Some((text, directive)) = self.start_agent_mentions(&text)? else {
+                    return Ok(());
+                };
                 self.echo_main_submission(&text)?;
+                #[cfg(feature = "subagents")]
+                self.set_agent_directive(directive);
                 self.start_main_run(&text, crate::question::QuestionOrigin::NewUserTurn)
                     .await?;
             }
@@ -4566,11 +4572,17 @@ impl<'a> App<'a> {
                 if crate::startup::heap_future(|| self.start_mcp_mentions(&next)).await? {
                     return Ok(());
                 }
+                #[cfg(feature = "subagents")]
+                let Some((next, directive)) = self.start_agent_mentions(&next)? else {
+                    return Ok(());
+                };
                 self.renderer.chain_prompt = None;
                 self.renderer.chain_but_mode = false;
                 self.chain.pending = None;
                 self.chain.label_msg = None;
                 echo_submission(&mut self.renderer, &next)?;
+                #[cfg(feature = "subagents")]
+                self.set_agent_directive(directive);
                 self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
                     .await?;
             }
@@ -5094,7 +5106,13 @@ impl<'a> App<'a> {
             if crate::startup::heap_future(|| self.start_mcp_mentions(&next)).await? {
                 return Ok(());
             }
+            #[cfg(feature = "subagents")]
+            let Some((next, directive)) = self.start_agent_mentions(&next)? else {
+                return Ok(());
+            };
             self.echo_main_submission(&next)?;
+            #[cfg(feature = "subagents")]
+            self.set_agent_directive(directive);
             self.start_main_run(&next, crate::question::QuestionOrigin::NewUserTurn)
                 .await?;
         }
@@ -5674,6 +5692,44 @@ impl<'a> App<'a> {
     fn echo_main_submission(&mut self, text: &str) -> anyhow::Result<()> {
         echo_submission(&mut self.renderer, text)?;
         Ok(())
+    }
+
+    /// Resolve `@agent:<name>` mentions in a literal submission.
+    ///
+    /// Returns the alias-normalised text to echo, persist and send, plus the
+    /// non-persisted routing directive for that one turn (`None` without a
+    /// mention). An unknown canonical name is refused: the error names the
+    /// valid personas, the draft returns to the editor, and `Ok(None)` tells
+    /// the caller not to start a turn. Persona definitions from an untrusted
+    /// project never resolve.
+    #[cfg(feature = "subagents")]
+    fn start_agent_mentions(
+        &mut self,
+        text: &str,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        match crate::context::mentions::parse_agent_mentions(text, Some(&self.ui.workspace)) {
+            Ok(None) => Ok(Some((text.to_owned(), None))),
+            Ok(Some(mentions)) => {
+                let directive = crate::context::mentions::routing_directive(&mentions.names);
+                Ok(Some((mentions.text, Some(directive))))
+            }
+            Err(error) => {
+                self.restore_interrupted_prompt(text);
+                self.renderer
+                    .write_line(&sanitize_output(&error.to_string()), C_ERROR)?;
+                self.refresh()?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Arm the routing directive immediately before the turn start that
+    /// consumes it, so a failed echo can never leave it for a later turn.
+    #[cfg(feature = "subagents")]
+    fn set_agent_directive(&mut self, directive: Option<String>) {
+        if directive.is_some() {
+            self.run.next_turn_directive = directive;
+        }
     }
 
     async fn handle_dot_command(
@@ -15018,6 +15074,246 @@ mod plan_approval_tests {
         assert!(provider.calls().is_empty());
         drop(app);
         provider.finish().await;
+    }
+
+    /// mini-agent-5eoy7.4: `@agent:` submissions through the real TUI submit
+    /// path. `rust-maintainer` is a compiled-in persona every workspace sees.
+    #[cfg(feature = "subagents")]
+    mod agent_mentions54 {
+        use super::*;
+
+        fn feed_text(app: &App<'_>) -> String {
+            let lines = app.renderer.feed().lines(500);
+            (0..lines.len())
+                .map(|index| lines[index].text.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        fn users(app: &App<'_>) -> Vec<String> {
+            app.ui
+                .session
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .map(|m| m.content.to_string())
+                .collect()
+        }
+        /// The host directive block of one captured request, if any.
+        fn directive(call: &serde_json::Value) -> Option<String> {
+            let last = call["messages"].as_array().unwrap().last().unwrap().clone();
+            assert_eq!(last["role"], "user");
+            let parts = last["content"].as_array()?;
+            let text = parts.last()?["text"].as_str()?.to_owned();
+            text.starts_with(crate::agent::input::TURN_DIRECTIVE_LABEL)
+                .then_some(text)
+        }
+        fn first_text(call: &serde_json::Value) -> String {
+            let last = call["messages"].as_array().unwrap().last().unwrap().clone();
+            match &last["content"] {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Array(parts) => parts[0]["text"].as_str().unwrap().to_owned(),
+                other => panic!("unexpected content {other}"),
+            }
+        }
+
+        /// Submit `typed` with Enter and, when a turn starts, finish it.
+        /// Returns the captured requests and the app's user messages, feed
+        /// text and editor buffer.
+        async fn submit(
+            typed: &str,
+            responses: Vec<&'static str>,
+            setup: impl FnOnce(&std::path::Path),
+        ) -> (Vec<serde_json::Value>, Vec<String>, String, String) {
+            #[cfg(feature = "hooks")]
+            let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+            let roots = Roots::new();
+            setup(roots.directory.path());
+            let starts = !responses.is_empty();
+            let provider = Provider::new(responses).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                no_context_files: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            user(&mut app, UserEvent::Paste(typed.into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(app.run.next_turn_directive.is_none());
+            assert_eq!(app.run.is_running, starts);
+            if starts {
+                assert!(finish_turn(&mut app).await);
+            }
+            let result = (
+                provider.calls(),
+                users(&app),
+                feed_text(&app),
+                app.input.buffer.to_string(),
+            );
+            drop(app);
+            provider.finish().await;
+            result
+        }
+
+        #[tokio::test]
+        async fn canonical_mention_sends_typed_text_plus_routing_directive() {
+            let typed = "@agent:rust-maintainer audit src/auth.rs";
+            let (calls, users, feed, buffer) = submit(typed, vec!["MENTION_DONE54"], |_| {}).await;
+            assert_eq!(users, vec![typed.to_owned()]);
+            assert!(feed.contains(typed), "{feed}");
+            assert!(buffer.is_empty());
+            assert_eq!(calls.len(), 1);
+            assert_eq!(first_text(&calls[0]), typed);
+            let directive = directive(&calls[0]).expect("routing directive");
+            assert!(directive.contains("agent_type \"rust-maintainer\" via the task tool"));
+            assert!(!users[0].contains("Host routing note"));
+        }
+
+        #[tokio::test]
+        async fn resolvable_alias_is_canonicalised_everywhere() {
+            let (calls, users, feed, _) =
+                submit("@agent-rust-maintainer x", vec!["ALIAS_DONE54"], |_| {}).await;
+            assert_eq!(users, vec!["@agent:rust-maintainer x".to_owned()]);
+            assert!(feed.contains("@agent:rust-maintainer x"), "{feed}");
+            assert_eq!(first_text(&calls[0]), "@agent:rust-maintainer x");
+            assert!(
+                directive(&calls[0])
+                    .unwrap()
+                    .contains("\"rust-maintainer\"")
+            );
+        }
+
+        #[tokio::test]
+        async fn unknown_name_is_refused_and_the_draft_restored() {
+            let (calls, users, feed, buffer) = submit("@agent:nope x", vec![], |_| {}).await;
+            assert!(calls.is_empty());
+            assert!(users.is_empty());
+            assert_eq!(buffer, "@agent:nope x");
+            assert!(
+                feed.contains("unknown agent '@agent:nope'; valid agents: "),
+                "{feed}"
+            );
+            assert!(feed.contains("rust-maintainer"), "{feed}");
+        }
+
+        #[tokio::test]
+        async fn embedded_agent_text_is_sent_untouched_without_directive() {
+            let typed = "mail me at a@agent:b";
+            let (calls, users, _, _) = submit(typed, vec!["PLAIN_DONE54"], |_| {}).await;
+            assert_eq!(users, vec![typed.to_owned()]);
+            assert_eq!(first_text(&calls[0]), typed);
+            assert_eq!(directive(&calls[0]), None);
+        }
+
+        #[tokio::test]
+        async fn untrusted_project_persona_is_refused() {
+            let (calls, users, feed, buffer) = submit("@agent:projectonly x", vec![], |root| {
+                for layer in [".zerostack/agents", ".claude/agents", ".mini-agent/agents"] {
+                    std::fs::create_dir_all(root.join(layer)).unwrap();
+                    std::fs::write(root.join(layer).join("projectonly.md"), "PROJECT_PERSONA54")
+                        .unwrap();
+                }
+            })
+            .await;
+            assert!(calls.is_empty() && users.is_empty());
+            assert_eq!(buffer, "@agent:projectonly x");
+            assert!(
+                feed.contains("unknown agent '@agent:projectonly'"),
+                "{feed}"
+            );
+        }
+
+        /// The queue-replay site resolves mentions like a direct submit.
+        #[tokio::test]
+        async fn queued_mention_is_canonicalised_and_routed() {
+            #[cfg(feature = "hooks")]
+            let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+            let roots = Roots::new();
+            let provider = Provider::new(vec!["FIRST_DONE54", "QUEUED_DONE54"]).await;
+            let cfg = provider.config();
+            let cli = crate::cli::Cli {
+                no_session: true,
+                no_tools: true,
+                no_context_files: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            let mut app = owned_app(ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+                SecurityMode::Standard,
+            ));
+            user(&mut app, UserEvent::Paste("first plain turn".into())).await;
+            key(&mut app, KeyCode::Enter).await;
+            assert!(app.run.is_running);
+            app.run
+                .pending_inputs
+                .push_back("@agent-rust-maintainer queued work".into());
+            // `finish_turn` expects an idle app afterwards; here the terminal
+            // event replays the queued input as a new turn instead.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = app.run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+                    let done = matches!(event, AgentEvent::Done { .. });
+                    assert!(!matches!(event, AgentEvent::Error { .. }));
+                    crate::startup::heap_future(|| app.handle_agent_event(event))
+                        .await
+                        .unwrap();
+                    if done {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(app.run.is_running);
+            assert!(app.run.next_turn_directive.is_none());
+            assert!(finish_turn(&mut app).await);
+            let calls = provider.calls();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(directive(&calls[0]), None);
+            assert_eq!(first_text(&calls[1]), "@agent:rust-maintainer queued work");
+            assert!(
+                directive(&calls[1])
+                    .unwrap()
+                    .contains("\"rust-maintainer\"")
+            );
+            assert_eq!(
+                users(&app),
+                vec![
+                    "first plain turn".to_owned(),
+                    "@agent:rust-maintainer queued work".to_owned()
+                ]
+            );
+            drop(app);
+            provider.finish().await;
+        }
     }
 
     #[cfg(feature = "agent-skills")]

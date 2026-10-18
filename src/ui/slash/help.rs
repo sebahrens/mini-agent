@@ -457,6 +457,11 @@ fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  @<query>               file picker (Tab/Enter insert, Esc cancel)",
     );
+    #[cfg(feature = "subagents")]
+    emit(
+        false,
+        "  @agent:<name>          route the request to a specialist via task",
+    );
     emit(
         false,
         "  mouse drag             select text (copies to clipboard on release)",

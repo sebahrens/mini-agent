@@ -1184,7 +1184,7 @@ pub(crate) fn available_names_for_workspace(
 
 /// [`available_names_for_workspace`] against explicit application paths, so
 /// tests can change project trust without touching the process paths.
-#[cfg(test)]
+#[cfg(all(test, feature = "subagents"))]
 pub(crate) fn available_names_for_paths_and_workspace(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
