@@ -1010,11 +1010,22 @@ mod tests {
         let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
         let home = fixture.home.canonicalize().unwrap();
         let run = |profile: SandboxProfile, script: String| {
+            // The fixture HOME lives under the test temp directory. Linux host
+            // profiles mount a fresh private /tmp over the host root, so a HOME
+            // there is only visible through a retained root. Re-expose it as
+            // an explicit read root, as the profile100 native test does; real
+            // HOME directories are not under /tmp. Workspace must not get it:
+            // it would expose the unconfigured ~/.npmrc.
+            let reads = if cfg!(target_os = "linux") && profile == SandboxProfile::HostRead {
+                vec![fixture.home.clone()]
+            } else {
+                Vec::new()
+            };
             let sandbox = Sandbox::new(true, backend)
                 .with_workspace_binding(Arc::new(
                     crate::paths::WorkspaceBinding::capture(&fixture.cwd).unwrap(),
                 ))
-                .with_general_profile(profile, Vec::new(), Vec::new())
+                .with_general_profile(profile, reads, Vec::new())
                 .with_home_paths(
                     vec![".gitconfig".into(), ".cargo:rw".into()],
                     vec![".vault".into()],
