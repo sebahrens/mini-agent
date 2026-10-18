@@ -895,7 +895,10 @@ bridges and both plaintext and TLS authentication tasks retain their own
 activity until actual cleanup, including cancellation before first poll. The
 listener waiting for its first peer is idle. Enabled transports drain these
 owners after connection teardown. Without the option the existing lifecycle
-is unchanged. Provider stream-stall timeouts remain independent.
+is unchanged. Provider stream-stall timeouts remain independent. An ACP
+session with an armed `/cron` schedule holds one activity lease until its last
+schedule is removed; session close and connection teardown drop the schedules
+(and the lease) before the settle wait.
 
 `--loop` accepts this server option, but its existing finite goal driver exits
 when it stops; it has no parked idle listener. Active rounds, validation and
@@ -1439,8 +1442,12 @@ command. `/rename` and `/undo` change the canonical session without launching a
 model. Undo removes conversation context, not filesystem effects or billed
 usage. `/compact` summarizes completed context and records actual compaction
 bounds; image pixels are explicitly absent from textual summaries. `/goal` is
-available only with the goal feature. Rendered resource text, images and model
-output never become local-command authority.
+available only with the goal feature. `/cron` (interval schedules only, see
+`extras/acp/cron.rs` and [COMMANDS.md](COMMANDS.md#cron)) edits the session's
+schedule store without registering a turn; a fire is admitted through the same
+turn registration as a client prompt and runs with request kind `scheduled`.
+Rendered resource text, images and model output never become local-command
+authority.
 
 
 The editor's `protocolSession.ts` uses public ACP requests and exact session-ID

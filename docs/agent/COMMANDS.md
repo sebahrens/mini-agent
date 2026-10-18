@@ -529,6 +529,33 @@ and stopping only edit the schedule.
 - **Relative times.** Deadlines use a monotonic clock that does not advance
   while the machine is suspended, so times are always shown relative to now
   (`in 4m`).
+- **ACP.** An ACP client sends `/cron` as the sole text block of a
+  `session/prompt`; the server advertises it in `available_commands_update`.
+  ACP supports only `/cron <interval> <prompt>`, `/cron` / `/cron list` and
+  `/cron stop <id>|all`. Self-paced `/cron <prompt>` (ACP turns do not offer
+  the turn-scoped `schedule_wakeup` tool), `/cron run` (there is no host idle
+  point to park a manual fire in), `/cron resume` (ACP schedules are never
+  saved) and `/` or `!` payloads (no host slash dispatcher or shell-line path
+  runs a fire) are refused with JSON-RPC `-32602` and a one-line reason.
+  `/cron` is answered without starting a turn, so it also works while a turn
+  runs. Schedules belong to one ACP session and are dropped on
+  `session/close`, when the session is replaced by a load, and on connection
+  teardown. A fire starts only when that session has no prompt in flight, no
+  unanswered question and no running goal; it then runs exactly like a client
+  prompt with request kind `scheduled` (`UserPromptSubmit` sees
+  `"origin": "scheduled"`) and streams through the usual `session/update`s,
+  preceded by a host-labelled `agent_message_chunk`
+  `cron c1: scheduled turn (fire 1/24, every 5m): <prompt>` whose
+  `_meta.cron` is `{"origin": "scheduled", "event": "started", "id", "fire",
+  "max_fires", "retired"}`. A fire's turn that is cancelled, fails or ends
+  waiting for an answer is reported the same way (`event` `finished` or
+  `failed`). A client prompt that arrives while a fire runs gets the usual
+  "already has an active prompt" error; two turns never interleave, and
+  `session/cancel` cancels a running fire while keeping its schedule.
+  `cron_max_fires`, the 16-schedule bound, the unbounded-spend warning and
+  budget suspension apply as in the TUI. While any schedule is armed the
+  session holds one idle lease, so `--idle-exit` does not stop the server
+  between fires; the lease is released when the last schedule is removed.
 
 ## Goal (feature-gated)
 

@@ -1,6 +1,7 @@
 mod accept;
 mod commands;
 pub mod config;
+mod cron;
 mod idle;
 mod policy;
 mod sessions;
@@ -313,6 +314,10 @@ struct SessionState {
     /// tool-enabled prompt alongside the configured servers.
     #[cfg(feature = "mcp")]
     client_mcp_servers: Arc<ClientMcpServers>,
+    /// This session's `/cron` schedules. Never persisted; dropping the
+    /// session (close or replacement) clears them and releases their idle
+    /// lease.
+    cron: cron::CronOwner,
 }
 
 struct PromptSessionSnapshot {
@@ -1287,6 +1292,12 @@ async fn connect_agent(
     } else {
         builder.connect_to(transport).await
     };
+    // Connection teardown dropped every `/cron` driver; drop the schedules
+    // and their idle leases too, so the settle wait below does not wait on a
+    // schedule that can never fire again.
+    for session in state.sessions.lock().await.values() {
+        session.cron.clear();
+    }
     #[cfg(feature = "subagents")]
     {
         let pools = state
@@ -1589,6 +1600,7 @@ async fn install_session(
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
             client_mcp_servers: Arc::new(client_mcp_servers),
+            cron: cron::CronOwner::default(),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id, turns);
@@ -2053,6 +2065,12 @@ async fn handle_prompt(
 
     tracing::info!("ACP prompt for session {}", session_id);
 
+    // `/cron` only edits the session's schedule store and never touches a
+    // running turn, so it is answered before (and without) turn admission.
+    if let Some(arguments) = commands::cron_arguments(&req.prompt) {
+        return cron::handle_command(&arguments, &session_id, responder, cx, &state).await;
+    }
+
     let command = commands::classify(&req.prompt)?;
     let prompt_input = parse_prompt_blocks(&req.prompt)?;
 
@@ -2061,51 +2079,121 @@ async fn handle_prompt(
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
-        let control = Arc::new(TurnControl::new());
-        let hook_lease;
-        let generation = {
-            let mut turns = lock_unpoisoned(&sess.turns);
-            if !turns.queue.is_empty() {
-                return Err(agent_client_protocol::Error::new(
-                    -32000,
-                    "ACP session already has an active prompt",
-                ));
-            }
-            hook_lease = state
-                .hook_roots
-                .as_ref()
-                .map(|claims| claims.acquire(sess.workspace.root()));
-            let generation = turns.next_generation;
-            turns.next_generation = turns.next_generation.wrapping_add(1);
-            turns.queue.push_back(RegisteredTurn {
-                generation,
-                control: control.clone(),
-            });
-            generation
-        };
-        PromptSessionSnapshot {
-            spend: sess.spend.clone(),
-            history: sess.history.clone(),
-            workspace: sess.workspace.clone(),
-            context: sess.context.clone(),
-            read_tracker: sess.read_tracker.clone(),
-            todo_store: sess.todo_store.clone(),
-            #[cfg(feature = "goal")]
-            goal_store: sess.goal_store.clone(),
-            sandbox: sess.sandbox.clone(),
-            #[cfg(feature = "js")]
-            js_session_state: sess.js_session_state.clone(),
-            #[cfg(feature = "skills")]
-            skill_services: sess.skill_services.clone(),
-            control: control.clone(),
-            registration: TurnRegistration {
-                generation,
-                turns: sess.turns.clone(),
-                control: control.clone(),
-            },
-            hook_lease,
-        }
+        admit_turn(&state, sess)?
     };
+
+    // Opt-in `@agent:<name>` routing (`headless_agent_mentions`). Resolved
+    // after admission so a refusal settles this generation like any other
+    // invalid prompt, and before `_meta.goal` so a refused prompt changes
+    // nothing. Commands are never parsed.
+    #[cfg(feature = "subagents")]
+    let prompt_input = if command.is_none() && state.cfg.resolve_headless_agent_mentions() {
+        route_prompt_agent_mentions(&req.prompt, &snapshot.workspace, prompt_input)?
+    } else {
+        prompt_input
+    };
+
+    // A client sets or clears the session's goal through the request's `_meta`
+    // rather than through prompt text: the objective is a long-lived
+    // instruction channel, and a text directive would let anything that reaches
+    // the prompt install one. It is applied only once this prompt has been
+    // admitted, so a prompt rejected because another turn is active cannot
+    // clear or replace the goal that turn is being judged against. A refused
+    // goal drops `registration`, which settles the just-admitted generation.
+    #[cfg(feature = "goal")]
+    if let Some(meta) = req.meta.as_ref()
+        && let Err(error) = apply_meta_goal(&state, &snapshot.goal_store, meta)
+    {
+        return Err(agent_client_protocol::Error::new(-32602, error));
+    }
+
+    let request_cancellation = responder.cancellation();
+    if request_cancellation.is_cancelled() {
+        snapshot.control.cancel();
+    }
+    let request_cancellation_bridge =
+        RequestCancellationBridge::new(request_cancellation, snapshot.control.clone());
+    spawn_turn(
+        state,
+        cx,
+        snapshot,
+        prompt_input,
+        command,
+        session_id,
+        PromptReply::Client(responder),
+        Some(request_cancellation_bridge),
+        activity,
+    )
+}
+
+/// Register the next turn generation of `sess`, or refuse while another turn
+/// (a client prompt or a `/cron` fire) is active: one session never runs two
+/// turns at once. Called under the session catalogue lock.
+fn admit_turn(
+    state: &AcpState,
+    sess: &SessionState,
+) -> Result<PromptSessionSnapshot, agent_client_protocol::Error> {
+    let control = Arc::new(TurnControl::new());
+    let hook_lease;
+    let generation = {
+        let mut turns = lock_unpoisoned(&sess.turns);
+        if !turns.queue.is_empty() {
+            return Err(agent_client_protocol::Error::new(
+                -32000,
+                "ACP session already has an active prompt",
+            ));
+        }
+        hook_lease = state
+            .hook_roots
+            .as_ref()
+            .map(|claims| claims.acquire(sess.workspace.root()));
+        let generation = turns.next_generation;
+        turns.next_generation = turns.next_generation.wrapping_add(1);
+        turns.queue.push_back(RegisteredTurn {
+            generation,
+            control: control.clone(),
+        });
+        generation
+    };
+    Ok(PromptSessionSnapshot {
+        spend: sess.spend.clone(),
+        history: sess.history.clone(),
+        workspace: sess.workspace.clone(),
+        context: sess.context.clone(),
+        read_tracker: sess.read_tracker.clone(),
+        todo_store: sess.todo_store.clone(),
+        #[cfg(feature = "goal")]
+        goal_store: sess.goal_store.clone(),
+        sandbox: sess.sandbox.clone(),
+        #[cfg(feature = "js")]
+        js_session_state: sess.js_session_state.clone(),
+        #[cfg(feature = "skills")]
+        skill_services: sess.skill_services.clone(),
+        control: control.clone(),
+        registration: TurnRegistration {
+            generation,
+            turns: sess.turns.clone(),
+            control,
+        },
+        hook_lease,
+    })
+}
+
+/// Run an admitted turn on its own task, owned by `activity` until the turn,
+/// its hooks and its tracked work settle. The connection owns only a waiter
+/// that cancels the turn on teardown.
+#[allow(clippy::too_many_arguments)]
+fn spawn_turn(
+    state: Arc<AcpState>,
+    cx: ConnectionTo<Client>,
+    snapshot: PromptSessionSnapshot,
+    prompt_input: crate::agent::input::PromptInput,
+    command: Option<commands::Command>,
+    session_id: SessionId,
+    reply: PromptReply,
+    request_cancellation_bridge: Option<RequestCancellationBridge>,
+    activity: idle::Activity,
+) -> Result<(), agent_client_protocol::Error> {
     let PromptSessionSnapshot {
         spend,
         history,
@@ -2125,39 +2213,7 @@ async fn handle_prompt(
         hook_lease,
     } = snapshot;
 
-    // Opt-in `@agent:<name>` routing (`headless_agent_mentions`). Resolved
-    // after admission so a refusal settles this generation like any other
-    // invalid prompt, and before `_meta.goal` so a refused prompt changes
-    // nothing. Commands are never parsed.
-    #[cfg(feature = "subagents")]
-    let prompt_input = if command.is_none() && state.cfg.resolve_headless_agent_mentions() {
-        route_prompt_agent_mentions(&req.prompt, &workspace, prompt_input)?
-    } else {
-        prompt_input
-    };
-
-    // A client sets or clears the session's goal through the request's `_meta`
-    // rather than through prompt text: the objective is a long-lived
-    // instruction channel, and a text directive would let anything that reaches
-    // the prompt install one. It is applied only once this prompt has been
-    // admitted, so a prompt rejected because another turn is active cannot
-    // clear or replace the goal that turn is being judged against. A refused
-    // goal drops `registration`, which settles the just-admitted generation.
-    #[cfg(feature = "goal")]
-    if let Some(meta) = req.meta.as_ref()
-        && let Err(error) = apply_meta_goal(&state, &goal_store, meta)
-    {
-        return Err(agent_client_protocol::Error::new(-32602, error));
-    }
-
     control.attach_sandbox(sandbox.clone());
-
-    let request_cancellation = responder.cancellation();
-    if request_cancellation.is_cancelled() {
-        control.cancel();
-    }
-    let request_cancellation_bridge =
-        RequestCancellationBridge::new(request_cancellation, control.clone());
 
     cx.spawn({
         let cx = cx.clone();
@@ -2174,7 +2230,7 @@ async fn handle_prompt(
                 let registration = registration;
                 let _request_cancellation_bridge = request_cancellation_bridge;
                 if control.is_cancelled() {
-                    let _ = respond_terminal(&registration, responder, StopReason::Cancelled);
+                    let _ = respond_terminal(&registration, reply, StopReason::Cancelled);
                     return Ok(());
                 }
                 let history = history.lock_owned().await;
@@ -2198,7 +2254,7 @@ async fn handle_prompt(
                             js_session_state,
                             #[cfg(feature = "skills")]
                             skill_services,
-                            responder,
+                            reply,
                             cx,
                             control,
                             &registration,
@@ -3057,9 +3113,36 @@ async fn drive_permission_bridge(
 
 // --- Prompt Execution ---
 
+/// Where a turn's terminal outcome goes: the client's `session/prompt`
+/// response, or, for a `/cron` fire that no client request started, a
+/// host-labelled `session/update` in that session.
+enum PromptReply {
+    Client(Responder<PromptResponse>),
+    Scheduled(cron::ScheduledReply),
+}
+
+impl PromptReply {
+    fn respond(self, response: PromptResponse) -> Result<(), agent_client_protocol::Error> {
+        match self {
+            Self::Client(responder) => responder.respond(response),
+            Self::Scheduled(reply) => reply.finished(response),
+        }
+    }
+
+    fn respond_with_error(
+        self,
+        error: agent_client_protocol::Error,
+    ) -> Result<(), agent_client_protocol::Error> {
+        match self {
+            Self::Client(responder) => responder.respond_with_error(error),
+            Self::Scheduled(reply) => reply.failed(error),
+        }
+    }
+}
+
 fn respond_terminal(
     registration: &TurnRegistration,
-    responder: Responder<PromptResponse>,
+    responder: PromptReply,
     reason: StopReason,
 ) -> Result<(), agent_client_protocol::Error> {
     let _ = registration.complete_and_settle();
@@ -3068,7 +3151,7 @@ fn respond_terminal(
 
 fn respond_terminal_error(
     registration: &TurnRegistration,
-    responder: Responder<PromptResponse>,
+    responder: PromptReply,
     error: String,
 ) -> Result<(), agent_client_protocol::Error> {
     registration.settle();
@@ -3092,7 +3175,7 @@ async fn run_prompt(
     #[cfg(feature = "skills")] skill_services: Arc<
         crate::extras::js::skills::session::SkillServiceOwner,
     >,
-    responder: Responder<PromptResponse>,
+    responder: PromptReply,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     registration: &TurnRegistration,
@@ -4045,7 +4128,7 @@ async fn execute_prompt(
         .with_main_session(&state.cfg, &history.session)
         .with_file_checkpoints(file_checkpoints.clone())
         .with_spend(crate::spend::run::Run::current())
-        .with_question_turn(Some(crate::question::QuestionTurn::default()));
+        .with_question_turn(cron::question_origin().capture(None));
     let (agent, prior_history) = if let Some(owner) = native_owner.as_mut() {
         use crate::session::native_replay::ReplayBoundary;
         let boundary = match history.session.native_history_snapshot() {
@@ -9543,6 +9626,270 @@ mod protocol_tests {
             .await
             .unwrap();
         retained_wait_for_fixture_cleanup(&retained).await;
+    }
+
+    fn cron_notices(
+        updates: &StdMutex<Vec<SessionNotification>>,
+    ) -> Vec<(String, Option<serde_json::Value>)> {
+        updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|notice| match &notice.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(text),
+                    ..
+                }) if text.text.starts_with("cron") => Some((
+                    text.text.clone(),
+                    notice
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("cron"))
+                        .cloned(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acp_cron_fire_runs_a_scheduled_turn_and_refuses_a_concurrent_prompt() {
+        let kinds = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(Notify::new());
+        let fixture: PromptFixture = {
+            let kinds = kinds.clone();
+            let release = release.clone();
+            Arc::new(move |prompt, _| {
+                kinds
+                    .lock()
+                    .unwrap()
+                    .push(crate::spend::run::Run::current().map(|run| run.kind()));
+                let release = release.clone();
+                Box::pin(async move {
+                    if prompt == "scheduled ping" {
+                        release.notified().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let retained = state.clone();
+        let inspect = state.clone();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let callback_kinds = kinds.clone();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                for refused in [
+                    "/cron run c1",
+                    "/cron resume",
+                    "/cron check it",
+                    "/cron 5m /cost",
+                    "/cron 5m !ls",
+                ] {
+                    let error = cx
+                        .send_request(prompt(session.clone(), refused))
+                        .block_task()
+                        .await
+                        .expect_err(refused);
+                    assert!(
+                        error.message.contains("ACP"),
+                        "{refused}: {}",
+                        error.message
+                    );
+                }
+                let armed = cx
+                    .send_request(prompt(session.clone(), "/cron 1m scheduled ping"))
+                    .block_task()
+                    .await?;
+                assert_eq!(armed.stop_reason, StopReason::EndTurn);
+                assert!(
+                    callback_kinds.lock().unwrap().is_empty(),
+                    "arming starts no turn"
+                );
+                tokio::time::sleep(Duration::from_secs(61)).await;
+                for _ in 0..200 {
+                    if !callback_kinds.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    *callback_kinds.lock().unwrap(),
+                    [Some(crate::spend::RequestKind::Scheduled)],
+                    "the fire runs one turn with the scheduled origin"
+                );
+                assert!(matches!(
+                    cron::question_origin(),
+                    crate::question::QuestionOrigin::NewUserTurn
+                ));
+                // The fire holds the session: a client prompt is refused like
+                // any concurrent prompt, never interleaved.
+                let busy = cx
+                    .send_request(prompt(session.clone(), "client prompt"))
+                    .block_task()
+                    .await
+                    .expect_err("a fire is in flight");
+                assert!(busy.message.contains("already has an active prompt"));
+                // `/cron` itself never touches the running turn.
+                cx.send_request(prompt(session.clone(), "/cron list"))
+                    .block_task()
+                    .await?;
+                release.notify_one();
+                for _ in 0..200 {
+                    if lock_unpoisoned(&inspect.sessions.lock().await[&session].turns)
+                        .queue
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let response = cx
+                    .send_request(prompt(session.clone(), "client prompt"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    callback_kinds.lock().unwrap().last(),
+                    Some(&Some(crate::spend::RequestKind::Turn))
+                );
+                {
+                    let sessions = inspect.sessions.lock().await;
+                    let history = sessions[&session].history.lock().await;
+                    assert_eq!(
+                        history.session.messages.len(),
+                        4,
+                        "the scheduled turn is recorded like a client prompt"
+                    );
+                }
+                cx.send_request(prompt(session.clone(), "/cron stop all"))
+                    .block_task()
+                    .await?;
+                assert!(
+                    !inspect.sessions.lock().await[&session]
+                        .cron
+                        .shared()
+                        .holds_lease()
+                );
+                cx.send_request(CloseSessionRequest::new(session))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let notices = cron_notices(&updates);
+        let started = notices
+            .iter()
+            .find(|(text, _)| {
+                text.starts_with("cron c1: scheduled turn (fire 1/24, every 1m): scheduled ping")
+            })
+            .expect("the client is told a scheduled turn started");
+        let meta = started.1.as_ref().expect("_meta.cron");
+        assert_eq!(meta["origin"], "scheduled");
+        assert_eq!(meta["event"], "started");
+        assert_eq!(meta["id"], "c1");
+        assert!(
+            notices
+                .iter()
+                .any(|(text, _)| text.starts_with("cron c1: every 1m"))
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|(text, _)| text == "cron: stopped 1 schedule(s)")
+        );
+        assert!(
+            updates.lock().unwrap().iter().any(|notice| matches!(
+                &notice.update,
+                SessionUpdate::AvailableCommandsUpdate(commands)
+                    if commands.available_commands.iter().any(|command| command.name == "cron")
+            )),
+            "/cron is advertised"
+        );
+        retained_wait_for_fixture_cleanup(&retained).await;
+        assert_eq!(kinds.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_armed_cron_is_released_by_close_and_by_connection_teardown() {
+        use futures::FutureExt;
+        let fixture: PromptFixture =
+            Arc::new(|_, _| Box::pin(async { panic!("no fire is due in this test") }));
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().idle =
+            idle::Idle::new(Some(Duration::from_secs(3))).unwrap();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let retained = state.clone();
+        let callback_state = retained.clone();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let closed = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(closed.clone(), "/cron 1h hourly"))
+                    .block_task()
+                    .await?;
+                let cron = callback_state.sessions.lock().await[&closed].cron.shared();
+                assert!(cron.holds_lease());
+                cx.send_request(CloseSessionRequest::new(closed))
+                    .block_task()
+                    .await?;
+                assert!(
+                    !cron.holds_lease(),
+                    "close drops the schedules and their lease"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(callback_state.idle.wait_settled().now_or_never().is_some());
+                // A schedule still armed when the connection ends.
+                let open = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(open, "/cron 1h hourly"))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Teardown cleared the dormant session's schedule, so actual cleanup
+        // settles instead of waiting on a schedule that can never fire again.
+        retained_wait_for_fixture_cleanup(&retained).await;
+        for session in retained.sessions.lock().await.values() {
+            assert!(!session.cron.shared().holds_lease());
+        }
     }
 
     // Session deletion and response delivery happen before the actual prompt
