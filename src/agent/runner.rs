@@ -3189,6 +3189,14 @@ where
         // attempt below clones exactly once; avoid making additional full
         // copies before any request has even started.
         let retry_message = prompt.to_message();
+        // Shared by every retry attempt of the first stream, so a retried
+        // first request stays forced until the model has responded once.
+        #[cfg(feature = "subagents")]
+        let first_request_tool = crate::agent::first_tool::FirstRequestToolHook::for_turn(
+            &agent,
+            prompt.first_request_tool(),
+        )
+        .await;
         let retry_history = history;
         let mut first_attempt_history = Some(retry_history.to_vec());
         let mut interactions: Vec<Message> = Vec::new();
@@ -3275,7 +3283,7 @@ where
                         .take()
                         .unwrap_or_else(|| retry_history.to_vec());
                     async {
-                        agent
+                        let request = agent
                             .stream_chat(prompt, history)
                             .max_turns(max_turns)
                             .tool_concurrency(
@@ -3286,7 +3294,10 @@ where
                             .add_hook(crate::spend::run::AdmissionHook(
                                 crate::spend::run::Run::current(),
                             ))
-                            .add_hook(crate::question::QuestionGuard)
+                            .add_hook(crate::question::QuestionGuard);
+                        #[cfg(feature = "subagents")]
+                        let request = request.add_hook(first_request_tool.clone());
+                        request
                             .tool_extensions(crate::question::extend_current(
                                 crate::spend::run::current_extensions(),
                             ))

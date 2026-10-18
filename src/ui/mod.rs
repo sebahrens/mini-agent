@@ -1211,6 +1211,7 @@ pub(crate) async fn start_main_run(
     start_main_run_with_directive(
         text,
         None,
+        None,
         record_chat_history,
         question_origin,
         run,
@@ -1221,8 +1222,25 @@ pub(crate) async fn start_main_run(
     .await
 }
 
+/// The runner input for a main turn: the captured prompt plus the
+/// non-persisted directive and, for a forced mention turn, the typed
+/// first-request tool marker (see `crate::agent::first_tool`).
+fn directed_input(
+    input: crate::agent::input::PromptInput,
+    turn_directive: Option<String>,
+    first_request_tool: Option<&'static str>,
+) -> crate::agent::input::PromptInput {
+    let input = input.with_turn_directive(turn_directive);
+    #[cfg(feature = "subagents")]
+    let input = input.with_first_request_tool(first_request_tool);
+    #[cfg(not(feature = "subagents"))]
+    let _ = first_request_tool;
+    input
+}
+
 /// [`start_main_run`] with an optional non-persisted host directive for this
-/// request only. `text` alone is captured by `PendingMainTurn`, saved as the
+/// request only. `first_request_tool` is the typed marker of an `@agent`
+/// mention turn under `agent_mention_tool_choice = "force"`. `text` alone is captured by `PendingMainTurn`, saved as the
 /// user message and passed to the UserPromptSubmit hook; the directive is
 /// attached only to the runner's `PromptInput` (see
 /// `PromptInput::with_turn_directive`).
@@ -1230,6 +1248,7 @@ pub(crate) async fn start_main_run(
 pub(crate) async fn start_main_run_with_directive(
     text: &str,
     turn_directive: Option<String>,
+    first_request_tool: Option<&'static str>,
     record_chat_history: bool,
     question_origin: crate::question::QuestionOrigin,
     run: &mut AgentRunState,
@@ -1405,11 +1424,11 @@ pub(crate) async fn start_main_run_with_directive(
         let scope = owner.scope.clone();
         let paused = crate::startup::heap_future(|| {
             agent.spawn_runner_paused_input_in_scope(
-                pending_turn
-                    .as_ref()
-                    .unwrap()
-                    .input()
-                    .with_turn_directive(turn_directive),
+                directed_input(
+                    pending_turn.as_ref().unwrap().input(),
+                    turn_directive,
+                    first_request_tool,
+                ),
                 history,
                 ui.cfg.retry.clone(),
                 #[cfg(feature = "hooks")]
@@ -1439,11 +1458,11 @@ pub(crate) async fn start_main_run_with_directive(
                 .with_spend_for_session(ui.session, ui.cfg, question_origin.request_kind())
                 .with_question_turn(question_turn)
                 .spawn_runner_paused_input(
-                    pending_turn
-                        .as_ref()
-                        .unwrap()
-                        .input()
-                        .with_turn_directive(turn_directive),
+                    directed_input(
+                        pending_turn.as_ref().unwrap().input(),
+                        turn_directive,
+                        first_request_tool,
+                    ),
                     history,
                     ui.cfg.retry.clone(),
                     #[cfg(feature = "hooks")]

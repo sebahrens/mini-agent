@@ -1215,6 +1215,19 @@ pub(crate) fn idle_interrupt(is_ctrl_d: bool, draft_empty: bool) -> IdleInterrup
     }
 }
 
+/// The typed first-request tool marker for an `@agent` mention turn: the
+/// `task` tool under `agent_mention_tool_choice = "force"`, otherwise none
+/// (the routing directive alone is the hint).
+#[cfg(feature = "subagents")]
+fn mention_first_request_tool(cfg: &crate::config::Config) -> Option<&'static str> {
+    match cfg.resolve_agent_mention_tool_choice() {
+        crate::config::AgentMentionToolChoice::Force => {
+            Some(crate::agent::first_tool::TASK_TOOL_NAME)
+        }
+        crate::config::AgentMentionToolChoice::Hint => None,
+    }
+}
+
 /// `/quit` and `/exit` leave the app; nothing needs warming after them.
 fn is_quit_command(text: &str) -> bool {
     matches!(text.split_whitespace().next(), Some("/quit" | "/exit"))
@@ -5464,6 +5477,7 @@ impl<'a> App<'a> {
         question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
         let turn_directive = self.run.next_turn_directive.take();
+        let first_request_tool = self.run.next_turn_first_request_tool.take();
         #[cfg(feature = "multimodal")]
         if let Err(error) =
             super::clipboard_image::user_message(&self.ui.session.pending_media, text)
@@ -5570,6 +5584,7 @@ impl<'a> App<'a> {
         super::start_main_run_with_directive(
             text,
             turn_directive,
+            first_request_tool,
             true,
             question_origin,
             &mut self.run,
@@ -5765,6 +5780,7 @@ impl<'a> App<'a> {
     fn set_agent_directive(&mut self, directive: Option<String>) {
         if directive.is_some() {
             self.run.next_turn_directive = directive;
+            self.run.next_turn_first_request_tool = mention_first_request_tool(self.ui.cfg);
         }
     }
 
@@ -15073,6 +15089,27 @@ mod plan_approval_tests {
         provider.finish().await;
     }
 
+    /// mini-agent-5eoy7.5 (3): only `force` arms the typed marker, and it
+    /// names the real `task` tool.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn mention_tool_choice55_force_arms_task_and_hint_arms_nothing() {
+        assert_eq!(
+            super::mention_first_request_tool(&crate::config::Config::default()),
+            None
+        );
+        let force = crate::config::Config {
+            agent_mention_tool_choice: Some(crate::config::AgentMentionToolChoice::Force),
+            ..Default::default()
+        };
+        assert_eq!(super::mention_first_request_tool(&force), Some("task"));
+        let hint = crate::config::Config {
+            agent_mention_tool_choice: Some(crate::config::AgentMentionToolChoice::Hint),
+            ..Default::default()
+        };
+        assert_eq!(super::mention_first_request_tool(&hint), None);
+    }
+
     /// A refused start still consumes the directive so it cannot attach to a
     /// later, unrelated turn.
     #[tokio::test]
@@ -15106,6 +15143,7 @@ mod plan_approval_tests {
             SecurityMode::Standard,
         ));
         app.run.next_turn_directive = Some("ROUTE_MARK53".into());
+        app.run.next_turn_first_request_tool = Some("task");
         let too_large = "word ".repeat(20_000);
         crate::startup::heap_future(|| {
             app.start_main_run(&too_large, crate::question::QuestionOrigin::NewUserTurn)
@@ -15115,6 +15153,7 @@ mod plan_approval_tests {
         assert!(!app.run.is_running);
         assert!(app.ui.session.messages.is_empty());
         assert!(app.run.next_turn_directive.is_none());
+        assert!(app.run.next_turn_first_request_tool.is_none());
         assert!(provider.calls().is_empty());
         drop(app);
         provider.finish().await;
@@ -15168,16 +15207,28 @@ mod plan_approval_tests {
             responses: Vec<&'static str>,
             setup: impl FnOnce(&std::path::Path),
         ) -> (Vec<serde_json::Value>, Vec<String>, String, String) {
+            submit_with(typed, responses, setup, None).await
+        }
+
+        /// [`submit`] with an `agent_mention_tool_choice` policy; `Some`
+        /// also enables the real tool set so the `task` tool is advertised.
+        async fn submit_with(
+            typed: &str,
+            responses: Vec<&'static str>,
+            setup: impl FnOnce(&std::path::Path),
+            tool_choice: Option<crate::config::AgentMentionToolChoice>,
+        ) -> (Vec<serde_json::Value>, Vec<String>, String, String) {
             #[cfg(feature = "hooks")]
             let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
             let roots = Roots::new();
             setup(roots.directory.path());
             let starts = !responses.is_empty();
             let provider = Provider::new(responses).await;
-            let cfg = provider.config();
+            let mut cfg = provider.config();
+            cfg.agent_mention_tool_choice = tool_choice;
             let cli = crate::cli::Cli {
                 no_session: true,
-                no_tools: true,
+                no_tools: tool_choice.is_none(),
                 no_context_files: true,
                 ..Default::default()
             };
@@ -15213,6 +15264,33 @@ mod plan_approval_tests {
             drop(app);
             provider.finish().await;
             result
+        }
+
+        /// mini-agent-5eoy7.5 (3): under `force`, a mention turn's first
+        /// request names the `task` tool in `tool_choice` (OpenAI completions
+        /// wire); a plain turn and a `hint` mention turn never force.
+        #[tokio::test]
+        async fn mention_tool_choice55_force_reaches_only_mention_turns() {
+            use crate::config::AgentMentionToolChoice::{Force, Hint};
+            let typed = "@agent:rust-maintainer audit src/auth.rs";
+            let (calls, ..) = submit_with(typed, vec!["FORCED55"], |_| {}, Some(Force)).await;
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0]["tools"].to_string().contains("\"task\""));
+            assert_eq!(
+                calls[0]["tool_choice"],
+                serde_json::json!({"type":"function","function":{"name":"task"}})
+            );
+            assert!(directive(&calls[0]).is_some());
+            for (typed, policy) in [
+                ("plain question about src/auth.rs", Force),
+                ("@agent:rust-maintainer audit src/auth.rs", Hint),
+            ] {
+                let (calls, ..) =
+                    submit_with(typed, vec!["UNFORCED55"], |_| {}, Some(policy)).await;
+                assert_eq!(calls.len(), 1);
+                let choice = &calls[0]["tool_choice"];
+                assert!(choice.is_null() || choice == "auto", "{typed}: {choice}");
+            }
         }
 
         #[tokio::test]

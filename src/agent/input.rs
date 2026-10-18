@@ -26,6 +26,12 @@ pub(crate) struct PromptInput {
     /// Non-persisted host directive for this request only. Not serialised,
     /// not part of `literal_text()`, never stored in the session.
     turn_directive: Option<String>,
+    /// Typed marker, set by the host for an `@agent` mention turn under
+    /// `agent_mention_tool_choice = "force"`: the tool the first model request
+    /// of this turn must call. Never inferred from the directive text, never
+    /// persisted; the runner and provider drop it where it cannot apply.
+    #[cfg(feature = "subagents")]
+    first_request_tool: Option<&'static str>,
 }
 impl PromptInput {
     pub(crate) fn text(text: String) -> Self {
@@ -33,6 +39,8 @@ impl PromptInput {
             text,
             user: None,
             turn_directive: None,
+            #[cfg(feature = "subagents")]
+            first_request_tool: None,
         }
     }
     /// Attach (or, with `None`, clear) the per-request host directive. Blank
@@ -41,6 +49,19 @@ impl PromptInput {
     pub(crate) fn with_turn_directive(mut self, directive: Option<String>) -> Self {
         self.turn_directive = directive.and_then(bounded_turn_directive);
         self
+    }
+    /// Mark (or, with `None`, unmark) this turn so its first model request
+    /// forces `tool`. See [`PromptInput::first_request_tool`].
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_first_request_tool(mut self, tool: Option<&'static str>) -> Self {
+        self.first_request_tool = tool;
+        self
+    }
+    /// The tool the first model request of this turn must call, if the host
+    /// asked for forcing. Later requests in the same turn never force.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn first_request_tool(&self) -> Option<&'static str> {
+        self.first_request_tool
     }
     #[cfg(test)]
     pub(crate) fn turn_directive(&self) -> Option<&str> {
@@ -56,6 +77,8 @@ impl PromptInput {
             text: user.literal_text(),
             user: Some(user),
             turn_directive: None,
+            #[cfg(feature = "subagents")]
+            first_request_tool: None,
         }
     }
     pub(crate) fn persisted_user(&self) -> Option<&crate::session::user::PersistedUserMessage> {
