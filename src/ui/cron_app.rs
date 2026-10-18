@@ -131,6 +131,8 @@ impl App<'_> {
         let Some(fire) = self.cron.begin_fire(&id, Instant::now(), max_fires) else {
             return Ok(());
         };
+        // The fire count (or a retirement) is saved by the turn's own save.
+        self.sync_cron_schedule();
         echo_cron_fire(&mut self.renderer, &fire)?;
         if fire.retired {
             self.renderer.write_line(
@@ -147,6 +149,34 @@ impl App<'_> {
         .await?;
         self.cron_turn = self.run.is_running.then_some(fire.payload);
         self.refresh()?;
+        Ok(())
+    }
+
+    /// Copy the live schedule into the session so the next ordinary save
+    /// persists it. Quit and teardown stop the store without syncing, so the
+    /// saved schedule survives them disarmed.
+    pub(super) fn sync_cron_schedule(&mut self) {
+        self.ui.session.cron_schedule = self.cron.export(Instant::now(), chrono::Utc::now());
+    }
+
+    /// The active session changed (`/resume`, `/new`, `/clear`, `/fork`,
+    /// ...): schedules of the previous session end here (they were saved with
+    /// it), and the new session's saved schedules are held disarmed behind one
+    /// notice until `/cron resume`.
+    pub(super) fn adopt_saved_cron(&mut self) -> io::Result<()> {
+        let dropped = self.cron.len();
+        self.cron = crate::ui::cron::CronStore::from_saved(&self.ui.session.cron_schedule);
+        if dropped > 0 {
+            self.renderer.write_line(
+                &format!("cron: {dropped} schedule(s) of the previous session stopped"),
+                C_TOOL,
+            )?;
+        }
+        if let Some(notice) = crate::ui::cron::saved_schedule_notice(&self.ui.session.cron_schedule)
+        {
+            self.renderer
+                .write_line(&sanitize_output(&notice), Color::Yellow)?;
+        }
         Ok(())
     }
 

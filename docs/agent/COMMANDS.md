@@ -443,6 +443,7 @@ arming, listing and stopping only edit the schedule.
 | `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), interval, time until the next fire, fires so far out of `cron_max_fires`, and the prompt. |
 | `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
 | `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
+| `/cron resume` | Re-arm the schedules saved with a resumed session. Each keeps its id and fire count and gets a fresh deadline one interval from now; missed fires are never caught up. With nothing saved it prints a one-line notice. |
 
 - **Prompts only.** A payload starting with `/` or `!` is refused with a
   one-line reason, so a schedule never runs slash commands or shell lines (and
@@ -466,17 +467,28 @@ arming, listing and stopping only edit the schedule.
   other schedule fires until it is answered.
 - **Interrupting.** Ctrl-C stops a running fire's turn but keeps its
   schedule (the prompt is not loaded into the editor). Esc at an idle, empty
-  editor clears parked fires without removing schedules. Quitting drops every
-  schedule.
+  editor clears parked fires without removing schedules. Quitting stops every
+  schedule; the session file keeps them disarmed (see below).
 - **Bounded.** At most 16 schedules per session, and each is removed after
   `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
 - **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a
   one-time warning that scheduled turns are unbounded in spend. When the USD
   budget refuses a fire, every schedule is suspended with one notice and kept
   (`/cron list` shows them; `/cron stop all` removes them).
-- **Session-local.** Schedules are not saved; they end with the session.
-  Deadlines use a monotonic clock that does not advance while the machine is
-  suspended, so times are always shown relative to now (`in 4m`).
+- **Saved disarmed.** Schedules are saved with the session (id, interval,
+  prompt, fires so far and the wall-clock time the next fire was expected),
+  updated whenever one is armed, stopped, fired or retired. They only fire in
+  the process that armed them: quitting, `/resume`, `/new`, `/clear` or any
+  other session switch stops them. Resuming a session with saved schedules
+  (`/resume`, `--continue`) never re-arms them on its own, to avoid surprise
+  spend; it shows one notice such as `this session had 2 /cron schedules (c1
+  every 5m: ...); /cron resume to re-arm`. Until then `/cron list` shows them
+  as `disarmed`, `/cron stop` removes them, and new schedules take ids after
+  the saved ones. A session without schedules is saved exactly as before, and
+  older builds ignore the field.
+- **Relative times.** Deadlines use a monotonic clock that does not advance
+  while the machine is suspended, so times are always shown relative to now
+  (`in 4m`).
 
 ## Goal (feature-gated)
 

@@ -144,6 +144,7 @@ pub(super) mod test_support {
         let (btw_tx, btw_rx) = mpsc::channel(1);
         let (title_tx, title_rx) = mpsc::channel(1);
         let (user_tx, user_rx) = mpsc::channel(1);
+        let cron = crate::ui::cron::CronStore::from_saved(&ui.session.cron_schedule);
         App {
             ui,
             run: AgentRunState::default(),
@@ -153,7 +154,7 @@ pub(super) mod test_support {
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
             },
-            cron: Default::default(),
+            cron,
             cron_turn: None,
             renderer: Renderer::for_app_test().unwrap(),
             input,
@@ -1928,6 +1929,9 @@ impl<'a> App<'a> {
         if let Some(question) = &ui.session.pending_question {
             renderer.write_line(&sanitize_output(&question.notice()), Color::Yellow)?;
         }
+        if let Some(notice) = super::cron::saved_schedule_notice(&ui.session.cron_schedule) {
+            renderer.write_line(&sanitize_output(&notice), Color::Yellow)?;
+        }
         if let Some(notice) = &ui.cfg.update_notice {
             renderer.write_line(&sanitize_output(notice), Color::DarkGrey)?;
             renderer.write_line("", Color::White)?;
@@ -2149,12 +2153,14 @@ impl<'a> App<'a> {
         let (title_tx, title_rx) = mpsc::channel::<SessionTitleResult>(4);
         let (git_status_tx, git_status_rx) = mpsc::channel(1);
 
+        // Saved `/cron` schedules are held disarmed until `/cron resume`.
+        let cron = super::cron::CronStore::from_saved(&ui.session.cron_schedule);
         let mut app = Self {
             ui,
             run,
             chain,
             slash,
-            cron: Default::default(),
+            cron,
             cron_turn: None,
             renderer,
             input,
@@ -6248,6 +6254,9 @@ impl<'a> App<'a> {
         .await;
         if needs_tty {
             self.rebind_event_thread();
+        }
+        if prior_question_session != self.ui.session.id {
+            self.adopt_saved_cron()?;
         }
         if prior_question_session != self.ui.session.id
             || (had_pending_question && self.ui.session.pending_question.is_none())

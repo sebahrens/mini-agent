@@ -7,8 +7,7 @@ use crate::ui::cron::{self, ArmError, CronStore};
 use crate::ui::renderer::Renderer;
 use tokio::time::Instant;
 
-const USAGE: &str =
-    "usage: /cron <interval> <prompt>  |  /cron list  |  /cron stop <id>|all  |  /cron run <id>";
+const USAGE: &str = "usage: /cron <interval> <prompt>  |  /cron list  |  /cron stop <id>|all  |  /cron run <id>  |  /cron resume";
 
 /// Why a payload cannot be scheduled, or `None` for a plain prompt.
 pub(crate) fn payload_refusal(payload: &str) -> Option<&'static str> {
@@ -31,6 +30,7 @@ pub(crate) fn handle(
 ) {
     match parts {
         ["/cron"] | ["/cron", "list"] => list(store, renderer, max_fires, now),
+        ["/cron", "resume"] => resume(store, renderer, max_fires, now),
         ["/cron", "stop", "all"] => {
             let count = store.stop_all();
             write_ok(renderer, format!("cron: stopped {count} schedule(s)"));
@@ -47,6 +47,13 @@ pub(crate) fn handle(
                 write_ok(
                     renderer,
                     format!("cron {id}: marked due; it fires at the next idle point"),
+                );
+            } else if store.disarmed().iter().any(|entry| entry.id == *id) {
+                write_error(
+                    renderer,
+                    format!(
+                        "cron {id}: disarmed since the session was resumed; /cron resume first"
+                    ),
                 );
             } else {
                 write_error(renderer, format!("cron: no schedule {id} (see /cron list)"));
@@ -68,8 +75,40 @@ pub(crate) fn handle(
     }
 }
 
+/// `/cron resume`: re-arm the schedules saved with a resumed session.
+fn resume(store: &mut CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant) {
+    if store.disarmed().is_empty() {
+        write_ok(renderer, "cron: no saved schedules to resume");
+        return;
+    }
+    let rearmed = store.rearm_saved(now);
+    for id in &rearmed {
+        if let Some(entry) = store.get(id) {
+            write_ok(
+                renderer,
+                format!(
+                    "cron {id}: re-armed every {}, next fire {}; {}/{max_fires} fires so far",
+                    cron::format_duration(entry.interval),
+                    cron::format_until(entry.next_at, now),
+                    entry.fires,
+                ),
+            );
+        }
+    }
+    let left = store.disarmed().len();
+    if left > 0 {
+        write_error(
+            renderer,
+            format!(
+                "cron: at most {} schedules per session; {left} saved schedule(s) left disarmed",
+                cron::CRON_MAX_ENTRIES
+            ),
+        );
+    }
+}
+
 fn list(store: &CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant) {
-    if store.is_empty() {
+    if store.is_empty() && store.disarmed().is_empty() {
         write_ok(renderer, "no cron schedules in this session");
         write_result(renderer, USAGE);
         return;
@@ -82,13 +121,7 @@ fn list(store: &CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant
         } else {
             cron::format_until(entry.next_at, now)
         };
-        let payload: String = crate::ui::events::sanitize_output(&entry.payload)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(80)
-            .collect();
+        let payload = one_line(&entry.payload);
         write_ok(
             renderer,
             format!(
@@ -99,6 +132,34 @@ fn list(store: &CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant
             ),
         );
     }
+    for entry in store.disarmed() {
+        write_ok(
+            renderer,
+            format!(
+                "{}  every {}  disarmed  {}/{max_fires}  {}",
+                entry.id,
+                cron::format_duration(std::time::Duration::from_secs(entry.interval_secs)),
+                entry.fires,
+                one_line(&entry.payload),
+            ),
+        );
+    }
+    if !store.disarmed().is_empty() {
+        write_result(
+            renderer,
+            "cron: /cron resume re-arms the disarmed schedules",
+        );
+    }
+}
+
+fn one_line(payload: &str) -> String {
+    crate::ui::events::sanitize_output(payload)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn arm(
@@ -319,6 +380,88 @@ mod tests {
         assert_eq!(
             run("/cron 5m a", &mut store, true, now),
             ["cron: at most 16 schedules per session; /cron stop one first"]
+        );
+    }
+
+    fn saved_store() -> CronStore {
+        let entry =
+            |id: &str, interval_secs, fires, payload: &str| crate::session::SavedCronEntry {
+                id: id.into(),
+                interval_secs,
+                payload: payload.into(),
+                fires,
+                next_fire_at: "2026-10-18T12:00:00Z".into(),
+            };
+        CronStore::from_saved(&crate::session::SavedCronSchedule {
+            last_id: 3,
+            entries: vec![
+                entry("c1", 300, 4, "check"),
+                entry("c3", 3600, 0, "summary"),
+            ],
+        })
+    }
+
+    #[test]
+    fn cron_resume_with_nothing_saved_is_a_one_liner() {
+        let mut store = CronStore::default();
+        assert_eq!(
+            run("/cron resume", &mut store, true, Instant::now()),
+            ["cron: no saved schedules to resume"]
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn cron_resume_rearms_saved_schedules_keeping_ids_and_fires() {
+        let now = Instant::now();
+        let mut store = saved_store();
+        assert_eq!(
+            run("/cron list", &mut store, true, now),
+            [
+                "c1  every 5m  disarmed  4/24  check",
+                "c3  every 1h  disarmed  0/24  summary",
+                "cron: /cron resume re-arms the disarmed schedules",
+            ]
+        );
+        assert_eq!(
+            run("/cron run c1", &mut store, true, now),
+            ["cron c1: disarmed since the session was resumed; /cron resume first"]
+        );
+        assert_eq!(
+            run("/cron resume", &mut store, true, now),
+            [
+                "cron c1: re-armed every 5m, next fire in 5m; 4/24 fires so far",
+                "cron c3: re-armed every 1h, next fire in 1h; 0/24 fires so far",
+            ]
+        );
+        assert_eq!(
+            store.next_deadline(),
+            Some(now + std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            run("/cron resume", &mut store, true, now),
+            ["cron: no saved schedules to resume"]
+        );
+        // Ids stay monotonic past the restored ones.
+        assert!(run("/cron 5m next", &mut store, true, now)[0].starts_with("cron c4: every 5m"));
+    }
+
+    #[test]
+    fn cron_stop_removes_a_disarmed_schedule() {
+        let now = Instant::now();
+        let mut store = saved_store();
+        assert_eq!(
+            run("/cron stop c3", &mut store, true, now),
+            ["cron c3: stopped"]
+        );
+        assert_eq!(store.disarmed().len(), 1);
+        assert_eq!(
+            run("/cron stop all", &mut store, true, now),
+            ["cron: stopped 1 schedule(s)"]
+        );
+        assert_eq!(
+            run("/cron resume", &mut store, true, now),
+            ["cron: no saved schedules to resume"]
         );
     }
 }
