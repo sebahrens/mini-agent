@@ -776,6 +776,13 @@ pub struct Session {
         skip_serializing_if = "crate::extras::goal::GoalStore::is_empty"
     )]
     pub goal_store: crate::extras::goal::GoalStore,
+    /// `/cron` schedules saved disarmed with this session. The TUI copies its
+    /// live store here whenever the schedule changes; a resumed session never
+    /// re-arms them until `/cron resume`. Absent schedules serialize away, so
+    /// a session without cron is byte-identical to one written before this
+    /// field existed, and older builds ignore the unknown field.
+    #[serde(default, skip_serializing_if = "SavedCronSchedule::is_empty")]
+    pub(crate) cron_schedule: SavedCronSchedule,
     /// Process-local repeated-read state for this logical session. It is never
     /// persisted; startup recreates it from the active configuration.
     #[serde(skip)]
@@ -838,6 +845,36 @@ pub struct Session {
     history_conversion_cache: HistoryConversionCache,
     #[serde(skip)]
     history_revision: u64,
+}
+
+/// One `/cron` schedule as saved with its session (always disarmed on load).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedCronEntry {
+    /// `c1`, `c2`, ...; kept when the entry is re-armed.
+    pub id: String,
+    pub interval_secs: u64,
+    pub payload: String,
+    /// Fires started so far; re-arming keeps counting toward `cron_max_fires`.
+    pub fires: u32,
+    /// Wall-clock RFC 3339 time the next fire was expected when saved. Display
+    /// only: re-arming always schedules `now + interval` and never catches up.
+    pub next_fire_at: CompactString,
+}
+
+/// The `/cron` schedule persisted with a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedCronSchedule {
+    /// Highest id number ever handed out, so restored ids are never reused.
+    #[serde(default)]
+    pub last_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<SavedCronEntry>,
+}
+
+impl SavedCronSchedule {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Working-tree summary parsed from `git status --porcelain=v2 --branch`.
@@ -1156,6 +1193,7 @@ impl Session {
             todos: crate::agent::tools::TodoStore::default(),
             #[cfg(feature = "goal")]
             goal_store: crate::extras::goal::GoalStore::default(),
+            cron_schedule: SavedCronSchedule::default(),
             read_tracker: crate::agent::tools::ReadTracker::default(),
             file_checkpoints: Default::default(),
             tool_result_spills: ToolResultSpillStore::default(),

@@ -433,3 +433,84 @@ async fn cron_arm_and_park_show_notices_and_the_statusline_item() {
     drop(app);
     provider.finish().await;
 }
+
+
+#[tokio::test]
+async fn cron_resumed_session_holds_saved_schedules_disarmed_behind_one_notice() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec![]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    session.cron_schedule = crate::session::SavedCronSchedule {
+        last_id: 2,
+        entries: vec![crate::session::SavedCronEntry {
+            id: "c2".into(),
+            interval_secs: 60,
+            payload: "saved job".into(),
+            fires: 3,
+            // Long past: a resumed schedule must never catch up.
+            next_fire_at: "2020-01-01T00:00:00Z".into(),
+        }],
+    };
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    // The fixture loads the session's store as startup does; switching to it
+    // in-process (`/resume`) adopts it the same way and shows the notice.
+    app.adopt_saved_cron().unwrap();
+    assert!(app.renderer.captured_output().contains(
+        "this session had 1 /cron schedule (c2 every 1m: saved job); /cron resume to re-arm"
+    ));
+    assert_eq!(app.cron_wakeup(), None);
+    fire(&mut app).await;
+    assert!(!app.run.is_running, "a disarmed schedule never fires");
+    assert!(user_rows(&app).is_empty());
+
+    crate::startup::heap_future(|| app.run_slash_command("/cron resume"))
+        .await
+        .unwrap();
+    let entry = app.cron.get("c2").expect("re-armed under its saved id");
+    assert_eq!(entry.fires, 3);
+    assert!(!entry.due, "no catch-up for the missed wall-clock time");
+    assert!(entry.next_at > Instant::now() + Duration::from_secs(50));
+    // The re-armed schedule is copied back into the session for the next save.
+    assert_eq!(app.ui.session.cron_schedule.entries.len(), 1);
+    assert_eq!(app.ui.session.cron_schedule.entries[0].id, "c2");
+
+    // Quit stops the live schedule but keeps the saved copy for next time.
+    assert!(matches!(
+        crate::startup::heap_future(|| app.handle_user_event(UserEvent::Quit))
+            .await
+            .unwrap(),
+        ControlFlow::Break(())
+    ));
+    assert!(app.cron.is_empty());
+    assert_eq!(app.ui.session.cron_schedule.entries.len(), 1);
+    drop(app);
+    provider.finish().await;
+}
+
+#[tokio::test]
+async fn cron_fire_copies_the_new_fire_count_into_the_session() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["DONE"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    arm_expired(&mut app, "persisted tick", 1);
+    fire(&mut app).await;
+    assert!(settle(&mut app).await);
+    let saved = &app.ui.session.cron_schedule;
+    assert_eq!(saved.entries.len(), 1);
+    assert_eq!((saved.entries[0].id.as_str(), saved.entries[0].fires), ("c1", 1));
+    drop(app);
+    provider.finish().await;
+}

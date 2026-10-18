@@ -11,7 +11,13 @@
 //! TUI is busy marks the entry due ([`CronStore::mark_expired_due`]); it then
 //! fires once at the next idle point. There is no catch-up: however many
 //! deadlines were missed, an entry holds at most one parked fire.
+//!
+//! Schedules are saved with the session ([`CronStore::export`] into
+//! `Session.cron_schedule`) but only ever fire in the process that armed them.
+//! A loaded session's schedules are held disarmed ([`CronStore::from_saved`])
+//! until `/cron resume` re-arms them with fresh deadlines.
 
+use crate::session::{SavedCronEntry, SavedCronSchedule};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -188,6 +194,9 @@ pub(crate) struct CronStore {
     suspended: bool,
     /// The unbounded-spend warning has been shown once this session.
     budget_warned: bool,
+    /// Schedules restored from the saved session, kept disarmed until
+    /// `/cron resume` (see [`CronStore::from_saved`]).
+    disarmed: Vec<SavedCronEntry>,
 }
 
 impl CronStore {
@@ -232,15 +241,17 @@ impl CronStore {
 
     /// Remove one entry; `false` when no entry has that id.
     pub(crate) fn stop(&mut self, id: &str) -> bool {
-        let before = self.entries.len();
+        let before = self.entries.len() + self.disarmed.len();
         self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        self.disarmed.retain(|entry| entry.id != id);
+        self.entries.len() + self.disarmed.len() != before
     }
 
     /// Remove every entry, returning how many there were. Ids keep counting.
     pub(crate) fn stop_all(&mut self) -> usize {
-        let count = self.entries.len();
+        let count = self.entries.len() + self.disarmed.len();
         self.entries.clear();
+        self.disarmed.clear();
         self.suspended = false;
         count
     }
@@ -365,6 +376,140 @@ impl CronStore {
                 .map(|deadline| deadline.saturating_duration_since(now)),
             parked: self.entries.iter().filter(|entry| entry.due).count(),
             suspended: self.suspended,
+        }
+    }
+}
+
+/// The numeric part of a `c<N>` id, if it has that shape.
+fn id_number(id: &str) -> Option<u64> {
+    id.strip_prefix('c')?.parse().ok()
+}
+
+/// Payload shown on one line, sanitized and cut to `max` characters.
+fn payload_preview(payload: &str, max: usize) -> String {
+    let flat = crate::ui::events::sanitize_output(payload)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// The one notice shown when a resumed session carries saved schedules, or
+/// `None` when it has none.
+pub(crate) fn saved_schedule_notice(saved: &SavedCronSchedule) -> Option<String> {
+    if saved.entries.is_empty() {
+        return None;
+    }
+    let count = saved.entries.len();
+    let listed = saved
+        .entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} every {}: {}",
+                entry.id,
+                format_duration(Duration::from_secs(entry.interval_secs)),
+                payload_preview(&entry.payload, 40)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let noun = if count == 1 { "schedule" } else { "schedules" };
+    Some(format!(
+        "this session had {count} /cron {noun} ({listed}); /cron resume to re-arm"
+    ))
+}
+
+impl CronStore {
+    /// A store for a freshly loaded session: every saved schedule is held
+    /// disarmed, and ids continue after the highest saved one, so a schedule
+    /// armed before `/cron resume` never takes a restored id.
+    pub(crate) fn from_saved(saved: &SavedCronSchedule) -> Self {
+        let highest = saved
+            .entries
+            .iter()
+            .filter_map(|entry| id_number(&entry.id))
+            .max()
+            .unwrap_or(0);
+        Self {
+            last_id: saved.last_id.max(highest),
+            disarmed: saved.entries.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// Restored schedules waiting for `/cron resume`.
+    pub(crate) fn disarmed(&self) -> &[SavedCronEntry] {
+        &self.disarmed
+    }
+
+    /// Re-arm every disarmed schedule with a fresh deadline `now + interval`
+    /// (never a catch-up), keeping its id and fire count. Returns the ids
+    /// re-armed; schedules beyond [`CRON_MAX_ENTRIES`] stay disarmed.
+    pub(crate) fn rearm_saved(&mut self, now: Instant) -> Vec<String> {
+        let mut rearmed = Vec::new();
+        let mut kept = Vec::new();
+        for saved in std::mem::take(&mut self.disarmed) {
+            if self.entries.len() >= CRON_MAX_ENTRIES {
+                kept.push(saved);
+                continue;
+            }
+            let interval = Duration::from_secs(saved.interval_secs)
+                .clamp(CRON_MIN_INTERVAL, CRON_MAX_INTERVAL);
+            if let Some(number) = id_number(&saved.id) {
+                self.last_id = self.last_id.max(number);
+            }
+            rearmed.push(saved.id.clone());
+            self.entries.push(CronEntry {
+                id: saved.id,
+                interval,
+                next_at: now + interval,
+                due: false,
+                fires: saved.fires,
+                payload: saved.payload,
+            });
+        }
+        self.disarmed = kept;
+        rearmed
+    }
+
+    /// The schedule to save with the session: armed entries (with their next
+    /// fire projected onto the wall clock for display) and disarmed ones as
+    /// they were restored.
+    pub(crate) fn export(
+        &self,
+        now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
+    ) -> SavedCronSchedule {
+        let armed = self.entries.iter().map(|entry| {
+            let left = if entry.due {
+                Duration::ZERO
+            } else {
+                entry.next_at.saturating_duration_since(now)
+            };
+            let next = chrono::Duration::from_std(left)
+                .ok()
+                .and_then(|left| wall_now.checked_add_signed(left))
+                .unwrap_or(wall_now);
+            SavedCronEntry {
+                id: entry.id.clone(),
+                interval_secs: entry.interval.as_secs(),
+                payload: entry.payload.clone(),
+                fires: entry.fires,
+                next_fire_at: next
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    .into(),
+            }
+        });
+        SavedCronSchedule {
+            last_id: self.last_id,
+            entries: armed.chain(self.disarmed.iter().cloned()).collect(),
         }
     }
 }
@@ -565,5 +710,107 @@ mod tests {
         assert_eq!(format_until(now + secs(3900), now), "in 1h5m");
         assert_eq!(format_duration(secs(3600)), "1h");
         assert_eq!(format_duration(secs(90)), "1m30s");
+    }
+
+    fn saved(id: &str, interval_secs: u64, fires: u32, payload: &str) -> SavedCronEntry {
+        SavedCronEntry {
+            id: id.into(),
+            interval_secs,
+            payload: payload.into(),
+            fires,
+            next_fire_at: "2026-10-18T12:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn restored_schedules_stay_disarmed_until_rearmed_with_fresh_deadlines() {
+        let schedule = SavedCronSchedule {
+            last_id: 4,
+            entries: vec![saved("c2", 300, 5, "a"), saved("c4", 3600, 0, "b")],
+        };
+        let mut store = CronStore::from_saved(&schedule);
+        assert!(store.is_empty(), "nothing is armed on load");
+        assert_eq!(store.next_deadline(), None);
+        assert_eq!(store.disarmed().len(), 2);
+
+        // Arming before /cron resume continues after the saved ids.
+        let now = Instant::now();
+        assert_eq!(store.arm(secs(60), "new".into(), now).unwrap().id, "c5");
+
+        let later = now + secs(10_000);
+        assert_eq!(store.rearm_saved(later), ["c2", "c4"]);
+        assert!(store.disarmed().is_empty());
+        let c2 = store.get("c2").unwrap();
+        assert_eq!(
+            (c2.fires, c2.next_at, c2.due),
+            (5, later + secs(300), false)
+        );
+        assert_eq!(store.get("c4").unwrap().next_at, later + secs(3600));
+        assert!(store.rearm_saved(later).is_empty());
+        assert_eq!(store.arm(secs(60), "x".into(), later).unwrap().id, "c6");
+    }
+
+    #[test]
+    fn next_id_passes_the_highest_restored_id_even_without_last_id() {
+        let schedule = SavedCronSchedule {
+            last_id: 0,
+            entries: vec![saved("c9", 60, 0, "a")],
+        };
+        let mut store = CronStore::from_saved(&schedule);
+        assert_eq!(
+            store.arm(secs(60), "b".into(), Instant::now()).unwrap().id,
+            "c10"
+        );
+    }
+
+    #[test]
+    fn export_keeps_ids_fires_and_disarmed_entries_and_stop_removes_disarmed() {
+        let now = Instant::now();
+        let wall = chrono::DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut store = CronStore::from_saved(&SavedCronSchedule {
+            last_id: 1,
+            entries: vec![saved("c1", 120, 3, "old")],
+        });
+        store.arm(secs(300), "new".into(), now).unwrap();
+        let exported = store.export(now + secs(60), wall);
+        assert_eq!(exported.last_id, 2);
+        assert_eq!(
+            exported.entries,
+            [
+                SavedCronEntry {
+                    id: "c2".into(),
+                    interval_secs: 300,
+                    payload: "new".into(),
+                    fires: 0,
+                    next_fire_at: "2026-10-18T12:04:00Z".into(),
+                },
+                saved("c1", 120, 3, "old"),
+            ]
+        );
+        assert!(store.stop("c1"));
+        assert!(store.disarmed().is_empty());
+        assert!(CronStore::default().export(now, wall).is_empty());
+    }
+
+    #[test]
+    fn saved_schedule_notice_lists_every_entry_once() {
+        assert_eq!(saved_schedule_notice(&SavedCronSchedule::default()), None);
+        let notice = saved_schedule_notice(&SavedCronSchedule {
+            last_id: 2,
+            entries: vec![
+                saved("c1", 300, 0, "check\nthe deploy"),
+                saved("c2", 7200, 1, &"x".repeat(60)),
+            ],
+        })
+        .unwrap();
+        assert!(
+            notice.starts_with(
+                "this session had 2 /cron schedules (c1 every 5m: check the deploy; c2 every 2h: xxx"
+            ),
+            "{notice}"
+        );
+        assert!(notice.ends_with("…); /cron resume to re-arm"), "{notice}");
     }
 }
