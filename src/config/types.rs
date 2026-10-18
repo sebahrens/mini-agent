@@ -21,6 +21,19 @@ pub enum TaskCostWeighting {
     Fixed,
 }
 
+/// How an `@agent:<name>` mention turn steers the model toward the `task` tool.
+/// `Hint` (default) only attaches the non-persisted routing directive; `Force`
+/// additionally sets `tool_choice` to the `task` tool on the first model
+/// request of that turn, where the provider and request support it.
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMentionToolChoice {
+    #[default]
+    Hint,
+    Force,
+}
+
 /// Explicit token weights used by fixed mode and as automatic-mode fallbacks.
 #[cfg(feature = "subagents")]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]

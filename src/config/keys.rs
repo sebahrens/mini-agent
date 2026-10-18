@@ -284,6 +284,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "subagents").shaped(ConfigShape::Object),
     gated("subagents", "subagent_model").shaped(ConfigShape::String),
     gated("subagents", "subagent_provider").shaped(ConfigShape::String),
+    gated("subagents", "agent_mention_tool_choice").described("@agent:<name> mention turns: hint (default) attaches only the routing note; force also sets tool_choice to the task tool on the turn's first request where the provider supports it.").shaped(ConfigShape::Enum(&["hint", "force"])),
     key("colors").shaped(ConfigShape::Object),
     key("chain").shaped(ConfigShape::Object),
     gated("lsp", "lsp").shaped(ConfigShape::Object),

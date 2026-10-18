@@ -227,6 +227,31 @@ behind a Git proposal. A message with `@mcp:` mentions takes the MCP resource
 path first. Without the `subagents` feature the text is sent literally.
 Headless `-p` and ACP prompts do not resolve `@agent:` yet.
 
+#### Forcing the first call (`agent_mention_tool_choice = "force"`)
+
+By default (`"hint"`) the routing note is the only steer and the model may
+answer without delegating. The startup key `agent_mention_tool_choice =
+"force"` additionally forces the turn's **first** model request to call
+`task`: the submit path arms a typed marker
+(`PromptInput::first_request_tool`, never inferred from the note text) next
+to the directive, and `src/agent/first_tool.rs` turns it into a per-request
+`tool_choice` patch (`ToolChoice::Specific(["task"])`, Anthropic
+`{"type":"tool","name":"task"}`). The hook disarms as soon as the model
+responds (an accepted turn, a tool call or a rejected call), so the request
+carrying the `task` result and every later step or continuation in the same
+turn use the baseline `auto` choice and the model can answer. A retried first
+attempt that produced no model output stays forced. Non-mention turns are never
+forced.
+
+Forcing falls back to the hint silently (debug log, never an error) when the
+request path cannot carry it: Copilot and Ollama (rig sends or honours no
+`tool_choice`), native Anthropic and OpenRouter `anthropic/` routes with
+thinking on or of unknown state, and Claude models that reject forced tools
+outright (Claude Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1). It also falls back
+when the agent's tool list for that request does not advertise `task` (for
+example `task_enabled = false` or `--no-tools`). OpenAI Responses and Chat
+Completions, Gemini and non-Claude OpenRouter routes carry it.
+
 ### Opt-in implementation personas
 
 Enable workspace-writing children explicitly in the parent configuration:

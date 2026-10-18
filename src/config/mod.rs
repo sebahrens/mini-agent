@@ -622,6 +622,11 @@ pub struct Config {
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_cost_weighting: Option<TaskCostWeighting>,
+    /// `hint` (default) or `force`: whether an `@agent:<name>` mention turn
+    /// forces its first model request to call the `task` tool. Startup key.
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_mention_tool_choice: Option<AgentMentionToolChoice>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_cost_weights: Option<TaskCostWeights>,
@@ -1220,6 +1225,12 @@ impl Config {
     #[cfg(feature = "subagents")]
     pub fn resolve_task_cost_weighting(&self) -> TaskCostWeighting {
         self.task_cost_weighting.unwrap_or_default()
+    }
+
+    /// Mention-turn `tool_choice` policy; `hint` unless explicitly `force`.
+    #[cfg(feature = "subagents")]
+    pub fn resolve_agent_mention_tool_choice(&self) -> AgentMentionToolChoice {
+        self.agent_mention_tool_choice.unwrap_or_default()
     }
 
     #[cfg(feature = "subagents")]
@@ -2136,6 +2147,41 @@ mod task_cost_config_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "subagents"))]
+mod agent_mention_tool_choice_tests {
+    use super::{AgentMentionToolChoice, Config};
+
+    #[test]
+    fn agent_mention_tool_choice_defaults_to_hint_and_parses_force() {
+        assert_eq!(
+            Config::default().resolve_agent_mention_tool_choice(),
+            AgentMentionToolChoice::Hint
+        );
+        let force: Config = toml::from_str("agent_mention_tool_choice='force'").unwrap();
+        assert_eq!(
+            force.resolve_agent_mention_tool_choice(),
+            AgentMentionToolChoice::Force
+        );
+        let hint: Config = toml::from_str("agent_mention_tool_choice='hint'").unwrap();
+        assert_eq!(
+            hint.resolve_agent_mention_tool_choice(),
+            AgentMentionToolChoice::Hint
+        );
+        let reparsed: Config = toml::from_str(&toml::to_string(&force).unwrap()).unwrap();
+        assert_eq!(
+            reparsed.agent_mention_tool_choice,
+            force.agent_mention_tool_choice
+        );
+        for source in [
+            "agent_mention_tool_choice='Force'",
+            "agent_mention_tool_choice='always'",
+            "agent_mention_tool_choice=true",
+        ] {
+            assert!(toml::from_str::<Config>(source).is_err(), "{source}");
         }
     }
 }
