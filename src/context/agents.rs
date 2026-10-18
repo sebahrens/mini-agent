@@ -1197,6 +1197,41 @@ pub(crate) fn available_names_for_paths_and_workspace(
     names
 }
 
+/// Sorted `(name, one-line description)` pairs from the same trusted source
+/// as [`available_names_for_workspace`]. The TUI feeds both the `/agent`
+/// sub-picker (names) and the `@agent:` rows (names and descriptions) from
+/// one call so the two never disagree.
+#[cfg(feature = "subagents")]
+pub(crate) fn available_described_names_for_workspace(
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> Vec<(String, String)> {
+    let agents = match workspace {
+        Some(workspace) => shared_for_workspace_binding(workspace),
+        None => std::sync::Arc::new(load()),
+    };
+    described_names(&agents)
+}
+
+/// [`available_described_names_for_workspace`] against explicit application
+/// paths, so tests can change project trust without touching process paths.
+#[cfg(all(test, feature = "subagents"))]
+pub(crate) fn available_described_names_for_paths_and_workspace(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Vec<(String, String)> {
+    described_names(&load_for_paths_and_workspace(paths, workspace))
+}
+
+#[cfg(feature = "subagents")]
+fn described_names(agents: &HashMap<String, AgentDefinition>) -> Vec<(String, String)> {
+    let mut entries: Vec<_> = agents
+        .iter()
+        .map(|(name, definition)| (name.clone(), definition.one_line_description()))
+        .collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
 #[cfg(feature = "subagents")]
 pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,

@@ -872,7 +872,7 @@ mod slash_picker_contract {
     fn tab_inserts_the_highlighted_agent_mention_keeping_the_at_and_a_space() {
         for code in [KeyCode::Tab, KeyCode::Enter] {
             let mut input = InputEditor::new();
-            input.set_agent_mentions(vec!["general".into(), "review".into()]);
+            input.set_agent_mentions(described(&["general", "review"]));
             typed(&mut input, "ask @");
             let Some(Picker::File(picker)) = input.picker.as_mut() else {
                 panic!("@ after a space opens the file picker");
@@ -899,7 +899,7 @@ mod slash_picker_contract {
     #[test]
     fn agent_rows_precede_file_rows_for_an_empty_query() {
         let mut input = InputEditor::new();
-        input.set_agent_mentions(vec!["general".into(), "review".into()]);
+        input.set_agent_mentions(described(&["general", "review"]));
         #[cfg(feature = "mcp")]
         input.set_mcp_resources(vec!["mcp:srv:notes".into()]);
         typed(&mut input, "@");
@@ -956,10 +956,17 @@ mod slash_picker_contract {
 
         // What App::refresh_custom_commands does on `@` and `/`.
         let refresh = |input: &mut InputEditor| {
-            let names =
-                crate::context::agents::available_names_for_paths_and_workspace(&paths, &workspace);
-            input.set_agent_mentions(names.clone());
+            let entries = crate::context::agents::available_described_names_for_paths_and_workspace(
+                &paths, &workspace,
+            );
+            let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+            assert_eq!(
+                names,
+                crate::context::agents::available_names_for_paths_and_workspace(&paths, &workspace),
+                "names and descriptions come from the one trusted source"
+            );
             input.set_agent_names(names);
+            input.set_agent_mentions(entries);
         };
         let rows = |input: &mut InputEditor| -> (Vec<String>, Vec<String>) {
             typed(input, "@");
@@ -1007,7 +1014,134 @@ mod slash_picker_contract {
         let (mentions, names) = rows(&mut input);
         assert!(names.iter().any(|name| name == "projectonly"));
         assert!(mentions.iter().any(|row| row == "@agent:projectonly"));
+        typed(&mut input, "@projectonly");
+        let Some(Picker::File(picker)) = input.picker.as_mut() else {
+            panic!("@ opens the file picker");
+        };
+        picker.test_set_cache(Vec::new());
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 80, 20).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(
+            rendered.contains("@agent:projectonly") && rendered.contains("project persona"),
+            "{rendered:?}"
+        );
         drop(workspace);
+    }
+
+    #[cfg(feature = "subagents")]
+    fn described(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), format!("{name} persona")))
+            .collect()
+    }
+
+    /// The visible text of each drawn overlay row: escape sequences are
+    /// stripped and every cursor move (`CSI ... H`) starts a new row.
+    #[cfg(feature = "subagents")]
+    fn visible_rows(rendered: &str) -> Vec<String> {
+        let mut rows = vec![String::new()];
+        let mut chars = rendered.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            if c == 'H' {
+                                rows.push(String::new());
+                            }
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            rows.last_mut().unwrap().push(c);
+        }
+        rows.retain(|row| !row.is_empty());
+        rows
+    }
+
+    /// mini-agent-5eoy7.5: a persona row draws `@agent:<name>  <description>`
+    /// with the description dimmed and cut to the row width; file rows have
+    /// no detail column, and the description is never matched.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn agent_rows_draw_a_dimmed_truncated_description_that_is_never_matched() {
+        let mut input = InputEditor::new();
+        input.set_agent_mentions(vec![(
+            "review".into(),
+            "Careful code reviewer for subtle regressions".into(),
+        )]);
+        typed(&mut input, "@");
+        let Some(Picker::File(picker)) = input.picker.as_mut() else {
+            panic!("@ opens the file picker");
+        };
+        picker.test_set_cache(vec![PathBuf::from("notes.md")]);
+        typed(&mut input, "e");
+        let Some(Picker::File(picker)) = input.picker.as_ref() else {
+            panic!("the file picker stays open while typing");
+        };
+        assert_eq!(
+            picker.matches,
+            vec![PathBuf::from("@agent:review"), PathBuf::from("notes.md")]
+        );
+
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 80, 20).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        let dim = format!(
+            "{}",
+            crossterm::style::SetAttribute(crossterm::style::Attribute::Dim)
+        );
+        assert_eq!(
+            rendered.matches(dim.as_str()).count(),
+            1,
+            "only the persona row has a detail"
+        );
+        assert_eq!(
+            visible_rows(&rendered),
+            vec![
+                "▸ @agent:review  Careful code reviewer for subtle regressions",
+                "  notes.md",
+            ]
+        );
+
+        // At 30 columns the row keeps the marker, the name and as much of
+        // the description as fits (30 - 3 - 13 - 2 = 12 cells), on one line.
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 30, 20).unwrap();
+        assert_eq!(
+            visible_rows(&String::from_utf8(bytes).unwrap()),
+            vec!["▸ @agent:review  Careful code", "  notes.md"]
+        );
+
+        // Too narrow for any description: the name alone is drawn.
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 17, 20).unwrap();
+        assert_eq!(
+            visible_rows(&String::from_utf8(bytes).unwrap()),
+            vec!["▸ @agent:review", "  notes.md"]
+        );
+
+        // A word only present in the description matches nothing.
+        let mut input = InputEditor::new();
+        input.set_agent_mentions(vec![(
+            "review".into(),
+            "Careful code reviewer for subtle regressions".into(),
+        )]);
+        typed(&mut input, "@");
+        let Some(Picker::File(picker)) = input.picker.as_mut() else {
+            panic!("@ opens the file picker");
+        };
+        picker.test_set_cache(Vec::new());
+        typed(&mut input, "subtle");
+        let Some(Picker::File(picker)) = input.picker.as_ref() else {
+            panic!("the file picker stays open while typing");
+        };
+        assert!(picker.matches.is_empty(), "{:?}", picker.matches);
     }
 
     /// mini-agent-o6zkz: backing out of an argument picker returns to slash

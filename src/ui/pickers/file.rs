@@ -58,6 +58,10 @@ pub(crate) struct CacheEntry {
     lower: String,
     is_dir: bool,
     kind: EntryKind,
+    /// Display-only detail drawn dimmed after a mention row (a persona's
+    /// one-line description). Shared, so matching clones a pointer, and
+    /// never part of `lower`, so filtering stays on the name.
+    description: Option<Arc<str>>,
 }
 
 /// Where a cache entry came from. Virtual entries are completion strings
@@ -86,6 +90,7 @@ impl CacheEntry {
             lower,
             is_dir,
             kind,
+            description: None,
         }
     }
 }
@@ -118,6 +123,8 @@ pub struct FilePicker {
     match_dirs: Vec<bool>,
     /// The [`EntryKind`] of each entry of `matches`.
     match_kinds: Vec<EntryKind>,
+    /// The display-only description of each entry of `matches`.
+    match_descriptions: Vec<Option<Arc<str>>>,
     pub selected: usize,
     pub(crate) argument_start: Option<usize>,
     file_cache: Vec<CacheEntry>,
@@ -142,6 +149,7 @@ impl FilePicker {
             matches: Vec::new(),
             match_dirs: Vec::new(),
             match_kinds: Vec::new(),
+            match_descriptions: Vec::new(),
             selected: 0,
             argument_start: None,
             file_cache: Vec::new(),
@@ -172,19 +180,38 @@ impl FilePicker {
         self.insert_virtual(items, EntryKind::Opaque);
     }
 
-    /// `@agent:<name>` mention rows, inserted with a trailing space.
+    #[cfg(feature = "mcp")]
+    fn insert_virtual(&mut self, items: impl Iterator<Item = PathBuf>, kind: EntryKind) {
+        self.insert_described_virtual(items.map(|path| (path, None)), kind);
+    }
+
+    /// `@agent:<name>` mention rows, inserted with a trailing space. The
+    /// description is drawn dimmed after the row and never matched.
     #[cfg(feature = "subagents")]
-    pub(crate) fn append_virtual_mentions(&mut self, items: impl Iterator<Item = PathBuf>) {
-        self.insert_virtual(items, EntryKind::Mention);
+    pub(crate) fn append_virtual_mentions(
+        &mut self,
+        items: impl Iterator<Item = (PathBuf, Arc<str>)>,
+    ) {
+        self.insert_described_virtual(
+            items.map(|(path, description)| (path, Some(description))),
+            EntryKind::Mention,
+        );
     }
 
     /// Insert virtual rows after earlier virtual rows and before every walked
     /// path (a synchronous walk may already have filled the cache).
     #[cfg(any(feature = "mcp", feature = "subagents"))]
-    fn insert_virtual(&mut self, items: impl Iterator<Item = PathBuf>, kind: EntryKind) {
+    fn insert_described_virtual(
+        &mut self,
+        items: impl Iterator<Item = (PathBuf, Option<Arc<str>>)>,
+        kind: EntryKind,
+    ) {
         let at = self.virtual_len;
         let entries: Vec<_> = items
-            .map(|path| CacheEntry::with_kind(path, false, kind))
+            .map(|(path, description)| CacheEntry {
+                description,
+                ..CacheEntry::with_kind(path, false, kind)
+            })
             .collect();
         self.virtual_len += entries.len();
         self.file_cache.splice(at..at, entries);
@@ -224,6 +251,7 @@ impl FilePicker {
         self.matches.clear();
         self.match_dirs.clear();
         self.match_kinds.clear();
+        self.match_descriptions.clear();
         self.selected = 0;
         self.file_cache.clear();
         self.virtual_len = 0;
@@ -313,6 +341,7 @@ impl FilePicker {
             self.matches.clear();
             self.match_dirs.clear();
             self.match_kinds.clear();
+            self.match_descriptions.clear();
             self.deactivate();
             return changed;
         }
@@ -382,6 +411,7 @@ impl FilePicker {
         self.matches.clear();
         self.match_dirs.clear();
         self.match_kinds.clear();
+        self.match_descriptions.clear();
         self.selected = 0;
         #[cfg(test)]
         count_filter(0, true);
@@ -403,6 +433,7 @@ impl FilePicker {
                 self.matches.push(entry.path.clone());
                 self.match_dirs.push(entry.is_dir);
                 self.match_kinds.push(entry.kind);
+                self.match_descriptions.push(entry.description.clone());
                 if self.matches.len() >= MAX_MATCHES {
                     break;
                 }
@@ -478,7 +509,7 @@ impl FilePicker {
                 floor_row,
             );
         }
-        super::draw_picker_rows(
+        super::draw_picker_described_rows(
             out,
             cols,
             self.matches.len(),
@@ -487,7 +518,7 @@ impl FilePicker {
                 if self.match_dirs[index] {
                     display.push('/');
                 }
-                display.into()
+                (display.into(), self.match_descriptions[index].as_deref())
             },
             self.selected,
             self.monochrome,

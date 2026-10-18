@@ -13,7 +13,7 @@ use std::io::Write;
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::Clear;
 
 use super::utils::resolve_color;
@@ -210,10 +210,38 @@ pub(crate) fn draw_picker_list(
 /// entries); every row is queued and the writer is flushed once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_picker_rows<'a>(
-    mut out: &mut dyn Write,
+    out: &mut dyn Write,
     cols: u16,
     len: usize,
     row: impl Fn(usize) -> std::borrow::Cow<'a, str>,
+    selected: usize,
+    monochrome: bool,
+    empty_message: Option<&str>,
+    floor_row: u16,
+    reserved_above: u16,
+) -> std::io::Result<()> {
+    draw_picker_described_rows(
+        out,
+        cols,
+        len,
+        |index| (row(index), None),
+        selected,
+        monochrome,
+        empty_message,
+        floor_row,
+        reserved_above,
+    )
+}
+
+/// [`draw_picker_rows`] where a row may carry a dimmed detail column drawn
+/// two spaces after its text. The detail only uses the width the text left
+/// over and is cut, never wrapped, so each row stays one terminal line.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_picker_described_rows<'a>(
+    mut out: &mut dyn Write,
+    cols: u16,
+    len: usize,
+    row: impl Fn(usize) -> (std::borrow::Cow<'a, str>, Option<&'a str>),
     selected: usize,
     monochrome: bool,
     empty_message: Option<&str>,
@@ -238,9 +266,10 @@ pub(crate) fn draw_picker_rows<'a>(
             picker_command(Clear(crossterm::terminal::ClearType::CurrentLine)),
         )?;
 
-        let text = row(i);
+        let (text, detail) = row(i);
         let item = display_safe(&text);
-        let truncated = crate::ui::utils::display_prefix(&item, cols.saturating_sub(3) as usize);
+        let available = cols.saturating_sub(3) as usize;
+        let truncated = crate::ui::utils::display_prefix(&item, available);
         let (color, marker) = if i == selected {
             (Color::Green, '▸')
         } else {
@@ -251,6 +280,20 @@ pub(crate) fn draw_picker_rows<'a>(
             "{}{marker} {truncated}{ResetColor}",
             SetForegroundColor(resolve_color(color, monochrome)),
         )?;
+        let remaining = available
+            .saturating_sub(crate::ui::utils::display_width(truncated))
+            .saturating_sub(2);
+        if let Some(detail) = detail.filter(|detail| !detail.is_empty() && remaining > 0) {
+            let detail = display_safe(detail);
+            let detail = crate::ui::utils::display_prefix(&detail, remaining);
+            write!(
+                out,
+                "  {}{}{detail}{}{ResetColor}",
+                SetAttribute(Attribute::Dim),
+                SetForegroundColor(resolve_color(Color::DarkGrey, monochrome)),
+                SetAttribute(Attribute::NormalIntensity),
+            )?;
+        }
     }
     out.flush()
 }
