@@ -546,6 +546,10 @@ pub(crate) struct AgentRunState {
     /// turn-scoped `schedule_wakeup` tool bound to this slot on the agent it
     /// runs, and the scheduler removes the tool when that turn ends.
     pub(crate) cron_wakeup: Option<crate::agent::tools::schedule_wakeup::WakeupSlot>,
+    /// Typed marker armed with `next_turn_directive` for an `@agent` mention
+    /// turn when `agent_mention_tool_choice = "force"`: the tool the turn's
+    /// first model request must call. Taken by the same start attempt.
+    pub(crate) next_turn_first_request_tool: Option<&'static str>,
     /// Clarification identity of the logical main user turn. Automatic
     /// phases, retries and context relief preserve this exact slot.
     pub question_turn: Option<crate::question::QuestionTurn>,

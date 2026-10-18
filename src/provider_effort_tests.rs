@@ -936,6 +936,219 @@ async fn turn_directive53_anthropic_wire_last_user_block_and_literal_hook_payloa
     );
 }
 
+/// Stand-in `task` tool: the forcing hook keys on the advertised name only.
+#[cfg(feature = "subagents")]
+struct FakeTask55;
+#[cfg(feature = "subagents")]
+impl rig::tool::Tool for FakeTask55 {
+    const NAME: &'static str = "task";
+    type Error = std::io::Error;
+    type Args = Value;
+    type Output = String;
+    fn description(&self) -> String {
+        "Delegate to a specialist".into()
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"agent_type":{"type":"string"}}})
+    }
+    async fn call(&self, _args: Value) -> Result<String, std::io::Error> {
+        Ok("CHILD_REPORT55".into())
+    }
+}
+
+/// A mention turn on the Anthropic wire: with the `task` tool the model calls
+/// it, then answers after the tool result (two requests); without it the
+/// model answers at once. Returns every request body.
+#[cfg(feature = "subagents")]
+async fn mention55_anthropic_turn(
+    model_name: &str,
+    first_request_tool: Option<&'static str>,
+    with_task_tool: bool,
+) -> Vec<Value> {
+    #[cfg(feature = "hooks")]
+    let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let tool_call = start()
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_task55","name":"task","input":{}}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"agent_type\":\"reviewer\"}"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        )
+        + &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}),
+        )
+        + &event("message_stop", json!({"type":"message_stop"}));
+    let answer = start() + &text(0, "ANSWER55") + &finish();
+    let wire = Wire::new(if with_task_tool {
+        vec![(true, tool_call), (true, answer)]
+    } else {
+        vec![(true, answer)]
+    });
+    let AnyModel::Anthropic(model) = wire.client().completion_model(model_name) else {
+        unreachable!()
+    };
+    let builder = rig::agent::AgentBuilder::new(model)
+        .preamble("Stable root policy")
+        .max_tokens(100)
+        .default_max_turns(4);
+    let agent = if with_task_tool {
+        builder.tool(FakeTask55).build()
+    } else {
+        builder.build()
+    };
+    let agent = AnyAgent::without_skills(AnyAgentInner::Anthropic(agent));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let prompt = crate::agent::input::PromptInput::text("please review".into())
+        .with_turn_directive(Some(crate::context::mentions::routing_directive(&[
+            "reviewer".into(),
+        ])))
+        .with_first_request_tool(first_request_tool);
+    let paused = crate::startup::heap_future(|| {
+        agent.spawn_runner_paused_input_in_scope(
+            prompt,
+            Vec::<Message>::new(),
+            RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            #[cfg(feature = "hooks")]
+            None,
+            scope.clone(),
+        )
+    })
+    .await;
+    let mut runner = paused.start_interactive();
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response, .. } => return response,
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => {
+                    runner
+                        .compaction_decision_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        panic!("runner closed without Done");
+    })
+    .await
+    .expect("mention turn did not retire");
+    cleanup.settle().await;
+    assert!(response.contains("ANSWER55"), "{response}");
+    let requests = wire.finish();
+    assert_eq!(requests.len(), if with_task_tool { 2 } else { 1 });
+    requests
+}
+
+/// rig's baseline for a tool-carrying Anthropic request is `auto` (or no
+/// field); a forced choice is `tool`/`any`.
+#[cfg(feature = "subagents")]
+fn mention55_assert_not_forced(request: &Value) {
+    let kind = request.pointer("/tool_choice/type");
+    assert!(
+        kind.is_none_or(|kind| kind == "auto"),
+        "forced tool_choice: {}",
+        request["tool_choice"]
+    );
+}
+
+/// mini-agent-5eoy7.5 (3): `force` on a mention turn forces exactly the first
+/// request to the `task` tool; the request carrying the tool result is not
+/// forced, so the model can answer.
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn mention_tool_choice55_force_sets_task_on_first_request_only() {
+    let requests = mention55_anthropic_turn("claude-opus-4-8", Some("task"), true).await;
+    assert_eq!(
+        requests[0]["tool_choice"],
+        json!({"type":"tool","name":"task"})
+    );
+    assert!(requests[0]["tools"].to_string().contains("\"task\""));
+    mention55_assert_not_forced(&requests[1]);
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("CHILD_REPORT55")
+    );
+}
+
+/// `hint` (no typed marker) never carries `tool_choice`, on either request.
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn mention_tool_choice55_hint_turn_sends_no_tool_choice() {
+    let requests = mention55_anthropic_turn("claude-opus-4-8", None, true).await;
+    for request in &requests {
+        mention55_assert_not_forced(request);
+    }
+}
+
+/// A request path that cannot carry a forced tool (Claude Opus 5.5 rejects
+/// forced tool_choice and thinks by default) and a request whose tool list
+/// lacks `task` both fall back to the hint and still complete.
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn mention_tool_choice55_unsupported_provider_or_missing_tool_falls_back_to_hint() {
+    let requests = mention55_anthropic_turn("claude-opus-5-5", Some("task"), true).await;
+    for request in &requests {
+        mention55_assert_not_forced(request);
+    }
+    let requests = mention55_anthropic_turn("claude-opus-4-8", Some("task"), false).await;
+    mention55_assert_not_forced(&requests[0]);
+}
+
+/// The Claude capability table: forcing only with thinking known off and
+/// never on models that reject forced tools; non-Claude OpenRouter routes
+/// carry it.
+#[cfg(feature = "subagents")]
+#[test]
+fn mention_tool_choice55_claude_blocker_table() {
+    use effort::Protocol;
+    assert_eq!(
+        claude_forced_tool_choice_blocker(Protocol::Anthropic, "claude-opus-4-8", None),
+        None
+    );
+    assert!(
+        claude_forced_tool_choice_blocker(
+            Protocol::Anthropic,
+            "claude-opus-4-8",
+            Some(&json!({"thinking":{"type":"adaptive"}}))
+        )
+        .is_some()
+    );
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+        assert!(claude_forced_tool_choice_blocker(Protocol::Anthropic, model, None).is_some());
+    }
+    assert!(
+        claude_forced_tool_choice_blocker(Protocol::Anthropic, "claude-unknown-model", None)
+            .is_some()
+    );
+    assert_eq!(
+        claude_forced_tool_choice_blocker(Protocol::OpenRouter, "openai/gpt-5", None),
+        None
+    );
+    assert!(
+        claude_forced_tool_choice_blocker(Protocol::OpenRouter, "anthropic/claude-opus-5.5", None)
+            .is_some()
+    );
+}
+
 #[cfg(all(feature = "hooks", unix))]
 #[tokio::test]
 async fn hooks60_actual_headless_gate_commits_system_notices_and_native_feed() {

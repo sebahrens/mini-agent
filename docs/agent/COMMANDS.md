@@ -445,6 +445,7 @@ and stopping only edit the schedule.
 | `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), `every <interval>` or `self-paced`, time until the next fire (`running` while a self-paced fire's turn has not chosen one yet), fires so far out of `cron_max_fires`, and the prompt. |
 | `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
 | `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
+| `/cron resume` | Re-arm the schedules saved with a resumed session. Each keeps its id and fire count and gets a fresh deadline one interval from now; missed fires are never caught up. With nothing saved it prints a one-line notice. |
 
 - **Prompts, plus a read-only slash allowlist.** A payload starting with `!`
   is always refused with a one-line reason. A payload starting with `/` is
@@ -500,16 +501,34 @@ and stopping only edit the schedule.
   `schedule_wakeup`. Esc at an idle, empty editor clears parked fires without
   removing interval schedules, and clears the pending wakeup of every
   self-paced schedule, which stops it (it has no interval to fall back to).
-  Quitting drops every schedule.
+  Quitting stops every schedule; the session file keeps them disarmed (see
+  below).
 - **Bounded.** At most 16 schedules per session, and each is removed after
   `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
 - **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a
   one-time warning that scheduled turns are unbounded in spend. When the USD
   budget refuses a fire, every schedule is suspended with one notice and kept
   (`/cron list` shows them; `/cron stop all` removes them).
-- **Session-local.** Schedules are not saved; they end with the session.
-  Deadlines use a monotonic clock that does not advance while the machine is
-  suspended, so times are always shown relative to now (`in 4m`).
+- **Saved disarmed.** Schedules are saved with the session (id, interval,
+  prompt, fires so far and the wall-clock time the next fire was expected),
+  updated whenever one is armed, stopped, fired or retired. They only fire in
+  the process that armed them: quitting, `/resume`, `/new`, `/clear` or any
+  other session switch stops them. Resuming a session with saved schedules
+  (`/resume`, `--continue`) never re-arms them on its own, to avoid surprise
+  spend; it shows one notice such as `this session had 2 /cron schedules (c1
+  every 5m: ...); /cron resume to re-arm`. Until then `/cron list` shows them
+  as `disarmed`, `/cron stop` removes them, and new schedules take ids after
+  the saved ones. A session without schedules is saved exactly as before, and
+  older builds ignore the field. A self-paced schedule is saved with
+  `"dynamic": true` (the key is omitted for interval schedules); one saved
+  while its fire was running is saved as not running. `/cron list` shows it as
+  `disarmed (self-paced)`, and `/cron resume` parks its next fire for the next
+  idle point (no catch-up). While a self-paced fire's turn runs, the statusline
+  `cron` item reads `running` until the turn chooses its wakeup, then shows
+  that countdown.
+- **Relative times.** Deadlines use a monotonic clock that does not advance
+  while the machine is suspended, so times are always shown relative to now
+  (`in 4m`).
 
 ## Goal (feature-gated)
 
@@ -579,6 +598,18 @@ An empty or whitespace-only `-p` prompt is a local usage error (exit 2) before
 provider and session initialization. Text mode reports `no prompt given` on
 stderr; `--output json` (or the final `--output stream-json` record) emits a result with `stop_reason: "failed"`, zero usage
 and cost, and the same message. No provider request or session message is created.
+
+`@agent:<name>` mentions in a `-p` prompt are plain text unless the opt-in
+`headless_agent_mentions = true` config key is set (default off, so scripts that
+pipe arbitrary text keep working). With it on, and the `subagents` feature
+compiled in, the typed prompt is resolved exactly as in the TUI: resolved
+`@agent-<name>` aliases are rewritten to `@agent:<name>`, that normalised text is
+what the session saves and hooks see, and the first model request carries the
+non-persisted routing note. An unknown canonical name exits nonzero before any
+provider request, with the error naming the valid personas on stderr (and in the
+`--output json`/`stream-json` failure result). Piped stdin, `!` commands and
+`--loop` runs are never parsed. See
+[SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent).
 
 At startup, mini-agent resolves the configured shell once against the canonical
 workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh

@@ -225,7 +225,45 @@ error lists the valid personas and the draft returns to the editor. The same
 resolution applies to queued input replayed after a turn and to input queued
 behind a Git proposal. A message with `@mcp:` mentions takes the MCP resource
 path first. Without the `subagents` feature the text is sent literally.
-Headless `-p` and ACP prompts do not resolve `@agent:` yet.
+
+Headless `-p` and ACP prompts resolve mentions only when the operator opts in
+with `headless_agent_mentions = true` (default off: scripts and editors that
+send arbitrary text would otherwise start failing on an `@agent:` token). With
+the key on, `-p` parses the typed prompt (never piped stdin, `!` commands or
+`--loop` runs) at startup: an unknown name exits nonzero with the error on
+stderr before any provider request; a resolved prompt is normalised and its
+first model request carries the routing note. ACP parses only the client's
+`text` content blocks of a non-command `session/prompt` (embedded resources and
+resource links are reference material and never route or fail): an unknown name
+is a JSON-RPC `-32602` invalid-params error carrying the same message, and a
+resolved prompt is normalised and routed for that request only. In both modes
+the note is never saved, replayed or shown to hooks. Without the `subagents`
+feature the key is accepted but inert and prompts pass through literally.
+
+#### Forcing the first call (`agent_mention_tool_choice = "force"`)
+
+By default (`"hint"`) the routing note is the only steer and the model may
+answer without delegating. The startup key `agent_mention_tool_choice =
+"force"` additionally forces the turn's **first** model request to call
+`task`: the submit path arms a typed marker
+(`PromptInput::first_request_tool`, never inferred from the note text) next
+to the directive, and `src/agent/first_tool.rs` turns it into a per-request
+`tool_choice` patch (`ToolChoice::Specific(["task"])`, Anthropic
+`{"type":"tool","name":"task"}`). The hook disarms as soon as the model
+responds (an accepted turn, a tool call or a rejected call), so the request
+carrying the `task` result and every later step or continuation in the same
+turn use the baseline `auto` choice and the model can answer. A retried first
+attempt that produced no model output stays forced. Non-mention turns are never
+forced.
+
+Forcing falls back to the hint silently (debug log, never an error) when the
+request path cannot carry it: Copilot and Ollama (rig sends or honours no
+`tool_choice`), native Anthropic and OpenRouter `anthropic/` routes with
+thinking on or of unknown state, and Claude models that reject forced tools
+outright (Claude Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1). It also falls back
+when the agent's tool list for that request does not advertise `task` (for
+example `task_enabled = false` or `--no-tools`). OpenAI Responses and Chat
+Completions, Gemini and non-Claude OpenRouter routes carry it.
 
 ### Opt-in implementation personas
 

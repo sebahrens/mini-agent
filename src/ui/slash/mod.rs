@@ -1000,6 +1000,9 @@ pub(crate) async fn handle_slash(
                 budget_capped,
                 tokio::time::Instant::now(),
             );
+            // The generic settlement (or the running turn's end) saves it.
+            ctx.session.cron_schedule =
+                cron_store.export(tokio::time::Instant::now(), chrono::Utc::now());
             Ok(())
         }
         "/loop" => {

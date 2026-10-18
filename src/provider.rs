@@ -2094,6 +2094,78 @@ pub enum AnyAgentInner {
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
+#[cfg(feature = "subagents")]
+impl AnyAgentInner {
+    /// Why this provider path cannot honour a forced `tool_choice` on its
+    /// request, or `None` when it can. Forcing then falls back to the routing
+    /// hint alone; it must never become a request error.
+    fn forced_tool_choice_blocker(&self) -> Option<&'static str> {
+        match self {
+            // rig's Copilot request builder never sends `tool_choice`, and
+            // Ollama drops it with a warning.
+            AnyAgentInner::Copilot(_) => Some("the Copilot request builder has no tool_choice"),
+            AnyAgentInner::Ollama(_) => Some("Ollama does not support tool_choice"),
+            AnyAgentInner::Anthropic(a) => claude_forced_tool_choice_blocker(
+                effort::Protocol::Anthropic,
+                &a.model.model,
+                a.additional_params.as_ref(),
+            ),
+            AnyAgentInner::OpenRouter(a) => claude_forced_tool_choice_blocker(
+                effort::Protocol::OpenRouter,
+                &a.model.model,
+                a.additional_params.as_ref(),
+            ),
+            AnyAgentInner::OpenAI(_) | AnyAgentInner::Gemini(_) => None,
+        }
+    }
+}
+
+/// Claude models whose API rejects forced `tool_choice` (`any`/`tool`)
+/// outright, whatever the thinking setting.
+#[cfg(feature = "subagents")]
+const CLAUDE_FORCED_TOOL_CHOICE_REJECTED: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+];
+
+/// Anthropic (native or an OpenRouter `anthropic/` route) rejects a forced
+/// tool while thinking is on, and some models reject it always. Unknown
+/// thinking state is treated as unsupported. Non-Claude OpenRouter routes
+/// carry `tool_choice` as OpenAI does.
+#[cfg(feature = "subagents")]
+fn claude_forced_tool_choice_blocker(
+    protocol: effort::Protocol,
+    model: &str,
+    params: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let routed = params
+        .and_then(|v| v.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(model);
+    let name = match protocol {
+        effort::Protocol::OpenRouter => match routed.strip_prefix("anthropic/") {
+            Some(name) => name.replace('.', "-"),
+            None => return None,
+        },
+        _ => routed.to_owned(),
+    };
+    if CLAUDE_FORCED_TOOL_CHOICE_REJECTED.iter().any(|rejected| {
+        name == *rejected
+            || name
+                .strip_prefix(rejected)
+                .is_some_and(|rest| rest.starts_with('-'))
+    }) {
+        return Some("this Claude model rejects forced tool_choice");
+    }
+    match effort::thinking_enabled(protocol, model, params) {
+        Some(false) => None,
+        Some(true) => Some("Claude rejects forced tool_choice while thinking is on"),
+        None => Some("Claude thinking state is unknown for this model"),
+    }
+}
+
 /// Compatibility data only. Runtime owners and approvals are never serialized.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2313,6 +2385,11 @@ pub struct AnyAgent {
     js_probe_pending: bool,
     native_host: Option<std::sync::Arc<NativeHostOwner>>,
     question_turn: Option<crate::question::QuestionTurn>,
+    /// Non-persisted host directive for the next headless turn only, shared
+    /// by clones and taken by the first `run_print_with_output` that starts a
+    /// request, so later goal rounds never repeat it.
+    #[cfg(feature = "subagents")]
+    headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
     #[cfg(feature = "memory")]
@@ -3044,6 +3121,8 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
+            #[cfg(feature = "subagents")]
+            headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
             #[cfg(feature = "memory")]
@@ -3266,6 +3345,25 @@ impl AnyAgent {
     ) -> Self {
         self.question_turn = turn;
         self
+    }
+
+    /// Attach a non-persisted host directive (an `@agent` routing note) to
+    /// the next headless turn this agent or any clone of it dispatches. The
+    /// UserPromptSubmit hook and persistence see only the literal prompt.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_headless_turn_directive(mut self, directive: Option<String>) -> Self {
+        self.headless_turn_directive =
+            directive.map(|directive| std::sync::Arc::new(std::sync::Mutex::new(Some(directive))));
+        self
+    }
+
+    #[cfg(feature = "subagents")]
+    fn take_headless_turn_directive(&self) -> Option<String> {
+        self.headless_turn_directive.as_ref().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
     }
 
     fn with_context_snapshot(mut self, snapshot: Option<builder::PreambleSnapshot>) -> Self {
@@ -3627,6 +3725,8 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
+            #[cfg(feature = "subagents")]
+            headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
             #[cfg(feature = "memory")]
@@ -3841,7 +3941,9 @@ impl AnyAgent {
                     return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                 }
             };
-            let prompt = prompt.to_string();
+            let prompt = crate::agent::input::PromptInput::text(prompt.to_string());
+            #[cfg(feature = "subagents")]
+            let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
             let turn = match &inner {
@@ -4341,6 +4443,23 @@ impl AnyAgent {
                 let inner = self.inner;
                 #[cfg(feature = "subagents")]
                 let background_scope = std::sync::Arc::downgrade(&work_scope);
+                // A forced first-request tool the provider path cannot carry
+                // falls back silently to the routing hint alone.
+                #[cfg(feature = "subagents")]
+                let prompt = match (
+                    prompt.first_request_tool(),
+                    inner.forced_tool_choice_blocker(),
+                ) {
+                    (Some(tool), Some(reason)) => {
+                        tracing::debug!(
+                            tool,
+                            reason,
+                            "tool_choice not forced; using the routing hint only"
+                        );
+                        prompt.with_first_request_tool(None)
+                    }
+                    _ => prompt,
+                };
                 let paused = match inner {
                     AnyAgentInner::OpenRouter(a) => {
                         runner::spawn_agent_paused_input_in_scope_with_native_capture(

@@ -52,6 +52,8 @@ pub struct StatusContext<'a> {
     /// Active goal, rendered as `round/max` plus a status word when the goal is
     /// not simply running.
     pub goal_label: Option<&'a str>,
+    /// Session `/cron` schedules (see [`cron_label`]); `None` hides the item.
+    pub cron_label: Option<&'a str>,
     pub prompt_name: Option<&'a str>,
     /// Configured `[reasoning] effort` (wire spelling), if any.
     pub reasoning_effort: Option<&'a str>,
@@ -67,6 +69,41 @@ pub struct StatusContext<'a> {
     /// implicitly selected default backend was unavailable. This security
     /// indicator is shown even when a custom `[statusline]` omits `sandbox`.
     pub sandbox_label: Option<&'a str>,
+}
+
+/// The `cron` item text: the armed count plus one state, by precedence
+/// `suspended` (budget exhausted), `waiting` (a scheduled turn holds a
+/// permission or question prompt), `parked` (a fire waits for idle), else the
+/// time to the next fire rounded up to the minute (`in <1m` below a minute).
+/// Times are relative only: monotonic deadlines shift across a host suspend.
+/// `None` when nothing is armed.
+pub(crate) fn cron_label(summary: crate::ui::cron::CronSummary, waiting: bool) -> Option<String> {
+    if summary.armed == 0 {
+        return None;
+    }
+    let state = if summary.suspended {
+        "suspended".to_owned()
+    } else if waiting {
+        "waiting".to_owned()
+    } else if summary.parked > 0 {
+        "parked".to_owned()
+    } else if summary.running > 0 {
+        "running".to_owned()
+    } else {
+        match summary.next_in {
+            Some(left) if left < std::time::Duration::from_secs(60) => "in <1m".to_owned(),
+            Some(left) => {
+                let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+                let minutes = secs.div_ceil(60);
+                format!(
+                    "in {}",
+                    crate::ui::cron::format_duration(std::time::Duration::from_secs(minutes * 60))
+                )
+            }
+            None => "armed".to_owned(),
+        }
+    };
+    Some(format!("\u{27f3} {} {state}", summary.armed))
 }
 
 /// Status segment text for a degraded (unavailable-default) sandbox.
@@ -208,6 +245,9 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.workspace.hash(&mut state);
     ctx.loop_label.hash(&mut state);
     ctx.goal_label.hash(&mut state);
+    // The label already carries the next fire bucketed to the minute, so a
+    // countdown rebuilds the spans once a minute, not every frame.
+    ctx.cron_label.hash(&mut state);
     ctx.prompt_name.hash(&mut state);
     ctx.reasoning_effort.hash(&mut state);
     ctx.perm_mode.hash(&mut state);
@@ -333,7 +373,7 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
                     let layout = SpanLayout::Item {
                         dynamic_color: live_color.is_some(),
                         priority: item_priority(item, seg.priority),
-                        compact: if matches!(item, "mode" | "sandbox" | "goal" | "loop") {
+                        compact: if matches!(item, "mode" | "sandbox" | "goal" | "loop" | "cron") {
                             None
                         } else {
                             seg.min
@@ -416,7 +456,7 @@ fn item_priority(item: &str, configured: Option<u8>) -> u8 {
     match item {
         "sandbox" => 255,
         "mode" => 254,
-        "goal" | "loop" => 253,
+        "goal" | "loop" | "cron" => 253,
         "prompt" => 240,
         _ => configured
             .unwrap_or(match item {
@@ -749,6 +789,7 @@ fn resolve_item(
         "sandbox" => ctx.sandbox_label.map(str::to_string),
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
         "goal" => ctx.goal_label.map(|s| format!("[{s}]")),
+        "cron" => ctx.cron_label.map(str::to_string),
         "chain" => ctx.chain_label.map(|s| s.to_string()),
         "todos" => match ctx.todos {
             Some((done, total)) => (total > 0 || always).then(|| format!("todo:{done}/{total}")),
@@ -998,6 +1039,7 @@ pub fn item_icon(item: &str) -> Option<&'static str> {
         "mode" => "\u{f023}",                                                //
         "loop" => "\u{f01e}",                                                //
         "goal" => "\u{f140}",                                                //
+        "cron" => "\u{f073}",                                                //
         "btw" => "\u{f075}",                                                 //
         "compaction" => "\u{f066}",                                          //
         _ => return None,
@@ -1101,6 +1143,8 @@ pub fn default_spec() -> StatusLineConfig {
         seg("sandbox", Some("red")),
         sep(" "),
         seg("loop", None),
+        sep(" "),
+        seg("cron", None),
         sep(" "),
         seg("goal", None),
         sep(" "),

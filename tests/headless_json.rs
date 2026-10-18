@@ -5140,3 +5140,115 @@ fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage
     assert!(history.contains("not a public network address"));
     assert!(history.contains("EXA_API_KEY"));
 }
+
+/// The text parts of the last user message of one Chat Completions body.
+#[cfg(feature = "subagents")]
+fn last_user_texts(body: &serde_json::Value) -> Vec<String> {
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    match &user["content"] {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str().map(str::to_owned))
+            .collect(),
+        other => panic!("unexpected user content {other}"),
+    }
+}
+
+/// `headless_agent_mentions` is opt-in: with it off, `-p` text (even an
+/// unknown `@agent:` token) reaches the model untouched, exactly as before.
+#[cfg(feature = "subagents")]
+#[test]
+fn headless_agent_mentions_off_passes_the_prompt_through_untouched() {
+    let root = TempRoot::new();
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","content":"ok"}),
+            "stop",
+        )],
+    );
+    let prompt = "ask @agent:no-such-persona and @agent-rust-maintainer";
+    let mut command = root.provider_command("read");
+    command.args(["-p", prompt]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(bodies.len(), 1, "{stderr}");
+    assert_eq!(last_user_texts(&bodies[0]), vec![prompt.to_string()]);
+    let saved = serde_json::to_string(&root.saved_session()["messages"]).unwrap();
+    assert!(saved.contains(prompt), "{saved}");
+}
+
+/// With the key on, a resolved mention is alias-normalised, the routing note
+/// rides on the request as a separate final block, and only the literal text
+/// is persisted.
+#[cfg(feature = "subagents")]
+#[test]
+fn headless_agent_mentions_on_routes_with_a_non_persisted_directive() {
+    let root = TempRoot::new();
+    let server = scripted_provider(
+        &root,
+        "headless_agent_mentions = true",
+        vec![ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","content":"routed"}),
+            "stop",
+        )],
+    );
+    let mut command = root.provider_command("read");
+    command.args(["-p", "ask @agent-rust-maintainer to review"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(bodies.len(), 1, "{stderr}");
+    let texts = last_user_texts(&bodies[0]);
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert_eq!(texts[0], "ask @agent:rust-maintainer to review");
+    assert!(
+        texts[1].contains("Host routing note") && texts[1].contains("\"rust-maintainer\""),
+        "{texts:?}"
+    );
+    let saved = serde_json::to_string(&root.saved_session()["messages"]).unwrap();
+    assert!(
+        saved.contains("ask @agent:rust-maintainer to review"),
+        "{saved}"
+    );
+    assert!(!saved.contains("Host routing note"), "{saved}");
+    assert!(!saved.contains("@agent-rust-maintainer"), "{saved}");
+}
+
+/// With the key on, an unknown canonical name fails the run with the valid
+/// names on stderr and a non-zero exit, before any provider request.
+#[cfg(feature = "subagents")]
+#[test]
+fn headless_agent_mentions_on_refuses_an_unknown_agent_before_any_request() {
+    let root = TempRoot::new();
+    let server = scripted_provider(&root, "headless_agent_mentions = true", Vec::new());
+    let mut command = root.provider_command("read");
+    command.args(["-p", "run @agent:no-such-persona now"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server.join().unwrap().unwrap();
+    assert!(bodies.is_empty(), "no provider request may be made");
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("unknown agent '@agent:no-such-persona'")
+            && stderr.contains("rust-maintainer"),
+        "{stderr}"
+    );
+}

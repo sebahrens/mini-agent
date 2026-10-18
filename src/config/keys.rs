@@ -138,6 +138,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("web-fetch-allow-http", &["web_fetch_allow_http"]).described("Permit native HTTP to safe public destinations").shaped(ConfigShape::Bool),
     aliased("web-search-provider", &["web_search_provider"]).described("Native search provider, exa or off").shaped(ConfigShape::Enum(&["exa", "off"])),
     key("headless_questions").shaped(ConfigShape::Enum(&["error", "fail"])),
+    key("headless_agent_mentions").described("Opt-in: resolve @agent:<name> mentions in -p and ACP prompts; an unknown name fails the request (needs the subagents feature)").shaped(ConfigShape::Bool),
     key("no_context_files")
         .described("Disable automatic instruction-file discovery")
         .shaped(ConfigShape::Bool),
@@ -284,6 +285,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "subagents").shaped(ConfigShape::Object),
     gated("subagents", "subagent_model").shaped(ConfigShape::String),
     gated("subagents", "subagent_provider").shaped(ConfigShape::String),
+    gated("subagents", "agent_mention_tool_choice").described("@agent:<name> mention turns: hint (default) attaches only the routing note; force also sets tool_choice to the task tool on the turn's first request where the provider supports it.").shaped(ConfigShape::Enum(&["hint", "force"])),
     key("colors").shaped(ConfigShape::Object),
     key("chain").shaped(ConfigShape::Object),
     gated("lsp", "lsp").shaped(ConfigShape::Object),

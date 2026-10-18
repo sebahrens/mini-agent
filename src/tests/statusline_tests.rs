@@ -6,6 +6,7 @@ fn ctx() -> StatusContext<'static> {
     StatusContext {
         workspace: std::path::Path::new("/var/lib/zerostack-demo/project"),
         loop_label: None,
+        cron_label: None,
         goal_label: None,
         prompt_name: None,
         reasoning_effort: None,
@@ -882,4 +883,125 @@ fn profile100_host_full_is_a_persistent_red_status_segment() {
     let spans = &statusline::build_lines(&spec, &session, &current)[0];
     assert!(spans.iter().any(|span| matches!(span, StatusSpan::Text {text, fg:Some(crossterm::style::Color::Red), ..} if text == "sandbox:host-full")));
     assert_eq!(line_text(spans).matches("sandbox:host-full").count(), 1);
+}
+
+fn cron_summary(armed: usize, next_in: Option<u64>) -> crate::ui::cron::CronSummary {
+    crate::ui::cron::CronSummary {
+        armed,
+        next_in: next_in.map(std::time::Duration::from_secs),
+        running: 0,
+        parked: 0,
+        suspended: false,
+    }
+}
+
+#[test]
+fn the_cron_item_shows_the_countdown_and_each_held_state() {
+    let session = Session::new("anthropic", "claude", 200_000, "");
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("cron")],
+        }],
+    };
+    let render = |label: Option<&str>| {
+        let mut ctx = ctx();
+        ctx.cron_label = label;
+        line_text(&statusline::build_lines(&spec, &session, &ctx)[0])
+    };
+
+    assert_eq!(statusline::cron_label(cron_summary(0, None), false), None);
+    assert_eq!(render(None), "", "no schedules must not occupy the line");
+
+    let armed = statusline::cron_label(cron_summary(2, Some(210)), false);
+    assert_eq!(armed.as_deref(), Some("⟳ 2 in 4m"));
+    assert_eq!(render(armed.as_deref()), "⟳ 2 in 4m");
+    assert_eq!(
+        statusline::cron_label(cron_summary(1, Some(20)), false).as_deref(),
+        Some("⟳ 1 in <1m")
+    );
+    assert_eq!(
+        statusline::cron_label(cron_summary(1, Some(3900)), false).as_deref(),
+        Some("⟳ 1 in 1h5m")
+    );
+
+    let parked = crate::ui::cron::CronSummary {
+        parked: 1,
+        ..cron_summary(2, Some(120))
+    };
+    assert_eq!(
+        statusline::cron_label(parked, false).as_deref(),
+        Some("⟳ 2 parked")
+    );
+    // A scheduled turn holding a prompt outranks a parked fire.
+    assert_eq!(
+        statusline::cron_label(parked, true).as_deref(),
+        Some("⟳ 2 waiting")
+    );
+    let suspended = crate::ui::cron::CronSummary {
+        suspended: true,
+        ..parked
+    };
+    let suspended = statusline::cron_label(suspended, true);
+    assert_eq!(suspended.as_deref(), Some("⟳ 2 suspended"));
+    assert_eq!(render(suspended.as_deref()), "⟳ 2 suspended");
+}
+
+#[test]
+fn the_cron_item_shows_a_running_self_paced_fire_and_then_its_wakeup_countdown() {
+    // In flight: the entry has no deadline until its turn calls
+    // `schedule_wakeup`, so the item says `running` rather than `armed`.
+    let running = crate::ui::cron::CronSummary {
+        running: 1,
+        ..cron_summary(1, None)
+    };
+    assert_eq!(
+        statusline::cron_label(running, false).as_deref(),
+        Some("⟳ 1 running")
+    );
+    // A prompt held by that turn still reads `waiting`.
+    assert_eq!(
+        statusline::cron_label(running, true).as_deref(),
+        Some("⟳ 1 waiting")
+    );
+    // Once the wakeup is chosen it is an ordinary countdown.
+    let mut store = crate::ui::cron::CronStore::default();
+    let now = tokio::time::Instant::now();
+    store.arm_dynamic("watch".into(), now).unwrap();
+    store.begin_fire("c1", now, 24).unwrap();
+    assert_eq!(
+        statusline::cron_label(store.summary(now), false).as_deref(),
+        Some("⟳ 1 running")
+    );
+    store.schedule_wakeup("c1", std::time::Duration::from_secs(300), now);
+    assert_eq!(
+        statusline::cron_label(store.summary(now), false).as_deref(),
+        Some("⟳ 1 in 5m")
+    );
+}
+
+#[test]
+fn the_cron_item_refreshes_only_when_its_minute_bucket_changes() {
+    let session = Session::new("anthropic", "claude", 200_000, "");
+    let key = |seconds: u64| {
+        let label = statusline::cron_label(cron_summary(1, Some(seconds)), false);
+        let mut ctx = ctx();
+        ctx.cron_label = label.as_deref();
+        statusline::cache_key(&session, &ctx)
+    };
+    // 4m00s and 3m01s both round up to `in 4m`: the cached spans are reused.
+    assert_eq!(key(240), key(181));
+    // Crossing into the next minute bucket rebuilds them.
+    assert_ne!(key(181), key(180));
+    // Arming the first schedule and clearing the last both rebuild.
+    assert_ne!(key(240), statusline::cache_key(&session, &ctx()));
+}
+
+#[test]
+fn the_default_layout_places_the_cron_item() {
+    let session = Session::new("anthropic", "claude", 200_000, "");
+    let mut ctx = ctx();
+    ctx.cron_label = Some("⟳ 1 in 5m");
+    let text = line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx)[0]);
+    assert!(text.contains("⟳ 1 in 5m"), "{text}");
+    assert_eq!(statusline::item_icon("cron"), Some("\u{f073}"));
 }

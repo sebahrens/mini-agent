@@ -1621,3 +1621,72 @@ async fn deferred_turn_end_save_failure_is_reported_and_keeps_prior_snapshot() {
     let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected);
 }
+
+#[test]
+fn session_without_cron_schedules_saves_byte_identical_without_the_field() {
+    let env = setup_test_env();
+    let mut s = Session::new("anthropic", "claude", 200000, "");
+    s.add_message(MessageRole::User, "question");
+    let before = serde_json::to_string_pretty(&s).unwrap();
+    assert!(!before.contains("cron_schedule"), "{before}");
+    save_session(&s).unwrap();
+
+    let loaded = load_session_exact(&s.id).unwrap().unwrap();
+    assert!(loaded.cron_schedule.is_empty());
+    assert_eq!(serde_json::to_string_pretty(&loaded).unwrap(), before);
+    drop(env);
+}
+
+#[test]
+fn saved_cron_schedules_round_trip_and_unknown_fields_are_ignored() {
+    let env = setup_test_env();
+    let mut s = Session::new("anthropic", "claude", 200000, "");
+    s.cron_schedule = crate::session::SavedCronSchedule {
+        last_id: 3,
+        entries: vec![
+            crate::session::SavedCronEntry {
+                id: "c1".into(),
+                interval_secs: 300,
+                payload: "check the deploy".into(),
+                fires: 2,
+                next_fire_at: "2026-10-18T12:05:00Z".into(),
+                dynamic: false,
+            },
+            crate::session::SavedCronEntry {
+                id: "c3".into(),
+                interval_secs: 3600,
+                payload: "summarise CI".into(),
+                fires: 0,
+                next_fire_at: "2026-10-18T13:00:00Z".into(),
+                dynamic: false,
+            },
+            crate::session::SavedCronEntry {
+                id: "c2".into(),
+                interval_secs: 0,
+                payload: "watch the queue".into(),
+                fires: 5,
+                next_fire_at: "2026-10-18T12:01:00Z".into(),
+                dynamic: true,
+            },
+        ],
+    };
+    save_session(&s).unwrap();
+    let loaded = load_session_exact(&s.id).unwrap().unwrap();
+    assert_eq!(loaded.cron_schedule, s.cron_schedule);
+    // `dynamic` is written only for self-paced entries, so interval entries
+    // (and files written before self-paced schedules) keep their exact shape.
+    let entries = serde_json::to_value(&s).unwrap()["cron_schedule"]["entries"].clone();
+    assert!(entries[0].get("dynamic").is_none() && entries[1].get("dynamic").is_none());
+    assert_eq!(entries[2]["dynamic"], true);
+
+    // The session deserializer does not deny unknown fields, which is what
+    // lets an older build load a file carrying `cron_schedule`.
+    let mut value = serde_json::to_value(&s).unwrap();
+    value.as_object_mut().unwrap().insert(
+        "a_field_from_the_future".into(),
+        serde_json::json!({"x": 1}),
+    );
+    let tolerant: Session = serde_json::from_value(value).unwrap();
+    assert_eq!(tolerant.cron_schedule, s.cron_schedule);
+    drop(env);
+}

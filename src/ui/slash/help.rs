@@ -338,6 +338,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /cron run <id>         fire a schedule at the next idle point",
     );
+    emit(
+        false,
+        "  /cron resume           re-arm the schedules saved with a resumed session",
+    );
     #[cfg(feature = "loop")]
     {
         emit(

@@ -135,11 +135,29 @@ impl App<'_> {
         self.cron.next_deadline()
     }
 
+    /// The `cron` statusline item: `waiting` while the running scheduled
+    /// turn holds a permission or question prompt.
+    pub(super) fn cron_status_label(&self) -> Option<String> {
+        let waiting = self.cron_turn.is_some()
+            && self.run.is_running
+            && (self.permission_prompt.is_some() || self.question_prompt.is_some());
+        crate::ui::statusline::cron_label(self.cron.summary(Instant::now()), waiting)
+    }
+
     /// Park every expired deadline and, when idle, start the earliest due
     /// fire as an ordinary turn with the scheduler origin.
     pub(super) async fn fire_due_cron(&mut self) -> anyhow::Result<()> {
-        self.cron.mark_expired_due(Instant::now());
-        if !self.cron_idle() || !self.cron.has_due() {
+        let parked = self.cron.mark_expired_due(Instant::now());
+        if !self.cron_idle() {
+            if parked > 0 && !self.cron.is_suspended() {
+                // Transient only: the feed records the fire when it runs.
+                self.renderer
+                    .show_notice("cron: fire parked until idle", Color::Cyan);
+                self.refresh()?;
+            }
+            return Ok(());
+        }
+        if !self.cron.has_due() {
             return Ok(());
         }
         if self.startup_work_pending() {
@@ -179,6 +197,8 @@ impl App<'_> {
             return Ok(());
         };
         let mark = FeedMark::of(&self.renderer);
+        // The fire count (or a retirement) is saved by the turn's own save.
+        self.sync_cron_schedule();
         echo_cron_fire(&mut self.renderer, &fire)?;
         if fire.retired {
             self.renderer.write_line(
@@ -221,6 +241,7 @@ impl App<'_> {
             return Ok(());
         };
         self.cron_noop = None;
+        self.sync_cron_schedule();
         echo_cron_fire(&mut self.renderer, &fire)?;
         if fire.retired {
             self.renderer.write_line(
@@ -277,6 +298,7 @@ impl App<'_> {
         }
         let Some(wakeup) = wakeup else {
             self.cron.stop(&turn.id);
+            self.sync_cron_schedule();
             self.cron_noop = None;
             self.renderer.write_line(
                 &format!(
@@ -289,6 +311,7 @@ impl App<'_> {
         };
         self.cron
             .schedule_wakeup(&turn.id, wakeup.delay, Instant::now());
+        self.sync_cron_schedule();
         if wakeup.noop {
             self.write_cron_noop(&turn, &wakeup)?;
         } else {
@@ -302,6 +325,34 @@ impl App<'_> {
                 ),
                 Color::Cyan,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Copy the live schedule into the session so the next ordinary save
+    /// persists it. Quit and teardown stop the store without syncing, so the
+    /// saved schedule survives them disarmed.
+    pub(super) fn sync_cron_schedule(&mut self) {
+        self.ui.session.cron_schedule = self.cron.export(Instant::now(), chrono::Utc::now());
+    }
+
+    /// The active session changed (`/resume`, `/new`, `/clear`, `/fork`,
+    /// ...): schedules of the previous session end here (they were saved with
+    /// it), and the new session's saved schedules are held disarmed behind one
+    /// notice until `/cron resume`.
+    pub(super) fn adopt_saved_cron(&mut self) -> io::Result<()> {
+        let dropped = self.cron.len();
+        self.cron = crate::ui::cron::CronStore::from_saved(&self.ui.session.cron_schedule);
+        if dropped > 0 {
+            self.renderer.write_line(
+                &format!("cron: {dropped} schedule(s) of the previous session stopped"),
+                C_TOOL,
+            )?;
+        }
+        if let Some(notice) = crate::ui::cron::saved_schedule_notice(&self.ui.session.cron_schedule)
+        {
+            self.renderer
+                .write_line(&sanitize_output(&notice), Color::Yellow)?;
         }
         Ok(())
     }
@@ -357,6 +408,9 @@ impl App<'_> {
         }
         let stopped = self.cron.clear_dynamic_wakeups();
         let cleared = self.cron.clear_due();
+        if !stopped.is_empty() {
+            self.sync_cron_schedule();
+        }
         if !stopped.is_empty() {
             self.cron_noop = None;
             self.renderer.write_line(

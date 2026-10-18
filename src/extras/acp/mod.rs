@@ -2125,6 +2125,17 @@ async fn handle_prompt(
         hook_lease,
     } = snapshot;
 
+    // Opt-in `@agent:<name>` routing (`headless_agent_mentions`). Resolved
+    // after admission so a refusal settles this generation like any other
+    // invalid prompt, and before `_meta.goal` so a refused prompt changes
+    // nothing. Commands are never parsed.
+    #[cfg(feature = "subagents")]
+    let prompt_input = if command.is_none() && state.cfg.resolve_headless_agent_mentions() {
+        route_prompt_agent_mentions(&req.prompt, &workspace, prompt_input)?
+    } else {
+        prompt_input
+    };
+
     // A client sets or clears the session's goal through the request's `_meta`
     // rather than through prompt text: the objective is a long-lived
     // instruction channel, and a text directive would let anything that reaches
@@ -2271,9 +2282,160 @@ fn parse_prompt_blocks(
     }
 }
 
+/// Resolve `@agent:<name>` mentions in the client's own text blocks.
+///
+/// Only `Text` blocks are parsed: embedded resources and links are reference
+/// material and can neither route nor fail a prompt. Resolved aliases are
+/// normalised in place (the normalised text is what the session records) and
+/// the routing note rides on this request only. An unknown canonical name is
+/// an invalid-params error naming the valid personas.
+#[cfg(feature = "subagents")]
+fn route_prompt_agent_mentions(
+    blocks: &[ContentBlock],
+    workspace: &crate::paths::WorkspaceBinding,
+    parsed: crate::agent::input::PromptInput,
+) -> Result<crate::agent::input::PromptInput, agent_client_protocol::Error> {
+    let mut names: Vec<String> = Vec::new();
+    let mut normalised_blocks: Option<Vec<ContentBlock>> = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        let mentions = crate::context::mentions::parse_agent_mentions(&text.text, Some(workspace))
+            .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+        let Some(mentions) = mentions else {
+            continue;
+        };
+        for name in mentions.names {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if mentions.text != text.text {
+            let mut normalised = text.clone();
+            normalised.text = mentions.text;
+            normalised_blocks.get_or_insert_with(|| blocks.to_vec())[index] =
+                ContentBlock::Text(normalised);
+        }
+    }
+    if names.is_empty() {
+        return Ok(parsed);
+    }
+    let prompt = match normalised_blocks {
+        Some(blocks) => parse_prompt_blocks(&blocks)?,
+        None => parsed,
+    };
+    Ok(prompt.with_turn_directive(Some(crate::context::mentions::routing_directive(&names))))
+}
+
 #[cfg(test)]
 mod typed_prompt_tests {
     use super::*;
+
+    /// An untrusted temporary workspace: compiled-in personas such as
+    /// `rust-maintainer` resolve, project personas never do.
+    #[cfg(feature = "subagents")]
+    fn mention_workspace() -> (std::path::PathBuf, crate::paths::WorkspaceBinding) {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-acp-mentions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+        (root, binding)
+    }
+
+    #[cfg(feature = "subagents")]
+    fn route(
+        blocks: &[ContentBlock],
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Result<crate::agent::input::PromptInput, agent_client_protocol::Error> {
+        route_prompt_agent_mentions(blocks, workspace, parse_prompt_blocks(blocks).unwrap())
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn acp_agent_mention_routes_with_a_non_persisted_directive() {
+        let (root, workspace) = mention_workspace();
+        let blocks = [ContentBlock::Text(TextContent::new(
+            "ask @agent-rust-maintainer, then @agent:rust-maintainer again",
+        ))];
+        let prompt = route(&blocks, &workspace).unwrap();
+        assert_eq!(
+            prompt.literal_text(),
+            "ask @agent:rust-maintainer, then @agent:rust-maintainer again"
+        );
+        let directive = prompt.turn_directive().expect("routing directive");
+        assert!(directive.contains("\"rust-maintainer\""), "{directive}");
+        assert_eq!(
+            directive.matches("rust-maintainer").count(),
+            1,
+            "{directive}"
+        );
+        let Message::User { content } = prompt.to_message() else {
+            panic!("a prompt renders as a user message");
+        };
+        let texts: Vec<_> = content
+            .iter()
+            .filter_map(|item| match item {
+                rig::message::UserContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert_eq!(texts[0], prompt.literal_text());
+        assert!(texts[1].contains(directive), "{texts:?}");
+        drop(workspace);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn acp_unknown_agent_mention_is_invalid_params_naming_valid_agents() {
+        let (root, workspace) = mention_workspace();
+        let error = route(
+            &[ContentBlock::Text(TextContent::new(
+                "run @agent:no-such-persona now",
+            ))],
+            &workspace,
+        )
+        .unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(
+            error
+                .message
+                .contains("unknown agent '@agent:no-such-persona'")
+                && error.message.contains("rust-maintainer"),
+            "{}",
+            error.message
+        );
+        drop(workspace);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn acp_agent_mentions_ignore_reference_blocks_and_plain_prompts() {
+        let (root, workspace) = mention_workspace();
+        // Resource text is reference material: it can neither fail nor route.
+        let blocks = [
+            ContentBlock::Text(TextContent::new("summarise the report")),
+            ContentBlock::ResourceLink(
+                ResourceLink::new("report", "file:///workspace/report.md")
+                    .description(Some("mentions @agent:no-such-persona".to_string())),
+            ),
+        ];
+        let prompt = route(&blocks, &workspace).unwrap();
+        assert_eq!(prompt.turn_directive(), None);
+        assert_eq!(
+            prompt.to_message(),
+            parse_prompt_blocks(&blocks).unwrap().to_message()
+        );
+        let plain = [ContentBlock::Text(TextContent::new("mail me@agent:x.org"))];
+        let prompt = route(&plain, &workspace).unwrap();
+        assert_eq!(prompt.turn_directive(), None);
+        assert_eq!(prompt.to_message(), Message::user("mail me@agent:x.org"));
+        drop(workspace);
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[test]
     fn acp53_image_prompt_feature_policy_is_explicit_and_nonfetching() {
         let blocks = vec![

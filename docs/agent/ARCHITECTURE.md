@@ -207,9 +207,14 @@ reproducing code; focus on structure, relationships, and rationale.
 - `src/startup.rs` — resolved workspace, session, permission and provider setup
 - `src/ui/app.rs` — interactive application loop
 - `src/ui/slash/` — slash command handlers
+<<<<<<< HEAD
 - `src/ui/cron.rs` — session-local `/cron` schedule store (`CronStore`), interval grammar and limits; owned by the TUI `App`, edited by `src/ui/slash/cron.rs`
 - `src/ui/cron_app.rs` — the `/cron` fire path on `App`: the idle predicate, the event-loop wakeup, the parked single fire, the budget gate and the scheduler-origin turn start (`QuestionOrigin::Scheduled`, `RequestKind::Scheduled`, self-paced fires (turn-scoped `schedule_wakeup`, settle, noop collapse) and allowlisted read-only slash fires)
 - `src/agent/tools/schedule_wakeup.rs` — the turn-scoped `schedule_wakeup` tool offered only during a self-paced `/cron` fire's turn (delay clamp, wakeup slot)
+=======
+- `src/ui/cron.rs` — session-local `/cron` schedule store (`CronStore`), interval grammar and limits; owned by the TUI `App`, edited by `src/ui/slash/cron.rs`; saved disarmed as `Session.cron_schedule` and re-armed only by `/cron resume`
+- `src/ui/cron_app.rs` — the `/cron` fire path on `App`: the idle predicate, the event-loop wakeup, the parked single fire, the budget gate and the scheduler-origin turn start (`QuestionOrigin::Scheduled`, `RequestKind::Scheduled`)
+>>>>>>> main
 ```
 
 ## Comparison with AGENTS.md
