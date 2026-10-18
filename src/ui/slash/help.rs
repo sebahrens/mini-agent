@@ -318,6 +318,22 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
             "  /advisor context-limit <n>  set max KB sent to advisor",
         );
     }
+    emit(
+        false,
+        "  /cron <every> <prompt> repeat a prompt every 5m/2h while idle (min 1m, max 24h)",
+    );
+    emit(
+        false,
+        "  /cron [list]           list schedules: id, interval, next fire, fires",
+    );
+    emit(
+        false,
+        "  /cron stop <id>|all    remove one or every schedule",
+    );
+    emit(
+        false,
+        "  /cron run <id>         fire a schedule at the next idle point",
+    );
     #[cfg(feature = "loop")]
     {
         emit(

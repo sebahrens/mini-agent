@@ -20,6 +20,7 @@ pub(crate) use app::retire_workspace_owners_and_complete_merge;
 pub(crate) use app::{ClipboardShortcut, clipboard_shortcut};
 #[cfg(test)]
 pub(crate) use app::{InterruptTarget, interrupt_target};
+pub(crate) mod cron;
 pub(crate) mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
@@ -859,7 +860,8 @@ pub(crate) enum SubmitAction {
 /// don't spawn or mutate the main run — the single "bypass" whitelist. Add
 /// future parallel-safe commands here. Currently: `/queue` (queue management),
 /// `/btw` (isolated, tool-less side question on its own event stream), and the
-/// read-or-park `/goal` verbs and `/loop` status/stop controls.
+/// read-or-park `/goal` verbs, `/loop` status/stop controls and every `/cron`
+/// verb.
 ///
 /// A goal relaunches back to back, so a run is active almost continuously for
 /// as long as the goal lasts. Without these, asking what the goal is doing or
@@ -883,6 +885,13 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
         || t.starts_with("/btw ")
         || goal_control_while_running(t)
         || loop_control_while_running(t)
+        || cron_control_while_running(t)
+}
+
+/// Every `/cron` verb passes while running: arming, listing, stopping and
+/// marking an entry due only edit the schedule; a fire itself waits for idle.
+fn cron_control_while_running(text: &str) -> bool {
+    crate::ui::slash::is_cron_control(text)
 }
 
 /// A running loop can be inspected or stopped, but a new loop cannot replace

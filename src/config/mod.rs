@@ -201,6 +201,9 @@ pub struct Config {
     pub keep_recent_tool_results: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_turns: Option<usize>,
+    /// Fires per `/cron` entry before it is removed (default 24).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_max_fires: Option<u32>,
     /// Trusted operator command run before a tool-using turn may complete.
     /// Project-local values require the existing sensitive-config approval.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -877,6 +880,13 @@ impl Config {
     /// Cumulative per-turn input+output token cap. `None` (default) means no
     /// cap; see the field docs. Never derived from `max_tokens`, which caps a
     /// single response, not a turn.
+    /// Fires one `/cron` entry may start before it is removed; at least 1.
+    pub fn resolve_cron_max_fires(&self) -> u32 {
+        self.cron_max_fires
+            .unwrap_or(crate::ui::cron::DEFAULT_CRON_MAX_FIRES)
+            .max(1)
+    }
+
     pub fn resolve_turn_token_budget(&self) -> Option<u64> {
         self.turn_token_budget
     }
@@ -1623,6 +1633,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_keep_recent_tool_results(), 3);
+    }
+
+    #[test]
+    fn cron_max_fires_defaults_to_24_and_is_at_least_one() {
+        assert_eq!(Config::default().resolve_cron_max_fires(), 24);
+        let explicit = Config {
+            cron_max_fires: Some(3),
+            ..Config::default()
+        };
+        assert_eq!(explicit.resolve_cron_max_fires(), 3);
+        let zero = Config {
+            cron_max_fires: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(zero.resolve_cron_max_fires(), 1);
+        let parsed: Config = toml::from_str("cron_max_fires = 5").unwrap();
+        assert_eq!(parsed.resolve_cron_max_fires(), 5);
     }
 
     #[test]

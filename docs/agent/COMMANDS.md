@@ -20,6 +20,7 @@ listing is a bounded text catalogue; it does not open a resume picker, create st
 or repair file permissions. Model switches and session load/delete selectors wait until
 the active turn settles. These views do not warm a model, save the session, or advance a
 queued goal. Existing `/queue`, `/btw`, and loop/goal stop controls retain their behavior.
+Every [`/cron`](#cron) verb also works while busy; a schedule only fires once the TUI is idle.
 
 The default footer keeps shared todo progress (`todo:<done>/<total>`) and queued inputs
 (`queue:<n>`) visible when nonempty, subject to the usual whole-item width priorities.
@@ -424,6 +425,40 @@ and rolls the transcript back.
 | `/loop [prompt]` | Start the iterative coding loop (bounded to 100 iterations). |
 | `/loop stop` | Stop future rounds of the active loop, even during a round. The current agent run finishes; an in-flight verification is cancelled. |
 | `/loop status` | Show current loop status, including during an active round. |
+
+`/loop` is not a timer: it starts round 1 immediately. To repeat a prompt on a
+schedule, use [`/cron`](#cron); a `/loop` whose first argument is an interval
+such as `5m` is refused with a `did you mean /cron 5m ...?` hint rather than
+starting a round.
+
+## Cron
+
+`/cron` repeats a plain prompt in the current session on a fixed interval. It
+is available in every build and every verb works while the agent is running;
+arming, listing and stopping only edit the schedule.
+
+| Command | Description |
+| ------- | ----------- |
+| `/cron <interval> <prompt>` | Arm a schedule. The interval is digits plus `s`, `m` or `h` (`90s`, `5m`, `2h`). The minimum is `1m` (a shorter interval is raised to it with a notice) and the maximum is `24h`. The first fire is one interval from now. |
+| `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), interval, time until the next fire, fires so far out of `cron_max_fires`, and the prompt. |
+| `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
+| `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
+
+- **Prompts only.** A payload starting with `/` or `!` is refused with a
+  one-line reason, so a schedule never runs slash commands or shell lines (and
+  cannot re-arm itself with `/cron`).
+- **Idle-only firing.** A schedule fires only when no run, goal round,
+  permission or question prompt, pending Git proposal or queued input is
+  active. A deadline that passes while busy parks **one** fire that runs at the
+  next idle point; there is no catch-up, however many deadlines were missed.
+  Each fire restarts the interval from the moment it starts.
+- **Bounded.** At most 16 schedules per session, and each is removed after
+  `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
+- **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a
+  one-time warning that scheduled turns are unbounded in spend.
+- **Session-local.** Schedules are not saved; they end with the session.
+  Deadlines use a monotonic clock that does not advance while the machine is
+  suspended, so times are always shown relative to now (`in 4m`).
 
 ## Goal (feature-gated)
 

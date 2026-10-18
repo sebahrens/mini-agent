@@ -151,6 +151,7 @@ pub(super) mod test_support {
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
             },
+            cron: Default::default(),
             renderer: Renderer::for_app_test().unwrap(),
             input,
             loop_state: EventLoopState::default(),
@@ -1262,6 +1263,8 @@ pub(crate) struct App<'a> {
     run: AgentRunState,
     chain: ChainState,
     slash: SlashState,
+    /// Session-local `/cron` schedules; the event loop only reads deadlines.
+    cron: super::cron::CronStore,
 
     renderer: Renderer,
     input: InputEditor,
@@ -2134,6 +2137,7 @@ impl<'a> App<'a> {
             run,
             chain,
             slash,
+            cron: Default::default(),
             renderer,
             input,
             loop_state: EventLoopState::default(),
@@ -6139,6 +6143,7 @@ impl<'a> App<'a> {
                 &mut self.slash,
                 &mut self.chain,
                 &mut self.terminal_guard,
+                &mut self.cron,
             )
         })
         .await;
@@ -6443,6 +6448,7 @@ impl<'a> App<'a> {
                     &mut self.slash,
                     &mut self.chain,
                     &mut self.terminal_guard,
+                    &mut self.cron,
                 )
             })
             .await;

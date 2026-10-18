@@ -94,6 +94,31 @@ fn running_loop_controls_pass_but_new_starts_remain_blocked() {
     }
 }
 
+/// Every `/cron` verb only edits the schedule store (a fire waits for idle),
+/// so all of them pass while a run is active, in every feature row.
+#[test]
+fn running_cron_controls_pass() {
+    for command in [
+        "/cron",
+        "/cron list",
+        "/cron stop c1",
+        "/cron stop all",
+        "/cron run c1",
+        "/cron 5m x",
+        "  /cron 5m check the deploy  ",
+    ] {
+        assert_eq!(
+            classify_submission(true, command),
+            SubmitAction::Run,
+            "{command}"
+        );
+    }
+    assert_eq!(
+        classify_submission(true, "/cronx"),
+        SubmitAction::RejectWhileRunning
+    );
+}
+
 #[cfg(not(feature = "loop"))]
 #[test]
 fn disabled_loop_controls_remain_blocked_during_a_run() {
