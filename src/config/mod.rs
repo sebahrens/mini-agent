@@ -186,6 +186,10 @@ pub struct Config {
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headless_questions: Option<HeadlessQuestions>,
+    /// Opt-in `@agent:<name>` routing for headless `-p` and ACP prompts
+    /// (default off: those prompts pass through untouched). Read at startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless_agent_mentions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_context_files: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -870,6 +874,13 @@ impl Config {
         (context_window / 20)
             .clamp(10_000, 50_000)
             .min(context_window / 4)
+    }
+
+    /// Whether headless `-p` and ACP prompts resolve `@agent:<name>`
+    /// mentions. Off by default so scripts piping arbitrary text keep their
+    /// behaviour; inert in builds without the `subagents` feature.
+    pub fn resolve_headless_agent_mentions(&self) -> bool {
+        self.headless_agent_mentions.unwrap_or(false)
     }
 
     pub fn resolve_keep_recent_tool_results(&self) -> usize {
@@ -1633,6 +1644,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_keep_recent_tool_results(), 3);
+    }
+
+    #[test]
+    fn headless_agent_mentions_is_opt_in() {
+        assert!(!Config::default().resolve_headless_agent_mentions());
+        let parsed: Config = toml::from_str("headless_agent_mentions = true").unwrap();
+        assert!(parsed.resolve_headless_agent_mentions());
+        let off: Config = toml::from_str("headless_agent_mentions = false").unwrap();
+        assert!(!off.resolve_headless_agent_mentions());
     }
 
     #[test]

@@ -2762,7 +2762,7 @@ fn document_media_type(mime: &str) -> DocumentMediaType {
 
 async fn continue_prompt_injector<M>(
     agent: &Agent<M>,
-    original_prompt: &str,
+    original_prompt: &crate::agent::input::PromptInput,
     retry_history: &[Message],
     continuation_bridge: &[Message],
     max_turns: usize,
@@ -2772,7 +2772,7 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let message = Message::user(original_prompt.to_owned());
+    let message = original_prompt.to_message();
     crate::startup::heap_future(|| {
         continue_prompt_message_injector(
             agent,
@@ -4100,7 +4100,7 @@ where
 {
     run_print_with_output_and_verification(
         agent,
-        prompt,
+        &crate::agent::input::PromptInput::text(prompt.to_owned()),
         crate::print::HeadlessOutputPolicy::legacy(pure_stdout, emit_stdout),
         retry_config,
         turn_token_budget,
@@ -4116,7 +4116,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_print_with_output_and_verification<M, H>(
     agent: &Agent<M>,
-    prompt: &str,
+    prompt: &crate::agent::input::PromptInput,
     output: crate::print::HeadlessOutputPolicy,
     retry_config: &RetryConfig,
     turn_token_budget: Option<u64>,
@@ -4189,7 +4189,7 @@ where
 {
     run_print_with_stream_policy_and_verification(
         agent,
-        prompt,
+        &crate::agent::input::PromptInput::text(prompt.to_owned()),
         crate::print::HeadlessOutputPolicy::legacy(pure_stdout, true),
         None,
         retry_config,
@@ -4249,7 +4249,7 @@ impl HeadlessTurn {
 #[allow(clippy::too_many_arguments)]
 async fn run_print_with_stream_policy_and_verification<M>(
     agent: &Agent<M>,
-    prompt: &str,
+    prompt: &crate::agent::input::PromptInput,
     output_policy: crate::print::HeadlessOutputPolicy,
     mutations: Option<&crate::print::HeadlessMutationEvents>,
     retry_config: &RetryConfig,
@@ -4275,7 +4275,7 @@ where
     let mut first_attempt_history = Some(history.to_vec());
     let stream = await_headless_work(crate::startup::heap_future(|| {
         retry::retry_stream_chat(retry_config, || {
-            let p = prompt.to_string();
+            let p = prompt.to_message();
             let h = first_attempt_history
                 .take()
                 .unwrap_or_else(|| history.to_vec());

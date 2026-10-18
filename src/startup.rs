@@ -27,6 +27,47 @@ async fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> any
     Err(HeadlessUsageError.into())
 }
 
+/// Resolve `@agent:<name>` mentions in an `-p` prompt when the operator
+/// opted in with `headless_agent_mentions`.
+///
+/// Only the typed prompt is parsed: this runs before piped stdin is appended,
+/// so untrusted reference material can neither route nor fail the run. A
+/// resolved prompt is rewritten to its alias-normalised text (what is
+/// persisted and echoed) and the returned routing note rides on the first
+/// model request only. An unknown canonical name fails the run before any
+/// provider request. `!` commands and `--loop` runs are never parsed.
+#[cfg(feature = "subagents")]
+async fn route_headless_agent_mentions(
+    cli: &mut Cli,
+    cfg: &Config,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> anyhow::Result<Option<String>> {
+    if !cli.print || cli.is_loop_mode() || !cfg.resolve_headless_agent_mentions() {
+        return Ok(None);
+    }
+    #[cfg(feature = "acp")]
+    if cli.acp_enabled {
+        return Ok(None);
+    }
+    let prompt = cli.message.join(" ");
+    if prompt.trim_start().starts_with('!') {
+        return Ok(None);
+    }
+    match crate::context::mentions::parse_agent_mentions(&prompt, Some(workspace)) {
+        Ok(None) => Ok(None),
+        Ok(Some(mentions)) => {
+            let directive = crate::context::mentions::routing_directive(&mentions.names);
+            cli.message = vec![mentions.text];
+            Ok(Some(directive))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            crate::print::emit_headless_preflight_failure(cli, workspace.root(), &message).await?;
+            Err(anyhow::Error::new(error))
+        }
+    }
+}
+
 fn resolve_startup_model_pricing(
     cli: &Cli,
     cfg: &Config,
@@ -523,6 +564,11 @@ pub(crate) struct Startup {
     native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
     native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
     native_headless: Option<provider::NativeRunOwner>,
+    /// Routing note for an `-p` prompt's `@agent:<name>` mentions, resolved
+    /// at startup when `headless_agent_mentions` is on; sent with the first
+    /// model request only and never persisted.
+    #[cfg(feature = "subagents")]
+    headless_agent_directive: Option<String>,
     #[cfg(feature = "hooks")]
     pending_session_start_context: Option<crate::extras::hooks::OwnedSessionStartContext>,
     #[cfg(feature = "hooks")]
@@ -980,6 +1026,9 @@ impl Startup {
     ) -> anyhow::Result<Self> {
         crate::output_schema::prepare(&mut cli)?;
         validate_headless_prompt(&cli, workspace.root()).await?;
+        #[cfg(feature = "subagents")]
+        let headless_agent_directive =
+            heap_future(|| route_headless_agent_mentions(&mut cli, &cfg, &workspace)).await?;
         use std::io::IsTerminal as _;
         let read_stdin = cli.print
             && !cli.is_loop_mode()
@@ -1349,6 +1398,8 @@ impl Startup {
             native_startup,
             native_ticket: None,
             native_headless: None,
+            #[cfg(feature = "subagents")]
+            headless_agent_directive,
             #[cfg(feature = "hooks")]
             pending_session_start_context: None,
             #[cfg(feature = "hooks")]
@@ -2202,6 +2253,8 @@ impl Startup {
                 )
             })
             .await;
+            #[cfg(feature = "subagents")]
+            let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
             if let Some(ss) = self.status_signals.as_ref() {

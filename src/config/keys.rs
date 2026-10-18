@@ -138,6 +138,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("web-fetch-allow-http", &["web_fetch_allow_http"]).described("Permit native HTTP to safe public destinations").shaped(ConfigShape::Bool),
     aliased("web-search-provider", &["web_search_provider"]).described("Native search provider, exa or off").shaped(ConfigShape::Enum(&["exa", "off"])),
     key("headless_questions").shaped(ConfigShape::Enum(&["error", "fail"])),
+    key("headless_agent_mentions").described("Opt-in: resolve @agent:<name> mentions in -p and ACP prompts; an unknown name fails the request (needs the subagents feature)").shaped(ConfigShape::Bool),
     key("no_context_files")
         .described("Disable automatic instruction-file discovery")
         .shaped(ConfigShape::Bool),

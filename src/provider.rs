@@ -2313,6 +2313,11 @@ pub struct AnyAgent {
     js_probe_pending: bool,
     native_host: Option<std::sync::Arc<NativeHostOwner>>,
     question_turn: Option<crate::question::QuestionTurn>,
+    /// Non-persisted host directive for the next headless turn only, shared
+    /// by clones and taken by the first `run_print_with_output` that starts a
+    /// request, so later goal rounds never repeat it.
+    #[cfg(feature = "subagents")]
+    headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
     #[cfg(feature = "memory")]
@@ -3044,6 +3049,8 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
+            #[cfg(feature = "subagents")]
+            headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
             #[cfg(feature = "memory")]
@@ -3266,6 +3273,25 @@ impl AnyAgent {
     ) -> Self {
         self.question_turn = turn;
         self
+    }
+
+    /// Attach a non-persisted host directive (an `@agent` routing note) to
+    /// the next headless turn this agent or any clone of it dispatches. The
+    /// UserPromptSubmit hook and persistence see only the literal prompt.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn with_headless_turn_directive(mut self, directive: Option<String>) -> Self {
+        self.headless_turn_directive =
+            directive.map(|directive| std::sync::Arc::new(std::sync::Mutex::new(Some(directive))));
+        self
+    }
+
+    #[cfg(feature = "subagents")]
+    fn take_headless_turn_directive(&self) -> Option<String> {
+        self.headless_turn_directive.as_ref().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
     }
 
     fn with_context_snapshot(mut self, snapshot: Option<builder::PreambleSnapshot>) -> Self {
@@ -3606,6 +3632,8 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
+            #[cfg(feature = "subagents")]
+            headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
             #[cfg(feature = "memory")]
@@ -3820,7 +3848,9 @@ impl AnyAgent {
                     return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                 }
             };
-            let prompt = prompt.to_string();
+            let prompt = crate::agent::input::PromptInput::text(prompt.to_string());
+            #[cfg(feature = "subagents")]
+            let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
             let turn = match &inner {

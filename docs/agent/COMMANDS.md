@@ -559,6 +559,18 @@ provider and session initialization. Text mode reports `no prompt given` on
 stderr; `--output json` (or the final `--output stream-json` record) emits a result with `stop_reason: "failed"`, zero usage
 and cost, and the same message. No provider request or session message is created.
 
+`@agent:<name>` mentions in a `-p` prompt are plain text unless the opt-in
+`headless_agent_mentions = true` config key is set (default off, so scripts that
+pipe arbitrary text keep working). With it on, and the `subagents` feature
+compiled in, the typed prompt is resolved exactly as in the TUI: resolved
+`@agent-<name>` aliases are rewritten to `@agent:<name>`, that normalised text is
+what the session saves and hooks see, and the first model request carries the
+non-persisted routing note. An unknown canonical name exits nonzero before any
+provider request, with the error naming the valid personas on stderr (and in the
+`--output json`/`stream-json` failure result). Piped stdin, `!` commands and
+`--loop` runs are never parsed. See
+[SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent).
+
 At startup, mini-agent resolves the configured shell once against the canonical
 workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
 with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
