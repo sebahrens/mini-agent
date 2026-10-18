@@ -272,6 +272,7 @@ personas never resolve.
 | Opt-in `headless_agent_mentions` for `-p` and ACP, and opt-in `agent_mention_tool_choice = "force"` with provider fallbacks to the hint | SUBAGENTS, CONFIG | mini-agent-5eoy7.5 |
 | `/cron` store, verbs and payload refusals; idle-only fire path with one parked fire, budget suspension and the `scheduled` origin and request kind; statusline item | COMMANDS, CONFIG, COST_TRACKING | mini-agent-5eoy7.6, mini-agent-5eoy7.7, mini-agent-5eoy7.8 |
 | Schedules saved disarmed with the session and `/cron resume`; self-paced `/cron <prompt>` through the turn-scoped `schedule_wakeup` tool; read-only slash allowlist | COMMANDS, TOOL_RUNTIME | mini-agent-5eoy7.9 |
+| ACP interval `/cron` per session (refused verbs return `-32602`), one Idle activity lease while armed so `--idle-exit` waits, scheduled turns reuse prompt admission | COMMANDS, CONFIG, TOOL_RUNTIME | mini-agent-5eoy7.9 |
 | `sandbox-home-mounts` and `sandbox-home-masks` for general contained commands; the JS worker launcher is unchanged | Phase 2, CONFIG | mini-agent-24w5s |
 
 ## Delivered startup follow-up (2026-09-09)

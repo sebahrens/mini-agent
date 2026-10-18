@@ -38,6 +38,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   disarmed with the session and re-armed only by `/cron resume`. The statusline `cron` item shows
   the armed count and the next fire, or a parked, waiting, running or suspended state. A `/loop`
   whose first argument is an interval is refused with a `/cron` hint instead of starting a round.
+  ACP sessions accept interval `/cron` schedules (not self-paced, `run`, `resume` or slash
+  payloads, which return `-32602`); they are per session, never saved, fire only when the session
+  has no active prompt, and keep `--idle-exit` waiting while any schedule is armed.
 - `sandbox-home-mounts` exposes chosen HOME dot files and folders to contained commands (read-only,
   or a writable directory with `:rw`), and `sandbox-home-masks` hides further HOME dot paths in
   every profile in addition to the built-in masks. Entries are validated at startup and fail
