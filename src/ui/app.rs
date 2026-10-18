@@ -1718,9 +1718,11 @@ impl<'a> App<'a> {
         // persona source as the task tool's enum.
         #[cfg(feature = "subagents")]
         {
-            let names = crate::context::agents::available_names_for_workspace(Some(&ui.workspace));
-            input.set_agent_mentions(names.clone());
-            input.set_agent_names(names);
+            let entries = crate::context::agents::available_described_names_for_workspace(Some(
+                &ui.workspace,
+            ));
+            input.set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
+            input.set_agent_mentions(entries);
         }
         #[cfg(not(feature = "subagents"))]
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
@@ -6409,10 +6411,12 @@ impl<'a> App<'a> {
         };
         #[cfg(feature = "subagents")]
         {
-            let names =
-                crate::context::agents::available_names_for_workspace(Some(&self.ui.workspace));
-            self.input.set_agent_mentions(names.clone());
-            self.input.set_agent_names(names);
+            let entries = crate::context::agents::available_described_names_for_workspace(Some(
+                &self.ui.workspace,
+            ));
+            self.input
+                .set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
+            self.input.set_agent_mentions(entries);
         }
         self.input.set_custom_commands(commands);
     }
