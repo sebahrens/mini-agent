@@ -1,4 +1,4 @@
-//! Session-local recurring scheduler state behind `/cron`.
+//! Per-session recurring scheduler state behind `/cron` (saved disarmed with the session).
 //!
 //! The store is plain data owned by the TUI `App`: slash edits run inside the
 //! user-event batch and the event loop recomputes [`CronStore::next_deadline`]

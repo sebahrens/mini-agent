@@ -1,4 +1,4 @@
-//! `/cron`: arm, list, stop and run session-local recurring prompts.
+//! `/cron`: arm, list, stop, run and resume per-session recurring prompts.
 //!
 //! This handler only edits the [`CronStore`]; it never starts a turn. Entries
 //! fire when the TUI is idle, so every verb is safe while a run is active.
