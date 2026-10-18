@@ -2092,6 +2092,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_read_roots.clone(),
         cfg.sandbox_write_roots.clone(),
     )
+    .with_home_paths(
+        cfg.sandbox_home_mounts.clone(),
+        cfg.sandbox_home_masks.clone(),
+    )
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),

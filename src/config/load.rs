@@ -65,6 +65,10 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "subagent_max_list_dir_entries",
     "subagent_max_read_lines",
     "temperature",
+    // Masks only hide more of HOME from contained commands, and project
+    // layers can only add to the list (see `merge_config_value_layer`).
+    "sandbox-home-masks",
+    "sandbox_home_masks",
 ];
 
 /// Top-level `extra_body` keys the OpenAI Responses request body actually
@@ -2024,6 +2028,16 @@ pub(super) fn merge_config_value_layer(
     }
     merged.provenance = provenance;
     merged.load_warnings = base.load_warnings.clone();
+    if matches!(layer, ConfigLayer::Project | ConfigLayer::Local) {
+        // A project layer may only add home masks, never drop inherited ones.
+        let mut masks = base.sandbox_home_masks.clone();
+        for mask in std::mem::take(&mut merged.sandbox_home_masks) {
+            if !masks.contains(&mask) {
+                masks.push(mask);
+            }
+        }
+        merged.sandbox_home_masks = masks;
+    }
     #[cfg(feature = "mcp")]
     {
         merged.mcp_origins = base.mcp_origins.clone();
@@ -3306,6 +3320,42 @@ mod project_config_trust_tests {
             cfg.sandbox_write_roots,
             [std::path::PathBuf::from("/write")]
         );
+    }
+
+    #[test]
+    fn home24w5s_project_layers_only_add_masks_and_need_trust_for_mounts() {
+        let root = crate::tests::OwnedTestDirectory::new("home24w5s-project-trust");
+        let path = root.path().join("project/.zerostack/config.toml");
+        let trust = root.path().join("state/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "sandbox-home-mounts = ['.aws-shim:rw']\nsandbox_home_masks = ['.netrc']\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            sandbox_home_masks: vec![".vault".into()],
+            ..Default::default()
+        };
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                panic!("no headless prompt")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert!(
+            cfg.sandbox_home_mounts.is_empty(),
+            "project mounts need trust"
+        );
+        assert_eq!(cfg.sandbox_home_masks, [".vault", ".netrc"]);
+        // A project cannot drop inherited masks by setting an empty list.
+        let (benign, _, sensitive) = split_project_override("sandbox-home-masks = []\n").unwrap();
+        assert!(sensitive.is_empty());
+        let merged = super::merge_config_value(&cfg, benign).unwrap();
+        assert_eq!(merged.sandbox_home_masks, [".vault", ".netrc"]);
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(cfg.sandbox_home_mounts, [".aws-shim:rw"]);
+        assert_eq!(cfg.sandbox_home_masks, [".vault", ".netrc"]);
     }
 
     #[test]
