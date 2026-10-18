@@ -1176,6 +1176,11 @@ one: `goal_id`, `goal_status` and `goal_round`, all null when no goal is
 running. `--loop` runs as a goal, and its envelopes still carry
 `loop_iteration` and `loop_active`, derived from the round the goal is on.
 
+A `UserPromptSubmit` envelope carries `prompt` and `origin`: `"user"` for
+typed, queued and steered input, `"scheduled"` for a turn fired by `/cron`
+(see [COMMANDS.md](COMMANDS.md#cron)), so a hook can treat scheduler prompts
+differently from human ones.
+
 Any handler can also signal via **exit code** instead of JSON: exit `0` means
 no objection, exit `2` blocks (for blockable events) with stderr as the
 reason, and any other exit code is a non-blocking error. Exit `2` combined

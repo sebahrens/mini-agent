@@ -87,7 +87,7 @@ impl Run {
     pub(crate) fn background_notices(
         &self,
     ) -> Option<crate::extras::subagents::background::NoticeLease> {
-        if !matches!(self.kind, RequestKind::Turn) || self.background_observation.is_some() {
+        if !self.kind.is_main_turn() || self.background_observation.is_some() {
             return None;
         }
         self.background_pool()?.pending_notices()
@@ -325,7 +325,11 @@ impl Run {
     fn reject_model_override(&mut self, cfg: &Config) {
         if !matches!(
             self.kind,
-            RequestKind::Turn | RequestKind::Btw | RequestKind::Subagent | RequestKind::Advisor
+            RequestKind::Turn
+                | RequestKind::Scheduled
+                | RequestKind::Btw
+                | RequestKind::Subagent
+                | RequestKind::Advisor
         ) {
             return;
         }
@@ -338,6 +342,10 @@ impl Run {
             self.prices =
                 PriceSnapshot::capture(None, Default::default(), self.prices.anthropic_native);
         }
+    }
+    /// The accounting kind every request of this run records.
+    pub(crate) fn kind(&self) -> RequestKind {
+        self.kind
     }
     pub(crate) fn current() -> Option<Self> {
         CURRENT.try_with(Clone::clone).ok().flatten()

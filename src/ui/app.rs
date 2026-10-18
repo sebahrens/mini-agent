@@ -1,3 +1,5 @@
+#[path = "cron_app.rs"]
+mod cron_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
@@ -152,6 +154,7 @@ pub(super) mod test_support {
                 todo_tools_enabled: false,
             },
             cron: Default::default(),
+            cron_turn: None,
             renderer: Renderer::for_app_test().unwrap(),
             input,
             loop_state: EventLoopState::default(),
@@ -1265,6 +1268,9 @@ pub(crate) struct App<'a> {
     slash: SlashState,
     /// Session-local `/cron` schedules; the event loop only reads deadlines.
     cron: super::cron::CronStore,
+    /// Payload of the scheduler fire whose turn is running, so an interrupt
+    /// does not load it into the user's editor.
+    cron_turn: Option<String>,
 
     renderer: Renderer,
     input: InputEditor,
@@ -2147,6 +2153,7 @@ impl<'a> App<'a> {
             chain,
             slash,
             cron: Default::default(),
+            cron_turn: None,
             renderer,
             input,
             loop_state: EventLoopState::default(),
@@ -2425,6 +2432,7 @@ impl<'a> App<'a> {
                 .git_poll
                 .forced_deadline()
                 .filter(|_| !self.git_status_in_flight);
+            let cron_wakeup = self.cron_wakeup();
 
             #[cfg(feature = "subagents")]
             let background_pool = self.ui.session.background_pool.clone();
@@ -2546,6 +2554,12 @@ impl<'a> App<'a> {
                 ), if forced_refresh.is_some() => {
                     // The next iteration dispatches the due refresh.
                 }
+                // A `/cron` deadline passed, or a parked fire can start now.
+                _ = tokio::time::sleep_until(
+                    cron_wakeup.unwrap_or_else(tokio::time::Instant::now)
+                ), if cron_wakeup.is_some() => {
+                    crate::startup::heap_future(|| self.fire_due_cron()).await?;
+                }
                 // A persistent deadline (not a fresh sleep per iteration):
                 // it fires even while other events arrive faster than its
                 // period, painting the throttled stream tail within one
@@ -2652,6 +2666,8 @@ impl<'a> App<'a> {
     }
 
     pub(super) async fn teardown_owners(&mut self) {
+        // Schedules are session-local; nothing may fire during teardown.
+        self.cron.stop_all();
         // Deferred SessionStart/native startup work must finish before session
         // end hooks and the final save observe the session.
         if let Err(error) = self.finish_startup_work().await {
@@ -3509,6 +3525,7 @@ impl<'a> App<'a> {
             }
             UserEvent::Quit => {
                 self.cancel_all_permissions();
+                self.cron.stop_all();
                 // The terminal may already be gone (SIGHUP): drawing can fail,
                 // but stopping the run and saving must still happen.
                 if self.run.is_running
@@ -3798,6 +3815,10 @@ impl<'a> App<'a> {
             && !self.input.picker.as_ref().is_some_and(Picker::active)
             && self.chain.plan.pending.is_none()
             && self.renderer.chain_prompt.is_none();
+        if eligible_escape && self.clear_parked_cron_fires()? {
+            self.rewind_escape = None;
+            return Ok(());
+        }
         if eligible_escape {
             let now = std::time::Instant::now();
             if self
@@ -4554,6 +4575,7 @@ impl<'a> App<'a> {
 
         if !self.run.is_running {
             self.run.main_abort = None;
+            self.cron_turn = None;
             if !self.run.pending_inputs.is_empty() && self.budget_admission_notice()? {
                 // Keep queued input visible for the owner to remove/resubmit;
                 // cap exhaustion must never dequeue or start a request.
@@ -4744,7 +4766,12 @@ impl<'a> App<'a> {
             }
             self.chain.loop_label = None;
         }
-        if let Some(text) = failed_prompt {
+        // An interrupted scheduler fire keeps its schedule; its payload is not
+        // the user's draft.
+        let scheduled = self.cron_turn.take();
+        if let Some(text) = failed_prompt
+            && scheduled.as_deref() != Some(text.as_str())
+        {
             self.restore_interrupted_prompt(&text);
         }
         if let Some(selection) = self.chain.dot_prompt_restore.take() {
@@ -13871,6 +13898,11 @@ mod plan_approval_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PLAN: &str = "Plan雪: update only the selected flag.\nVerify its test. $(literal)";
+
+    /// The `/cron` fire path reuses this module's owned provider fixtures.
+    mod cron_app_tests {
+        include!("cron_app_tests.rs");
+    }
 
     struct OwnedApp<'a>(App<'a>);
     impl<'a> std::ops::Deref for OwnedApp<'a> {

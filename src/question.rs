@@ -216,13 +216,32 @@ pub(crate) struct QuestionTurn(Arc<Mutex<TurnState>>);
 pub(crate) enum QuestionOrigin {
     NewUserTurn,
     ContinueUserTurn,
+    /// A fresh turn started by the session `/cron` scheduler, not typed by a
+    /// human. It opens a new question turn like `NewUserTurn`, is accounted as
+    /// [`crate::spend::RequestKind::Scheduled`], and `UserPromptSubmit` hooks
+    /// see `"origin": "scheduled"`.
+    Scheduled,
 }
 
 impl QuestionOrigin {
     pub(crate) fn capture(self, previous: Option<QuestionTurn>) -> Option<QuestionTurn> {
         match self {
-            Self::NewUserTurn => Some(QuestionTurn::default()),
+            Self::NewUserTurn | Self::Scheduled => Some(QuestionTurn::default()),
             Self::ContinueUserTurn => previous,
+        }
+    }
+
+    /// Whether this start begins a new turn (fresh question and instruction
+    /// state) rather than continuing the previous one.
+    pub(crate) fn starts_new_turn(self) -> bool {
+        matches!(self, Self::NewUserTurn | Self::Scheduled)
+    }
+
+    /// The spend accounting kind for the main-turn request this origin starts.
+    pub(crate) fn request_kind(self) -> crate::spend::RequestKind {
+        match self {
+            Self::Scheduled => crate::spend::RequestKind::Scheduled,
+            Self::NewUserTurn | Self::ContinueUserTurn => crate::spend::RequestKind::Turn,
         }
     }
 }

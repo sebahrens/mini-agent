@@ -447,15 +447,33 @@ arming, listing and stopping only edit the schedule.
 - **Prompts only.** A payload starting with `/` or `!` is refused with a
   one-line reason, so a schedule never runs slash commands or shell lines (and
   cannot re-arm itself with `/cron`).
-- **Idle-only firing.** A schedule fires only when no run, goal round,
-  permission or question prompt, pending Git proposal or queued input is
-  active. A deadline that passes while busy parks **one** fire that runs at the
-  next idle point; there is no catch-up, however many deadlines were missed.
-  Each fire restarts the interval from the moment it starts.
+- **Idle-only firing.** A schedule fires only when no run, live goal
+  (running, paused or waiting), permission or question prompt, unanswered
+  model question, chain or plan prompt, pending Git proposal or Git command,
+  MCP admin operation, attached image or queued input is active. A deadline
+  that passes while busy parks **one** fire that runs at the next idle point,
+  after any queued input; there is no catch-up, however many deadlines were
+  missed. Each fire restarts the interval from the moment it starts, so a long
+  turn cannot fire twice.
+- **What a fire does.** The chat shows a host marker
+  `⟳ cron c1 (every 5m): <prompt>` instead of the `> ` echo of typed input,
+  and the prompt runs as a normal turn in the current session. The marker is
+  display-only: the session records the prompt as an ordinary user message,
+  so it appears in history and `/rewind`. `UserPromptSubmit` hooks see
+  `"origin": "scheduled"` (see [CONFIG.md](CONFIG.md)), and usage is recorded
+  with request kind `scheduled`. A permission prompt opened by a fired turn
+  waits for your answer like any other; it is never auto-approved, and no
+  other schedule fires until it is answered.
+- **Interrupting.** Ctrl-C stops a running fire's turn but keeps its
+  schedule (the prompt is not loaded into the editor). Esc at an idle, empty
+  editor clears parked fires without removing schedules. Quitting drops every
+  schedule.
 - **Bounded.** At most 16 schedules per session, and each is removed after
   `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
 - **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a
-  one-time warning that scheduled turns are unbounded in spend.
+  one-time warning that scheduled turns are unbounded in spend. When the USD
+  budget refuses a fire, every schedule is suspended with one notice and kept
+  (`/cron list` shows them; `/cron stop all` removes them).
 - **Session-local.** Schedules are not saved; they end with the session.
   Deadlines use a monotonic clock that does not advance while the machine is
   suspended, so times are always shown relative to now (`in 4m`).

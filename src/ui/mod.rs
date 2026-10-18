@@ -1294,22 +1294,14 @@ pub(crate) async fn start_main_run(
             h.into()
         }
     };
-    if matches!(
-        question_origin,
-        crate::question::QuestionOrigin::NewUserTurn
-    ) {
+    if question_origin.starts_new_turn() {
         ui.session.pending_question = None;
     }
     run.question_turn = question_origin.capture(run.question_turn.take());
     let question_turn = run.question_turn.clone();
     #[cfg(feature = "agent-skills")]
     {
-        if run.instruction_turn.is_none()
-            || matches!(
-                question_origin,
-                crate::question::QuestionOrigin::NewUserTurn
-            )
-        {
+        if run.instruction_turn.is_none() || question_origin.starts_new_turn() {
             run.instruction_turn = Some(match run.pending_skill_turn.take() {
                 Some(prepared) => prepared,
                 None => crate::extras::skills::session::InstructionTurn::new(
@@ -1341,11 +1333,8 @@ pub(crate) async fn start_main_run(
     run.native_checkpointed = false;
     let runner = if let Some(mut owner) = native_owner.take() {
         use crate::session::native_replay::ReplayBoundary;
-        let spend = crate::spend::run::Run::for_session(
-            ui.session,
-            ui.cfg,
-            crate::spend::RequestKind::Turn,
-        );
+        let spend =
+            crate::spend::run::Run::for_session(ui.session, ui.cfg, question_origin.request_kind());
         owner.scope.run(async { spend.prepare().await }).await?;
         let boundary = match ui.session.native_history_snapshot() {
             Some(saved) => saved.saved_boundary()?,
@@ -1411,7 +1400,7 @@ pub(crate) async fn start_main_run(
     } else {
         let paused = crate::startup::heap_future(|| {
             agent
-                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+                .with_spend_for_session(ui.session, ui.cfg, question_origin.request_kind())
                 .with_question_turn(question_turn)
                 .spawn_runner_paused_input(
                     pending_turn.as_ref().unwrap().input(),

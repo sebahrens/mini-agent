@@ -38,6 +38,7 @@ fn envelope_never_contains_transcript_path() {
         },
         EventFields::UserPromptSubmit {
             prompt: "hi".into(),
+            origin: "user",
         },
         EventFields::SessionStart {
             source: "startup".into(),
@@ -146,5 +147,21 @@ fn hooks60_compaction_notification_and_permission_envelopes_preserve_common_iden
         assert_eq!(envelope["session_path"], "/tmp/sess.json");
         assert_eq!(envelope["cwd"], "/repo");
         assert!(envelope.get("transcript_path").is_none());
+    }
+}
+
+#[test]
+fn user_prompt_submit_envelope_names_its_origin() {
+    for origin in ["user", "scheduled"] {
+        let envelope = build_envelope(
+            &ctx(),
+            "UserPromptSubmit",
+            EventFields::UserPromptSubmit {
+                prompt: "hi".into(),
+                origin,
+            },
+        );
+        assert_eq!(envelope["prompt"], "hi");
+        assert_eq!(envelope["origin"], origin);
     }
 }
