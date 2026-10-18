@@ -903,6 +903,7 @@ impl Config {
     /// Whether headless `-p` and ACP prompts resolve `@agent:<name>`
     /// mentions. Off by default so scripts piping arbitrary text keep their
     /// behaviour; inert in builds without the `subagents` feature.
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub fn resolve_headless_agent_mentions(&self) -> bool {
         self.headless_agent_mentions.unwrap_or(false)
     }

@@ -2005,18 +2005,19 @@ fn headless_print_reports_a_degraded_default_sandbox_on_stderr() {
 }
 
 /// One scripted provider reply.
-#[cfg(all(unix, feature = "goal"))]
+#[cfg(all(unix, any(feature = "goal", feature = "subagents")))]
 enum ScriptedReply {
     /// Stream this completion.
     Stream(serde_json::Value, &'static str),
     /// Mark `provider.waiting` and hold the request open until the client
     /// abandons it.
+    #[cfg_attr(not(feature = "goal"), allow(dead_code))]
     Hang,
 }
 
 /// A local provider that answers each request from a script, in order, and
 /// hands every request body back for inspection.
-#[cfg(all(unix, feature = "goal"))]
+#[cfg(all(unix, any(feature = "goal", feature = "subagents")))]
 fn scripted_provider(
     root: &TempRoot,
     extra_config: &str,
@@ -5163,7 +5164,7 @@ fn last_user_texts(body: &serde_json::Value) -> Vec<String> {
 
 /// `headless_agent_mentions` is opt-in: with it off, `-p` text (even an
 /// unknown `@agent:` token) reaches the model untouched, exactly as before.
-#[cfg(feature = "subagents")]
+#[cfg(all(unix, feature = "subagents"))]
 #[test]
 fn headless_agent_mentions_off_passes_the_prompt_through_untouched() {
     let root = TempRoot::new();
@@ -5194,7 +5195,7 @@ fn headless_agent_mentions_off_passes_the_prompt_through_untouched() {
 /// With the key on, a resolved mention is alias-normalised, the routing note
 /// rides on the request as a separate final block, and only the literal text
 /// is persisted.
-#[cfg(feature = "subagents")]
+#[cfg(all(unix, feature = "subagents"))]
 #[test]
 fn headless_agent_mentions_on_routes_with_a_non_persisted_directive() {
     let root = TempRoot::new();
@@ -5234,7 +5235,7 @@ fn headless_agent_mentions_on_routes_with_a_non_persisted_directive() {
 
 /// With the key on, an unknown canonical name fails the run with the valid
 /// names on stderr and a non-zero exit, before any provider request.
-#[cfg(feature = "subagents")]
+#[cfg(all(unix, feature = "subagents"))]
 #[test]
 fn headless_agent_mentions_on_refuses_an_unknown_agent_before_any_request() {
     let root = TempRoot::new();

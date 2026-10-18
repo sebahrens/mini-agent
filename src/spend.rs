@@ -191,6 +191,7 @@ pub(crate) enum RequestKind {
 
 impl RequestKind {
     /// A main conversation turn, typed or scheduled.
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub(crate) fn is_main_turn(self) -> bool {
         matches!(self, Self::Turn | Self::Scheduled)
     }
