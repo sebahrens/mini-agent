@@ -6,7 +6,7 @@ use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::normalize::NormalizedText;
 use crate::agent::tools::{
     AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError,
-    check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity,
+    check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity_chars,
     normalize_whitespace,
 };
 use crate::config::types::EditSystem;
@@ -229,7 +229,11 @@ fn line_spans(content: &str) -> Vec<LineSpan<'_>> {
     spans
 }
 
-fn find_best_match(content: &str, search: &str) -> MatchResult {
+fn find_best_match(
+    content: &str,
+    search: &str,
+    normalized: &std::sync::OnceLock<NormalizedText>,
+) -> MatchResult {
     // Step 1: exact match in original content
     if let Some(pos) = content.find(search) {
         return MatchResult::Exact(pos);
@@ -239,7 +243,7 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     // bytes (trailing whitespace, collapsed blank lines, tab expansion), so the
     // match span is translated back through the normalizer's byte map rather
     // than by arithmetic on the original text.
-    let content_norm = NormalizedText::new(content);
+    let content_norm = normalized.get_or_init(|| NormalizedText::new(content));
     let search_norm = normalize_whitespace(search);
     if search_norm.is_empty() {
         return MatchResult::NotFound;
@@ -298,13 +302,14 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
         }
     }
 
+    let search_norm_chars: Vec<char> = search_norm_joined.chars().collect();
     let mut best_sim = 0.0f64;
     let mut best_start = 0usize;
     let mut applicable = None;
 
     for start in 0..=content_lines.len() - search_lines.len() {
         let window_norm = content_norm_lines[start..start + search_lines.len()].join("\n");
-        let sim = levenshtein_similarity(&search_norm_joined, &window_norm);
+        let sim = levenshtein_similarity_chars(&search_norm_chars, &window_norm);
         if sim > best_sim {
             best_sim = sim;
             best_start = start;
@@ -431,6 +436,9 @@ async fn handle_similarity(
     }
 
     let mut resolved: Vec<ResolvedSim> = Vec::new();
+    // Normalizing a large file is the expensive part of a non-exact match;
+    // build it at most once per call and share it across all blocks.
+    let normalized_content = std::sync::OnceLock::<NormalizedText>::new();
 
     for (i, blk) in blocks.iter().enumerate() {
         let label = if blocks.len() > 1 {
@@ -450,7 +458,7 @@ async fn handle_similarity(
                 .match_indices(&search)
                 .map(|(start, _)| (start, start + search.len()))
                 .collect();
-            let normalized = NormalizedText::new(content);
+            let normalized = normalized_content.get_or_init(|| NormalizedText::new(content));
             let normalized_search = normalize_whitespace(&search);
             let mut all = exact.clone();
             if !normalized_search.is_empty() {
@@ -489,10 +497,11 @@ async fn handle_similarity(
                 continue;
             }
         }
-        match find_best_match(content, &search) {
+        match find_best_match(content, &search, &normalized_content) {
             MatchResult::Exact(pos) => {
-                let count = overlapping_match_indices(content, &search).count();
-                if count > 1 {
+                // Stop at the second hit; only the (rare) ambiguous case counts them all.
+                if overlapping_match_indices(content, &search).nth(1).is_some() {
+                    let count = overlapping_match_indices(content, &search).count();
                     if !disclose_source {
                         return Err(ToolError::Msg(format!(
                             "{label}search text matched more than once in {path}. Add more surrounding context to the SEARCH block to make it unique. Source previews require read permission."
@@ -1785,5 +1794,22 @@ mod tests {
             std::fs::read_to_string(temp.path().join("target.txt")).unwrap(),
             "ALPHA\nbeta\n"
         );
+    }
+
+    #[test]
+    fn similarity_normalizes_content_lazily_and_once_across_blocks() {
+        let content = "fn a() {\n\tone();  \n}\nfn b() {\n\ttwo();\n}\n";
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match(content, "fn a() {", &cache),
+            MatchResult::Exact(0)
+        ));
+        assert!(cache.get().is_none(), "exact matches never normalize");
+        let first = find_best_match(content, "fn a() {\n    one();\n}", &cache);
+        assert!(matches!(first, MatchResult::Normalized(..)));
+        let built = cache.get().expect("non-exact match builds the cache") as *const _;
+        let second = find_best_match(content, "fn b() {\n    two();\n}", &cache);
+        assert!(matches!(second, MatchResult::Normalized(..)));
+        assert!(std::ptr::eq(built, cache.get().unwrap()));
     }
 }

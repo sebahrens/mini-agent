@@ -108,20 +108,26 @@ pub fn normalize_whitespace(s: &str) -> String {
     NormalizedText::new(s).text
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
-    let a_len = a.chars().count();
-    let b_len = b.chars().count();
-    let max_len = a_len.max(b_len);
+    let a_chars: Vec<char> = a.chars().collect();
+    levenshtein_similarity_chars(&a_chars, b)
+}
+
+/// Same as `levenshtein_similarity`, with the first operand's characters
+/// collected once by the caller (the fuzzy matcher compares one search string
+/// against many windows).
+pub fn levenshtein_similarity_chars(a_chars: &[char], b: &str) -> f64 {
+    let b_chars: Vec<char> = b.chars().collect();
+    let max_len = a_chars.len().max(b_chars.len());
     if max_len == 0 {
         return 1.0;
     }
-    let dist = levenshtein_distance(a, b);
+    let dist = levenshtein_distance(a_chars, &b_chars);
     1.0 - (dist as f64 / max_len as f64)
 }
 
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
+fn levenshtein_distance(a_chars: &[char], b_chars: &[char]) -> usize {
     let a_len = a_chars.len();
     let b_len = b_chars.len();
 
