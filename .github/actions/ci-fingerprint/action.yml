@@ -1,0 +1,91 @@
+name: CI pass fingerprint
+description: >-
+  Skip a job whose fingerprinted inputs already passed on main, and record a
+  pass marker after a successful push to main (mini-agent-m7wn5). Never used by
+  the Phase 6 containment gates. Tags, schedule and dispatch always run.
+inputs:
+  mode:
+    description: check (job start) or save (after the job's last step succeeded)
+    required: true
+  job:
+    description: Job id the marker belongs to
+    required: true
+  classes:
+    description: production or production+tests
+    required: true
+  row:
+    description: Feature row or other matrix discriminator
+    required: false
+    default: ''
+  key:
+    description: Marker key from the check step (save mode)
+    required: false
+    default: ''
+outputs:
+  skip:
+    description: "'true' when a pass marker exists for this fingerprint"
+    value: ${{ steps.result.outputs.skip }}
+  key:
+    description: Marker key (ci-pass-<job>-<fingerprint>)
+    value: ${{ steps.compute.outputs.key }}
+  write:
+    description: "'true' when this run may save a marker"
+    value: ${{ steps.compute.outputs.write }}
+runs:
+  using: composite
+  steps:
+    - name: Compute the job fingerprint
+      id: compute
+      if: inputs.mode == 'check'
+      shell: bash
+      env:
+        FP_JOB: ${{ inputs.job }}
+        FP_CLASSES: ${{ inputs.classes }}
+        FP_ROW: ${{ inputs.row }}
+        FP_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        py=$(command -v python3 || command -v python)
+        "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" compute \
+          --job "$FP_JOB" --classes "$FP_CLASSES" --row "$FP_ROW"
+
+    - name: Look up the pass marker
+      id: lookup
+      if: inputs.mode == 'check' && steps.compute.outputs.read == 'true'
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ${{ runner.temp }}/ci-pass-marker
+        key: ${{ steps.compute.outputs.key }}
+        lookup-only: true
+
+    - name: Report the result
+      id: result
+      if: inputs.mode == 'check'
+      shell: bash
+      env:
+        HIT: ${{ steps.lookup.outputs.cache-hit }}
+        KEY: ${{ steps.compute.outputs.key }}
+      run: |
+        if [ "$HIT" = "true" ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Skipping: inputs match a passing run on main (fingerprint $KEY)"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Write the pass marker
+      if: inputs.mode == 'save'
+      shell: bash
+      env:
+        FP_KEY: ${{ inputs.key }}
+        FP_ACTION_PATH: ${{ github.action_path }}
+        MARKER: ${{ runner.temp }}/ci-pass-marker
+      run: |
+        py=$(command -v python3 || command -v python)
+        "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" marker "$MARKER" --key "$FP_KEY"
+
+    - name: Save the pass marker
+      if: inputs.mode == 'save' && inputs.key != ''
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ${{ runner.temp }}/ci-pass-marker
+        key: ${{ inputs.key }}
